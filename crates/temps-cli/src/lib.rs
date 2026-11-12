@@ -16,6 +16,7 @@ pub mod commands;
 pub(crate) mod database_url_source;
 mod docker_context;
 pub mod otel_export;
+pub(crate) mod server_secrets;
 pub(crate) mod service_definition;
 
 use clap::{Parser, Subcommand};

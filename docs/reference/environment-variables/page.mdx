@@ -142,14 +142,18 @@ logs a warning when it is used.
 
 Admin commands run from a shell on the server's host (`temps doctor`,
 `temps migrate`, `temps reset-admin-password`, `temps api-key`,
-`temps domain import`, `temps backfill`, `temps network setup-multi-node`)
-fall back to the installed service when none of the above is set: they read
-`--database-url` and `--data-dir` from `/etc/systemd/system/temps.service`
-(with its drop-ins, `Environment=`, `EnvironmentFile=` and `LoadCredential=`)
-or from the launchd agent `~/Library/LaunchAgents/dev.temps.temps.plist`, and
-say which file they used. `temps serve`, `temps proxy`, `temps setup` and
-`temps backup restore` never do: they use only their own configuration. When
-no source supplies a URL, the error lists every place that was checked.
+`temps domain import`, `temps backfill`, `temps network setup-multi-node`, and
+the pre-update lock-capacity check of `temps upgrade`) fall back to the
+installed service when none of the above is set: they read `--database-url`
+and `--data-dir` from `/etc/systemd/system/temps.service` (with its drop-ins,
+`Environment=`, `EnvironmentFile=` and `LoadCredential=`) or from the launchd
+agent `~/Library/LaunchAgents/dev.temps.temps.plist`, and say which file they
+used. With the server's database, a command that needs the encryption key reads
+it the way the server does (the service's `TEMPS_ENCRYPTION_KEY` /
+`TEMPS_ENCRYPTION_KEY_FILE`, else its data directory) and never creates one.
+`temps serve`, `temps proxy`, `temps setup` and `temps backup restore` never
+fall back: they use only their own configuration. When no source supplies a
+URL, the error lists every place that was checked.
 
 ### Database URL Format
 

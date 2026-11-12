@@ -244,16 +244,25 @@ impl ResolvedDatabaseUrl {
         self.service.as_ref()
     }
 
+    /// The installed service, when this URL is the one that server connects
+    /// with.
+    pub(crate) fn serving_service(&self) -> Option<&ServiceDefinition> {
+        self.service
+            .as_ref()
+            .filter(|service| service.url() == Some(self.url.as_str()))
+    }
+
     /// The installed server's data directory, when this URL is the one that
     /// server connects with. A command that reads the encryption key must
     /// use the server's data directory with the server's database: with any
     /// other, it would find no key (or create a new one) and fail to decrypt
     /// what the server wrote.
     pub(crate) fn service_data_dir(&self) -> Option<&Path> {
-        let service = self.service.as_ref()?;
-        (service.url() == Some(self.url.as_str()))
-            .then_some(service.data_dir.as_ref().map(|(dir, _)| dir.as_path()))
-            .flatten()
+        self.serving_service()?
+            .data_dir
+            .as_ref()
+            .ok()
+            .map(|(dir, _)| dir.as_path())
     }
 
     /// A one-line notice for stderr when the URL was not given to this

@@ -37,6 +37,9 @@ pub(crate) const DATA_DIR_ENV: &str = "TEMPS_DATA_DIR";
 
 /// Larger than any service definition or URL file; a bigger file is not one.
 const MAX_FILE_BYTES: u64 = 256 * 1024;
+/// Where systemd mounts a unit's credentials (`%d`, `$CREDENTIALS_DIRECTORY`)
+/// while it runs.
+const SYSTEMD_CREDENTIALS_ROOT: &str = "/run/credentials";
 
 /// Which supervisor the definition is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,12 +125,22 @@ pub(crate) struct ServiceDefinition {
     /// be read from where the server reads it (for example a root-only
     /// environment file read by an unprivileged user).
     pub database_url: Result<Option<(String, UrlLocation)>, String>,
-    pub data_dir: Option<(PathBuf, DataDirLocation)>,
-    /// The server's working directory, where it also looks for GeoLite2.
+    /// The data directory and where it was found; `Err` says why it is
+    /// unknown.
+    pub data_dir: Result<(PathBuf, DataDirLocation), String>,
+    /// The server's working directory (`/` unless the definition sets one),
+    /// where it also looks for GeoLite2 and against which it opens relative
+    /// paths; `None` when the definition sets one that cannot be resolved.
     pub working_directory: Option<PathBuf>,
     /// The effective service environment (`Environment=` then
-    /// `EnvironmentFile=`, which overrides it).
+    /// `EnvironmentFile=`, which overrides it). `TEMPS_*_FILE` paths are
+    /// absolute (resolved against the working directory) and point at the
+    /// file `LoadCredential=` copies a credential from, since the server's
+    /// credentials directory exists only inside the running service.
     pub environment: BTreeMap<String, String>,
+    /// Why the environment the server sees is not fully known, for example
+    /// an `EnvironmentFile=` this user cannot read. Empty when it is.
+    pub environment_gaps: Vec<String>,
     /// Files the definition references that could not be read.
     pub problems: Vec<String>,
 }
@@ -148,6 +161,7 @@ impl std::fmt::Debug for ServiceDefinition {
             .field("data_dir", &self.data_dir)
             .field("working_directory", &self.working_directory)
             .field("environment", &self.environment.keys().collect::<Vec<_>>())
+            .field("environment_gaps", &self.environment_gaps)
             .field("problems", &self.problems)
             .finish()
     }
@@ -167,6 +181,11 @@ impl ServiceDefinition {
             .get(name)
             .map(String::as_str)
             .filter(|value| !value.is_empty())
+    }
+
+    /// Why the server's environment is not fully known, when it is not.
+    pub(crate) fn incomplete_environment(&self) -> Option<String> {
+        (!self.environment_gaps.is_empty()).then(|| self.environment_gaps.join("; "))
     }
 }
 
@@ -236,16 +255,6 @@ pub(crate) fn probe(locations: &ServiceLocations) -> Vec<ServiceProbe> {
     probes
 }
 
-/// The first definition found, if any.
-pub(crate) fn installed() -> Option<ServiceDefinition> {
-    probe(&ServiceLocations::installed())
-        .into_iter()
-        .find_map(|probe| match probe {
-            ServiceProbe::Found(definition) => Some(*definition),
-            ServiceProbe::Absent { .. } | ServiceProbe::Ignored { .. } => None,
-        })
-}
-
 fn probe_file(
     path: &Path,
     parse: impl FnOnce(String) -> Result<ServiceDefinition, String>,
@@ -307,8 +316,8 @@ fn read_trusted(path: &Path) -> Result<Option<String>, String> {
 #[cfg(unix)]
 fn check_not_writable_by_others(metadata: &std::fs::Metadata) -> Result<(), String> {
     use std::os::unix::fs::MetadataExt;
-    // SAFETY: geteuid/getegid cannot fail and touch no memory.
-    let (euid, egid) = unsafe { (libc::geteuid(), libc::getegid()) };
+    // SAFETY: geteuid cannot fail and touches no memory.
+    let euid = unsafe { libc::geteuid() };
     let mode = metadata.mode();
     if metadata.uid() != 0 && metadata.uid() != euid {
         return Err(format!(
@@ -317,11 +326,16 @@ fn check_not_writable_by_others(metadata: &std::fs::Metadata) -> Result<(), Stri
         ));
     }
     if mode & 0o002 != 0 {
-        return Err("is writable by every user, so it is not trusted".to_string());
+        return Err(
+            "is writable by every user, so it is not trusted; remove that with `chmod o-w`"
+                .to_string(),
+        );
     }
-    if mode & 0o020 != 0 && metadata.gid() != 0 && metadata.gid() != egid {
+    // Any member of the group could rewrite it, including the caller's own
+    // group: the command may run as root, and the group may not be.
+    if mode & 0o020 != 0 {
         return Err(format!(
-            "is writable by group {}, so it is not trusted",
+            "is writable by group {}, so it is not trusted; remove that with `chmod g-w`",
             metadata.gid()
         ));
     }
@@ -450,55 +464,96 @@ fn logical_lines(contents: &str) -> Vec<String> {
 
 fn systemd_definition(unit: &Path, sources: &[(PathBuf, String)]) -> ServiceDefinition {
     let service = parse_systemd_service(sources);
+    let credentials_dir = credentials_dir(unit);
+    let specifiers = |value: &str| resolve_specifiers(value, &credentials_dir);
     let mut problems = Vec::new();
+    let mut environment_gaps = Vec::new();
+
+    // LoadCredential=<id>:<path>; the first entry for an id wins.
+    let mut credentials: BTreeMap<String, PathBuf> = BTreeMap::new();
+    for entry in &service.load_credentials {
+        let entry = specifiers(entry);
+        if let Some((id, path)) = entry.split_once(':') {
+            credentials
+                .entry(id.trim().to_string())
+                .or_insert_with(|| PathBuf::from(path.trim()));
+        }
+    }
 
     let mut environment = BTreeMap::new();
     for assignment in service
         .environment
         .iter()
-        .flat_map(|value| split_words(&resolve_specifiers(value)))
+        .flat_map(|value| split_words(&specifiers(value)))
     {
         if let Some((key, value)) = assignment.split_once('=') {
             environment.insert(key.to_string(), value.to_string());
         }
     }
+    let environment_files: Vec<(bool, PathBuf)> = service
+        .environment_files
+        .iter()
+        .map(|entry| {
+            let entry = specifiers(entry);
+            match entry.strip_prefix('-') {
+                Some(path) => (true, PathBuf::from(path.trim())),
+                None => (false, PathBuf::from(entry.trim())),
+            }
+        })
+        .collect();
     // EnvironmentFile= overrides Environment=, later files override earlier.
-    for entry in &service.environment_files {
-        let entry = resolve_specifiers(entry);
-        let (optional, path) = match entry.strip_prefix('-') {
-            Some(path) => (true, path),
-            None => (false, entry.as_str()),
-        };
-        let path = PathBuf::from(path.trim());
-        match read_trusted(&path) {
+    for (optional, path) in &environment_files {
+        match read_trusted(path) {
             Ok(Some(contents)) => {
                 for (key, value) in parse_environment_file(&contents) {
                     environment.insert(key, value);
                 }
             }
-            Ok(None) if optional => {}
+            Ok(None) if *optional => {}
             Ok(None) => problems.push(format!(
                 "EnvironmentFile={} does not exist (systemd refuses to start the unit)",
                 path.display()
             )),
-            Err(reason) => problems.push(format!("EnvironmentFile={} {reason}", path.display())),
+            // The server reads it, so whatever it sets is unknown here.
+            Err(reason) => {
+                let gap = format!("EnvironmentFile={} {reason}", path.display());
+                problems.push(gap.clone());
+                environment_gaps.push(gap);
+            }
+        }
+    }
+    // `%d/<id>` exists only inside the running service: read the file
+    // LoadCredential= copies it from instead.
+    for value in environment.values_mut() {
+        let source = Path::new(value.as_str())
+            .strip_prefix(&credentials_dir)
+            .ok()
+            .and_then(Path::to_str)
+            .and_then(|id| credentials.get(id))
+            .filter(|source| source.is_absolute())
+            .cloned();
+        if let Some(source) = source {
+            *value = source.display().to_string();
         }
     }
 
-    let working_directory = service
-        .working_directory
-        .as_deref()
-        .map(resolve_specifiers)
-        .and_then(|dir| {
-            let dir = dir.strip_prefix('-').unwrap_or(&dir).to_string();
-            expand_home(&dir, environment.get("HOME").map(String::as_str))
-        });
+    let cwd = match service.working_directory.as_deref().map(specifiers) {
+        None => Ok(PathBuf::from("/")),
+        Some(dir) => {
+            let dir = dir.strip_prefix('-').unwrap_or(&dir);
+            expand_home(dir, environment.get("HOME").map(String::as_str)).ok_or_else(|| {
+                format!("the service's WorkingDirectory={dir} could not be resolved")
+            })
+        }
+    };
+    let file_gaps = resolve_file_variables(&mut environment, &cwd);
 
+    let mut unset = Vec::new();
     let arguments = service.exec_start.as_deref().map(|exec_start| {
         let exec_start = exec_start.trim_start_matches(['@', '-', ':', '+', '!']);
-        split_words(&resolve_specifiers(exec_start))
+        split_words(&specifiers(exec_start))
             .into_iter()
-            .map(|word| expand_variables(&word, &environment))
+            .map(|word| expand_variables(&word, &environment, &mut unset))
             .collect::<Vec<_>>()
     });
     let serve_arguments = arguments.as_deref().filter(|args| runs_serve(args));
@@ -506,50 +561,112 @@ fn systemd_definition(unit: &Path, sources: &[(PathBuf, String)]) -> ServiceDefi
         problems.push("ExecStart= does not run `temps serve`".to_string());
     }
 
-    let credential = service
-        .load_credentials
-        .iter()
-        .map(|entry| resolve_specifiers(entry))
-        .find_map(|entry| {
-            let (id, path) = entry.split_once(':')?;
-            (id.trim() == DATABASE_URL_CREDENTIAL).then(|| PathBuf::from(path.trim()))
-        });
-
-    let database_url = serve_database_url(
-        serve_arguments,
-        &environment,
-        &service.environment_files,
-        credential,
-    );
-    let data_dir = serve_data_dir(
-        serve_arguments,
-        &environment,
-        environment.get("HOME").map(PathBuf::from),
-        working_directory.as_deref(),
-    );
+    let environment_gap = (!environment_gaps.is_empty()).then(|| environment_gaps.join("; "));
+    let (database_url, data_dir) = match &environment_gap {
+        // ExecStart= expands a variable an unreadable file may set.
+        Some(gap) if serve_arguments.is_some() && !unset.is_empty() => {
+            let reason = format!(
+                "ExecStart= uses ${} and {gap}, so what `temps serve` runs with is unknown",
+                unset.join(", $")
+            );
+            (Err(reason.clone()), Err(reason))
+        }
+        _ => (
+            serve_database_url(
+                serve_arguments,
+                &environment,
+                environment_gap.as_deref(),
+                &environment_files,
+                credentials.get(DATABASE_URL_CREDENTIAL).cloned(),
+                &cwd,
+            ),
+            serve_data_dir(
+                serve_arguments,
+                &environment,
+                environment_gap.as_deref(),
+                environment.get("HOME").map(PathBuf::from),
+                &cwd,
+            ),
+        ),
+    };
+    environment_gaps.extend(file_gaps);
 
     ServiceDefinition {
         path: unit.to_path_buf(),
         kind: ServiceKind::Systemd,
         database_url,
         data_dir,
-        working_directory,
+        working_directory: cwd.ok(),
         environment,
+        environment_gaps,
         problems,
     }
+}
+
+/// `%d` for `unit`: `/run/credentials/<unit name>`.
+fn credentials_dir(unit: &Path) -> PathBuf {
+    let name = unit
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "temps.service".to_string());
+    Path::new(SYSTEMD_CREDENTIALS_ROOT).join(name)
+}
+
+/// `path` as the server opens it: relative to its working directory.
+fn absolute_in(path: PathBuf, cwd: &Result<PathBuf, String>) -> Result<PathBuf, String> {
+    if path.is_absolute() {
+        return Ok(path);
+    }
+    match cwd {
+        Ok(cwd) => Ok(cwd.join(&path).components().collect()),
+        Err(reason) => Err(format!("{} is relative, and {reason}", path.display())),
+    }
+}
+
+/// `serve` opens a relative `TEMPS_*_FILE` against its own working
+/// directory, not this command's, so make each absolute. Returns the ones
+/// that cannot be (other than the URL file, whose error the URL carries).
+fn resolve_file_variables(
+    environment: &mut BTreeMap<String, String>,
+    cwd: &Result<PathBuf, String>,
+) -> Vec<String> {
+    let mut gaps = Vec::new();
+    for (key, value) in environment
+        .iter_mut()
+        .filter(|(key, _)| key.starts_with("TEMPS_") && key.ends_with("_FILE"))
+    {
+        let raw = value.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        match absolute_in(PathBuf::from(raw), cwd) {
+            Ok(path) => *value = path.display().to_string(),
+            Err(reason) if key != DATABASE_URL_FILE_ENV => gaps.push(format!("{key}={reason}")),
+            Err(_) => {}
+        }
+    }
+    gaps
 }
 
 /// `serve` with `--database-url` wins over `TEMPS_DATABASE_URL`, which wins
 /// over `TEMPS_DATABASE_URL_FILE`, which wins over the credential: the same
 /// order as `temps serve` itself (clap, then `adopt_database_url_file`).
+/// With `environment_gap`, only the flag is certain.
 fn serve_database_url(
     arguments: Option<&[String]>,
     environment: &BTreeMap<String, String>,
-    environment_files: &[String],
+    environment_gap: Option<&str>,
+    environment_files: &[(bool, PathBuf)],
     credential: Option<PathBuf>,
+    cwd: &Result<PathBuf, String>,
 ) -> Result<Option<(String, UrlLocation)>, String> {
     if let Some(url) = arguments.and_then(|args| flag_value(args, "--database-url")) {
         return Ok(Some((url, UrlLocation::CommandLine)));
+    }
+    if let Some(gap) = environment_gap {
+        return Err(format!(
+            "{gap}; it may set {DATABASE_URL_ENV}, so the URL the server uses is unknown"
+        ));
     }
     if let Some(url) = environment
         .get(DATABASE_URL_ENV)
@@ -564,7 +681,8 @@ fn serve_database_url(
         .get(DATABASE_URL_FILE_ENV)
         .filter(|path| !path.trim().is_empty())
     {
-        let path = PathBuf::from(path.trim());
+        let path = absolute_in(PathBuf::from(path.trim()), cwd)
+            .map_err(|reason| format!("{DATABASE_URL_FILE_ENV}={reason}"))?;
         return read_url(&path).map(|url| Some((url, UrlLocation::UrlFile(path))));
     }
     if let Some(path) = credential {
@@ -590,40 +708,44 @@ fn read_url(path: &Path) -> Result<String, String> {
 
 /// The last environment file that sets `name` (later files win), so the
 /// origin names the file the value really came from.
-fn environment_file_defining(environment_files: &[String], name: &str) -> Option<PathBuf> {
-    environment_files.iter().rev().find_map(|entry| {
-        let entry = resolve_specifiers(entry);
-        let path = PathBuf::from(entry.strip_prefix('-').unwrap_or(&entry).trim());
-        let contents = read_trusted(&path).ok().flatten()?;
+fn environment_file_defining(environment_files: &[(bool, PathBuf)], name: &str) -> Option<PathBuf> {
+    environment_files.iter().rev().find_map(|(_, path)| {
+        let contents = read_trusted(path).ok().flatten()?;
         parse_environment_file(&contents)
             .into_iter()
             .any(|(key, _)| key == name)
-            .then_some(path)
+            .then(|| path.clone())
     })
 }
 
 /// `serve`'s data directory: `--data-dir`, `TEMPS_DATA_DIR`, then
 /// `$HOME/.temps`. A relative path is relative to the working directory.
+/// With `environment_gap`, only the flag is certain.
 fn serve_data_dir(
     arguments: Option<&[String]>,
     environment: &BTreeMap<String, String>,
+    environment_gap: Option<&str>,
     home: Option<PathBuf>,
-    working_directory: Option<&Path>,
-) -> Option<(PathBuf, DataDirLocation)> {
+    cwd: &Result<PathBuf, String>,
+) -> Result<(PathBuf, DataDirLocation), String> {
     let (dir, location) =
         if let Some(dir) = arguments.and_then(|args| flag_value(args, "--data-dir")) {
             (PathBuf::from(dir), DataDirLocation::CommandLine)
+        } else if let Some(gap) = environment_gap {
+            return Err(format!(
+                "{gap}; it may set {DATA_DIR_ENV}, so the data directory is unknown"
+            ));
         } else if let Some(dir) = environment.get(DATA_DIR_ENV).filter(|dir| !dir.is_empty()) {
             (PathBuf::from(dir), DataDirLocation::Environment)
+        } else if let Some(home) = home {
+            (home.join(".temps"), DataDirLocation::HomeDefault)
         } else {
-            (home?.join(".temps"), DataDirLocation::HomeDefault)
+            return Err(format!(
+                "it sets no --data-dir, {DATA_DIR_ENV} or HOME, so the data directory is unknown"
+            ));
         };
-    if dir.is_absolute() {
-        Some((dir, location))
-    } else {
-        let base = working_directory.filter(|dir| dir.is_absolute())?;
-        Some((base.join(dir).components().collect(), location))
-    }
+    let dir = absolute_in(dir, cwd).map_err(|reason| format!("its data directory {reason}"))?;
+    Ok((dir, location))
 }
 
 fn runs_serve(arguments: &[String]) -> bool {
@@ -645,9 +767,27 @@ fn flag_value(arguments: &[String], flag: &str) -> Option<String> {
     None
 }
 
-/// systemd's `%%` is a literal `%`. Other specifiers are left as written.
-fn resolve_specifiers(value: &str) -> String {
-    value.replace("%%", "%")
+/// systemd's `%%` (a literal `%`) and `%d` (the unit's credentials
+/// directory). Other specifiers are left as written.
+fn resolve_specifiers(value: &str, credentials_dir: &Path) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('%') => out.push('%'),
+            Some('d') => out.push_str(&credentials_dir.display().to_string()),
+            Some(other) => {
+                out.push('%');
+                out.push(other);
+            }
+            None => out.push('%'),
+        }
+    }
+    out
 }
 
 /// `~` or `~/x` against `home`; anything else unchanged when absolute.
@@ -696,8 +836,22 @@ fn split_words(value: &str) -> Vec<String> {
 }
 
 /// `${NAME}` and `$NAME` from the service environment; `$$` is a literal `$`.
-/// An unset variable expands to nothing, as in systemd.
-fn expand_variables(word: &str, environment: &BTreeMap<String, String>) -> String {
+/// An unset variable expands to nothing, as in systemd, and is added to
+/// `unset`.
+fn expand_variables(
+    word: &str,
+    environment: &BTreeMap<String, String>,
+    unset: &mut Vec<String>,
+) -> String {
+    let mut lookup = |name: String| match environment.get(&name) {
+        Some(value) => value.clone(),
+        None => {
+            if !unset.contains(&name) {
+                unset.push(name);
+            }
+            String::new()
+        }
+    };
     let mut out = String::with_capacity(word.len());
     let mut chars = word.chars().peekable();
     while let Some(c) = chars.next() {
@@ -713,7 +867,7 @@ fn expand_variables(word: &str, environment: &BTreeMap<String, String>) -> Strin
             Some('{') => {
                 chars.next();
                 let name: String = chars.by_ref().take_while(|c| *c != '}').collect();
-                out.push_str(environment.get(&name).map(String::as_str).unwrap_or(""));
+                out.push_str(&lookup(name));
             }
             Some(c) if c.is_ascii_alphabetic() || *c == '_' => {
                 let mut name = String::new();
@@ -724,7 +878,7 @@ fn expand_variables(word: &str, environment: &BTreeMap<String, String>) -> Strin
                     name.push(*c);
                     chars.next();
                 }
-                out.push_str(environment.get(&name).map(String::as_str).unwrap_or(""));
+                out.push_str(&lookup(name));
             }
             _ => out.push('$'),
         }
@@ -767,30 +921,40 @@ fn launchd_definition(agent: &Path, contents: &str, home: Option<&Path>) -> Serv
             .entry("HOME".to_string())
             .or_insert_with(|| home.display().to_string());
     }
-    let working_directory = plist_value_after_key(contents, "WorkingDirectory")
+    // launchd starts a job in `/` unless WorkingDirectory says otherwise.
+    let cwd = match plist_value_after_key(contents, "WorkingDirectory")
         .and_then(|rest| element_body(rest, "string"))
-        .map(|dir| PathBuf::from(unescape_xml(dir.trim())))
-        .filter(|dir| dir.is_absolute());
+        .map(|dir| unescape_xml(dir.trim()))
+    {
+        None => Ok(PathBuf::from("/")),
+        Some(dir) if Path::new(&dir).is_absolute() => Ok(PathBuf::from(dir)),
+        Some(dir) => Err(format!(
+            "the agent's WorkingDirectory {dir} is not an absolute path"
+        )),
+    };
+    let environment_gaps = resolve_file_variables(&mut environment, &cwd);
 
     let mut problems = Vec::new();
     let serve_arguments = arguments.as_deref().filter(|args| runs_serve(args));
     if arguments.is_some() && serve_arguments.is_none() {
         problems.push("ProgramArguments does not run `temps serve`".to_string());
     }
-    let database_url = serve_database_url(serve_arguments, &environment, &[], None);
+    let database_url = serve_database_url(serve_arguments, &environment, None, &[], None, &cwd);
     let data_dir = serve_data_dir(
         serve_arguments,
         &environment,
+        None,
         environment.get("HOME").map(PathBuf::from),
-        working_directory.as_deref(),
+        &cwd,
     );
     ServiceDefinition {
         path: agent.to_path_buf(),
         kind: ServiceKind::Launchd,
         database_url,
         data_dir,
-        working_directory,
+        working_directory: cwd.ok(),
         environment,
+        environment_gaps,
         problems,
     }
 }
@@ -873,11 +1037,26 @@ mod tests {
         )
     }
 
+    /// Written 0644 whatever the umask, since group-writable files are not
+    /// trusted.
     fn write(path: &Path, contents: &str) {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).unwrap();
         }
         std::fs::write(path, contents).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+    }
+
+    /// Make `path` unreadable; `false` when this user reads it anyway (root).
+    #[cfg(unix)]
+    fn make_unreadable(path: &Path) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        std::fs::read(path).is_err()
     }
 
     fn found(probes: Vec<ServiceProbe>) -> ServiceDefinition {
@@ -915,7 +1094,7 @@ mod tests {
         );
         assert_eq!(
             definition.data_dir,
-            Some((home.join(".temps/data"), DataDirLocation::CommandLine))
+            Ok((home.join(".temps/data"), DataDirLocation::CommandLine))
         );
         assert_eq!(definition.working_directory, Some(home.join(".temps")));
         assert!(definition.problems.is_empty(), "{:?}", definition.problems);
@@ -946,7 +1125,7 @@ mod tests {
         );
         assert_eq!(
             definition.data_dir,
-            Some((PathBuf::from("/srv/temps"), DataDirLocation::Environment))
+            Ok((PathBuf::from("/srv/temps"), DataDirLocation::Environment))
         );
     }
 
@@ -989,7 +1168,7 @@ mod tests {
         );
         assert_eq!(
             definition.data_dir,
-            Some((PathBuf::from("/srv/data"), DataDirLocation::CommandLine))
+            Ok((PathBuf::from("/srv/data"), DataDirLocation::CommandLine))
         );
     }
 
@@ -1073,7 +1252,7 @@ mod tests {
         assert_eq!(definition.url(), Some(URL));
         assert_eq!(
             definition.data_dir,
-            Some((
+            Ok((
                 PathBuf::from("/home/svc/data"),
                 DataDirLocation::CommandLine
             ))
@@ -1090,7 +1269,7 @@ mod tests {
         );
         assert_eq!(
             found(probe(&systemd_at(&unit))).data_dir,
-            Some((
+            Ok((
                 PathBuf::from("/home/svc/.temps"),
                 DataDirLocation::HomeDefault
             ))
@@ -1102,7 +1281,7 @@ mod tests {
         );
         assert_eq!(
             found(probe(&systemd_at(&unit))).data_dir,
-            Some((
+            Ok((
                 PathBuf::from("/srv/temps/data"),
                 DataDirLocation::CommandLine
             ))
@@ -1132,6 +1311,179 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_unit_its_group_can_rewrite_is_ignored() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let unit = root.path().join("temps.service");
+        write(&unit, &installer_unit(root.path()));
+        std::fs::set_permissions(&unit, std::fs::Permissions::from_mode(0o664)).unwrap();
+        match probe(&systemd_at(&unit)).as_slice() {
+            [ServiceProbe::Ignored { reason, .. }] => {
+                assert!(reason.contains("writable by group"), "{reason}");
+                assert!(reason.contains("chmod g-w"), "{reason}");
+            }
+            other => panic!("expected the unit to be ignored, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn credentials_named_with_percent_d_are_read_from_their_load_credential_source() {
+        let root = tempfile::tempdir().unwrap();
+        let url_file = root.path().join("credstore/database-url");
+        write(&url_file, &format!("{URL}\n"));
+        let key_file = root.path().join("credstore/encryption-key");
+        write(&key_file, "key");
+        let unit = root.path().join("temps.service");
+        write(
+            &unit,
+            &format!(
+                "[Service]\nLoadCredential=db:{}\nLoadCredential=key:{}\n\
+                 Environment=TEMPS_DATABASE_URL_FILE=%d/db TEMPS_ENCRYPTION_KEY_FILE=%d/key \
+                 LITERAL=100%%\nExecStart=/usr/bin/temps serve\n",
+                url_file.display(),
+                key_file.display()
+            ),
+        );
+        let definition = found(probe(&systemd_at(&unit)));
+        assert_eq!(definition.url(), Some(URL));
+        assert_eq!(
+            definition
+                .database_url
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .1,
+            UrlLocation::UrlFile(url_file)
+        );
+        assert_eq!(
+            definition.env("TEMPS_ENCRYPTION_KEY_FILE"),
+            Some(&*key_file.display().to_string())
+        );
+        assert_eq!(definition.env("LITERAL"), Some("100%"));
+        assert!(definition.environment_gaps.is_empty());
+    }
+
+    #[test]
+    fn relative_paths_resolve_against_the_services_working_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let url_file = root.path().join("secrets/database-url");
+        write(&url_file, &format!("{URL}\n"));
+        let unit = root.path().join("temps.service");
+        write(
+            &unit,
+            &format!(
+                "[Service]\nWorkingDirectory={}\n\
+                 Environment=TEMPS_DATABASE_URL_FILE=secrets/database-url \
+                 TEMPS_AUTH_SECRET_FILE=./secrets/auth\n\
+                 ExecStart=/usr/bin/temps serve --data-dir data\n",
+                root.path().display()
+            ),
+        );
+        let definition = found(probe(&systemd_at(&unit)));
+        assert_eq!(definition.url(), Some(URL));
+        assert_eq!(
+            definition.env("TEMPS_AUTH_SECRET_FILE"),
+            Some(&*root.path().join("secrets/auth").display().to_string())
+        );
+        assert_eq!(
+            definition.data_dir,
+            Ok((root.path().join("data"), DataDirLocation::CommandLine))
+        );
+
+        // No WorkingDirectory=: systemd starts the service in `/`.
+        write(
+            &unit,
+            "[Service]\nEnvironment=TEMPS_AUTH_SECRET_FILE=secrets/auth\n\
+             ExecStart=/usr/bin/temps serve --data-dir srv/data\n",
+        );
+        let definition = found(probe(&systemd_at(&unit)));
+        assert_eq!(definition.working_directory, Some(PathBuf::from("/")));
+        assert_eq!(
+            definition.env("TEMPS_AUTH_SECRET_FILE"),
+            Some("/secrets/auth")
+        );
+        assert_eq!(
+            definition.data_dir,
+            Ok((PathBuf::from("/srv/data"), DataDirLocation::CommandLine))
+        );
+
+        // A WorkingDirectory= that cannot be resolved leaves them unknown.
+        write(
+            &unit,
+            "[Service]\nWorkingDirectory=~\n\
+             Environment=TEMPS_AUTH_SECRET_FILE=secrets/auth \
+             TEMPS_DATABASE_URL_FILE=database-url\n\
+             ExecStart=/usr/bin/temps serve --data-dir data\n",
+        );
+        let definition = found(probe(&systemd_at(&unit)));
+        assert_eq!(definition.working_directory, None);
+        let url_error = definition.database_url.as_ref().unwrap_err();
+        assert!(url_error.contains("WorkingDirectory=~"), "{url_error}");
+        let dir_error = definition.data_dir.as_ref().unwrap_err();
+        assert!(dir_error.contains("is relative"), "{dir_error}");
+        let gap = definition.incomplete_environment().unwrap();
+        assert!(gap.contains("TEMPS_AUTH_SECRET_FILE"), "{gap}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_environment_file_leaves_what_it_may_set_unknown() {
+        let root = tempfile::tempdir().unwrap();
+        let env_file = root.path().join("temps.env");
+        write(&env_file, "TEMPS_DATABASE_URL=postgres://from-file/db\n");
+        if !make_unreadable(&env_file) {
+            return;
+        }
+        let unit = root.path().join("temps.service");
+        write(
+            &unit,
+            &format!(
+                "[Service]\nEnvironment=TEMPS_DATABASE_URL={URL} HOME=/home/svc\n\
+                 EnvironmentFile={}\nExecStart=/usr/bin/temps serve\n",
+                env_file.display()
+            ),
+        );
+        let definition = found(probe(&systemd_at(&unit)));
+        // Not Environment='s URL: the file the server reads may override it.
+        let error = definition.database_url.as_ref().unwrap_err();
+        assert!(error.contains("temps.env"), "{error}");
+        assert!(definition.data_dir.is_err());
+        assert!(definition.incomplete_environment().is_some());
+
+        // Flags on ExecStart= are certain whatever the file sets...
+        write(
+            &unit,
+            &format!(
+                "[Service]\nEnvironmentFile={}\n\
+                 ExecStart=/usr/bin/temps serve --database-url={URL} --data-dir=/srv/data\n",
+                env_file.display()
+            ),
+        );
+        let definition = found(probe(&systemd_at(&unit)));
+        assert_eq!(definition.url(), Some(URL));
+        assert_eq!(
+            definition.data_dir,
+            Ok((PathBuf::from("/srv/data"), DataDirLocation::CommandLine))
+        );
+
+        // ...unless they expand a variable the file may set.
+        write(
+            &unit,
+            &format!(
+                "[Service]\nEnvironmentFile={}\n\
+                 ExecStart=/usr/bin/temps serve --database-url=${{DB}} --data-dir=/srv/data\n",
+                env_file.display()
+            ),
+        );
+        let definition = found(probe(&systemd_at(&unit)));
+        let error = definition.database_url.as_ref().unwrap_err();
+        assert!(error.contains("$DB"), "{error}");
+        assert!(definition.data_dir.is_err());
+    }
+
     #[test]
     fn the_launchd_agent_yields_its_url_and_data_dir() {
         let root = tempfile::tempdir().unwrap();
@@ -1159,7 +1511,7 @@ mod tests {
         assert_eq!(definition.url(), Some(URL));
         assert_eq!(
             definition.data_dir,
-            Some((home.join(".temps/data"), DataDirLocation::CommandLine))
+            Ok((home.join(".temps/data"), DataDirLocation::CommandLine))
         );
         assert_eq!(definition.env("HOME"), Some(&*home.display().to_string()));
     }

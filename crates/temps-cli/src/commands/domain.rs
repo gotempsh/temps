@@ -15,7 +15,7 @@ use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use temps_core::EncryptionService;
 use temps_entities::domains;
 use temps_schema::establish_connection;
@@ -1870,16 +1870,16 @@ async fn execute_import(cmd: ImportCertificateCommand) -> anyhow::Result<()> {
     )?;
     database.announce_discovery();
 
-    // The server's data directory with the server's database: its key is the
-    // one the stored private keys must be encrypted with.
-    let data_dir = get_data_dir(&cmd.data_dir.clone().or_else(|| {
-        database
-            .service_data_dir()
-            .map(std::path::Path::to_path_buf)
-    }))?;
-
-    // Load encryption key
-    let encryption_key = load_encryption_key(&data_dir)?;
+    // The server's data directory and key with the server's database: the
+    // stored private key must be encrypted with the key the server reads.
+    let data_dir = match cmd.data_dir.clone() {
+        Some(dir) => dir,
+        None => match crate::server_secrets::service_data_dir(&database)? {
+            Some(dir) => dir,
+            None => get_data_dir(&None)?,
+        },
+    };
+    let encryption_key = crate::server_secrets::encryption_key(&data_dir, &database)?;
     let encryption_service = EncryptionService::new(&encryption_key)
         .map_err(|e| anyhow::anyhow!("Failed to create encryption service: {}", e))?;
 
@@ -2034,12 +2034,6 @@ fn get_data_dir(data_dir: &Option<PathBuf>) -> anyhow::Result<PathBuf> {
             .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
         Ok(home.join(".temps"))
     }
-}
-
-fn load_encryption_key(data_dir: &Path) -> anyhow::Result<String> {
-    temps_config::resolve_installation_secrets(data_dir)
-        .map(|secrets| secrets.encryption_key)
-        .map_err(|error| anyhow::anyhow!("Failed to resolve installation secrets: {error}"))
 }
 
 fn validate_and_parse_certificate(

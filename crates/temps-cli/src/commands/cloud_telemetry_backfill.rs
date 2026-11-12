@@ -161,11 +161,13 @@ async fn run_async(args: CloudTelemetryBackfillArgs) -> anyhow::Result<()> {
     database.announce_discovery();
     // The server's own data directory with the server's database: its key
     // decrypts the Cloud link.
-    let data_dir = resolve_data_dir(args.data_dir.clone().or_else(|| {
-        database
-            .service_data_dir()
-            .map(std::path::Path::to_path_buf)
-    }))?;
+    let data_dir = match args.data_dir.clone() {
+        Some(dir) => dir,
+        None => match crate::server_secrets::service_data_dir(&database)? {
+            Some(dir) => dir,
+            None => resolve_data_dir(None)?,
+        },
+    };
     let database_url = database.url();
 
     let bootstrap_stateless = temps_config::bootstrap_stateless_requested()?;
@@ -199,7 +201,8 @@ async fn run_async(args: CloudTelemetryBackfillArgs) -> anyhow::Result<()> {
         temps_schema::ensure_no_unprotected_upgrade(db.as_ref()).await?;
         temps_schema::run_migrations(db.as_ref()).await?;
     }
-    let link = load_cloud_link(&data_dir, db.clone(), database_url, stateless).await?;
+    let key = crate::server_secrets::encryption_key(&data_dir, &database)?;
+    let link = load_cloud_link(&data_dir, &key, db.clone(), database_url, stateless).await?;
     let compression = temps_config::stored_clickhouse_compression(db.as_ref()).await;
     let source = build_source(&args, db.clone(), compression)?;
 
@@ -518,15 +521,13 @@ fn resolve_data_dir(explicit: Option<PathBuf>) -> anyhow::Result<PathBuf> {
 /// Load the same link state the server uses, decrypted with the same key.
 async fn load_cloud_link(
     data_dir: &Path,
+    key: &str,
     db: Arc<sea_orm::DatabaseConnection>,
     database_url: &str,
     stateless: bool,
 ) -> anyhow::Result<Arc<temps_cloud_client::CloudLink>> {
-    let key = temps_config::resolve_installation_secrets(data_dir)
-        .map_err(|error| anyhow::anyhow!("Could not resolve installation secrets: {error}"))?
-        .encryption_key;
     let encryption = Arc::new(
-        temps_core::EncryptionService::new(&key)
+        temps_core::EncryptionService::new(key)
             .map_err(|error| anyhow::anyhow!("Could not initialise encryption: {error}"))?,
     );
 

@@ -13,7 +13,8 @@ use super::upgrade;
 use crate::database_url_source::{
     resolve_database_url, DatabaseUrlNotFound, DatabaseUrlOrigin, ResolvedDatabaseUrl, UrlDiscovery,
 };
-use crate::service_definition::{self, ServiceDefinition};
+use crate::server_secrets::SecretsEnvironment;
+use crate::service_definition::{self, ServiceDefinition, ServiceLocations, ServiceProbe};
 
 mod firecracker;
 mod mesh;
@@ -153,13 +154,19 @@ impl DoctorCommand {
         // directory without repeating its flags.
         let database =
             resolve_database_url(self.database_url.as_deref(), UrlDiscovery::InstalledService);
+        let probes = service_definition::probe(&ServiceLocations::installed());
         let service = database
             .as_ref()
             .ok()
             .and_then(ResolvedDatabaseUrl::service)
             .cloned()
-            .or_else(service_definition::installed);
-        let (data_dir, data_dir_source) = self.resolve_data_dir(service.as_ref());
+            .or_else(|| {
+                probes.iter().find_map(|probe| match probe {
+                    ServiceProbe::Found(definition) => Some((**definition).clone()),
+                    ServiceProbe::Absent { .. } | ServiceProbe::Ignored { .. } => None,
+                })
+            });
+        let (data_dir, data_dir_source) = self.resolve_data_dir(service.as_ref(), &probes);
 
         if let Some(DoctorScope::Mesh(args)) = &self.scope {
             let database_url = database
@@ -187,14 +194,20 @@ impl DoctorCommand {
         // -- Installed service --
         println!();
         println!("{}", "  Installed service".bright_yellow().bold());
-        check_installed_service(service.as_ref(), &mut report);
+        check_installed_service(service.as_ref(), &probes, &mut report);
         report.print();
         report.checks.clear();
 
         // -- Data Directory --
         println!();
         println!("{}", "  Data Directory".bright_yellow().bold());
-        self.check_data_dir(&data_dir, &data_dir_source, service.as_ref(), &mut report);
+        self.check_data_dir(
+            &data_dir,
+            &data_dir_source,
+            service.as_ref(),
+            SecretsEnvironment::choose(service.as_ref()),
+            &mut report,
+        );
         report.print();
         report.checks.clear();
 
@@ -275,9 +288,13 @@ impl DoctorCommand {
     /// The data directory `temps serve` uses, and where that answer came
     /// from: `--data-dir` / `TEMPS_DATA_DIR` here, else the installed
     /// service's, else the default layout.
-    fn resolve_data_dir(&self, service: Option<&ServiceDefinition>) -> (PathBuf, String) {
+    fn resolve_data_dir(
+        &self,
+        service: Option<&ServiceDefinition>,
+        probes: &[ServiceProbe],
+    ) -> (PathBuf, String) {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-        resolve_doctor_data_dir(self.data_dir.as_deref(), service, &home)
+        resolve_doctor_data_dir(self.data_dir.as_deref(), service, probes, &home)
     }
 
     // ── Version checks ──────────────────────────────────────────────
@@ -324,6 +341,7 @@ impl DoctorCommand {
         data_dir: &Path,
         source: &str,
         service: Option<&ServiceDefinition>,
+        secrets_env: SecretsEnvironment<'_>,
         report: &mut DiagnosticReport,
     ) {
         report.add(
@@ -360,16 +378,41 @@ impl DoctorCommand {
         // injected through its environment, else the data directory's files,
         // which it generates when they are missing. Its environment is this
         // shell's when that injects any of them, else the installed service's.
-        let secrets_env = SecretsEnvironment::choose(service);
-        if let SecretsEnvironment::Service(service) = &secrets_env {
-            report.add(
+        match &secrets_env {
+            SecretsEnvironment::Service(service) => report.add(
                 "Secrets source",
                 CheckResult::Info(format!(
                     "Checked with the environment of {}",
                     service.path.display()
                 )),
-            );
+            ),
+            SecretsEnvironment::Unknown { service, reason } => {
+                let result = environment_unknown_result(&service.path, reason);
+                report.add("Encryption key", result.clone());
+                report.add("Auth secret", result);
+            }
+            SecretsEnvironment::Shell | SecretsEnvironment::Empty => {}
         }
+        if !matches!(secrets_env, SecretsEnvironment::Unknown { .. }) {
+            self.check_secrets(data_dir, &secrets_env, report);
+        }
+
+        report.add(
+            "GeoLite2 database",
+            geolite_result(
+                data_dir,
+                service.and_then(|service| service.working_directory.as_deref()),
+            ),
+        );
+        report.add("Logs directory", logs_dir_result(data_dir));
+    }
+
+    fn check_secrets(
+        &self,
+        data_dir: &Path,
+        secrets_env: &SecretsEnvironment<'_>,
+        report: &mut DiagnosticReport,
+    ) {
         let inspection =
             temps_config::inspect_installation_secrets_with(data_dir, |name| secrets_env.get(name));
         let initialized = matches!(
@@ -384,15 +427,6 @@ impl DoctorCommand {
             encryption_key_result(&inspection.encryption_key, initialized),
         );
         report.add("Auth secret", auth_secret_result(&inspection.auth_secret));
-
-        report.add(
-            "GeoLite2 database",
-            geolite_result(
-                data_dir,
-                service.and_then(|service| service.working_directory.as_deref()),
-            ),
-        );
-        report.add("Logs directory", logs_dir_result(data_dir));
     }
 
     // ── Docker checks ───────────────────────────────────────────────
@@ -1313,6 +1347,7 @@ pub(super) fn default_data_dir(home: &Path) -> PathBuf {
 fn resolve_doctor_data_dir(
     explicit: Option<&Path>,
     service: Option<&ServiceDefinition>,
+    probes: &[ServiceProbe],
     home: &Path,
 ) -> (PathBuf, String) {
     if let Some(dir) = explicit {
@@ -1321,24 +1356,62 @@ fn resolve_doctor_data_dir(
             "from --data-dir / TEMPS_DATA_DIR".to_string(),
         );
     }
-    if let Some(service) = service {
-        if let Some((dir, location)) = &service.data_dir {
-            return (
-                dir.clone(),
-                format!("from {} in {}", location.describe(), service.path.display()),
-            );
-        }
-    }
+    let why_default = match service {
+        Some(service) => match &service.data_dir {
+            Ok((dir, location)) => {
+                return (
+                    dir.clone(),
+                    format!("from {} in {}", location.describe(), service.path.display()),
+                );
+            }
+            Err(reason) => format!(
+                "the data directory of {} is unknown ({reason}); pass --data-dir",
+                service.path.display()
+            ),
+        },
+        None => match ignored_probes(probes).next() {
+            Some((path, _)) => format!(
+                "the installed service {} could not be used (see Installed service); pass                  --data-dir",
+                path.display()
+            ),
+            None => "no --data-dir, TEMPS_DATA_DIR or installed service".to_string(),
+        },
+    };
     (
         default_data_dir(home),
-        "default layout: no --data-dir, TEMPS_DATA_DIR or installed service".to_string(),
+        format!("default layout: {why_default}"),
     )
+}
+
+fn ignored_probes(probes: &[ServiceProbe]) -> impl Iterator<Item = (&Path, &str)> {
+    probes.iter().filter_map(|probe| match probe {
+        ServiceProbe::Ignored { path, reason } => Some((path.as_path(), reason.as_str())),
+        ServiceProbe::Absent { .. } | ServiceProbe::Found(_) => None,
+    })
 }
 
 /// The installed service doctor read, and anything it references that could
 /// not be used.
-fn check_installed_service(service: Option<&ServiceDefinition>, report: &mut DiagnosticReport) {
+fn check_installed_service(
+    service: Option<&ServiceDefinition>,
+    probes: &[ServiceProbe],
+    report: &mut DiagnosticReport,
+) {
+    // A definition that exists but is not used (another user can rewrite it,
+    // this user cannot read it) is the likeliest reason nothing below
+    // matches the server.
+    let mut ignored = false;
+    for (path, reason) in ignored_probes(probes) {
+        ignored = true;
+        report.add(
+            "Ignored",
+            CheckResult::Warn(format!("{} {reason}", path.display())),
+        );
+    }
     let Some(service) = service else {
+        if ignored {
+            return;
+        }
         let checked = service_definition::ServiceLocations::installed()
             .paths()
             .iter()
@@ -1361,51 +1434,9 @@ fn check_installed_service(service: Option<&ServiceDefinition>, report: &mut Dia
     for problem in &service.problems {
         report.add("Definition", CheckResult::Warn(problem.clone()));
     }
-}
-
-/// The variables `ServerConfig::new` reads the installation secrets from.
-const SECRET_VARIABLES: [&str; 5] = [
-    temps_config::STATELESS_ENV,
-    temps_config::AUTH_SECRET_ENV,
-    temps_config::AUTH_SECRET_FILE_ENV,
-    temps_config::ENCRYPTION_KEY_ENV,
-    temps_config::ENCRYPTION_KEY_FILE_ENV,
-];
-
-/// Which environment the secrets are checked against: this shell's when it
-/// injects any of them (the operator is testing that), else the installed
-/// service's, which a shell does not inherit.
-enum SecretsEnvironment<'a> {
-    Shell,
-    Service(&'a ServiceDefinition),
-    Empty,
-}
-
-impl<'a> SecretsEnvironment<'a> {
-    fn choose(service: Option<&'a ServiceDefinition>) -> Self {
-        if SECRET_VARIABLES
-            .iter()
-            .any(|name| std::env::var_os(name).is_some())
-        {
-            return SecretsEnvironment::Shell;
-        }
-        match service {
-            Some(service)
-                if SECRET_VARIABLES
-                    .iter()
-                    .any(|name| service.environment.contains_key(*name)) =>
-            {
-                SecretsEnvironment::Service(service)
-            }
-            Some(_) | None => SecretsEnvironment::Empty,
-        }
-    }
-
-    fn get(&self, name: &str) -> Option<String> {
-        match self {
-            SecretsEnvironment::Shell => std::env::var(name).ok(),
-            SecretsEnvironment::Service(service) => service.environment.get(name).cloned(),
-            SecretsEnvironment::Empty => None,
+    for gap in &service.environment_gaps {
+        if !service.problems.contains(gap) {
+            report.add("Definition", CheckResult::Warn(gap.clone()));
         }
     }
 }
@@ -1434,6 +1465,16 @@ fn unreadable_by_this_user(error: &temps_config::ConfigServiceError) -> Option<&
         }
         _ => None,
     }
+}
+
+/// The service's environment could not be read completely, so what it
+/// injects (and so which secrets the server uses) is unknown.
+fn environment_unknown_result(definition: &Path, reason: &str) -> CheckResult {
+    CheckResult::Warn(format!(
+        "Could not verify: the environment {} gives the server could not be read completely \
+         ({reason}). Run `sudo temps doctor`, or run it as the user `temps serve` runs as",
+        definition.display()
+    ))
 }
 
 fn unverifiable(path: &Path) -> CheckResult {
@@ -2320,7 +2361,7 @@ mod tests {
     fn doctor_checks_the_data_dir_the_installed_service_uses() {
         let home = tempfile::tempdir().unwrap();
         let (service, data_dir) = installer_layout(home.path());
-        let (dir, source) = resolve_doctor_data_dir(None, Some(&service), home.path());
+        let (dir, source) = resolve_doctor_data_dir(None, Some(&service), &[], home.path());
         assert_eq!(dir, data_dir);
         assert!(
             source.contains("--data-dir") && source.contains("temps.service"),
@@ -2328,15 +2369,121 @@ mod tests {
         );
 
         let explicit = home.path().join("elsewhere");
-        let (dir, _) = resolve_doctor_data_dir(Some(&explicit), Some(&service), home.path());
+        let (dir, _) = resolve_doctor_data_dir(Some(&explicit), Some(&service), &[], home.path());
         assert_eq!(dir, explicit, "--data-dir / TEMPS_DATA_DIR still win");
+    }
+
+    #[test]
+    fn an_ignored_service_definition_is_shown_with_its_reason() {
+        let home = tempfile::tempdir().unwrap();
+        let probes = vec![ServiceProbe::Ignored {
+            path: home.path().join("temps.service"),
+            reason: "is writable by group 4, so it is not trusted; remove that with `chmod g-w`"
+                .to_string(),
+        }];
+        let mut report = DiagnosticReport::new();
+        check_installed_service(None, &probes, &mut report);
+        assert!(
+            matches!(
+                report.checks.as_slice(),
+                [(label, CheckResult::Warn(message))]
+                    if label == "Ignored"
+                        && message.contains("temps.service")
+                        && message.contains("chmod g-w")
+            ),
+            "{:?}",
+            report.checks
+        );
+
+        let (_, source) = resolve_doctor_data_dir(None, None, &probes, home.path());
+        assert!(
+            source.contains("temps.service") && source.contains("could not be used"),
+            "{source}"
+        );
+    }
+
+    #[test]
+    fn a_service_without_a_known_data_dir_says_so() {
+        let home = tempfile::tempdir().unwrap();
+        let unit = home.path().join("temps.service");
+        std::fs::write(&unit, "[Service]\nExecStart=/usr/bin/temps serve\n").unwrap();
+        let service = match service_definition::probe(&ServiceLocations {
+            systemd_unit: Some(unit),
+            launchd_agent: None,
+        })
+        .pop()
+        {
+            Some(ServiceProbe::Found(service)) => *service,
+            other => panic!("expected the unit to parse, got {other:?}"),
+        };
+        let (_, source) = resolve_doctor_data_dir(None, Some(&service), &[], home.path());
+        assert!(
+            source.contains("is unknown") && source.contains("--data-dir"),
+            "{source}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secrets_are_unverified_when_the_service_environment_is_unreadable() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let (_, data_dir) = installer_layout(home.path());
+        let env_file = home.path().join("temps.env");
+        std::fs::write(&env_file, "TEMPS_ENCRYPTION_KEY=elsewhere\n").unwrap();
+        std::fs::set_permissions(&env_file, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&env_file).is_ok() {
+            // Running as root: every file is readable.
+            return;
+        }
+        let unit = home.path().join("temps.service");
+        std::fs::write(
+            &unit,
+            format!(
+                "[Service]\nEnvironmentFile={}\nExecStart=/usr/bin/temps serve --data-dir={}\n",
+                env_file.display(),
+                data_dir.display()
+            ),
+        )
+        .unwrap();
+        let service = match service_definition::probe(&ServiceLocations {
+            systemd_unit: Some(unit),
+            launchd_agent: None,
+        })
+        .pop()
+        {
+            Some(ServiceProbe::Found(service)) => *service,
+            other => panic!("expected the unit to parse, got {other:?}"),
+        };
+        let doctor = DoctorCommand {
+            database_url: None,
+            data_dir: None,
+            scope: None,
+        };
+        let mut report = DiagnosticReport::new();
+        doctor.check_data_dir(
+            &data_dir,
+            "test",
+            Some(&service),
+            SecretsEnvironment::of_service(Some(&service)),
+            &mut report,
+        );
+        for name in ["Encryption key", "Auth secret"] {
+            let result = report.checks.iter().find(|(label, _)| label == name);
+            assert!(
+                matches!(result, Some((_, CheckResult::Warn(message)))
+                    if message.contains("Could not verify") && message.contains("temps.env")),
+                "{name}: {result:?}"
+            );
+        }
+        assert_eq!(report.fail_count, 0, "{:?}", report.checks);
     }
 
     #[test]
     fn the_auth_secret_passes_on_the_layout_serve_uses() {
         let home = tempfile::tempdir().unwrap();
         let (service, _) = installer_layout(home.path());
-        let (data_dir, _) = resolve_doctor_data_dir(None, Some(&service), home.path());
+        let (data_dir, _) = resolve_doctor_data_dir(None, Some(&service), &[], home.path());
         let inspection = temps_config::inspect_installation_secrets_with(&data_dir, no_env);
         assert!(
             matches!(

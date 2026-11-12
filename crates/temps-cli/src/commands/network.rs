@@ -17,7 +17,7 @@
 //!   - `temps network diag`   — ICMP/UDP reachability check against each
 //!     peer's bridge_address
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command as ProcCommand;
 use std::sync::Arc;
 
@@ -350,12 +350,15 @@ async fn execute_setup_multi_node(cmd: SetupMultiNodeCommand) -> anyhow::Result<
         );
     }
 
-    let data_dir = cmd
+    let data_dir = match cmd
         .data_dir
         .or_else(|| std::env::var_os("TEMPS_DATA_DIR").map(PathBuf::from))
-        .or_else(|| database.service_data_dir().map(Path::to_path_buf))
-        .or_else(|| dirs::home_dir().map(|home| home.join(".temps")))
-        .ok_or_else(|| anyhow::anyhow!("could not determine the Temps data directory"))?;
+    {
+        Some(dir) => dir,
+        None => crate::server_secrets::service_data_dir(&database)?
+            .or_else(|| dirs::home_dir().map(|home| home.join(".temps")))
+            .ok_or_else(|| anyhow::anyhow!("could not determine the Temps data directory"))?,
+    };
 
     let docker = Arc::new(
         bollard::Docker::connect_with_defaults()
@@ -372,9 +375,7 @@ async fn execute_setup_multi_node(cmd: SetupMultiNodeCommand) -> anyhow::Result<
     )
     .await
     .map_err(|error| anyhow::anyhow!("multi-node control-plane setup failed: {error}"))?;
-    let encryption_key = temps_config::resolve_installation_secrets(&data_dir)
-        .map_err(|error| anyhow::anyhow!("could not resolve installation secrets: {error}"))?
-        .encryption_key;
+    let encryption_key = crate::server_secrets::encryption_key(&data_dir, &database)?;
     let encryption = Arc::new(
         temps_core::EncryptionService::new(&encryption_key)
             .map_err(|error| anyhow::anyhow!("invalid Temps encryption key: {error}"))?,
