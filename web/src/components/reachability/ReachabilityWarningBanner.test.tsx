@@ -7,6 +7,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router'
 import type { ReachabilityWarning } from '@/api/client'
 import { client } from '@/api/client/client.gen'
+import { restoreClientConfig } from '@/test/client-config'
 import { installBrowserWindow } from '@/test/dom'
 import {
   ReachabilityWarningBanner,
@@ -153,7 +154,7 @@ test('one click plans the edited host and applies only the per-domain option', a
       confirmed: false,
     })
   } finally {
-    client.setConfig(previous)
+    restoreClientConfig(client, previous)
   }
 })
 
@@ -187,7 +188,7 @@ test('confirmation-required plans go to review without applying', async () => {
     )
     expect(requests).toBe(1)
   } finally {
-    client.setConfig(previous)
+    restoreClientConfig(client, previous)
   }
 })
 

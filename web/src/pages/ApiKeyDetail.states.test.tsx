@@ -7,6 +7,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import type { QueryKey } from '@tanstack/react-query'
 import { MemoryRouter, Route, Routes } from 'react-router'
 import { client as apiClient } from '@/api/client/client.gen'
+import { restoreClientConfig } from '@/test/client-config'
 import { getApiKeyOptions } from '@/api/client/@tanstack/react-query.gen'
 import ApiKeyDetail from './ApiKeyDetail'
 
@@ -14,7 +15,7 @@ const apiKeyKey = getApiKeyOptions({ path: { id: 1 } }).queryKey
 const NOT_FOUND = 'API key not found'
 
 const originalConfig = apiClient.getConfig()
-afterEach(() => apiClient.setConfig(originalConfig))
+afterEach(() => restoreClientConfig(apiClient, originalConfig))
 
 function createClient() {
   return new QueryClient({

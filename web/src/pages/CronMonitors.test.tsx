@@ -15,6 +15,7 @@ import { installBrowserWindow } from '@/test/dom'
 import { client as apiClient } from '@/api/client/client.gen'
 import { getEnvironmentsOptions } from '@/api/client/@tanstack/react-query.gen'
 import type { ProjectResponse } from '@/api/client'
+import { restoreClientConfig } from '@/test/client-config'
 import {
   ProjectEnvironmentContext,
   type ProjectEnvironmentContextValue,
@@ -26,7 +27,7 @@ installBrowserWindow()
 const original = apiClient.getConfig()
 afterEach(() => {
   cleanup()
-  apiClient.setConfig(original)
+  restoreClientConfig(apiClient, original)
 })
 
 test('cron limits validate before transport; a native API error preserves inputs for retry', async () => {

@@ -6,6 +6,7 @@ import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router'
 import { client } from '@/api/client/client.gen'
+import { restoreClientConfig } from '@/test/client-config'
 import type {
   BlueprintDocument,
   BlueprintResponse,
@@ -20,7 +21,7 @@ const originalConfig = client.getConfig()
 
 afterEach(() => {
   cleanup()
-  client.setConfig(originalConfig)
+  restoreClientConfig(client, originalConfig)
 })
 
 const CHAT = 'conv_1'
