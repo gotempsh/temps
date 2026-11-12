@@ -1878,7 +1878,9 @@ impl MariaDbService {
 
     /// Ship every closed (rotated) binary-log segment that has not yet been
     /// archived to S3, advancing the manifest only past segments that actually
-    /// uploaded successfully. Returns the number of segments shipped this run.
+    /// uploaded successfully. Returns the number of segments shipped this run;
+    /// a segment that does not upload fails the run (after the manifest
+    /// records the ones before it), so a failure never reads as up to date.
     ///
     /// Steps:
     /// 1. `FLUSH BINARY LOGS` rotates the active segment closed.
@@ -1946,6 +1948,9 @@ impl MariaDbService {
         );
 
         let mut shipped = 0usize;
+        // The segment that did not upload, and why: the run then fails
+        // instead of reporting the segments it never shipped as up to date.
+        let mut ship_failure: Option<(String, EngineError)> = None;
         for file in &to_ship {
             let key = Self::binlog_object_key(prefix, &self.name, file)?;
             match self
@@ -1973,6 +1978,7 @@ impl MariaDbService {
                         "Failed to ship MariaDB binlog segment, stopping run: {}",
                         e
                     );
+                    ship_failure = Some((file.clone(), e));
                     break;
                 }
             }
@@ -1996,6 +2002,18 @@ impl MariaDbService {
                 );
                 return Err(e);
             }
+        }
+
+        if let Some((file, error)) = ship_failure {
+            return Err(EngineError::failed(
+                &self.name,
+                format!(
+                    "binary-log segment {file} did not upload to s3://{bucket}: {error}. \
+                     {shipped} of {} segment(s) to ship were shipped before it (recorded in \
+                     the manifest); the next run resumes from {file}",
+                    to_ship.len()
+                ),
+            ));
         }
 
         Ok(shipped)

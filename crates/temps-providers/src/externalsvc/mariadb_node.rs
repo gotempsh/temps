@@ -1302,11 +1302,11 @@ mod docker_tests {
         }
     }
 
-    /// With `--log-bin` the check lets the archiver run (its upload to the
-    /// unreachable S3 source then fails): only a server without binary
-    /// logging is refused.
+    /// With `--log-bin` the check lets the archiver run, and a segment
+    /// that does not upload (the S3 source is unreachable) fails the run:
+    /// it never reports "up to date" with nothing shipped.
     #[tokio::test]
-    async fn a_server_with_binary_logging_is_not_refused() {
+    async fn a_binary_log_that_does_not_upload_fails_the_run() {
         let Some(docker) = docker_or_skip().await else {
             return;
         };
@@ -1315,19 +1315,17 @@ mod docker_tests {
             return;
         };
         let name = super::super::naming::mariadb_container_name(&service);
-        let enabled = MariaDbService::new(service.clone(), docker.clone())
-            .binary_logging_enabled(
-                &node_service(45, &archive_request(&service).service_config, "checked")
-                    .expect("a managed MariaDB")
-                    .1,
-            )
-            .await;
         let result = binlog_archive_on_node(archive_request(&service), docker.clone(), None).await;
         remove(&docker, &name).await;
-        assert!(enabled.expect("log_bin is readable"), "--log-bin is on");
-        assert!(
-            !matches!(&result, MariadbBinlogArchiveResult::Refused { .. }),
-            "{result:?}"
-        );
+        match result {
+            MariadbBinlogArchiveResult::Failed { reason } => {
+                assert!(reason.contains("did not upload"), "{reason}");
+                assert!(reason.contains("0 of"), "{reason}");
+                assert!(!reason.contains("binary logging is off"), "{reason}");
+                assert!(!reason.contains(ROOT_PASSWORD), "{reason}");
+                assert!(!reason.contains("SECRET"), "{reason}");
+            }
+            other => panic!("a failed upload must fail the run, got {other:?}"),
+        }
     }
 }
