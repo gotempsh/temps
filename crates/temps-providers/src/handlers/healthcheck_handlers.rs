@@ -36,7 +36,7 @@ use temps_providers_core::healthcheck::{
     HealthcheckOverrides, HealthcheckSource, HealthcheckSources, HealthcheckTimings,
     ResolvedHealthcheck,
 };
-use tracing::error;
+use tracing::{error, warn};
 use utoipa::{OpenApi, ToSchema};
 
 use super::audit::{
@@ -61,9 +61,13 @@ pub struct HealthcheckState {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ApplyServiceHealthcheckResponse {
     pub service_id: i32,
+    /// As this host's Docker got them: below API 1.44 the interval is the
+    /// start interval.
     pub applied: HealthcheckTimings,
-    /// The service's healthcheck as it is now.
-    pub healthcheck: ServiceHealthcheck,
+    /// The service's healthcheck as it is now. `null` when it could not be
+    /// read back; the recreate still succeeded, so read it again rather than
+    /// applying again.
+    pub healthcheck: Option<ServiceHealthcheck>,
 }
 
 fn audit_context(auth: &AuthContext, metadata: &RequestMetadata) -> AuditContext {
@@ -370,10 +374,19 @@ pub async fn apply_service_healthcheck(
     if let Err(e) = state.app.audit_service.create_audit_log(&audit).await {
         error!("Failed to create audit log for applying the healthcheck of service {id}: {e}");
     }
-    let healthcheck = manager
-        .get_service_healthcheck(id)
-        .await
-        .map_err(|e| healthcheck_problem(e, "read the healthcheck"))?;
+    // The container is already replaced: a failed read is not a failed
+    // apply, and a 500 here would invite a second restart.
+    let healthcheck = match manager.get_service_healthcheck(id).await {
+        Ok(healthcheck) => Some(healthcheck),
+        Err(error) => {
+            warn!(
+                service_id = id,
+                %error,
+                "Recreated the container with its healthcheck, but could not read the healthcheck back"
+            );
+            None
+        }
+    };
     Ok(Json(ApplyServiceHealthcheckResponse {
         service_id: id,
         applied: applied.timings,

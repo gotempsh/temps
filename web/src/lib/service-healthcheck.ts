@@ -142,8 +142,9 @@ export const READINESS_POLL_SECS = 2
  * is seen inside the engine's readiness wait. A check has to start by the
  * wait minus the timeout and the poll: the first one (one start interval in
  * with a start period, one interval in without), and checks keep coming
- * until then (the start period lasts that long, the start period plus one
- * interval fits, or the interval is no longer than the start interval).
+ * until then (the start period lasts that long, the first check after it
+ * fits, counting a check still running as it ends, or the interval is no
+ * longer than the start interval).
  */
 export function healthcheckFormSchema(inherited: InheritedHealthcheck[]) {
   const shape = Object.fromEntries(
@@ -183,9 +184,12 @@ export function healthcheckFormSchema(inherited: InheritedHealthcheck[]) {
         })
         return
       }
+      // Docker waits each interval from when the previous check finished,
+      // and a check running as the start period ends may take its timeout.
+      const boundaryCheck = startPeriod > 0 ? timeout : 0
       const covered =
         startPeriod >= lastStart ||
-        startPeriod + interval <= lastStart ||
+        startPeriod + boundaryCheck + interval <= lastStart ||
         interval <= startInterval
       if (!covered) {
         ctx.addIssue({
@@ -194,7 +198,7 @@ export function healthcheckFormSchema(inherited: InheritedHealthcheck[]) {
             overrides.start_period_secs !== null
               ? ['start_period_secs']
               : ['interval_secs'],
-          message: `Start period (${startPeriod}s) plus interval (${interval}s) must leave the ${timeout}s check time to finish inside the ${wait}s Temps waits for a new container to become healthy (by ${lastStart}s), or the start period must last that long`,
+          message: `Start period (${startPeriod}s), a check running as it ends (up to ${boundaryCheck}s) and one interval (${interval}s) must leave the next ${timeout}s check time to finish inside the ${wait}s Temps waits for a new container to become healthy (by ${lastStart}s), or the start period must last that long`,
         })
         return
       }

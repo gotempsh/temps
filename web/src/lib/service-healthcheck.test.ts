@@ -157,9 +157,13 @@ describe('a check must be seen inside the readiness wait', () => {
     expect(
       issues({ start_period_secs: '55', interval_secs: '10' }, [rustfs])
     ).toEqual([])
+    // 20s, a 5s check running as it ends, then 28s: the next starts at 53s.
     expect(
-      issues({ start_period_secs: '20', interval_secs: '33' }, [rustfs])
+      issues({ start_period_secs: '20', interval_secs: '28' }, [rustfs])
     ).toEqual([])
+    expect(
+      issues({ start_period_secs: '20', interval_secs: '33' }, [rustfs])[0]
+    ).toStartWith('start_period_secs: Start period (20s), a check running')
     // Checking as often as while starting needs no start period.
     expect(
       issues(
@@ -174,14 +178,14 @@ describe('a check must be seen inside the readiness wait', () => {
   })
 
   test("an instance default is checked against every engine's wait", () => {
-    // 30s + 30s leaves time inside Redis' 90s wait but not RustFS' 60s.
+    // 30s + 5s + 30s leaves time inside Redis' 90s wait but not RustFS' 60s.
     expect(
       issues({ start_period_secs: '30', interval_secs: '30' }, [redis])
     ).toEqual([])
     expect(
       issues({ start_period_secs: '30', interval_secs: '30' }, [redis, rustfs])
     ).toEqual([
-      'start_period_secs: Start period (30s) plus interval (30s) must leave the 5s check time to finish inside the 60s Temps waits for a new container to become healthy (by 53s), or the start period must last that long',
+      'start_period_secs: Start period (30s), a check running as it ends (up to 5s) and one interval (30s) must leave the next 5s check time to finish inside the 60s Temps waits for a new container to become healthy (by 53s), or the start period must last that long',
     ])
   })
 
@@ -191,7 +195,7 @@ describe('a check must be seen inside the readiness wait', () => {
       readinessWaitSecs: 90,
     }
     expect(issues({ interval_secs: '120' }, [shortStart])).toEqual([
-      'interval_secs: Start period (10s) plus interval (120s) must leave the 5s check time to finish inside the 90s Temps waits for a new container to become healthy (by 83s), or the start period must last that long',
+      'interval_secs: Start period (10s), a check running as it ends (up to 5s) and one interval (120s) must leave the next 5s check time to finish inside the 90s Temps waits for a new container to become healthy (by 83s), or the start period must last that long',
     ])
   })
 })

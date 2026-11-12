@@ -195,6 +195,24 @@ mod tests {
     use super::*;
     use temps_providers_core::healthcheck::{HealthcheckSource, HealthcheckValidationError};
 
+    /// The settings section publishes the bounds the instance default is
+    /// validated against.
+    #[test]
+    fn the_settings_schema_publishes_the_accepted_bounds() {
+        use temps_providers_core::healthcheck::HealthcheckField;
+        use utoipa::PartialSchema;
+        let schema = serde_json::to_value(
+            <temps_config::ManagedServiceHealthcheckSettings as PartialSchema>::schema(),
+        )
+        .expect("serialize the schema");
+        for field in HealthcheckField::ALL {
+            let property = &schema["properties"][field.name()];
+            let (min, max) = field.bounds();
+            assert_eq!(property["minimum"], min, "{}: {property}", field.name());
+            assert_eq!(property["maximum"], max, "{}: {property}", field.name());
+        }
+    }
+
     #[test]
     fn an_instance_default_is_checked_against_every_engine() {
         assert!(validate_instance_default(&HealthcheckOverrides::default()).is_ok());

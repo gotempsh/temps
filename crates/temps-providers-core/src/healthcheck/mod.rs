@@ -826,17 +826,20 @@ mod docker_tests {
             .and_then(|config| config.healthcheck)
             .expect("the container has a healthcheck");
 
-        let expected = effective_timings(
-            HealthcheckTimings::builtin(ManagedEngine::Rustfs),
-            start_interval_support(&docker).await,
-        );
+        let support = start_interval_support(&docker).await;
+        let expected =
+            effective_timings(HealthcheckTimings::builtin(ManagedEngine::Rustfs), support);
         assert_eq!(stored.interval, Some(nanos(expected.interval_secs)));
-        assert_eq!(stored.start_interval, Some(2_000_000_000));
         assert_eq!(stored.start_period, Some(60_000_000_000));
         assert_eq!(stored.timeout, Some(5_000_000_000));
         assert_eq!(stored.retries, Some(3));
-        if start_interval_support(&docker).await == StartIntervalSupport::Supported {
+        if support == StartIntervalSupport::Supported {
             assert_eq!(stored.interval, Some(30_000_000_000));
+            assert_eq!(stored.start_interval, Some(2_000_000_000));
+        } else {
+            // Below API 1.44 the daemon drops StartInterval; the fallback
+            // interval above is what it checks at.
+            assert_eq!(stored.interval, Some(2_000_000_000));
         }
     }
 }

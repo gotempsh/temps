@@ -1808,17 +1808,20 @@ pub struct BlobSettings {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(default)]
 pub struct ManagedServiceHealthcheckSettings {
-    /// Seconds between checks once a container is healthy.
-    #[schema(example = 60)]
+    /// Seconds between checks once a container is healthy (5–3600).
+    #[schema(example = 60, minimum = 5, maximum = 3600)]
     pub interval_secs: Option<u32>,
-    /// Seconds between checks while a container is starting.
-    #[schema(example = 2)]
+    /// Seconds between checks while a container is starting (1–60).
+    #[schema(example = 2, minimum = 1, maximum = 60)]
     pub start_interval_secs: Option<u32>,
-    /// Seconds after start during which failed checks do not count.
+    /// Seconds after start during which failed checks do not count (0–600).
+    #[schema(minimum = 0, maximum = 600)]
     pub start_period_secs: Option<u32>,
-    /// Seconds one check may run before it counts as failed.
+    /// Seconds one check may run before it counts as failed (1–60).
+    #[schema(minimum = 1, maximum = 60)]
     pub timeout_secs: Option<u32>,
-    /// Consecutive failed checks that make a container unhealthy.
+    /// Consecutive failed checks that make a container unhealthy (1–10).
+    #[schema(minimum = 1, maximum = 10)]
     pub retries: Option<u32>,
 }
 
@@ -2816,12 +2819,22 @@ impl AppSettings {
                         share_observations: false,
                     }),
             };
+            // The instance's managed service healthcheck default: dropping it
+            // would create every new container with the built-in timings.
+            let managed_service_healthchecks = value
+                .get("managed_service_healthchecks")
+                .and_then(|section| {
+                    serde_json::from_value::<ManagedServiceHealthcheckSettings>(section.clone())
+                        .ok()
+                })
+                .unwrap_or_default();
             Self {
                 anonymous_telemetry_enabled,
                 expose_platform_identity,
                 clickhouse,
                 on_demand_tls,
                 shield,
+                managed_service_healthchecks,
                 ..Self::default()
             }
         })
@@ -2947,7 +2960,32 @@ impl AppSettings {
 
 #[cfg(test)]
 mod shield_settings_tests {
-    use super::{AppSettings, ShieldSettings};
+    use super::{AppSettings, ManagedServiceHealthcheckSettings, ShieldSettings};
+
+    #[test]
+    fn a_malformed_unrelated_section_keeps_the_healthcheck_default() {
+        let stored = serde_json::json!({
+            "geo": "not an object",
+            "managed_service_healthchecks": { "interval_secs": 60, "retries": 4 }
+        });
+        assert_eq!(
+            AppSettings::from_json(stored).managed_service_healthchecks,
+            ManagedServiceHealthcheckSettings {
+                interval_secs: Some(60),
+                retries: Some(4),
+                ..Default::default()
+            }
+        );
+        // Malformed itself: the built-in timings, as without a default.
+        let malformed = serde_json::json!({
+            "geo": "not an object",
+            "managed_service_healthchecks": { "interval_secs": "often" }
+        });
+        assert_eq!(
+            AppSettings::from_json(malformed).managed_service_healthchecks,
+            ManagedServiceHealthcheckSettings::default()
+        );
+    }
 
     #[test]
     fn a_malformed_unrelated_section_keeps_the_shield_opt_out() {

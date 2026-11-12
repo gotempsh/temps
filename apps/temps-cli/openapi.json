@@ -6018,11 +6018,19 @@
         "description": "After `apply`: the container was recreated with these timings.",
         "properties": {
           "applied": {
-            "$ref": "#/components/schemas/HealthcheckTimings"
+            "$ref": "#/components/schemas/HealthcheckTimings",
+            "description": "As this host's Docker got them: below API 1.44 the interval is the\nstart interval."
           },
           "healthcheck": {
-            "$ref": "#/components/schemas/ServiceHealthcheck",
-            "description": "The service's healthcheck as it is now."
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ServiceHealthcheck",
+                "description": "The service's healthcheck as it is now. `null` when it could not be\nread back; the recreate still succeeded, so read it again rather than\napplying again."
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "service_id": {
             "format": "int32",
@@ -6031,8 +6039,7 @@
         },
         "required": [
           "service_id",
-          "applied",
-          "healthcheck"
+          "applied"
         ],
         "type": "object"
       },
@@ -37101,7 +37108,8 @@
             "description": "Seconds between checks once healthy (5–3600).",
             "example": 60,
             "format": "int32",
-            "minimum": 0,
+            "maximum": 3600,
+            "minimum": 5,
             "type": [
               "integer",
               "null"
@@ -37112,7 +37120,8 @@
             "description": "Consecutive failures that make the container unhealthy (1–10).",
             "example": 3,
             "format": "int32",
-            "minimum": 0,
+            "maximum": 10,
+            "minimum": 1,
             "type": [
               "integer",
               "null"
@@ -37123,7 +37132,8 @@
             "description": "Seconds between checks while starting (1–60).",
             "example": 2,
             "format": "int32",
-            "minimum": 0,
+            "maximum": 60,
+            "minimum": 1,
             "type": [
               "integer",
               "null"
@@ -37134,6 +37144,7 @@
             "description": "Seconds after start during which failures do not count (0–600).",
             "example": 90,
             "format": "int32",
+            "maximum": 600,
             "minimum": 0,
             "type": [
               "integer",
@@ -37145,7 +37156,8 @@
             "description": "Seconds one check may run (1–60, and shorter than the interval).",
             "example": 5,
             "format": "int32",
-            "minimum": 0,
+            "maximum": 60,
+            "minimum": 1,
             "type": [
               "integer",
               "null"
@@ -43591,10 +43603,11 @@
         "properties": {
           "interval_secs": {
             "default": null,
-            "description": "Seconds between checks once a container is healthy.",
+            "description": "Seconds between checks once a container is healthy (5–3600).",
             "example": 60,
             "format": "int32",
-            "minimum": 0,
+            "maximum": 3600,
+            "minimum": 5,
             "type": [
               "integer",
               "null"
@@ -43602,9 +43615,10 @@
           },
           "retries": {
             "default": null,
-            "description": "Consecutive failed checks that make a container unhealthy.",
+            "description": "Consecutive failed checks that make a container unhealthy (1–10).",
             "format": "int32",
-            "minimum": 0,
+            "maximum": 10,
+            "minimum": 1,
             "type": [
               "integer",
               "null"
@@ -43612,10 +43626,11 @@
           },
           "start_interval_secs": {
             "default": null,
-            "description": "Seconds between checks while a container is starting.",
+            "description": "Seconds between checks while a container is starting (1–60).",
             "example": 2,
             "format": "int32",
-            "minimum": 0,
+            "maximum": 60,
+            "minimum": 1,
             "type": [
               "integer",
               "null"
@@ -43623,8 +43638,9 @@
           },
           "start_period_secs": {
             "default": null,
-            "description": "Seconds after start during which failed checks do not count.",
+            "description": "Seconds after start during which failed checks do not count (0–600).",
             "format": "int32",
+            "maximum": 600,
             "minimum": 0,
             "type": [
               "integer",
@@ -43633,9 +43649,10 @@
           },
           "timeout_secs": {
             "default": null,
-            "description": "Seconds one check may run before it counts as failed.",
+            "description": "Seconds one check may run before it counts as failed (1–60).",
             "format": "int32",
-            "minimum": 0,
+            "maximum": 60,
+            "minimum": 1,
             "type": [
               "integer",
               "null"

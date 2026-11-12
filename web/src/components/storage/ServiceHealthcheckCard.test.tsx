@@ -16,7 +16,10 @@ import type {
   ServiceHealthcheck,
 } from '@/api/client/types.gen'
 import { installBrowserWindow } from '@/test/dom'
-import { ServiceHealthcheckView } from './ServiceHealthcheckCard'
+import {
+  ServiceHealthcheckView,
+  type ServiceHealthcheckViewProps,
+} from './ServiceHealthcheckCard'
 
 installBrowserWindow()
 afterEach(cleanup)
@@ -64,22 +67,27 @@ const STANDALONE: ServiceHealthcheck = {
   readiness_wait_secs: 90,
 }
 
-function renderView(
+function view(
   healthcheck: ServiceHealthcheck,
-  handlers: {
-    onSave?: (overrides: HealthcheckOverrides) => void
-    onApply?: () => void
-  } = {}
+  props: Partial<Omit<ServiceHealthcheckViewProps, 'healthcheck'>> = {}
 ) {
-  return render(
+  return (
     <MemoryRouter>
       <ServiceHealthcheckView
+        onSave={() => {}}
+        onApply={() => {}}
+        {...props}
         healthcheck={healthcheck}
-        onSave={handlers.onSave ?? (() => {})}
-        onApply={handlers.onApply ?? (() => {})}
       />
     </MemoryRouter>
   )
+}
+
+function renderView(
+  healthcheck: ServiceHealthcheck,
+  props: Partial<Omit<ServiceHealthcheckViewProps, 'healthcheck'>> = {}
+) {
+  return render(view(healthcheck, props))
 }
 
 test('shows each effective value with its source and what the running container has', () => {
@@ -277,4 +285,62 @@ test('a stopped service cannot be recreated, and says when it applies', () => {
       .disabled
   ).toBe(true)
   expect(view.getByText(/it is stopped/)).toBeTruthy()
+})
+
+test('only a viewer who can read the instance default gets a link to it', () => {
+  const member = renderView(STANDALONE)
+  expect(member.queryByRole('link', { name: 'Instance default' })).toBeNull()
+  expect(
+    member.getByText(/An administrator sets the instance default/)
+  ).toBeTruthy()
+  cleanup()
+
+  const admin = renderView(STANDALONE, { canReadDefaults: true })
+  expect(
+    admin.getByRole('link', { name: 'Instance default' }).getAttribute('href')
+  ).toBe('/settings/service-healthchecks')
+})
+
+test("another service's settings do not keep this service's edits", async () => {
+  const rendered = renderView(STANDALONE)
+  fireEvent.change(rendered.getByLabelText('Interval (s)'), {
+    target: { value: '120' },
+  })
+  await waitFor(() =>
+    expect(rendered.getByText('Discard changes')).toBeTruthy()
+  )
+
+  // The page navigates to another service and the card is reused.
+  rendered.rerender(
+    view({
+      ...STANDALONE,
+      service_id: 8,
+      service_name: 'sessions-cache',
+      overrides: { ...NO_OVERRIDES, interval_secs: 300 },
+    })
+  )
+
+  await waitFor(() =>
+    expect(
+      (rendered.getByLabelText('Interval (s)') as HTMLInputElement).value
+    ).toBe('300')
+  )
+  expect(rendered.queryByText('Discard changes')).toBeNull()
+})
+
+test('a failed save is shown beside Save and cleared by the next edit', async () => {
+  const onEdit = mock(() => {})
+  const rendered = renderView(STANDALONE, {
+    saveError: 'Interval (45s) is not allowed here',
+    onEdit,
+  })
+  expect(
+    rendered.getByText('The health check settings were not saved')
+  ).toBeTruthy()
+  expect(rendered.getByText('Interval (45s) is not allowed here')).toBeTruthy()
+
+  fireEvent.change(rendered.getByLabelText('Interval (s)'), {
+    target: { value: '90' },
+  })
+  await waitFor(() => expect(onEdit).toHaveBeenCalled())
 })

@@ -786,6 +786,57 @@ impl DatabaseWorkloadPlan {
         }
     }
 
+    /// Keep the healthcheck timings the running container was created with,
+    /// rather than the ones this process would resolve: a worker's agent
+    /// rebuilds a database from its inspected container and has no copy of
+    /// the control plane's healthcheck overrides (#1877). A value the daemon
+    /// did not store (`StartInterval` below API 1.44) leaves the spec's, and
+    /// a container without a healthcheck leaves them all.
+    pub fn keep_healthcheck(&mut self, existing: &ContainerInspectResponse) {
+        let Some(health) = existing
+            .config
+            .as_ref()
+            .and_then(|config| config.healthcheck.as_ref())
+            .filter(|health| {
+                health
+                    .test
+                    .as_ref()
+                    .and_then(|test| test.first())
+                    .is_some_and(|first| first != "NONE")
+            })
+        else {
+            return;
+        };
+        let secs = |nanos: Option<i64>| {
+            nanos
+                .and_then(|nanos| u32::try_from(nanos / 1_000_000_000).ok())
+                .filter(|secs| *secs > 0)
+        };
+        let probes = &mut self.spec.probes;
+        if let Some(startup) = probes.startup.as_mut() {
+            // Docker leaves a start period of 0 out.
+            startup.initial_delay_secs = secs(health.start_period).unwrap_or(0);
+            if let Some(start_interval) = secs(health.start_interval) {
+                startup.period_secs = start_interval;
+            }
+        }
+        if let Some(readiness) = probes.readiness.as_mut() {
+            if let Some(interval) = secs(health.interval) {
+                readiness.period_secs = interval;
+            }
+            if let Some(timeout) = secs(health.timeout) {
+                readiness.timeout_secs = timeout;
+            }
+            if let Some(retries) = health
+                .retries
+                .and_then(|retries| u32::try_from(retries).ok())
+                .filter(|retries| *retries > 0)
+            {
+                readiness.failure_threshold = retries;
+            }
+        }
+    }
+
     /// Admit the plan's spec again where it is executed (a worker's agent):
     /// a plan is never trusted to have been admitted by its sender.
     pub fn readmit(&self) -> Result<Self, ServiceWorkloadError> {
@@ -1160,6 +1211,77 @@ mod tests {
             let mut plan = admitted.clone();
             plan.keep_restart_policy(&existing(unset));
             assert_eq!(restart_of(&plan), Some(RestartPolicyNameEnum::ALWAYS));
+        }
+    }
+
+    #[test]
+    fn a_rebuilt_container_keeps_its_own_healthcheck() {
+        use bollard::models::{ContainerConfig, HealthConfig};
+        let process = DatabaseProcess::from_remote_params(DatabaseEngine::Redis, &redis_params());
+        let admitted = DatabaseWorkloadPlan::admit(
+            &identity(DatabaseEngine::Redis, "redis-orders", Some(3)),
+            &process,
+        )
+        .unwrap();
+        let health_of = |plan: &DatabaseWorkloadPlan| {
+            let values = process.secret_values();
+            database_create_body(plan, SecretValues::Resolved(&values), &Default::default())
+                .unwrap()
+                .healthcheck
+                .unwrap()
+        };
+        let existing = |health: Option<HealthConfig>| ContainerInspectResponse {
+            config: Some(ContainerConfig {
+                healthcheck: health,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        const S: i64 = 1_000_000_000;
+        // Created by the control plane with this service's overrides.
+        let overridden = HealthConfig {
+            test: Some(vec!["CMD-SHELL".into(), "redis-cli ping".into()]),
+            interval: Some(60 * S),
+            timeout: Some(7 * S),
+            retries: Some(4),
+            start_period: Some(40 * S),
+            start_interval: Some(3 * S),
+        };
+        let mut plan = admitted.clone();
+        plan.keep_healthcheck(&existing(Some(overridden.clone())));
+        let kept = health_of(&plan);
+        assert_eq!(kept.interval, Some(60 * S));
+        assert_eq!(kept.timeout, Some(7 * S));
+        assert_eq!(kept.retries, Some(4));
+        assert_eq!(kept.start_period, Some(40 * S));
+        assert_eq!(kept.start_interval, Some(3 * S));
+        // The command is the spec's, not copied from the container.
+        assert_eq!(kept.test, health_of(&admitted).test);
+
+        // A daemon below API 1.44 stored no start interval and no zero start
+        // period: the spec's start interval stays, the start period is 0.
+        let mut plan = admitted.clone();
+        plan.keep_healthcheck(&existing(Some(HealthConfig {
+            start_interval: None,
+            start_period: None,
+            ..overridden
+        })));
+        let kept = health_of(&plan);
+        assert_eq!(kept.interval, Some(60 * S));
+        assert_eq!(kept.start_interval, health_of(&admitted).start_interval);
+        assert_eq!(kept.start_period.unwrap_or(0), 0);
+
+        // Nothing to keep: the spec's healthcheck.
+        for none in [
+            None,
+            Some(HealthConfig {
+                test: Some(vec!["NONE".into()]),
+                ..Default::default()
+            }),
+        ] {
+            let mut plan = admitted.clone();
+            plan.keep_healthcheck(&existing(none));
+            assert_eq!(health_of(&plan), health_of(&admitted));
         }
     }
 

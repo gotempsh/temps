@@ -125,6 +125,8 @@ pub struct ServiceHealthcheckUpdate {
 pub struct HealthcheckApplied {
     pub service_id: i32,
     pub service_name: String,
+    /// As this host's Docker got them: below API 1.44 the interval is the
+    /// start interval ([`healthcheck::effective_timings`]).
     pub timings: HealthcheckTimings,
 }
 
@@ -525,6 +527,11 @@ impl ExternalServiceManager {
             |current| self.apply_now_engine(current).map(|_| ()),
         )
         .await?;
+        let support = match self.docker.get() {
+            Some(docker) => healthcheck::start_interval_support(docker).await,
+            None => StartIntervalSupport::Supported,
+        };
+        let timings = healthcheck::effective_timings(timings, support);
         info!(
             service_id,
             interval_secs = timings.interval_secs,
@@ -538,6 +545,33 @@ impl ExternalServiceManager {
             service_name: service.name,
             timings,
         })
+    }
+
+    /// Forget a deleted service's overrides. Under [`HEALTHCHECK_WRITES`],
+    /// which an override save holds through its commit and publish, so a
+    /// save that committed before the delete cannot put the entry back after
+    /// it (and hand it to a later service reusing the container name).
+    pub(crate) async fn forget_healthcheck_overrides(service_id: i32) {
+        let _writes = HEALTHCHECK_WRITES.lock().await;
+        registry::clear_service(service_id);
+    }
+
+    /// Publish a service's overrides again under its container's current
+    /// name, after a rename: the engines look them up by container name, so
+    /// the old name would keep them and the new one would not.
+    pub(crate) async fn republish_healthcheck_overrides(
+        &self,
+        service_id: i32,
+    ) -> Result<(), ExternalServiceError> {
+        let _writes = HEALTHCHECK_WRITES.lock().await;
+        let service = self.get_service(service_id).await?;
+        let target = self.healthcheck_target(&service)?;
+        registry::set_service(registry::ServiceHealthcheckEntry {
+            service_id,
+            container_name: target.container_name,
+            overrides: service_overrides(&service),
+        });
+        Ok(())
     }
 
     /// The engine whose container Apply now recreates, or why it may not:
@@ -884,6 +918,74 @@ mod tests {
             !matches!(error, ExternalServiceError::HealthcheckUnsupported { .. }),
             "{error:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_renamed_service_keeps_its_overrides_under_its_new_container_name() {
+        use crate::services::test_support::encrypted_service_model;
+        // Ids and names no other test uses: the table is process-wide.
+        let before = external_services::Model {
+            id: 990_101,
+            name: "hc-rename-before".to_string(),
+            healthcheck_interval_secs: Some(60),
+            ..encrypted_service_model(990_101, serde_json::json!({}))
+        };
+        let after = external_services::Model {
+            name: "hc-rename-after".to_string(),
+            ..before.clone()
+        };
+        let manager = manager_over(vec![after.clone()]);
+        let old_container = manager
+            .healthcheck_target(&before)
+            .unwrap()
+            .container_name
+            .unwrap();
+        let new_container = manager
+            .healthcheck_target(&after)
+            .unwrap()
+            .container_name
+            .unwrap();
+        assert_ne!(old_container, new_container);
+        registry::set_service(registry::ServiceHealthcheckEntry {
+            service_id: before.id,
+            container_name: Some(old_container.clone()),
+            overrides: service_overrides(&before),
+        });
+
+        manager
+            .republish_healthcheck_overrides(before.id)
+            .await
+            .unwrap();
+        let on_new = registry::for_container(&new_container);
+        let on_old = registry::for_container(&old_container);
+        registry::clear_service(before.id);
+        assert_eq!(on_new.interval_secs, Some(60));
+        assert!(on_old.is_empty(), "{on_old:?}");
+    }
+
+    #[tokio::test]
+    async fn a_delete_forgets_overrides_only_after_a_save_in_flight_published() {
+        let service_id = 990_102;
+        let container = "hc-delete-in-flight";
+        let held = HEALTHCHECK_WRITES.lock().await;
+        // As a save does while it holds the lock: commit, then publish.
+        let forgetting = tokio::spawn(
+            crate::services::ExternalServiceManager::forget_healthcheck_overrides(service_id),
+        );
+        tokio::task::yield_now().await;
+        registry::set_service(registry::ServiceHealthcheckEntry {
+            service_id,
+            container_name: Some(container.to_string()),
+            overrides: HealthcheckOverrides {
+                interval_secs: Some(60),
+                ..Default::default()
+            },
+        });
+        assert!(!forgetting.is_finished());
+        drop(held);
+        forgetting.await.unwrap();
+        assert!(registry::for_container(container).is_empty());
+        assert!(registry::for_service(service_id).is_empty());
     }
 
     #[tokio::test]

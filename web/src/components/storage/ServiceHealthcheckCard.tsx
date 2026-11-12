@@ -23,6 +23,7 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { Skeleton } from '@/components/ui/skeleton'
 import { ErrorAlert } from '@/components/utils/ErrorAlert'
+import { useIsInstanceAdmin } from '@/hooks/useIsInstanceAdmin'
 import { problemDetail } from '@/lib/api-problem'
 import {
   APPLY_ON_RECREATE,
@@ -43,6 +44,12 @@ export interface ServiceHealthcheckViewProps {
   onSave: (overrides: HealthcheckOverrides) => void
   /** Called once the operator confirmed the restart. */
   onApply: () => void
+  /** Why the last save failed, shown beside Save. */
+  saveError?: string | null
+  /** Told when a field changes, to clear `saveError`. */
+  onEdit?: () => void
+  /** Whether the viewer can open the instance default (settings:read). */
+  canReadDefaults?: boolean
 }
 
 /** A service's effective healthcheck, its overrides and Apply now. */
@@ -52,6 +59,9 @@ export function ServiceHealthcheckView({
   applying = false,
   onSave,
   onApply,
+  saveError,
+  onEdit,
+  canReadDefaults = false,
 }: ServiceHealthcheckViewProps) {
   const [confirming, setConfirming] = useState(false)
   const [dirty, setDirty] = useState(false)
@@ -161,6 +171,9 @@ export function ServiceHealthcheckView({
       ) : null}
 
       <HealthcheckOverridesForm
+        // Another service's page reuses this card: its edits must not carry
+        // over into this service's form.
+        key={healthcheck.service_id}
         overrides={healthcheck.overrides}
         inherited={inherited}
         inheritedFrom="the instance default"
@@ -169,6 +182,8 @@ export function ServiceHealthcheckView({
         submitLabel="Save overrides"
         onSave={onSave}
         onDirtyChange={onDirtyChange}
+        saveError={saveError}
+        onEdit={onEdit}
       />
 
       <div className="flex flex-col gap-3 rounded-lg border p-4 sm:flex-row sm:items-center sm:justify-between">
@@ -177,12 +192,16 @@ export function ServiceHealthcheckView({
           <p className="text-xs text-muted-foreground">
             {applyBlocked ??
               'Apply now recreates the container; it restarts briefly.'}{' '}
-            <Link
-              to={HEALTHCHECK_DEFAULTS_HREF}
-              className="text-primary hover:text-primary/80"
-            >
-              Instance default
-            </Link>
+            {canReadDefaults ? (
+              <Link
+                to={HEALTHCHECK_DEFAULTS_HREF}
+                className="text-primary hover:text-primary/80"
+              >
+                Instance default
+              </Link>
+            ) : (
+              'An administrator sets the instance default.'
+            )}
           </p>
         </div>
         <Button
@@ -233,6 +252,7 @@ export function ServiceHealthcheckCard({
   serviceStatus?: string
 }) {
   const queryClient = useQueryClient()
+  const canReadDefaults = useIsInstanceAdmin()
   const seenStatus = useRef(serviceStatus)
   useEffect(() => {
     if (seenStatus.current === serviceStatus) return
@@ -264,7 +284,9 @@ export function ServiceHealthcheckCard({
   const apply = useMutation({
     ...applyServiceHealthcheckMutation(),
     onSuccess: (result) => {
-      queryClient.setQueryData(queryKey, result.healthcheck)
+      // Null when it could not be read back; onSettled reads it again.
+      if (result.healthcheck)
+        queryClient.setQueryData(queryKey, result.healthcheck)
       toast.success(`${serviceName} was recreated with its health check`)
     },
     onError: (error) =>
@@ -293,7 +315,38 @@ export function ServiceHealthcheckCard({
             </div>
             <Skeleton className="h-9 w-full" />
           </div>
-        ) : query.isError ? (
+        ) : query.data ? (
+          <div className="space-y-4">
+            {/* A failed background refresh keeps the form and its edits. */}
+            {query.isError ? (
+              <Callout
+                tone="error"
+                title="Could not refresh the health check settings"
+              >
+                {problemDetail(
+                  query.error,
+                  'Showing the settings as last loaded.'
+                )}
+              </Callout>
+            ) : null}
+            <ServiceHealthcheckView
+              healthcheck={query.data}
+              saving={save.isPending}
+              applying={apply.isPending}
+              saveError={
+                save.isError
+                  ? problemDetail(save.error, 'The settings were not changed.')
+                  : null
+              }
+              onEdit={save.reset}
+              canReadDefaults={canReadDefaults}
+              onSave={(overrides) =>
+                save.mutate({ path: { id: serviceId }, body: overrides })
+              }
+              onApply={() => apply.mutate({ path: { id: serviceId } })}
+            />
+          </div>
+        ) : (
           <ErrorAlert
             title="Could not load the health check settings"
             description={problemDetail(
@@ -302,16 +355,6 @@ export function ServiceHealthcheckCard({
             )}
             retry={() => query.refetch()}
             retrying={query.isFetching}
-          />
-        ) : (
-          <ServiceHealthcheckView
-            healthcheck={query.data}
-            saving={save.isPending}
-            applying={apply.isPending}
-            onSave={(overrides) =>
-              save.mutate({ path: { id: serviceId }, body: overrides })
-            }
-            onApply={() => apply.mutate({ path: { id: serviceId } })}
           />
         )}
       </CardContent>

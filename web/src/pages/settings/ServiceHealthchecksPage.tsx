@@ -3,7 +3,7 @@
 
 import { useEffect, useMemo } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { PageHeader, SettingsGroup } from '@temps-sdk/ds'
+import { Callout, PageHeader, SettingsGroup } from '@temps-sdk/ds'
 import { toast } from 'sonner'
 import {
   getHealthcheckDefaultsOptions,
@@ -164,7 +164,10 @@ export function ServiceHealthchecksPage() {
     [query.data]
   )
 
-  if (error) {
+  const defaults = isAdmin ? query.data : undefined
+  // A failed background refresh keeps the loaded form and its edits; only a
+  // first load that failed (or a refusal) replaces it.
+  if (error && !defaults) {
     return (
       <SettingsLoadFailure
         error={error}
@@ -175,7 +178,6 @@ export function ServiceHealthchecksPage() {
     )
   }
 
-  const defaults = query.data
   if (!defaults) {
     return (
       <SettingsFormSkeleton
@@ -188,6 +190,14 @@ export function ServiceHealthchecksPage() {
   return (
     <div className="space-y-10">
       <PageHeader title={TITLE} />
+      {query.isError ? (
+        <Callout
+          tone="error"
+          title="Could not refresh the health check defaults"
+        >
+          {problemDetail(query.error, 'Showing the defaults as last loaded.')}
+        </Callout>
+      ) : null}
       <SettingsGroup
         title="Instance default"
         description="Every managed database and storage service uses these unless it sets its own."
@@ -197,6 +207,12 @@ export function ServiceHealthchecksPage() {
           inherited={builtins}
           inheritedFrom="each engine's built-in value"
           saving={save.isPending}
+          saveError={
+            save.isError
+              ? problemDetail(save.error, 'The defaults were not changed.')
+              : null
+          }
+          onEdit={save.reset}
           onSave={(overrides) => save.mutate({ body: overrides })}
         />
       </SettingsGroup>

@@ -301,6 +301,14 @@ pub enum S3ServerKind {
 }
 
 impl S3ServerKind {
+    /// The engine whose healthcheck timings and data checks apply to it.
+    pub fn managed_engine(self) -> super::recreate_guard::ManagedEngine {
+        match self {
+            S3ServerKind::Rustfs => super::recreate_guard::ManagedEngine::Rustfs,
+            S3ServerKind::Minio => super::recreate_guard::ManagedEngine::Minio,
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             S3ServerKind::Rustfs => "rustfs",
@@ -794,10 +802,7 @@ echo '[restore] complete'"#;
         kind: S3ServerKind,
     ) -> Result<()> {
         let container_name = self.get_container_name();
-        let engine = match kind {
-            S3ServerKind::Minio => super::recreate_guard::ManagedEngine::Minio,
-            S3ServerKind::Rustfs => super::recreate_guard::ManagedEngine::Rustfs,
-        };
+        let engine = kind.managed_engine();
         super::recreate_guard::recreate_preserving_data(
             super::recreate_guard::RecreateRequest {
                 docker,
@@ -896,7 +901,7 @@ echo '[restore] complete'"#;
             healthcheck: Some(
                 temps_providers_core::healthcheck::managed_health_config(
                     docker,
-                    temps_providers_core::externalsvc::recreate_guard::ManagedEngine::Minio,
+                    kind.managed_engine(),
                     &container_name,
                     server_spec.healthcheck,
                 )
@@ -3447,6 +3452,20 @@ fn mc_strip_scheme(endpoint: &str) -> (&'static str, &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_server_kind_gets_its_own_healthcheck_timings() {
+        use temps_providers_core::healthcheck::HealthcheckTimings;
+        // RustFS gives a new container 60 s to start, MinIO 90 s.
+        assert_eq!(
+            HealthcheckTimings::builtin(S3ServerKind::Rustfs.managed_engine()).start_period_secs,
+            60
+        );
+        assert_eq!(
+            HealthcheckTimings::builtin(S3ServerKind::Minio.managed_engine()).start_period_secs,
+            90
+        );
+    }
 
     #[test]
     fn test_parameter_schema_editable_fields() {

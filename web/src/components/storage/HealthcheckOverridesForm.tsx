@@ -4,7 +4,7 @@
 import { useEffect, useMemo, useRef } from 'react'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useForm } from 'react-hook-form'
-import { Field, SaveRow } from '@temps-sdk/ds'
+import { Callout, Field, SaveRow } from '@temps-sdk/ds'
 import type { HealthcheckOverrides } from '@/api/client/types.gen'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -34,6 +34,10 @@ export interface HealthcheckOverridesFormProps {
   onSave: (overrides: HealthcheckOverrides) => void
   /** Told whether the form has unsaved edits. */
   onDirtyChange?: (dirty: boolean) => void
+  /** Why the last save failed, shown beside Save until the next edit. */
+  saveError?: string | null
+  /** Told when a field changes, to clear `saveError`. */
+  onEdit?: () => void
 }
 
 /** Five optional healthcheck values; an empty field inherits. */
@@ -46,6 +50,8 @@ export function HealthcheckOverridesForm({
   submitLabel = 'Save',
   onSave,
   onDirtyChange,
+  saveError,
+  onEdit,
 }: HealthcheckOverridesFormProps) {
   const schema = useMemo(() => healthcheckFormSchema(inherited), [inherited])
   const saved = useMemo(() => formValuesOf(overrides), [overrides])
@@ -87,6 +93,8 @@ export function HealthcheckOverridesForm({
     <form
       className="space-y-4"
       aria-label="Healthcheck overrides"
+      // A typed change, not a reset after a refetch or save.
+      onChange={onEdit}
       onSubmit={(event) =>
         void handleSubmit((values) => save(overridesOf(values)))(event)
       }
@@ -137,6 +145,11 @@ export function HealthcheckOverridesForm({
         >
           Clear overrides
         </Button>
+      ) : null}
+      {saveError ? (
+        <Callout tone="error" title="The health check settings were not saved">
+          {saveError}
+        </Callout>
       ) : null}
       <SaveRow
         dirty={isDirty}

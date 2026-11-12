@@ -20,19 +20,19 @@ use super::HealthcheckTimings;
 #[serde(default)]
 pub struct HealthcheckOverrides {
     /// Seconds between checks once healthy (5–3600).
-    #[schema(example = 60)]
+    #[schema(example = 60, minimum = 5, maximum = 3600)]
     pub interval_secs: Option<u32>,
     /// Seconds between checks while starting (1–60).
-    #[schema(example = 2)]
+    #[schema(example = 2, minimum = 1, maximum = 60)]
     pub start_interval_secs: Option<u32>,
     /// Seconds after start during which failures do not count (0–600).
-    #[schema(example = 90)]
+    #[schema(example = 90, minimum = 0, maximum = 600)]
     pub start_period_secs: Option<u32>,
     /// Seconds one check may run (1–60, and shorter than the interval).
-    #[schema(example = 5)]
+    #[schema(example = 5, minimum = 1, maximum = 60)]
     pub timeout_secs: Option<u32>,
     /// Consecutive failures that make the container unhealthy (1–10).
-    #[schema(example = 3)]
+    #[schema(example = 3, minimum = 1, maximum = 10)]
     pub retries: Option<u32>,
 }
 
@@ -168,8 +168,9 @@ pub enum HealthcheckValidationError {
     #[error(
         "healthcheck start_period_secs ({start_period_secs}s, from {start_period_source}) plus \
          interval_secs ({interval_secs}s, from {interval_source}) plus timeout_secs \
-         ({timeout_secs}s, from {timeout_source}) and the up to {READINESS_POLL_SECS}s Temps takes \
-         to read the result must not exceed {readiness_wait_secs}s, how long Temps waits for this \
+         ({timeout_secs}s, from {timeout_source}), twice with a start period (a check still \
+         running when it ends, then the next one), and the up to {READINESS_POLL_SECS}s Temps \
+         takes to read the result must not exceed {readiness_wait_secs}s, how long Temps waits for this \
          engine's container to become healthy, unless the start period lasts that long: after \
          the start period Docker checks only once per interval, so a container still starting \
          would be seen too late and every create, upgrade and restore would time out"
@@ -243,11 +244,13 @@ impl ResolvedHealthcheck {
     ///     else one full interval after;
     ///   * and checks must keep coming until then. Docker checks every start
     ///     interval inside the start period and once per interval after it,
-    ///     so the start period lasts until then, or the start period plus one
-    ///     interval fits before it, or the interval is no longer than the
-    ///     start interval (checks never slow down). Otherwise a container
-    ///     that takes longer to start than the start period is checked next
-    ///     only after the wait gave up.
+    ///     each wait counted from when the previous check finished, so the
+    ///     start period lasts until then, or the first check after it fits
+    ///     before it (the start period, plus the timeout of a check still
+    ///     running when it ends, plus one interval), or the interval is no
+    ///     longer than the start interval (checks never slow down). Otherwise
+    ///     a container that takes longer to start than the start period is
+    ///     checked next only after the wait gave up.
     pub fn validate(&self, readiness_wait_secs: u32) -> Result<(), HealthcheckValidationError> {
         let t = &self.timings;
         if t.timeout_secs >= t.interval_secs {
@@ -280,8 +283,19 @@ impl ResolvedHealthcheck {
                 readiness_wait_secs,
             });
         }
+        // A start-period check that starts just before the period ends may
+        // run its full timeout; Docker waits one interval after it finishes.
+        let boundary_check = if t.start_period_secs > 0 {
+            t.timeout_secs
+        } else {
+            0
+        };
+        let first_after_start_period = t
+            .start_period_secs
+            .saturating_add(boundary_check)
+            .saturating_add(t.interval_secs);
         let covered = t.start_period_secs >= last_start
-            || t.start_period_secs.saturating_add(t.interval_secs) <= last_start
+            || first_after_start_period <= last_start
             || t.interval_secs <= t.start_interval_secs;
         if !covered {
             return Err(HealthcheckValidationError::StartPeriodTooShortForInterval {
@@ -585,9 +599,10 @@ mod tests {
         assert_eq!(check(53, 3600), Ok(()));
         assert_eq!(check(55, 10), Ok(()));
         // A shorter start period plus one interval still leaves the check
-        // time to finish and be read.
+        // time to finish and be read: 20 s, a 5 s check running as it ends,
+        // then 28 s, so the next check starts at 53 s.
         assert_eq!(check(0, 53), Ok(()));
-        assert_eq!(check(20, 33), Ok(()));
+        assert_eq!(check(20, 28), Ok(()));
         // Checking as often as while starting needs no start period.
         let never_slower = HealthcheckOverrides {
             start_period_secs: Some(0),
@@ -601,7 +616,9 @@ mod tests {
         );
 
         // The next check after the start period starts too late to be seen.
-        for (start_period, interval) in [(10, 120), (30, 30), (20, 34)] {
+        // (20, 33) would start it at 53 s if the check running when the start
+        // period ends took no time; it may take 5 s.
+        for (start_period, interval) in [(10, 120), (30, 30), (20, 33), (20, 29)] {
             let error = check(start_period, interval).unwrap_err();
             assert_eq!(
                 error,
@@ -687,6 +704,21 @@ mod tests {
         ));
         assert!(check(79).is_err());
         assert_eq!(check(78), Ok(()));
+    }
+
+    /// The published schema says what validation accepts, so a client that
+    /// validates against it is not refused with a 400.
+    #[test]
+    fn the_schema_publishes_the_accepted_bounds() {
+        use utoipa::PartialSchema;
+        let schema = serde_json::to_value(<HealthcheckOverrides as PartialSchema>::schema())
+            .expect("serialize the schema");
+        for field in HealthcheckField::ALL {
+            let property = &schema["properties"][field.name()];
+            let (min, max) = field.bounds();
+            assert_eq!(property["minimum"], min, "{}: {property}", field.name());
+            assert_eq!(property["maximum"], max, "{}: {property}", field.name());
+        }
     }
 
     #[test]

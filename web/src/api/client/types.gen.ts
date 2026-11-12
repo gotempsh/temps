@@ -2836,11 +2836,12 @@ export type ApplyRequest = {
  * After `apply`: the container was recreated with these timings.
  */
 export type ApplyServiceHealthcheckResponse = {
-    applied: HealthcheckTimings;
     /**
-     * The service's healthcheck as it is now.
+     * As this host's Docker got them: below API 1.44 the interval is the
+     * start interval.
      */
-    healthcheck: ServiceHealthcheck;
+    applied: HealthcheckTimings;
+    healthcheck?: ServiceHealthcheck | null;
     service_id: number;
 };
 
@@ -20212,23 +20213,23 @@ export type ManagedEnvironmentVariableSource = 'error_tracking' | 'open_telemetr
  */
 export type ManagedServiceHealthcheckSettings = {
     /**
-     * Seconds between checks once a container is healthy.
+     * Seconds between checks once a container is healthy (5–3600).
      */
     interval_secs?: number | null;
     /**
-     * Consecutive failed checks that make a container unhealthy.
+     * Consecutive failed checks that make a container unhealthy (1–10).
      */
     retries?: number | null;
     /**
-     * Seconds between checks while a container is starting.
+     * Seconds between checks while a container is starting (1–60).
      */
     start_interval_secs?: number | null;
     /**
-     * Seconds after start during which failed checks do not count.
+     * Seconds after start during which failed checks do not count (0–600).
      */
     start_period_secs?: number | null;
     /**
-     * Seconds one check may run before it counts as failed.
+     * Seconds one check may run before it counts as failed (1–60).
      */
     timeout_secs?: number | null;
 };
