@@ -87,6 +87,10 @@ fn healthcheck_problem(error: ExternalServiceError, operation: &str) -> Problem 
             .title("Healthcheck Not Available For This Service")
             .detail(error.to_string())
             .build(),
+        ExternalServiceError::HealthcheckDefaultConflictsWithService { .. } => conflict()
+            .title("Healthcheck Default Conflicts With A Service Override")
+            .detail(error.to_string())
+            .build(),
         ExternalServiceError::ServiceNotFound { .. } => not_found()
             .title("Service Not Found")
             .detail(error.to_string())
@@ -135,7 +139,8 @@ pub async fn get_healthcheck_defaults(
     request_body = HealthcheckOverrides,
     responses(
         (status = 200, description = "Saved", body = HealthcheckDefaults),
-        (status = 400, description = "A value is out of range or the timeout is not shorter than the interval", body = temps_core::problemdetails::ProblemDetails),
+        (status = 400, description = "A value is out of range, the timeout is not shorter than the interval, or no check would land inside an engine's readiness wait", body = temps_core::problemdetails::ProblemDetails),
+        (status = 409, description = "The default would make a service's existing overrides invalid", body = temps_core::problemdetails::ProblemDetails),
         (status = 401, description = "Unauthorized", body = temps_core::problemdetails::ProblemDetails),
         (status = 403, description = "Insufficient permissions", body = temps_core::problemdetails::ProblemDetails),
         (status = 500, description = "Internal server error", body = temps_core::problemdetails::ProblemDetails)
@@ -212,7 +217,7 @@ pub async fn get_service_healthcheck(
     request_body = HealthcheckOverrides,
     responses(
         (status = 200, description = "Saved; applies when the container is recreated", body = ServiceHealthcheck),
-        (status = 400, description = "A value is out of range or the timeout is not shorter than the interval", body = temps_core::problemdetails::ProblemDetails),
+        (status = 400, description = "A value is out of range, the timeout is not shorter than the interval, or no check would land inside the engine's readiness wait", body = temps_core::problemdetails::ProblemDetails),
         (status = 401, description = "Unauthorized", body = temps_core::problemdetails::ProblemDetails),
         (status = 403, description = "Insufficient permissions", body = temps_core::problemdetails::ProblemDetails),
         (status = 404, description = "Service not found", body = temps_core::problemdetails::ProblemDetails),
@@ -263,8 +268,10 @@ pub async fn update_service_healthcheck(
 ///
 /// The service restarts briefly. Its volumes and configuration are kept: the
 /// original container is kept until the replacement holds the same data,
-/// and put back otherwise. Not available for clusters, worker databases or
-/// imported containers.
+/// and put back otherwise. Only for a running standalone service on a
+/// process that runs local containers: recreating starts the container, so
+/// a stopped service is left alone. Not available for clusters, worker
+/// databases or imported containers.
 #[utoipa::path(
     tag = "External Services",
     post,
@@ -275,7 +282,7 @@ pub async fn update_service_healthcheck(
         (status = 401, description = "Unauthorized", body = temps_core::problemdetails::ProblemDetails),
         (status = 403, description = "Insufficient permissions", body = temps_core::problemdetails::ProblemDetails),
         (status = 404, description = "Service not found", body = temps_core::problemdetails::ProblemDetails),
-        (status = 409, description = "Temps cannot recreate this container from here, or the recreate was refused to protect its data", body = temps_core::problemdetails::ProblemDetails),
+        (status = 409, description = "Temps will not recreate this container from here (not running, local workloads disabled, a cluster, worker or imported container), or the recreate was refused to protect its data", body = temps_core::problemdetails::ProblemDetails),
         (status = 500, description = "The recreate failed; the original container was kept", body = temps_core::problemdetails::ProblemDetails)
     ),
     security(("bearer_auth" = []))
@@ -366,7 +373,9 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::StatusCode;
-    use sea_orm::{ActiveModelTrait, DatabaseBackend, DatabaseConnection, MockDatabase, Set};
+    use sea_orm::{
+        ActiveModelTrait, DatabaseBackend, DatabaseConnection, EntityTrait, MockDatabase, Set,
+    };
     use std::sync::Mutex;
     use temps_entities::external_services;
     use tower::ServiceExt;
@@ -471,6 +480,15 @@ mod tests {
     }
 
     fn state(db: Arc<DatabaseConnection>, audit: RecordingAuditLogger) -> Arc<HealthcheckState> {
+        state_with(db, audit, true)
+    }
+
+    /// `local_workloads`: whether this process runs managed containers.
+    fn state_with(
+        db: Arc<DatabaseConnection>,
+        audit: RecordingAuditLogger,
+        local_workloads: bool,
+    ) -> Arc<HealthcheckState> {
         let docker = Arc::new(temps_core::DockerHandle::disabled(
             "control-plane",
             "healthcheck handler test",
@@ -481,7 +499,7 @@ mod tests {
                 ENCRYPTION_PASSWORD,
             )),
             docker,
-            true,
+            local_workloads,
             Arc::new(temps_dns::DnsRegistry::new(db.clone())),
         ));
         let server_config = Arc::new(
@@ -517,10 +535,11 @@ mod tests {
                 destinations: Some(0),
             }),
         });
-        Arc::new(HealthcheckState {
-            app,
-            defaults: Arc::new(HealthcheckDefaultsService::new(config)),
-        })
+        let defaults = Arc::new(HealthcheckDefaultsService::new(
+            config,
+            app.external_service_manager.clone(),
+        ));
+        Arc::new(HealthcheckState { app, defaults })
     }
 
     fn mock_state(audit: RecordingAuditLogger) -> Arc<HealthcheckState> {
@@ -898,5 +917,196 @@ mod tests {
         let detail = body["detail"].as_str().unwrap_or_default();
         assert!(detail.contains(&row.id.to_string()), "{detail}");
         assert!(audit.recorded().is_empty());
+    }
+
+    async fn set_status(db: &DatabaseConnection, row: &external_services::Model, status: &str) {
+        let mut active: external_services::ActiveModel = row.clone().into();
+        active.status = Set(status.to_string());
+        active.update(db).await.expect("update status");
+    }
+
+    #[tokio::test]
+    async fn a_default_whose_first_check_comes_after_the_readiness_wait_is_a_400() {
+        let audit = RecordingAuditLogger::default();
+        // A start period of 0 and a 120s interval: Docker's first check
+        // would come after RustFS's 60s and every other engine's wait.
+        let (status, body) = body_json(
+            update_healthcheck_defaults(
+                RequireAuth(auth(temps_auth::Role::Admin)),
+                State(mock_state(audit.clone())),
+                Extension(metadata()),
+                Json(HealthcheckOverrides {
+                    start_period_secs: Some(0),
+                    interval_secs: Some(120),
+                    ..Default::default()
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let detail = body["detail"].as_str().unwrap_or_default();
+        assert!(detail.contains("start_period_secs"), "{detail}");
+        assert!(audit.recorded().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_stopped_service_is_not_started_by_apply_now() {
+        let Some(database) = test_database("stopped healthcheck apply test").await else {
+            return;
+        };
+        let db = database.connection_arc();
+        let row = insert_service(db.as_ref(), "stopped-cache", "redis", "standalone").await;
+        set_status(db.as_ref(), &row, "stopped").await;
+        let audit = RecordingAuditLogger::default();
+        let app = state(db.clone(), audit.clone());
+
+        let (status, body) = body_json(
+            get_service_healthcheck(
+                RequireAuth(auth(temps_auth::Role::Admin)),
+                State(app.clone()),
+                Path(row.id),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["capability"]["configurable"], true);
+        assert_eq!(body["capability"]["can_apply_now"], false);
+        let reason = body["capability"]["apply_now_reason"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            reason.contains("stopped") && reason.contains("would start it"),
+            "{reason}"
+        );
+
+        let (status, body) = body_json(
+            apply_service_healthcheck(
+                RequireAuth(auth(temps_auth::Role::Admin)),
+                State(app),
+                Path(row.id),
+                Extension(metadata()),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(
+            body["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("stopped"),
+            "{body}"
+        );
+        // Nothing was recreated or started: the row is still stopped.
+        let stored = external_services::Entity::find_by_id(row.id)
+            .one(db.as_ref())
+            .await
+            .expect("read service")
+            .expect("service exists");
+        assert_eq!(stored.status, "stopped");
+        assert!(audit.recorded().is_empty());
+    }
+
+    #[tokio::test]
+    async fn without_local_workloads_apply_reports_the_policy_not_docker() {
+        let Some(database) = test_database("local workloads healthcheck apply test").await else {
+            return;
+        };
+        let db = database.connection_arc();
+        let row = insert_service(db.as_ref(), "remote-console-cache", "redis", "standalone").await;
+        let audit = RecordingAuditLogger::default();
+        let app = state_with(db, audit.clone(), false);
+
+        let (status, body) = body_json(
+            get_service_healthcheck(
+                RequireAuth(auth(temps_auth::Role::Admin)),
+                State(app.clone()),
+                Path(row.id),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["capability"]["can_apply_now"], false);
+        assert!(
+            body["capability"]["apply_now_reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("local workloads are disabled"),
+            "{body}"
+        );
+
+        let (status, body) = body_json(
+            apply_service_healthcheck(
+                RequireAuth(auth(temps_auth::Role::Admin)),
+                State(app),
+                Path(row.id),
+                Extension(metadata()),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(
+            body["error_code"],
+            temps_core::WORKER_NODE_REQUIRED_ERROR_CODE,
+            "{body}"
+        );
+        assert!(audit.recorded().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_default_that_would_invalidate_a_service_override_is_refused() {
+        let Some(database) = test_database("healthcheck default conflict test").await else {
+            return;
+        };
+        let db = database.connection_arc();
+        let row = insert_service(db.as_ref(), "slow-check-cache", "redis", "standalone").await;
+        let audit = RecordingAuditLogger::default();
+        let app = state(db, audit.clone());
+
+        // A 20s timeout is fine against the built-in 30s interval...
+        let saved = update_service_healthcheck(
+            RequireAuth(auth(temps_auth::Role::Admin)),
+            State(app.clone()),
+            Path(row.id),
+            Extension(metadata()),
+            Json(HealthcheckOverrides {
+                timeout_secs: Some(20),
+                ..Default::default()
+            }),
+        )
+        .await;
+        let (status, body) = body_json(saved).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        // ...but not against a 15s instance default, which every engine's
+        // built-in values would accept.
+        let refused = update_healthcheck_defaults(
+            RequireAuth(auth(temps_auth::Role::Admin)),
+            State(app.clone()),
+            Extension(metadata()),
+            Json(HealthcheckOverrides {
+                interval_secs: Some(15),
+                ..Default::default()
+            }),
+        )
+        .await;
+        temps_providers_core::healthcheck::registry::clear_service(row.id);
+        let (status, body) = body_json(refused).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        let detail = body["detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains(&format!("service {}", row.id))
+                && detail.contains("slow-check-cache")
+                && detail.contains("timeout_secs"),
+            "{detail}"
+        );
+        // Only the service save was audited; the default was not saved.
+        let operations = audit.recorded();
+        assert_eq!(operations.len(), 1, "{operations:?}");
+        assert_eq!(operations[0].0, "EXTERNAL_SERVICE_HEALTHCHECK_UPDATED");
     }
 }

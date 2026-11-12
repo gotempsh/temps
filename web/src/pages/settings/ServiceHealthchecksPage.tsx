@@ -156,7 +156,11 @@ export function ServiceHealthchecksPage() {
   })
 
   const builtins = useMemo(
-    () => query.data?.engines.map((row) => row.builtin) ?? [],
+    () =>
+      query.data?.engines.map((row) => ({
+        timings: row.builtin,
+        readinessWaitSecs: row.readiness_wait_secs,
+      })) ?? [],
     [query.data]
   )
 

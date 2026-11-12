@@ -5,10 +5,7 @@ import { useEffect, useMemo } from 'react'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useForm } from 'react-hook-form'
 import { Field, SaveRow } from '@temps-sdk/ds'
-import type {
-  HealthcheckOverrides,
-  HealthcheckTimings,
-} from '@/api/client/types.gen'
+import type { HealthcheckOverrides } from '@/api/client/types.gen'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import {
@@ -18,6 +15,7 @@ import {
   healthcheckFormSchema,
   overridesOf,
   type HealthcheckFormValues,
+  type InheritedHealthcheck,
 } from '@/lib/service-healthcheck'
 
 export interface HealthcheckOverridesFormProps {
@@ -27,7 +25,7 @@ export interface HealthcheckOverridesFormProps {
    * What an empty field falls back to, one entry per engine the values apply
    * to. The first entry's values are shown as placeholders.
    */
-  inherited: HealthcheckTimings[]
+  inherited: InheritedHealthcheck[]
   /** Shown as each placeholder's source, e.g. "the instance default". */
   inheritedFrom: string
   saving: boolean
@@ -69,7 +67,7 @@ export function HealthcheckOverridesForm({
     onDirtyChange?.(isDirty)
   }, [isDirty, onDirtyChange])
 
-  const placeholderOf = inherited[0]
+  const placeholderOf = inherited[0]?.timings
   const hasOverride = Object.values(saved).some((v) => v !== '')
 
   return (

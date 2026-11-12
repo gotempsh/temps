@@ -27914,12 +27914,19 @@
           },
           "engine": {
             "$ref": "#/components/schemas/ManagedEngine"
+          },
+          "readiness_wait_secs": {
+            "description": "How long Temps waits for a new container of this engine to become\nhealthy; a check has to land inside it.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
           }
         },
         "required": [
           "engine",
           "builtin",
-          "effective"
+          "effective",
+          "readiness_wait_secs"
         ],
         "type": "object"
       },
@@ -66272,9 +66279,25 @@
             "$ref": "#/components/schemas/HealthcheckOverrides",
             "description": "This service's own overrides (null = inherit)."
           },
+          "overrides_ignored_reason": {
+            "description": "Why this service's overrides are set aside: they no longer combine\nwith the instance default, so `effective` is what the container gets\nwithout them. Change or clear them to use them again.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "pending_recreate": {
-            "description": "The running container differs from `effective` (as this host's\nDocker would store it) until it is recreated.",
+            "description": "The running container differs from `effective` (as this host's\nDocker would store it) until it is recreated. `false` when either is\nunknown.",
             "type": "boolean"
+          },
+          "readiness_wait_secs": {
+            "description": "How long Temps waits for a new container of this engine to become\nhealthy; a check has to land inside it.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "running": {
             "oneOf": [
@@ -108679,7 +108702,7 @@
                 }
               }
             },
-            "description": "A value is out of range or the timeout is not shorter than the interval"
+            "description": "A value is out of range, the timeout is not shorter than the interval, or no check would land inside an engine's readiness wait"
           },
           "401": {
             "content": {
@@ -108700,6 +108723,16 @@
               }
             },
             "description": "Insufficient permissions"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The default would make a service's existing overrides invalid"
           },
           "500": {
             "content": {
@@ -110045,7 +110078,7 @@
                 }
               }
             },
-            "description": "A value is out of range or the timeout is not shorter than the interval"
+            "description": "A value is out of range, the timeout is not shorter than the interval, or no check would land inside the engine's readiness wait"
           },
           "401": {
             "content": {
@@ -110111,7 +110144,7 @@
     },
     "/external-services/{id}/healthcheck/apply": {
       "post": {
-        "description": "The service restarts briefly. Its volumes and configuration are kept: the\noriginal container is kept until the replacement holds the same data,\nand put back otherwise. Not available for clusters, worker databases or\nimported containers.",
+        "description": "The service restarts briefly. Its volumes and configuration are kept: the\noriginal container is kept until the replacement holds the same data,\nand put back otherwise. Only for a running standalone service on a\nprocess that runs local containers: recreating starts the container, so\na stopped service is left alone. Not available for clusters, worker\ndatabases or imported containers.",
         "operationId": "apply_service_healthcheck",
         "parameters": [
           {
@@ -110174,7 +110207,7 @@
                 }
               }
             },
-            "description": "Temps cannot recreate this container from here, or the recreate was refused to protect its data"
+            "description": "Temps will not recreate this container from here (not running, local workloads disabled, a cluster, worker or imported container), or the recreate was refused to protect its data"
           },
           "500": {
             "content": {

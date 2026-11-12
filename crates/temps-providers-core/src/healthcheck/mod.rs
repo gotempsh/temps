@@ -113,6 +113,21 @@ impl HealthcheckTimings {
     }
 }
 
+/// How long the shortest readiness wait after creating or starting an
+/// `engine` container gives it to become healthy (the engine's own wait;
+/// upgrade and recreate waits are longer). A healthcheck must check inside
+/// it; see [`ResolvedHealthcheck::validate`].
+pub const fn readiness_wait_secs(engine: ManagedEngine) -> u32 {
+    match engine {
+        ManagedEngine::Postgres
+        | ManagedEngine::Redis
+        | ManagedEngine::MongoDb
+        | ManagedEngine::Minio => 90,
+        ManagedEngine::MariaDb => 120,
+        ManagedEngine::Rustfs => 60,
+    }
+}
+
 /// Whether the Docker daemon honours `HealthConfig.StartInterval`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartIntervalSupport {
@@ -154,6 +169,31 @@ pub fn effective_timings(
             interval_secs: timings.interval_secs.min(timings.start_interval_secs),
             ..timings
         },
+    }
+}
+
+/// Whether a running container's healthcheck, as `inspect` reads it back,
+/// is the one a container created now with `expected` would get.
+///
+/// A daemon without `StartInterval` support does not store it, so the
+/// running value reads back as 0: the start interval is not compared there.
+pub fn matches_running(
+    running: &HealthcheckTimings,
+    expected: HealthcheckTimings,
+    support: StartIntervalSupport,
+) -> bool {
+    let expected = effective_timings(expected, support);
+    match support {
+        StartIntervalSupport::Supported => *running == expected,
+        StartIntervalSupport::Unsupported => {
+            HealthcheckTimings {
+                start_interval_secs: 0,
+                ..*running
+            } == HealthcheckTimings {
+                start_interval_secs: 0,
+                ..expected
+            }
+        }
     }
 }
 
@@ -220,6 +260,15 @@ static LOCAL_DAEMON_SUPPORT: OnceLock<StartIntervalSupport> = OnceLock::new();
 /// A version that cannot be read is not cached: that container gets the
 /// fallback, and the next create asks again.
 pub async fn start_interval_support(docker: &Docker) -> StartIntervalSupport {
+    known_start_interval_support(docker)
+        .await
+        .unwrap_or(StartIntervalSupport::Unsupported)
+}
+
+/// [`start_interval_support`], or `None` when the daemon's version could
+/// not be read: for a status read, which must not report a difference it
+/// cannot know.
+pub async fn known_start_interval_support(docker: &Docker) -> Option<StartIntervalSupport> {
     detect_start_interval_support(&LOCAL_DAEMON_SUPPORT, async {
         match tokio::time::timeout(VERSION_TIMEOUT, docker.version()).await {
             Ok(Ok(version)) => Ok(version.api_version),
@@ -230,17 +279,17 @@ pub async fn start_interval_support(docker: &Docker) -> StartIntervalSupport {
     .await
 }
 
-/// [`start_interval_support`] against any cache and version source, so the
-/// caching and the fallback can be tested without a daemon.
+/// [`known_start_interval_support`] against any cache and version source,
+/// so the caching and the fallback can be tested without a daemon.
 async fn detect_start_interval_support<F>(
     cache: &OnceLock<StartIntervalSupport>,
     api_version: F,
-) -> StartIntervalSupport
+) -> Option<StartIntervalSupport>
 where
     F: std::future::Future<Output = Result<Option<String>, String>>,
 {
     if let Some(support) = cache.get() {
-        return *support;
+        return Some(*support);
     }
     match api_version.await {
         Ok(Some(version)) => match StartIntervalSupport::from_api_version(&version) {
@@ -255,7 +304,7 @@ where
                 } else {
                     debug!(api_version = %version, "Docker daemon honours healthcheck StartInterval");
                 }
-                *cache.get_or_init(|| support)
+                Some(*cache.get_or_init(|| support))
             }
             None => {
                 warn!(
@@ -263,7 +312,7 @@ where
                     "Docker daemon reported an API version that is not major.minor; using the \
                      startup healthcheck interval for this container"
                 );
-                StartIntervalSupport::Unsupported
+                None
             }
         },
         Ok(None) => {
@@ -271,7 +320,7 @@ where
                 "Docker daemon reported no API version; using the startup healthcheck interval \
                  for this container"
             );
-            StartIntervalSupport::Unsupported
+            None
         }
         Err(reason) => {
             warn!(
@@ -279,31 +328,66 @@ where
                 "Could not read the Docker daemon's API version; using the startup healthcheck \
                  interval for this container"
             );
-            StartIntervalSupport::Unsupported
+            None
         }
     }
 }
 
-/// Resolve `service` over the instance default and `engine`'s built-in.
+/// What a container of `engine` with `service`'s overrides is created with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckedResolution {
+    pub resolved: ResolvedHealthcheck,
+    /// Why the service's overrides were set aside, when they no longer
+    /// combine with the instance default (it changed after they were saved).
+    pub ignored: Option<HealthcheckValidationError>,
+}
+
+/// Resolve `service` over `instance` and `engine`'s built-in, checked.
 ///
-/// A combination that does not validate (the instance default changed under
-/// a service override, so its timeout is no longer shorter than its
-/// interval) falls back to the built-in timings rather than creating a
-/// container whose checks overlap.
-pub fn resolve_for(engine: ManagedEngine, service: &HealthcheckOverrides) -> ResolvedHealthcheck {
+/// A combination that does not validate drops the service's overrides and
+/// keeps the instance default; if that does not validate either (it was
+/// saved under older built-in values), the built-in timings apply. Either
+/// way the reason is returned, so the caller can say the overrides are being
+/// ignored instead of creating a container that cannot become healthy.
+pub fn resolve_checked(
+    engine: ManagedEngine,
+    service: &HealthcheckOverrides,
+    instance: &HealthcheckOverrides,
+) -> CheckedResolution {
     let builtin = HealthcheckTimings::builtin(engine);
-    let resolved = resolve(service, &registry::instance_default(), &builtin);
-    match resolved.validate() {
-        Ok(()) => resolved,
-        Err(error) => {
-            warn!(
-                %engine,
-                %error,
-                "Managed service healthcheck overrides do not combine; using the built-in timings"
-            );
-            resolve(&Default::default(), &Default::default(), &builtin)
-        }
+    let wait = readiness_wait_secs(engine);
+    let resolved = resolve(service, instance, &builtin);
+    let Err(error) = resolved.validate(wait) else {
+        return CheckedResolution {
+            resolved,
+            ignored: None,
+        };
+    };
+    let without_service = resolve(&Default::default(), instance, &builtin);
+    let resolved = if without_service.validate(wait).is_ok() {
+        without_service
+    } else {
+        resolve(&Default::default(), &Default::default(), &builtin)
+    };
+    CheckedResolution {
+        resolved,
+        ignored: Some(error),
     }
+}
+
+/// [`resolve_checked`] against the registered instance default, logging
+/// overrides that are set aside.
+pub fn resolve_for(engine: ManagedEngine, service: &HealthcheckOverrides) -> ResolvedHealthcheck {
+    let checked = resolve_checked(engine, service, &registry::instance_default());
+    if let Some(error) = &checked.ignored {
+        warn!(
+            %engine,
+            %error,
+            "Managed service healthcheck overrides do not combine with the instance default; \
+             the container gets the timings without them"
+        );
+    }
+    checked.resolved
 }
 
 /// The timings a new control-plane `engine` container named
@@ -504,6 +588,133 @@ mod tests {
     }
 
     #[test]
+    fn overrides_that_no_longer_combine_are_set_aside_and_say_why() {
+        let service = HealthcheckOverrides {
+            timeout_secs: Some(20),
+            retries: Some(5),
+            ..Default::default()
+        };
+        // Saved while the interval was the built-in 30s; the instance
+        // default later lowered it to 15s.
+        let instance = HealthcheckOverrides {
+            interval_secs: Some(15),
+            ..Default::default()
+        };
+        let checked = resolve_checked(ManagedEngine::MongoDb, &service, &instance);
+        assert!(
+            matches!(
+                checked.ignored,
+                Some(HealthcheckValidationError::TimeoutNotShorterThanInterval {
+                    timeout_secs: 20,
+                    interval_secs: 15,
+                    ..
+                })
+            ),
+            "{:?}",
+            checked.ignored
+        );
+        // The instance default still applies; only the service's own
+        // values are dropped.
+        assert_eq!(checked.resolved.timings.interval_secs, 15);
+        assert_eq!(
+            checked.resolved.sources.interval_secs,
+            HealthcheckSource::InstanceDefault
+        );
+        assert_eq!(checked.resolved.timings.timeout_secs, 10);
+        assert_eq!(checked.resolved.timings.retries, 3);
+
+        // An instance default that is itself invalid for the engine falls
+        // back to the built-in timings.
+        let stale_instance = HealthcheckOverrides {
+            interval_secs: Some(8),
+            ..Default::default()
+        };
+        let checked = resolve_checked(ManagedEngine::MongoDb, &Default::default(), &stale_instance);
+        assert!(checked.ignored.is_some());
+        assert_eq!(
+            checked.resolved.timings,
+            HealthcheckTimings::builtin(ManagedEngine::MongoDb)
+        );
+
+        let fine = resolve_checked(ManagedEngine::MongoDb, &service, &Default::default());
+        assert_eq!(fine.ignored, None);
+        assert_eq!(fine.resolved.timings.timeout_secs, 20);
+    }
+
+    #[test]
+    fn a_running_container_matches_what_this_daemon_would_store() {
+        let expected = HealthcheckTimings::builtin(ManagedEngine::Redis);
+        let modern = health_config("true", &expected);
+        let running = |health: &HealthConfig| HealthcheckTimings {
+            interval_secs: (health.interval.unwrap_or(0) / NANOS_PER_SEC) as u32,
+            start_interval_secs: (health.start_interval.unwrap_or(0) / NANOS_PER_SEC) as u32,
+            start_period_secs: (health.start_period.unwrap_or(0) / NANOS_PER_SEC) as u32,
+            timeout_secs: (health.timeout.unwrap_or(0) / NANOS_PER_SEC) as u32,
+            retries: health.retries.unwrap_or(0) as u32,
+        };
+        assert!(matches_running(
+            &running(&modern),
+            expected,
+            StartIntervalSupport::Supported
+        ));
+
+        // An old daemon was sent the fallback and dropped StartInterval: it
+        // reads back as 0, and still matches, so it is not "pending" forever.
+        let sent = effective_timings(expected, StartIntervalSupport::Unsupported);
+        let old = HealthConfig {
+            start_interval: None,
+            ..health_config("true", &sent)
+        };
+        assert!(matches_running(
+            &running(&old),
+            expected,
+            StartIntervalSupport::Unsupported
+        ));
+
+        // A container from before the change differs on either daemon.
+        let before = HealthcheckTimings {
+            interval_secs: 1,
+            start_interval_secs: 1,
+            start_period_secs: 5,
+            timeout_secs: 3,
+            ..expected
+        };
+        assert!(!matches_running(
+            &before,
+            expected,
+            StartIntervalSupport::Supported
+        ));
+        assert!(!matches_running(
+            &before,
+            expected,
+            StartIntervalSupport::Unsupported
+        ));
+    }
+
+    #[test]
+    fn every_builtin_checks_inside_its_engine_s_readiness_wait() {
+        for engine in [
+            ManagedEngine::Postgres,
+            ManagedEngine::Redis,
+            ManagedEngine::MongoDb,
+            ManagedEngine::MariaDb,
+            ManagedEngine::Rustfs,
+            ManagedEngine::Minio,
+        ] {
+            let builtin = HealthcheckTimings::builtin(engine);
+            assert!(
+                builtin.start_period_secs >= readiness_wait_secs(engine),
+                "{engine}"
+            );
+            assert_eq!(
+                resolve_checked(engine, &Default::default(), &Default::default()).ignored,
+                None,
+                "{engine}"
+            );
+        }
+    }
+
+    #[test]
     fn overrides_that_no_longer_combine_fall_back_to_the_builtin() {
         let resolved = resolve_for(
             ManagedEngine::Redis,
@@ -530,28 +741,28 @@ mod tests {
                 Ok(Some("1.43".to_string()))
             })
             .await;
-            assert_eq!(support, StartIntervalSupport::Unsupported);
+            assert_eq!(support, Some(StartIntervalSupport::Unsupported));
         }
         assert_eq!(asked.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
-    async fn an_unreadable_version_falls_back_and_is_asked_again() {
+    async fn an_unreadable_version_is_unknown_and_asked_again() {
         let cache = OnceLock::new();
         let failed =
             detect_start_interval_support(&cache, async { Err("connection refused".to_string()) })
                 .await;
-        assert_eq!(failed, StartIntervalSupport::Unsupported);
+        assert_eq!(failed, None);
         assert!(cache.get().is_none(), "a failure is not cached");
         let missing = detect_start_interval_support(&cache, async { Ok(None) }).await;
-        assert_eq!(missing, StartIntervalSupport::Unsupported);
+        assert_eq!(missing, None);
         let garbled =
             detect_start_interval_support(&cache, async { Ok(Some("v-next".to_string())) }).await;
-        assert_eq!(garbled, StartIntervalSupport::Unsupported);
+        assert_eq!(garbled, None);
         assert!(cache.get().is_none());
         let modern =
             detect_start_interval_support(&cache, async { Ok(Some("1.54".to_string())) }).await;
-        assert_eq!(modern, StartIntervalSupport::Supported);
+        assert_eq!(modern, Some(StartIntervalSupport::Supported));
         assert_eq!(cache.get(), Some(&StartIntervalSupport::Supported));
     }
 }

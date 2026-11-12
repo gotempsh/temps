@@ -4179,8 +4179,10 @@ export const updateServiceHealthcheck = <ThrowOnError extends boolean = false>(o
  *
  * The service restarts briefly. Its volumes and configuration are kept: the
  * original container is kept until the replacement holds the same data,
- * and put back otherwise. Not available for clusters, worker databases or
- * imported containers.
+ * and put back otherwise. Only for a running standalone service on a
+ * process that runs local containers: recreating starts the container, so
+ * a stopped service is left alone. Not available for clusters, worker
+ * databases or imported containers.
  */
 export const applyServiceHealthcheck = <ThrowOnError extends boolean = false>(options: Options<ApplyServiceHealthcheckData, ThrowOnError>): RequestResult<ApplyServiceHealthcheckResponses, ApplyServiceHealthcheckErrors, ThrowOnError> => (options.client ?? client).post<ApplyServiceHealthcheckResponses, ApplyServiceHealthcheckErrors, ThrowOnError>({
     security: [{ scheme: 'bearer', type: 'http' }],

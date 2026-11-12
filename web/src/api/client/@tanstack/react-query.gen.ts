@@ -8390,8 +8390,10 @@ export const updateServiceHealthcheckMutation = (options?: Partial<Options<Updat
  *
  * The service restarts briefly. Its volumes and configuration are kept: the
  * original container is kept until the replacement holds the same data,
- * and put back otherwise. Not available for clusters, worker databases or
- * imported containers.
+ * and put back otherwise. Only for a running standalone service on a
+ * process that runs local containers: recreating starts the container, so
+ * a stopped service is left alone. Not available for clusters, worker
+ * databases or imported containers.
  */
 export const applyServiceHealthcheckMutation = (options?: Partial<Options<ApplyServiceHealthcheckData>>): UseMutationOptions<ApplyServiceHealthcheckResponse2, ApplyServiceHealthcheckError, Options<ApplyServiceHealthcheckData>> => {
     const mutationOptions: UseMutationOptions<ApplyServiceHealthcheckResponse2, ApplyServiceHealthcheckError, Options<ApplyServiceHealthcheckData>> = {

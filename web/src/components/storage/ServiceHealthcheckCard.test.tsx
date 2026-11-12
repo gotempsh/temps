@@ -61,6 +61,7 @@ const STANDALONE: ServiceHealthcheck = {
   running: { ...BUILTIN, interval_secs: 1, start_interval_secs: 1 },
   pending_recreate: true,
   start_interval_supported: true,
+  readiness_wait_secs: 90,
 }
 
 function renderView(
@@ -227,4 +228,51 @@ test('a host whose Docker ignores the start interval says so', () => {
   expect(
     view.getByText("This host's Docker ignores the start interval")
   ).toBeTruthy()
+})
+
+test('a start period of 0 with a long interval is refused before Save', async () => {
+  const onSave = mock((_: HealthcheckOverrides) => {})
+  const view = renderView(STANDALONE, { onSave })
+  fireEvent.change(view.getByLabelText('Interval (s)'), {
+    target: { value: '120' },
+  })
+  fireEvent.change(view.getByLabelText('Start period (s)'), {
+    target: { value: '0' },
+  })
+  await act(async () => {
+    fireEvent.click(view.getByRole('button', { name: 'Save overrides' }))
+  })
+  expect(await view.findByText(/must fit in the 90s Temps waits/)).toBeTruthy()
+  expect(onSave).not.toHaveBeenCalled()
+})
+
+test('overrides set aside because they no longer combine say why', () => {
+  const view = renderView({
+    ...STANDALONE,
+    overrides_ignored_reason:
+      'Timeout (40s) from the instance default must be shorter than the interval (30s) from this service',
+  })
+  expect(
+    view.getByText("This service's overrides are not being used")
+  ).toBeTruthy()
+  expect(
+    view.getByText(/Timeout \(40s\) from the instance default/)
+  ).toBeTruthy()
+})
+
+test('a stopped service cannot be recreated, and says when it applies', () => {
+  const view = renderView({
+    ...STANDALONE,
+    capability: {
+      configurable: true,
+      can_apply_now: false,
+      apply_now_reason:
+        'it is stopped, and recreating its container would start it; the settings apply when its container is next created',
+    },
+  })
+  expect(
+    (view.getByRole('button', { name: 'Apply now' }) as HTMLButtonElement)
+      .disabled
+  ).toBe(true)
+  expect(view.getByText(/it is stopped/)).toBeTruthy()
 })

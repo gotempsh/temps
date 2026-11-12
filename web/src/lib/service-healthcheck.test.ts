@@ -12,6 +12,7 @@ import {
   healthcheckFormSchema,
   overridesOf,
   type HealthcheckFormValues,
+  type InheritedHealthcheck,
 } from './service-healthcheck'
 
 const REDIS: HealthcheckTimings = {
@@ -22,10 +23,18 @@ const REDIS: HealthcheckTimings = {
   retries: 3,
 }
 const MONGODB: HealthcheckTimings = { ...REDIS, timeout_secs: 10 }
+const RUSTFS: HealthcheckTimings = { ...REDIS, start_period_secs: 60 }
+
+const redis: InheritedHealthcheck = { timings: REDIS, readinessWaitSecs: 90 }
+const mongodb: InheritedHealthcheck = {
+  timings: MONGODB,
+  readinessWaitSecs: 90,
+}
+const rustfs: InheritedHealthcheck = { timings: RUSTFS, readinessWaitSecs: 60 }
 
 const EMPTY: HealthcheckFormValues = formValuesOf(undefined)
 
-function issues(values: Partial<HealthcheckFormValues>, inherited = [REDIS]) {
+function issues(values: Partial<HealthcheckFormValues>, inherited = [redis]) {
   const result = healthcheckFormSchema(inherited).safeParse({
     ...EMPTY,
     ...values,
@@ -85,9 +94,59 @@ describe('healthcheck form schema', () => {
     ])
     // The instance default applies to every engine: 8s is fine for Redis
     // and too short for MongoDB's 10s timeout.
-    expect(issues({ interval_secs: '8' }, [REDIS])).toEqual([])
-    expect(issues({ interval_secs: '8' }, [REDIS, MONGODB])).toEqual([
+    expect(issues({ interval_secs: '8' }, [redis])).toEqual([])
+    expect(issues({ interval_secs: '8' }, [redis, mongodb])).toEqual([
       'interval_secs: Timeout (10s) must be shorter than the interval (8s)',
+    ])
+  })
+})
+
+describe('a check must land inside the readiness wait', () => {
+  test('a start period of 0 with a long interval is refused before Save', () => {
+    expect(
+      issues({ start_period_secs: '0', interval_secs: '120' }, [redis])
+    ).toEqual([
+      'start_period_secs: Start period (0s) plus interval (120s) must fit in the 90s Temps waits for a new container to become healthy, or the start period must cover it',
+    ])
+  })
+
+  test('the start period covering the wait, or one interval fitting in it, is fine', () => {
+    expect(issues({ interval_secs: '3600' }, [redis])).toEqual([])
+    expect(
+      issues({ start_period_secs: '0', interval_secs: '60' }, [redis])
+    ).toEqual([])
+    // Checking as often as while starting needs no start period.
+    expect(
+      issues(
+        {
+          start_period_secs: '0',
+          start_interval_secs: '60',
+          interval_secs: '60',
+        },
+        [rustfs]
+      )
+    ).toEqual([])
+  })
+
+  test("an instance default is checked against every engine's wait", () => {
+    // 30s + 45s fits Redis' 90s wait but not RustFS' 60s.
+    expect(
+      issues({ start_period_secs: '30', interval_secs: '45' }, [redis])
+    ).toEqual([])
+    expect(
+      issues({ start_period_secs: '30', interval_secs: '45' }, [redis, rustfs])
+    ).toEqual([
+      'start_period_secs: Start period (30s) plus interval (45s) must fit in the 60s Temps waits for a new container to become healthy, or the start period must cover it',
+    ])
+  })
+
+  test('an inherited start period is blamed on the interval', () => {
+    const noStartPeriod: InheritedHealthcheck = {
+      timings: { ...REDIS, start_period_secs: 0 },
+      readinessWaitSecs: 90,
+    }
+    expect(issues({ interval_secs: '120' }, [noStartPeriod])).toEqual([
+      'interval_secs: Start period (0s) plus interval (120s) must fit in the 90s Temps waits for a new container to become healthy, or the start period must cover it',
     ])
   })
 })

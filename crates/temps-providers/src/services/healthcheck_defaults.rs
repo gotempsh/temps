@@ -16,7 +16,8 @@ use temps_providers_core::healthcheck::{
 use tracing::info;
 use utoipa::ToSchema;
 
-use super::ExternalServiceError;
+use super::manager::HEALTHCHECK_WRITES;
+use super::{ExternalServiceError, ExternalServiceManager};
 
 /// Every engine whose containers get a Temps-built healthcheck.
 pub const HEALTHCHECK_ENGINES: [ManagedEngine; 6] = [
@@ -58,6 +59,9 @@ pub struct EngineHealthcheckDefault {
     pub builtin: HealthcheckTimings,
     /// What a service without overrides gets, and where each value comes from.
     pub effective: ResolvedHealthcheck,
+    /// How long Temps waits for a new container of this engine to become
+    /// healthy; a check has to land inside it.
+    pub readiness_wait_secs: u32,
 }
 
 /// The instance default and what it gives each engine.
@@ -80,6 +84,7 @@ impl HealthcheckDefaults {
                         engine,
                         builtin,
                         effective: healthcheck::resolve(&Default::default(), &overrides, &builtin),
+                        readiness_wait_secs: healthcheck::readiness_wait_secs(engine),
                     }
                 })
                 .collect(),
@@ -95,7 +100,10 @@ pub struct HealthcheckDefaultsUpdate {
 }
 
 /// Validate an instance default: each value within its bounds, and the
-/// combination with every engine's built-in values valid. Pure.
+/// combination with every engine's built-in values valid (the timeout
+/// shorter than the interval, a check inside the engine's readiness wait).
+/// Pure; the stored service overrides are checked by
+/// [`HealthcheckDefaultsService::update`].
 pub fn validate_instance_default(
     overrides: &HealthcheckOverrides,
 ) -> Result<(), ExternalServiceError> {
@@ -110,7 +118,7 @@ pub fn validate_instance_default(
             overrides,
             &HealthcheckTimings::builtin(engine),
         )
-        .validate()
+        .validate(healthcheck::readiness_wait_secs(engine))
         .map_err(invalid)?;
     }
     Ok(())
@@ -119,11 +127,13 @@ pub fn validate_instance_default(
 /// Reads and writes the instance default.
 pub struct HealthcheckDefaultsService {
     config: Arc<ConfigService>,
+    /// Checks a new default against the overrides services already have.
+    services: Arc<ExternalServiceManager>,
 }
 
 impl HealthcheckDefaultsService {
-    pub fn new(config: Arc<ConfigService>) -> Self {
-        Self { config }
+    pub fn new(config: Arc<ConfigService>, services: Arc<ExternalServiceManager>) -> Self {
+        Self { config, services }
     }
 
     /// The stored instance default.
@@ -148,6 +158,13 @@ impl HealthcheckDefaultsService {
         overrides: HealthcheckOverrides,
     ) -> Result<HealthcheckDefaultsUpdate, ExternalServiceError> {
         validate_instance_default(&overrides)?;
+        // Held through the save and the registry publish, so no service
+        // override is saved against the old default in between, and the
+        // registry ends with the default saved last.
+        let _writes = HEALTHCHECK_WRITES.lock().await;
+        self.services
+            .check_instance_default_against_services(&overrides)
+            .await?;
         let mut previous = HealthcheckOverrides::default();
         let saved = self
             .config

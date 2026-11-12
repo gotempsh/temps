@@ -208,6 +208,7 @@ fn data_safety_problem(error: &crate::services::ExternalServiceError) -> Option<
         | E::ClusterMemberLimitExceeded { .. }
         | E::InvalidHealthcheck { .. }
         | E::HealthcheckUnsupported { .. }
+        | E::HealthcheckDefaultConflictsWithService { .. }
         | E::ClusterMemberProvisioning { .. }
         | E::ClusterNotSettled { .. }
         | E::ClusterBusy { .. }
@@ -273,6 +274,7 @@ fn service_name_problem(error: &crate::services::ExternalServiceError) -> Option
         | E::ClusterMemberLimitExceeded { .. }
         | E::InvalidHealthcheck { .. }
         | E::HealthcheckUnsupported { .. }
+        | E::HealthcheckDefaultConflictsWithService { .. }
         | E::ClusterMemberProvisioning { .. }
         | E::ClusterNotSettled { .. }
         | E::ClusterBusy { .. }
@@ -362,6 +364,7 @@ fn cluster_placement_problem(error: &crate::services::ExternalServiceError) -> O
         | E::LocalWorkloadsDisabled { .. }
         | E::InvalidHealthcheck { .. }
         | E::HealthcheckUnsupported { .. }
+        | E::HealthcheckDefaultConflictsWithService { .. }
         | E::Engine { .. } => return None,
     };
     Some(conflict().title(title).detail(error.to_string()).build())

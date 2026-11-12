@@ -1329,6 +1329,7 @@ export function ServiceDetail() {
             <ServiceHealthcheckCard
               serviceId={service.service.id}
               serviceName={service.service.name}
+              serviceStatus={service.service.status}
             />
 
             {/* Server TLS for managed PostgreSQL (ADR-093) */}

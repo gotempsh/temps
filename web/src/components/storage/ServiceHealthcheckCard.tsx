@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useCallback, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Callout, Status } from '@temps-sdk/ds'
 import { HeartPulse, Loader2, RotateCw } from 'lucide-react'
@@ -56,8 +56,18 @@ export function ServiceHealthcheckView({
   const [confirming, setConfirming] = useState(false)
   const [dirty, setDirty] = useState(false)
   const inherited = useMemo(
-    () => (healthcheck.inherited ? [healthcheck.inherited.timings] : []),
-    [healthcheck.inherited]
+    () =>
+      healthcheck.inherited
+        ? [
+            {
+              timings: healthcheck.inherited.timings,
+              readinessWaitSecs:
+                healthcheck.readiness_wait_secs ??
+                healthcheck.inherited.timings.start_period_secs,
+            },
+          ]
+        : [],
+    [healthcheck.inherited, healthcheck.readiness_wait_secs]
   )
   const onDirtyChange = useCallback((d: boolean) => setDirty(d), [])
   const { capability, effective, running } = healthcheck
@@ -119,6 +129,17 @@ export function ServiceHealthcheckView({
           )
         })}
       </dl>
+
+      {healthcheck.overrides_ignored_reason ? (
+        <Callout
+          tone="warning"
+          title="This service's overrides are not being used"
+        >
+          They no longer combine with the instance default, so new containers
+          get the values above without them:{' '}
+          {healthcheck.overrides_ignored_reason}. Change or clear them below.
+        </Callout>
+      ) : null}
 
       {healthcheck.start_interval_supported === false ? (
         <Callout
@@ -203,11 +224,23 @@ const TITLE = 'Health checks'
 export function ServiceHealthcheckCard({
   serviceId,
   serviceName,
+  serviceStatus,
 }: {
   serviceId: number
   serviceName: string
+  /** The service's lifecycle status; a change re-reads whether Apply now
+   * is possible (it is not while the service is stopped). */
+  serviceStatus?: string
 }) {
   const queryClient = useQueryClient()
+  const seenStatus = useRef(serviceStatus)
+  useEffect(() => {
+    if (seenStatus.current === serviceStatus) return
+    seenStatus.current = serviceStatus
+    void queryClient.invalidateQueries({
+      queryKey: getServiceHealthcheckQueryKey({ path: { id: serviceId } }),
+    })
+  }, [serviceStatus, serviceId, queryClient])
   const queryKey = getServiceHealthcheckQueryKey({ path: { id: serviceId } })
   const query = useQuery(
     getServiceHealthcheckOptions({ path: { id: serviceId } })

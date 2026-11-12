@@ -87,11 +87,21 @@ pub struct ServiceHealthcheck {
     /// a cleared field falls back to.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inherited: Option<ResolvedHealthcheck>,
+    /// Why this service's overrides are set aside: they no longer combine
+    /// with the instance default, so `effective` is what the container gets
+    /// without them. Change or clear them to use them again.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overrides_ignored_reason: Option<String>,
+    /// How long Temps waits for a new container of this engine to become
+    /// healthy; a check has to land inside it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub readiness_wait_secs: Option<u32>,
     /// The running container's healthcheck, when it could be read.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub running: Option<HealthcheckTimings>,
     /// The running container differs from `effective` (as this host's
-    /// Docker would store it) until it is recreated.
+    /// Docker would store it) until it is recreated. `false` when either is
+    /// unknown.
     pub pending_recreate: bool,
     /// `false`: this host's Docker ignores the start interval, so the
     /// steady-state interval stays at the start interval. Absent when not
@@ -173,7 +183,37 @@ struct HealthcheckTarget {
     capability: HealthcheckCapability,
 }
 
+/// Serializes healthcheck writes in this process (a service's overrides,
+/// the instance default) from the stored write through publishing it to
+/// the registry, so the registry ends with the value committed last, and an
+/// instance default is checked against the service overrides it will be
+/// combined with. Writes are rare operator actions.
+pub(crate) static HEALTHCHECK_WRITES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 impl ExternalServiceManager {
+    /// Why Temps will not recreate a control-plane service's container from
+    /// here right now, if it will not. Recreating starts the container, so a
+    /// service the operator stopped (or that is still starting, failed or
+    /// being created) is left alone: its next start or recreate applies the
+    /// healthcheck.
+    fn local_apply_blocker(&self, service: &external_services::Model) -> Option<String> {
+        if !self.local_workloads_enabled {
+            return Some(
+                "local workloads are disabled on this process, so Temps does not create or \
+                 recreate containers here"
+                    .to_string(),
+            );
+        }
+        if service.status != "running" {
+            return Some(format!(
+                "it is {}, and recreating its container would start it; the settings apply \
+                 when its container is next created",
+                service.status
+            ));
+        }
+        None
+    }
+
     /// Classify `service` (pure apart from decrypting its parameters).
     fn healthcheck_target(
         &self,
@@ -223,8 +263,8 @@ impl ExternalServiceManager {
                 capability: HealthcheckCapability {
                     configurable: true,
                     reason: None,
-                    can_apply_now: true,
-                    apply_now_reason: None,
+                    can_apply_now: self.local_apply_blocker(service).is_none(),
+                    apply_now_reason: self.local_apply_blocker(service),
                 },
             }),
             // A worker's agent gives a database a healthcheck only when it
@@ -289,26 +329,32 @@ impl ExternalServiceManager {
         let service = self.get_service(service_id).await?;
         let target = self.healthcheck_target(&service)?;
         let overrides = service_overrides(&service);
-        let effective = target
+        let instance = registry::instance_default();
+        let checked = target
             .engine
-            .map(|engine| healthcheck::resolve_for(engine, &overrides));
-        let inherited = target
-            .engine
-            .map(|engine| healthcheck::resolve_for(engine, &HealthcheckOverrides::default()));
-        let support = match &target.container_name {
-            Some(_) => match self.docker.get() {
-                Some(docker) => Some(healthcheck::start_interval_support(docker).await),
-                None => None,
-            },
-            None => None,
+            .map(|engine| healthcheck::resolve_checked(engine, &overrides, &instance));
+        let inherited = target.engine.map(|engine| {
+            healthcheck::resolve_checked(engine, &HealthcheckOverrides::default(), &instance)
+                .resolved
+        });
+        // The running container is read only on a process that runs local
+        // containers; elsewhere there is nothing here to compare.
+        let local_container = target
+            .container_name
+            .as_deref()
+            .filter(|_| self.local_workloads_enabled);
+        let support = match (local_container, self.docker.get()) {
+            (Some(_), Some(docker)) => healthcheck::known_start_interval_support(docker).await,
+            _ => None,
         };
-        let running = match &target.container_name {
+        let running = match local_container {
             Some(container) => self.running_healthcheck(container).await,
             None => None,
         };
+        let effective = checked.as_ref().map(|c| c.resolved);
         let pending_recreate = match (&running, &effective, support) {
             (Some(running), Some(effective), Some(support)) => {
-                *running != healthcheck::effective_timings(effective.timings, support)
+                !healthcheck::matches_running(running, effective.timings, support)
             }
             _ => false,
         };
@@ -321,6 +367,11 @@ impl ExternalServiceManager {
             overrides,
             effective,
             inherited,
+            overrides_ignored_reason: checked
+                .as_ref()
+                .and_then(|c| c.ignored.as_ref())
+                .map(ToString::to_string),
+            readiness_wait_secs: target.engine.map(healthcheck::readiness_wait_secs),
             running,
             pending_recreate,
             start_interval_supported: support.map(|s| s == StartIntervalSupport::Supported),
@@ -345,6 +396,9 @@ impl ExternalServiceManager {
                 service_id: Some(service_id),
                 source,
             })?;
+        // Held through the commit and the registry publish; the combination
+        // check reads the instance default under it too.
+        let _writes = HEALTHCHECK_WRITES.lock().await;
         let service = self.get_service(service_id).await?;
         let target = self.healthcheck_target(&service)?;
         if !overrides.is_empty() {
@@ -361,7 +415,7 @@ impl ExternalServiceManager {
             };
             let builtin = HealthcheckTimings::builtin(engine);
             healthcheck::resolve(&overrides, &registry::instance_default(), &builtin)
-                .validate()
+                .validate(healthcheck::readiness_wait_secs(engine))
                 .map_err(|source| ExternalServiceError::InvalidHealthcheck {
                     service_id: Some(service_id),
                     source,
@@ -445,6 +499,13 @@ impl ExternalServiceManager {
         service_id: i32,
     ) -> Result<HealthcheckApplied, ExternalServiceError> {
         let service = self.get_service(service_id).await?;
+        // The process policy comes before anything reaches Docker, so the
+        // operator sees why rather than a missing-daemon error.
+        if service.node_id.is_none() && !self.local_workloads_enabled {
+            return Err(ExternalServiceError::LocalWorkloadsDisabled {
+                name: service.name.clone(),
+            });
+        }
         let target = self.healthcheck_target(&service)?;
         let (Some(engine), true) = (target.engine, target.capability.can_apply_now) else {
             return Err(ExternalServiceError::HealthcheckUnsupported {
@@ -482,17 +543,7 @@ impl ExternalServiceManager {
         &self,
         instance_default: HealthcheckOverrides,
     ) -> Result<usize, ExternalServiceError> {
-        let rows = external_services::Entity::find()
-            .filter(
-                Condition::any()
-                    .add(external_services::Column::HealthcheckIntervalSecs.is_not_null())
-                    .add(external_services::Column::HealthcheckStartIntervalSecs.is_not_null())
-                    .add(external_services::Column::HealthcheckStartPeriodSecs.is_not_null())
-                    .add(external_services::Column::HealthcheckTimeoutSecs.is_not_null())
-                    .add(external_services::Column::HealthcheckRetries.is_not_null()),
-            )
-            .all(self.db.as_ref())
-            .await?;
+        let rows = self.services_with_healthcheck_overrides().await?;
         let mut entries = Vec::with_capacity(rows.len());
         for row in &rows {
             let container_name = match self.healthcheck_target(row) {
@@ -521,6 +572,70 @@ impl ExternalServiceManager {
             "Loaded managed service healthcheck overrides"
         );
         Ok(count)
+    }
+
+    /// Every service row with at least one healthcheck override (none on a
+    /// default install).
+    async fn services_with_healthcheck_overrides(
+        &self,
+    ) -> Result<Vec<external_services::Model>, ExternalServiceError> {
+        Ok(external_services::Entity::find()
+            .filter(
+                Condition::any()
+                    .add(external_services::Column::HealthcheckIntervalSecs.is_not_null())
+                    .add(external_services::Column::HealthcheckStartIntervalSecs.is_not_null())
+                    .add(external_services::Column::HealthcheckStartPeriodSecs.is_not_null())
+                    .add(external_services::Column::HealthcheckTimeoutSecs.is_not_null())
+                    .add(external_services::Column::HealthcheckRetries.is_not_null()),
+            )
+            .all(self.db.as_ref())
+            .await?)
+    }
+
+    /// Refuse an instance default that would no longer combine with the
+    /// overrides a service already has: the service's next container would
+    /// otherwise set them aside. Call it holding [`HEALTHCHECK_WRITES`], so
+    /// no override is saved between this check and the default's save.
+    pub(crate) async fn check_instance_default_against_services(
+        &self,
+        instance: &HealthcheckOverrides,
+    ) -> Result<(), ExternalServiceError> {
+        let mut conflicts = Vec::new();
+        for row in self.services_with_healthcheck_overrides().await? {
+            let engine = match self.healthcheck_target(&row) {
+                Ok(target) => target.engine,
+                Err(error) => {
+                    warn!(
+                        service_id = row.id,
+                        %error,
+                        "Could not classify a service with healthcheck overrides; not checking \
+                         the instance default against them"
+                    );
+                    None
+                }
+            };
+            let Some(engine) = engine else { continue };
+            let resolved = healthcheck::resolve(
+                &service_overrides(&row),
+                instance,
+                &HealthcheckTimings::builtin(engine),
+            );
+            if let Err(source) = resolved.validate(healthcheck::readiness_wait_secs(engine)) {
+                conflicts.push((row.id, row.name, source));
+            }
+        }
+        let others = conflicts.len().saturating_sub(1);
+        match conflicts.into_iter().next() {
+            None => Ok(()),
+            Some((service_id, name, source)) => Err(
+                ExternalServiceError::HealthcheckDefaultConflictsWithService {
+                    service_id,
+                    name,
+                    source,
+                    others,
+                },
+            ),
+        }
     }
 }
 

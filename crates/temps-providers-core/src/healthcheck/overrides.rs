@@ -149,6 +149,21 @@ pub enum HealthcheckValidationError {
         interval_secs: u32,
         interval_source: HealthcheckSource,
     },
+    #[error(
+        "healthcheck start_period_secs ({start_period_secs}s, from {start_period_source}) plus \
+         interval_secs ({interval_secs}s, from {interval_source}) must not exceed \
+         {readiness_wait_secs}s, how long Temps waits for this engine's container to become \
+         healthy, unless the start period alone covers that wait: after the start period Docker \
+         checks only once per interval, so a container still starting would be seen too late \
+         and every create, upgrade and restore would time out"
+    )]
+    StartPeriodTooShortForInterval {
+        start_period_secs: u32,
+        start_period_source: HealthcheckSource,
+        interval_secs: u32,
+        interval_source: HealthcheckSource,
+        readiness_wait_secs: u32,
+    },
 }
 
 /// Where an effective healthcheck value comes from.
@@ -191,10 +206,21 @@ pub struct ResolvedHealthcheck {
 }
 
 impl ResolvedHealthcheck {
-    /// Check the combination: the timeout must be shorter than the interval.
-    /// Each value is already within its bounds when it came from a validated
-    /// override or a built-in default.
-    pub fn validate(&self) -> Result<(), HealthcheckValidationError> {
+    /// Check the combination, for an engine whose readiness waits give a new
+    /// container `readiness_wait_secs` to become healthy. Each value is
+    /// already within its bounds when it came from a validated override or a
+    /// built-in default.
+    ///
+    /// * The timeout must be shorter than the interval, or checks overlap.
+    /// * A check must land inside the readiness wait. Docker checks every
+    ///   start interval inside the start period, and once per interval after
+    ///   it, so the start period covers the wait, or the start period plus
+    ///   one interval fits in it, or the interval is no longer than the start
+    ///   interval (checks never slow down). Otherwise a container that takes
+    ///   longer to start than the start period is first checked after the
+    ///   wait gave up (with a start period of 0, the first check comes one
+    ///   full interval after start).
+    pub fn validate(&self, readiness_wait_secs: u32) -> Result<(), HealthcheckValidationError> {
         let t = &self.timings;
         if t.timeout_secs >= t.interval_secs {
             return Err(HealthcheckValidationError::TimeoutNotShorterThanInterval {
@@ -202,6 +228,18 @@ impl ResolvedHealthcheck {
                 timeout_source: self.sources.timeout_secs,
                 interval_secs: t.interval_secs,
                 interval_source: self.sources.interval_secs,
+            });
+        }
+        let covered = t.start_period_secs >= readiness_wait_secs
+            || t.start_period_secs.saturating_add(t.interval_secs) <= readiness_wait_secs
+            || t.interval_secs <= t.start_interval_secs;
+        if !covered {
+            return Err(HealthcheckValidationError::StartPeriodTooShortForInterval {
+                start_period_secs: t.start_period_secs,
+                start_period_source: self.sources.start_period_secs,
+                interval_secs: t.interval_secs,
+                interval_source: self.sources.interval_secs,
+                readiness_wait_secs,
             });
         }
         Ok(())
@@ -270,6 +308,9 @@ mod tests {
     fn builtin() -> HealthcheckTimings {
         HealthcheckTimings::builtin(ManagedEngine::Rustfs)
     }
+
+    /// How long RustFS's readiness wait gives a new container.
+    const RUSTFS_WAIT: u32 = 60;
 
     fn all(value: u32) -> HealthcheckOverrides {
         HealthcheckOverrides {
@@ -419,7 +460,7 @@ mod tests {
                 ..Default::default()
             };
             let error = resolve(&service, &instance, &builtin())
-                .validate()
+                .validate(RUSTFS_WAIT)
                 .unwrap_err();
             assert_eq!(
                 error,
@@ -440,7 +481,10 @@ mod tests {
             timeout_secs: Some(9),
             ..Default::default()
         };
-        assert_eq!(resolve(&service, &instance, &builtin()).validate(), Ok(()));
+        assert_eq!(
+            resolve(&service, &instance, &builtin()).validate(RUSTFS_WAIT),
+            Ok(())
+        );
     }
 
     #[test]
@@ -463,9 +507,59 @@ mod tests {
             };
             assert_eq!(as_overrides.validate(), Ok(()), "{engine}");
             assert_eq!(
-                resolve(&Default::default(), &Default::default(), &builtin).validate(),
+                resolve(&Default::default(), &Default::default(), &builtin)
+                    .validate(crate::healthcheck::readiness_wait_secs(engine)),
                 Ok(()),
                 "{engine}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_check_must_land_inside_the_readiness_wait() {
+        let check = |start_period: u32, interval: u32| {
+            let instance = HealthcheckOverrides {
+                start_period_secs: Some(start_period),
+                interval_secs: Some(interval),
+                ..Default::default()
+            };
+            resolve(&Default::default(), &instance, &builtin()).validate(RUSTFS_WAIT)
+        };
+        // The start period covers the whole wait: any interval is fine.
+        assert_eq!(check(60, 3600), Ok(()));
+        assert_eq!(check(600, 600), Ok(()));
+        // A shorter start period plus one interval still fits in the wait.
+        assert_eq!(check(0, 60), Ok(()));
+        assert_eq!(check(30, 30), Ok(()));
+        // The first check after the start period comes after the wait.
+        // Checking as often as while starting needs no start period.
+        let never_slower = HealthcheckOverrides {
+            start_period_secs: Some(0),
+            start_interval_secs: Some(10),
+            interval_secs: Some(10),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve(&never_slower, &Default::default(), &builtin()).validate(5),
+            Ok(())
+        );
+        for (start_period, interval) in [(0, 61), (0, 120), (10, 120), (55, 10)] {
+            let error = check(start_period, interval).unwrap_err();
+            assert_eq!(
+                error,
+                HealthcheckValidationError::StartPeriodTooShortForInterval {
+                    start_period_secs: start_period,
+                    start_period_source: InstanceDefault,
+                    interval_secs: interval,
+                    interval_source: InstanceDefault,
+                    readiness_wait_secs: RUSTFS_WAIT,
+                },
+                "{start_period}+{interval}"
+            );
+            let message = error.to_string();
+            assert!(
+                message.contains("start_period_secs") && message.contains("60s"),
+                "{message}"
             );
         }
     }

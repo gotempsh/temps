@@ -124,21 +124,36 @@ function fieldSchema(spec: HealthcheckFieldSpec) {
     )
 }
 
+/** What an empty field falls back to for one engine, and how long that
+ * engine's readiness wait gives a new container to become healthy. */
+export interface InheritedHealthcheck {
+  timings: HealthcheckTimings
+  readinessWaitSecs: number
+}
+
 /**
  * The override form's schema. `inherited` is what an empty field falls back
- * to, one entry per engine the values apply to: the timeout must stay
- * shorter than the interval for every one of them, as the server checks.
+ * to, one entry per engine the values apply to. For every one of them, as
+ * the server checks: the timeout stays shorter than the interval, and a
+ * check lands inside the engine's readiness wait (the start period covers
+ * it, the start period plus one interval fits in it, or the interval is no
+ * longer than the start interval).
  */
-export function healthcheckFormSchema(inherited: HealthcheckTimings[]) {
+export function healthcheckFormSchema(inherited: InheritedHealthcheck[]) {
   const shape = Object.fromEntries(
     HEALTHCHECK_FIELDS.map((spec) => [spec.field, fieldSchema(spec)])
   ) as Record<HealthcheckField, ReturnType<typeof fieldSchema>>
   return z.object(shape).superRefine((values, ctx) => {
     const overrides = overridesOf(values)
-    for (const base of inherited) {
+    for (const { timings: base, readinessWaitSecs: wait } of inherited) {
       const interval = overrides.interval_secs ?? base.interval_secs
       const timeout = overrides.timeout_secs ?? base.timeout_secs
-      if (Number.isNaN(interval) || Number.isNaN(timeout)) return
+      const startPeriod = overrides.start_period_secs ?? base.start_period_secs
+      const startInterval =
+        overrides.start_interval_secs ?? base.start_interval_secs
+      if ([interval, timeout, startPeriod, startInterval].some(Number.isNaN)) {
+        return
+      }
       if (timeout >= interval) {
         ctx.addIssue({
           code: 'custom',
@@ -147,6 +162,21 @@ export function healthcheckFormSchema(inherited: HealthcheckTimings[]) {
               ? ['timeout_secs']
               : ['interval_secs'],
           message: `Timeout (${timeout}s) must be shorter than the interval (${interval}s)`,
+        })
+        return
+      }
+      const covered =
+        startPeriod >= wait ||
+        startPeriod + interval <= wait ||
+        interval <= startInterval
+      if (!covered) {
+        ctx.addIssue({
+          code: 'custom',
+          path:
+            overrides.start_period_secs !== null
+              ? ['start_period_secs']
+              : ['interval_secs'],
+          message: `Start period (${startPeriod}s) plus interval (${interval}s) must fit in the ${wait}s Temps waits for a new container to become healthy, or the start period must cover it`,
         })
         return
       }

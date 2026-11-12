@@ -14,6 +14,7 @@ mod crud;
 mod env_vars;
 mod health;
 mod healthcheck;
+pub(crate) use healthcheck::HEALTHCHECK_WRITES;
 mod import;
 mod lifecycle;
 mod managed_s3;

@@ -383,6 +383,7 @@ impl TempsPlugin for ProvidersPlugin {
             crate::handlers::server_tls_handlers::configure_routes().with_state(app_state.clone());
         let healthcheck_defaults = Arc::new(crate::services::HealthcheckDefaultsService::new(
             context.require_service::<temps_config::ConfigService>(),
+            app_state.external_service_manager.clone(),
         ));
         let healthcheck_routes = crate::handlers::healthcheck_handlers::configure_routes()
             .with_state(Arc::new(

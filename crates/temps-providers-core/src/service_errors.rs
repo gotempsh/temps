@@ -405,6 +405,30 @@ pub enum ExternalServiceError {
         operation: &'static str,
         reason: String,
     },
+    /// The new instance default would no longer combine with the overrides
+    /// a service already has, so its next container would silently drop
+    /// them.
+    #[error(
+        "The healthcheck instance default would make the overrides of service {service_id} \
+         ('{name}') invalid: {source}{others}. Change or clear those overrides first.",
+        others = more_services(*others)
+    )]
+    HealthcheckDefaultConflictsWithService {
+        service_id: i32,
+        name: String,
+        #[source]
+        source: crate::healthcheck::HealthcheckValidationError,
+        /// How many other services would be affected too.
+        others: usize,
+    },
+}
+
+fn more_services(others: usize) -> String {
+    match others {
+        0 => String::new(),
+        1 => " (and 1 other service)".to_string(),
+        n => format!(" (and {n} other services)"),
+    }
 }
 
 fn healthcheck_target(service_id: Option<i32>) -> String {
@@ -566,6 +590,7 @@ pub fn worker_node_required(error: &ExternalServiceError) -> Option<Problem> {
         | E::ClusterMemberLimitExceeded { .. }
         | E::InvalidHealthcheck { .. }
         | E::HealthcheckUnsupported { .. }
+        | E::HealthcheckDefaultConflictsWithService { .. }
         | E::ClusterMemberProvisioning { .. }
         | E::ClusterNotSettled { .. }
         | E::ClusterBusy { .. }

@@ -13162,6 +13162,11 @@ export type EngineHealthcheckDefault = {
      */
     effective: ResolvedHealthcheck;
     engine: ManagedEngine;
+    /**
+     * How long Temps waits for a new container of this engine to become
+     * healthy; a check has to land inside it.
+     */
+    readiness_wait_secs: number;
 };
 
 /**
@@ -30792,10 +30797,22 @@ export type ServiceHealthcheck = {
      */
     overrides: HealthcheckOverrides;
     /**
+     * Why this service's overrides are set aside: they no longer combine
+     * with the instance default, so `effective` is what the container gets
+     * without them. Change or clear them to use them again.
+     */
+    overrides_ignored_reason?: string | null;
+    /**
      * The running container differs from `effective` (as this host's
-     * Docker would store it) until it is recreated.
+     * Docker would store it) until it is recreated. `false` when either is
+     * unknown.
      */
     pending_recreate: boolean;
+    /**
+     * How long Temps waits for a new container of this engine to become
+     * healthy; a check has to land inside it.
+     */
+    readiness_wait_secs?: number | null;
     running?: HealthcheckTimings | null;
     service_id: number;
     service_name: string;
@@ -53473,7 +53490,7 @@ export type UpdateHealthcheckDefaultsData = {
 
 export type UpdateHealthcheckDefaultsErrors = {
     /**
-     * A value is out of range or the timeout is not shorter than the interval
+     * A value is out of range, the timeout is not shorter than the interval, or no check would land inside an engine's readiness wait
      */
     400: ProblemDetails;
     /**
@@ -53484,6 +53501,10 @@ export type UpdateHealthcheckDefaultsErrors = {
      * Insufficient permissions
      */
     403: ProblemDetails;
+    /**
+     * The default would make a service's existing overrides invalid
+     */
+    409: ProblemDetails;
     /**
      * Internal server error
      */
@@ -54343,7 +54364,7 @@ export type UpdateServiceHealthcheckData = {
 
 export type UpdateServiceHealthcheckErrors = {
     /**
-     * A value is out of range or the timeout is not shorter than the interval
+     * A value is out of range, the timeout is not shorter than the interval, or no check would land inside the engine's readiness wait
      */
     400: ProblemDetails;
     /**
@@ -54405,7 +54426,7 @@ export type ApplyServiceHealthcheckErrors = {
      */
     404: ProblemDetails;
     /**
-     * Temps cannot recreate this container from here, or the recreate was refused to protect its data
+     * Temps will not recreate this container from here (not running, local workloads disabled, a cluster, worker or imported container), or the recreate was refused to protect its data
      */
     409: ProblemDetails;
     /**
