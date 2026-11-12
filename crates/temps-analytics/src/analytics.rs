@@ -264,7 +264,8 @@ pub const MAX_ENRICHMENT_KEYS: usize = 128;
 /// inside the bound, so its page number is lower than the true one.
 /// `is_entry` and `is_bounce` stay exact, and so do the detail's entry, exit
 /// and bounce rates: lookups bounded by the session's own lifetime cover the
-/// page views outside the bound (see [`ANALYTICS_ROW_CLOCK_SLACK_HOURS`]).
+/// page views outside the bound (see [`ANALYTICS_ROW_CLOCK_SLACK_HOURS`],
+/// including its limit for older keyed sessions).
 const PAGE_VISITORS_SESSION_LOOKBACK_HOURS: i64 = 24;
 
 /// How far past the requested window `get_page_path_visitors` reads a
@@ -280,11 +281,23 @@ const PAGE_VISITORS_SESSION_LOOKAHEAD_MINUTES: i64 = 30;
 /// session. The proxy re-issues the session cookie (`Max-Age` = the session
 /// timeout, 30 minutes by default) only on the tracked document responses that
 /// also move `last_accessed_at`, so a browser stops sending a session id within
-/// that timeout of the session's last recorded access. The gaps are therefore
-/// the session timeout, batch-writer delay and clock skew between proxy nodes
+/// that timeout of the session's last recorded access. Keyed (SDK) sessions are
+/// not proxied; event ingest moves their `last_accessed_at` forward at least
+/// every few minutes of activity (`SESSION_LAST_ACCESS_REFRESH_SECONDS` in
+/// `temps-analytics-events`). The gaps are therefore the session timeout, that
+/// refresh interval, batch-writer delay and clock skew between proxy nodes
 /// and the control plane; a day is far beyond them. Used as a time bound so
 /// TimescaleDB skips chunks (including compressed ones, which cannot use the
 /// visitor or session index) that cannot hold the rows.
+///
+/// Keyed sessions ingested before that refresh existed kept the time of their
+/// first event in `last_accessed_at`. For one of those that stayed active for
+/// more than a day, page views later than a day after its first event are
+/// not seen by the lookups past a window: its exit and bounce come from the
+/// events inside the read bound, as if the session ended there, and its last
+/// page view in the bound gets the fallback time on page (the 1s floor in the
+/// visitors list, 30s in the detail average). It goes away as event
+/// retention removes those sessions' events.
 const ANALYTICS_ROW_CLOCK_SLACK_HOURS: i32 = 24;
 
 /// `ts` minus [`ANALYTICS_ROW_CLOCK_SLACK_HOURS`], saturated at the minimum
@@ -321,7 +334,8 @@ fn earliest_row_time(ts: UtcDateTime) -> UtcDateTime {
 ///     exit page (no next event), then a 1s floor.
 /// is_entry / is_exit / is_bounce also account for the session's page
 /// views before $8 and after $9 (existence checks bounded by the session's
-/// own lifetime, see [`ANALYTICS_ROW_CLOCK_SLACK_HOURS`]), so they are
+/// own lifetime, see [`ANALYTICS_ROW_CLOCK_SLACK_HOURS`], including its limit
+/// for older keyed sessions), so they are
 /// exact; session_page_number counts page views from $8 (see
 /// [`PAGE_VISITORS_SESSION_LOOKBACK_HOURS`]).
 ///
@@ -989,7 +1003,9 @@ fn page_path_visitors_context_bounds(
 ///      ([`ANALYTICS_ROW_CLOCK_SLACK_HOURS`]), so it reads only the chunks the
 ///      session spans; a session without a request_sessions row falls back to
 ///      `$8` hours around the bound. Entry, exit and bounce are therefore
-///      exact, as if the session's whole life had been read.
+///      exact, as if the session's whole life had been read (except for the
+///      older keyed sessions described at
+///      [`ANALYTICS_ROW_CLOCK_SLACK_HOURS`]).
 ///   5. Visitor and session totals are aggregated separately and joined as
 ///      one row each. The previous query cross-joined an inlined session
 ///      aggregate with every page view, and the planner re-ran that aggregate

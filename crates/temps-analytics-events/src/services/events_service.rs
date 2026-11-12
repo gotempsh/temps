@@ -1974,7 +1974,23 @@ WHERE project_id = $1
                     );
                 }
                 Ok(Some(ref session)) if session.visitor_id.is_some() => {
-                    // Row exists with visitor_id already populated — nothing to do.
+                    // Row exists with visitor_id already populated. Keep its
+                    // last_accessed_at following the session's events: keyed
+                    // (SDK) sessions never pass through the proxy, so nothing
+                    // else moves it after the first event.
+                    let now = chrono::Utc::now();
+                    if session_last_access_is_stale(session.last_accessed_at, now) {
+                        if let Err(e) = self.refresh_session_last_access(session_id_str, now).await
+                        {
+                            tracing::warn!(
+                                session_id = %session_id_str,
+                                project_id,
+                                error = %e,
+                                "Failed to refresh request_sessions.last_accessed_at; \
+                                 the event still records"
+                            );
+                        }
+                    }
                 }
                 Ok(maybe_session) => {
                     // Row is missing (None) OR exists with visitor_id = NULL.
@@ -2394,6 +2410,51 @@ WHERE project_id = $1
         self.db.execute(stmt).await.map_err(EventsError::Database)?;
         Ok(())
     }
+
+    /// Moves an existing session row's `last_accessed_at` forward to `now`.
+    /// The `WHERE` makes a concurrent refresh of the same session a no-op and
+    /// never moves the value backwards.
+    async fn refresh_session_last_access(
+        &self,
+        session_id: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), EventsError> {
+        use sea_orm::ConnectionTrait;
+
+        let stmt = Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            r#"UPDATE request_sessions
+               SET last_accessed_at = $2
+               WHERE session_id = $1 AND last_accessed_at < $2"#,
+            [session_id.to_string().into(), now.into()],
+        );
+
+        self.db.execute(stmt).await.map_err(EventsError::Database)?;
+        Ok(())
+    }
+}
+
+/// How stale an existing session row's `last_accessed_at` may get before an
+/// ingested event of that session moves it forward.
+///
+/// The proxy moves `last_accessed_at` on the document responses it tracks, but
+/// keyed (SDK) sessions are not proxied, so without this a continuously active
+/// keyed session would keep the time of its first event for days. Page-flow
+/// analytics bound their reads by the session's `[started_at,
+/// last_accessed_at]` plus a day of slack (`ANALYTICS_ROW_CLOCK_SLACK_HOURS` in
+/// `temps-analytics`), so this interval must stay far below a day. It also
+/// caps the write rate at one small `UPDATE` per active session per interval,
+/// instead of one per event.
+const SESSION_LAST_ACCESS_REFRESH_SECONDS: i64 = 5 * 60;
+
+/// Whether an event ingested at `now` should move a session row's
+/// `last_accessed_at` forward (see [`SESSION_LAST_ACCESS_REFRESH_SECONDS`]).
+fn session_last_access_is_stale(
+    last_accessed_at: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    now.signed_duration_since(last_accessed_at)
+        > chrono::Duration::seconds(SESSION_LAST_ACCESS_REFRESH_SECONDS)
 }
 
 /// Computes the percentage change between two visitor counts for the dashboard
@@ -5861,7 +5922,9 @@ mod tests {
     /// Regression test: `record_event` must self-heal the `request_sessions`
     /// table when the proxy's async `ProxyLogBatchWriter` hasn't flushed the
     /// session row yet (timing miss), or when it created one with
-    /// `visitor_id = NULL` due to a prior FK-cache failure.
+    /// `visitor_id = NULL` due to a prior FK-cache failure, and must keep an
+    /// existing row's `last_accessed_at` following the session's events
+    /// (throttled by `SESSION_LAST_ACCESS_REFRESH_SECONDS`).
     ///
     /// Without this fix:
     ///  - `get_visitor_sessions_by_id` (LEFT JOIN on rs.id, decoded into a
@@ -6127,7 +6190,110 @@ mod tests {
             "orphaned request_sessions.visitor_id must be backfilled by record_event"
         );
 
+        // ── Case (c): a complete row keeps following the session's events ────
+        // A keyed (SDK) session is never proxied, so only event ingest can move
+        // its last_accessed_at. Age the row created in case (a) by three days.
+        let aged = chrono::Utc::now() - chrono::Duration::days(3);
+        request_sessions::ActiveModel {
+            id: Set(created_session.id),
+            last_accessed_at: Set(aged),
+            ..Default::default()
+        }
+        .update(db.as_ref())
+        .await
+        .expect("Failed to age the request_sessions row");
+
+        let record_on_fresh_session = |path: &'static str| {
+            service.record_event(
+                project.id,
+                Some(environment.id),
+                Some(deployment.id),
+                Some(fresh_session_id.clone()),
+                Some(fresh_visitor_id.clone()),
+                "page_view",
+                serde_json::json!({}),
+                path,
+                "",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        };
+        let before_refresh = chrono::Utc::now();
+        record_on_fresh_session("/later")
+            .await
+            .expect("record_event must succeed for a session with a stale row");
+        let refreshed = request_sessions::Entity::find()
+            .filter(request_sessions::Column::SessionId.eq(fresh_session_id.clone()))
+            .one(db.as_ref())
+            .await
+            .expect("query refreshed session")
+            .expect("refreshed request_sessions row must still exist");
+        assert!(
+            refreshed.last_accessed_at >= before_refresh,
+            "a stale last_accessed_at ({aged}) must move to the event's time, got {}",
+            refreshed.last_accessed_at
+        );
+        assert_eq!(
+            refreshed.started_at, created_session.started_at,
+            "refreshing last_accessed_at must leave started_at alone"
+        );
+
+        // ── Case (d): a recently refreshed row is not written again ──────────
+        record_on_fresh_session("/later/again")
+            .await
+            .expect("record_event must succeed for a recently refreshed session");
+        let unchanged = request_sessions::Entity::find()
+            .filter(request_sessions::Column::SessionId.eq(fresh_session_id.clone()))
+            .one(db.as_ref())
+            .await
+            .expect("query recently refreshed session")
+            .expect("request_sessions row must still exist");
+        assert_eq!(
+            unchanged.last_accessed_at, refreshed.last_accessed_at,
+            "an event within the refresh interval must not rewrite last_accessed_at"
+        );
+
         println!("✅ record_event session-race regression test passed!");
+    }
+
+    #[test]
+    fn test_session_last_access_is_stale_boundaries() {
+        let now = chrono::Utc::now();
+        let interval = chrono::Duration::seconds(SESSION_LAST_ACCESS_REFRESH_SECONDS);
+        assert!(!session_last_access_is_stale(now, now));
+        assert!(!session_last_access_is_stale(now - interval, now));
+        assert!(session_last_access_is_stale(
+            now - interval - chrono::Duration::seconds(1),
+            now
+        ));
+        assert!(session_last_access_is_stale(
+            now - chrono::Duration::days(3),
+            now
+        ));
+        // A row stamped ahead of this node's clock is left alone.
+        assert!(!session_last_access_is_stale(
+            now + chrono::Duration::minutes(10),
+            now
+        ));
+        assert!(
+            interval < chrono::Duration::hours(1),
+            "the refresh interval must stay far below the analytics row clock slack (a day)"
+        );
     }
 
     /// Regression test for the dashboard "visitors in last 24h" trend badge showing
