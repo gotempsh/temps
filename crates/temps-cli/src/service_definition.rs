@@ -238,7 +238,7 @@ pub(crate) fn probe(locations: &ServiceLocations) -> Vec<ServiceProbe> {
     if let Some(unit) = &locations.systemd_unit {
         probes.push(probe_file(unit, |contents| {
             let mut sources = vec![(unit.clone(), contents)];
-            sources.extend(read_drop_ins(unit)?);
+            sources.extend(read_drop_ins(unit, &drop_in_roots(unit))?);
             Ok(systemd_definition(unit, &sources))
         }));
     }
@@ -347,29 +347,71 @@ fn check_not_writable_by_others(_metadata: &std::fs::Metadata) -> Result<(), Str
     Ok(())
 }
 
-/// `<unit>.d/*.conf`, in the lexical order systemd applies them.
-fn read_drop_ins(unit: &Path) -> Result<Vec<(PathBuf, String)>, String> {
-    let mut dir = unit.as_os_str().to_owned();
-    dir.push(".d");
-    let dir = PathBuf::from(dir);
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => {
-            return Err(format!(
-                "its drop-in directory {} cannot be read: {error}",
-                dir.display()
-            ))
+/// The directories systemd looks for drop-ins in, highest priority first
+/// (systemd.unit(5)): `systemctl set-property` writes to `system.control`,
+/// `systemctl edit --runtime` to `/run/systemd/system`, and packages ship
+/// theirs under `/usr/lib`.
+const SYSTEMD_DROP_IN_ROOTS: [&str; 9] = [
+    "/etc/systemd/system.control",
+    "/run/systemd/system.control",
+    "/run/systemd/transient",
+    "/etc/systemd/system",
+    "/run/systemd/system",
+    "/usr/local/lib/systemd/system",
+    "/usr/lib/systemd/system",
+    "/lib/systemd/system",
+    "/run/systemd/generator.late",
+];
+
+/// Where to look for `unit`'s drop-ins: systemd's load paths for the unit
+/// the installer writes, else (a unit somewhere else, as in tests) only its
+/// own directory.
+fn drop_in_roots(unit: &Path) -> Vec<PathBuf> {
+    if unit == Path::new(SYSTEMD_UNIT_PATH) {
+        SYSTEMD_DROP_IN_ROOTS.iter().map(PathBuf::from).collect()
+    } else {
+        unit.parent().map(Path::to_path_buf).into_iter().collect()
+    }
+}
+
+/// `<root>/<unit>.d/*.conf` and `<root>/service.d/*.conf` across `roots`
+/// (highest priority first), merged as systemd does: a file name in a
+/// higher-priority directory hides the same name in a lower one, a drop-in
+/// linked to `/dev/null` masks it, and the rest apply in lexical order of
+/// file name.
+fn read_drop_ins(unit: &Path, roots: &[PathBuf]) -> Result<Vec<(PathBuf, String)>, String> {
+    let mut unit_dir = unit
+        .file_name()
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_default();
+    unit_dir.push(".d");
+    let mut chosen: BTreeMap<std::ffi::OsString, PathBuf> = BTreeMap::new();
+    for root in roots {
+        for dir in [root.join(&unit_dir), root.join("service.d")] {
+            let entries = match std::fs::read_dir(&dir) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "its drop-in directory {} cannot be read: {error}",
+                        dir.display()
+                    ))
+                }
+            };
+            for path in entries.flatten().map(|entry| entry.path()) {
+                if path.extension().is_some_and(|ext| ext == "conf") {
+                    if let Some(name) = path.file_name() {
+                        chosen.entry(name.to_os_string()).or_insert(path);
+                    }
+                }
+            }
         }
-    };
-    let mut paths: Vec<PathBuf> = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "conf"))
-        .collect();
-    paths.sort();
+    }
     let mut drop_ins = Vec::new();
-    for path in paths {
+    for path in chosen.into_values() {
+        if std::fs::canonicalize(&path).is_ok_and(|target| target == Path::new("/dev/null")) {
+            continue;
+        }
         match read_trusted(&path) {
             Ok(Some(contents)) => drop_ins.push((path, contents)),
             Ok(None) => {}
@@ -390,6 +432,7 @@ struct SystemdService {
     load_credentials: Vec<String>,
     working_directory: Option<String>,
     user: Option<String>,
+    unset_environment: Vec<String>,
 }
 
 /// Apply the unit and its drop-ins in order, as systemd does: a later
@@ -428,6 +471,7 @@ fn parse_systemd_service(sources: &[(PathBuf, String)]) -> SystemdService {
                 "Environment" => &mut service.environment,
                 "EnvironmentFile" => &mut service.environment_files,
                 "LoadCredential" => &mut service.load_credentials,
+                "UnsetEnvironment" => &mut service.unset_environment,
                 _ => continue,
             };
             if value.is_empty() {
@@ -563,6 +607,25 @@ fn systemd_definition(unit: &Path, sources: &[(PathBuf, String)]) -> ServiceDefi
                 .ok_or_else(|| "root's home directory could not be found".to_string()),
         },
     };
+    // UnsetEnvironment= is applied last, to the whole environment: `NAME`
+    // removes the variable, `NAME=VALUE` only that exact assignment. A HOME
+    // it removes still leaves `dirs::home_dir` the account's.
+    for entry in service
+        .unset_environment
+        .iter()
+        .flat_map(|value| split_words(&specifiers(value)))
+    {
+        match entry.split_once('=') {
+            Some((key, value)) => {
+                if environment.get(key).is_some_and(|set| set == value) {
+                    environment.remove(key);
+                }
+            }
+            None => {
+                environment.remove(&entry);
+            }
+        }
+    }
 
     let cwd = match service.working_directory.as_deref().map(specifiers) {
         None => Ok(PathBuf::from("/")),
@@ -969,25 +1032,120 @@ fn expand_variables(
     out
 }
 
-/// `KEY=VALUE` lines of an `EnvironmentFile=`: `#`/`;` comments, optional
-/// single or double quotes around the value, `\` continuations.
+/// The assignments of an `EnvironmentFile=`, read with systemd's own rules
+/// for that format (`parse_env_file`), which differ from unit files':
+/// - `#`/`;` start a comment only at the start of a line;
+/// - unquoted, `\x` is `x`, a trailing `\` joins the next line (with no
+///   space), and trailing whitespace is dropped;
+/// - `'...'` is literal;
+/// - in `"..."` only `\"`, `\\`, `` \` `` and `\$` are escapes, others keep
+///   their backslash.
 fn parse_environment_file(contents: &str) -> Vec<(String, String)> {
-    logical_lines(contents)
-        .into_iter()
-        .filter_map(|line| {
-            let (key, value) = line.trim().split_once('=')?;
-            let key = key.trim();
-            if key.is_empty() || key.contains(char::is_whitespace) {
-                return None;
+    #[derive(Clone, Copy)]
+    enum State {
+        PreKey,
+        Key,
+        PreValue,
+        Value,
+        ValueEscape,
+        Single,
+        Double,
+        DoubleEscape,
+        Comment,
+        CommentEscape,
+    }
+    let mut assignments = Vec::new();
+    let mut state = State::PreKey;
+    let mut key = String::new();
+    let mut value = String::new();
+    // Length of `value` up to its last character that is not unquoted,
+    // unescaped trailing whitespace.
+    let mut significant = 0;
+    let mut finish = |key: &mut String, value: &mut String, significant: &mut usize| {
+        value.truncate(*significant);
+        let name = key.trim_end();
+        if !name.is_empty() && !name.contains(char::is_whitespace) {
+            assignments.push((name.to_string(), std::mem::take(value)));
+        }
+        key.clear();
+        value.clear();
+        *significant = 0;
+    };
+    for c in contents.chars() {
+        state = match (state, c) {
+            (State::PreKey, '#' | ';') => State::Comment,
+            (State::PreKey, c) if c.is_whitespace() => State::PreKey,
+            (State::PreKey, c) => {
+                key.push(c);
+                State::Key
             }
-            let value = value.trim();
-            let value = match split_words(value).as_slice() {
-                [single] if value.starts_with(['"', '\'']) => single.clone(),
-                _ => value.to_string(),
-            };
-            Some((key.to_string(), value))
-        })
-        .collect()
+            (State::Key, '\n') => {
+                key.clear();
+                State::PreKey
+            }
+            (State::Key, '=') => State::PreValue,
+            (State::Key, c) => {
+                key.push(c);
+                State::Key
+            }
+            (State::PreValue | State::Value, '\n') => {
+                finish(&mut key, &mut value, &mut significant);
+                State::PreKey
+            }
+            (State::PreValue, '\'') => State::Single,
+            (State::PreValue, '"') => State::Double,
+            (State::PreValue | State::Value, '\\') => State::ValueEscape,
+            (State::PreValue, c) if c.is_whitespace() => State::PreValue,
+            (State::PreValue | State::Value, c) => {
+                value.push(c);
+                if !c.is_whitespace() {
+                    significant = value.len();
+                }
+                State::Value
+            }
+            (State::ValueEscape, '\n') => State::Value,
+            (State::ValueEscape, c) => {
+                value.push(c);
+                significant = value.len();
+                State::Value
+            }
+            (State::Single, '\'') => State::PreValue,
+            (State::Single, c) => {
+                value.push(c);
+                significant = value.len();
+                State::Single
+            }
+            (State::Double, '"') => State::PreValue,
+            (State::Double, '\\') => State::DoubleEscape,
+            (State::Double, c) => {
+                value.push(c);
+                significant = value.len();
+                State::Double
+            }
+            (State::DoubleEscape, '\n') => State::Double,
+            (State::DoubleEscape, c) => {
+                if !matches!(c, '"' | '\\' | '`' | '$') {
+                    value.push('\\');
+                }
+                value.push(c);
+                significant = value.len();
+                State::Double
+            }
+            (State::Comment, '\\') => State::CommentEscape,
+            (State::Comment, '\n') => State::PreKey,
+            (State::Comment, _) | (State::CommentEscape, _) => State::Comment,
+        };
+    }
+    match state {
+        State::PreValue
+        | State::Value
+        | State::ValueEscape
+        | State::Single
+        | State::Double
+        | State::DoubleEscape => finish(&mut key, &mut value, &mut significant),
+        State::PreKey | State::Key | State::Comment | State::CommentEscape => {}
+    }
+    assignments
 }
 
 fn launchd_definition(agent: &Path, contents: &str, home: Option<&Path>) -> ServiceDefinition {

@@ -197,7 +197,9 @@ fn installed_server(database: &ResolvedDatabaseUrl) -> InstalledServer<'_> {
         return InstalledServer::Other;
     };
     match &service.database_url {
-        Ok(Some((url, _))) if url == database.url() => InstalledServer::Serving(service),
+        Ok(Some((url, _))) if crate::database_url_source::same_database(url, database.url()) => {
+            InstalledServer::Serving(service)
+        }
         Ok(_) => InstalledServer::Other,
         Err(reason) => InstalledServer::Unknown { service, reason },
     }
@@ -742,5 +744,35 @@ mod tests {
             "{error}"
         );
         assert!(!error.to_string().contains(KEY), "{error}");
+    }
+
+    #[test]
+    fn the_servers_database_spelled_differently_still_gets_the_servers_key_rules() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("data");
+        let unit = root.path().join("temps.service");
+        write(
+            &unit,
+            &format!(
+                "[Service]\nExecStart=/usr/bin/temps serve --database-url={URL} --data-dir={}\n",
+                data.display()
+            ),
+        );
+        // `postgres://` and an explicit default port: the same database.
+        let database = resolve(
+            &unit,
+            Some("postgres://temps:s3cr3t-pw@127.0.0.1:5432/temps"),
+        );
+        assert_eq!(service_data_dir(&database).unwrap(), Some(data.clone()));
+        std::fs::create_dir_all(&data).unwrap();
+        let error = encryption_key_in(&data, &database, Vec::new()).unwrap_err();
+        assert!(
+            matches!(error, ServerSecretsError::KeyNotCreated { .. }),
+            "{error}"
+        );
+        assert!(
+            !data.join(temps_config::ENCRYPTION_KEY_FILE).exists(),
+            "a key was created"
+        );
     }
 }

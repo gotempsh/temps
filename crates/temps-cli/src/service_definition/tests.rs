@@ -588,3 +588,117 @@ fn words_split_like_systemd() {
         ]
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn drop_ins_merge_across_load_paths_as_systemd_does() {
+    let root = tempfile::tempdir().unwrap();
+    let low = root.path().join("usr-lib");
+    let high = root.path().join("run");
+    let unit = low.join("temps.service");
+    write(
+        &unit,
+        "[Service]\nExecStart=/usr/bin/temps serve --data-dir /base\n",
+    );
+    // The same name in a higher-priority directory hides the lower one.
+    write(
+        &low.join("temps.service.d/10-dir.conf"),
+        "[Service]\nExecStart=\nExecStart=/usr/bin/temps serve --data-dir /low\n",
+    );
+    write(
+        &high.join("temps.service.d/10-dir.conf"),
+        "[Service]\nExecStart=\nExecStart=/usr/bin/temps serve --data-dir /high\n",
+    );
+    // Type-level drop-ins apply to every service.
+    write(
+        &high.join("service.d/20-env.conf"),
+        "[Service]\nEnvironment=FROM_TYPE_DROP_IN=1\n",
+    );
+    // A drop-in linked to /dev/null masks the same name below it.
+    write(
+        &low.join("temps.service.d/30-masked.conf"),
+        "[Service]\nEnvironment=MASKED=1\n",
+    );
+    std::fs::create_dir_all(high.join("temps.service.d")).unwrap();
+    std::os::unix::fs::symlink("/dev/null", high.join("temps.service.d/30-masked.conf")).unwrap();
+
+    let mut sources = vec![(unit.clone(), std::fs::read_to_string(&unit).unwrap())];
+    sources.extend(read_drop_ins(&unit, &[high.clone(), low.clone()]).unwrap());
+    let definition = systemd_definition(&unit, &sources);
+    assert_eq!(
+        definition.data_dir,
+        Ok((PathBuf::from("/high"), DataDirLocation::CommandLine))
+    );
+    assert_eq!(definition.env("FROM_TYPE_DROP_IN"), Some("1"));
+    assert_eq!(definition.env("MASKED"), None);
+
+    // The installer's unit is read with systemd's load paths, runtime
+    // overrides included.
+    let roots = drop_in_roots(Path::new(SYSTEMD_UNIT_PATH));
+    for expected in ["/run/systemd/system", "/etc/systemd/system.control"] {
+        assert!(roots.contains(&PathBuf::from(expected)), "{roots:?}");
+    }
+}
+
+#[test]
+fn unset_environment_removes_what_the_server_does_not_get() {
+    let root = tempfile::tempdir().unwrap();
+    let url_file = root.path().join("database-url");
+    write(&url_file, &format!("{URL}\n"));
+    let unit = root.path().join("temps.service");
+    write(
+        &unit,
+        &format!(
+            "[Service]\nEnvironment=TEMPS_DATABASE_URL=postgres://old/db KEEP=a DROP_EXACT=b\n\
+             LoadCredential=temps_database_url:{}\n\
+             UnsetEnvironment=TEMPS_DATABASE_URL KEEP=other DROP_EXACT=b\n\
+             ExecStart=/usr/bin/temps serve\n",
+            url_file.display()
+        ),
+    );
+    let definition = found(probe(&systemd_at(&unit)));
+    assert_eq!(definition.url(), Some(URL));
+    assert_eq!(
+        definition
+            .database_url
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .1,
+        UrlLocation::Credential(url_file)
+    );
+    // `NAME=VALUE` removes only that exact assignment.
+    assert_eq!(definition.env("KEEP"), Some("a"));
+    assert_eq!(definition.env("DROP_EXACT"), None);
+}
+
+#[test]
+fn environment_files_use_their_own_escape_rules() {
+    let parsed = parse_environment_file(
+        "# comment\n\
+         TEMPS_DATA_DIR=/srv/temps\\ data\n\
+         SINGLE='kept\\as is'\n\
+         DOUBLE=\"a\\\"b\\\\c\\d\"\n\
+         JOINED=one\\\ntwo\n\
+         TRAILING=value   \n\
+         SPACED=  two words  \n\
+         HASH=#not-a-comment\n\
+         EMPTY=\n\
+         not an assignment\n",
+    );
+    assert_eq!(
+        parsed,
+        [
+            ("TEMPS_DATA_DIR", "/srv/temps data"),
+            ("SINGLE", "kept\\as is"),
+            ("DOUBLE", "a\"b\\c\\d"),
+            ("JOINED", "onetwo"),
+            ("TRAILING", "value"),
+            ("SPACED", "two words"),
+            ("HASH", "#not-a-comment"),
+            ("EMPTY", ""),
+        ]
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+    );
+}

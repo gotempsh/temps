@@ -131,7 +131,7 @@ instead of starting an app that cannot resolve its dependency hostnames.
 
 | Variable             | CLI Flag         | Default    | Description                  |
 | -------------------- | ---------------- | ---------- | ---------------------------- |
-| `TEMPS_DATABASE_URL` | `--database-url` | (required) | PostgreSQL connection string |
+| `TEMPS_DATABASE_URL` | `--database-url` | -- | PostgreSQL connection string. `serve`, `proxy` and `setup` need a database URL from this, the flag, `TEMPS_DATABASE_URL_FILE` or the `temps_database_url` credential |
 | `TEMPS_DATABASE_URL_FILE` | -- | -- | Path to a file whose content is the connection string. Used only when `TEMPS_DATABASE_URL` is not set |
 
 When neither variable is set, Temps also reads the systemd credential
@@ -151,6 +151,12 @@ agent `~/Library/LaunchAgents/dev.temps.temps.plist`, and say which file they
 used. With the server's database, a command that needs the encryption key reads
 it the way the server does (the service's `TEMPS_ENCRYPTION_KEY` /
 `TEMPS_ENCRYPTION_KEY_FILE`, else its data directory) and never creates one.
+A URL is the server's database when it names the same host, port and database
+as the service's URL: `postgres://` or `postgresql://`, an explicit default
+port, credentials and options such as `sslmode` do not matter, but `localhost`
+and `127.0.0.1` count as different hosts. With any other database, or when the
+service definition is ignored (`temps doctor` shows why), these commands
+resolve the key as `temps serve` would on this host, and may create one.
 If this shell sets any of `TEMPS_STATELESS`, `TEMPS_AUTH_SECRET`,
 `TEMPS_AUTH_SECRET_FILE`, `TEMPS_ENCRYPTION_KEY` or `TEMPS_ENCRYPTION_KEY_FILE`,
 the shell's settings replace all of the service's secret settings (to test an

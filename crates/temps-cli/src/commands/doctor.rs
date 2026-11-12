@@ -166,7 +166,11 @@ impl DoctorCommand {
                     ServiceProbe::Absent { .. } | ServiceProbe::Ignored { .. } => None,
                 })
             });
-        let (data_dir, data_dir_source) = self.resolve_data_dir(service.as_ref(), &probes);
+        let DoctorDataDir {
+            dir: data_dir,
+            source: data_dir_source,
+            unverified: data_dir_unverified,
+        } = self.resolve_data_dir(service.as_ref(), &probes);
 
         if let Some(DoctorScope::Mesh(args)) = &self.scope {
             let database_url = database
@@ -204,6 +208,7 @@ impl DoctorCommand {
         self.check_data_dir(
             &data_dir,
             &data_dir_source,
+            data_dir_unverified,
             service.as_ref(),
             SecretsEnvironment::choose(service.as_ref()),
             &mut report,
@@ -292,7 +297,7 @@ impl DoctorCommand {
         &self,
         service: Option<&ServiceDefinition>,
         probes: &[ServiceProbe],
-    ) -> (PathBuf, String) {
+    ) -> DoctorDataDir {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
         resolve_doctor_data_dir(self.data_dir.as_deref(), service, probes, &home)
     }
@@ -340,6 +345,7 @@ impl DoctorCommand {
         &self,
         data_dir: &Path,
         source: &str,
+        unverified: bool,
         service: Option<&ServiceDefinition>,
         secrets_env: SecretsEnvironment<'_>,
         report: &mut DiagnosticReport,
@@ -348,6 +354,18 @@ impl DoctorCommand {
             "Path",
             CheckResult::Info(format!("{} ({source})", data_dir.display())),
         );
+        // A guess, while an installed server exists: a pass below says
+        // nothing about the server's own files.
+        if unverified {
+            report.add(
+                "Server's data directory",
+                CheckResult::Warn(format!(
+                    "Unknown, so the checks below are for {}, which may not be the one the \
+                     installed server uses. Pass --data-dir with the server's data directory",
+                    data_dir.display()
+                )),
+            );
+        }
 
         if !data_dir.exists() {
             report.add(
@@ -1345,6 +1363,17 @@ pub(super) fn default_data_dir(home: &Path) -> PathBuf {
     }
 }
 
+/// The data directory doctor checks.
+#[derive(Debug)]
+struct DoctorDataDir {
+    dir: PathBuf,
+    /// Where the answer came from.
+    source: String,
+    /// The default layout guessed while an installed service exists whose
+    /// data directory could not be found: it may not be the server's.
+    unverified: bool,
+}
+
 /// Doctor's data directory and a description of where it came from:
 /// explicit, else the installed service's (what the server really uses),
 /// else the default layout.
@@ -1353,20 +1382,23 @@ fn resolve_doctor_data_dir(
     service: Option<&ServiceDefinition>,
     probes: &[ServiceProbe],
     home: &Path,
-) -> (PathBuf, String) {
+) -> DoctorDataDir {
     if let Some(dir) = explicit {
-        return (
-            dir.to_path_buf(),
-            "from --data-dir / TEMPS_DATA_DIR".to_string(),
-        );
+        return DoctorDataDir {
+            dir: dir.to_path_buf(),
+            source: "from --data-dir / TEMPS_DATA_DIR".to_string(),
+            unverified: false,
+        };
     }
+    let unverified = service.is_some() || ignored_probes(probes).next().is_some();
     let why_default = match service {
         Some(service) => match &service.data_dir {
             Ok((dir, location)) => {
-                return (
-                    dir.clone(),
-                    format!("from {} in {}", location.describe(), service.path.display()),
-                );
+                return DoctorDataDir {
+                    dir: dir.clone(),
+                    source: format!("from {} in {}", location.describe(), service.path.display()),
+                    unverified: false,
+                };
             }
             Err(reason) => format!(
                 "the data directory of {} is unknown ({reason}); pass --data-dir",
@@ -1382,10 +1414,11 @@ fn resolve_doctor_data_dir(
             None => "no --data-dir, TEMPS_DATA_DIR or installed service".to_string(),
         },
     };
-    (
-        default_data_dir(home),
-        format!("default layout: {why_default}"),
-    )
+    DoctorDataDir {
+        dir: default_data_dir(home),
+        source: format!("default layout: {why_default}"),
+        unverified,
+    }
 }
 
 fn ignored_probes(probes: &[ServiceProbe]) -> impl Iterator<Item = (&Path, &str)> {
@@ -1572,11 +1605,18 @@ fn geolite_result(data_dir: &Path, working_directory: Option<&Path>) -> CheckRes
     if let Some(found) = candidates.iter().find(|path| path.is_file()) {
         return CheckResult::Pass(found.display().to_string());
     }
-    let looked_in = candidates
+    let mut looked_in = candidates
         .iter()
         .map(|path| path.display().to_string())
         .collect::<Vec<_>>()
         .join(" or ");
+    // `resolve_mmdb_path` tries the server's working directory first. This
+    // process's own is not the server's, so it is not a stand-in.
+    if working_directory.is_none() {
+        looked_in.push_str(
+            " (the server's working directory is unknown, and a copy there would be used first)",
+        );
+    }
     let system_copy = Path::new("/usr/share/GeoIP").join(temps_geo::CITY_DB_FILENAME);
     if system_copy.is_file() {
         return CheckResult::Warn(format!(
@@ -1584,6 +1624,12 @@ fn geolite_result(data_dir: &Path, working_directory: Option<&Path>) -> CheckRes
              location: copy it to {}",
             system_copy.display(),
             data_dir.join(temps_geo::CITY_DB_FILENAME).display()
+        ));
+    }
+    if working_directory.is_none() {
+        return CheckResult::Warn(format!(
+            "Not found in {looked_in}. If it is not there either, `temps serve` tries to \
+             download it at startup, and geolocation is disabled until it has it"
         ));
     }
     CheckResult::Warn(format!(
@@ -1654,7 +1700,7 @@ fn service_url_mismatch(resolved: &ResolvedDatabaseUrl) -> Option<String> {
     }
     let service = resolved.service()?;
     let service_url = service.url()?;
-    (service_url != resolved.url()).then(|| {
+    (!crate::database_url_source::same_database(service_url, resolved.url())).then(|| {
         format!(
             "{} connects to a different database URL than {}; the checks below are for the \
              one given here",
@@ -2318,8 +2364,21 @@ mod tests {
     fn installer_layout(home: &Path) -> (ServiceDefinition, PathBuf) {
         let data_dir = home.join(".temps/data");
         std::fs::create_dir_all(&data_dir).unwrap();
-        // Exactly what serve does at startup.
-        temps_config::resolve_installation_secrets(&data_dir).unwrap();
+        // The two files serve creates at startup, written here so an
+        // exported TEMPS_ENCRYPTION_KEY / TEMPS_AUTH_SECRET cannot change
+        // the fixture.
+        for (file, secret) in [
+            (
+                temps_config::AUTH_SECRET_FILE,
+                "3f9a1c7e5b2d8046af13ce97b5d20864e1f7a3c9052bd6e48a1f7c3e95b02d64",
+            ),
+            (
+                temps_config::ENCRYPTION_KEY_FILE,
+                "b7e2d94a1c6f3058e9a2d7c41b8f6e03a5c9d2e7f1b4a8c6d3e0f9b2a7c5e1d4",
+            ),
+        ] {
+            std::fs::write(data_dir.join(file), secret).unwrap();
+        }
         std::fs::copy(
             data_dir.join("encryption_key"),
             home.join(".temps/encryption_key"),
@@ -2366,7 +2425,8 @@ mod tests {
     fn doctor_checks_the_data_dir_the_installed_service_uses() {
         let home = tempfile::tempdir().unwrap();
         let (service, data_dir) = installer_layout(home.path());
-        let (dir, source) = resolve_doctor_data_dir(None, Some(&service), &[], home.path());
+        let DoctorDataDir { dir, source, .. } =
+            resolve_doctor_data_dir(None, Some(&service), &[], home.path());
         assert_eq!(dir, data_dir);
         assert!(
             source.contains("--data-dir") && source.contains("temps.service"),
@@ -2374,7 +2434,7 @@ mod tests {
         );
 
         let explicit = home.path().join("elsewhere");
-        let (dir, _) = resolve_doctor_data_dir(Some(&explicit), Some(&service), &[], home.path());
+        let dir = resolve_doctor_data_dir(Some(&explicit), Some(&service), &[], home.path()).dir;
         assert_eq!(dir, explicit, "--data-dir / TEMPS_DATA_DIR still win");
     }
 
@@ -2400,7 +2460,10 @@ mod tests {
             report.checks
         );
 
-        let (_, source) = resolve_doctor_data_dir(None, None, &probes, home.path());
+        let DoctorDataDir {
+            source, unverified, ..
+        } = resolve_doctor_data_dir(None, None, &probes, home.path());
+        assert!(unverified);
         assert!(
             source.contains("temps.service") && source.contains("could not be used"),
             "{source}"
@@ -2427,7 +2490,10 @@ mod tests {
             Some(ServiceProbe::Found(service)) => *service,
             other => panic!("expected the unit to parse, got {other:?}"),
         };
-        let (_, source) = resolve_doctor_data_dir(None, Some(&service), &[], home.path());
+        let DoctorDataDir {
+            source, unverified, ..
+        } = resolve_doctor_data_dir(None, Some(&service), &[], home.path());
+        assert!(unverified);
         assert!(
             source.contains("is unknown") && source.contains("--data-dir"),
             "{source}"
@@ -2479,6 +2545,7 @@ mod tests {
         doctor.check_data_dir(
             &data_dir,
             "test",
+            false,
             Some(&service),
             SecretsEnvironment::of_service(Some(&service)),
             &mut report,
@@ -2495,6 +2562,50 @@ mod tests {
     }
 
     #[test]
+    fn a_guessed_data_dir_is_flagged_when_an_installed_server_exists() {
+        let home = tempfile::tempdir().unwrap();
+        let (service, data_dir) = installer_layout(home.path());
+        let doctor = DoctorCommand {
+            database_url: None,
+            data_dir: None,
+            scope: None,
+        };
+        for unverified in [true, false] {
+            let mut report = DiagnosticReport::new();
+            doctor.check_data_dir(
+                &data_dir,
+                "test",
+                unverified,
+                Some(&service),
+                SecretsEnvironment::of_service(Some(&service)),
+                &mut report,
+            );
+            let flagged = report.checks.iter().any(|(label, result)| {
+                label == "Server's data directory"
+                    && matches!(result, CheckResult::Warn(message) if message.contains("--data-dir"))
+            });
+            assert_eq!(flagged, unverified, "{:?}", report.checks);
+        }
+
+        // No installed server: the default layout is the answer, not a guess.
+        let empty = tempfile::tempdir().unwrap();
+        assert!(!resolve_doctor_data_dir(None, None, &[], empty.path()).unverified);
+    }
+
+    #[test]
+    fn geolite_says_when_the_servers_working_directory_is_unknown() {
+        let data = tempfile::tempdir().unwrap();
+        for (working_directory, mentions_unknown) in [(None, true), (Some(data.path()), false)] {
+            let result = geolite_result(data.path(), working_directory);
+            assert!(
+                matches!(&result, CheckResult::Warn(message)
+                    if message.contains("working directory is unknown") == mentions_unknown),
+                "{result:?}"
+            );
+        }
+    }
+
+    #[test]
     fn doctor_says_when_this_shells_secrets_replace_the_services() {
         let home = tempfile::tempdir().unwrap();
         let (service, data_dir) = installer_layout(home.path());
@@ -2507,6 +2618,7 @@ mod tests {
         doctor.check_data_dir(
             &data_dir,
             "test",
+            false,
             Some(&service),
             SecretsEnvironment::choose_with(Some(&service), vec![temps_config::AUTH_SECRET_ENV]),
             &mut report,
@@ -2528,7 +2640,7 @@ mod tests {
     fn the_auth_secret_passes_on_the_layout_serve_uses() {
         let home = tempfile::tempdir().unwrap();
         let (service, _) = installer_layout(home.path());
-        let (data_dir, _) = resolve_doctor_data_dir(None, Some(&service), &[], home.path());
+        let data_dir = resolve_doctor_data_dir(None, Some(&service), &[], home.path()).dir;
         let inspection = temps_config::inspect_installation_secrets_with(&data_dir, no_env);
         assert!(
             matches!(

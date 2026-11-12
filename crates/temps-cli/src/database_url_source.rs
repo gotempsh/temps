@@ -244,12 +244,14 @@ impl ResolvedDatabaseUrl {
         self.service.as_ref()
     }
 
-    /// The installed service, when this URL is the one that server connects
-    /// with.
+    /// The installed service, when this URL names the database that server
+    /// connects to (see [`same_database`]).
     pub(crate) fn serving_service(&self) -> Option<&ServiceDefinition> {
-        self.service
-            .as_ref()
-            .filter(|service| service.url() == Some(self.url.as_str()))
+        self.service.as_ref().filter(|service| {
+            service
+                .url()
+                .is_some_and(|url| same_database(url, self.url.as_str()))
+        })
     }
 
     /// The installed server's data directory, when this URL is the one that
@@ -463,6 +465,57 @@ fn resolve_with(
     }
 
     Err(DatabaseUrlNotFound { checked, discovery })
+}
+
+/// Whether two database URLs name the same database: identical, or
+/// PostgreSQL URLs with the same host, port and database once spelling is
+/// set aside (`postgres://` or `postgresql://`, host case, the default port
+/// 5432, a socket `host=` / `port=` / `dbname=` parameter, credentials and
+/// other parameters such as `sslmode`). A host given two ways (`localhost`
+/// and `127.0.0.1`) still counts as different: whether they are the same
+/// server cannot be told from the URL.
+pub(crate) fn same_database(a: &str, b: &str) -> bool {
+    a == b
+        || matches!(
+            (database_identity(a), database_identity(b)),
+            (Some(a), Some(b)) if a == b
+        )
+}
+
+/// `(host, port, database)` of a PostgreSQL URL.
+fn database_identity(raw: &str) -> Option<(String, u16, String)> {
+    let url = url::Url::parse(raw.trim()).ok()?;
+    if !matches!(url.scheme(), "postgres" | "postgresql") {
+        return None;
+    }
+    let parameter = |name: &str| {
+        url.query_pairs()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.into_owned())
+            .filter(|value| !value.is_empty())
+    };
+    let host = url
+        .host_str()
+        .filter(|host| !host.is_empty())
+        .map(str::to_string)
+        .or_else(|| parameter("host"))
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let port = match url.port() {
+        Some(port) => port,
+        None => match parameter("port") {
+            Some(port) => port.parse().ok()?,
+            None => 5432,
+        },
+    };
+    let path = url.path().trim_start_matches('/');
+    let database = if path.is_empty() {
+        // libpq's default: the database named after the user.
+        parameter("dbname").unwrap_or_else(|| url.username().to_string())
+    } else {
+        urlencoding::decode(path).ok()?.into_owned()
+    };
+    Some((host, port, database))
 }
 
 /// Whether the raw command line passes the database URL as a flag
@@ -967,5 +1020,31 @@ mod tests {
         .to_string();
         assert!(message.contains("does not run `temps serve`"), "{message}");
         assert!(!message.contains(PASSWORD), "{message}");
+    }
+
+    #[test]
+    fn the_same_database_spelled_differently_is_recognised() {
+        let base = "postgresql://temps:pw@127.0.0.1:5432/temps?sslmode=disable";
+        for same in [
+            "postgres://temps:pw@127.0.0.1/temps",
+            "postgresql://other-user:other-pw@127.0.0.1:5432/temps?sslmode=require",
+            "POSTGRES://temps@127.0.0.1:5432/temps",
+        ] {
+            assert!(same_database(base, same), "{same}");
+        }
+        assert!(same_database(
+            "postgresql:///temps?host=/var/run/postgresql",
+            "postgres:///temps?host=/var/run/postgresql&port=5432"
+        ));
+        for different in [
+            "postgresql://temps:pw@127.0.0.1:5433/temps",
+            "postgresql://temps:pw@127.0.0.1:5432/other",
+            "postgresql://temps:pw@10.0.0.2:5432/temps",
+            // Possibly the same server, but that cannot be told from the URL.
+            "postgresql://temps:pw@localhost:5432/temps",
+            "not a url",
+        ] {
+            assert!(!same_database(base, different), "{different}");
+        }
     }
 }
