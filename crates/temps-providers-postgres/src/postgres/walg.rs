@@ -25,6 +25,136 @@ pub(super) fn shell_export_assignment(line: &str) -> Option<String> {
     valid_key.then(|| format!("export {key}={}", shell_escape(value)))
 }
 
+/// A shell command that replaces `path` with `lines` atomically.
+///
+/// `archive_command` sources `walg.env` for every segment, so the live file
+/// must never be seen half written, and a failed write (a full disk is
+/// likely exactly when WAL has piled up) must leave the old file intact.
+/// The lines go to a sibling temporary file created mode 0600, which is
+/// renamed over `path` only after the whole write succeeded; on failure the
+/// temporary file is removed and the command exits non-zero. Leftovers of
+/// an earlier write killed mid-way are removed first.
+///
+/// Every write holds an `flock` on `<path>.lock` (where `flock` exists), so
+/// two writers never interleave. With `expected_checksum` (a `cksum < path`
+/// line from [`WalgEnvSnapshot`]) the file is only replaced if it still
+/// has that content under the lock; otherwise the command exits
+/// [`WALG_ENV_CHANGED_EXIT`] and leaves it alone, so a repair computed from
+/// an older snapshot never overwrites what a backup or repoint just wrote.
+pub(crate) fn atomic_write_command(
+    lines: &[String],
+    path: &str,
+    expected_checksum: Option<&str>,
+) -> String {
+    let path = shell_escape(path);
+    let unchanged_check = expected_checksum
+        .map(|checksum| {
+            format!(
+                "if [ \"$(cksum < {path} 2>/dev/null)\" != {checksum} ]; then exit {WALG_ENV_CHANGED_EXIT}; fi; ",
+                checksum = shell_escape(checksum),
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        "umask 077; exec 9>>{path}.lock || exit 1; \
+         if command -v flock >/dev/null 2>&1; then flock -w 30 9 || exit {WALG_ENV_LOCK_BUSY_EXIT}; fi; \
+         {unchanged_check}\
+         rm -f {path}.tmp.*; tmp={path}.tmp.$$; \
+         if printf '%s\\n' {lines} > \"$tmp\" && chmod 600 \"$tmp\" && mv -f \"$tmp\" {path}; \
+         then exit 0; else rm -f \"$tmp\"; exit 1; fi",
+        lines = lines
+            .iter()
+            .map(|line| shell_escape(line))
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
+/// Exit code of [`atomic_write_command`] when the file no longer has the
+/// expected content.
+pub(crate) const WALG_ENV_CHANGED_EXIT: i64 = 3;
+
+/// Exit code of [`atomic_write_command`] when another writer held the lock
+/// for 30 seconds.
+pub(crate) const WALG_ENV_LOCK_BUSY_EXIT: i64 = 4;
+
+/// What a conditional write of `walg.env` did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WalgEnvWrite {
+    Written,
+    /// The file changed since the snapshot the new contents were built
+    /// from; it was left as it is.
+    ChangedConcurrently,
+}
+
+/// One consistent read of `walg.env`: its checksum, its text, and the
+/// `WALG_`/`AWS_` assignments the shell sees when sourcing it, all taken
+/// from the same copy of the file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WalgEnvSnapshot {
+    pub(crate) checksum: String,
+    pub(crate) raw: String,
+    pub(crate) evaluated: Vec<String>,
+}
+
+const SNAPSHOT_NO_FILE: &str = "__TEMPS_NO_WALG_ENV__";
+const SNAPSHOT_CKSUM: &str = "__TEMPS_WALG_ENV_CKSUM__";
+const SNAPSHOT_RAW: &str = "__TEMPS_WALG_ENV_RAW__";
+const SNAPSHOT_EVAL: &str = "__TEMPS_WALG_ENV_EVAL__";
+
+/// Copies `walg.env` once and reports everything from that copy, so the
+/// checksum, text and assignments always describe the same file.
+///
+/// The copy holds credentials, so it is removed on every way out: the
+/// `EXIT` trap is set as soon as `mktemp` created it, before the copy that
+/// can fail part way (a full `/tmp`, the file vanishing).
+const WALG_ENV_SNAPSHOT_SCRIPT: &str = "f=/var/lib/postgresql/walg.env; \
+     [ -f \"$f\" ] || { echo __TEMPS_NO_WALG_ENV__; exit 0; }; \
+     umask 077; snap=$(mktemp \"${TMPDIR:-/tmp}/walg-env.XXXXXX\") || exit 1; \
+     trap 'rm -f \"$snap\"' EXIT; \
+     cp \"$f\" \"$snap\" || exit 1; \
+     echo __TEMPS_WALG_ENV_CKSUM__; cksum < \"$snap\"; \
+     echo __TEMPS_WALG_ENV_RAW__; cat \"$snap\"; echo; \
+     echo __TEMPS_WALG_ENV_EVAL__; \
+     env -i sh -c '. \"$1\" && env' sh \"$snap\" | grep -E '^(WALG_|AWS_)'; \
+     exit 0";
+
+/// Parse what [`WALG_ENV_SNAPSHOT_SCRIPT`] printed: `Ok(None)` when there is
+/// no file.
+pub(crate) fn parse_walg_env_snapshot(
+    output: &str,
+) -> std::result::Result<Option<WalgEnvSnapshot>, String> {
+    if output.lines().any(|line| line == SNAPSHOT_NO_FILE) {
+        return Ok(None);
+    }
+    let missing = || "the walg.env snapshot is incomplete".to_string();
+    let after_cksum = output
+        .split_once(&format!("{SNAPSHOT_CKSUM}\n"))
+        .ok_or_else(missing)?
+        .1;
+    let (checksum, after_raw) = after_cksum
+        .split_once(&format!("\n{SNAPSHOT_RAW}\n"))
+        .ok_or_else(missing)?;
+    let (raw, evaluated) = after_raw
+        .rsplit_once(&format!("\n{SNAPSHOT_EVAL}\n"))
+        .or_else(|| {
+            after_raw
+                .strip_suffix(&format!("\n{SNAPSHOT_EVAL}"))
+                .map(|raw| (raw, ""))
+        })
+        .ok_or_else(missing)?;
+    Ok(Some(WalgEnvSnapshot {
+        checksum: checksum.trim().to_string(),
+        raw: raw.to_string(),
+        evaluated: evaluated
+            .lines()
+            .map(str::trim_end)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect(),
+    }))
+}
+
 /// What enabling WAL archiving did to the running service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WalArchivingOutcome {
@@ -440,27 +570,40 @@ impl PostgresService {
     }
 
     /// Replace the file at `target_path` with `lines`, verbatim, owned by
-    /// `postgres` and readable only by it (it holds credentials).
+    /// `postgres` and readable only by it (it holds credentials). Atomic:
+    /// see [`atomic_write_command`].
     async fn write_file_lines_at(
         &self,
         container_name: &str,
         lines: &[String],
         target_path: &str,
     ) -> Result<()> {
+        match self
+            .write_file_lines_if_unchanged(container_name, lines, target_path, None)
+            .await?
+        {
+            WalgEnvWrite::Written => Ok(()),
+            // Without an expected checksum the file is always replaced.
+            WalgEnvWrite::ChangedConcurrently => Err(EngineError::failed(
+                &self.name,
+                format!("walg.env on container '{container_name}' changed while it was written"),
+            )),
+        }
+    }
+
+    /// [`Self::write_file_lines_at`], but only if the file still has the
+    /// content `expected_checksum` describes (see [`atomic_write_command`]).
+    async fn write_file_lines_if_unchanged(
+        &self,
+        container_name: &str,
+        lines: &[String],
+        target_path: &str,
+        expected_checksum: Option<&str>,
+    ) -> Result<WalgEnvWrite> {
         use bollard::exec::{CreateExecOptions, StartExecOptions};
 
         let walg_env_path = target_path;
-
-        let write_cmd = format!(
-            "printf '%s\\n' {} > {} && chmod 600 {}",
-            lines
-                .iter()
-                .map(|line| shell_escape(line))
-                .collect::<Vec<_>>()
-                .join(" "),
-            walg_env_path,
-            walg_env_path,
-        );
+        let write_cmd = atomic_write_command(lines, walg_env_path, expected_checksum);
 
         let exec = self
             .docker
@@ -488,16 +631,30 @@ impl PostgresService {
         loop {
             let inspect = self.docker.inspect_exec(&exec.id).await?;
             if inspect.running == Some(false) {
-                if inspect.exit_code != Some(0) {
-                    return Err(EngineError::failed(
-                        &self.name,
-                        format!(
-                            "Failed to write walg.env on container '{}' (exit code {:?})",
-                            container_name, inspect.exit_code
-                        ),
-                    ));
+                match inspect.exit_code {
+                    Some(0) => break,
+                    Some(WALG_ENV_CHANGED_EXIT) if expected_checksum.is_some() => {
+                        return Ok(WalgEnvWrite::ChangedConcurrently)
+                    }
+                    Some(WALG_ENV_LOCK_BUSY_EXIT) => {
+                        return Err(EngineError::failed(
+                            &self.name,
+                            format!(
+                                "Could not write {walg_env_path} on container '{container_name}': \
+                                 another write held its lock for 30 seconds"
+                            ),
+                        ))
+                    }
+                    code => {
+                        return Err(EngineError::failed(
+                            &self.name,
+                            format!(
+                                "Failed to write {walg_env_path} on container '{container_name}' \
+                                 (exit code {code:?}); the previous file is unchanged"
+                            ),
+                        ))
+                    }
                 }
-                break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
@@ -506,7 +663,7 @@ impl PostgresService {
             "Written WAL-G credentials to {} on container '{}'",
             walg_env_path, container_name
         );
-        Ok(())
+        Ok(WalgEnvWrite::Written)
     }
 
     /// The env file lives at `/var/lib/postgresql/walg.env` on the shared volume, so it:
@@ -1566,36 +1723,36 @@ impl PostgresService {
         &self,
         container_name: &str,
     ) -> std::result::Result<Option<Vec<String>>, String> {
-        // `env -i`: read only what the file sets, not the container's own
-        // environment.
+        Ok(self
+            .read_walg_env_snapshot(container_name)
+            .await?
+            .map(|snapshot| snapshot.evaluated))
+    }
+
+    /// One consistent [`WalgEnvSnapshot`] of the container's `walg.env`, or
+    /// `None` when there is no file. `env -i`: only what the file sets, not
+    /// the container's own environment.
+    pub(crate) async fn read_walg_env_snapshot(
+        &self,
+        container_name: &str,
+    ) -> std::result::Result<Option<WalgEnvSnapshot>, String> {
         let result = crate::externalsvc::exec_util::run_exec(
             &self.docker,
             container_name,
             vec![
                 "sh".to_string(),
                 "-c".to_string(),
-                "[ -f /var/lib/postgresql/walg.env ] || { echo __TEMPS_NO_WALG_ENV__; exit 0; }; \
-                 env -i sh -c '. /var/lib/postgresql/walg.env && env' \
-                 | grep -E '^(WALG_|AWS_)'"
-                    .to_string(),
+                WALG_ENV_SNAPSHOT_SCRIPT.to_string(),
             ],
             None,
             Duration::from_secs(15),
         )
         .await
         .map_err(|error| error.to_string())?;
-        if result.output.contains("__TEMPS_NO_WALG_ENV__") {
-            return Ok(None);
+        if result.exit_code != 0 {
+            return Err(format!("reading walg.env exited with {}", result.exit_code));
         }
-        Ok(Some(
-            result
-                .output
-                .lines()
-                .map(str::trim_end)
-                .filter(|line| !line.is_empty())
-                .map(str::to_string)
-                .collect(),
-        ))
+        parse_walg_env_snapshot(&result.output)
     }
 
     /// How the running container's `walg.env` differs from the settings
@@ -1638,29 +1795,11 @@ impl PostgresService {
     /// no restart. Best effort: a failure is logged and the start goes on,
     /// leaving the file as it was; the next backup rewrites it from the S3
     /// source anyway.
-    /// The container's `walg.env` as written, for patching in place.
-    async fn read_raw_walg_env(&self, container_name: &str) -> std::result::Result<String, String> {
-        let result = crate::externalsvc::exec_util::run_exec(
-            &self.docker,
-            container_name,
-            vec![
-                "cat".to_string(),
-                "/var/lib/postgresql/walg.env".to_string(),
-            ],
-            None,
-            Duration::from_secs(15),
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-        if result.exit_code != 0 {
-            return Err(format!("cat exited with {}", result.exit_code));
-        }
-        Ok(result.output)
-    }
-
     pub(super) async fn repair_walg_env_on_start(&self, container_name: &str) {
-        let lines = match self.read_live_walg_env(container_name).await {
-            Ok(Some(lines)) => lines,
+        // One snapshot: what is checked, patched and compared before the
+        // write all describe the same file.
+        let snapshot = match self.read_walg_env_snapshot(container_name).await {
+            Ok(Some(snapshot)) => snapshot,
             Ok(None) => return,
             Err(error) => {
                 warn!(
@@ -1672,28 +1811,22 @@ impl PostgresService {
                 return;
             }
         };
-        let Some(repaired) = repair_walg_env_lines(&lines) else {
+        let Some(repaired) = repair_walg_env_lines(&snapshot.evaluated) else {
             return;
         };
-        // Patched, not regenerated, so nothing else in the file is lost.
-        let raw = match self.read_raw_walg_env(container_name).await {
-            Ok(raw) => raw,
-            Err(error) => {
-                warn!(
-                    service = %self.name,
-                    container = container_name,
-                    error = %error,
-                    "Could not read walg.env to repair its S3 endpoint; leaving it unchanged"
-                );
-                return;
-            }
-        };
-        let patched = patch_walg_env_file(&raw, &repaired);
+        // Patched, not regenerated, so nothing else in the file is lost; and
+        // written only if nobody rewrote the file since the snapshot.
+        let patched = patch_walg_env_file(&snapshot.raw, &repaired);
         match self
-            .write_file_lines_at(container_name, &patched, "/var/lib/postgresql/walg.env")
+            .write_file_lines_if_unchanged(
+                container_name,
+                &patched,
+                "/var/lib/postgresql/walg.env",
+                Some(&snapshot.checksum),
+            )
             .await
         {
-            Ok(()) => {
+            Ok(WalgEnvWrite::Written) => {
                 info!(
                     service = %self.name,
                     container = container_name,
@@ -1703,6 +1836,12 @@ impl PostgresService {
                 );
                 self.end_stale_wal_pushes(container_name).await;
             }
+            Ok(WalgEnvWrite::ChangedConcurrently) => info!(
+                service = %self.name,
+                container = container_name,
+                "walg.env was rewritten (by a backup or repoint) while it was being repaired; \
+                 keeping the newer file, which Temps generated with the current rules"
+            ),
             Err(error) => warn!(
                 service = %self.name,
                 container = container_name,
@@ -1714,1098 +1853,5 @@ impl PostgresService {
     }
 }
 
-/// The reported outage end to end, against real WAL-G and a real plain-HTTP
-/// S3 store reached by IP address: the settings Temps generates archive a
-/// segment, and the settings it generated before this fix are refused with
-/// the same error the outage logged. Skips when Docker or an image is
-/// unavailable.
-#[cfg(all(test, feature = "docker-tests"))]
-mod plain_http_ip_archive_docker_tests {
-    use super::{archive_walg_env_lines, PostgresService};
-    use crate::externalsvc::S3Credentials;
-    use bollard::models::{ContainerCreateBody, HostConfig, PortBinding};
-    use bollard::query_parameters::{
-        CreateContainerOptionsBuilder, CreateImageOptionsBuilder, RemoveContainerOptionsBuilder,
-    };
-    use futures::StreamExt;
-    use std::collections::HashMap;
-    use std::sync::Arc;
-    use std::time::Duration;
-
-    const RUSTFS_IMAGE: &str = "rustfs/rustfs:1.0.0";
-    const WALG_IMAGE: &str = "gotempsh/postgres-walg:18-bookworm";
-    const ACCESS_KEY: &str = "walg-test-access";
-    const SECRET_KEY: &str = "walg-test-secret-key";
-    const BUCKET: &str = "archive";
-
-    async fn ensure_image(docker: &bollard::Docker, image: &str) -> bool {
-        if docker.inspect_image(image).await.is_ok() {
-            return true;
-        }
-        let (from_image, tag) = image.rsplit_once(':').unwrap_or((image, "latest"));
-        let options = CreateImageOptionsBuilder::default()
-            .from_image(from_image)
-            .tag(tag)
-            .build();
-        let mut pull = docker.create_image(Some(options), None, None);
-        while let Some(step) = pull.next().await {
-            if let Err(error) = step {
-                eprintln!("Skipping plain-HTTP WAL-G test: cannot pull {image}: {error}");
-                return false;
-            }
-        }
-        true
-    }
-
-    async fn run(
-        docker: &Arc<bollard::Docker>,
-        s3_name: &str,
-        walg_name: &str,
-    ) -> Result<(), String> {
-        // The S3 store: published on a random loopback port so this process
-        // can create the bucket, and reached by its bridge IP from the WAL-G
-        // container, exactly like an S3 source entered as `<ip>:9000`.
-        let mut ports = HashMap::new();
-        ports.insert(
-            "9000/tcp".to_string(),
-            Some(vec![PortBinding {
-                host_ip: Some("127.0.0.1".to_string()),
-                host_port: Some(String::new()),
-            }]),
-        );
-        docker
-            .create_container(
-                Some(
-                    CreateContainerOptionsBuilder::default()
-                        .name(s3_name)
-                        .build(),
-                ),
-                ContainerCreateBody {
-                    image: Some(RUSTFS_IMAGE.to_string()),
-                    env: Some(vec![
-                        format!("RUSTFS_ACCESS_KEY={ACCESS_KEY}"),
-                        format!("RUSTFS_SECRET_KEY={SECRET_KEY}"),
-                    ]),
-                    exposed_ports: Some(vec!["9000/tcp".to_string()]),
-                    host_config: Some(HostConfig {
-                        port_bindings: Some(ports),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(|e| format!("create S3 container: {e}"))?;
-        docker
-            .start_container(s3_name, None)
-            .await
-            .map_err(|e| format!("start S3 container: {e}"))?;
-        let inspect = docker
-            .inspect_container(s3_name, None)
-            .await
-            .map_err(|e| format!("inspect S3 container: {e}"))?;
-        let settings = inspect
-            .network_settings
-            .ok_or("S3 container has no network")?;
-        let ip = settings
-            .networks
-            .as_ref()
-            .and_then(|networks| networks.values().find_map(|n| n.ip_address.clone()))
-            .filter(|ip| !ip.is_empty())
-            .ok_or("S3 container has no bridge IP")?;
-        let host_port = settings
-            .ports
-            .as_ref()
-            .and_then(|ports| ports.get("9000/tcp").cloned().flatten())
-            .and_then(|bindings| bindings.into_iter().find_map(|b| b.host_port))
-            .ok_or("S3 port not published")?;
-
-        let admin = S3Credentials {
-            access_key_id: ACCESS_KEY.to_string(),
-            secret_key: SECRET_KEY.to_string(),
-            session_token: None,
-            region: "us-east-1".to_string(),
-            endpoint: Some(format!("127.0.0.1:{host_port}")),
-            bucket_name: BUCKET.to_string(),
-            bucket_path: "pg".to_string(),
-            force_path_style: true,
-        }
-        .build_s3_client()
-        .await;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-        loop {
-            match admin.create_bucket().bucket(BUCKET).send().await {
-                Ok(_) => break,
-                Err(error) if tokio::time::Instant::now() >= deadline => {
-                    return Err(format!("create bucket: {error:?}"))
-                }
-                Err(_) => tokio::time::sleep(Duration::from_millis(500)).await,
-            }
-        }
-
-        // The WAL-G side: Temps's PostgreSQL image, idle.
-        docker
-            .create_container(
-                Some(
-                    CreateContainerOptionsBuilder::default()
-                        .name(walg_name)
-                        .build(),
-                ),
-                ContainerCreateBody {
-                    image: Some(WALG_IMAGE.to_string()),
-                    entrypoint: Some(vec!["sleep".to_string()]),
-                    cmd: Some(vec!["600".to_string()]),
-                    user: Some("postgres".to_string()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(|e| format!("create WAL-G container: {e}"))?;
-        docker
-            .start_container(walg_name, None)
-            .await
-            .map_err(|e| format!("start WAL-G container: {e}"))?;
-
-        // The reported S3 source: plain HTTP, an IP, no scheme, path style
-        // left unticked.
-        let source = S3Credentials {
-            access_key_id: ACCESS_KEY.to_string(),
-            secret_key: SECRET_KEY.to_string(),
-            session_token: None,
-            region: "us-east-1".to_string(),
-            endpoint: Some(format!("{ip}:9000")),
-            bucket_name: BUCKET.to_string(),
-            bucket_path: "pg".to_string(),
-            force_path_style: false,
-        };
-        let prefix = format!("s3://{BUCKET}/pg/walg");
-        let service = PostgresService::new("plain-http-archive".to_string(), docker.clone());
-        let resolved = source
-            .resolve_endpoint_for_container(docker, walg_name)
-            .await;
-        let env = archive_walg_env_lines(&source, &prefix, resolved.as_deref());
-        if !env.contains(&format!("AWS_ENDPOINT=http://{ip}:9000"))
-            || !env.contains(&"AWS_S3_FORCE_PATH_STYLE=true".to_string())
-        {
-            return Err(format!("generated walg.env is wrong: {:?}", env));
-        }
-
-        // 1. The check Temps now runs before enabling archiving passes, and
-        //    running it again reuses the same probe key.
-        for _ in 0..2 {
-            service
-                .check_archive_target_env(walg_name, &env, &source)
-                .await
-                .map_err(|e| format!("check with the generated settings failed: {e}"))?;
-        }
-
-        // 2. A real segment archives through `walg.env`, as archive_command
-        //    runs it.
-        service
-            .write_walg_env_file(walg_name, &env)
-            .await
-            .map_err(|e| format!("write walg.env: {e}"))?;
-        let push = crate::externalsvc::exec_util::run_exec(
-            docker,
-            walg_name,
-            vec![
-                "sh".to_string(),
-                "-c".to_string(),
-                "set -e; mkdir -p /tmp/pg_wal/archive_status; \
-                 head -c 16777216 /dev/zero > /tmp/pg_wal/000000010000000000000001; \
-                 . /var/lib/postgresql/walg.env && S3_MAX_RETRIES=1 timeout 60 \
-                 wal-g wal-push /tmp/pg_wal/000000010000000000000001 \
-                 && wal-g st ls -r"
-                    .to_string(),
-            ],
-            None,
-            Duration::from_secs(90),
-        )
-        .await
-        .map_err(|e| format!("wal-push exec: {e}"))?;
-        if push.exit_code != 0 || !push.output.contains("000000010000000000000001") {
-            return Err(format!(
-                "wal-push failed (exit {}): {}",
-                push.exit_code, push.output
-            ));
-        }
-        // With credentials that may delete, the probe is removed.
-        if push.output.contains(super::ARCHIVE_CHECK_PROBE_KEY) {
-            return Err(format!("the check left its probe behind: {}", push.output));
-        }
-
-        // 3. What Temps generated before the fix, both ways it failed:
-        //    a bare endpoint, which WAL-G dials over HTTPS, and, until path
-        //    style was ticked, a `<bucket>.<ip>` host that cannot resolve.
-        let legacy = |path_style: bool| {
-            let mut env = vec![
-                format!("WALG_S3_PREFIX={prefix}"),
-                format!("AWS_ACCESS_KEY_ID={ACCESS_KEY}"),
-                format!("AWS_SECRET_ACCESS_KEY={SECRET_KEY}"),
-                "AWS_REGION=us-east-1".to_string(),
-                format!("AWS_ENDPOINT={ip}:9000"),
-            ];
-            if path_style {
-                env.push("AWS_S3_FORCE_PATH_STYLE=true".to_string());
-            }
-            env
-        };
-        for (path_style, cause) in [
-            (true, "HTTP response to HTTPS client"),
-            (false, "no such host"),
-        ] {
-            match service
-                .check_archive_target_env(walg_name, &legacy(path_style), &source)
-                .await
-            {
-                Ok(_) => return Err("the pre-fix settings unexpectedly archived".to_string()),
-                Err(error) => {
-                    let text = error.to_string();
-                    if !text.contains(cause) || !text.contains("missing (WAL-G uses https)") {
-                        return Err(format!("unexpected pre-fix failure: {text}"));
-                    }
-                    if text.contains(SECRET_KEY) || text.contains("docker exec") {
-                        return Err(format!("the check error is not clean: {text}"));
-                    }
-                }
-            }
-        }
-
-        // 4. An existing install on its next start: the pre-fix walg.env is
-        //    in place and PostgreSQL has already started a wal-push with it,
-        //    which hangs retrying HTTPS against a plain-HTTP store. The
-        //    start-time repair rewrites the file and ends that attempt, and
-        //    the next segment archives.
-        service
-            .write_walg_env_file(walg_name, &legacy(true))
-            .await
-            .map_err(|e| format!("write legacy walg.env: {e}"))?;
-        let exec = |script: &str| {
-            crate::externalsvc::exec_util::run_exec(
-                docker,
-                walg_name,
-                vec!["sh".to_string(), "-c".to_string(), script.to_string()],
-                None,
-                Duration::from_secs(90),
-            )
-        };
-        // A line an operator added by hand, which the repair must keep.
-        exec("echo '# kept: operator note' >> /var/lib/postgresql/walg.env")
-            .await
-            .map_err(|e| format!("append to walg.env: {e}"))?;
-        exec(
-            "head -c 16777216 /dev/zero > /tmp/pg_wal/000000010000000000000002; \
-             . /var/lib/postgresql/walg.env && \
-             nohup wal-g wal-push /tmp/pg_wal/000000010000000000000002 >/tmp/stale-push.log 2>&1 &",
-        )
-        .await
-        .map_err(|e| format!("start the stale wal-push: {e}"))?;
-        let running = "for p in /proc/[0-9]*; do \
-                         case \"$(tr '\\0' ' ' < $p/cmdline 2>/dev/null)\" in \
-                           'wal-g wal-push '*) echo running;; esac; done; exit 0";
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        if !exec(running)
-            .await
-            .map_err(|e| e.to_string())?
-            .output
-            .contains("running")
-        {
-            return Err("the stale wal-push did not keep running".to_string());
-        }
-
-        service.repair_walg_env_on_start(walg_name).await;
-
-        let live = service
-            .read_live_walg_env(walg_name)
-            .await
-            .map_err(|e| format!("read repaired walg.env: {e}"))?
-            .ok_or("walg.env is gone after the repair")?;
-        if !live.contains(&format!("AWS_ENDPOINT=http://{ip}:9000"))
-            || !live.contains(&format!("AWS_SECRET_ACCESS_KEY={SECRET_KEY}"))
-            || !live.contains(&format!("WALG_S3_PREFIX={prefix}"))
-        {
-            return Err(format!("walg.env was not repaired in place: {live:?}"));
-        }
-        let raw = service
-            .read_raw_walg_env(walg_name)
-            .await
-            .map_err(|e| format!("read repaired walg.env: {e}"))?;
-        if !raw.contains("# kept: operator note") {
-            return Err(format!("the repair dropped a line it does not fix: {raw}"));
-        }
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        if exec(running)
-            .await
-            .map_err(|e| e.to_string())?
-            .output
-            .contains("running")
-        {
-            return Err("the wal-push started with the old walg.env is still running".to_string());
-        }
-        let retried = exec(
-            ". /var/lib/postgresql/walg.env && S3_MAX_RETRIES=1 timeout 60 \
-             wal-g wal-push /tmp/pg_wal/000000010000000000000002 && wal-g st ls -r",
-        )
-        .await
-        .map_err(|e| format!("retry wal-push: {e}"))?;
-        if retried.exit_code != 0 || !retried.output.contains("000000010000000000000002") {
-            return Err(format!(
-                "the segment did not archive after the repair (exit {}): {}",
-                retried.exit_code, retried.output
-            ));
-        }
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn generated_walg_env_archives_to_a_plain_http_store_by_ip() {
-        let Ok(docker) = bollard::Docker::connect_with_local_defaults() else {
-            eprintln!("Skipping plain-HTTP WAL-G test: no Docker configuration");
-            return;
-        };
-        if docker.ping().await.is_err() {
-            eprintln!("Skipping plain-HTTP WAL-G test: Docker is not reachable");
-            return;
-        }
-        if !ensure_image(&docker, RUSTFS_IMAGE).await || !ensure_image(&docker, WALG_IMAGE).await {
-            return;
-        }
-        let docker = Arc::new(docker);
-        let run_id = uuid::Uuid::new_v4().simple().to_string();
-        let s3_name = format!("temps-test-walg-http-s3-{}", &run_id[..12]);
-        let walg_name = format!("temps-test-walg-http-pg-{}", &run_id[..12]);
-        let outcome = run(&docker, &s3_name, &walg_name).await;
-        // Only the two containers this test created.
-        for name in [&walg_name, &s3_name] {
-            let _ = docker
-                .remove_container(
-                    name,
-                    Some(
-                        RemoveContainerOptionsBuilder::default()
-                            .force(true)
-                            .v(true)
-                            .build(),
-                    ),
-                )
-                .await;
-        }
-        if let Err(reason) = outcome {
-            panic!("{reason}");
-        }
-    }
-}
-
 #[cfg(test)]
-mod target_check_tests {
-    use super::{
-        archive_target_check_exec_deadline, archive_target_check_script, archive_target_settings,
-        summarize_walg_output, ArchiveTargetCheckError, ARCHIVE_CHECK_PROBE_KEY,
-        ARCHIVE_PROBE_CLEANUP_TIMEOUT_SECS, ARCHIVE_TARGET_CHECK_TIMEOUT_SECS, CHECK_EXIT_MARKER,
-    };
-    use crate::externalsvc::S3Credentials;
-
-    fn source(endpoint: Option<&str>, force_path_style: bool) -> S3Credentials {
-        S3Credentials {
-            access_key_id: "test-access".to_string(),
-            secret_key: "test-secret".to_string(),
-            session_token: None,
-            region: "us-east-1".to_string(),
-            endpoint: endpoint.map(str::to_string),
-            bucket_name: "archive".to_string(),
-            bucket_path: "pg".to_string(),
-            force_path_style,
-        }
-    }
-
-    #[test]
-    fn the_check_overwrites_one_fixed_probe_and_never_a_random_one() {
-        let script = archive_target_check_script();
-        // `st check write` names its probe randomly, so a credential that
-        // cannot delete would leave one object per check.
-        assert!(!script.contains("st check"), "{script}");
-        assert!(
-            script.contains("wal-g st put -f --no-compress --no-encrypt"),
-            "{script}"
-        );
-        assert!(
-            script.contains(&format!("\"$probe\" {ARCHIVE_CHECK_PROBE_KEY}")),
-            "{script}"
-        );
-        // The removal names the probe key exactly, never an empty prefix,
-        // and only runs after a successful upload.
-        assert!(
-            script.contains(&format!("wal-g st rm {ARCHIVE_CHECK_PROBE_KEY} ")),
-            "{script}"
-        );
-        assert!(!ARCHIVE_CHECK_PROBE_KEY.is_empty());
-        assert!(!ARCHIVE_CHECK_PROBE_KEY.contains('/'));
-        assert!(script.find("st put").unwrap_or(usize::MAX) < script.find("st rm").unwrap_or(0));
-        assert!(script.contains(&format!("echo \"{CHECK_EXIT_MARKER}$code\"; exit 0")));
-    }
-
-    /// An upload that succeeds just inside its bound, followed by a removal
-    /// that hangs until its own bound, still reports success: the exec
-    /// deadline outlasts both, so it is never what fails a writable target.
-    #[test]
-    fn the_exec_deadline_outlasts_a_slow_upload_and_a_stalled_cleanup() {
-        let script = archive_target_check_script();
-        assert!(
-            script.contains(&format!(
-                "timeout {ARCHIVE_TARGET_CHECK_TIMEOUT_SECS} wal-g st put"
-            )),
-            "{script}"
-        );
-        assert!(
-            script.contains(&format!(
-                "timeout {ARCHIVE_PROBE_CLEANUP_TIMEOUT_SECS} wal-g st rm"
-            )),
-            "{script}"
-        );
-        // The only two commands that talk to the target are bounded.
-        assert_eq!(script.matches("wal-g st ").count(), 2, "{script}");
-        assert_eq!(script.matches("timeout ").count(), 2, "{script}");
-        let worst_case = ARCHIVE_TARGET_CHECK_TIMEOUT_SECS + ARCHIVE_PROBE_CLEANUP_TIMEOUT_SECS;
-        assert!(
-            archive_target_check_exec_deadline().as_secs() >= worst_case + 10,
-            "deadline {:?} vs {worst_case}s of sequential bounds",
-            archive_target_check_exec_deadline()
-        );
-    }
-
-    #[test]
-    fn settings_name_the_scheme_and_why_path_style_is_forced() {
-        let env = vec![
-            "AWS_ENDPOINT=http://10.0.0.5:9000".to_string(),
-            "AWS_S3_FORCE_PATH_STYLE=true".to_string(),
-        ];
-        let settings = archive_target_settings(&env, &source(Some("10.0.0.5:9000"), false));
-        assert_eq!(settings.endpoint, "http://10.0.0.5:9000");
-        assert_eq!(settings.scheme, "http");
-        assert!(settings.force_path_style);
-        assert_eq!(
-            settings.path_style_reason,
-            "forced: the endpoint is an IP address"
-        );
-    }
-
-    #[test]
-    fn settings_for_aws_s3_say_so() {
-        let settings = archive_target_settings(&[], &source(None, false));
-        assert_eq!(settings.endpoint, "AWS S3 (region us-east-1)");
-        assert_eq!(settings.scheme, "aws");
-        assert!(!settings.force_path_style);
-    }
-
-    #[test]
-    fn the_exit_marker_is_split_from_walg_output() {
-        let (output, code) =
-            super::split_check_exit("ERROR: refused\n__TEMPS_WALG_CHECK_EXIT__=1\n");
-        assert_eq!(output, "ERROR: refused\n");
-        assert_eq!(code, Some(1));
-        assert_eq!(super::split_check_exit("no marker").1, None);
-    }
-
-    #[test]
-    fn a_scheme_less_endpoint_reports_what_walg_does_with_it() {
-        let env = vec!["AWS_ENDPOINT=10.0.0.5:9000".to_string()];
-        let settings = archive_target_settings(&env, &source(Some("10.0.0.5:9000"), false));
-        assert_eq!(settings.scheme, "missing (WAL-G uses https)");
-        assert!(!settings.force_path_style);
-        assert_eq!(settings.path_style_reason, "as configured on the S3 source");
-    }
-
-    #[test]
-    fn walg_errors_are_kept_and_noise_dropped() {
-        let output = "INFO: 2026/01/01 starting\n\
-            ERROR: 2026/01/01 failed to read from the storage: send request failed\n\
-            caused by: Head \"https://10.0.0.5:9000/archive/x\": http: server gave HTTP response to HTTPS client\n";
-        let summary = summarize_walg_output(output);
-        assert!(summary.contains("server gave HTTP response to HTTPS client"));
-        assert!(!summary.contains("starting"));
-        assert_eq!(summarize_walg_output(""), "no output");
-    }
-
-    #[test]
-    fn the_error_names_endpoint_scheme_path_style_and_cause() {
-        let error = ArchiveTargetCheckError {
-            service_name: "orders".to_string(),
-            endpoint: "http://10.0.0.5:9000".to_string(),
-            scheme: "http".to_string(),
-            force_path_style: false,
-            path_style_reason: "as configured on the S3 source".to_string(),
-            message: "dial tcp: lookup archive.10.0.0.5: no such host".to_string(),
-        };
-        let text = error.to_string();
-        assert!(text.contains("'orders'"));
-        assert!(text.contains("http://10.0.0.5:9000"));
-        assert!(text.contains("scheme http"));
-        assert!(text.contains("path-style addressing off"));
-        assert!(text.contains("no such host"));
-        assert!(text.contains("Archiving settings were not changed"));
-    }
-}
-
-#[cfg(test)]
-mod repair_tests {
-    use super::{patch_walg_env_file, repair_walg_env_lines, walg_env_drift};
-
-    #[test]
-    fn the_repair_keeps_every_line_it_does_not_fix() {
-        let raw = "# added by an operator\n\
-                   export WALG_S3_PREFIX='s3://archive/pg/walg'\n\
-                   export AWS_ENDPOINT='10.0.0.5:9000'\n\
-                   export S3_MAX_RETRIES='1'\n\
-                   \n\
-                   AWS_S3_FORCE_PATH_STYLE=false\n\
-                   export AWS_ENDPOINT_SUFFIX='kept'\n";
-        let evaluated = lines(&[
-            "WALG_S3_PREFIX=s3://archive/pg/walg",
-            "AWS_ENDPOINT=10.0.0.5:9000",
-            "AWS_S3_FORCE_PATH_STYLE=false",
-            "AWS_ENDPOINT_SUFFIX=kept",
-        ]);
-        let repaired = repair_walg_env_lines(&evaluated).unwrap();
-        let patched = patch_walg_env_file(raw, &repaired);
-        assert_eq!(
-            patched,
-            lines(&[
-                "# added by an operator",
-                "export WALG_S3_PREFIX='s3://archive/pg/walg'",
-                "export S3_MAX_RETRIES='1'",
-                "",
-                "export AWS_ENDPOINT_SUFFIX='kept'",
-                "export AWS_ENDPOINT='http://10.0.0.5:9000'",
-                "export AWS_S3_FORCE_PATH_STYLE='true'",
-            ])
-        );
-    }
-
-    #[test]
-    fn a_scheme_only_repair_leaves_the_path_style_line_alone() {
-        let raw = "export AWS_ENDPOINT='minio.internal.example:9000'\n\
-                   export AWS_S3_FORCE_PATH_STYLE='true'\n";
-        let repaired = repair_walg_env_lines(&lines(&[
-            "AWS_ENDPOINT=minio.internal.example:9000",
-            "AWS_S3_FORCE_PATH_STYLE=true",
-        ]))
-        .unwrap();
-        assert_eq!(
-            patch_walg_env_file(raw, &repaired),
-            lines(&[
-                "export AWS_ENDPOINT='http://minio.internal.example:9000'",
-                "export AWS_S3_FORCE_PATH_STYLE='true'",
-            ])
-        );
-    }
-
-    fn lines(values: &[&str]) -> Vec<String> {
-        values.iter().map(|value| value.to_string()).collect()
-    }
-
-    #[test]
-    fn a_legacy_live_file_is_reported_with_the_restart_that_repairs_it() {
-        let live = lines(&[
-            "WALG_S3_PREFIX=s3://archive/pg/walg",
-            "AWS_SECRET_ACCESS_KEY=hunter2",
-            "AWS_ENDPOINT=10.0.0.5:9000",
-        ]);
-        let generated = lines(&[
-            "WALG_S3_PREFIX=s3://archive/pg/walg",
-            "AWS_SECRET_ACCESS_KEY=hunter2",
-            "AWS_ENDPOINT=http://10.0.0.5:9000",
-            "AWS_S3_FORCE_PATH_STYLE=true",
-        ]);
-        let drift = walg_env_drift(&live, &generated).expect("they differ");
-        assert!(
-            drift.contains("10.0.0.5:9000 (no scheme, so WAL-G uses https)"),
-            "{drift}"
-        );
-        assert!(drift.contains("instead of http://10.0.0.5:9000"), "{drift}");
-        assert!(
-            drift.contains("path-style addressing off instead of on"),
-            "{drift}"
-        );
-        assert!(drift.contains("Restart the service"), "{drift}");
-        assert!(!drift.contains("hunter2"), "{drift}");
-    }
-
-    #[test]
-    fn a_live_file_pointing_elsewhere_needs_a_backup_to_rewrite_it() {
-        let live = lines(&["AWS_ENDPOINT=https://old.example.com"]);
-        let generated = lines(&["AWS_ENDPOINT=https://s3.example.com"]);
-        let drift = walg_env_drift(&live, &generated).expect("they differ");
-        assert!(drift.contains("Run a backup"), "{drift}");
-    }
-
-    #[test]
-    fn a_live_file_matching_the_settings_is_not_drift() {
-        let generated = lines(&[
-            "AWS_ENDPOINT=http://10.0.0.5:9000",
-            "AWS_S3_FORCE_PATH_STYLE=true",
-            "AWS_SECRET_ACCESS_KEY=rotated",
-        ]);
-        let live = lines(&[
-            "AWS_ENDPOINT=http://10.0.0.5:9000",
-            "AWS_S3_FORCE_PATH_STYLE=true",
-            "AWS_SECRET_ACCESS_KEY=old",
-        ]);
-        assert_eq!(walg_env_drift(&live, &generated), None);
-    }
-
-    #[test]
-    fn a_bare_ip_endpoint_gets_a_scheme_and_path_style() {
-        let before = lines(&[
-            "WALG_S3_PREFIX=s3://archive/pg/walg",
-            "AWS_ACCESS_KEY_ID=test-access",
-            "AWS_SECRET_ACCESS_KEY=test-secret",
-            "AWS_ENDPOINT=10.0.0.5:9000",
-        ]);
-        let after = repair_walg_env_lines(&before).expect("needs repair");
-        assert_eq!(
-            after,
-            lines(&[
-                "WALG_S3_PREFIX=s3://archive/pg/walg",
-                "AWS_ACCESS_KEY_ID=test-access",
-                "AWS_SECRET_ACCESS_KEY=test-secret",
-                "AWS_ENDPOINT=http://10.0.0.5:9000",
-                "AWS_S3_FORCE_PATH_STYLE=true",
-            ])
-        );
-    }
-
-    #[test]
-    fn an_explicit_false_path_style_is_replaced_for_an_ip() {
-        let after = repair_walg_env_lines(&lines(&[
-            "AWS_ENDPOINT=http://10.0.0.5:9000",
-            "AWS_S3_FORCE_PATH_STYLE=false",
-        ]))
-        .expect("needs repair");
-        assert_eq!(
-            after,
-            lines(&[
-                "AWS_ENDPOINT=http://10.0.0.5:9000",
-                "AWS_S3_FORCE_PATH_STYLE=true"
-            ])
-        );
-    }
-
-    #[test]
-    fn a_bare_hostname_gets_a_scheme_only() {
-        let after = repair_walg_env_lines(&lines(&["AWS_ENDPOINT=objects.internal:9000"]))
-            .expect("needs repair");
-        assert_eq!(after, lines(&["AWS_ENDPOINT=http://objects.internal:9000"]));
-    }
-
-    #[test]
-    fn a_current_file_is_left_alone() {
-        assert_eq!(
-            repair_walg_env_lines(&lines(&[
-                "AWS_ENDPOINT=http://10.0.0.5:9000",
-                "AWS_S3_FORCE_PATH_STYLE=true",
-            ])),
-            None
-        );
-        assert_eq!(
-            repair_walg_env_lines(&lines(&["AWS_ENDPOINT=https://s3.example.com"])),
-            None
-        );
-        // AWS S3 itself: nothing to repair.
-        assert_eq!(
-            repair_walg_env_lines(&lines(&["WALG_S3_PREFIX=s3://a/b"])),
-            None
-        );
-    }
-}
-
-#[cfg(test)]
-mod archive_env_tests {
-    use super::archive_walg_env_lines;
-    use crate::externalsvc::S3Credentials;
-
-    fn http_ip_source() -> S3Credentials {
-        S3Credentials {
-            access_key_id: "test-access".to_string(),
-            secret_key: "test-secret".to_string(),
-            session_token: None,
-            region: "us-east-1".to_string(),
-            endpoint: Some("10.0.0.5:9000".to_string()),
-            bucket_name: "archive".to_string(),
-            bucket_path: "pg".to_string(),
-            // The reported case: path style left off in the form.
-            force_path_style: false,
-        }
-    }
-
-    /// The reported outage: a plain-HTTP store at an IP address, stored
-    /// without a scheme. `walg.env` must name `http://` (WAL-G otherwise
-    /// dials HTTPS) and force path style (`<bucket>.<ip>` cannot resolve).
-    #[tokio::test]
-    async fn walg_env_for_a_plain_http_ip_source_has_a_scheme_and_path_style() {
-        let s3 = http_ip_source();
-        // A non-loopback endpoint never touches Docker; a lazy client is
-        // enough.
-        let docker = bollard::Docker::connect_with_http(
-            "http://127.0.0.1:1",
-            1,
-            bollard::API_DEFAULT_VERSION,
-        )
-        .expect("lazy docker client");
-        let resolved = s3.resolve_endpoint_for_container(&docker, "unused").await;
-        assert_eq!(resolved.as_deref(), Some("http://10.0.0.5:9000"));
-
-        let env = archive_walg_env_lines(&s3, "s3://archive/pg/walg", resolved.as_deref());
-        assert!(
-            env.contains(&"AWS_ENDPOINT=http://10.0.0.5:9000".to_string()),
-            "{env:?}"
-        );
-        assert!(
-            env.contains(&"AWS_S3_FORCE_PATH_STYLE=true".to_string()),
-            "{env:?}"
-        );
-    }
-
-    #[test]
-    fn walg_env_keeps_https_and_the_operators_choice_for_a_hostname() {
-        let s3 = S3Credentials {
-            endpoint: Some("https://s3.example.com".to_string()),
-            ..http_ip_source()
-        };
-        let env =
-            archive_walg_env_lines(&s3, "s3://archive/pg/walg", Some("https://s3.example.com"));
-        assert!(env.contains(&"AWS_ENDPOINT=https://s3.example.com".to_string()));
-        assert!(!env
-            .iter()
-            .any(|line| line.starts_with("AWS_S3_FORCE_PATH_STYLE")));
-    }
-
-    #[test]
-    fn walg_env_adds_a_scheme_to_a_bare_resolved_endpoint() {
-        let env =
-            archive_walg_env_lines(&http_ip_source(), "s3://a/b", Some("objects.internal:9000"));
-        assert!(env.contains(&"AWS_ENDPOINT=http://objects.internal:9000".to_string()));
-    }
-
-    #[test]
-    fn walg_env_for_aws_s3_has_no_endpoint() {
-        let s3 = S3Credentials {
-            endpoint: None,
-            ..http_ip_source()
-        };
-        let env = archive_walg_env_lines(&s3, "s3://a/b", None);
-        assert!(!env.iter().any(|line| line.starts_with("AWS_ENDPOINT")));
-        assert!(!env
-            .iter()
-            .any(|line| line.starts_with("AWS_S3_FORCE_PATH_STYLE")));
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[cfg(feature = "docker-tests")]
-    use crate::externalsvc::{ExternalService, ServiceConfig};
-    use bollard::Docker;
-    use std::sync::Arc;
-
-    /// A private, run-owned PostgreSQL fixture exercises PostgreSQL's real
-    /// archive_command show hook. The fixture supplies separate off/on servers;
-    /// this test only reads their settings and never changes their workloads.
-    #[tokio::test]
-    async fn archive_settings_handles_postgres_disabled_command_display() {
-        let Some(fixture_path) = std::env::var_os("TEMPS_TEST_ARCHIVE_SETTINGS_FIXTURE") else {
-            eprintln!(
-                "Skipping archive settings integration regression: no owned fixture supplied"
-            );
-            return;
-        };
-        #[derive(serde::Deserialize)]
-        struct Fixture {
-            off: PostgresConfig,
-            on: PostgresConfig,
-        }
-        let fixture: Fixture = serde_json::from_slice(
-            &std::fs::read(fixture_path).expect("read private owned PostgreSQL fixture"),
-        )
-        .expect("parse private owned PostgreSQL fixture");
-        let docker = Arc::new(Docker::connect_with_local_defaults().expect("Docker configuration"));
-        let service = PostgresService::new("archive-settings-regression".to_string(), docker);
-        let off = service
-            .active_archive_settings(&fixture.off, "/bin/true")
-            .await
-            .expect("off policy must not wait for a command hidden by PostgreSQL");
-        assert_eq!(off, ("off".to_string(), "(disabled)".to_string()));
-        assert!(fixture.off.container_name.is_some());
-        let refusal = service
-            .enable_wal_archiving(
-                fixture.off.container_name.as_deref().unwrap(),
-                &["WALG_S3_PREFIX=s3://test-bucket/unused".to_string()],
-                &fixture.off,
-                true,
-            )
-            .await
-            .expect_err("an imported off-policy container must never be recreated");
-        assert!(refusal
-            .to_string()
-            .contains("imported database has archive_mode off"));
-        assert_eq!(
-            service
-                .active_archive_settings(&fixture.off, "/bin/true")
-                .await
-                .expect("the refused imported workload remains usable"),
-            off
-        );
-        let on = service
-            .active_archive_settings(&fixture.on, "/bin/true")
-            .await
-            .expect("on policy must expose the exact configured command");
-        assert_eq!(on, ("on".to_string(), "/bin/true".to_string()));
-        let error = service
-            .active_archive_settings(&fixture.on, "wal-g wal-push %p")
-            .await
-            .expect_err("active archiving must reject a different command");
-        assert!(error
-            .reason
-            .contains("expected archive command did not apply"));
-    }
-
-    #[test]
-    fn imported_restore_rejects_effective_command_line_archive_policy() {
-        assert!(imported_archive_mode_is_command_line("on", "command line"));
-        assert!(imported_archive_mode_is_command_line(
-            "always",
-            "command line"
-        ));
-        assert!(!imported_archive_mode_is_command_line(
-            "off",
-            "command line"
-        ));
-        assert!(!imported_archive_mode_is_command_line(
-            "on",
-            "configuration file"
-        ));
-    }
-
-    #[test]
-    fn imported_restore_detects_startup_archive_mode_override() {
-        let command = |args: &[&str]| {
-            args.iter()
-                .map(|arg| String::from(*arg))
-                .collect::<Vec<_>>()
-        };
-        assert!(postgres_cmd_pins_archive_mode_on(&command(&[
-            "postgres",
-            "-c",
-            "archive_mode=on"
-        ])));
-        assert!(postgres_cmd_pins_archive_mode_on(&command(&[
-            "postgres",
-            "-carchive_mode=always"
-        ])));
-        assert!(postgres_cmd_pins_archive_mode_on(&command(&[
-            "postgres",
-            "--archive_mode=on"
-        ])));
-        assert!(!postgres_cmd_pins_archive_mode_on(&command(&[
-            "postgres",
-            "-c",
-            "archive_mode=off"
-        ])));
-        assert!(!postgres_cmd_pins_archive_mode_on(&command(&[
-            "postgres",
-            "-c",
-            "archive_mode=on",
-            "-c",
-            "archive_mode=off"
-        ])));
-        assert!(!postgres_cmd_pins_archive_mode_on(&command(&[
-            "postgres",
-            "-c",
-            "archive_command=/bin/true"
-        ])));
-        assert!(postgres_cmd_pins_archive_mode_on(&command(&[
-            "postgres",
-            "-c",
-            "ARCHIVE_MODE=ON"
-        ])));
-        assert!(postgres_cmd_pins_archive_mode_on(&command(&[
-            "postgres",
-            "-cARCHIVE_MODE=ALWAYS"
-        ])));
-        assert!(!postgres_cmd_pins_archive_mode_on(&command(&[
-            "postgres",
-            "-c",
-            "ARCHIVE_MODE=on",
-            "-c",
-            "archive_mode=off"
-        ])));
-        assert!(postgres_cmd_pins_archive_mode_on(&command(&[
-            "postgres",
-            "-c",
-            "archive_mode=off",
-            "-c",
-            "ARCHIVE_MODE=always"
-        ])));
-
-        assert!(postgres_cmd_pins_archive_mode_on(&command(&[
-            "postgres",
-            "--archive-mode=on"
-        ])));
-        assert!(!postgres_cmd_pins_archive_mode_on(&command(&[
-            "postgres",
-            "--ARCHIVE-MODE=always",
-            "--archive_mode=off"
-        ])));
-    }
-
-    fn backup_with_metadata(metadata: serde_json::Value) -> temps_entities::backups::Model {
-        temps_entities::backups::Model {
-            id: 1,
-            name: "backup".into(),
-            backup_id: "selected-backup".into(),
-            schedule_id: None,
-            schedule_run_id: None,
-            backup_type: "external_service".into(),
-            state: "completed".into(),
-            started_at: chrono::Utc::now(),
-            finished_at: Some(chrono::Utc::now()),
-            size_bytes: None,
-            file_count: None,
-            s3_source_id: 1,
-            s3_location: "s3://bucket/repository".into(),
-            error_message: None,
-            metadata: metadata.to_string(),
-            checksum: None,
-            compression_type: "lz4".into(),
-            created_by: 1,
-            expires_at: None,
-            tags: "[]".into(),
-        }
-    }
-
-    #[test]
-    fn walg_restore_selector_uses_persisted_backup_identity() {
-        let backup = backup_with_metadata(serde_json::json!({
-            "walg_identity_version": 1,
-            "walg_target_user_data": {"temps_backup_id": "selected-backup"}
-        }));
-        assert_eq!(
-            walg_target_user_data(&backup).expect("valid metadata should parse"),
-            Some(r#"{"temps_backup_id":"selected-backup"}"#.to_string())
-        );
-    }
-
-    #[test]
-    fn walg_restore_selector_rejects_incomplete_identity_metadata() {
-        let backup = backup_with_metadata(serde_json::json!({"walg_identity_version": 1}));
-        let error = walg_target_user_data(&backup).expect_err("missing selector must fail closed");
-        assert!(error
-            .to_string()
-            .contains("missing its WAL-G target user data"));
-    }
-
-    #[test]
-    fn walg_restore_selector_rejects_mismatched_backup_identity() {
-        let backup = backup_with_metadata(serde_json::json!({
-            "walg_identity_version": 1,
-            "walg_target_user_data": {"temps_backup_id": "different-backup"}
-        }));
-        let error = walg_target_user_data(&backup).expect_err("mismatched selector must fail");
-        assert!(error.to_string().contains("for a different backup"));
-    }
-
-    #[test]
-    fn sourced_walg_values_are_shell_quoted() {
-        assert_eq!(
-            shell_export_assignment("WALG_S3_PREFIX=s3://bucket/ok;touch${IFS}/tmp/pwn;#"),
-            Some("export WALG_S3_PREFIX='s3://bucket/ok;touch${IFS}/tmp/pwn;#'".to_string())
-        );
-        assert_eq!(
-            shell_export_assignment("AWS_SECRET_ACCESS_KEY=abc'def"),
-            Some("export AWS_SECRET_ACCESS_KEY='abc'\\''def'".to_string())
-        );
-        assert!(shell_export_assignment("BAD-KEY=value").is_none());
-    }
-
-    /// Regression test: `compute_desired_enable_archiving()` must find a
-    /// pre-existing `walg.env` on the data volume even when there is no
-    /// live container to probe directly. Without the volume-probe fallback,
-    /// `start()`'s `need_create` path (force_recreate, node failover, or an
-    /// externally-removed container) would silently bake `archive_mode=off`
-    /// into the recreated container even though WAL-G was already
-    /// configured on the volume.
-    #[cfg(feature = "docker-tests")]
-    #[tokio::test]
-    async fn test_walg_env_probed_from_volume_when_container_missing() {
-        use std::net::TcpListener;
-        let port = TcpListener::bind("127.0.0.1:0")
-            .expect("failed to bind for port allocation")
-            .local_addr()
-            .expect("failed to read local addr")
-            .port();
-
-        let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
-        let service = PostgresService::new("test-walg-volume-probe".to_string(), docker.clone());
-
-        let config = ServiceConfig {
-            name: "test-walg-volume-probe".to_string(),
-            service_type: crate::externalsvc::ServiceType::Postgres,
-            version: None,
-            parameters: serde_json::json!({
-                "host": "localhost",
-                "port": port.to_string(),
-                "database": "testdb",
-                "username": "testuser",
-                "password": "testpass123",
-                "max_connections": 100,
-                "ssl_mode": "disable",
-                "docker_image": "gotempsh/postgres-walg:18-bookworm"
-            }),
-        };
-
-        service.init(config).await.expect("init should succeed");
-        let container_name = service.get_container_name();
-
-        // No walg.env written yet -- archiving must read as not desired.
-        assert!(
-            !service.compute_desired_enable_archiving().await,
-            "fresh service should not have archiving enabled"
-        );
-
-        service
-            .write_walg_env_file(&container_name, &["AWS_ACCESS_KEY_ID=test".to_string()])
-            .await
-            .expect("failed to write walg.env");
-
-        // Sanity check: the live container reports archiving desired.
-        assert!(
-            service.compute_desired_enable_archiving().await,
-            "live container should report walg.env as present"
-        );
-
-        // Remove the container but keep the volume, simulating
-        // force_recreate / node failover / an externally-removed container.
-        docker
-            .remove_container(
-                &container_name,
-                Some(bollard::query_parameters::RemoveContainerOptions {
-                    force: true,
-                    ..Default::default()
-                }),
-            )
-            .await
-            .expect("failed to remove container");
-
-        assert!(
-            service.compute_desired_enable_archiving().await,
-            "archiving must still read as desired from the volume once the container is gone"
-        );
-
-        // Cleanup: volume (container is already gone).
-        let _ = docker
-            .remove_volume(
-                &format!("{container_name}_data"),
-                None::<bollard::query_parameters::RemoveVolumeOptions>,
-            )
-            .await;
-    }
-}
+mod tests;
