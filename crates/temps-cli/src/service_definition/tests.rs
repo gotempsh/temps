@@ -621,6 +621,16 @@ fn drop_ins_merge_across_load_paths_as_systemd_does() {
     );
     std::fs::create_dir_all(high.join("temps.service.d")).unwrap();
     std::os::unix::fs::symlink("/dev/null", high.join("temps.service.d/30-masked.conf")).unwrap();
+    // A unit-specific drop-in hides a type-wide one of the same name even
+    // from a lower-priority directory.
+    write(
+        &high.join("service.d/40-database.conf"),
+        "[Service]\nEnvironment=TEMPS_DATABASE_URL=postgres://db.invalid/type-wide\n",
+    );
+    write(
+        &low.join("temps.service.d/40-database.conf"),
+        "[Service]\nEnvironment=TEMPS_DATABASE_URL=postgres://db.invalid/unit-specific\n",
+    );
 
     let mut sources = vec![(unit.clone(), std::fs::read_to_string(&unit).unwrap())];
     sources.extend(read_drop_ins(&unit, &[high.clone(), low.clone()]).unwrap());
@@ -631,6 +641,10 @@ fn drop_ins_merge_across_load_paths_as_systemd_does() {
     );
     assert_eq!(definition.env("FROM_TYPE_DROP_IN"), Some("1"));
     assert_eq!(definition.env("MASKED"), None);
+    assert_eq!(
+        definition.url(),
+        Some("postgres://db.invalid/unit-specific")
+    );
 
     // The installer's unit is read with systemd's load paths, runtime
     // overrides included.

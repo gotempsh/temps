@@ -378,7 +378,9 @@ fn drop_in_roots(unit: &Path) -> Vec<PathBuf> {
 /// (highest priority first), merged as systemd does: a file name in a
 /// higher-priority directory hides the same name in a lower one, a drop-in
 /// linked to `/dev/null` masks it, and the rest apply in lexical order of
-/// file name.
+/// file name. Every unit-specific directory outranks every type-wide one,
+/// whatever their roots: systemd looks the type-wide ones up last, so the
+/// more specific drop-in can override them.
 fn read_drop_ins(unit: &Path, roots: &[PathBuf]) -> Result<Vec<(PathBuf, String)>, String> {
     let mut unit_dir = unit
         .file_name()
@@ -386,8 +388,8 @@ fn read_drop_ins(unit: &Path, roots: &[PathBuf]) -> Result<Vec<(PathBuf, String)
         .unwrap_or_default();
     unit_dir.push(".d");
     let mut chosen: BTreeMap<std::ffi::OsString, PathBuf> = BTreeMap::new();
-    for root in roots {
-        for dir in [root.join(&unit_dir), root.join("service.d")] {
+    for dir_name in [unit_dir.as_os_str(), std::ffi::OsStr::new("service.d")] {
+        for dir in roots.iter().map(|root| root.join(dir_name)) {
             let entries = match std::fs::read_dir(&dir) {
                 Ok(entries) => entries,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
