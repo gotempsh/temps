@@ -198,16 +198,16 @@ async fn run_async(args: CloudTelemetryBackfillArgs) -> anyhow::Result<()> {
     }
     let stateless = persisted_mode.is_stateless();
     // After the mode checks, which only read, so a run they reject creates
-    // no secret files; before migrations, so a missing key fails with
-    // nothing changed.
+    // no secret files; before migrations, so a missing or malformed key
+    // fails with nothing changed.
     let key = crate::server_secrets::encryption_key(&data_dir, &database)?;
     key.announce();
-    let key = key.into_value();
+    let encryption = Arc::new(key.into_encryption()?);
     if !stateless {
         temps_schema::ensure_no_unprotected_upgrade(db.as_ref()).await?;
         temps_schema::run_migrations(db.as_ref()).await?;
     }
-    let link = load_cloud_link(&data_dir, &key, db.clone(), database_url, stateless).await?;
+    let link = load_cloud_link(&data_dir, encryption, db.clone(), database_url, stateless).await?;
     let compression = temps_config::stored_clickhouse_compression(db.as_ref()).await;
     let source = build_source(&args, db.clone(), compression)?;
 
@@ -526,16 +526,11 @@ fn resolve_data_dir(explicit: Option<PathBuf>) -> anyhow::Result<PathBuf> {
 /// Load the same link state the server uses, decrypted with the same key.
 async fn load_cloud_link(
     data_dir: &Path,
-    key: &str,
+    encryption: Arc<temps_core::EncryptionService>,
     db: Arc<sea_orm::DatabaseConnection>,
     database_url: &str,
     stateless: bool,
 ) -> anyhow::Result<Arc<temps_cloud_client::CloudLink>> {
-    let encryption = Arc::new(
-        temps_core::EncryptionService::new(key)
-            .map_err(|error| anyhow::anyhow!("Could not initialise encryption: {error}"))?,
-    );
-
     if stateless {
         return temps_cloud_client::CloudLink::load_encrypted_postgres(
             data_dir.to_path_buf(),

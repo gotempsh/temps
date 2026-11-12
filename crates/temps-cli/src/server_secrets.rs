@@ -176,6 +176,15 @@ pub(crate) enum ServerSecretsError {
         #[source]
         source: Box<temps_config::ConfigServiceError>,
     },
+    #[error(
+        "The encryption key {origin} is not a valid Temps encryption key: {source}. Nothing \
+         was changed. Set it to the server's key, 64 hex characters"
+    )]
+    InvalidKey {
+        origin: String,
+        #[source]
+        source: temps_core::EncryptionError,
+    },
 }
 
 /// How the database a command uses relates to the installed server.
@@ -231,6 +240,8 @@ pub(crate) fn service_data_dir(
 /// An encryption key, and for the installed server's where it was read from.
 pub(crate) struct ServerKey {
     value: String,
+    /// Where the key was read from, never the key.
+    origin: String,
     notice: Option<String>,
     /// Read from the data directory's `encryption_key`, not injected.
     from_data_dir: bool,
@@ -240,6 +251,7 @@ impl std::fmt::Debug for ServerKey {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ServerKey")
+            .field("origin", &self.origin)
             .field("notice", &self.notice)
             .finish_non_exhaustive()
     }
@@ -259,8 +271,18 @@ impl ServerKey {
         }
     }
 
-    pub(crate) fn into_value(self) -> String {
-        self.value
+    /// The service that encrypts with this key. It checks the key is one,
+    /// so a caller that builds it before writing anything fails with
+    /// nothing changed.
+    pub(crate) fn into_encryption(
+        self,
+    ) -> Result<temps_core::EncryptionService, ServerSecretsError> {
+        temps_core::EncryptionService::new(&self.value).map_err(|source| {
+            ServerSecretsError::InvalidKey {
+                origin: self.origin,
+                source,
+            }
+        })
     }
 }
 
@@ -293,10 +315,21 @@ fn encryption_key_in(
                 definition: service.path.clone(),
                 reason: reason.to_string(),
             };
+            // Only a key the shell itself sets: one that sets another secret
+            // variable still leaves the key to the data directory, which
+            // says nothing about whose it is. Checked before reading, so a
+            // data directory without a key reports the unknown server, not
+            // a missing key.
+            let shell_sets_key = shell_variables.iter().any(|name| {
+                *name == temps_config::ENCRYPTION_KEY_ENV
+                    || *name == temps_config::ENCRYPTION_KEY_FILE_ENV
+            });
+            if !shell_sets_key {
+                return Err(unknown());
+            }
             match SecretsEnvironment::choose_with(Some(service), shell_variables) {
-                // Only a key the shell itself sets: one that sets another
-                // secret variable still leaves the key to the data
-                // directory, which says nothing about whose it is.
+                // Should the shell's key variable still leave the key to
+                // the data directory, that key is refused too.
                 environment @ SecretsEnvironment::Shell(_) => {
                     let key = service_encryption_key(data_dir, service, environment)?;
                     if key.from_data_dir {
@@ -313,6 +346,10 @@ fn encryption_key_in(
         InstalledServer::Other => temps_config::resolve_installation_secrets(data_dir)
             .map(|secrets| ServerKey {
                 value: secrets.encryption_key,
+                origin: format!(
+                    "for data directory {}, as `temps serve` would read it on this host",
+                    data_dir.display()
+                ),
                 notice: None,
                 from_data_dir: true,
             })
@@ -348,15 +385,19 @@ fn service_encryption_key(
     let inspection =
         temps_config::inspect_installation_secrets_with(data_dir, |name| environment.get(name));
     match inspection.encryption_key {
-        Ok(temps_config::InspectedSecret::Found { value, source }) => Ok(ServerKey {
-            value,
-            notice: Some(format!(
-                "Using the encryption key {} ({}).",
+        Ok(temps_config::InspectedSecret::Found { value, source }) => {
+            let origin = format!(
+                "{} ({})",
                 describe_key_source(&source),
                 environment.describe()
-            )),
-            from_data_dir: matches!(source, temps_config::SecretSource::DataDir { .. }),
-        }),
+            );
+            Ok(ServerKey {
+                value,
+                notice: Some(format!("Using the encryption key {origin}.")),
+                origin,
+                from_data_dir: matches!(source, temps_config::SecretSource::DataDir { .. }),
+            })
+        }
         Ok(temps_config::InspectedSecret::NotCreatedYet { path }) => {
             Err(ServerSecretsError::KeyNotCreated {
                 definition: service.path.clone(),
@@ -471,7 +512,7 @@ mod tests {
                 SecretsEnvironment::of_service(Some(service))
             )
             .unwrap()
-            .into_value(),
+            .value,
             KEY
         );
     }
@@ -502,9 +543,56 @@ mod tests {
                 SecretsEnvironment::of_service(Some(service))
             )
             .unwrap()
-            .into_value(),
+            .value,
             KEY
         );
+    }
+
+    #[test]
+    fn a_malformed_key_is_refused_before_anything_encrypts_with_it() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("data");
+        const MALFORMED: &str = "not-a-key-but-secret-anyway";
+        write(&data.join(temps_config::ENCRYPTION_KEY_FILE), MALFORMED);
+        let unit = root.path().join("temps.service");
+        write(
+            &unit,
+            &format!(
+                "[Service]\nExecStart=/usr/bin/temps serve --database-url={URL} --data-dir={}\n",
+                data.display()
+            ),
+        );
+        let database = resolve(&unit, None);
+        let service = database.serving_service().unwrap();
+        let key = service_encryption_key(
+            &data,
+            service,
+            SecretsEnvironment::of_service(Some(service)),
+        )
+        .unwrap();
+        let error = key.into_encryption().unwrap_err();
+        assert!(
+            matches!(error, ServerSecretsError::InvalidKey { .. }),
+            "{error}"
+        );
+        // It says which key, and never what the key is.
+        let message = error.to_string();
+        assert!(
+            message.contains(&data.display().to_string())
+                && message.contains("Nothing was changed"),
+            "{message}"
+        );
+        assert!(!message.contains(MALFORMED), "{message}");
+
+        // A well-formed key gives the service that encrypts with it.
+        write(&data.join(temps_config::ENCRYPTION_KEY_FILE), KEY);
+        let key = service_encryption_key(
+            &data,
+            service,
+            SecretsEnvironment::of_service(Some(service)),
+        )
+        .unwrap();
+        assert!(key.into_encryption().is_ok());
     }
 
     #[cfg(unix)]
@@ -561,7 +649,11 @@ mod tests {
         assert!(encryption_key_in(&data, &database, Vec::new()).is_err());
 
         // Nor when this shell sets a secret variable other than the key's:
-        // the key would still come from --data-dir.
+        // the key would still come from --data-dir. That is so whether or
+        // not the directory holds a key: one without says the server is
+        // unknown, not that its key is missing.
+        let keyless = root.path().join("keyless-data");
+        std::fs::create_dir_all(&keyless).unwrap();
         for variable in [
             temps_config::AUTH_SECRET_ENV,
             temps_config::AUTH_SECRET_FILE_ENV,
@@ -579,7 +671,16 @@ mod tests {
                 "{variable}: {error}"
             );
             assert!(!error.to_string().contains(KEY), "{error}");
+            let error = encryption_key_in(&keyless, &database, vec![variable]).unwrap_err();
+            assert!(
+                matches!(error, ServerSecretsError::ServerUnknown { .. }),
+                "{variable}, no key in the directory: {error}"
+            );
         }
+        assert!(
+            !keyless.join(temps_config::ENCRYPTION_KEY_FILE).exists(),
+            "a key was created"
+        );
     }
 
     #[cfg(unix)]

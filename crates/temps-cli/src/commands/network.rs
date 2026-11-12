@@ -287,9 +287,11 @@ async fn execute_setup_multi_node(cmd: SetupMultiNodeCommand) -> anyhow::Result<
             .ok_or_else(|| anyhow::anyhow!("could not determine the Temps data directory"))?,
     };
 
+    // Before connecting, so a missing or malformed key fails with the pool,
+    // mesh and overlay unchanged.
     let key = crate::server_secrets::encryption_key(&data_dir, &database)?;
     key.announce();
-    let encryption_key = key.into_value();
+    let encryption = Arc::new(key.into_encryption()?);
     let db = temps_schema::establish_connection(database.url())
         .await
         .map_err(|error| anyhow::anyhow!("could not connect to the Temps database: {error}"))?;
@@ -380,10 +382,6 @@ async fn execute_setup_multi_node(cmd: SetupMultiNodeCommand) -> anyhow::Result<
     )
     .await
     .map_err(|error| anyhow::anyhow!("multi-node control-plane setup failed: {error}"))?;
-    let encryption = Arc::new(
-        temps_core::EncryptionService::new(&encryption_key)
-            .map_err(|error| anyhow::anyhow!("invalid Temps encryption key: {error}"))?,
-    );
     let dns_registry = Arc::new(temps_dns::DnsRegistry::new(db.clone()));
     let services =
         temps_providers::ExternalServiceManager::new(db.clone(), encryption, docker, dns_registry);

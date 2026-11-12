@@ -16,7 +16,6 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
-use temps_core::EncryptionService;
 use temps_entities::domains;
 use temps_schema::establish_connection;
 use x509_parser::prelude::*;
@@ -1881,9 +1880,7 @@ async fn execute_import(cmd: ImportCertificateCommand) -> anyhow::Result<()> {
     };
     let key = crate::server_secrets::encryption_key(&data_dir, &database)?;
     key.announce();
-    let encryption_key = key.into_value();
-    let encryption_service = EncryptionService::new(&encryption_key)
-        .map_err(|e| anyhow::anyhow!("Failed to create encryption service: {}", e))?;
+    let encryption_service = key.into_encryption()?;
 
     // Read certificate and private key files
     println!(
