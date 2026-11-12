@@ -23,7 +23,7 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
     (
         "vault configuration is managed by instance administrators; general sessions have a separate human confirmation path",
         &[
-            "create_access_bundle", "create_access_bundle_general", "create_access_vault_general",
+            "create_access_bundle", "create_access_vault_general",
             "update_access_bundle_general", "update_access_vault_general",
             "delete_access_vault_general", "delete_access_bundle_general", "delete_access_service_general",
             "create_access_service_general", "update_access_service_general",
