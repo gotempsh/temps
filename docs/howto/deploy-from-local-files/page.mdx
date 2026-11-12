@@ -67,7 +67,9 @@ What is left out depends on how the files arrive.
 
 The console lists what it skipped under **Left out of the upload**, with the reason for each.
 
-**A ZIP** is uploaded exactly as it is. Your browser does not open or filter it, and Temps stores the original archive on the server. The server inspects it, and a ZIP that contains `*.pem`, `*.key` or `credentials.json` is refused with the entry named. A key inside `node_modules/` or `.git/` is skipped instead of refused, but it is still in the archive that is stored. Those three names are the only secrets Temps looks for, so a `.env` file, an SSH key or a token in another file is not detected. The server skips the other entries in the table above when it builds, but they are still inside the archive you uploaded. Remove every secret from the folder before you zip it.
+These rules match file names only. Any other secret in the folder, such as an SSH key named `id_rsa`, a `service-account.json` or a config file that holds a token, is uploaded with the rest. Remove every secret from the folder before you drop it.
+
+**A ZIP** is uploaded exactly as it is. Your browser does not open or filter it, and Temps stores the original archive on the server. The server inspects it, and a ZIP that contains `*.pem`, `*.key` or `credentials.json` is refused with the entry named. A key inside a left-out folder such as `node_modules/` or `.git/` is skipped instead of refused, but it is still in the archive that is stored. Those three patterns are the only entries that make Temps refuse a ZIP: an SSH key such as `id_rsa` or a token in another file is accepted. The server skips the other entries in the table above, `.env` files included, when it builds, but they are still inside the archive you uploaded. Remove every secret from the folder before you zip it.
 
 ---
 
