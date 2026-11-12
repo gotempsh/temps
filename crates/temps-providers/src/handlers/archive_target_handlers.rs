@@ -197,6 +197,17 @@ pub async fn test_wal_archive_target(
         .external_service_manager
         .test_wal_archive_target(id)
         .await?;
+    Ok(audited_response(&app_state, &auth, &metadata, id, outcome).await)
+}
+
+/// Audit a completed check, passed or refused, and build its response.
+async fn audited_response(
+    app_state: &AppState,
+    auth: &temps_auth::AuthContext,
+    metadata: &RequestMetadata,
+    id: i32,
+    outcome: ArchiveTargetTestOutcome,
+) -> Json<ArchiveTargetTestResponse> {
     let audit = ExternalServiceArchiveTargetTestedAudit {
         context: AuditContext {
             user_id: auth.user_id(),
@@ -216,7 +227,7 @@ pub async fn test_wal_archive_target(
             "Failed to create audit log for a WAL archive target check: {}", e
         );
     }
-    Ok(Json(ArchiveTargetTestResponse::from(outcome)))
+    Json(ArchiveTargetTestResponse::from(outcome))
 }
 
 pub fn configure_routes() -> Router<Arc<AppState>> {
@@ -314,6 +325,14 @@ mod tests {
     }
 
     fn state(db: MockDatabase, audit: RecordingAuditLogger) -> Arc<AppState> {
+        state_with_project_roles(db, audit, None)
+    }
+
+    fn state_with_project_roles(
+        db: MockDatabase,
+        audit: RecordingAuditLogger,
+        project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
+    ) -> Arc<AppState> {
         let db = Arc::new(db.into_connection());
         let encryption = Arc::new(temps_core::EncryptionService::new_from_password(
             "archive-target-handler-test",
@@ -346,7 +365,7 @@ mod tests {
             api_key_service: Arc::new(temps_auth::ApiKeyService::new(db)),
             config_service: None,
             telemetry: Arc::new(temps_core::NoopTelemetryReporter),
-            project_access_checker: None,
+            project_access_checker,
             application_network_reconciler: None,
             notification_service: Arc::new(crate::handlers::types::StaticNotificationService {
                 destinations: Some(0),
@@ -413,6 +432,168 @@ mod tests {
             assert!(body["detail"].is_string(), "Problem Details body: {body}");
             assert!(audit.operations.lock().unwrap().is_empty());
         }
+    }
+
+    /// Scoped project roles: a member of every project whose role there
+    /// grants only reading external services.
+    struct ReadOnlyProjectRole;
+
+    #[async_trait::async_trait]
+    impl temps_core::ProjectAccessChecker for ReadOnlyProjectRole {
+        async fn user_can_access_project(
+            &self,
+            _user_id: i32,
+            _project_id: i32,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(true)
+        }
+
+        async fn effective_project_permissions(
+            &self,
+            _user_id: i32,
+            _project_id: i32,
+        ) -> Result<Option<Vec<String>>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(Some(vec![
+                temps_auth::Permission::ExternalServicesRead.to_string()
+            ]))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_read_only_role_in_the_linked_project_cannot_run_the_check() {
+        let audit = RecordingAuditLogger::default();
+        let svc = service("postgres");
+        let link = project_services::Model {
+            id: 1,
+            project_id: 99,
+            service_id: 7,
+            database_provisioning_mode: "shared".into(),
+            custom_database_name: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        // Only the ownership lookups: loading the service for the check
+        // would run out of mock results and fail with a 500, not a 403.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![svc]])
+            .append_query_results([vec![link]]);
+        let app = state_with_project_roles(db, audit.clone(), Some(Arc::new(ReadOnlyProjectRole)));
+        // An instance User holds ExternalServicesWrite and passes the
+        // instance-level guard; the project role must still refuse.
+        let (status, body) = body_json(
+            test_wal_archive_target(
+                RequireAuth(auth(temps_auth::Role::User)),
+                State(app),
+                Path(7),
+                Extension(metadata()),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(body["detail"].is_string(), "Problem Details body: {body}");
+        assert!(audit.operations.lock().unwrap().is_empty());
+    }
+
+    fn checked_outcome(ok: bool) -> ArchiveTargetTestOutcome {
+        ArchiveTargetTestOutcome {
+            ok,
+            s3_source_id: 3,
+            s3_source_name: "archive".to_string(),
+            endpoint: "http://10.0.0.5:9000".to_string(),
+            scheme: "http".to_string(),
+            force_path_style: true,
+            path_style_reason: "Forced: the endpoint is an IP address".to_string(),
+            message: if ok {
+                "WAL-G wrote a probe object to the archive target".to_string()
+            } else {
+                "server gave HTTP response to HTTPS client".to_string()
+            },
+            live_settings_drift: None,
+            checked_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_completed_check_is_audited_and_returned_passed_or_refused() {
+        for ok in [true, false] {
+            let audit = RecordingAuditLogger::default();
+            let app = state(MockDatabase::new(DatabaseBackend::Postgres), audit.clone());
+            let response = audited_response(
+                &app,
+                &auth(temps_auth::Role::Admin),
+                &metadata(),
+                7,
+                checked_outcome(ok),
+            )
+            .await
+            .into_response();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["ok"], ok);
+            assert_eq!(body["endpoint"], "http://10.0.0.5:9000");
+            assert_eq!(body["scheme"], "http");
+            assert_eq!(body["force_path_style"], true);
+            assert_eq!(body["s3_source_id"], 3);
+            assert!(body["live_settings_drift"].is_null());
+            assert!(body["checked_at"].as_str().unwrap().ends_with('Z'));
+            assert_eq!(
+                *audit.operations.lock().unwrap(),
+                vec!["EXTERNAL_SERVICE_ARCHIVE_TARGET_TESTED".to_string()]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn without_docker_the_check_is_a_500_and_nothing_is_audited() {
+        let audit = RecordingAuditLogger::default();
+        let mut svc = service("postgres");
+        svc.continuous_archive_s3_source_id = Some(3);
+        let encryption =
+            temps_core::EncryptionService::new_from_password("archive-target-handler-test");
+        let now = Utc::now();
+        let source = temps_entities::s3_sources::Model {
+            id: 3,
+            name: "archive".to_string(),
+            bucket_name: "archive".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint: Some("http://10.0.0.5:9000".to_string()),
+            bucket_path: "pg".to_string(),
+            access_key_id: encryption.encrypt_string("test-access").unwrap(),
+            secret_key: encryption.encrypt_string("test-secret").unwrap(),
+            session_token: None,
+            credentials_expire_at: None,
+            force_path_style: None,
+            is_default: false,
+            managed_by_cloud: false,
+            lifecycle_reconcile_failed_at: None,
+            lifecycle_reconcile_generation: 0,
+            created_at: now,
+            updated_at: now,
+            backing_service_id: None,
+            worker_credentials: temps_entities::s3_sources::WORKER_CREDENTIALS_SCOPED.to_string(),
+        };
+        let db = owned_then_loaded(&svc).append_query_results([vec![source]]);
+        let app = state(db, audit.clone());
+        let (status, body) = body_json(
+            test_wal_archive_target(
+                RequireAuth(auth(temps_auth::Role::Admin)),
+                State(app),
+                Path(7),
+                Extension(metadata()),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert!(
+            body["detail"].as_str().unwrap().contains("service 7"),
+            "{body}"
+        );
+        assert!(audit.operations.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

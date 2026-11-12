@@ -92,6 +92,19 @@ pub struct ArchiveTargetCheck {
 /// error, and this bounds a target that never answers.
 const ARCHIVE_TARGET_CHECK_TIMEOUT_SECS: u64 = 60;
 
+/// Upper bound of removing the check's probe after a successful upload.
+/// Best effort: a removal that fails or hangs never fails the check.
+const ARCHIVE_PROBE_CLEANUP_TIMEOUT_SECS: u64 = 30;
+
+/// How long the exec running the check may take: the upload and the
+/// cleanup run one after the other, each under its own `timeout`, plus a
+/// margin for starting the shell. A slow but successful upload followed by
+/// a stalled removal must still reach the line that reports the upload's
+/// exit code, or a writable target would read as a failed check.
+fn archive_target_check_exec_deadline() -> Duration {
+    Duration::from_secs(ARCHIVE_TARGET_CHECK_TIMEOUT_SECS + ARCHIVE_PROBE_CLEANUP_TIMEOUT_SECS + 15)
+}
+
 /// The settings a check reports: what `walg_env` hands WAL-G.
 fn archive_target_settings(
     walg_env: &[String],
@@ -131,6 +144,39 @@ fn archive_target_settings(
         force_path_style,
         path_style_reason: reason.describe().to_string(),
     }
+}
+
+/// The one object the archive target check writes, at the root of the
+/// service's WAL-G prefix, outside `basebackups_005/` and `wal_005/` (the
+/// only folders WAL-G reads for backups and WAL).
+pub(crate) const ARCHIVE_CHECK_PROBE_KEY: &str = "temps-archive-check";
+
+/// The archive target check, run in the service's container with the
+/// `WALG_`/`AWS_` settings in its environment.
+///
+/// It uploads a 5-byte probe to the fixed [`ARCHIVE_CHECK_PROBE_KEY`]
+/// (`st put -f` overwrites it), then tries to remove it. A worker node's
+/// scoped archive credential may write but never delete, so its removal is
+/// refused; because the key is fixed, the next check overwrites the same
+/// object instead of leaving another one. (`wal-g st check write` uploads a
+/// randomly named object and only warns when it cannot delete it, which
+/// left one object per scoped backup.)
+///
+/// The script always exits 0 and prints the upload's exit code on its last
+/// line, so a refusal is read as WAL-G's answer rather than a failed exec.
+pub(crate) fn archive_target_check_script() -> String {
+    format!(
+        "if command -v wal-g >/dev/null 2>&1; then \
+         probe=$(mktemp) && printf temps > \"$probe\" && \
+         timeout {ARCHIVE_TARGET_CHECK_TIMEOUT_SECS} wal-g st put -f --no-compress --no-encrypt \
+           \"$probe\" {ARCHIVE_CHECK_PROBE_KEY} 2>&1; code=$?; \
+         rm -f \"$probe\"; \
+         if [ \"$code\" -eq 0 ]; then \
+           timeout {ARCHIVE_PROBE_CLEANUP_TIMEOUT_SECS} wal-g st rm {ARCHIVE_CHECK_PROBE_KEY} >/dev/null 2>&1 || true; \
+         fi; \
+         else echo 'wal-g is not installed in this image'; code=127; fi; \
+         echo \"{CHECK_EXIT_MARKER}$code\"; exit 0"
+    )
 }
 
 /// Prefix of the last line the check script prints: WAL-G's exit code.
@@ -1118,10 +1164,9 @@ impl PostgresService {
             .await
     }
 
-    /// Run WAL-G's own storage check (`wal-g st check write`: put, read
-    /// back and delete a small probe object) against the archive target of
-    /// this service, with the settings `walg.env` would hold, without
-    /// writing `walg.env`. Read-only for the database. The outer error is a
+    /// Check that WAL-G can write to the archive target of this service
+    /// (see [`archive_target_check_script`]), with the settings `walg.env`
+    /// would hold, without writing `walg.env`. Read-only for the database. The outer error is a
     /// service that cannot be checked at all; the inner one is the target's
     /// answer.
     pub async fn check_archive_target(
@@ -1166,22 +1211,14 @@ impl PostgresService {
             .cloned()
             .collect();
         env.push("S3_MAX_RETRIES=1".to_string());
-        // The exec always succeeds and reports WAL-G's exit code on its
-        // last line, so a refusal is read as WAL-G's answer rather than as
-        // a failed exec.
-        let script = format!(
-            "if command -v wal-g >/dev/null 2>&1; then \
-             timeout {ARCHIVE_TARGET_CHECK_TIMEOUT_SECS} wal-g st check write 2>&1; code=$?; \
-             else echo 'wal-g is not installed in this image'; code=127; fi; \
-             echo \"{CHECK_EXIT_MARKER}$code\"; exit 0"
-        );
+        let script = archive_target_check_script();
         let redact = crate::externalsvc::SensitiveValues::new().s3_credentials(s3_credentials);
         let result = crate::externalsvc::exec_util::run_exec(
             &self.docker,
             container_name,
             vec!["sh".to_string(), "-c".to_string(), script],
             Some(env),
-            Duration::from_secs(ARCHIVE_TARGET_CHECK_TIMEOUT_SECS + 15),
+            archive_target_check_exec_deadline(),
         )
         .await
         .map_err(|error| failure(redact.redact(&format!("could not run the check: {error}"))))?;
@@ -1764,11 +1801,14 @@ mod plain_http_ip_archive_docker_tests {
             return Err(format!("generated walg.env is wrong: {:?}", env));
         }
 
-        // 1. The check Temps now runs before enabling archiving passes.
-        service
-            .check_archive_target_env(walg_name, &env, &source)
-            .await
-            .map_err(|e| format!("check with the generated settings failed: {e}"))?;
+        // 1. The check Temps now runs before enabling archiving passes, and
+        //    running it again reuses the same probe key.
+        for _ in 0..2 {
+            service
+                .check_archive_target_env(walg_name, &env, &source)
+                .await
+                .map_err(|e| format!("check with the generated settings failed: {e}"))?;
+        }
 
         // 2. A real segment archives through `walg.env`, as archive_command
         //    runs it.
@@ -1799,6 +1839,10 @@ mod plain_http_ip_archive_docker_tests {
                 "wal-push failed (exit {}): {}",
                 push.exit_code, push.output
             ));
+        }
+        // With credentials that may delete, the probe is removed.
+        if push.output.contains(super::ARCHIVE_CHECK_PROBE_KEY) {
+            return Err(format!("the check left its probe behind: {}", push.output));
         }
 
         // 3. What Temps generated before the fix, both ways it failed:
@@ -1953,7 +1997,11 @@ mod plain_http_ip_archive_docker_tests {
 
 #[cfg(test)]
 mod target_check_tests {
-    use super::{archive_target_settings, summarize_walg_output, ArchiveTargetCheckError};
+    use super::{
+        archive_target_check_exec_deadline, archive_target_check_script, archive_target_settings,
+        summarize_walg_output, ArchiveTargetCheckError, ARCHIVE_CHECK_PROBE_KEY,
+        ARCHIVE_PROBE_CLEANUP_TIMEOUT_SECS, ARCHIVE_TARGET_CHECK_TIMEOUT_SECS, CHECK_EXIT_MARKER,
+    };
     use crate::externalsvc::S3Credentials;
 
     fn source(endpoint: Option<&str>, force_path_style: bool) -> S3Credentials {
@@ -1967,6 +2015,61 @@ mod target_check_tests {
             bucket_path: "pg".to_string(),
             force_path_style,
         }
+    }
+
+    #[test]
+    fn the_check_overwrites_one_fixed_probe_and_never_a_random_one() {
+        let script = archive_target_check_script();
+        // `st check write` names its probe randomly, so a credential that
+        // cannot delete would leave one object per check.
+        assert!(!script.contains("st check"), "{script}");
+        assert!(
+            script.contains("wal-g st put -f --no-compress --no-encrypt"),
+            "{script}"
+        );
+        assert!(
+            script.contains(&format!("\"$probe\" {ARCHIVE_CHECK_PROBE_KEY}")),
+            "{script}"
+        );
+        // The removal names the probe key exactly, never an empty prefix,
+        // and only runs after a successful upload.
+        assert!(
+            script.contains(&format!("wal-g st rm {ARCHIVE_CHECK_PROBE_KEY} ")),
+            "{script}"
+        );
+        assert!(!ARCHIVE_CHECK_PROBE_KEY.is_empty());
+        assert!(!ARCHIVE_CHECK_PROBE_KEY.contains('/'));
+        assert!(script.find("st put").unwrap_or(usize::MAX) < script.find("st rm").unwrap_or(0));
+        assert!(script.contains(&format!("echo \"{CHECK_EXIT_MARKER}$code\"; exit 0")));
+    }
+
+    /// An upload that succeeds just inside its bound, followed by a removal
+    /// that hangs until its own bound, still reports success: the exec
+    /// deadline outlasts both, so it is never what fails a writable target.
+    #[test]
+    fn the_exec_deadline_outlasts_a_slow_upload_and_a_stalled_cleanup() {
+        let script = archive_target_check_script();
+        assert!(
+            script.contains(&format!(
+                "timeout {ARCHIVE_TARGET_CHECK_TIMEOUT_SECS} wal-g st put"
+            )),
+            "{script}"
+        );
+        assert!(
+            script.contains(&format!(
+                "timeout {ARCHIVE_PROBE_CLEANUP_TIMEOUT_SECS} wal-g st rm"
+            )),
+            "{script}"
+        );
+        // The only two commands that talk to the target are bounded.
+        assert_eq!(script.matches("wal-g st ").count(), 2, "{script}");
+        assert_eq!(script.matches("timeout ").count(), 2, "{script}");
+        let worst_case = ARCHIVE_TARGET_CHECK_TIMEOUT_SECS + ARCHIVE_PROBE_CLEANUP_TIMEOUT_SECS;
+        assert!(
+            archive_target_check_exec_deadline().as_secs() >= worst_case + 10,
+            "deadline {:?} vs {worst_case}s of sequential bounds",
+            archive_target_check_exec_deadline()
+        );
     }
 
     #[test]

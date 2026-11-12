@@ -212,7 +212,7 @@ fn outcome(
             scheme: check.scheme,
             force_path_style: check.force_path_style,
             path_style_reason: check.path_style_reason,
-            message: "WAL-G wrote, read back and deleted a probe object".to_string(),
+            message: "WAL-G wrote a probe object to the archive target".to_string(),
             live_settings_drift,
             checked_at,
         },
