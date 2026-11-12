@@ -570,6 +570,12 @@ pub struct DockerCleanupService {
     /// who disabled retention, followed by a transient settings-read error,
     /// must not have deletions silently resume under the stale boot policy.
     last_known_image_retention: std::sync::Mutex<(bool, i64)>,
+    /// Lists and removes the images this install labelled, for the sweep of
+    /// images whose project no longer exists (`orphaned_images`).
+    owned_image_daemon: Arc<dyn super::orphaned_images::OwnedImageDaemon>,
+    /// Most orphaned project images one nightly run removes (default: 200);
+    /// the rest wait for the next night.
+    max_orphaned_images_per_run: usize,
 }
 
 impl DockerCleanupService {
@@ -596,7 +602,22 @@ impl DockerCleanupService {
             image_retention_enabled: true,
             config_service: None,
             last_known_image_retention: std::sync::Mutex::new((true, 336)),
+            owned_image_daemon: Arc::new(DefaultDockerClient),
+            max_orphaned_images_per_run: 200,
         }
+    }
+
+    pub fn with_owned_image_daemon(
+        mut self,
+        daemon: Arc<dyn super::orphaned_images::OwnedImageDaemon>,
+    ) -> Self {
+        self.owned_image_daemon = daemon;
+        self
+    }
+
+    pub fn with_max_orphaned_images_per_run(mut self, count: usize) -> Self {
+        self.max_orphaned_images_per_run = count;
+        self
     }
 
     pub fn with_static_dir(mut self, static_dir: PathBuf) -> Self {
@@ -987,6 +1008,45 @@ impl DockerCleanupService {
         }
     }
 
+    /// Remove images this install built for projects that no longer exist
+    /// (see `orphaned_images` for the safety rules). Skipped, like the
+    /// retention pass, when the operator turned image retention off: built
+    /// images are then kept forever.
+    async fn remove_orphaned_project_images(&self) {
+        let (image_retention_enabled, _) = self.current_image_retention().await;
+        if !image_retention_enabled {
+            debug!(
+                "Deployment image retention is disabled; not removing images of deleted projects"
+            );
+            return;
+        }
+        match super::orphaned_images::sweep_orphaned_project_images(
+            self.db.as_ref(),
+            self.owned_image_daemon.as_ref(),
+            self.max_orphaned_images_per_run,
+        )
+        .await
+        {
+            Ok(report) if report.orphaned == 0 => debug!(
+                labelled = report.labelled,
+                "No images of deleted projects to remove"
+            ),
+            Ok(report) => info!(
+                labelled = report.labelled,
+                orphaned = report.orphaned,
+                removed = report.removed,
+                kept = report.kept,
+                failed = report.failed,
+                deferred = report.deferred,
+                "Swept images built for deleted projects"
+            ),
+            Err(error) => error!(
+                %error,
+                "Could not sweep images built for deleted projects; nothing was removed, retrying next run"
+            ),
+        }
+    }
+
     /// Per-image eligibility and oldest reference, computed inside Postgres.
     ///
     /// **What is a candidate.** Only a tag the Temps image builder recorded
@@ -1299,6 +1359,10 @@ impl DockerCleanupService {
 
         // Remove old deployment images per project retention policy
         self.prune_old_deployment_images().await;
+
+        // Remove images built for projects that have since been deleted,
+        // which the row-based pass above can no longer see
+        self.remove_orphaned_project_images().await;
 
         // Cleanup old persisted static asset chunks
         if let Some(ref static_dir) = self.static_dir {

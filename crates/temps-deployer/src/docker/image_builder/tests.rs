@@ -165,6 +165,7 @@ async fn local_workspace_archive_intersects_root_and_specific_rules() {
 #[test]
 fn buildkit_arguments_extend_user_arguments() {
     let request = BuildRequest {
+        labels: Default::default(),
         build_secrets: Default::default(),
         cache_from: Vec::new(),
         image_name: "test".into(),
@@ -187,6 +188,36 @@ fn buildkit_arguments_extend_user_arguments() {
     assert_eq!(args["OVERRIDE"], "builder");
     assert_eq!(args["BUILDKIT_INLINE_CACHE"], "1");
     assert_eq!(docker_build_args(&request, false), request.build_args);
+}
+
+#[test]
+fn built_images_carry_the_requested_labels_and_cannot_drop_built_by() {
+    let mut request = BuildRequest {
+        cache_from: Vec::new(),
+        image_name: "app-1:latest".to_string(),
+        context_path: PathBuf::from("/tmp"),
+        dockerfile_path: None,
+        build_args: HashMap::new(),
+        build_args_buildkit: HashMap::new(),
+        platform: None,
+        log_path: PathBuf::from("/tmp/build.log"),
+        labels: HashMap::new(),
+        build_secrets: Default::default(),
+    };
+    request
+        .labels
+        .insert("sh.temps.image.project_id".to_string(), "7".to_string());
+    request
+        .labels
+        .insert("built-by".to_string(), "someone-else".to_string());
+
+    let labels = image_labels(&request);
+
+    assert_eq!(
+        labels.get("sh.temps.image.project_id").map(String::as_str),
+        Some("7")
+    );
+    assert_eq!(labels.get("built-by").map(String::as_str), Some("temps"));
 }
 
 #[test]
@@ -380,6 +411,7 @@ CMD ["cat", "/hello.txt"]
     match create_test_docker_runtime().await {
         Ok(runtime) => {
             let request = BuildRequest {
+                labels: Default::default(),
                 build_secrets: Default::default(),
                 cache_from: Vec::new(),
                 image_name: "docker-test:latest".to_string(),
@@ -626,6 +658,7 @@ async fn buildkit_build_stage_sees_root_owned_context() {
     let runtime = DockerRuntime::new(Arc::new(docker.clone()), true, network.clone());
     let log_dir = TempDir::new().unwrap();
     let request = BuildRequest {
+        labels: Default::default(),
         build_secrets: Default::default(),
         cache_from: Vec::new(),
         image_name: image.clone(),

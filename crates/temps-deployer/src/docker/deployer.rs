@@ -1348,6 +1348,19 @@ impl ContainerDeployer for DockerRuntime {
             ))),
         }
     }
+
+    async fn remove_unused_images(
+        &self,
+        requests: &[crate::ImageRemovalRequest],
+    ) -> Result<Vec<crate::ImageRemovalOutcome>, DeployerError> {
+        let docker = self.require_docker()?;
+        temps_docker_util::remove_unused_images(&docker, requests)
+            .await
+            .map_err(|error| DeployerError::ImageRemoval {
+                location: "the local Docker daemon".to_string(),
+                reason: error.to_string(),
+            })
+    }
 }
 
 #[cfg(test)]

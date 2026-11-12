@@ -182,6 +182,13 @@ impl ContainerDeployer for ReplicaAwareDeployer {
     async fn image_exists(&self, image_name: &str) -> Result<bool, DeployerError> {
         self.local.image_exists(image_name).await
     }
+
+    async fn remove_unused_images(
+        &self,
+        requests: &[crate::ImageRemovalRequest],
+    ) -> Result<Vec<crate::ImageRemovalOutcome>, DeployerError> {
+        self.local.remove_unused_images(requests).await
+    }
 }
 
 #[cfg(test)]

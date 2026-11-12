@@ -9,6 +9,8 @@
 //!   wait.
 //! - [`network`]: create a named bridge network, tolerating a concurrent
 //!   creator.
+//! - [`image_removal`]: remove images only when no container, running or
+//!   stopped, was created from them.
 //! - [`upload`]: stream a tar archive into a container, bounded by a stall
 //!   timeout rather than a total deadline.
 //!
@@ -25,6 +27,7 @@
 
 pub mod error;
 pub mod exec;
+pub mod image_removal;
 pub mod network;
 pub mod pull;
 pub mod upload;
@@ -36,6 +39,9 @@ pub use error::DockerUtilError;
 pub use exec::{
     exec_capture, ExecCaptureOptions, ExecOutput, ExitCodePolicy, OtherFrames, OutputLimit,
     RingBuffer, StreamErrorPolicy,
+};
+pub use image_removal::{
+    remove_unused_images, ImageRemovalOutcome, ImageRemovalRequest, ImageRemovalStatus,
 };
 pub use network::{ensure_bridge_network, NetworkEnsured};
 pub use pull::{pull_image, pull_image_with_progress, PullSpec, PullTimeouts};

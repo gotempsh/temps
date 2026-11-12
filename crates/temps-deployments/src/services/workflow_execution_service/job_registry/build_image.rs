@@ -17,6 +17,31 @@ use temps_deployer::ImageBuilder;
 use temps_entities::{deployment_jobs, deployments};
 use tracing::{debug, info, warn};
 
+/// The ownership labels for the image the build of `deployment_id` (of
+/// `project_id`) produces, or none when this install's image ownership ID
+/// cannot be read or created.
+async fn build_image_labels<C: sea_orm::ConnectionTrait>(
+    db: &C,
+    project_id: i32,
+    deployment_id: i32,
+) -> std::collections::HashMap<String, String> {
+    use temps_docker_housekeeping::services::image_ownership;
+    match image_ownership::ensure_image_instance_id(db).await {
+        Ok(instance_id) => {
+            image_ownership::image_ownership_labels(&instance_id, project_id, deployment_id)
+        }
+        Err(error) => {
+            warn!(
+                deployment_id,
+                project_id,
+                %error,
+                "Could not read this install's image ownership ID; building the image without ownership labels"
+            );
+            std::collections::HashMap::new()
+        }
+    }
+}
+
 #[async_trait]
 impl FromJobRecord for BuildImageJob {
     const JOB_TYPES: &'static [&'static str] = &["BuildImageJob"];
@@ -81,6 +106,15 @@ impl FromJobRecord for BuildImageJob {
         builder = builder
             .preset(project.preset)
             .preset_config(project.preset_config.clone());
+
+        // Record on the image which install, project and deployment built
+        // it, so housekeeping can still recognise it once the project and
+        // its rows are deleted. Without the install ID the image is built
+        // unlabelled: retention then only finds it through the deployment
+        // rows, as before, and the orphan sweep never touches it.
+        builder = builder.image_labels(
+            build_image_labels(service.db.as_ref(), deployment.project_id, deployment.id).await,
+        );
 
         // Unseal build args from job_config. The planner derives build
         // args from env vars and stores them encrypted (build_args
@@ -565,4 +599,42 @@ async fn worker_image_builder(
         }
     };
     Ok((builder, image_builder))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sea_orm::{DatabaseBackend, MockDatabase, Value};
+    use std::collections::BTreeMap;
+    use temps_docker_housekeeping::services::image_ownership::{
+        IMAGE_DEPLOYMENT_LABEL, IMAGE_INSTANCE_LABEL, IMAGE_PROJECT_LABEL,
+    };
+
+    #[tokio::test]
+    async fn the_built_image_names_this_install_its_project_and_its_deployment() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![BTreeMap::from([(
+                "instance_id".to_string(),
+                Value::from("install-a".to_string()),
+            )])]])
+            .into_connection();
+        let labels = build_image_labels(&db, 7, 42).await;
+        assert_eq!(labels[IMAGE_INSTANCE_LABEL], "install-a");
+        assert_eq!(labels[IMAGE_PROJECT_LABEL], "7");
+        assert_eq!(labels[IMAGE_DEPLOYMENT_LABEL], "42");
+        assert!(
+            labels
+                .keys()
+                .all(|key| key.starts_with(temps_deployer::build_protocol::IMAGE_LABEL_PREFIX)),
+            "every label must also be accepted by a worker build: {labels:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_the_install_id_the_image_is_built_unlabelled() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors([sea_orm::DbErr::Custom("connection reset".to_string())])
+            .into_connection();
+        assert!(build_image_labels(&db, 7, 42).await.is_empty());
+    }
 }

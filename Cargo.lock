@@ -13685,6 +13685,7 @@ dependencies = [
  "temps-config",
  "temps-core",
  "temps-database",
+ "temps-docker-util",
  "temps-entities",
  "temps-file-store",
  "temps-test-utils",
@@ -13693,6 +13694,7 @@ dependencies = [
  "tower",
  "tracing",
  "utoipa",
+ "uuid",
 ]
 
 [[package]]
@@ -13702,6 +13704,8 @@ dependencies = [
  "bollard",
  "bytes",
  "futures",
+ "serde",
+ "serde_json",
  "tar",
  "tempfile",
  "thiserror 2.0.21",

@@ -38,6 +38,11 @@ const DOCKER_DEFAULT_SHM_BYTES: i64 = 64 * 1024 * 1024;
 /// container is a difference. Other labels (the image's) are ignored.
 const TEMPS_LABEL_PREFIXES: &[&str] = &["temps.", "sh.temps."];
 
+/// Build provenance Temps stamps on the images it builds (which install,
+/// project and deployment built it). A container inherits it from its image,
+/// so it is the image's, not part of the container's configuration.
+const IMAGE_PROVENANCE_PREFIX: &str = "sh.temps.image.";
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContainerShape {
     pub image: Option<String>,
@@ -431,7 +436,8 @@ pub fn diff(expected: &ContainerShape, actual: &ContainerShape) -> Vec<ShapeDiff
         }
     }
     for (key, value) in &actual.labels {
-        let ours = TEMPS_LABEL_PREFIXES.iter().any(|p| key.starts_with(p));
+        let ours = TEMPS_LABEL_PREFIXES.iter().any(|p| key.starts_with(p))
+            && !key.starts_with(IMAGE_PROVENANCE_PREFIX);
         if ours && !expected.labels.contains_key(key) {
             found.insert(key.clone(), value.clone());
         }
@@ -651,6 +657,20 @@ mod tests {
             labels.actual.contains("sh.temps.service=true"),
             "{labels:?}"
         );
+    }
+
+    /// A container inherits its image's labels; the build provenance Temps
+    /// puts on images it built is not a difference in the container.
+    #[test]
+    fn image_provenance_labels_inherited_from_the_image_are_not_a_difference() {
+        let expected = ContainerShape::from_create_body(&body()).mask(["REDIS_PASSWORD"]);
+        let mut running = body();
+        let mut labels = running.labels.clone().unwrap_or_default();
+        labels.insert("sh.temps.image.project_id".into(), "7".into());
+        labels.insert("sh.temps.image.instance".into(), "install-a".into());
+        running.labels = Some(labels);
+        let actual = ContainerShape::from_inspect(&running_as(&running)).mask(["REDIS_PASSWORD"]);
+        assert_eq!(diff(&expected, &actual), vec![]);
     }
 
     #[test]

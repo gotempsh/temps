@@ -398,6 +398,12 @@ impl TempsPlugin for DeploymentsPlugin {
                 deployment_service.clone() as Arc<dyn temps_core::DeploymentContainerCleaner>;
             context.register_service(deployment_container_cleaner);
 
+            // Read a deleted project's built images before its rows cascade
+            // away, and remove them from every runtime holding them after.
+            let project_image_cleaner =
+                deployment_service.clone() as Arc<dyn temps_core::ProjectImageCleaner>;
+            context.register_service(project_image_cleaner);
+
             // Remote container log source — lets the log-aggregator collect logs
             // from containers on remote worker nodes into searchable history. The
             // aggregator picks this up via get_service and runs its reconcile

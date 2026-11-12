@@ -42,6 +42,7 @@ async fn main() {
     let runtime = DockerRuntime::new(docker, true, "temps-bench".to_string());
 
     let request = BuildRequest {
+        labels: Default::default(),
         build_secrets: Default::default(),
         cache_from: Vec::new(),
         image_name: tag.clone(),

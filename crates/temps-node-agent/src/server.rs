@@ -195,6 +195,10 @@ pub fn build_router(
         )
         .route("/agent/images/scan", post(crate::build_handler::scan_image))
         .route("/agent/images/{name}/exists", get(handlers::image_exists))
+        .route(
+            temps_deployer::remote::REMOVE_IMAGES_PATH,
+            post(handlers::remove_images),
+        )
         .route("/agent/health", get(handlers::health_check))
         // Service management routes
         .route("/agent/services", post(service_handlers::create_service))
@@ -2439,6 +2443,72 @@ pub(crate) mod tests {
             }
             assert!(AgentApiDoc::openapi().paths.paths.contains_key(route));
         }
+    }
+
+    /// The image removal route exists, is documented, refuses callers
+    /// without the agent token, and bounds the batch before touching Docker.
+    #[tokio::test]
+    async fn image_removal_route_is_behind_agent_auth_and_bounded() {
+        use tower::ServiceExt;
+        let remote = Arc::new(
+            temps_deployer::remote::RemoteNodeDeployer::new(
+                "http://127.0.0.1:9".into(),
+                "unused".into(),
+                "no-io".into(),
+            )
+            .unwrap(),
+        );
+        let app = build_router(
+            remote.clone(),
+            remote,
+            None,
+            &test_agent_config(false),
+            SharedNetwork {
+                overlay_bridge_address: Default::default(),
+                overlay_peers: Default::default(),
+                host_bind_address: Arc::new(std::sync::RwLock::new("127.0.0.1".into())),
+                dns_policy: temps_node_dns::open_dns_policy_slot(),
+            },
+            Default::default(),
+            AgentEngines {
+                service_runtime: crate::test_engines::service_runtime(),
+                plugin_builder: crate::test_engines::plugin_builder(),
+            },
+        );
+        let route = temps_deployer::remote::REMOVE_IMAGES_PATH;
+        let one = br#"{"images":[{"reference":"app-1:latest"}]}"#.to_vec();
+        for token in [None, Some("wrong")] {
+            let response = app
+                .clone()
+                .oneshot(post_json(route, token, one.clone()))
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), 401, "{token:?}");
+        }
+
+        let too_many = serde_json::to_vec(&temps_deployer::remote::RemoveImagesRequest {
+            images: vec![
+                temps_deployer::ImageRemovalRequest::new("app:latest", None);
+                temps_deployer::MAX_IMAGE_REMOVAL_BATCH + 1
+            ],
+        })
+        .unwrap();
+        let response = app
+            .clone()
+            .oneshot(post_json(route, Some("secret"), too_many))
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 400);
+
+        // The runtime behind this agent cannot be reached: the whole call
+        // fails, and says so, rather than reporting images as removed.
+        let response = app
+            .clone()
+            .oneshot(post_json(route, Some("secret"), one))
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 500);
+        assert!(AgentApiDoc::openapi().paths.paths.contains_key(route));
     }
 
     #[tokio::test]

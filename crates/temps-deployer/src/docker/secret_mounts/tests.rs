@@ -48,6 +48,7 @@ impl SecretBuildFixture {
         cache_from: Vec<String>,
     ) -> BuildRequest {
         BuildRequest {
+            labels: Default::default(),
             build_secrets: crate::BuildSecrets::new(
                 secrets
                     .iter()
@@ -414,6 +415,7 @@ fn oversized_build_secret_is_refused_by_name_without_its_value() {
 #[test]
 fn frontend_options_keep_the_dockerfile_path_arguments_and_platform() {
     let request = BuildRequest {
+        labels: Default::default(),
         build_secrets: Default::default(),
         cache_from: vec!["seed:latest".to_string()],
         image_name: "test".into(),

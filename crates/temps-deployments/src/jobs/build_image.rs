@@ -765,6 +765,10 @@ pub struct BuildConfig {
     /// binfmt handlers registered on the host.
     pub target_platforms: Vec<String>,
     pub cache_from: Vec<String>,
+    /// Labels stamped on every image this build produces: which install,
+    /// project and deployment built it (`sh.temps.image.*`), so housekeeping
+    /// recognises the image after the project's rows are gone.
+    pub image_labels: HashMap<String, String>,
 }
 
 impl std::fmt::Debug for BuildConfig {
@@ -784,6 +788,7 @@ impl std::fmt::Debug for BuildConfig {
             )
             .field("target_platforms", &self.target_platforms)
             .field("cache_from", &self.cache_from)
+            .field("image_labels", &self.image_labels)
             .finish()
     }
 }
@@ -797,6 +802,7 @@ impl Default for BuildConfig {
             build_args_buildkit: Vec::new(),
             target_platforms: Vec::new(),
             cache_from: Vec::new(),
+            image_labels: HashMap::new(),
         }
     }
 }
@@ -2412,6 +2418,7 @@ impl BuildImageJob {
             }
 
             let build_request = BuildRequest {
+                labels: self.build_config.image_labels.clone(),
                 build_secrets: build_secrets.clone(),
                 cache_from: self.build_config.cache_from.clone(),
                 image_name: tag.clone(),
@@ -2784,6 +2791,7 @@ impl BuildImageJob {
         .await?;
         let request = temps_deployer::BuildRequestWithCallback {
             request: BuildRequest {
+                labels: self.build_config.image_labels.clone(),
                 build_secrets: Default::default(),
                 cache_from: self.build_config.cache_from.clone(),
                 image_name: tag.clone(),
@@ -3439,6 +3447,11 @@ impl BuildImageJobBuilder {
 
     pub fn cache_from(mut self, cache_from: Vec<String>) -> Self {
         self.build_config.cache_from = cache_from;
+        self
+    }
+
+    pub fn image_labels(mut self, image_labels: HashMap<String, String>) -> Self {
+        self.build_config.image_labels = image_labels;
         self
     }
 

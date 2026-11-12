@@ -116,6 +116,18 @@ pub enum DockerUtilError {
         waited_secs: u64,
     },
 
+    /// The daemon's images or containers could not be listed, so no image
+    /// can be proved unused and none is removed.
+    #[error("Failed to {operation} while checking which images are still in use: {source}")]
+    ImageInventory {
+        operation: &'static str,
+        source: DockerError,
+    },
+
+    /// More images were passed to one removal call than it accepts.
+    #[error("Refusing to remove {requested} images in one call; at most {max} are accepted")]
+    ImageBatchTooLarge { requested: usize, max: usize },
+
     /// The Docker daemon rejected or aborted an upload.
     #[error(
         "Failed to upload '{dest_name}' ({size} bytes) into {container_id}:{dest_dir}: {reason}"
@@ -140,8 +152,10 @@ impl DockerUtilError {
             | Self::ExecStream { source, .. }
             | Self::ExecInspect { source, .. }
             | Self::PullFailed { source, .. }
-            | Self::Network { source, .. } => Ok(source),
+            | Self::Network { source, .. }
+            | Self::ImageInventory { source, .. } => Ok(source),
             other @ (Self::ExecTimedOut { .. }
+            | Self::ImageBatchTooLarge { .. }
             | Self::ExecCancelled { .. }
             | Self::PullStalled { .. }
             | Self::PullTimedOut { .. }
@@ -162,7 +176,8 @@ impl DockerUtilError {
             | Self::ExecStream { source, .. }
             | Self::ExecInspect { source, .. }
             | Self::PullFailed { source, .. }
-            | Self::Network { source, .. } => source.to_string(),
+            | Self::Network { source, .. }
+            | Self::ImageInventory { source, .. } => source.to_string(),
             Self::PullStalled { idle_secs, .. } => {
                 format!("no progress from the Docker daemon for {idle_secs}s")
             }
@@ -171,6 +186,7 @@ impl DockerUtilError {
             }
             Self::ExecTimedOut { .. }
             | Self::ExecCancelled { .. }
+            | Self::ImageBatchTooLarge { .. }
             | Self::UploadSource { .. }
             | Self::UploadInvalidName { .. }
             | Self::UploadStalled { .. }

@@ -158,6 +158,9 @@ pub struct ProjectDeletedAudit {
     pub project_id: i32,
     pub project_name: String,
     pub project_slug: String,
+    /// What removing the project's built images did: removed, kept for
+    /// safety, failed, and runtimes that could not be asked.
+    pub images: temps_core::ProjectImageCleanupReport,
 }
 
 #[derive(Debug, Clone, Serialize)]

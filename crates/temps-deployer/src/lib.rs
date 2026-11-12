@@ -24,6 +24,10 @@ use std::pin::Pin;
 use temps_core::UtcDateTime;
 use thiserror::Error;
 
+pub use temps_docker_util::image_removal::{
+    ImageRemovalOutcome, ImageRemovalRequest, ImageRemovalStatus, MAX_IMAGE_REMOVAL_BATCH,
+};
+
 /// Backpressure-aware byte stream used when importing an OCI image.
 ///
 /// Keeping this at the trait boundary lets remote agents forward an upload
@@ -291,6 +295,12 @@ pub enum DeployerError {
     /// a deployment is requested on a control-plane node that runs no
     /// workloads; applications must be deployed on worker nodes joined with
     /// `temps join`.
+    /// Images on `location` could not be checked or removed. Nothing is
+    /// removed when this is returned: per-image failures are reported in the
+    /// outcomes instead.
+    #[error("Cannot remove images on {location}: {reason}")]
+    ImageRemoval { location: String, reason: String },
+
     #[error(transparent)]
     DockerUnavailable(#[from] temps_core::DockerUnavailable),
 }
@@ -325,6 +335,12 @@ pub struct BuildRequest {
     pub build_args_buildkit: HashMap<String, String>,
     pub platform: Option<String>,
     pub log_path: PathBuf,
+    /// Labels to stamp on the built image, on top of `built-by=temps`. Temps
+    /// records which install, project and deployment built it here
+    /// (`sh.temps.image.*`), so housekeeping can tell its own images from anyone
+    /// else's after the database rows that named them are gone.
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
     /// Values served to the Dockerfile's `RUN --mount=type=secret` steps. Never
     /// serialized, so they cannot travel over the worker build protocol.
     ///
@@ -1330,6 +1346,24 @@ pub trait ContainerDeployer: Send + Sync {
     async fn image_exists(&self, _image_name: &str) -> Result<bool, DeployerError> {
         Ok(true)
     }
+
+    /// Remove each requested image that no container on this runtime uses,
+    /// running or stopped, judged by image ID (see
+    /// [`temps_docker_util::image_removal`]). One outcome per request, in
+    /// order; at most [`MAX_IMAGE_REMOVAL_BATCH`] requests per call.
+    ///
+    /// Fails as a whole, removing nothing, when the runtime's images and
+    /// containers cannot be listed or the runtime cannot remove images at
+    /// all, which is what this default says.
+    async fn remove_unused_images(
+        &self,
+        _requests: &[ImageRemovalRequest],
+    ) -> Result<Vec<ImageRemovalOutcome>, DeployerError> {
+        Err(DeployerError::ImageRemoval {
+            location: "this container runtime".to_string(),
+            reason: "it does not support removing images".to_string(),
+        })
+    }
 }
 
 /// Combined trait for both building and deploying
@@ -1677,6 +1711,7 @@ mod tests {
         build_args.insert("ENV".to_string(), "production".to_string());
 
         let request = BuildRequest {
+            labels: Default::default(),
             build_secrets: Default::default(),
             cache_from: Vec::new(),
             image_name: "test-image:latest".to_string(),
@@ -1912,6 +1947,7 @@ mod tests {
     #[test]
     fn test_serde_serialization() {
         let request = BuildRequest {
+            labels: Default::default(),
             build_secrets: Default::default(),
             cache_from: Vec::new(),
             image_name: "test:latest".to_string(),
@@ -1985,6 +2021,7 @@ CMD ["echo", "Hello from container"]
         build_args.insert("RUST_VERSION".to_string(), "1.70".to_string());
 
         let request = BuildRequest {
+            labels: Default::default(),
             build_secrets: Default::default(),
             cache_from: Vec::new(),
             image_name: "test-app:v1.0".to_string(),
@@ -2255,6 +2292,7 @@ CMD ["echo", "Hello from container"]
     #[test]
     fn build_secrets_never_reach_debug_output_or_the_wire() {
         let request = BuildRequest {
+            labels: Default::default(),
             build_secrets: BuildSecrets::new(
                 [("API_KEY".to_string(), "secret-value-1725".to_string())].into(),
             ),
