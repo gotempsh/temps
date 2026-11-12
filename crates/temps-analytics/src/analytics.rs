@@ -252,8 +252,9 @@ pub const MAX_ENRICHMENT_BYTES: usize = 64 * 1024;
 /// See [`MAX_ENRICHMENT_BYTES`].
 pub const MAX_ENRICHMENT_KEYS: usize = 128;
 
-/// How far before the requested window `get_page_path_visitors` reads a
-/// session's earlier page views to number them (`session_page_number`).
+/// How far before the requested window `get_page_path_visitors` and
+/// `get_page_path_detail` read a session's page views in full (to number them,
+/// `session_page_number`, and for the detail's entry and exit pages).
 ///
 /// A session is a sliding 30-minute inactivity window, so one continuously
 /// active client can keep a single session for days. Reading every event such
@@ -261,8 +262,9 @@ pub const MAX_ENRICHMENT_KEYS: usize = 128;
 /// history; this bound caps it. A session that already had page views more
 /// than this long before the window is numbered from the first page view
 /// inside the bound, so its page number is lower than the true one.
-/// `is_entry` and `is_bounce` stay exact: an existence check covers the
-/// earlier page views.
+/// `is_entry` and `is_bounce` stay exact, and so do the detail's entry, exit
+/// and bounce rates: lookups bounded by the session's own lifetime cover the
+/// page views outside the bound (see [`ANALYTICS_ROW_CLOCK_SLACK_HOURS`]).
 const PAGE_VISITORS_SESSION_LOOKBACK_HOURS: i64 = 24;
 
 /// How far past the requested window `get_page_path_visitors` reads a
@@ -960,6 +962,239 @@ fn page_path_visitors_context_bounds(
         .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC);
     (context_start, context_end)
 }
+
+/// `get_page_path_detail`'s headline stats: unique visitors, page views and
+/// average time on page for the page in the window, and the entry, exit and
+/// bounce rates of the sessions that viewed it.
+///
+/// The cost is bounded by the window, not by the sessions' history:
+///   1. target_sessions: the sessions with a non-crawler view of the page in
+///      the window (an index range scan on project/type/path/timestamp).
+///   2. session_events: only those sessions' page views (any page) and
+///      page_leaves of the page, inside [$6, $7] (the window widened by
+///      [`page_path_visitors_context_bounds`]) and the project, so
+///      TimescaleDB reads only the chunks of the bound. Whether that is one
+///      index lookup per session or one hash join over the bound's rows is
+///      left to the planner: both are bounded, and forcing per-session
+///      lookups costs one index probe per session per chunk, which made
+///      this read over 10x slower than the hash join on a 30-day window.
+///   3. ranked: one sort of those rows by session and time feeds every window
+///      function (O(n log n); the self-joins they replaced were O(n^2) per
+///      session).
+///   4. session_flow: each session's entry and exit page and page view count
+///      come from its rows in the bound, plus two indexed lookups per session
+///      for its first page view before $6 and its last page view after $7.
+///      Like `get_page_path_visitors`' existence checks, each is bounded by
+///      the session's own lifetime in request_sessions widened by `$8` hours
+///      ([`ANALYTICS_ROW_CLOCK_SLACK_HOURS`]), so it reads only the chunks the
+///      session spans; a session without a request_sessions row falls back to
+///      `$8` hours around the bound. Entry, exit and bounce are therefore
+///      exact, as if the session's whole life had been read.
+///   5. Visitor and session totals are aggregated separately and joined as
+///      one row each. The previous query cross-joined an inlined session
+///      aggregate with every page view, and the planner re-ran that aggregate
+///      over all of the sessions' events once per page view.
+///
+/// time_on_page keeps the 3-priority COALESCE: the next page_leave of the page
+/// within 30 min, else the next page view of the session (any page), else a
+/// 30s fallback. Values outside (0, 1800) are left out of the average. A next
+/// page view past $7 is more than 30 min away, so only its existence matters
+/// and it is left out of the average. Only page_leaves of the page are read,
+/// since priority 1 only looks at those, and they do not affect the page
+/// view counts or the entry/exit pages.
+///
+/// Entry, exit and bounce are session-level facts derived here: the
+/// events.is_entry / is_exit / is_bounce columns are never populated by the
+/// ingest path. A bounce is a session that entered on the page and viewed
+/// nothing else. Timestamp ties between page views are broken by event id.
+///
+/// Parameters: `$1` project_id, `$2` page_path, `$3`/`$4` window start
+/// (inclusive) / end (exclusive), `$5` environment_id (NULL for all),
+/// `$6`/`$7` the session-event bounds from
+/// [`page_path_visitors_context_bounds`], `$8`
+/// [`ANALYTICS_ROW_CLOCK_SLACK_HOURS`].
+const PAGE_PATH_DETAIL_STATS_SQL: &str = r#"
+            WITH target_sessions AS MATERIALIZED (
+                SELECT DISTINCT e.session_id
+                FROM events e
+                WHERE e.project_id = $1
+                  AND e.event_type = 'page_view'
+                  AND e.page_path = $2
+                  AND e.timestamp >= $3
+                  AND e.timestamp < $4
+                  AND e.is_crawler = false
+                  AND e.session_id IS NOT NULL
+                  AND ($5::int IS NULL OR e.environment_id = $5)
+            ),
+            session_events AS (
+                SELECT e.id, e.session_id, e.event_type, e.page_path, e.timestamp, e.visitor_id
+                FROM target_sessions ts
+                JOIN events e ON e.session_id = ts.session_id
+                WHERE e.project_id = $1
+                  AND e.timestamp >= $6
+                  AND e.timestamp <= $7
+                  AND ($5::int IS NULL OR e.environment_id = $5)
+                  AND (e.event_type = 'page_view'
+                       OR (e.event_type = 'page_leave' AND e.page_path = $2))
+            ),
+            -- next_*: the earliest page_leave / page view strictly after each
+            -- row, a running MIN over the rows already seen in descending time
+            -- order, excluding same-timestamp peers. The frame head stays at
+            -- the partition start, so PostgreSQL accumulates it in a single
+            -- pass. pv_from_last numbers page views from the session's last
+            -- one (1 = exit page, pv_total = entry page); its order extends
+            -- w_next's, so one sort serves both.
+            ranked AS MATERIALIZED (
+                SELECT
+                    se.session_id,
+                    se.event_type,
+                    se.page_path,
+                    se.timestamp,
+                    se.visitor_id,
+                    MIN(se.timestamp) FILTER (WHERE se.event_type = 'page_leave')
+                        OVER w_next AS next_page_leave_ts,
+                    MIN(se.timestamp) FILTER (WHERE se.event_type = 'page_view')
+                        OVER w_next AS next_page_view_ts,
+                    COUNT(*) FILTER (WHERE se.event_type = 'page_view')
+                        OVER w_from_last AS pv_from_last,
+                    COUNT(*) FILTER (WHERE se.event_type = 'page_view')
+                        OVER (PARTITION BY se.session_id) AS pv_total
+                FROM session_events se
+                WINDOW
+                    w_next AS (
+                        PARTITION BY se.session_id
+                        ORDER BY se.timestamp DESC
+                        RANGE BETWEEN UNBOUNDED PRECEDING AND '1 microsecond' PRECEDING
+                    ),
+                    w_from_last AS (
+                        PARTITION BY se.session_id
+                        ORDER BY se.timestamp DESC, se.id DESC
+                        ROWS UNBOUNDED PRECEDING
+                    )
+            ),
+            session_flow AS MATERIALIZED (
+                SELECT
+                    s.session_id,
+                    s.pv_total,
+                    COALESCE(before_bound.page_path, s.first_in_bound_path) AS entry_path,
+                    COALESCE(after_bound.page_path, s.last_in_bound_path) AS exit_path,
+                    before_bound.page_path IS NOT NULL AS has_page_view_before_bound,
+                    after_bound.page_path IS NOT NULL AS has_page_view_after_bound
+                FROM (
+                    SELECT
+                        r.session_id,
+                        MAX(r.pv_total) AS pv_total,
+                        MAX(r.page_path) FILTER (
+                            WHERE r.event_type = 'page_view' AND r.pv_from_last = r.pv_total
+                        ) AS first_in_bound_path,
+                        MAX(r.page_path) FILTER (
+                            WHERE r.event_type = 'page_view' AND r.pv_from_last = 1
+                        ) AS last_in_bound_path
+                    FROM ranked r
+                    GROUP BY r.session_id
+                ) s
+                -- Tolerate both bare-UUID and legacy v2|uuid|ts formats in
+                -- events.session_id (see VISITOR_SESSIONS_SQL): two
+                -- unique-index lookups per session.
+                LEFT JOIN request_sessions rs_exact ON rs_exact.session_id = s.session_id
+                LEFT JOIN request_sessions rs_v2
+                    ON s.session_id LIKE 'v2|%'
+                    AND rs_v2.session_id = split_part(s.session_id, '|', 2)
+                -- LIMIT keeps each of these one index lookup per session. The
+                -- last condition of each only reads the session (a one-time
+                -- filter): a session whose lifetime lies inside the bound
+                -- skips the lookup, instead of TimescaleDB re-checking every
+                -- chunk before (or after) the bound against it.
+                LEFT JOIN LATERAL (
+                    SELECT earlier.page_path
+                    FROM events earlier
+                    WHERE earlier.session_id = s.session_id
+                      AND earlier.project_id = $1
+                      AND earlier.event_type = 'page_view'
+                      AND earlier.timestamp < $6
+                      AND earlier.timestamp >= COALESCE(rs_exact.started_at, rs_v2.started_at, $6)
+                          - make_interval(hours => $8)
+                      AND COALESCE(rs_exact.started_at, rs_v2.started_at, $6)
+                          - make_interval(hours => $8) < $6
+                      AND ($5::int IS NULL OR earlier.environment_id = $5)
+                    ORDER BY earlier.timestamp ASC, earlier.id ASC
+                    LIMIT 1
+                ) before_bound ON true
+                LEFT JOIN LATERAL (
+                    SELECT later.page_path
+                    FROM events later
+                    WHERE later.session_id = s.session_id
+                      AND later.project_id = $1
+                      AND later.event_type = 'page_view'
+                      AND later.timestamp > $7
+                      AND later.timestamp <= COALESCE(
+                              rs_exact.last_accessed_at, rs_v2.last_accessed_at, $7
+                          ) + make_interval(hours => $8)
+                      AND COALESCE(rs_exact.last_accessed_at, rs_v2.last_accessed_at, $7)
+                          + make_interval(hours => $8) > $7
+                      AND ($5::int IS NULL OR later.environment_id = $5)
+                    ORDER BY later.timestamp DESC, later.id DESC
+                    LIMIT 1
+                ) after_bound ON true
+            ),
+            page_stats AS (
+                SELECT
+                    COUNT(DISTINCT r.visitor_id) AS unique_visitors,
+                    COUNT(*) AS total_page_views,
+                    AVG(t.seconds) FILTER (WHERE t.seconds > 0 AND t.seconds < 1800)
+                        AS avg_time_on_page
+                FROM ranked r
+                JOIN session_flow sf ON sf.session_id = r.session_id
+                CROSS JOIN LATERAL (
+                    SELECT CASE
+                        -- Priority 1 only counts within 30 min.
+                        WHEN r.next_page_leave_ts <= r.timestamp + INTERVAL '30 minutes'
+                            THEN EXTRACT(EPOCH FROM (r.next_page_leave_ts - r.timestamp))
+                        WHEN r.next_page_view_ts IS NOT NULL
+                            THEN EXTRACT(EPOCH FROM (r.next_page_view_ts - r.timestamp))
+                        -- The next page view lies past $7, so at least 30 min
+                        -- away: outside the average.
+                        WHEN sf.has_page_view_after_bound THEN NULL
+                        ELSE EXTRACT(EPOCH FROM INTERVAL '30 seconds')
+                    END AS seconds
+                ) t
+                WHERE r.event_type = 'page_view'
+                  AND r.page_path = $2
+                  AND r.timestamp >= $3
+                  AND r.timestamp < $4
+            ),
+            session_stats AS (
+                SELECT
+                    COUNT(*) AS total_sessions,
+                    COUNT(*) FILTER (WHERE entry_path = $2) AS entry_count,
+                    COUNT(*) FILTER (WHERE exit_path = $2) AS exit_count,
+                    COUNT(*) FILTER (
+                        WHERE entry_path = $2
+                          AND pv_total <= 1
+                          AND NOT has_page_view_before_bound
+                          AND NOT has_page_view_after_bound
+                    ) AS bounce_count
+                FROM session_flow
+            )
+            SELECT
+                ps.unique_visitors,
+                ps.total_page_views,
+                COALESCE(ps.avg_time_on_page, 0)::float8 AS avg_time_on_page,
+                -- Bounce rate: sessions that entered on this page and viewed
+                -- nothing else, over sessions that entered on this page
+                -- (the Plausible/GA definition).
+                CASE WHEN ss.entry_count > 0
+                     THEN ss.bounce_count::float / ss.entry_count::float * 100
+                     ELSE 0 END AS bounce_rate,
+                CASE WHEN ss.total_sessions > 0
+                     THEN ss.entry_count::float / ss.total_sessions::float * 100
+                     ELSE 0 END AS entry_rate,
+                CASE WHEN ss.total_sessions > 0
+                     THEN ss.exit_count::float / ss.total_sessions::float * 100
+                     ELSE 0 END AS exit_rate
+            FROM page_stats ps
+            CROSS JOIN session_stats ss
+            "#;
 
 /// A JSON object of at most `max_keys` top-level keys and `max_bytes` bytes.
 fn validate_document(
@@ -4014,138 +4249,8 @@ WHERE project_id = $1
             _ => ("1 day", "day"),
         };
 
-        // Build environment filter
-        let env_filter = environment_id
-            .map(|id| format!("AND e.environment_id = {}", id))
-            .unwrap_or_default();
-
-        // 1. Get overall page stats
-        // Materialize session events in a CTE, then find each page_view's next
-        // events with window functions over the session ordered by time
-        // (O(n log n); self-joins of the CTE were O(n^2) per session),
-        // preserving the exact 3-priority time_on_page logic.
-        let stats_sql = format!(
-            r#"
-            WITH session_events AS MATERIALIZED (
-                -- Materialize all events for sessions that viewed this page in the time range
-                SELECT
-                    e.id as event_id,
-                    e.session_id,
-                    e.event_type,
-                    e.page_path,
-                    e.timestamp,
-                    e.visitor_id,
-                    e.referrer
-                FROM events e
-                WHERE e.session_id IN (
-                    SELECT DISTINCT session_id
-                    FROM events
-                    WHERE project_id = $1
-                      AND page_path = $2
-                      AND event_type = 'page_view'
-                      AND timestamp >= $3
-                      AND timestamp < $4
-                      AND is_crawler = false
-                      {env_filter}
-                )
-                AND e.event_type IN ('page_view', 'page_leave')
-            ),
-            -- Per-session rollup across ALL pages the session visited.
-            -- Bounce/entry/exit are session-level facts derived at query time:
-            -- the events.is_bounce / is_entry / is_exit columns are never
-            -- populated by the ingest path. A bounce is a session with at most
-            -- one page view; an entry session for this page is one whose first
-            -- page view was this page.
-            session_pv AS (
-                SELECT
-                    session_id,
-                    COUNT(*) FILTER (WHERE event_type = 'page_view') as page_views,
-                    (ARRAY_AGG(page_path ORDER BY timestamp ASC)
-                        FILTER (WHERE event_type = 'page_view'))[1] as entry_path,
-                    (ARRAY_AGG(page_path ORDER BY timestamp DESC)
-                        FILTER (WHERE event_type = 'page_view'))[1] as exit_path
-                FROM session_events
-                GROUP BY session_id
-            ),
-            -- Earliest page_leave on the same page and earliest page_view
-            -- strictly after each event: a running MIN over the rows already
-            -- seen in descending time order, excluding same-timestamp peers.
-            -- The frame head stays at the partition start, so PostgreSQL
-            -- accumulates each in a single pass.
-            next_events AS (
-                SELECT
-                    se.*,
-                    MIN(se.timestamp) FILTER (WHERE se.event_type = 'page_leave') OVER (
-                        PARTITION BY se.session_id, se.page_path
-                        ORDER BY se.timestamp DESC
-                        RANGE BETWEEN UNBOUNDED PRECEDING AND '1 microsecond' PRECEDING
-                    ) as next_page_leave_any_ts,
-                    MIN(se.timestamp) FILTER (WHERE se.event_type = 'page_view') OVER (
-                        PARTITION BY se.session_id
-                        ORDER BY se.timestamp DESC
-                        RANGE BETWEEN UNBOUNDED PRECEDING AND '1 microsecond' PRECEDING
-                    ) as next_page_view_ts
-                FROM session_events se
-            ),
-            page_events AS (
-                SELECT
-                    ne.visitor_id,
-                    ne.session_id,
-                    ne.timestamp,
-                    ne.referrer,
-                    EXTRACT(EPOCH FROM (
-                        COALESCE(
-                            -- Priority 1 only counts within 30 min.
-                            CASE
-                                WHEN ne.next_page_leave_any_ts
-                                    <= ne.timestamp + INTERVAL '30 minutes'
-                                THEN ne.next_page_leave_any_ts
-                            END,
-                            ne.next_page_view_ts,
-                            ne.timestamp + INTERVAL '30 seconds'
-                        ) - ne.timestamp
-                    )) as time_on_page_seconds
-                FROM next_events ne
-                WHERE ne.event_type = 'page_view'
-                  AND ne.page_path = $2
-                  AND ne.timestamp >= $3
-                  AND ne.timestamp < $4
-            ),
-            session_stats AS (
-                SELECT
-                    COUNT(*) as total_sessions,
-                    COUNT(*) FILTER (WHERE entry_path = $2) as entry_count,
-                    COUNT(*) FILTER (WHERE exit_path = $2) as exit_count,
-                    COUNT(*) FILTER (WHERE entry_path = $2 AND page_views <= 1) as bounce_count
-                FROM session_pv
-            )
-            SELECT
-                COUNT(DISTINCT pe.visitor_id) as unique_visitors,
-                COUNT(*) as total_page_views,
-                COALESCE(AVG(
-                    CASE
-                        WHEN pe.time_on_page_seconds > 0 AND pe.time_on_page_seconds < 1800
-                        THEN pe.time_on_page_seconds
-                    END
-                ), 0)::float8 as avg_time_on_page,
-                -- Bounce rate: sessions that entered on this page and viewed
-                -- nothing else, over sessions that entered on this page
-                -- (the Plausible/GA definition).
-                CASE WHEN ss.entry_count > 0
-                     THEN ss.bounce_count::float / ss.entry_count::float * 100
-                     ELSE 0 END as bounce_rate,
-                CASE WHEN ss.total_sessions > 0
-                     THEN ss.entry_count::float / ss.total_sessions::float * 100
-                     ELSE 0 END as entry_rate,
-                CASE WHEN ss.total_sessions > 0
-                     THEN ss.exit_count::float / ss.total_sessions::float * 100
-                     ELSE 0 END as exit_rate
-            FROM page_events pe
-            CROSS JOIN session_stats ss
-            GROUP BY ss.total_sessions, ss.entry_count, ss.exit_count, ss.bounce_count
-            "#,
-            env_filter = env_filter
-        );
+        // 1. Overall page stats (see PAGE_PATH_DETAIL_STATS_SQL).
+        let (context_start, context_end) = page_path_visitors_context_bounds(start_date, end_date);
 
         #[derive(FromQueryResult)]
         struct PageStats {
@@ -4159,12 +4264,16 @@ WHERE project_id = $1
 
         let stats = PageStats::find_by_statement(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
-            &stats_sql,
+            PAGE_PATH_DETAIL_STATS_SQL,
             vec![
                 project_id.into(),
                 page_path.into(),
                 start_date.into(),
                 end_date.into(),
+                environment_id.into(),
+                context_start.into(),
+                context_end.into(),
+                ANALYTICS_ROW_CLOCK_SLACK_HOURS.into(),
             ],
         ))
         .one(self.db.as_ref())
@@ -4200,7 +4309,7 @@ WHERE project_id = $1
                   AND e.event_type = 'page_view'
                   AND e.timestamp >= $3
                   AND e.timestamp < $4
-                  {}
+                  AND ($5::int IS NULL OR e.environment_id = $5)
                 GROUP BY date_trunc('{}', e.timestamp)
             )
             SELECT
@@ -4212,12 +4321,7 @@ WHERE project_id = $1
             LEFT JOIN page_activity pa ON tb.bucket = pa.bucket
             ORDER BY tb.bucket
             "#,
-            date_trunc_unit,
-            date_trunc_unit,
-            pg_interval,
-            date_trunc_unit,
-            env_filter,
-            date_trunc_unit
+            date_trunc_unit, date_trunc_unit, pg_interval, date_trunc_unit, date_trunc_unit
         );
 
         #[derive(FromQueryResult)]
@@ -4236,6 +4340,7 @@ WHERE project_id = $1
                 page_path.into(),
                 start_date.into(),
                 end_date.into(),
+                environment_id.into(),
             ],
         ))
         .all(self.db.as_ref())
@@ -4252,8 +4357,7 @@ WHERE project_id = $1
             .collect();
 
         // 3. Get geographic distribution by country
-        let countries_sql = format!(
-            r#"
+        let countries_sql = r#"
             WITH country_stats AS (
                 SELECT
                     COALESCE(ig.country, 'Unknown') as country,
@@ -4267,7 +4371,7 @@ WHERE project_id = $1
                   AND e.event_type = 'page_view'
                   AND e.timestamp >= $3
                   AND e.timestamp < $4
-                  {}
+                  AND ($5::int IS NULL OR e.environment_id = $5)
                 GROUP BY COALESCE(ig.country, 'Unknown'), ig.country_code
             ),
             total AS (
@@ -4285,9 +4389,7 @@ WHERE project_id = $1
             CROSS JOIN total t
             ORDER BY cs.visitors DESC
             LIMIT 50
-            "#,
-            env_filter
-        );
+            "#;
 
         #[derive(FromQueryResult)]
         struct CountryStats {
@@ -4300,12 +4402,13 @@ WHERE project_id = $1
 
         let country_results = CountryStats::find_by_statement(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
-            &countries_sql,
+            countries_sql,
             vec![
                 project_id.into(),
                 page_path.into(),
                 start_date.into(),
                 end_date.into(),
+                environment_id.into(),
             ],
         ))
         .all(self.db.as_ref())
@@ -4323,8 +4426,7 @@ WHERE project_id = $1
             .collect();
 
         // 4. Get top referrers
-        let referrers_sql = format!(
-            r#"
+        let referrers_sql = r#"
             WITH referrer_stats AS (
                 SELECT
                     COALESCE(NULLIF(e.referrer, ''), 'Direct') as referrer,
@@ -4335,7 +4437,7 @@ WHERE project_id = $1
                   AND e.event_type = 'page_view'
                   AND e.timestamp >= $3
                   AND e.timestamp < $4
-                  {}
+                  AND ($5::int IS NULL OR e.environment_id = $5)
                 GROUP BY COALESCE(NULLIF(e.referrer, ''), 'Direct')
             ),
             total AS (
@@ -4351,9 +4453,7 @@ WHERE project_id = $1
             CROSS JOIN total t
             ORDER BY rs.visits DESC
             LIMIT 20
-            "#,
-            env_filter
-        );
+            "#;
 
         #[derive(FromQueryResult)]
         struct ReferrerStats {
@@ -4364,12 +4464,13 @@ WHERE project_id = $1
 
         let referrer_results = ReferrerStats::find_by_statement(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
-            &referrers_sql,
+            referrers_sql,
             vec![
                 project_id.into(),
                 page_path.into(),
                 start_date.into(),
                 end_date.into(),
+                environment_id.into(),
             ],
         ))
         .all(self.db.as_ref())
@@ -7357,6 +7458,317 @@ mod tests {
             .await?;
         assert_eq!(all_environments.total_count, 12);
         assert_eq!(all_environments.sessions.len(), 12);
+
+        cleanup_test_analytics!(db);
+        Ok(())
+    }
+
+    /// Regression test for the page-path-detail slowness: the stats query read
+    /// every event the matched sessions ever had (no project or time bound)
+    /// and re-ran its per-session aggregate once per page view of the page.
+    ///
+    /// Seeds a session with 3000 page views that started 30h before the
+    /// window next to ordinary sessions, and asserts the stats with and
+    /// without the environment filter, time_on_page priorities and the
+    /// 1800s cut-off, that entry/exit/bounce see page views outside the
+    /// bound within the session's lifetime (and, without a request_sessions
+    /// row, within a day of the bound), and that no plan node handles more
+    /// rows than a small multiple of the sessions' page views in the bound.
+    #[tokio::test]
+    async fn test_get_page_path_detail_bounds_session_scan_by_date() -> anyhow::Result<()> {
+        use sea_orm::{ActiveModelTrait, ConnectionTrait, Set, Statement};
+
+        let Some((service, db, _container)) =
+            analytics_service_or_skip("test_page_path_detail_bounded").await
+        else {
+            return Ok(());
+        };
+        let scope = seeded_scope(db.as_ref()).await?;
+        let (project_id, env_id) = (scope.project_id, scope.environment_id);
+
+        const TARGET: &str = "/detail-target";
+        const BUSY_PAGE_VIEWS: i64 = 3000;
+        let w0 = chrono::DateTime::parse_from_rfc3339("2026-03-02T12:00:00Z")?
+            .with_timezone(&chrono::Utc);
+        let window_end = w0 + chrono::Duration::hours(2);
+        let at = |seconds: i64| w0 + chrono::Duration::seconds(seconds);
+        let hours = chrono::Duration::hours;
+        let minutes = chrono::Duration::minutes;
+
+        let mut visitors = Vec::new();
+        for name in ["detail-busy", "detail-old", "detail-other"] {
+            let visitor = temps_entities::visitor::ActiveModel {
+                visitor_id: Set(name.to_string()),
+                project_id: Set(project_id),
+                environment_id: Set(env_id),
+                first_seen: Set(w0),
+                last_seen: Set(w0),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await?;
+            visitors.push(visitor.id);
+        }
+        let seeder = |visitor_id: i32| FlowSeeder {
+            db: db.as_ref(),
+            project_id,
+            environment_id: Some(env_id),
+            visitor_id: Some(visitor_id),
+        };
+        let (busy_seed, old_seed, seed) = (
+            seeder(visitors[0]),
+            seeder(visitors[1]),
+            seeder(visitors[2]),
+        );
+
+        // The busy session: one page view every 2s for 100 minutes on 1000
+        // pages, the target every 500th view and as the last view, after 5
+        // page views 30h before the window (outside the lookback, inside its
+        // lifetime): none of its views is the entry.
+        let busy = "d0d0d0d0-0000-4000-8000-000000000001";
+        let busy_late = window_end + minutes(45);
+        insert_request_session(db.as_ref(), busy, w0 - hours(30), busy_late, None).await?;
+        for minute in 0..5 {
+            let ts = w0 - hours(30) + minutes(minute);
+            busy_seed
+                .event(busy, "page_view", "/bulk/early", ts)
+                .await?;
+        }
+        db.execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r#"
+            INSERT INTO events (timestamp, project_id, environment_id, session_id, visitor_id,
+                                hostname, pathname, page_path, href,
+                                is_entry, is_exit, is_bounce, is_crawler, event_type)
+            SELECT $1::timestamptz + k * INTERVAL '2 seconds', $2, $3, $4, $7,
+                   'example.com', p, p, 'https://example.com' || p,
+                   false, false, false, false, 'page_view'
+            FROM generate_series(0, $5 - 1) k
+            CROSS JOIN LATERAL (
+                SELECT CASE WHEN k % 500 = 0 OR k = $5 - 1 THEN $6
+                            ELSE '/bulk/page-' || (k % 1000) END AS p
+            ) pages
+            "#,
+            vec![
+                w0.into(),
+                project_id.into(),
+                env_id.into(),
+                busy.into(),
+                BUSY_PAGE_VIEWS.into(),
+                TARGET.into(),
+                visitors[0].into(),
+            ],
+        ))
+        .await?;
+        // Leaves the view at k = 500 after 1s, and is also the first leave of
+        // the page within 30 min of the view at k = 0 (1001s).
+        busy_seed
+            .event(busy, "page_leave", TARGET, at(1001))
+            .await?;
+        // After the 30-min lookahead: the last target view is left out of the
+        // average and the session's exit is this page.
+        busy_seed
+            .event(busy, "page_view", "/bulk/late", busy_late)
+            .await?;
+
+        // Started 26h before the window, then viewed only the target inside
+        // the bound: an exit, but neither an entry nor a bounce; 30s fallback.
+        let old_view = "d0d0d0d0-0000-4000-8000-000000000002";
+        insert_request_session(db.as_ref(), old_view, w0 - hours(26), at(600), None).await?;
+        old_seed
+            .event(old_view, "page_view", "/early", w0 - hours(26))
+            .await?;
+        old_seed
+            .event(old_view, "page_view", TARGET, at(600))
+            .await?;
+
+        // Entry, exit and bounce, 30s fallback.
+        let bounce = "d0d0d0d0-0000-4000-8000-000000000003";
+        seed.event(bounce, "page_view", TARGET, at(1200)).await?;
+        // Entry; the next page view 50s later (priority 2).
+        let entry_only = "d0d0d0d0-0000-4000-8000-000000000004";
+        seed.event(entry_only, "page_view", TARGET, at(1800))
+            .await?;
+        seed.event(entry_only, "page_view", "/other", at(1850))
+            .await?;
+        // Exit; left after 20s (priority 1).
+        let exit_only = "d0d0d0d0-0000-4000-8000-000000000005";
+        seed.event(exit_only, "page_view", "/other", at(2400))
+            .await?;
+        seed.event(exit_only, "page_view", TARGET, at(2460)).await?;
+        seed.event(exit_only, "page_leave", TARGET, at(2480))
+            .await?;
+        // Entered 23h before the window, inside the lookback: not an entry.
+        let covered = "d0d0d0d0-0000-4000-8000-000000000006";
+        seed.event(covered, "page_view", "/yesterday", w0 - hours(23))
+            .await?;
+        seed.event(covered, "page_view", TARGET, at(3000)).await?;
+        // Its last page view is the target again, 45 min after the window
+        // (no request_sessions row: found within a day of the bound): an
+        // exit, not a bounce, and the in-window view is left out of the
+        // average.
+        let exits_later = "d0d0d0d0-0000-4000-8000-000000000007";
+        seed.event(exits_later, "page_view", TARGET, at(3600))
+            .await?;
+        seed.event(exits_later, "page_view", TARGET, busy_late)
+            .await?;
+        // The next page view 2000s later is past the 1800s cut-off.
+        let long_stay = "d0d0d0d0-0000-4000-8000-000000000008";
+        seed.event(long_stay, "page_view", TARGET, at(4500)).await?;
+        seed.event(long_stay, "page_view", "/after", at(6500))
+            .await?;
+        // The next page view comes 30h after the window, inside the session's
+        // lifetime: left out of the average, neither an exit nor a bounce.
+        let much_later = window_end + hours(30);
+        let day_later = "d0d0d0d0-0000-4000-8000-000000000009";
+        insert_request_session(db.as_ref(), day_later, at(5000), much_later, None).await?;
+        seed.event(day_later, "page_view", TARGET, at(5000)).await?;
+        seed.event(day_later, "page_view", "/much-later", much_later)
+            .await?;
+        // The same without a request_sessions row: the lookups only reach a
+        // day past the bound, so the view gets the 30s fallback and the
+        // session counts as an exit and a bounce (the documented fallback).
+        let no_lifetime = "d0d0d0d0-0000-4000-8000-00000000000c";
+        seed.event(no_lifetime, "page_view", TARGET, at(5400))
+            .await?;
+        seed.event(no_lifetime, "page_view", "/much-later", much_later)
+            .await?;
+        // Counted only without the environment filter.
+        let no_environment = "d0d0d0d0-0000-4000-8000-00000000000a";
+        seed.insert(no_environment, "page_view", TARGET, at(4200), None, false)
+            .await?;
+        // Never a session of the page (the activity series still counts it).
+        let crawler = "d0d0d0d0-0000-4000-8000-00000000000b";
+        seed.insert(crawler, "page_view", TARGET, at(4000), Some(env_id), true)
+            .await?;
+
+        // (unique visitors, page views, avg time, bounce, entry, exit rate)
+        let summary = |d: &crate::types::responses::PagePathDetailResponse| {
+            (
+                d.unique_visitors,
+                d.total_page_views,
+                d.avg_time_on_page,
+                d.bounce_rate,
+                d.entry_rate,
+                d.exit_rate,
+            )
+        };
+        let rate = |part: f64, whole: f64| part / whole * 100.0;
+
+        // 10 sessions; time on page: busy 1001, 1, 2 x4 (its last view is
+        // left out), old_view, bounce, covered and no_lifetime 30, entry_only
+        // 50, exit_only 20; exits_later, long_stay and day_later left out.
+        let detail = service
+            .get_page_path_detail(project_id, TARGET, w0, window_end, Some(env_id), None)
+            .await?;
+        assert_eq!(
+            summary(&detail),
+            (
+                3,
+                16,
+                1200.0 / 12.0,
+                rate(2.0, 6.0),
+                rate(6.0, 10.0),
+                rate(6.0, 10.0)
+            ),
+            "entries: bounce, entry_only, exits_later, long_stay, day_later, no_lifetime; \
+             exits: old_view, bounce, exit_only, covered, exits_later, no_lifetime; \
+             bounces: bounce, no_lifetime"
+        );
+        assert_eq!(detail.bucket_interval, "hour");
+        // The other three queries bind the environment too; they count the
+        // crawler view, as before.
+        let activity_views: i64 = detail.activity_over_time.iter().map(|b| b.page_views).sum();
+        assert_eq!(activity_views, 17);
+        assert_eq!(detail.referrers.iter().map(|r| r.visits).sum::<i64>(), 17);
+        let country_views: i64 = detail.countries.iter().map(|c| c.page_views).sum();
+        assert_eq!(country_views, 17);
+
+        let all_environments = service
+            .get_page_path_detail(project_id, TARGET, w0, window_end, None, None)
+            .await?;
+        assert_eq!(
+            summary(&all_environments),
+            (
+                3,
+                17,
+                1230.0 / 13.0,
+                rate(3.0, 7.0),
+                rate(7.0, 11.0),
+                rate(7.0, 11.0)
+            ),
+            "no_environment adds a bouncing session"
+        );
+        let activity_views: i64 = all_environments
+            .activity_over_time
+            .iter()
+            .map(|b| b.page_views)
+            .sum();
+        assert_eq!(activity_views, 18);
+
+        // The same SQL reading every session's whole life in the bound gives
+        // the unbounded answer, which differs only for no_lifetime: its view
+        // is left out of the average and it is neither an exit nor a bounce.
+        let stats = |start: UtcDateTime, end: UtcDateTime| {
+            Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                PAGE_PATH_DETAIL_STATS_SQL,
+                vec![
+                    project_id.into(),
+                    TARGET.into(),
+                    w0.into(),
+                    window_end.into(),
+                    Some(env_id).into(),
+                    start.into(),
+                    end.into(),
+                    ANALYTICS_ROW_CLOCK_SLACK_HOURS.into(),
+                ],
+            )
+        };
+        let year = chrono::Duration::days(365);
+        let row = db
+            .query_one(stats(w0 - year, window_end + year))
+            .await?
+            .expect("the stats query returns one row");
+        let unbounded = (
+            row.try_get::<i64>("", "unique_visitors")?,
+            row.try_get::<i64>("", "total_page_views")?,
+            row.try_get::<f64>("", "avg_time_on_page")?,
+            row.try_get::<f64>("", "bounce_rate")?,
+            row.try_get::<f64>("", "entry_rate")?,
+            row.try_get::<f64>("", "exit_rate")?,
+        );
+        assert_eq!(
+            unbounded,
+            (
+                3,
+                16,
+                1170.0 / 11.0,
+                rate(1.0, 6.0),
+                rate(6.0, 10.0),
+                rate(5.0, 10.0)
+            )
+        );
+
+        // The cost stays linear in the sessions' page views inside the bound
+        // (the busy session's 3000 and a few more): the previous query
+        // re-aggregated all of them once per page view of the page.
+        let (context_start, context_end) = page_path_visitors_context_bounds(w0, window_end);
+        let explain = stats(context_start, context_end);
+        let plan_row = db
+            .query_one(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                format!("EXPLAIN (ANALYZE, TIMING OFF, FORMAT JSON) {}", explain.sql),
+                explain.values.map(|values| values.0).unwrap_or_default(),
+            ))
+            .await?
+            .expect("EXPLAIN returns one row");
+        let plan: serde_json::Value = plan_row.try_get("", "QUERY PLAN")?;
+        let max_rows = max_rows_handled(&plan[0]["Plan"]);
+        assert!(
+            max_rows <= (4 * BUSY_PAGE_VIEWS) as f64,
+            "a plan node handled {max_rows} rows for sessions of about {BUSY_PAGE_VIEWS} page views"
+        );
 
         cleanup_test_analytics!(db);
         Ok(())
