@@ -84,6 +84,7 @@ export function SegmentVisitors({
   value,
   startDate,
   endDate,
+  rangeScope,
   environment,
   onBack,
 }: SegmentVisitorsProps) {
@@ -92,7 +93,7 @@ export function SegmentVisitors({
 
   const filterParam = segmentParamFor(dimension)
 
-  const pageScope = `${dimension}\u0000${value}\u0000${startDate}\u0000${endDate}\u0000${environment ?? ''}`
+  const pageScope = `${dimension}\u0000${value}\u0000${rangeScope}\u0000${environment ?? ''}`
   const [previousPageScope, setPreviousPageScope] = React.useState(pageScope)
   if (pageScope !== previousPageScope) {
     setPreviousPageScope(pageScope)

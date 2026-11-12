@@ -970,6 +970,7 @@ function SegmentVisitorsTab({ project }: SegmentVisitorsTabProps) {
         value={value}
         startDate={startDate}
         endDate={endDate}
+        rangeScope={`${dateFilter.quickFilter}\u0000${dateFilter.dateRange?.from?.getTime() ?? ''}\u0000${dateFilter.dateRange?.to?.getTime() ?? ''}`}
         environment={selectedEnvironment}
         onBack={() => {
           const params = new URLSearchParams()
