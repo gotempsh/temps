@@ -76,6 +76,57 @@ describe('keepPreviousWindow', () => {
     expect(otherService(rows, { queryKey: key(window) })).toBeUndefined()
   })
 
+  test('keeps it when a range anchored to a day only moves its end ("today")', () => {
+    const today = keepPreviousWindow(
+      key({ start_date: window.start_date, end_date: moved.end_date })
+    )
+    expect(today(rows, { queryKey: key(window) })).toBe(rows)
+  })
+
+  test('drops it when another range is picked, wider, narrower or elsewhere', () => {
+    const lastWeek = keepPreviousWindow(
+      key({ start_date: '2025-12-26T00:05:00Z', end_date: moved.end_date })
+    )
+    expect(lastWeek(rows, { queryKey: key(window) })).toBeUndefined()
+    const lastHour = keepPreviousWindow(
+      key({ start_date: '2026-01-01T23:05:00Z', end_date: moved.end_date })
+    )
+    expect(lastHour(rows, { queryKey: key(window) })).toBeUndefined()
+    const nextDay = keepPreviousWindow(
+      key({ start_date: window.end_date, end_date: '2026-01-03T00:00:00Z' })
+    )
+    expect(nextDay(rows, { queryKey: key(window) })).toBeUndefined()
+    const earlier = keepPreviousWindow(
+      key({
+        start_date: '2025-12-31T00:00:00Z',
+        end_date: '2026-01-01T00:00:00Z',
+      })
+    )
+    expect(earlier(rows, { queryKey: key(window) })).toBeUndefined()
+  })
+
+  test('reads a window named in a hand-written key', () => {
+    const usageKey = (from: string, to: string) => [
+      'aiUsage',
+      'summary',
+      { from, to },
+    ]
+    const refreshed = keepPreviousWindow(
+      usageKey(moved.start_date, moved.end_date)
+    )
+    expect(
+      refreshed(rows, {
+        queryKey: usageKey(window.start_date, window.end_date),
+      })
+    ).toBe(rows)
+    const wider = keepPreviousWindow(
+      usageKey('2025-12-02T00:05:00Z', moved.end_date)
+    )
+    expect(
+      wider(rows, { queryKey: usageKey(window.start_date, window.end_date) })
+    ).toBeUndefined()
+  })
+
   test('has nothing to keep without a previous query', () => {
     expect(keepPreviousWindow(key(window))(rows, undefined)).toBeUndefined()
   })

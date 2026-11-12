@@ -38,7 +38,6 @@ import {
 import { Link, useSearchParams } from 'react-router'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import {
-  keepPreviousData,
   useMutation,
   useMutationState,
   useQuery,
@@ -995,22 +994,25 @@ export function UsageAnalytics() {
     return { from, to, bucket }
   }, [endMs, timeRange])
 
-  const { data: summary, isLoading: summaryLoading } = useQuery({
-    queryKey: ['aiUsage', 'summary', timeParams.from, timeParams.to],
+  // The window is named in each key ({ from, to }), so a Refresh that moves
+  // it keeps the numbers on screen and picking another range does not.
+  const { data: summary, isLoading: summaryLoading } = useWindowQuery({
+    queryKey: [
+      'aiUsage',
+      'summary',
+      { from: timeParams.from, to: timeParams.to },
+    ],
     queryFn: () =>
       fetchJson<UsageSummary>(
         buildUsageUrl('summary', { from: timeParams.from, to: timeParams.to })
       ),
-    placeholderData: keepPreviousData,
   })
 
-  const { data: timeseries, isLoading: timeseriesLoading } = useQuery({
+  const { data: timeseries, isLoading: timeseriesLoading } = useWindowQuery({
     queryKey: [
       'aiUsage',
       'timeseries',
-      timeParams.from,
-      timeParams.to,
-      timeParams.bucket,
+      { from: timeParams.from, to: timeParams.to, bucket: timeParams.bucket },
     ],
     queryFn: () =>
       fetchJson<TimeseriesBucket[]>(
@@ -1020,11 +1022,14 @@ export function UsageAnalytics() {
           bucket: timeParams.bucket,
         })
       ),
-    placeholderData: keepPreviousData,
   })
 
-  const { data: byProvider } = useQuery({
-    queryKey: ['aiUsage', 'by-provider', timeParams.from, timeParams.to],
+  const { data: byProvider } = useWindowQuery({
+    queryKey: [
+      'aiUsage',
+      'by-provider',
+      { from: timeParams.from, to: timeParams.to },
+    ],
     queryFn: () =>
       fetchJson<ProviderUsage[]>(
         buildUsageUrl('by-provider', {
@@ -1032,11 +1037,14 @@ export function UsageAnalytics() {
           to: timeParams.to,
         })
       ),
-    placeholderData: keepPreviousData,
   })
 
-  const { data: topModels } = useQuery({
-    queryKey: ['aiUsage', 'top-models', timeParams.from, timeParams.to],
+  const { data: topModels } = useWindowQuery({
+    queryKey: [
+      'aiUsage',
+      'top-models',
+      { from: timeParams.from, to: timeParams.to },
+    ],
     queryFn: () =>
       fetchJson<ModelUsage[]>(
         buildUsageUrl('top-models', {
@@ -1045,7 +1053,6 @@ export function UsageAnalytics() {
           limit: '10',
         })
       ),
-    placeholderData: keepPreviousData,
   })
 
   // Recent Requests: pagination + filters. `pageSize` is user-configurable up
