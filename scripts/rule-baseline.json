@@ -45,7 +45,7 @@
       "lazy_error_variants": 4,
       "anyhow_in_library": 1,
       "files_over_3000_lines": 1,
-      "functions_over_300_lines": 3
+      "functions_over_300_lines": 1
     },
     "temps-analytics-events": {
       "lazy_error_variants": 2,

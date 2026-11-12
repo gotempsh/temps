@@ -8,7 +8,13 @@ import { Callout, ResponsivePagination } from '@temps-sdk/ds'
 import { sandboxAccessVaultsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { SandboxServices } from './SandboxServices'
 import { AccessSessionsList } from './AccessSessionsList'
+import { SandboxServiceAccess } from './SandboxServiceAccess'
 
+/**
+ * The vaults linked to this sandbox (directly or through its project), its
+ * fixed sessions and, for a sandbox in a project, its service approvals and
+ * time-limited access requests. Services themselves are edited in Vault.
+ */
 export function SandboxVaultAccess({
   projectId,
   sandboxId,
@@ -86,7 +92,21 @@ export function SandboxVaultAccess({
       )}
       <AccessSessionsList sandboxId={sandboxId} />
       {projectId != null && (
-        <SandboxServices projectId={projectId} sandboxId={sandboxId} />
+        <>
+          <SandboxServices projectId={projectId} sandboxId={sandboxId} />
+          <details>
+            <summary className="cursor-pointer text-sm">
+              Time-limited access requests
+            </summary>
+            <div className="pt-3">
+              <SandboxServiceAccess
+                projectId={projectId}
+                sandboxId={sandboxId}
+                manageServices={false}
+              />
+            </div>
+          </details>
+        </>
       )}
     </section>
   )

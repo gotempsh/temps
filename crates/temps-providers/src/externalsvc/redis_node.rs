@@ -33,7 +33,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use super::naming::{redis_container_name, shell_escape};
-use super::postgres_walg_backup::{run_walg_exec, walg_identity_env, WalgBaseBackupError};
+use super::postgres_walg_backup::{
+    refuse_overlapping_backup_push, run_walg_exec, walg_identity_env, WalgBaseBackupError,
+};
 use super::redis::restore_swap::keep_target_bookkeeping;
 use super::redis::{classify_redis_backup_location, RedisBackupLocationKind};
 use super::worker_data::{
@@ -170,6 +172,12 @@ pub enum RedisNodeError {
     Exec { container: String, reason: String },
     #[error("The backup of Redis container '{container}' was cancelled")]
     Cancelled { container: String },
+    #[error(
+        "A wal-g backup-push of Redis service {service_id} is still running in '{container}', \
+         left by an earlier attempt whose agent restarted or passed its deadline. Nothing was \
+         started; the backup can run once it ends"
+    )]
+    BackupPushRunning { service_id: i32, container: String },
     #[error("RDB backup of Redis service {service_id} ('{service}') failed: {source}")]
     Rdb {
         service_id: i32,
@@ -213,6 +221,24 @@ fn tail(text: &str) -> String {
     format!("…{}", &trimmed[start..])
 }
 
+/// A WAL-G exec's error as this engine's.
+fn walg_error(error: WalgBaseBackupError, container_name: &str) -> RedisNodeError {
+    match error {
+        WalgBaseBackupError::Cancelled { container } => RedisNodeError::Cancelled { container },
+        WalgBaseBackupError::BackupPushRunning {
+            service_id,
+            container,
+        } => RedisNodeError::BackupPushRunning {
+            service_id,
+            container,
+        },
+        other => RedisNodeError::Exec {
+            container: container_name.to_string(),
+            reason: other.to_string(),
+        },
+    }
+}
+
 /// One WAL-G stream backup of a Redis service.
 /// `Debug` redacts the password.
 #[derive(Clone)]
@@ -254,6 +280,9 @@ pub async fn redis_walg_backup(
         s3,
         backup_uuid,
     } = backup;
+    refuse_overlapping_backup_push(docker, service_id, &container_name, "Redis", cancel)
+        .await
+        .map_err(|error| walg_error(error, &container_name))?;
     let prefix = walg_prefix(&s3.bucket_name, &s3.bucket_path, &service);
     let endpoint = s3
         .resolve_endpoint_for_container(docker, &container_name)
@@ -267,13 +296,7 @@ pub async fn redis_walg_backup(
     );
     let output = run_walg_exec(docker, &container_name, "wal-g backup-push", &env, cancel)
         .await
-        .map_err(|error| match error {
-            WalgBaseBackupError::Cancelled { container } => RedisNodeError::Cancelled { container },
-            other => RedisNodeError::Exec {
-                container: container_name.clone(),
-                reason: other.to_string(),
-            },
-        })?;
+        .map_err(|error| walg_error(error, &container_name))?;
     if output.exit_code != 0 {
         return Err(RedisNodeError::BackupPush {
             service_id,
@@ -879,5 +902,51 @@ mod tests {
                 "{location}: a refused restore never enters its write phase"
             );
         }
+    }
+}
+
+/// Against a real Docker daemon. Skips without Docker.
+#[cfg(test)]
+#[cfg(feature = "docker-tests")]
+mod docker_tests {
+    use super::*;
+    use crate::externalsvc::postgres_walg_backup::docker_tests::{
+        container, docker_or_skip, let_the_push_start, remove, unreachable_s3, SURVIVING_PUSH,
+    };
+
+    /// As for PostgreSQL: a retry after the agent restarted, or after the
+    /// deadline, must not start a second `backup-push` (a second RDB
+    /// stream) while the first one still runs.
+    #[tokio::test]
+    async fn a_surviving_backup_push_is_not_overlapped() {
+        let Some(docker) = docker_or_skip().await else {
+            return;
+        };
+        let name = container(&docker, SURVIVING_PUSH).await;
+        let_the_push_start().await;
+        let result = redis_walg_backup(
+            &docker,
+            RedisWalgBackup {
+                service_id: 44,
+                service: "cache".to_string(),
+                container_name: name.clone(),
+                password: "redis-secret".to_string(),
+                s3: unreachable_s3(),
+                backup_uuid: "b-2".to_string(),
+            },
+            &CancellationToken::new(),
+        )
+        .await;
+        remove(&docker, &name).await;
+        let error = result.expect_err("a second backup-push must not start");
+        assert!(
+            matches!(
+                &error,
+                RedisNodeError::BackupPushRunning { service_id: 44, container } if container == &name
+            ),
+            "unexpected error: {error}"
+        );
+        assert!(error.to_string().contains("still running"), "{error}");
+        assert!(!error.is_refusal(), "a retry can succeed once it ends");
     }
 }
