@@ -744,9 +744,13 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
     (structuredSummary.failureStatus === 409 && cliSummaryQuery.isPending)
 
   const investigateWithAi = React.useCallback(() => {
+    // The window the summary was made for, which Refresh does not move, so
+    // the lead and the data the assistant inspects cover the same period.
+    const windowStart = summaryData ? summaryWindow.startIso : startIso
+    const windowEnd = summaryData ? summaryWindow.endIso : endIso
     const scope = [
       `Service: ${project.name} (project slug ${project.slug}, project id ${project.id})`,
-      `Window: ${startIso ?? 'unknown'} to ${endIso ?? 'unknown'}`,
+      `Window: ${windowStart ?? 'unknown'} to ${windowEnd ?? 'unknown'}`,
       selectedEnvironment == null
         ? 'Environment: all environments'
         : `Environment id: ${selectedEnvironment}`,
@@ -783,6 +787,7 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
     selectedEnvironment,
     startIso,
     summaryData,
+    summaryWindow,
   ])
 
   const points = React.useMemo(

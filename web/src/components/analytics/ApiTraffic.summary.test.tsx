@@ -91,7 +91,7 @@ function mockTraffic() {
   return { timeseriesEnds, summaryRouteEnds, prompts }
 }
 
-function renderTab() {
+function renderTab(open: AiAssistantValue['open'] = () => {}) {
   return render(
     <QueryClientProvider
       client={
@@ -99,7 +99,7 @@ function renderTab() {
       }
     >
       <AiAssistantContext.Provider
-        value={{ open: () => {} } as unknown as AiAssistantValue}
+        value={{ open } as unknown as AiAssistantValue}
       >
         <MemoryRouter initialEntries={['/api-traffic?filter=24hours']}>
           <ApiTrafficTab
@@ -143,4 +143,28 @@ test('Refresh keeps a generated summary on screen and asks the AI nothing new', 
   expect(screen.getByText('Traffic is steady')).toBeTruthy()
   expect(traffic.prompts).toHaveLength(1)
   expect(traffic.summaryRouteEnds).toEqual([first])
+})
+
+test('Investigate with AI after a Refresh inspects the window the summary was made for', async () => {
+  const traffic = mockTraffic()
+  const prompts: string[] = []
+  renderTab(((request: { context: { startPrompt?: string } }) => {
+    prompts.push(request.context.startPrompt ?? '')
+  }) as unknown as AiAssistantValue['open'])
+  const generate = await screen.findByRole('button', {
+    name: 'Generate AI traffic summary',
+  })
+  await waitFor(() => expect(generate.hasAttribute('disabled')).toBe(false))
+  fireEvent.click(generate)
+  await screen.findByText('Traffic is steady')
+  await new Promise((resolve) => setTimeout(resolve, 5))
+
+  fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
+  await waitFor(() => expect(traffic.timeseriesEnds).toHaveLength(2))
+  fireEvent.click(screen.getByRole('button', { name: 'Investigate with AI' }))
+
+  const [summarized, moved] = traffic.timeseriesEnds
+  expect(prompts).toHaveLength(1)
+  expect(prompts[0]).toContain(`to ${summarized}`)
+  expect(prompts[0]).not.toContain(moved)
 })
