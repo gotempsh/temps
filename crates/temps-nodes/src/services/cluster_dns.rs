@@ -412,6 +412,39 @@ pub struct DnsNode {
 /// (ADR-104 D4). `None` when the control plane does not serve local
 /// containers itself (cluster DNS off, its resolver down, or a release older
 /// than ADR-104).
+/// One evaluation of a node's internal routing alarm: advances `down_streak`
+/// and returns why the alarm should be open, or `None` to resolve it.
+///
+/// A node that reports no internal routing has nothing down: the alarm is
+/// resolved and the streak starts over. That is the control plane once its
+/// routing stops (cluster DNS turned off, or a worker joined and serves the
+/// names), so an alarm opened while it was down does not stay open after it
+/// stopped serving them.
+pub fn internal_proxy_alarm(
+    is_control_plane: bool,
+    cluster_dns_enabled: bool,
+    node_status: &str,
+    proxy: Option<&InternalProxyState>,
+    down_streak: &mut u32,
+) -> Option<String> {
+    let Some(proxy) = proxy else {
+        *down_streak = 0;
+        return None;
+    };
+    *down_streak = if proxy.listening == Some(false) {
+        down_streak.saturating_add(1)
+    } else {
+        0
+    };
+    internal_proxy_alert_for(
+        is_control_plane,
+        cluster_dns_enabled,
+        node_status,
+        proxy,
+        *down_streak,
+    )
+}
+
 pub fn control_plane_proxy_state(
     report: Option<&dns_resolver_reports::Model>,
 ) -> Option<InternalProxyState> {
@@ -1247,23 +1280,15 @@ impl ClusterDnsCollector {
                 decision.query_failures,
             )
             .await;
-            if let Some(proxy) = proxy {
-                let streak = state.proxy_down_streak.entry(node_id).or_default();
-                *streak = if proxy.listening == Some(false) {
-                    streak.saturating_add(1)
-                } else {
-                    0
-                };
-                let reason = internal_proxy_alert_for(
-                    node_id == CONTROL_PLANE_NODE_ID,
-                    enabled,
-                    &status,
-                    &proxy,
-                    *streak,
-                );
-                self.apply(node_id, &node_name, AlarmType::DnsInternalProxyDown, reason)
-                    .await;
-            }
+            let reason = internal_proxy_alarm(
+                node_id == CONTROL_PLANE_NODE_ID,
+                enabled,
+                &status,
+                proxy.as_ref(),
+                state.proxy_down_streak.entry(node_id).or_default(),
+            );
+            self.apply(node_id, &node_name, AlarmType::DnsInternalProxyDown, reason)
+                .await;
         }
         Ok(())
     }
@@ -1603,7 +1628,7 @@ mod tests {
             "address": "172.20.0.1:80",
             "listening": false,
             "mode": "down",
-            "error": "172.20.0.1:591 is in use by another program",
+            "error": "172.20.0.1:80 is in use by another program",
         }));
         let down = control_plane_proxy_state(Some(&cp)).expect("reported");
         let reason = internal_proxy_alert_for(true, true, "active", &down, 2).expect("alarm");
@@ -1617,6 +1642,47 @@ mod tests {
         // Anything but an object is unknown, not "down".
         cp.internal_proxy = Some(serde_json::json!("yes"));
         assert_eq!(control_plane_proxy_state(Some(&cp)), None);
+    }
+
+    /// The control plane's routing alarm opens after two down passes and is
+    /// resolved, with its streak reset, once the control plane reports no
+    /// routing at all (a worker joined, or cluster DNS was turned off).
+    #[test]
+    fn the_control_plane_routing_alarm_resolves_once_it_reports_nothing() {
+        let down = InternalProxyState {
+            listening: Some(false),
+            address: Some("172.20.0.1:80".into()),
+            error: Some("172.20.0.1:80 is in use by another program".into()),
+            ..Default::default()
+        };
+        let mut streak = 0;
+        assert_eq!(
+            internal_proxy_alarm(true, true, "active", Some(&down), &mut streak),
+            None
+        );
+        assert!(internal_proxy_alarm(true, true, "active", Some(&down), &mut streak).is_some());
+        // Routing stopped: nothing is reported, so nothing is down.
+        assert_eq!(
+            internal_proxy_alarm(true, true, "active", None, &mut streak),
+            None
+        );
+        assert_eq!(streak, 0);
+        // Down again later starts a new streak: one pass pages nobody.
+        assert_eq!(
+            internal_proxy_alarm(true, true, "active", Some(&down), &mut streak),
+            None
+        );
+        assert_eq!(streak, 1);
+        // Listening resets it as before.
+        let up = InternalProxyState {
+            listening: Some(true),
+            ..down.clone()
+        };
+        assert_eq!(
+            internal_proxy_alarm(true, true, "active", Some(&up), &mut streak),
+            None
+        );
+        assert_eq!(streak, 0);
     }
 
     fn health(
