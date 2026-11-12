@@ -883,6 +883,29 @@ fn a_lost_encryption_key_on_an_initialized_dir_fails() {
     ));
 }
 
+#[cfg(unix)]
+#[test]
+fn the_write_probe_never_follows_a_planted_symlink() {
+    let dir = tempfile::tempdir().unwrap();
+    let victim = dir.path().join("victim");
+    std::fs::write(&victim, "keep me").unwrap();
+    // The fixed name the probe used to write through.
+    std::os::unix::fs::symlink(&victim, dir.path().join(".doctor-test")).unwrap();
+
+    probe_writable(dir.path()).unwrap();
+    assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep me");
+    // Nothing is left behind but what was there.
+    let mut names: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    names.sort();
+    assert_eq!(names, vec![".doctor-test", "victim"]);
+
+    // A directory it cannot write is reported as such.
+    assert!(probe_writable(&dir.path().join("missing")).is_err());
+}
+
 #[test]
 fn a_missing_data_dir_is_not_a_setup_step_when_a_server_is_installed() {
     let root = tempfile::tempdir().unwrap();

@@ -376,19 +376,9 @@ impl DoctorCommand {
             return;
         }
 
-        // Check writable
-        let test_file = data_dir.join(".doctor-test");
-        match std::fs::write(&test_file, "test") {
-            Ok(_) => {
-                let _ = std::fs::remove_file(&test_file);
-                report.add("Writable", CheckResult::Pass("Yes".to_string()));
-            }
-            Err(e) => {
-                report.add(
-                    "Writable",
-                    CheckResult::Fail(format!("Not writable: {}", e)),
-                );
-            }
+        match probe_writable(data_dir) {
+            Ok(()) => report.add("Writable", CheckResult::Pass("Yes".to_string())),
+            Err(e) => report.add("Writable", CheckResult::Fail(format!("Not writable: {e}"))),
         }
 
         // The secrets as `temps serve` resolves them (ServerConfig::new):
@@ -1709,6 +1699,19 @@ fn geolite_result(data_dir: &Path, working_directory: Option<&Path>) -> CheckRes
 
 /// `temps serve` creates `<data dir>/logs` every time it starts and refuses
 /// to start when it cannot.
+/// Whether this user can create a file in `data_dir`. The probe is created
+/// exclusively under a random name and removed on drop, so it never opens an
+/// existing file: with sudo, a symlink planted in a directory the service
+/// account can write would otherwise have root truncate its target.
+fn probe_writable(data_dir: &Path) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut probe = tempfile::Builder::new()
+        .prefix(".doctor-test-")
+        .tempfile_in(data_dir)?;
+    probe.write_all(b"test")?;
+    probe.flush()
+}
+
 /// Why `data_dir` cannot be checked, when it cannot: missing, or not
 /// visible to this user (`Path::exists` says "missing" for both). With an
 /// installed server a missing directory is not a setup step: `temps serve`
