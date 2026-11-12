@@ -24,6 +24,36 @@ pub fn image_id_spellings(image_id: &str) -> [String; 2] {
     [format!("sha256:{hex}"), hex]
 }
 
+/// A tag as recorded and with its implicit `:latest` made explicit or
+/// dropped, so a deployment that names `app` matches the image `app:latest`.
+pub fn tag_spellings(tag: &str) -> Vec<String> {
+    let tag = tag.trim();
+    let name = tag.rsplit('/').next().unwrap_or(tag);
+    if tag.contains('@') {
+        vec![tag.to_string()]
+    } else if let Some(bare) = tag.strip_suffix(":latest") {
+        vec![tag.to_string(), bare.to_string()]
+    } else if name.contains(':') {
+        vec![tag.to_string()]
+    } else {
+        vec![tag.to_string(), format!("{tag}:latest")]
+    }
+}
+
+/// Whether `named` (from [`referenced_images`]) holds any spelling of `tag`.
+pub fn names_tag(named: &HashSet<String>, tag: &str) -> bool {
+    tag_spellings(tag)
+        .iter()
+        .any(|spelling| named.contains(spelling))
+}
+
+/// Whether `named` holds any spelling of `image_id`.
+pub fn names_image_id(named: &HashSet<String>, image_id: &str) -> bool {
+    image_id_spellings(image_id)
+        .iter()
+        .any(|spelling| named.contains(spelling))
+}
+
 /// The members of `candidates` (tags or image IDs, as recorded) that a
 /// deployment or build of any project other than `excluding_project` names.
 /// `None` checks every project, for images whose own project is gone.
@@ -98,6 +128,20 @@ mod tests {
             image_id_spellings("abcd"),
             ["sha256:abcd".to_string(), "abcd".to_string()]
         );
+    }
+
+    #[test]
+    fn an_implicit_latest_tag_matches_either_spelling() {
+        assert_eq!(tag_spellings("app-1"), vec!["app-1", "app-1:latest"]);
+        assert_eq!(tag_spellings("app-1:latest"), vec!["app-1:latest", "app-1"]);
+        assert_eq!(tag_spellings("app-1:v2"), vec!["app-1:v2"]);
+        assert_eq!(
+            tag_spellings("registry:5000/app"),
+            vec!["registry:5000/app", "registry:5000/app:latest"]
+        );
+        let named = HashSet::from(["app-1".to_string()]);
+        assert!(names_tag(&named, "app-1:latest"));
+        assert!(!names_tag(&named, "app-1:v2"));
     }
 
     #[tokio::test]

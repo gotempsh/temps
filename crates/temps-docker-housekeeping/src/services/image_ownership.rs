@@ -24,6 +24,9 @@ pub const IMAGE_INSTANCE_LABEL: &str = "sh.temps.image.instance";
 pub const IMAGE_PROJECT_LABEL: &str = "sh.temps.image.project_id";
 /// The deployment whose build produced the image.
 pub const IMAGE_DEPLOYMENT_LABEL: &str = "sh.temps.image.deployment_id";
+/// The tag the build gave the image. The sweep only removes an image whose
+/// one tag is still this one: an image an operator retagged is theirs.
+pub const IMAGE_TAG_LABEL: &str = "sh.temps.image.tag";
 
 /// Why this install's image ownership ID could not be read or created.
 #[derive(Debug, thiserror::Error)]
@@ -106,6 +109,17 @@ pub fn image_ownership_labels(
     ])
 }
 
+/// `labels` (the ownership labels of a build) for the image tagged `tag`.
+/// Without ownership labels there is nothing to add: the image stays
+/// unrecognised, as before.
+pub fn labels_for_tag(labels: &HashMap<String, String>, tag: &str) -> HashMap<String, String> {
+    let mut labels = labels.clone();
+    if labels.contains_key(IMAGE_INSTANCE_LABEL) {
+        labels.insert(IMAGE_TAG_LABEL.to_string(), tag.to_string());
+    }
+    labels
+}
+
 /// The project an image's labels name, if they name a valid one.
 pub fn labelled_project_id(labels: &HashMap<String, String>) -> Option<i32> {
     labels
@@ -129,6 +143,13 @@ mod tests {
             "image labels must not collide with container labels: {labels:?}"
         );
         assert_eq!(labelled_project_id(&labels), Some(7));
+    }
+
+    #[test]
+    fn each_built_image_records_its_own_tag_only_when_it_is_owned() {
+        let owned = labels_for_tag(&image_ownership_labels("install-a", 7, 42), "app-42:latest");
+        assert_eq!(owned[IMAGE_TAG_LABEL], "app-42:latest");
+        assert!(labels_for_tag(&HashMap::new(), "app-42:latest").is_empty());
     }
 
     #[test]

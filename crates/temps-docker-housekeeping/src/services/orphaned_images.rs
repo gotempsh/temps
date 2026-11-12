@@ -18,8 +18,9 @@
 //! - only when **no other project** still names the image's tag or ID in a
 //!   deployment or build (a promotion, an identical build), checked for the
 //!   whole set of orphans in one query;
-//! - only when it carries the one tag Temps gave it, so an image someone
-//!   retagged for themselves stays;
+//! - only when its tags are exactly the one its build gave it (recorded as
+//!   `sh.temps.image.tag`), so an image someone retagged for themselves
+//!   stays;
 //! - only when **no container**, running or stopped, was created from the
 //!   image, judged by image ID; removed by that ID and never forced.
 //!
@@ -262,18 +263,22 @@ async fn existing_project_ids<C: ConnectionTrait>(
 }
 
 /// The removal request for an orphan: by its one tag, expecting its ID, or
-/// by ID if it has no tag. `None` when it carries several tags: the extra
-/// ones are someone's own (a retag), so the image is not Temps' alone.
+/// by ID if it has no tag. `None` when its tags are not exactly the one the
+/// build gave it (`sh.temps.image.tag`): a second tag, or one that replaced
+/// the build's, is an operator's retag, so the image is theirs. An image
+/// built without that label is kept too: its one tag proves nothing.
 fn removal_request(image: &OwnedImage) -> Option<ImageRemovalRequest> {
     match image.tags.as_slice() {
         [] => Some(ImageRemovalRequest::new(
             image.image_id.clone(),
             Some(image.image_id.clone()),
         )),
-        [tag] => Some(ImageRemovalRequest::new(
-            tag.clone(),
-            Some(image.image_id.clone()),
-        )),
+        [tag] => {
+            let built = image.labels.get(image_ownership::IMAGE_TAG_LABEL)?;
+            image_references::tag_spellings(built)
+                .contains(tag)
+                .then(|| ImageRemovalRequest::new(tag.clone(), Some(image.image_id.clone())))
+        }
         _ => None,
     }
 }
@@ -327,7 +332,9 @@ pub async fn sweep_orphaned_project_images<C: ConnectionTrait>(
     // built the same image: any row naming its tags or ID keeps it.
     let mut candidates = Vec::new();
     for image in &orphans {
-        candidates.extend(image.tags.iter().cloned());
+        for tag in &image.tags {
+            candidates.extend(image_references::tag_spellings(tag));
+        }
         candidates.extend(image_references::image_id_spellings(&image.image_id));
     }
     let named = image_references::referenced_images(db, &candidates, None)
@@ -344,10 +351,11 @@ pub async fn sweep_orphaned_project_images<C: ConnectionTrait>(
             report.deferred = orphans.len() - index;
             break;
         }
-        let named_elsewhere = image.tags.iter().any(|tag| named.contains(tag))
-            || image_references::image_id_spellings(&image.image_id)
-                .iter()
-                .any(|id| named.contains(id));
+        let named_elsewhere = image
+            .tags
+            .iter()
+            .any(|tag| image_references::names_tag(&named, tag))
+            || image_references::names_image_id(&named, &image.image_id);
         if named_elsewhere {
             report.kept += 1;
             log_kept(image, "another project's deployment or build names it");
@@ -355,7 +363,7 @@ pub async fn sweep_orphaned_project_images<C: ConnectionTrait>(
         }
         let Some(request) = removal_request(image) else {
             report.kept += 1;
-            log_kept(image, "it carries more than the one tag Temps gave it");
+            log_kept(image, "its tags are not just the one its build gave it");
             continue;
         };
         match daemon.container_using_image(&image.image_id).await {
@@ -417,6 +425,10 @@ mod tests {
                 project.to_string(),
             );
         }
+        labels.insert(
+            image_ownership::IMAGE_TAG_LABEL.to_string(),
+            format!("{id}:latest"),
+        );
         OwnedImage {
             image_id: id.to_string(),
             tags: vec![format!("{id}:latest")],
@@ -603,15 +615,23 @@ mod tests {
     async fn held_shared_and_retagged_orphans_do_not_use_up_the_limit() {
         let mut retagged = image("gone-retagged", Some("2"), 25);
         retagged.tags.push("operator-backup:keep".to_string());
+        // The operator retagged it and removed the build's tag.
+        let mut replaced = image("gone-replaced", Some("2"), 26);
+        replaced.tags = vec!["operator-backup:v1".to_string()];
+        let mut unrecorded = image("gone-unrecorded", Some("2"), 27);
+        unrecorded.labels.remove(image_ownership::IMAGE_TAG_LABEL);
         let mut daemon = ScriptedDaemon::new(vec![
             image("gone-held", Some("2"), 10),
             image("gone-shared", Some("2"), 20),
             retagged,
+            replaced,
+            unrecorded,
             image("gone-free", Some("2"), 30),
         ]);
         daemon.held = vec!["gone-held"];
-        // Another project still deploys the shared image by its tag.
-        let db = mock_db(Some("install-a"), &[], &["gone-shared:latest"]);
+        // Another project still deploys the shared image, naming it without
+        // its implicit `:latest`.
+        let db = mock_db(Some("install-a"), &[], &["gone-shared"]);
 
         let report = sweep_orphaned_project_images(&db, &daemon, 1)
             .await
@@ -621,10 +641,10 @@ mod tests {
         assert_eq!(
             report,
             OrphanSweepReport {
-                labelled: 4,
-                orphaned: 4,
+                labelled: 6,
+                orphaned: 6,
                 removed: 1,
-                kept: 3,
+                kept: 5,
                 failed: 0,
                 deferred: 0,
             }
@@ -799,15 +819,24 @@ mod tests {
         let images = [
             (
                 &orphan,
-                image_ownership::image_ownership_labels(&instance, doomed.id, 1),
+                image_ownership::labels_for_tag(
+                    &image_ownership::image_ownership_labels(&instance, doomed.id, 1),
+                    &orphan,
+                ),
             ),
             (
                 &held,
-                image_ownership::image_ownership_labels(&instance, doomed.id, 2),
+                image_ownership::labels_for_tag(
+                    &image_ownership::image_ownership_labels(&instance, doomed.id, 2),
+                    &held,
+                ),
             ),
             (
                 &live_image,
-                image_ownership::image_ownership_labels(&instance, live.id, 3),
+                image_ownership::labels_for_tag(
+                    &image_ownership::image_ownership_labels(&instance, live.id, 3),
+                    &live_image,
+                ),
             ),
             (
                 &foreign,

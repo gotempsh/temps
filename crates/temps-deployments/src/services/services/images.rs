@@ -47,23 +47,21 @@ const RUNTIME_REMOVAL_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 const TOTAL_REMOVAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Split `images` into those to remove and the references that another
-/// project's deployment or build names (`shared_refs`, tags or image IDs).
+/// project's deployment or build names (`shared_refs`, tags or image IDs as
+/// returned by [`image_references::referenced_images`]). A tag matches with
+/// or without its implicit `:latest`, an ID with or without `sha256:`.
 pub(super) fn partition_shared(
     images: Vec<ProjectImage>,
     shared_refs: &HashSet<String>,
 ) -> (Vec<ProjectImage>, Vec<String>) {
-    let normalized: HashSet<String> = shared_refs
-        .iter()
-        .map(|reference| normalize_ref(reference))
-        .collect();
     let mut keep = Vec::new();
     let mut shared = Vec::new();
     for image in images {
-        let tag_shared = normalized.contains(&normalize_ref(&image.reference));
+        let tag_shared = image_references::names_tag(shared_refs, &image.reference);
         let id_shared = image
             .image_id
             .as_deref()
-            .is_some_and(|id| normalized.contains(&normalize_ref(id)));
+            .is_some_and(|id| image_references::names_image_id(shared_refs, id));
         if tag_shared || id_shared {
             shared.push(image.reference);
         } else {
@@ -71,20 +69,6 @@ pub(super) fn partition_shared(
         }
     }
     (keep, shared)
-}
-
-/// Image IDs in one spelling (`sha256:<hex>`), tags as written.
-fn normalize_ref(reference: &str) -> String {
-    let trimmed = reference.trim();
-    let lower = trimmed.to_ascii_lowercase();
-    let hex = lower.trim_start_matches("sha256:");
-    if lower.starts_with("sha256:")
-        || (hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
-    {
-        format!("sha256:{}", hex.to_ascii_lowercase())
-    } else {
-        trimmed.to_string()
-    }
 }
 
 impl DeploymentService {
@@ -134,7 +118,10 @@ impl DeploymentService {
                     FROM built
                     WHERE NULLIF(image_tag, '') IS NOT NULL
                       AND image_tag NOT LIKE '%/%'
-                    ORDER BY image_tag, id DESC
+                    -- A local multi-platform build lists its primary tag
+                    -- again among the platforms, without an ID: keep the
+                    -- row that recorded one.
+                    ORDER BY image_tag, id DESC, (image_id IS NULL)
                 ) latest
                 ORDER BY id DESC
                 LIMIT $3
@@ -166,7 +153,7 @@ impl DeploymentService {
         // one query shared with the orphan sweep.
         let mut candidates: Vec<String> = Vec::with_capacity(images.len() * 3);
         for image in &images {
-            candidates.push(image.reference.clone());
+            candidates.extend(image_references::tag_spellings(&image.reference));
             if let Some(id) = &image.image_id {
                 candidates.extend(image_references::image_id_spellings(id));
             }
@@ -427,9 +414,11 @@ mod tests {
         ];
         // Another project deploys app-1 by tag, and produced app-2's image
         // (same ID, its own tag) from an identical build.
+        // Another project deploys app-1 by its bare name, and its identical
+        // build recorded app-2's image ID without the `sha256:` prefix.
         let shared = HashSet::from([
-            "app-1:latest".to_string(),
-            ID.trim_start_matches("sha256:").to_uppercase(),
+            "app-1".to_string(),
+            ID.trim_start_matches("sha256:").to_string(),
         ]);
         let (keep, kept_shared) = partition_shared(images, &shared);
         assert_eq!(keep, vec![image("app-3:latest", Some("sha256:cd"))]);
@@ -796,6 +785,34 @@ mod tests {
         )
         .insert(db.as_ref())
         .await?;
+        // A local multi-platform build: the primary tag is listed again
+        // among the platforms, and no per-platform IDs are recorded. The
+        // primary must keep its recorded ID.
+        let local = deployments::ActiveModel {
+            project_id: Set(doomed.id),
+            environment_id: Set(doomed_env.id),
+            slug: Set("multi-arch-2".to_string()),
+            state: Set("deployed".to_string()),
+            metadata: Set(Some(deployments::DeploymentMetadata::default())),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        insert_build(
+            local.id,
+            serde_json::json!({
+                "image_tag": "multi-arch-2:latest",
+                "image_id": "sha256:ee",
+                "image_tags_by_platform": {
+                    "linux/amd64": "multi-arch-2:latest",
+                    "linux/arm64": "multi-arch-2:latest-arm64"
+                }
+            }),
+        )
+        .insert(db.as_ref())
+        .await?;
         // Another project's identical build produced the riscv64 image.
         let other_deployment = record_build(
             db.as_ref(),
@@ -825,6 +842,8 @@ mod tests {
             vec![
                 image("multi-arch-1:latest", Some("sha256:aa")),
                 image("multi-arch-1:latest-arm64", Some("sha256:bb")),
+                image("multi-arch-2:latest", Some("sha256:ee")),
+                image("multi-arch-2:latest-arm64", None),
             ]
         );
         assert_eq!(plan.shared, vec!["multi-arch-1:latest-riscv64".to_string()]);

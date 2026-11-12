@@ -2418,7 +2418,10 @@ impl BuildImageJob {
             }
 
             let build_request = BuildRequest {
-                labels: self.build_config.image_labels.clone(),
+                labels: temps_docker_housekeeping::services::image_ownership::labels_for_tag(
+                    &self.build_config.image_labels,
+                    &tag,
+                ),
                 build_secrets: build_secrets.clone(),
                 cache_from: self.build_config.cache_from.clone(),
                 image_name: tag.clone(),
@@ -2791,7 +2794,10 @@ impl BuildImageJob {
         .await?;
         let request = temps_deployer::BuildRequestWithCallback {
             request: BuildRequest {
-                labels: self.build_config.image_labels.clone(),
+                labels: temps_docker_housekeeping::services::image_ownership::labels_for_tag(
+                    &self.build_config.image_labels,
+                    &tag,
+                ),
                 build_secrets: Default::default(),
                 cache_from: self.build_config.cache_from.clone(),
                 image_name: tag.clone(),
