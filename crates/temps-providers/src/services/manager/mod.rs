@@ -13,6 +13,7 @@ mod cluster_provisioning;
 mod crud;
 mod env_vars;
 mod health;
+mod healthcheck;
 mod import;
 mod lifecycle;
 mod managed_s3;
@@ -26,6 +27,10 @@ mod server_tls;
 mod stats_poll;
 mod wal_health;
 
+pub use healthcheck::{
+    service_overrides, HealthcheckApplied, HealthcheckCapability, ServiceHealthcheck,
+    ServiceHealthcheckUpdate,
+};
 pub(super) use server_tls::ServiceTlsLocks;
 pub use stats_poll::{
     cpu_utilization_percent, ContainerStatsBaseline, CpuLimit, PolledContainerStats,

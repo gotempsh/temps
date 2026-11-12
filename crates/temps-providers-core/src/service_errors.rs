@@ -387,6 +387,31 @@ pub enum ExternalServiceError {
         requested: usize,
         max: u16,
     },
+    /// A healthcheck override (of a service, or the instance default when
+    /// `service_id` is `None`) is out of bounds or does not combine.
+    #[error("Invalid healthcheck for {target}: {source}", target = healthcheck_target(*service_id))]
+    InvalidHealthcheck {
+        service_id: Option<i32>,
+        #[source]
+        source: crate::healthcheck::HealthcheckValidationError,
+    },
+    /// The service's container has no healthcheck Temps builds (a cluster,
+    /// an imported container, an engine without one), or Temps cannot
+    /// recreate it from here to apply one (a worker database).
+    #[error("Cannot {operation} of service {service_id} ('{name}'): {reason}")]
+    HealthcheckUnsupported {
+        service_id: i32,
+        name: String,
+        operation: &'static str,
+        reason: String,
+    },
+}
+
+fn healthcheck_target(service_id: Option<i32>) -> String {
+    match service_id {
+        Some(id) => format!("service {id}"),
+        None => "the instance default".to_string(),
+    }
 }
 
 impl From<ServiceIdentityReservationError> for ExternalServiceError {
@@ -539,6 +564,8 @@ pub fn worker_node_required(error: &ExternalServiceError) -> Option<Problem> {
         | E::ControlPlaneMemberUnreachable { .. }
         | E::ClusterPortsUnavailable { .. }
         | E::ClusterMemberLimitExceeded { .. }
+        | E::InvalidHealthcheck { .. }
+        | E::HealthcheckUnsupported { .. }
         | E::ClusterMemberProvisioning { .. }
         | E::ClusterNotSettled { .. }
         | E::ClusterBusy { .. }

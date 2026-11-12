@@ -49,6 +49,11 @@ fn target_all_expansion_excludes_destination_backing_service() {
             workload_mode: Default::default(),
             log_ingest_lines_per_sec: None,
             log_ingest_kib_per_sec: None,
+            healthcheck_interval_secs: None,
+            healthcheck_start_interval_secs: None,
+            healthcheck_start_period_secs: None,
+            healthcheck_timeout_secs: None,
+            healthcheck_retries: None,
         }
     }
 
@@ -1205,6 +1210,11 @@ async fn integration_attach_list_detach_round_trip() {
         workload_mode: Default::default(),
         log_ingest_lines_per_sec: Set(None),
         log_ingest_kib_per_sec: Set(None),
+        healthcheck_interval_secs: Set(None),
+        healthcheck_start_interval_secs: Set(None),
+        healthcheck_start_period_secs: Set(None),
+        healthcheck_timeout_secs: Set(None),
+        healthcheck_retries: Set(None),
         created_at: Set(chrono::Utc::now()),
         updated_at: Set(chrono::Utc::now()),
     };
@@ -1397,6 +1407,11 @@ async fn integration_flip_to_all_clears_membership() {
         workload_mode: Default::default(),
         log_ingest_lines_per_sec: Set(None),
         log_ingest_kib_per_sec: Set(None),
+        healthcheck_interval_secs: Set(None),
+        healthcheck_start_interval_secs: Set(None),
+        healthcheck_start_period_secs: Set(None),
+        healthcheck_timeout_secs: Set(None),
+        healthcheck_retries: Set(None),
         created_at: Set(chrono::Utc::now()),
         updated_at: Set(chrono::Utc::now()),
     }

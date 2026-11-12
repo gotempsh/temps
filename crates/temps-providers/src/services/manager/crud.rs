@@ -1164,6 +1164,8 @@ impl ExternalServiceManager {
             })
             .await
             .map_err(ExternalServiceError::from)?;
+        // A later service that reuses the name must not inherit these.
+        temps_providers_core::healthcheck::registry::clear_service(service_id);
 
         // Stop the per-cluster role reconciler before dropping its records,
         // otherwise a tick mid-deletion could re-write what we just removed.

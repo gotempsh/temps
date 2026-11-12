@@ -1599,6 +1599,11 @@ mod tests {
             metrics_enabled: Set(true),
             default_backup_provisioned: Set(false),
             log_ingest_kib_per_sec: Set(Some(0)),
+            healthcheck_interval_secs: Set(None),
+            healthcheck_start_interval_secs: Set(None),
+            healthcheck_start_period_secs: Set(None),
+            healthcheck_timeout_secs: Set(None),
+            healthcheck_retries: Set(None),
             ..Default::default()
         }
         .insert(conn.as_ref())

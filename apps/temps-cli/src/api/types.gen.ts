@@ -2274,6 +2274,13 @@ export type AppSettings = {
      */
     loopback_ja4_header?: string | null;
     /**
+     * Instance-wide defaults for the Docker healthcheck of managed service
+     * containers. Owned by `PUT /external-services/healthcheck-defaults`,
+     * which validates and audits them; the generic settings update
+     * preserves the stored value. Unset values use Temps' built-in timings.
+     */
+    managed_service_healthchecks?: ManagedServiceHealthcheckSettings;
+    /**
      * MCP server settings (ADR-039). Off by default — enable via the Settings
      * UI to expose the MCP endpoint to the Temps CLI wizard.
      */
@@ -2823,6 +2830,18 @@ export type ApplyRequest = {
      * The plan this acts on, from `POST …/reachability/plan`.
      */
     plan_id: string;
+};
+
+/**
+ * After `apply`: the container was recreated with these timings.
+ */
+export type ApplyServiceHealthcheckResponse = {
+    applied: HealthcheckTimings;
+    /**
+     * The service's healthcheck as it is now.
+     */
+    healthcheck: ServiceHealthcheck;
+    service_id: number;
 };
 
 export type ApproveSandboxService = {
@@ -13131,6 +13150,21 @@ export type EndpointDto = {
 };
 
 /**
+ * What a service of one engine inherits.
+ */
+export type EngineHealthcheckDefault = {
+    /**
+     * Temps' own timings for the engine.
+     */
+    builtin: HealthcheckTimings;
+    /**
+     * What a service without overrides gets, and where each value comes from.
+     */
+    effective: ResolvedHealthcheck;
+    engine: ManagedEngine;
+};
+
+/**
  * A single job that was successfully enqueued during a fan-out run.
  */
 export type EnqueuedJob = {
@@ -17197,6 +17231,112 @@ export type HealthSummary = {
     uptime_pct: number;
 };
 
+/**
+ * Whether Temps can give this service's container a healthcheck, and
+ * whether it can recreate it from here to apply one now.
+ */
+export type HealthcheckCapability = {
+    /**
+     * Why not, when `can_apply_now` is false.
+     */
+    apply_now_reason?: string | null;
+    /**
+     * Temps can recreate the container from here to apply the settings.
+     */
+    can_apply_now: boolean;
+    /**
+     * The container has a Docker healthcheck Temps builds, so overrides
+     * apply to it.
+     */
+    configurable: boolean;
+    /**
+     * Why not, when `configurable` is false.
+     */
+    reason?: string | null;
+};
+
+/**
+ * The instance default and what it gives each engine.
+ */
+export type HealthcheckDefaults = {
+    engines: Array<EngineHealthcheckDefault>;
+    /**
+     * The instance default (null = the engine's built-in value).
+     */
+    overrides: HealthcheckOverrides;
+};
+
+/**
+ * Overrides of some or all of the five healthcheck values. `None` inherits.
+ */
+export type HealthcheckOverrides = {
+    /**
+     * Seconds between checks once healthy (5–3600).
+     */
+    interval_secs?: number | null;
+    /**
+     * Consecutive failures that make the container unhealthy (1–10).
+     */
+    retries?: number | null;
+    /**
+     * Seconds between checks while starting (1–60).
+     */
+    start_interval_secs?: number | null;
+    /**
+     * Seconds after start during which failures do not count (0–600).
+     */
+    start_period_secs?: number | null;
+    /**
+     * Seconds one check may run (1–60, and shorter than the interval).
+     */
+    timeout_secs?: number | null;
+};
+
+/**
+ * Where an effective healthcheck value comes from.
+ */
+export type HealthcheckSource = 'builtin' | 'instance_default' | 'service';
+
+/**
+ * The source of each of the five values.
+ */
+export type HealthcheckSources = {
+    interval_secs: HealthcheckSource;
+    retries: HealthcheckSource;
+    start_interval_secs: HealthcheckSource;
+    start_period_secs: HealthcheckSource;
+    timeout_secs: HealthcheckSource;
+};
+
+/**
+ * The five numbers of a Docker healthcheck, in whole seconds (retries is a
+ * count).
+ */
+export type HealthcheckTimings = {
+    /**
+     * Seconds between checks once the container is healthy.
+     */
+    interval_secs: number;
+    /**
+     * Consecutive failed checks that make the container unhealthy.
+     */
+    retries: number;
+    /**
+     * Seconds between checks while the container is starting, within
+     * `start_period_secs`.
+     */
+    start_interval_secs: number;
+    /**
+     * Seconds after start during which failed checks do not count and
+     * checks run every `start_interval_secs`.
+     */
+    start_period_secs: number;
+    /**
+     * Seconds one check may run before it counts as failed.
+     */
+    timeout_secs: number;
+};
+
 export type HeartbeatApiRequest = {
     /**
      * Container platform of this node's Docker daemon (`linux/amd64`,
@@ -20013,6 +20153,11 @@ export type ManagedDomainResponse = {
     zone_id?: string | null;
 };
 
+/**
+ * Engines whose containers Temps manages and may need to replace.
+ */
+export type ManagedEngine = 'postgres' | 'redis' | 'mariadb' | 'mongodb' | 'rustfs' | 'minio';
+
 export type ManagedEnvironmentVariable = {
     description: string;
     is_secret: boolean;
@@ -20026,6 +20171,36 @@ export type ManagedEnvironmentVariable = {
 };
 
 export type ManagedEnvironmentVariableSource = 'error_tracking' | 'open_telemetry' | 'temps';
+
+/**
+ * Instance-wide defaults for the Docker healthcheck every managed database
+ * and storage container is created with. `None` inherits Temps' built-in
+ * value for the engine; a service can override each value again. Bounds and
+ * validation live with the healthcheck builder
+ * (`temps_providers_core::healthcheck`).
+ */
+export type ManagedServiceHealthcheckSettings = {
+    /**
+     * Seconds between checks once a container is healthy.
+     */
+    interval_secs?: number | null;
+    /**
+     * Consecutive failed checks that make a container unhealthy.
+     */
+    retries?: number | null;
+    /**
+     * Seconds between checks while a container is starting.
+     */
+    start_interval_secs?: number | null;
+    /**
+     * Seconds after start during which failed checks do not count.
+     */
+    start_period_secs?: number | null;
+    /**
+     * Seconds one check may run before it counts as failed.
+     */
+    timeout_secs?: number | null;
+};
 
 /**
  * A manual action the user must perform outside of the automated migration
@@ -27915,6 +28090,14 @@ export type ResolvedEnvVarSource = {
 };
 
 /**
+ * The values a container would be created with, and where each comes from.
+ */
+export type ResolvedHealthcheck = {
+    sources: HealthcheckSources;
+    timings: HealthcheckTimings;
+};
+
+/**
  * Where a stale deployment runs: the control plane or a worker.
  */
 export type ResolverCoverageHost = {
@@ -30594,6 +30777,35 @@ export type ServiceHealthStatusEntryResponse = {
      * been probed yet.
      */
     status?: string | null;
+};
+
+/**
+ * A service's healthcheck as the console shows it.
+ */
+export type ServiceHealthcheck = {
+    capability: HealthcheckCapability;
+    effective?: ResolvedHealthcheck | null;
+    engine?: ManagedEngine | null;
+    inherited?: ResolvedHealthcheck | null;
+    /**
+     * This service's own overrides (null = inherit).
+     */
+    overrides: HealthcheckOverrides;
+    /**
+     * The running container differs from `effective` (as this host's
+     * Docker would store it) until it is recreated.
+     */
+    pending_recreate: boolean;
+    running?: HealthcheckTimings | null;
+    service_id: number;
+    service_name: string;
+    service_type: string;
+    /**
+     * `false`: this host's Docker ignores the start interval, so the
+     * steady-state interval stays at the start interval. Absent when not
+     * known yet.
+     */
+    start_interval_supported?: boolean | null;
 };
 
 /**
@@ -38532,6 +38744,13 @@ export type AppSettingsWritable = {
      * Set through [`normalize_loopback_ja4_header`].
      */
     loopback_ja4_header?: string | null;
+    /**
+     * Instance-wide defaults for the Docker healthcheck of managed service
+     * containers. Owned by `PUT /external-services/healthcheck-defaults`,
+     * which validates and audits them; the generic settings update
+     * preserves the stored value. Unset values use Temps' built-in timings.
+     */
+    managed_service_healthchecks?: ManagedServiceHealthcheckSettings;
     /**
      * MCP server settings (ADR-039). Off by default — enable via the Settings
      * UI to expose the MCP endpoint to the Temps CLI wizard.
@@ -53212,6 +53431,76 @@ export type ListServiceHealthStatusesResponses = {
 
 export type ListServiceHealthStatusesResponse = ListServiceHealthStatusesResponses[keyof ListServiceHealthStatusesResponses];
 
+export type GetHealthcheckDefaultsData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/external-services/healthcheck-defaults';
+};
+
+export type GetHealthcheckDefaultsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetHealthcheckDefaultsError = GetHealthcheckDefaultsErrors[keyof GetHealthcheckDefaultsErrors];
+
+export type GetHealthcheckDefaultsResponses = {
+    /**
+     * The instance default
+     */
+    200: HealthcheckDefaults;
+};
+
+export type GetHealthcheckDefaultsResponse = GetHealthcheckDefaultsResponses[keyof GetHealthcheckDefaultsResponses];
+
+export type UpdateHealthcheckDefaultsData = {
+    body: HealthcheckOverrides;
+    path?: never;
+    query?: never;
+    url: '/external-services/healthcheck-defaults';
+};
+
+export type UpdateHealthcheckDefaultsErrors = {
+    /**
+     * A value is out of range or the timeout is not shorter than the interval
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type UpdateHealthcheckDefaultsError = UpdateHealthcheckDefaultsErrors[keyof UpdateHealthcheckDefaultsErrors];
+
+export type UpdateHealthcheckDefaultsResponses = {
+    /**
+     * Saved
+     */
+    200: HealthcheckDefaults;
+};
+
+export type UpdateHealthcheckDefaultsResponse = UpdateHealthcheckDefaultsResponses[keyof UpdateHealthcheckDefaultsResponses];
+
 export type ImportExternalServiceData = {
     body: ImportExternalServiceRequest;
     path?: never;
@@ -53997,6 +54286,144 @@ export type GetServiceHealthStatusResponses = {
 };
 
 export type GetServiceHealthStatusResponse = GetServiceHealthStatusResponses[keyof GetServiceHealthStatusResponses];
+
+export type GetServiceHealthcheckData = {
+    body?: never;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/healthcheck';
+};
+
+export type GetServiceHealthcheckErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Service not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetServiceHealthcheckError = GetServiceHealthcheckErrors[keyof GetServiceHealthcheckErrors];
+
+export type GetServiceHealthcheckResponses = {
+    /**
+     * The service's healthcheck
+     */
+    200: ServiceHealthcheck;
+};
+
+export type GetServiceHealthcheckResponse = GetServiceHealthcheckResponses[keyof GetServiceHealthcheckResponses];
+
+export type UpdateServiceHealthcheckData = {
+    body: HealthcheckOverrides;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/healthcheck';
+};
+
+export type UpdateServiceHealthcheckErrors = {
+    /**
+     * A value is out of range or the timeout is not shorter than the interval
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Service not found
+     */
+    404: ProblemDetails;
+    /**
+     * The service's container has no healthcheck Temps builds
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type UpdateServiceHealthcheckError = UpdateServiceHealthcheckErrors[keyof UpdateServiceHealthcheckErrors];
+
+export type UpdateServiceHealthcheckResponses = {
+    /**
+     * Saved; applies when the container is recreated
+     */
+    200: ServiceHealthcheck;
+};
+
+export type UpdateServiceHealthcheckResponse = UpdateServiceHealthcheckResponses[keyof UpdateServiceHealthcheckResponses];
+
+export type ApplyServiceHealthcheckData = {
+    body?: never;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/healthcheck/apply';
+};
+
+export type ApplyServiceHealthcheckErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Service not found
+     */
+    404: ProblemDetails;
+    /**
+     * Temps cannot recreate this container from here, or the recreate was refused to protect its data
+     */
+    409: ProblemDetails;
+    /**
+     * The recreate failed; the original container was kept
+     */
+    500: ProblemDetails;
+};
+
+export type ApplyServiceHealthcheckError = ApplyServiceHealthcheckErrors[keyof ApplyServiceHealthcheckErrors];
+
+export type ApplyServiceHealthcheckResponses = {
+    /**
+     * The container was recreated
+     */
+    200: ApplyServiceHealthcheckResponse;
+};
+
+export type ApplyServiceHealthcheckResponse2 = ApplyServiceHealthcheckResponses[keyof ApplyServiceHealthcheckResponses];
 
 export type GetServiceLogIngestionData = {
     body?: never;

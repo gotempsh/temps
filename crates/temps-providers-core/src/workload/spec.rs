@@ -165,10 +165,10 @@ impl DatabaseEngine {
     /// The engine's healthcheck, as §13 probes: readiness is the check,
     /// startup the grace period. The timings are the ones every managed
     /// container of this engine gets (`crate::healthcheck`).
-    pub fn probes(self, env: &BTreeMap<String, String>, container_name: &str) -> Probes {
+    pub fn probes(self, env: &BTreeMap<String, String>, service_id: i32) -> Probes {
         crate::healthcheck::managed_probes(
             self.managed_engine(),
-            container_name,
+            service_id,
             self.healthcheck_script(env),
         )
     }
@@ -693,7 +693,7 @@ pub fn database_workload_spec(
             app_protocol: Default::default(),
         }],
         network: Default::default(),
-        probes: identity.engine.probes(&probe_env, &identity.container_name),
+        probes: identity.engine.probes(&probe_env, identity.service_id),
         placement: PlacementSpec {
             // Node 0 is the control plane, as in the node list.
             nodes: Some(vec![identity.node_id.unwrap_or(0)]),
@@ -1290,7 +1290,8 @@ mod tests {
                 ("POSTGRES_USER".to_string(), "app".to_string()),
                 ("POSTGRES_DB".to_string(), "shop".to_string()),
             ]),
-            "postgres-shop",
+            // No override is registered for this id.
+            -1,
         );
         let health = temps_workload_docker::data::healthcheck(&probes).unwrap();
         assert_eq!(
@@ -1307,7 +1308,7 @@ mod tests {
         // Without POSTGRES_DB the image's database is the user's.
         let probes = DatabaseEngine::Postgres.probes(
             &BTreeMap::from([("POSTGRES_USER".to_string(), "app".to_string())]),
-            "postgres-app",
+            -1,
         );
         let health = temps_workload_docker::data::healthcheck(&probes).unwrap();
         assert_eq!(

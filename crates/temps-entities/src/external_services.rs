@@ -103,6 +103,16 @@ pub struct Model {
     pub log_ingest_lines_per_sec: Option<i32>,
     /// As `log_ingest_lines_per_sec`, in KiB per second.
     pub log_ingest_kib_per_sec: Option<i32>,
+    /// Docker healthcheck overrides for this service's container, in seconds
+    /// (`healthcheck_retries` is a count). NULL inherits the instance default
+    /// (`AppSettings.managed_service_healthchecks`), then Temps' built-in
+    /// value. Applied when the container is next created or recreated. Added
+    /// by `m20261112_000001_add_external_services_healthcheck_overrides`.
+    pub healthcheck_interval_secs: Option<i32>,
+    pub healthcheck_start_interval_secs: Option<i32>,
+    pub healthcheck_start_period_secs: Option<i32>,
+    pub healthcheck_timeout_secs: Option<i32>,
+    pub healthcheck_retries: Option<i32>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

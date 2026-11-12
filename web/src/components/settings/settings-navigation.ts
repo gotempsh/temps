@@ -13,6 +13,7 @@ import {
   Gauge,
   Globe,
   HardDrive,
+  HeartPulse,
   Key,
   KeyRound,
   LockKeyhole,
@@ -108,6 +109,17 @@ export const settingsNavigationGroups: SettingsNavigationGroup[] = [
         title: 'Request timeouts',
         url: '/settings/request-timeouts',
         icon: Clock,
+      },
+      {
+        title: 'Service health checks',
+        url: '/settings/service-healthchecks',
+        icon: HeartPulse,
+        keywords: [
+          'healthcheck',
+          'docker healthcheck',
+          'health check interval',
+          'database health',
+        ],
       },
       {
         title: 'DNS',

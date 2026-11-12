@@ -31,6 +31,7 @@ import { MonitoringCard } from '@/components/storage/MonitoringCard'
 import { EditServiceDialog } from '@/components/storage/EditServiceDialog'
 import { ServiceResourcesPanel } from '@/components/storage/ServiceResourcesPanel'
 import { ServiceTlsCard } from '@/components/storage/ServiceTlsCard'
+import { ServiceHealthcheckCard } from '@/components/storage/ServiceHealthcheckCard'
 import { ResponsivePagination } from '@/components/ui/responsive-pagination'
 import { MajorUpgradeDialog } from '@/components/storage/MajorUpgradeDialog'
 import {
@@ -1320,6 +1321,12 @@ export function ServiceDetail() {
 
             {/* Resources: container runtime, live CPU/mem, applied limits */}
             <ServiceResourcesPanel
+              serviceId={service.service.id}
+              serviceName={service.service.name}
+            />
+
+            {/* The container's Docker healthcheck and its overrides */}
+            <ServiceHealthcheckCard
               serviceId={service.service.id}
               serviceName={service.service.name}
             />

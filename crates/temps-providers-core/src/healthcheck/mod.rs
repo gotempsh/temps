@@ -22,6 +22,12 @@
 //! checks at the steady-state interval; there the steady-state interval falls
 //! back to the startup one (see [`effective_timings`]). The daemon's API
 //! version is asked once per process and cached.
+//!
+//! An operator can override any of the five values for the whole instance
+//! and per service ([`overrides`]); the engines read the overrides from
+//! [`registry`] when they create a container. Docker cannot change a
+//! running container's healthcheck, so an override reaches a container when
+//! it is next created or recreated.
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -34,6 +40,14 @@ use tracing::{debug, warn};
 use utoipa::ToSchema;
 
 use crate::externalsvc::recreate_guard::ManagedEngine;
+
+mod overrides;
+pub mod registry;
+
+pub use overrides::{
+    resolve, HealthcheckField, HealthcheckOverrides, HealthcheckSource, HealthcheckSources,
+    HealthcheckValidationError, ResolvedHealthcheck,
+};
 
 const NANOS_PER_SEC: i64 = 1_000_000_000;
 
@@ -270,9 +284,32 @@ where
     }
 }
 
-/// The timings a new `engine` container named `container_name` gets.
-pub fn resolved_timings(engine: ManagedEngine, _container_name: &str) -> HealthcheckTimings {
-    HealthcheckTimings::builtin(engine)
+/// Resolve `service` over the instance default and `engine`'s built-in.
+///
+/// A combination that does not validate (the instance default changed under
+/// a service override, so its timeout is no longer shorter than its
+/// interval) falls back to the built-in timings rather than creating a
+/// container whose checks overlap.
+pub fn resolve_for(engine: ManagedEngine, service: &HealthcheckOverrides) -> ResolvedHealthcheck {
+    let builtin = HealthcheckTimings::builtin(engine);
+    let resolved = resolve(service, &registry::instance_default(), &builtin);
+    match resolved.validate() {
+        Ok(()) => resolved,
+        Err(error) => {
+            warn!(
+                %engine,
+                %error,
+                "Managed service healthcheck overrides do not combine; using the built-in timings"
+            );
+            resolve(&Default::default(), &Default::default(), &builtin)
+        }
+    }
+}
+
+/// The timings a new control-plane `engine` container named
+/// `container_name` gets.
+pub fn resolved_timings(engine: ManagedEngine, container_name: &str) -> HealthcheckTimings {
+    resolve_for(engine, &registry::for_container(container_name)).timings
 }
 
 /// The healthcheck an engine puts in its own create request for
@@ -297,15 +334,14 @@ pub async fn managed_health_config(
     health_config(script, &timings)
 }
 
-/// The workload-spec probes of a database `engine` container named
-/// `container_name`. The daemon adjustment happens where the container is
-/// created ([`probes_for_daemon`]), on the host that creates it.
-pub fn managed_probes(
-    engine: ManagedEngine,
-    container_name: &str,
-    script: impl Into<String>,
-) -> Probes {
-    probes(script, &resolved_timings(engine, container_name))
+/// The workload-spec probes of a database `engine` container of service
+/// `service_id`, wherever it runs. The daemon adjustment happens where the
+/// container is created ([`probes_for_daemon`]), on the host that creates it.
+pub fn managed_probes(engine: ManagedEngine, service_id: i32, script: impl Into<String>) -> Probes {
+    probes(
+        script,
+        &resolve_for(engine, &registry::for_service(service_id)).timings,
+    )
 }
 
 #[cfg(test)]
@@ -438,6 +474,50 @@ mod tests {
         assert_eq!(readiness.timeout_secs, timings.timeout_secs);
         assert_eq!(readiness.failure_threshold, timings.retries);
         assert!(probes.liveness.is_none());
+    }
+
+    #[test]
+    fn a_service_override_reaches_its_container_and_its_workload_probes() {
+        // Ids and names no other test uses (the table is process-wide).
+        registry::set_service(registry::ServiceHealthcheckEntry {
+            service_id: 8_201,
+            container_name: Some("postgres-healthcheck-resolve".into()),
+            overrides: HealthcheckOverrides {
+                interval_secs: Some(60),
+                ..Default::default()
+            },
+        });
+        let timings = resolved_timings(ManagedEngine::Postgres, "postgres-healthcheck-resolve");
+        assert_eq!(timings.interval_secs, 60);
+        assert_eq!(timings.start_interval_secs, 2);
+        assert_eq!(
+            resolved_timings(ManagedEngine::Postgres, "postgres-healthcheck-other"),
+            HealthcheckTimings::builtin(ManagedEngine::Postgres)
+        );
+        let probes = managed_probes(ManagedEngine::Postgres, 8_201, "pg_isready");
+        assert_eq!(probes.readiness.map(|p| p.period_secs), Some(60));
+        registry::clear_service(8_201);
+        assert_eq!(
+            resolved_timings(ManagedEngine::Postgres, "postgres-healthcheck-resolve"),
+            HealthcheckTimings::builtin(ManagedEngine::Postgres)
+        );
+    }
+
+    #[test]
+    fn overrides_that_no_longer_combine_fall_back_to_the_builtin() {
+        let resolved = resolve_for(
+            ManagedEngine::Redis,
+            &HealthcheckOverrides {
+                interval_secs: Some(10),
+                timeout_secs: Some(20),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            resolved.timings,
+            HealthcheckTimings::builtin(ManagedEngine::Redis)
+        );
+        assert_eq!(resolved.sources.interval_secs, HealthcheckSource::Builtin);
     }
 
     #[tokio::test]

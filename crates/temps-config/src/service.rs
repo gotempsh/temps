@@ -1823,6 +1823,10 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         // from an older snapshot must not rename a running service's container.
         settings.kv = locked_settings.kv.clone();
         settings.blob = locked_settings.blob.clone();
+        // The managed-service healthcheck defaults are owned by
+        // `update_managed_service_healthcheck_settings`, whose handler
+        // validates and audits them.
+        settings.managed_service_healthchecks = locked_settings.managed_service_healthchecks;
         // Shield's platform settings are owned by `update_shield_settings`
         // (`PUT /settings/shield`), which audits each change.
         settings.shield = locked_settings.shield.clone();
@@ -2244,6 +2248,20 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         F: FnOnce(&mut BlobSettings),
     {
         self.update_settings_section("blob", update_fn).await
+    }
+
+    /// Change the managed-service healthcheck defaults under the settings-row
+    /// lock and return them as saved. Generic settings saves restore this
+    /// section from the locked row, so this is its only write path.
+    pub async fn update_managed_service_healthcheck_settings<F>(
+        &self,
+        update_fn: F,
+    ) -> Result<crate::ManagedServiceHealthcheckSettings, ConfigServiceError>
+    where
+        F: FnOnce(&mut crate::ManagedServiceHealthcheckSettings),
+    {
+        self.update_settings_section("managed_service_healthchecks", update_fn)
+            .await
     }
 
     /// Change the OTLP ingest settings under the settings-row lock and return
@@ -4977,6 +4995,50 @@ mod tests {
             .iter()
             .flat_map(|transaction| transaction.statements())
             .all(|statement| !statement.to_string().starts_with("UPDATE ")));
+    }
+
+    #[tokio::test]
+    async fn healthcheck_defaults_change_only_through_their_own_write_path() {
+        let database = match temps_test_utils::TestDatabase::with_migrations().await {
+            Ok(database) => database,
+            Err(error)
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+            {
+                eprintln!("Skipping healthcheck settings test: Docker unavailable: {error}");
+                return;
+            }
+            Err(error) => panic!("healthcheck settings test database failed: {error}"),
+        };
+        let service = ConfigService::new(test_config(), database.db.clone());
+        let stale_bulk_document = service.get_settings().await.expect("initial settings");
+        assert_eq!(
+            stale_bulk_document.managed_service_healthchecks,
+            crate::ManagedServiceHealthcheckSettings::default(),
+            "nothing is overridden by default"
+        );
+
+        let saved = service
+            .update_managed_service_healthcheck_settings(|h| {
+                h.interval_secs = Some(60);
+                h.retries = Some(4);
+            })
+            .await
+            .expect("save the healthcheck defaults");
+        assert_eq!(saved.interval_secs, Some(60));
+
+        // A settings-page save from before the change neither reverts the
+        // section nor, when it sets the section itself, changes it.
+        let mut rewrite = stale_bulk_document;
+        rewrite.managed_service_healthchecks.interval_secs = Some(5);
+        service
+            .update_settings(rewrite)
+            .await
+            .expect("bulk save that sets the healthcheck section");
+        let stored = service
+            .get_settings()
+            .await
+            .expect("settings after the saves");
+        assert_eq!(stored.managed_service_healthchecks, saved);
     }
 
     #[tokio::test]

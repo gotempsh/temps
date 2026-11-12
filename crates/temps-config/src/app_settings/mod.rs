@@ -171,6 +171,13 @@ pub struct AppSettings {
     /// stored value.
     pub blob: BlobSettings,
 
+    /// Instance-wide defaults for the Docker healthcheck of managed service
+    /// containers. Owned by `PUT /external-services/healthcheck-defaults`,
+    /// which validates and audits them; the generic settings update
+    /// preserves the stored value. Unset values use Temps' built-in timings.
+    #[serde(default)]
+    pub managed_service_healthchecks: ManagedServiceHealthcheckSettings,
+
     // On-demand (lazy) HTTP-01 TLS issuance settings (ADR-018). On for new
     // installations (see `AppSettings::default`); a stored row that predates the
     // section stays off via `legacy_on_demand_tls_settings`, so an upgrade never
@@ -1793,6 +1800,28 @@ pub struct BlobSettings {
     pub container_name: String,
 }
 
+/// Instance-wide defaults for the Docker healthcheck every managed database
+/// and storage container is created with. `None` inherits Temps' built-in
+/// value for the engine; a service can override each value again. Bounds and
+/// validation live with the healthcheck builder
+/// (`temps_providers_core::healthcheck`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct ManagedServiceHealthcheckSettings {
+    /// Seconds between checks once a container is healthy.
+    #[schema(example = 60)]
+    pub interval_secs: Option<u32>,
+    /// Seconds between checks while a container is starting.
+    #[schema(example = 2)]
+    pub start_interval_secs: Option<u32>,
+    /// Seconds after start during which failed checks do not count.
+    pub start_period_secs: Option<u32>,
+    /// Seconds one check may run before it counts as failed.
+    pub timeout_secs: Option<u32>,
+    /// Consecutive failed checks that make a container unhealthy.
+    pub retries: Option<u32>,
+}
+
 /// On-demand (lazy) HTTP-01 TLS issuance settings (ADR-018).
 ///
 /// When `enabled`, the proxy's `certificate_callback` triggers ACME HTTP-01
@@ -2501,6 +2530,7 @@ impl Default for AppSettings {
             preview_gateway: PreviewGatewaySettings::default(),
             kv: KvSettings::default(),
             blob: BlobSettings::default(),
+            managed_service_healthchecks: ManagedServiceHealthcheckSettings::default(),
             // New installations opt in: stable environment URLs not covered by
             // a wildcard certificate are ordered over HTTP-01 without any setup
             // step. It still does nothing until a public zone can be derived and
