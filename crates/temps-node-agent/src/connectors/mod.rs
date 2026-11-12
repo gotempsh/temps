@@ -15,6 +15,7 @@
 //! container drivers forward to the loopback tunnel origin listener, which
 //! trusts the provider's client-address header from loopback only.
 
+pub mod child;
 pub mod process;
 pub mod sync;
 pub mod wire;
