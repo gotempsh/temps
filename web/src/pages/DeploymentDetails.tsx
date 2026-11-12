@@ -9,7 +9,6 @@ import {
   getDeploymentOptions,
   getFailureReportPreviewOptions,
   getDeploymentJobsOptions,
-  getSettingsOptions,
   pauseDeploymentMutation,
   resumeDeploymentMutation,
   rollbackToDeploymentMutation,
@@ -71,6 +70,7 @@ import GithubIcon from '@/icons/Github'
 import { useAssistantPageContext } from '@/components/ai/AiAssistantContext'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { useScreenshotsEnabled } from '@/hooks/useScreenshotsEnabled'
 import { writeToClipboard } from '@/lib/clipboard'
 import { formatMicrocores } from '@/lib/cpu-format'
 import {
@@ -104,7 +104,6 @@ import { useEffect, useState, type ReactNode } from 'react'
 import { Link, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
 import { announceOperation } from '@/components/operations/operations-tray-store'
-import { ReachableAfterDeploy } from '@/components/reachability/ReachableAfterDeploy'
 import { ReachabilityWarningBanner } from '@/components/reachability/ReachabilityWarningBanner'
 
 type BadgeVariant =
@@ -1130,13 +1129,8 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
     },
   })
 
-  // Fetch platform settings to check if screenshots are enabled
-  const { data: settings } = useQuery({
-    ...getSettingsOptions(),
-    retry: false,
-  })
-
-  const screenshotsEnabled = settings?.screenshots?.enabled ?? false
+  // Whether the platform captures screenshots; off for roles that can't read it
+  const screenshotsEnabled = useScreenshotsEnabled()
 
   const createDeployment = useMutation({
     ...triggerProjectPipelineMutation(),
@@ -1576,20 +1570,8 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
 
         <ReachabilityWarningBanner
           warning={deployment.reachability_warning}
+          projectId={project.id}
           projectSlug={project.slug}
-        />
-
-        <ReachableAfterDeploy
-          enabled={
-            deployment.status === 'completed' &&
-            project.hosting !== 'external' &&
-            project.source_type !== 'external' &&
-            // ADR 068 D5 already says it, with its fixes.
-            !deployment.reachability_warning
-          }
-          projectId={deployment.project_id}
-          projectSlug={project.slug}
-          environmentId={deployment.environment_id}
         />
 
         {isComposeProject(project) && (

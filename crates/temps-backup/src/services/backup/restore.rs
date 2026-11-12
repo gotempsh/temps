@@ -1137,6 +1137,7 @@ mod tests {
             force_path_style: Some(true),
             is_default: None,
             backing_service_id: None,
+            worker_credentials: None,
         };
 
         let s3_source = source_backup_service
@@ -1206,6 +1207,7 @@ mod tests {
             force_path_style: Some(true),
             is_default: None,
             backing_service_id: None,
+            worker_credentials: None,
         };
 
         let target_s3_source = target_backup_service

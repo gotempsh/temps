@@ -3,6 +3,7 @@
 
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
+import { DiscordHelpLink } from '@/components/support/DiscordHelpLink'
 import {
   Card,
   CardContent,
@@ -111,6 +112,9 @@ export function ErrorFallback({
               Back to dashboard
             </Button>
           </div>
+          <p className="text-sm text-muted-foreground">
+            Need help with Temps? <DiscordHelpLink />
+          </p>
         </CardContent>
       </Card>
     </div>

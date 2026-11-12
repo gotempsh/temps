@@ -101,6 +101,16 @@ impl NodeService {
     ) -> Result<Option<mesh::PublishedControlPlane>, MeshError> {
         mesh::published_control_plane(self.db.as_ref()).await
     }
+
+    /// The cluster network settings row (the VXLAN network ID and port a
+    /// joining node checks its host against, ADR 062), if it exists yet.
+    pub async fn cluster_network_config(
+        &self,
+    ) -> Result<Option<temps_entities::network_config::Model>, NodeError> {
+        Ok(temps_entities::network_config::Entity::find_by_id(1)
+            .one(self.db.as_ref())
+            .await?)
+    }
 }
 
 #[cfg(test)]
@@ -183,5 +193,59 @@ mod tests {
         ));
 
         service.allocate_overlay_cidr(7).await;
+    }
+
+    // ADR 062: plane-identity reads the cluster's VXLAN settings through
+    // the service; a database error reaches the caller as one, typed.
+    #[tokio::test]
+    async fn the_cluster_network_config_is_read_from_its_singleton_row() {
+        let row = temps_entities::network_config::Model {
+            id: 1,
+            compute_pool_cidr: "10.202.0.0/16".into(),
+            subnet_prefix_len: 24,
+            transport: "vxlan".into(),
+            vxlan_vni: 70_001,
+            vxlan_port: 4789,
+            underlay_mtu: 1500,
+            control_plane_compute_cidr: None,
+            control_plane_underlay_address: None,
+            control_plane_overlay_ready: false,
+            control_plane_setup_generation: 0,
+            wireguard_enabled: false,
+            wireguard_cidr: "10.201.0.0/16".into(),
+            wireguard_port: 51820,
+            control_plane_wg_public_key: None,
+            control_plane_wg_endpoint: None,
+            node_api_port: None,
+            mesh_hub_node_id: None,
+            mesh_hub_control_plane: false,
+            compute_pool_confirmed_at: None,
+            docker_network_name: "temps0".into(),
+            updated_at: chrono::Utc::now(),
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![row]])
+                .into_connection(),
+        );
+        let service = NodeService::new(db.clone());
+        let read = service.cluster_network_config().await.unwrap();
+        assert_eq!(read.map(|config| config.vxlan_vni), Some(70_001));
+        drop(service);
+        let log = statements(db);
+        assert!(
+            log.contains("network_config") && log.contains("$1"),
+            "{log}"
+        );
+
+        let failing = NodeService::new(Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_errors([DbErr::Custom("connection lost".to_string())])
+                .into_connection(),
+        ));
+        assert!(matches!(
+            failing.cluster_network_config().await,
+            Err(NodeError::Database(_))
+        ));
     }
 }

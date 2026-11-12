@@ -29,6 +29,9 @@ use crate::handlers::audit::{
     NodeArchitectureChangedAudit, NodePublicIngressChangedAudit, NodeRemovalAudit,
 };
 use crate::handlers::types::NodeAdminState;
+use crate::services::cluster_dns::{
+    InternalProxyState, InternalRedirectState, InternalRoutingMode,
+};
 pub use crate::services::edge_routes::{EdgeCertBundle, EdgeCertificates, EdgeRouteEntry};
 use crate::services::edge_routes::{EdgeRouteError, EdgeRouteService};
 use crate::services::node_service::{
@@ -368,6 +371,11 @@ pub struct HeartbeatApiRequest {
     /// when the set changes. Absent from older agents.
     #[serde(default)]
     pub overlay_addresses: Option<Vec<OverlayAddressReport>>,
+    /// The VXLAN network ID this node's overlay follows (ADR 062): that of
+    /// the last peer list it acted on. Absent from older agents, which run
+    /// every overlay on 42.
+    #[serde(default)]
+    pub overlay_vxlan_vni: Option<u32>,
 }
 
 /// One running container's overlay address, from a heartbeat.
@@ -401,6 +409,20 @@ where
             })
             .collect()
     }))
+}
+
+/// A reported network ID outside VXLAN's 24 bits is dropped (and logged),
+/// not stored: it is what the change gate reads.
+fn reported_vxlan_vni(node_id: i32, reported: Option<u32>) -> Option<u32> {
+    let vni = reported?;
+    if vni == 0 || vni > temps_network::MAX_VXLAN_VNI {
+        warn!(
+            node_id,
+            vni, "ignoring an out-of-range overlay VXLAN network ID"
+        );
+        return None;
+    }
+    Some(vni)
 }
 
 #[derive(Debug, Clone, Deserialize, ToSchema)]
@@ -649,18 +671,6 @@ pub struct EdgeRoutesResponse {
     pub certificates: Option<EdgeCertificates>,
 }
 
-/// S3 credentials distributed to agents for backup/restore operations.
-#[derive(Serialize, Deserialize, ToSchema)]
-pub struct S3CredentialsResponse {
-    pub access_key_id: String,
-    pub secret_key: String,
-    pub region: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub endpoint: Option<String>,
-    pub bucket_name: String,
-    pub force_path_style: bool,
-}
-
 /// Per-node DNS resolver health, as last reported by that node's heartbeat.
 /// Part of `GET /api/cluster/dns/status`.
 #[derive(Serialize, Deserialize, ToSchema)]
@@ -684,6 +694,34 @@ pub struct NodeDnsStatusEntry {
     pub dns_resolver_consecutive_failures: i32,
     pub dns_resolver_last_error: Option<String>,
     pub dns_resolver_record_count: Option<i32>,
+    /// Whether containers' calls to port 80 of the node's bridge address,
+    /// where every `<env>.<project>.temps.local` name points, are served.
+    /// The resolver can be healthy while this is `false`: the names resolve
+    /// and every call fails. `None` = not reported (older agent, or no
+    /// overlay bridge yet).
+    pub internal_proxy_listening: Option<bool>,
+    /// What containers call, e.g. `10.205.0.1:80`.
+    pub internal_proxy_address: Option<String>,
+    /// Why the calls are not served, written for the operator; `None` while
+    /// they are.
+    pub internal_proxy_error: Option<String>,
+    /// How the calls are served (ADR-098): `redirect` to the proxy's own
+    /// port, the `direct` fallback on port 80, or `down`. `None` from an
+    /// older agent.
+    pub internal_proxy_mode: Option<InternalRoutingMode>,
+    /// The proxy's own listener, e.g. `10.205.0.1:591`, while the agent
+    /// holds it.
+    pub internal_proxy_listen_address: Option<String>,
+    /// Whether the port-80 redirect is in place; `None` from an older agent.
+    pub internal_proxy_redirect: Option<InternalRedirectState>,
+    /// Why the redirect is missing, also while the fallback serves.
+    pub internal_proxy_redirect_error: Option<String>,
+}
+
+/// The internal routing state from a heartbeat's `capacity.internal_proxy`;
+/// every field `None` when the agent never reported it.
+fn internal_proxy_from_capacity(capacity: &serde_json::Value) -> InternalProxyState {
+    crate::services::cluster_dns::internal_proxy_state(capacity)
 }
 
 /// An internal DNS name two owners publish (ADR-055 §10). The holder's
@@ -757,7 +795,6 @@ pub struct ClusterDnsStatusResponse {
         mesh_enroll,
         plane_identity,
         node_heartbeat,
-        get_s3_credentials,
         crate::handlers::network::list_peers,
         crate::handlers::network::register_mesh,
         crate::handlers::network::report_mesh_handshakes,
@@ -779,6 +816,7 @@ pub struct ClusterDnsStatusResponse {
         crate::handlers::wireguard_mesh::set_wireguard_mesh_hub,
         crate::handlers::cluster_network::get_cluster_network,
         crate::handlers::cluster_network::update_cluster_network,
+        crate::handlers::cluster_network::change_cluster_network_id,
         crate::handlers::node_pairings::create_node_pairing,
         crate::handlers::node_pairings::list_node_pairings,
         crate::handlers::node_pairings::cancel_node_pairing,
@@ -797,11 +835,11 @@ pub struct ClusterDnsStatusResponse {
         HeartbeatApiRequest,
         HeartbeatResponse,
         DnsResolverHeartbeat,
-        S3CredentialsResponse,
         crate::handlers::network::PeerEntry,
         crate::handlers::network::AllocEntry,
         crate::handlers::network::PeerListResponse,
         crate::handlers::network::WireguardMeshEntry,
+        crate::handlers::network::VxlanEntry,
         crate::handlers::network::WireguardMeshSelfEntry,
         crate::handlers::network::WireguardMeshPeerEntry,
         crate::handlers::network::RegisterWireguardMeshRequest,
@@ -817,6 +855,8 @@ pub struct ClusterDnsStatusResponse {
         NodePlacementReference,
         DrainStatusResponse,
         NodeDnsStatusEntry,
+        InternalRoutingMode,
+        InternalRedirectState,
         DnsNameConflictEntry,
         ClusterDnsStatusResponse,
         crate::services::DeploymentWithoutResolver,
@@ -841,6 +881,8 @@ pub struct ClusterDnsStatusResponse {
         crate::handlers::cluster_network::ClusterNetworkReassignment,
         crate::handlers::cluster_network::ClusterNetworkChangeResponse,
         crate::handlers::cluster_network::UpdateClusterNetworkRequest,
+        crate::handlers::cluster_network::ClusterNetworkIdChangeResponse,
+        crate::services::cluster_network::NetworkIdChange,
         OccupiedRangeReport,
         OverlayAddressReport,
         OverlayHeartbeat,
@@ -884,10 +926,6 @@ pub fn configure_routes() -> Router<Arc<NodeAppState>> {
         // it sends the join token (ADR 060).
         .route("/internal/nodes/plane-identity", get(plane_identity))
         .route("/internal/nodes/{node_id}/heartbeat", post(node_heartbeat))
-        .route(
-            "/internal/nodes/{node_id}/s3-credentials/{s3_source_id}",
-            get(get_s3_credentials),
-        )
         .route(
             "/internal/nodes/{node_id}/network/peers",
             get(crate::handlers::network::list_peers),
@@ -956,6 +994,27 @@ pub fn configure_admin_routes() -> Router<Arc<NodeAdminState>> {
         )
         .route("/internal/edge/nodes", get(list_edge_nodes))
         .route("/cluster/dns/status", get(cluster_dns_status))
+        // ADR-095: the Settings → DNS page.
+        .route(
+            "/cluster/dns/resolvers",
+            get(crate::handlers::cluster_dns::list_dns_resolvers),
+        )
+        .route(
+            "/cluster/dns/records",
+            get(crate::handlers::cluster_dns::list_dns_records),
+        )
+        .route(
+            "/cluster/dns/queries",
+            get(crate::handlers::cluster_dns::list_dns_queries),
+        )
+        .route(
+            "/cluster/dns/traffic",
+            get(crate::handlers::cluster_dns::dns_traffic),
+        )
+        .route(
+            "/cluster/dns/resolve",
+            post(crate::handlers::cluster_dns::resolve_dns_name),
+        )
         // Literal segment, so it can never be shadowed by the `{node_id}`
         // routes below it.
         .route("/nodes/capability", get(node_capability))
@@ -972,6 +1031,10 @@ pub fn configure_admin_routes() -> Router<Arc<NodeAdminState>> {
             "/settings/cluster-network",
             get(crate::handlers::cluster_network::get_cluster_network)
                 .put(crate::handlers::cluster_network::update_cluster_network),
+        )
+        .route(
+            "/settings/cluster-network/network-id",
+            post(crate::handlers::cluster_network::change_cluster_network_id),
         )
         .route(
             "/nodes/pairings",
@@ -2262,6 +2325,14 @@ pub struct PlaneIdentityResponse {
     /// The control plane's WireGuard mesh public key. `None` while the mesh
     /// is off or not up yet.
     pub control_plane_wg_public_key: Option<String>,
+    /// The cluster's VXLAN network ID (ADR 062), so a join can warn before
+    /// spending its token when a device on the host already holds it. Not
+    /// secret: it is in every overlay packet. `None` from an older plane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vxlan_vni: Option<u32>,
+    /// The cluster's VXLAN UDP port, with `vxlan_vni`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vxlan_port: Option<u16>,
 }
 
 /// Identify this control plane to a joining worker (ADR 060)
@@ -2329,9 +2400,25 @@ async fn plane_identity(
                     ));
             }
         };
+    // Best-effort: the join only uses it for a warning.
+    let vxlan = match app_state.node_service.cluster_network_config().await {
+        Ok(row) => row.and_then(|config| {
+            crate::handlers::network::VxlanEntry::from_config(&config)
+                .map_err(
+                    |reason| warn!(%reason, "invalid cluster VXLAN settings for plane-identity"),
+                )
+                .ok()
+        }),
+        Err(error) => {
+            warn!(%error, "could not read the cluster VXLAN settings for plane-identity");
+            None
+        }
+    };
     Ok(Json(PlaneIdentityResponse {
         ca_fingerprint,
         control_plane_wg_public_key,
+        vxlan_vni: vxlan.map(|entry| entry.vni),
+        vxlan_port: vxlan.map(|entry| entry.port),
     }))
 }
 
@@ -2534,6 +2621,7 @@ async fn node_heartbeat(
             .occupied_ranges
             .map(|reports| occupied_ranges_from_report(Some(node_id), reports)),
         deployments_without_resolver: request.deployments_without_resolver,
+        overlay_vxlan_vni: reported_vxlan_vni(node_id, request.overlay_vxlan_vni),
     };
 
     let architecture_change = app_state
@@ -2713,128 +2801,6 @@ async fn ingest_instance_reports(
             false
         }
     }
-}
-
-/// Get decrypted S3 credentials for a backup/restore operation.
-///
-/// Agents call this endpoint to receive the S3 credentials they need to upload
-/// or download backups. The credentials are decrypted from the stored S3 source
-/// and returned over the authenticated TLS/WireGuard channel.
-#[utoipa::path(
-    tag = "Nodes",
-    get,
-    path = "/internal/nodes/{node_id}/s3-credentials/{s3_source_id}",
-    params(
-        ("node_id" = i32, Path, description = "Node ID"),
-        ("s3_source_id" = i32, Path, description = "S3 source ID")
-    ),
-    responses(
-        (status = 200, description = "S3 credentials", body = S3CredentialsResponse),
-        (status = 401, description = "Unauthorized"),
-        (status = 404, description = "S3 source not found"),
-        (status = 500, description = "Internal server error")
-    )
-)]
-async fn get_s3_credentials(
-    State(app_state): State<Arc<NodeAppState>>,
-    headers: HeaderMap,
-    Path((node_id, s3_source_id)): Path<(i32, i32)>,
-) -> Result<impl IntoResponse, Problem> {
-    // Verify the node's token
-    let token = extract_bearer_token(&headers)?;
-    let node = app_state
-        .node_service
-        .get_by_id(node_id)
-        .await
-        .map_err(Problem::from)?;
-
-    let token_hash = sha256_hex(&token);
-    if !constant_time_eq(node.token_hash.as_bytes(), token_hash.as_bytes()) {
-        warn!(node_id, "Invalid token for S3 credentials request");
-        return Err(problemdetails::new(StatusCode::UNAUTHORIZED)
-            .with_title("Invalid Token")
-            .with_detail(format!("Invalid authentication token for node {}", node_id)));
-    }
-
-    // Authorization (ADR-020 WS-4.1 / analyst-1): a valid node token only proves
-    // *which* node is calling — it does NOT entitle that node to every tenant's
-    // S3 credentials. Only hand back a source the node legitimately needs: one
-    // used by a backup of a service hosted on this node. Otherwise a single
-    // compromised worker could enumerate s3_source_id and exfiltrate all keys.
-    if !app_state
-        .node_service
-        .is_authorized_for_s3_source(node_id, s3_source_id)
-        .await
-        .map_err(Problem::from)?
-    {
-        warn!(
-            node_id,
-            s3_source_id,
-            "Node not authorized for S3 source (no backup of a service hosted on this node uses it)"
-        );
-        return Err(problemdetails::new(StatusCode::FORBIDDEN)
-            .with_title("Forbidden")
-            .with_detail(format!(
-                "Node {} is not authorized for S3 source {}",
-                node_id, s3_source_id
-            )));
-    }
-
-    // Look up the S3 source
-    let s3_source = app_state
-        .node_service
-        .s3_source(s3_source_id)
-        .await
-        .map_err(|e| match e {
-            NodeError::Database(e) => {
-                error!("Failed to look up S3 source {}: {}", s3_source_id, e);
-                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                    .with_title("Database Error")
-                    .with_detail(format!("Failed to look up S3 source: {}", e))
-            }
-            other => Problem::from(other),
-        })?;
-
-    // Decrypt credentials
-    let access_key_id = app_state
-        .encryption_service
-        .decrypt_string(&s3_source.access_key_id)
-        .map_err(|e| {
-            error!(
-                "Failed to decrypt access key for S3 source {}: {}",
-                s3_source_id, e
-            );
-            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Decryption Error")
-                .with_detail("Failed to decrypt S3 credentials")
-        })?;
-
-    let secret_key = app_state
-        .encryption_service
-        .decrypt_string(&s3_source.secret_key)
-        .map_err(|e| {
-            error!(
-                "Failed to decrypt secret key for S3 source {}: {}",
-                s3_source_id, e
-            );
-            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Decryption Error")
-                .with_detail("Failed to decrypt S3 credentials")
-        })?;
-
-    info!(
-        "Distributed S3 credentials for source {} to node {} ({})",
-        s3_source_id, node_id, node.name
-    );
-
-    Ok(Json(S3CredentialsResponse {
-        access_key_id,
-        secret_key,
-        region: s3_source.region,
-        endpoint: s3_source.endpoint,
-        bucket_name: s3_source.bucket_name,
-        force_path_style: s3_source.force_path_style.unwrap_or(true),
-    }))
 }
 
 /// Return the route table for edge CDN nodes.
@@ -3300,17 +3266,29 @@ async fn cluster_dns_status(
     let now = chrono::Utc::now();
     let node_entries = nodes
         .into_iter()
-        .map(|n| NodeDnsStatusEntry {
-            node_id: n.id,
-            node_name: n.name,
-            node_status: n.status,
-            dns_resolver_running: n.dns_resolver_running,
-            dns_resolver_tasks_alive: n.dns_resolver_tasks_alive,
-            dns_resolver_last_sync_at: n.dns_resolver_last_sync_at.map(|t| t.to_rfc3339()),
-            seconds_since_last_sync: n.dns_resolver_last_sync_at.map(|t| (now - t).num_seconds()),
-            dns_resolver_consecutive_failures: n.dns_resolver_consecutive_failures,
-            dns_resolver_last_error: n.dns_resolver_last_error,
-            dns_resolver_record_count: n.dns_resolver_record_count,
+        .map(|n| {
+            let proxy = internal_proxy_from_capacity(&n.capacity);
+            NodeDnsStatusEntry {
+                node_id: n.id,
+                node_name: n.name,
+                node_status: n.status,
+                dns_resolver_running: n.dns_resolver_running,
+                dns_resolver_tasks_alive: n.dns_resolver_tasks_alive,
+                dns_resolver_last_sync_at: n.dns_resolver_last_sync_at.map(|t| t.to_rfc3339()),
+                seconds_since_last_sync: n
+                    .dns_resolver_last_sync_at
+                    .map(|t| (now - t).num_seconds()),
+                dns_resolver_consecutive_failures: n.dns_resolver_consecutive_failures,
+                dns_resolver_last_error: n.dns_resolver_last_error,
+                dns_resolver_record_count: n.dns_resolver_record_count,
+                internal_proxy_listening: proxy.listening,
+                internal_proxy_address: proxy.address,
+                internal_proxy_error: proxy.error,
+                internal_proxy_mode: proxy.mode,
+                internal_proxy_listen_address: proxy.proxy_address,
+                internal_proxy_redirect: proxy.redirect,
+                internal_proxy_redirect_error: proxy.redirect_error,
+            }
         })
         .collect();
 
@@ -4434,11 +4412,6 @@ impl From<EdgeRouteError> for Problem {
 impl From<NodeError> for Problem {
     fn from(error: NodeError) -> Self {
         match error {
-            NodeError::S3SourceNotFound { s3_source_id } => {
-                problemdetails::new(StatusCode::NOT_FOUND)
-                    .with_title("S3 Source Not Found")
-                    .with_detail(format!("S3 source {} not found", s3_source_id))
-            }
             NodeError::OnlyPlacementTarget {
                 node_id,
                 ref node_name,
@@ -4662,12 +4635,86 @@ mod join_telemetry_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_reported_network_id_outside_24_bits_is_dropped() {
+        assert_eq!(super::reported_vxlan_vni(1, None), None);
+        assert_eq!(super::reported_vxlan_vni(1, Some(0)), None);
+        assert_eq!(super::reported_vxlan_vni(1, Some(16_777_216)), None);
+        assert_eq!(super::reported_vxlan_vni(1, Some(42)), Some(42));
+        assert_eq!(
+            super::reported_vxlan_vni(1, Some(16_777_215)),
+            Some(16_777_215)
+        );
+    }
+
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
     use sea_orm::{DatabaseBackend, EntityTrait, MockDatabase};
     use temps_entities::{deployment_containers, nodes};
     use tower::ServiceExt;
+
+    #[test]
+    fn internal_proxy_state_is_read_from_the_heartbeat_capacity() {
+        let held = serde_json::json!({
+            "cpu_cores": 44,
+            "internal_proxy": {
+                "address": "10.205.0.1:80",
+                "listening": false,
+                "error": "another program already listens on 10.205.0.1:80",
+                "attempts": 7,
+            },
+        });
+        let proxy = internal_proxy_from_capacity(&held);
+        assert_eq!(
+            (proxy.listening, proxy.address, proxy.error, proxy.mode),
+            (
+                Some(false),
+                Some("10.205.0.1:80".to_string()),
+                Some("another program already listens on 10.205.0.1:80".to_string()),
+                None,
+            )
+        );
+
+        let serving = serde_json::json!({
+            "internal_proxy": {"address": "10.205.0.1:80", "listening": true, "error": null},
+        });
+        let proxy = internal_proxy_from_capacity(&serving);
+        assert_eq!(
+            (proxy.listening, proxy.address, proxy.error),
+            (Some(true), Some("10.205.0.1:80".to_string()), None)
+        );
+
+        // An ADR-098 agent serving through the fallback says why.
+        let fallback = serde_json::json!({
+            "internal_proxy": {
+                "address": "10.205.0.1:80",
+                "listening": true,
+                "mode": "direct",
+                "proxy_address": "10.205.0.1:591",
+                "redirect": "missing",
+                "redirect_error": "nft (nftables) is not installed on this worker",
+            },
+        });
+        let proxy = internal_proxy_from_capacity(&fallback);
+        assert_eq!(proxy.mode, Some(InternalRoutingMode::Direct));
+        assert_eq!(proxy.redirect, Some(InternalRedirectState::Missing));
+        assert_eq!(proxy.proxy_address.as_deref(), Some("10.205.0.1:591"));
+        assert!(proxy.redirect_error.unwrap().contains("nftables"));
+
+        // An agent from before this field, or a malformed value: unknown,
+        // never "not listening".
+        for unknown in [
+            serde_json::json!({"cpu_cores": 2}),
+            serde_json::json!({"internal_proxy": "yes"}),
+            serde_json::Value::Null,
+        ] {
+            assert_eq!(
+                internal_proxy_from_capacity(&unknown),
+                InternalProxyState::default()
+            );
+        }
+    }
 
     // ── Removing containers a node removal would lose track of ──────────
 
@@ -5186,6 +5233,7 @@ mod tests {
             overlay_ready_cidr: None,
             overlay_remediation: None,
             overlay_network_name: None,
+            overlay_vxlan_vni: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
@@ -6243,15 +6291,6 @@ mod tests {
             body.get("certificates").is_none(),
             "a worker receives no certificates: {body}"
         );
-    }
-
-    #[test]
-    fn a_missing_s3_source_is_a_404_naming_the_id() {
-        let problem = Problem::from(NodeError::S3SourceNotFound { s3_source_id: 12 });
-        assert_eq!(problem.status_code, StatusCode::NOT_FOUND);
-        let body = serde_json::to_value(&problem.body).unwrap();
-        assert_eq!(body["title"], "S3 Source Not Found");
-        assert_eq!(body["detail"], "S3 source 12 not found");
     }
 
     #[test]

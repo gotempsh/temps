@@ -812,6 +812,13 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     "list_email_domain_projects",
     // Cluster and platform
     "cluster_dns_status",
+    // Internal DNS observability (ADR-095), SettingsRead: each node's
+    // resolver health, the records it serves, the query log and traffic.
+    // Names, addresses and counts only, no credential.
+    "list_dns_resolvers",
+    "list_dns_records",
+    "list_dns_queries",
+    "dns_traffic",
     "NodeCapabilityGet",
     "NodeDockerDiskUsageGet",
     "admin_list_nodes",
@@ -842,6 +849,10 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     "admin_get_node_resources",
     "admin_list_environment_volumes",
     "get_effective_policy",
+    // Which projects may call a project's internal addresses (ADR 101):
+    // project and environment ids, names and a description, no credential.
+    // ProjectsRead on the project, narrowed to it.
+    "list_internal_access_grants",
     "get_ingress_settings",
     "get_rule",
     "get_workload_mode",
@@ -1304,6 +1315,10 @@ pub const AI_READ_SAFE_POSTS: &[&str] = &[
     // created or stored; the token is a `SecretString`, so the assistant
     // passes it through a secret slot.
     "check_cloudflare_token",
+    // Read-only POST: one test lookup of a *.temps.local name from one
+    // node's resolver (ADR-095), SettingsRead. It stores nothing; the body
+    // is a POST only because it names the node, the name and the type.
+    "resolve_dns_name",
 ];
 
 /// [`AI_READ_SAFE_POSTS`] as owned strings, the shape [`crate::InternalApiCaller`] takes.

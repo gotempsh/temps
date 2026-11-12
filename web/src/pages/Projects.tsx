@@ -42,11 +42,13 @@ import { CreateProjectGroupDialog } from '@/components/project-groups/CreateProj
 import { ProjectGroupCard } from '@/components/project-groups/ProjectGroupCard'
 import { projectListItems } from '@/components/project-groups/project-list-items'
 import { useProjectGroups } from '@/components/project-groups/useProjectGroups'
+import { groupServiceLive } from '@/components/project-groups/group-service-live'
 import type { ProjectGroupResponse, ProjectResponse } from '@/api/client'
 import {
   PROJECT_PAGE_SIZE_OPTIONS,
   projectPageCount,
   readProjectPagination,
+  showsProjectPagination,
   withProjectPagination,
   withProjectSearch,
 } from '@/lib/project-list-pagination'
@@ -234,9 +236,20 @@ export function Projects() {
     }
   }, [])
 
+  // Services inside the projects on this page are read in the same batches,
+  // so a project card shows each service's health and traffic too.
+  const shownGroupMembers = useMemo(
+    () =>
+      grouped && page === 1 ? visibleGroups.flatMap((g) => g.projects) : [],
+    [grouped, page, visibleGroups]
+  )
+
   const projectIds = useMemo(
-    () => standaloneProjects.map((project) => project.id),
-    [standaloneProjects]
+    () => [
+      ...standaloneProjects.map((project) => project.id),
+      ...shownGroupMembers.map((service) => service.id),
+    ],
+    [standaloneProjects, shownGroupMembers]
   )
 
   const dashboardAnalytics = useDashboardAnalytics(
@@ -247,11 +260,15 @@ export function Projects() {
 
   // External (telemetry-only) projects have no deployments to report on.
   const hostedProjectIds = useMemo(
-    () =>
-      standaloneProjects
+    () => [
+      ...standaloneProjects
         .filter((project) => project.source_type !== 'external')
         .map((project) => project.id),
-    [standaloneProjects]
+      ...shownGroupMembers
+        .filter((service) => service.source_type !== 'external')
+        .map((service) => service.id),
+    ],
+    [standaloneProjects, shownGroupMembers]
   )
   const dashboardHealth = useDashboardHealth(
     hostedProjectIds,
@@ -262,6 +279,29 @@ export function Projects() {
   // traffic-derived health cannot. See project-card-health.ts.
   const monitorHealth = useProjectsMonitorHealth(projectIds)
   const latestDeploymentMedia = useLatestDeploymentMedia(hostedProjectIds)
+
+  const groupLive = useMemo(() => {
+    const sources = {
+      analytics: dashboardAnalytics.data?.projects,
+      health: dashboardHealth.data?.projects,
+      monitors: monitorHealth.data?.projects,
+      healthLoading: dashboardHealth.isLoading,
+      healthError: dashboardHealth.isError,
+    }
+    return Object.fromEntries(
+      shownGroupMembers.map((service) => [
+        service.id,
+        groupServiceLive(service.id, sources),
+      ])
+    )
+  }, [
+    shownGroupMembers,
+    dashboardAnalytics.data?.projects,
+    dashboardHealth.data?.projects,
+    dashboardHealth.isLoading,
+    dashboardHealth.isError,
+    monitorHealth.data?.projects,
+  ])
 
   const renderProjectCard = (project: ProjectResponse) => (
     <ProjectCard
@@ -296,6 +336,7 @@ export function Projects() {
   })
 
   const isLoading = groupsQuery.isLoading || servicesLoading || isPageOutOfRange
+  const firstProject = !isLoading && !isError && isEmptyInstall
 
   return (
     <PageContainer
@@ -304,18 +345,23 @@ export function Projects() {
     >
       {/* Header */}
       <ProjectsHeader
-        firstProject={!isLoading && !isError && isEmptyInstall}
+        firstProject={firstProject}
         actions={
           <>
             {serviceTotal > 0 && <PlatformStrip />}
-            <Button
-              variant="outline"
-              className="max-sm:flex-1"
-              onClick={() => setCreatingGroup(true)}
-            >
-              <Boxes className="size-4" />
-              New project
-            </Button>
+            {/* A project groups services, so on an install with none there
+                is nothing to put in one yet; the page below is about the
+                first service. */}
+            {!firstProject && (
+              <Button
+                variant="outline"
+                className="max-sm:flex-1"
+                onClick={() => setCreatingGroup(true)}
+              >
+                <Boxes className="size-4" />
+                New project
+              </Button>
+            )}
             <CreateActionButton
               to="/projects/new"
               label="Create service"
@@ -439,7 +485,11 @@ export function Projects() {
           <div className={PROJECT_GRID_CLASS}>
             {listItems.map((item) =>
               item.kind === 'group' ? (
-                <ProjectGroupCard key={item.key} group={item.group} />
+                <ProjectGroupCard
+                  key={item.key}
+                  group={item.group}
+                  live={groupLive}
+                />
               ) : (
                 renderProjectCard(item.project)
               )
@@ -449,20 +499,22 @@ export function Projects() {
       )}
 
       {/* Pagination of the services listed on their own. */}
-      {projectsData && standaloneTotal > 0 && !isPageOutOfRange && (
-        <ResponsivePagination
-          page={page}
-          pageSize={pageSize}
-          total={standaloneTotal}
-          totalPages={totalPages}
-          pageSizeOptions={PROJECT_PAGE_SIZE_OPTIONS}
-          ariaLabel="Service list pagination"
-          pageSizeAriaLabel="Services per page"
-          className="pt-2"
-          onPageChange={(nextPage) => setPagination(nextPage)}
-          onPageSizeChange={(nextPageSize) => setPagination(1, nextPageSize)}
-        />
-      )}
+      {projectsData &&
+        showsProjectPagination(standaloneTotal, page) &&
+        !isPageOutOfRange && (
+          <ResponsivePagination
+            page={page}
+            pageSize={pageSize}
+            total={standaloneTotal}
+            totalPages={totalPages}
+            pageSizeOptions={PROJECT_PAGE_SIZE_OPTIONS}
+            ariaLabel="Service list pagination"
+            pageSizeAriaLabel="Services per page"
+            className="pt-2"
+            onPageChange={(nextPage) => setPagination(nextPage)}
+            onPageSizeChange={(nextPageSize) => setPagination(1, nextPageSize)}
+          />
+        )}
     </PageContainer>
   )
 }

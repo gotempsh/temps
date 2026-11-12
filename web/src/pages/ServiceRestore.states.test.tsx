@@ -10,6 +10,7 @@ import { BreadcrumbProvider } from '@/contexts/BreadcrumbContext'
 import { ServiceRestore } from './ServiceRestore'
 import {
   restoreCapabilitiesQuery,
+  restoreOwnBackupsQuery,
   restoreRunQuery,
   restoreServiceQuery,
   restoreSourcesQuery,
@@ -29,6 +30,7 @@ interface PageSeeds {
   service?: Seed
   capabilities?: Seed
   sources?: Seed
+  ownBackups?: Seed
   runs?: Seed
   run?: {
     id: number
@@ -126,6 +128,7 @@ function renderPage(seeds: PageSeeds = {}) {
     restoreSourcesQuery().queryKey,
     seeds.sources ?? { data: sourceData }
   )
+  seed(client, restoreOwnBackupsQuery(SERVICE_ID).queryKey, seeds.ownBackups)
   seed(
     client,
     serviceRestoreRunsQuery(SERVICE_ID).queryKey,
@@ -213,12 +216,61 @@ describe('capability and source errors (#1238)', () => {
   })
 
   test('a failed source list is an error with Retry, never "no sources"', () => {
-    for (const status of [403, 404, 500, undefined]) {
+    for (const status of [404, 500, undefined]) {
       const markup = renderPage({ sources: { error: problem(status) } })
       expect(markup).toContain('Could not load storage sources')
       expect(markup).toContain('Retry')
       expect(markup).not.toContain('No storage sources yet')
     }
+  })
+
+  test("a refused source list falls back to the database's own backups", () => {
+    const markup = renderPage({
+      sources: { error: problem(403) },
+      ownBackups: {
+        data: {
+          page: 1,
+          page_size: 100,
+          total: 1,
+          backups: [
+            {
+              backup_id: '5b7c2f0e-0000-4000-8000-000000000001',
+              backup_type: 'full',
+              compression_type: 'gzip',
+              external_service_backup_id: 9,
+              id: 41,
+              name: 'postgres backup (orders-db)',
+              s3_location: 'backups/orders-db/41',
+              s3_source_id: 2,
+              s3_source_name: 'primary-bucket',
+              size_bytes: 2048,
+              started_at: '2026-01-01T10:00:00Z',
+              state: 'completed',
+            },
+          ],
+        },
+      },
+    })
+    // No dead end: no error card, no "ask an administrator", no retry.
+    expect(markup).not.toContain('Could not load storage sources')
+    expect(markup).not.toContain('You do not have permission to read')
+    expect(markup).toContain('Your role cannot choose a storage source.')
+    // The backup can be picked.
+    expect(markup).toContain('The postgres backups of this database.')
+    expect(markup).toContain('Restore backup from')
+    expect(markup).toContain('Tracked')
+    expect(markup).toContain('completed')
+  })
+
+  test('a refused source list with no backups of its own says so, not "ask an administrator"', () => {
+    const markup = renderPage({
+      sources: { error: problem(403) },
+      ownBackups: {
+        data: { page: 1, page_size: 100, total: 0, backups: [] },
+      },
+    })
+    expect(markup).toContain('This database has no backups yet.')
+    expect(markup).not.toContain('Could not load storage sources')
   })
 
   test('a genuinely empty source list onboards', () => {
@@ -310,6 +362,14 @@ describe('run tracking (#1237)', () => {
       'Following restore run #31, which was already in progress for this database.'
     )
     expect(markup).not.toContain('Start restore')
+  })
+
+  test('an in-place restore lets the user copy the name to type', () => {
+    const markup = renderPage({
+      url: `/storage/${SERVICE_ID}/restore?mode=in_place`,
+    })
+    expect(markup).toContain('Type the service name to confirm')
+    expect(markup).toContain('aria-label="Copy &quot;orders-db&quot;"')
   })
 
   test('no active run in history shows the restore form', () => {

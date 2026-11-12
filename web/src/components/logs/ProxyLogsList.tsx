@@ -1,17 +1,13 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { TimeRangeFilter } from '@/components/ui/time-range-filter'
-import { resolveTimeRange } from '@/lib/time-range-filter'
-
-import { ProjectResponse } from '@/api/client'
+import type { ProjectResponse, ProxyLogResponse } from '@/api/client'
 import {
   getEnvironmentsOptions,
   getProxyLogsOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { AiAgentLogo } from '@/components/ui/ai-agent-logo'
 import { Badge } from '@/components/ui/badge'
-import { httpStatusClass } from '@/lib/http-status-class'
 import { Button } from '@/components/ui/button'
 import {
   Select,
@@ -23,167 +19,171 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
-import { SortableTableHead } from '@/components/ui/sortable-table-head'
+import { TimeRangeFilter } from '@/components/ui/time-range-filter'
+import { ResponsivePagination } from '@/components/ui/responsive-pagination'
+import { httpStatusClass } from '@/lib/http-status-class'
+import { resolveTimeRange } from '@/lib/time-range-filter'
 import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from '@/components/ui/table'
+  Callout,
+  DataTable,
+  PageHeader,
+  PageState,
+  RecordLink,
+  Status,
+  fmtDuration,
+  fmtNumber,
+  useUrlState,
+  type DataTableColumn,
+  type StatusTone,
+} from '@temps-sdk/ds'
 import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import {
-  ChevronLeft,
-  ChevronRight,
+  AlertCircle,
+  ArrowDown,
+  ArrowUp,
+  ArrowUpDown,
   FileSearch,
+  RefreshCw,
   SlidersHorizontal,
   X,
 } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
-import { useSearchParams } from 'react-router'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { useLocation } from 'react-router'
+import {
+  DEFAULT_REQUEST_LOG_COLUMNS,
+  REQUEST_LOG_COLUMNS,
+  REQUEST_LOG_COLUMNS_STORAGE_KEY,
+  type RequestLogColumn,
+} from './request-log-columns'
+import { TableColumnPicker } from '@/components/table/TableColumnPicker'
+import { useTableColumns } from '@/components/table/useTableColumns'
+import {
+  captureListReturnState,
+  useListScrollRestoration,
+  type ListReturnState,
+} from '@/components/table/list-navigation'
 
 interface ProxyLogsListProps {
   project: ProjectResponse
-  onRowClick?: (requestId: string, projectId: number, timestamp: string) => void
+  listState?: ListReturnState | null
+  onRememberList?: (state: ListReturnState) => void
   showEnvironmentFilter?: boolean
 }
 
-const STATUS_BADGE_CLASSES: Record<
-  ReturnType<typeof httpStatusClass>,
-  string
-> = {
-  '1xx': 'bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200',
-  '2xx': 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200',
-  '3xx':
-    'bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200',
-  '4xx': 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200',
-  '5xx': 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200',
-  unknown:
-    'bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200',
+type SortField = 'timestamp' | 'status_code' | 'response_time_ms'
+
+const HTTP_METHODS = [
+  'GET',
+  'POST',
+  'PUT',
+  'DELETE',
+  'PATCH',
+  'HEAD',
+  'OPTIONS',
+]
+
+function positiveInteger(value: string | undefined, fallback: number) {
+  const parsed = Number(value)
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback
+}
+
+function statusTone(code: number): StatusTone {
+  const status = httpStatusClass(code)
+  return status === '2xx'
+    ? 'ok'
+    : status === '4xx'
+      ? 'warn'
+      : status === '5xx'
+        ? 'error'
+        : 'idle'
 }
 
 export default function ProxyLogsList({
   project,
-  onRowClick,
+  listState,
+  onRememberList,
   showEnvironmentFilter = true,
 }: ProxyLogsListProps) {
-  const [searchParams, setSearchParams] = useSearchParams()
-  const [page, setPage] = useState<number>(() => {
-    const pageParam = searchParams.get('page')
-    return pageParam ? parseInt(pageParam) : 1
+  const { state, patch } = useUrlState()
+  const location = useLocation()
+  const url = location.pathname + location.search
+  const container = useRef<HTMLDivElement>(null)
+  // Reuse the exact query window on return. Resolving "24h" again would change
+  // the query key, discard the cached rows and clamp the pane's scroll to zero.
+  const [saved] = useState(() => {
+    const candidate = listState
+    return candidate?.url === url ? candidate : null
   })
-  const [limit, setLimit] = useState<number>(() => {
-    const limitParam = searchParams.get('limit')
-    return limitParam ? parseInt(limitParam) : 25
-  })
-  const [sortBy, setSortBy] = useState<
-    'timestamp' | 'status_code' | 'response_time_ms'
-  >(() => {
-    const value = searchParams.get('sort_by')
-    return value === 'status_code' || value === 'response_time_ms'
-      ? value
+  const [initialNow] = useState(Date.now)
+  const [refreshedAt, setRefreshedAt] = useState<number | null>(null)
+  const page = positiveInteger(state.page, 1)
+  const requestedLimit = positiveInteger(state.limit, 25)
+  const limit = [10, 25, 50, 100].includes(requestedLimit) ? requestedLimit : 25
+  const sortBy: SortField =
+    state.sort_by === 'status_code' || state.sort_by === 'response_time_ms'
+      ? state.sort_by
       : 'timestamp'
-  })
-  const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>(() =>
-    searchParams.get('sort_order') === 'asc' ? 'asc' : 'desc'
-  )
-  const [method, setMethod] = useState<string>('all')
-  const [statusCode, setStatusCode] = useState<string>(() => {
-    const statusCode = searchParams.get('status_code')
-    return statusCode ? statusCode : 'all'
-  })
-  const [timeRange, setTimeRange] = useState<string>(() => {
-    const explicit = searchParams.get('time_range')
-    if (explicit) return explicit
-    // Drill-downs from analytics (AI agent/provider/page) default to a wider
-    // 7-day window so the crawler rows they linked to actually fall inside it —
-    // the analytics overview itself defaults to multi-day ranges.
-    const fromAnalytics =
-      searchParams.get('ai_agent') ||
-      searchParams.get('ai_provider') ||
-      searchParams.get('is_ai_agent') ||
-      searchParams.get('path')
-    return fromAnalytics ? '7d' : '24h'
-  })
-  const [environment, setEnvironment] = useState<string>(() => {
-    return searchParams.get('environment') || 'all'
-  })
-  // Default to showing all traffic: this page's whole purpose is a complete
-  // request log, and a project whose traffic is mostly programmatic API
-  // callers (not human pageloads) would otherwise silently render as near-
-  // empty, since "Hide bots" was previously the default and API/service
-  // clients are routinely bot-classified (curl, SDKs, monitoring probes).
-  const [showBots, setShowBots] = useState<string>(() => {
-    return searchParams.get('show_bots') || 'all'
-  })
-  // AI / path context, set by the analytics drill-downs (AI Agents card, AI
-  // Agents detail page, Page detail). When present we scope the table to that
-  // crawler / page and show a removable chip so the user understands why the
-  // list is filtered.
-  const [aiAgent, setAiAgent] = useState<string>(() => {
-    return searchParams.get('ai_agent') || ''
-  })
-  const [aiProvider, setAiProvider] = useState<string>(() => {
-    return searchParams.get('ai_provider') || ''
-  })
-  const [isAiAgent, setIsAiAgent] = useState<boolean>(() => {
-    return searchParams.get('is_ai_agent') === 'true'
-  })
-  const [pathFilter, setPathFilter] = useState<string>(() => {
-    return searchParams.get('path') || ''
-  })
-  // The advanced filters are collapsed by default — only the user-agent search
-  // and the results summary stay visible until the user opens them.
-  const [showFilters, setShowFilters] = useState<boolean>(() => {
-    // Auto-open if the user arrived with a non-default filter in the URL.
-    return (
-      searchParams.get('filters') === 'open' ||
-      !!searchParams.get('status_code') ||
-      (!!searchParams.get('time_range') &&
-        searchParams.get('time_range') !== '24h') ||
-      (!!searchParams.get('environment') &&
-        searchParams.get('environment') !== 'all') ||
-      (!!searchParams.get('show_bots') &&
-        searchParams.get('show_bots') !== 'no')
-    )
-  })
-
+  const sortOrder = state.sort_order === 'asc' ? 'asc' : 'desc'
+  const method = HTTP_METHODS.includes(state.method ?? '')
+    ? state.method!
+    : 'all'
+  const statusCode = /^[1-5]\d{2}$/.test(state.status_code ?? '')
+    ? state.status_code!
+    : 'all'
+  const environment = positiveInteger(state.environment, 0)
+    ? state.environment!
+    : 'all'
+  const showBots =
+    state.show_bots === 'no' || state.show_bots === 'yes'
+      ? state.show_bots
+      : 'all'
+  const aiAgent = state.ai_agent ?? ''
+  const aiProvider = state.ai_provider ?? ''
+  const isAiAgent = state.is_ai_agent === 'true'
+  const pathFilter = state.path ?? ''
   const hasAiContext = !!aiAgent || !!aiProvider || isAiAgent
+  const timeRange =
+    state.time_range || (hasAiContext || pathFilter ? '7d' : '24h')
+  const activeFilterCount = [
+    method !== 'all',
+    statusCode !== 'all',
+    environment !== 'all',
+    showBots !== 'all',
+  ].filter(Boolean).length
+  const hasFilters =
+    activeFilterCount > 0 || timeRange !== '24h' || hasAiContext || !!pathFilter
+  const showFilters =
+    state.filters === 'open' ||
+    (state.filters !== 'closed' && activeFilterCount > 0)
+  const { visibleKeys, changeColumns, resetColumns } = useTableColumns({
+    options: REQUEST_LOG_COLUMNS,
+    defaults: DEFAULT_REQUEST_LOG_COLUMNS,
+    storageKey: REQUEST_LOG_COLUMNS_STORAGE_KEY,
+  })
 
-  // Calculate date range based on selected time range
   const dateRange = useMemo(() => {
-    const window = resolveTimeRange(timeRange)
-    return { from: new Date(window.from), to: new Date(window.to) }
-  }, [timeRange])
+    if (refreshedAt === null && saved?.timeRange === timeRange) {
+      return saved.dateRange
+    }
+    const range = resolveTimeRange(timeRange, refreshedAt ?? initialNow)
+    return { from: range.from, to: range.to }
+  }, [timeRange, refreshedAt, initialNow, saved])
 
-  const { data: environmentsData } = useQuery(
-    getEnvironmentsOptions({
-      path: {
-        project_id: project.id,
-      },
-    })
+  const { data: environmentsData, isLoading: environmentsLoading } = useQuery(
+    getEnvironmentsOptions({ path: { project_id: project.id } })
   )
-
-  const { data: logs, isLoading } = useQuery(
-    getProxyLogsOptions({
+  const query = useQuery({
+    ...getProxyLogsOptions({
       query: {
-        page: page,
+        page,
         page_size: limit,
         project_id: project.id,
-        status_code:
-          statusCode && statusCode !== 'all' ? parseInt(statusCode) : undefined,
-        method: method && method !== 'all' ? method : undefined,
-        start_date: dateRange.from.toISOString(),
-        end_date: dateRange.to.toISOString(),
-        environment_id:
-          environment && environment !== 'all'
-            ? parseInt(environment)
-            : undefined,
-        // AI context implies bot traffic, so don't let the default "hide bots"
-        // suppress the very rows the user drilled into. Otherwise honour the
-        // explicit bot filter.
+        status_code: statusCode !== 'all' ? Number(statusCode) : undefined,
+        method: method !== 'all' ? method : undefined,
+        start_date: dateRange.from,
+        end_date: dateRange.to,
+        environment_id: environment !== 'all' ? Number(environment) : undefined,
         is_bot: hasAiContext
           ? undefined
           : showBots === 'no'
@@ -198,196 +198,208 @@ export default function ProxyLogsList({
         sort_by: sortBy,
         sort_order: sortOrder,
       },
-    })
-  )
-
-  // Calculate total pages
-  const totalPages = useMemo(() => {
-    if (!logs) return 0
-    return Math.ceil(logs.total / limit)
-  }, [logs, limit])
+    }),
+  })
+  const { data: logs, isLoading, error } = query
+  const totalPages = Math.max(1, Math.ceil((logs?.total ?? 0) / limit))
 
   useEffect(() => {
-    const newParams = new URLSearchParams()
+    if (query.isSuccess && page > totalPages)
+      patch({ page: totalPages === 1 ? undefined : totalPages })
+  }, [query.isSuccess, page, totalPages, patch])
 
-    if (timeRange && timeRange !== '24h') {
-      newParams.set('time_range', timeRange)
-    }
+  useListScrollRestoration(container, saved, !!logs, url)
+  const rememberList = () =>
+    onRememberList?.(
+      captureListReturnState(container.current, { url, timeRange, dateRange })
+    )
+  const changeFilter = (key: string, value: string) =>
+    patch({ [key]: value === 'all' ? undefined : value, page: undefined })
+  const handleMethodChange = (value: string) => changeFilter('method', value)
+  const handleStatusCodeChange = (value: string) =>
+    changeFilter('status_code', value)
+  const handleEnvironmentChange = (value: string) =>
+    changeFilter('environment', value)
+  const handleShowBotsChange = (value: string) =>
+    changeFilter('show_bots', value)
+  const handleTimeRangeChange = (value: string) =>
+    patch({ time_range: value, page: undefined })
+  const setPage = (value: number) =>
+    patch({ page: value > 1 ? value : undefined })
+  const setAiAgent = (value: string) => patch({ ai_agent: value })
+  const setAiProvider = (value: string) => patch({ ai_provider: value })
+  const setIsAiAgent = (value: boolean) =>
+    patch({ is_ai_agent: value ? true : undefined })
+  const setPathFilter = (value: string) => patch({ path: value })
+  const clearFilters = () =>
+    patch({
+      time_range: '24h',
+      method: undefined,
+      status_code: undefined,
+      environment: undefined,
+      show_bots: undefined,
+      ai_agent: undefined,
+      ai_provider: undefined,
+      is_ai_agent: undefined,
+      path: undefined,
+      page: undefined,
+    })
+  const handleSort = (field: SortField) =>
+    patch({
+      sort_by: field,
+      sort_order: sortBy === field && sortOrder === 'desc' ? 'asc' : 'desc',
+      page: undefined,
+    })
 
-    if (environment && environment !== 'all') {
-      newParams.set('environment', environment)
-    }
-
-    if (statusCode && statusCode !== 'all') {
-      newParams.set('status_code', statusCode)
-    }
-
-    if (showBots && showBots !== 'all') {
-      newParams.set('show_bots', showBots)
-    }
-
-    if (aiAgent) {
-      newParams.set('ai_agent', aiAgent)
-    }
-    if (aiProvider) {
-      newParams.set('ai_provider', aiProvider)
-    }
-    if (isAiAgent) {
-      newParams.set('is_ai_agent', 'true')
-    }
-    if (pathFilter) {
-      newParams.set('path', pathFilter)
-    }
-
-    if (showFilters) {
-      newParams.set('filters', 'open')
-    }
-
-    if (page > 1) {
-      newParams.set('page', page.toString())
-    }
-
-    if (limit !== 25) {
-      newParams.set('limit', limit.toString())
-    }
-
-    if (sortBy !== 'timestamp') {
-      newParams.set('sort_by', sortBy)
-    }
-    if (sortOrder !== 'desc') {
-      newParams.set('sort_order', sortOrder)
-    }
-
-    setSearchParams(newParams)
-  }, [
-    timeRange,
-    environment,
-    statusCode,
-    showBots,
-    aiAgent,
-    aiProvider,
-    isAiAgent,
-    pathFilter,
-    showFilters,
-    page,
-    limit,
-    sortBy,
-    sortOrder,
-    setSearchParams,
-  ])
-
-  const handleMethodChange = (value: string) => {
-    setMethod(value)
-    setPage(1)
-  }
-
-  const handleStatusCodeChange = (value: string) => {
-    setStatusCode(value)
-    setPage(1)
-  }
-
-  const handleEnvironmentChange = (value: string) => {
-    setEnvironment(value)
-    setPage(1)
-  }
-
-  const handleTimeRangeChange = (value: string) => {
-    setTimeRange(value)
-    setPage(1)
-  }
-
-  const handleLimitChange = (value: string) => {
-    setLimit(parseInt(value))
-    setPage(1)
-  }
-
-  const handleSort = (
-    field: 'timestamp' | 'status_code' | 'response_time_ms'
-  ) => {
-    if (sortBy === field) {
-      setSortOrder(sortOrder === 'desc' ? 'asc' : 'desc')
-    } else {
-      setSortBy(field)
-      setSortOrder('desc')
-    }
-    setPage(1)
-  }
-
-  const handleShowBotsChange = (value: string) => {
-    setShowBots(value)
-    setPage(1)
-  }
-
-  // Count of advanced filters currently narrowing the result set (everything
-  // except the always-visible user-agent search and the default time range).
-  const activeFilterCount = useMemo(() => {
-    let n = 0
-    if (timeRange !== '24h') n += 1
-    if (method !== 'all') n += 1
-    if (statusCode !== 'all') n += 1
-    if (environment !== 'all') n += 1
-    if (showBots !== 'all') n += 1
-    return n
-  }, [timeRange, method, statusCode, environment, showBots])
-
-  const clearFilters = () => {
-    setTimeRange('24h')
-    setMethod('all')
-    setStatusCode('all')
-    setEnvironment('all')
-    setShowBots('all')
-    setPage(1)
-  }
-
-  const handleRowClick = (
-    requestId: string,
-    logProjectId: number,
-    timestamp: string
-  ) => {
-    if (onRowClick) {
-      onRowClick(requestId, logProjectId, timestamp)
+  const renderValue = (key: RequestLogColumn, log: ProxyLogResponse) => {
+    switch (key) {
+      case 'path': {
+        const detailParams = new URLSearchParams({ ts: log.timestamp })
+        return (
+          <RecordLink
+            to={`/projects/${project.slug}/request-logs/${encodeURIComponent(log.request_id)}?${detailParams}`}
+            state={{ listReturnTo: url }}
+            onClick={rememberList}
+            aria-label={`View ${log.method} ${log.path} request details`}
+            title={`${log.host}${log.path}${log.query_string ? `?${log.query_string}` : ''}`}
+            className="font-mono"
+          >
+            <span className="block max-w-80 truncate">{log.path}</span>
+          </RecordLink>
+        )
+      }
+      case 'timestamp':
+        return (
+          <time dateTime={log.timestamp} title={log.timestamp}>
+            {format(new Date(log.timestamp), 'MMM dd, HH:mm:ss')}
+          </time>
+        )
+      case 'method':
+        return <Badge variant="outline">{log.method}</Badge>
+      case 'status_code':
+        return (
+          <Status
+            tone={statusTone(log.status_code)}
+            label={String(log.status_code)}
+          />
+        )
+      case 'routing_status':
+        return <Badge variant="secondary">{log.routing_status}</Badge>
+      case 'response_time_ms':
+        return log.response_time_ms == null
+          ? '—'
+          : fmtDuration(log.response_time_ms)
+      case 'user_agent':
+        return log.bot_name ? (
+          <span className="inline-flex items-center gap-1.5">
+            <AiAgentLogo agent={log.bot_name} size={14} />
+            {log.bot_name}
+          </span>
+        ) : (
+          <span
+            className="block max-w-64 truncate"
+            title={log.user_agent ?? undefined}
+          >
+            {log.user_agent || '—'}
+          </span>
+        )
+      case 'environment_id':
+        return (
+          environmentsData?.find((env) => env.id === log.environment_id)
+            ?.name ??
+          (log.environment_id == null ? '—' : String(log.environment_id))
+        )
+      default:
+        return (
+          <span
+            className={`block max-w-64 truncate ${key === 'host' || key === 'client_ip' ? 'font-mono' : ''}`}
+            title={log[key] ?? undefined}
+          >
+            {log[key] || '—'}
+          </span>
+        )
     }
   }
 
-  // Helper function to generate pagination button numbers
-  const getPaginationPages = (currentPage: number, totalPages: number) => {
-    const pageNumbers = []
-    const maxButtons = 5
-    let startPage = Math.max(1, currentPage - Math.floor(maxButtons / 2))
-    const endPage = Math.min(totalPages, startPage + maxButtons - 1)
-
-    if (endPage - startPage < maxButtons - 1) {
-      startPage = Math.max(1, endPage - maxButtons + 1)
-    }
-
-    for (let i = startPage; i <= endPage; i++) {
-      pageNumbers.push(i)
-    }
-
-    return pageNumbers
-  }
+  const columns: DataTableColumn<ProxyLogResponse>[] =
+    REQUEST_LOG_COLUMNS.filter((column) =>
+      visibleKeys.includes(column.key)
+    ).map(({ key, label }) => {
+      const sortable =
+        key === 'timestamp' ||
+        key === 'status_code' ||
+        key === 'response_time_ms'
+      const active = sortBy === key
+      const Icon = active
+        ? sortOrder === 'asc'
+          ? ArrowUp
+          : ArrowDown
+        : ArrowUpDown
+      return {
+        key,
+        header: sortable ? (
+          <button
+            type="button"
+            className="inline-flex min-h-9 items-center gap-1 rounded-sm hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            aria-label={`Sort by ${label}, ${active && sortOrder === 'desc' ? 'ascending' : 'descending'}`}
+            onClick={() => handleSort(key)}
+          >
+            {label}
+            <Icon className="size-3.5" aria-hidden="true" />
+          </button>
+        ) : (
+          label
+        ),
+        ariaSort:
+          sortable && active
+            ? sortOrder === 'asc'
+              ? 'ascending'
+              : 'descending'
+            : undefined,
+        className: `whitespace-nowrap ${key === 'response_time_ms' ? 'text-right tabular-nums' : ''} ${key === 'timestamp' ? 'tabular-nums text-muted-foreground' : ''}`,
+        render: (log) => renderValue(key, log),
+      }
+    })
 
   return (
-    <div className="space-y-4 px-4 sm:px-0">
-      {/* Header: title + results summary */}
-      <div className="flex flex-col gap-1">
-        <h2 className="text-lg font-semibold tracking-tight">Proxy logs</h2>
-        <p className="text-sm text-muted-foreground">
-          {logs
-            ? `${logs.total.toLocaleString()} request${logs.total === 1 ? '' : 's'} found`
-            : 'Browse and analyze request logs'}
-        </p>
-      </div>
-
-      {/* Toolbar: collapsed filters toggle + page size */}
-      <div className="flex items-center gap-2">
+    <div ref={container} className="w-full min-w-0 space-y-6">
+      <PageHeader
+        headingLevel="h2"
+        title="Request logs"
+        description={
+          logs
+            ? `${fmtNumber(logs.total)} requests`
+            : 'Browse requests handled by this project.'
+        }
+        actions={
+          <Button
+            variant="outline"
+            size="sm"
+            aria-disabled={query.isFetching}
+            onClick={() => {
+              if (query.isFetching) return
+              if (timeRange.startsWith('custom:')) void query.refetch()
+              else setRefreshedAt(Date.now())
+            }}
+          >
+            <RefreshCw className="mr-2 size-4" aria-hidden="true" />
+            {query.isFetching ? 'Refreshing…' : 'Refresh'}
+          </Button>
+        }
+      />
+      <div className="flex flex-wrap items-center gap-2">
+        <fieldset aria-label="Time range" className="min-w-0">
+          <TimeRangeFilter value={timeRange} onChange={handleTimeRangeChange} />
+        </fieldset>
         <Button
           type="button"
           variant={showFilters ? 'secondary' : 'outline'}
           size="sm"
-          onClick={() => setShowFilters((v) => !v)}
+          aria-expanded={showFilters}
+          aria-controls="request-log-filters"
+          onClick={() => patch({ filters: showFilters ? 'closed' : 'open' })}
         >
-          <SlidersHorizontal className="mr-2 size-4" />
+          <SlidersHorizontal className="mr-2 size-4" aria-hidden="true" />
           Filters
           {activeFilterCount > 0 && (
             <Badge variant="secondary" className="ml-2 tabular-nums">
@@ -396,37 +408,21 @@ export default function ProxyLogsList({
           )}
         </Button>
         <div className="ml-auto">
-          <Select value={limit.toString()} onValueChange={handleLimitChange}>
-            <SelectTrigger className="w-[110px]">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="10">10 / page</SelectItem>
-              <SelectItem value="25">25 / page</SelectItem>
-              <SelectItem value="50">50 / page</SelectItem>
-              <SelectItem value="100">100 / page</SelectItem>
-            </SelectContent>
-          </Select>
+          <TableColumnPicker
+            options={REQUEST_LOG_COLUMNS}
+            visibleKeys={visibleKeys}
+            onChange={changeColumns}
+            onReset={resetColumns}
+          />
         </div>
       </div>
-
       {/* Collapsible advanced filters — hidden by default */}
       {showFilters && (
-        <div className="rounded-lg border bg-muted/30 p-3 sm:p-4">
+        <div
+          id="request-log-filters"
+          className="rounded-lg border bg-muted/30 p-3 sm:p-4"
+        >
           <div className="flex flex-wrap items-end gap-2 sm:gap-3">
-            <div className="flex flex-col gap-1">
-              <label
-                htmlFor="filter-time-range"
-                className="text-xs font-medium text-muted-foreground"
-              >
-                Time range
-              </label>
-              <TimeRangeFilter
-                value={timeRange}
-                onChange={handleTimeRangeChange}
-              />
-            </div>
-
             <div className="flex flex-col gap-1">
               <label
                 htmlFor="filter-method"
@@ -517,7 +513,7 @@ export default function ProxyLogsList({
                 >
                   Environment
                 </label>
-                {isLoading ? (
+                {environmentsLoading ? (
                   <Skeleton className="h-9 w-full sm:w-[180px]" />
                 ) : (
                   <Select
@@ -643,208 +639,81 @@ export default function ProxyLogsList({
         </div>
       )}
 
-      <div className="space-y-4">
-        {!isLoading && logs?.logs.length === 0 ? (
-          <div className="flex flex-col items-center justify-center py-16 text-center">
-            <FileSearch className="h-16 w-16 text-muted-foreground mb-4" />
-            <h3 className="text-lg font-semibold mb-2">
-              No request logs found
-            </h3>
-            <p className="text-sm text-muted-foreground max-w-md">
-              {statusCode !== 'all' || method !== 'all' || environment !== 'all'
-                ? 'Try adjusting your filters to see more results.'
-                : 'Start making requests to see logs appear here.'}
-            </p>
+      {error && logs && (
+        <Callout tone="error" title="Request logs could not refresh">
+          <div className="flex flex-wrap items-center gap-3">
+            <span>Showing previously loaded requests.</span>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => void query.refetch()}
+            >
+              Retry
+            </Button>
           </div>
-        ) : (
-          <div className="-mx-4 overflow-x-auto whitespace-nowrap sm:mx-0">
-            <div className="inline-block min-w-full px-4 align-middle sm:px-0">
-              <Table className="w-full">
-                <TableHeader>
-                  <TableRow>
-                    <SortableTableHead
-                      label="Timestamp"
-                      active={sortBy === 'timestamp'}
-                      direction={sortOrder}
-                      onClick={() => handleSort('timestamp')}
-                      className="whitespace-nowrap"
-                    />
-                    <TableHead className="whitespace-nowrap">Method</TableHead>
-                    <TableHead className="whitespace-nowrap">URL</TableHead>
-                    <SortableTableHead
-                      label="Status"
-                      active={sortBy === 'status_code'}
-                      direction={sortOrder}
-                      onClick={() => handleSort('status_code')}
-                      className="whitespace-nowrap"
-                    />
-                    <SortableTableHead
-                      label="Duration"
-                      active={sortBy === 'response_time_ms'}
-                      direction={sortOrder}
-                      onClick={() => handleSort('response_time_ms')}
-                      className="whitespace-nowrap"
-                    />
-                    <TableHead className="whitespace-nowrap">
-                      User agent
-                    </TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {isLoading
-                    ? [...Array(5)].map((_, i) => (
-                        <TableRow key={i}>
-                          <TableCell>
-                            <Skeleton className="h-6 w-32" />
-                          </TableCell>
-                          <TableCell>
-                            <Skeleton className="h-6 w-16" />
-                          </TableCell>
-                          <TableCell>
-                            <Skeleton className="h-6 w-96" />
-                          </TableCell>
-                          <TableCell>
-                            <Skeleton className="h-6 w-16" />
-                          </TableCell>
-                          <TableCell>
-                            <Skeleton className="h-6 w-20" />
-                          </TableCell>
-                          <TableCell>
-                            <Skeleton className="h-6 w-40" />
-                          </TableCell>
-                        </TableRow>
-                      ))
-                    : logs?.logs.map((log) => (
-                        <TableRow
-                          key={log.request_id}
-                          className={
-                            onRowClick ? 'cursor-pointer hover:bg-muted/50' : ''
-                          }
-                          onClick={() =>
-                            onRowClick &&
-                            log.project_id &&
-                            handleRowClick(
-                              log.request_id,
-                              log.project_id,
-                              log.timestamp
-                            )
-                          }
-                        >
-                          <TableCell className="tabular-nums text-muted-foreground">
-                            {format(
-                              new Date(log.timestamp),
-                              'yyyy-MM-dd HH:mm:ss'
-                            )}
-                          </TableCell>
-                          <TableCell>
-                            <span
-                              className={`rounded-full px-2 py-1 text-xs font-medium ${
-                                log.method === 'GET'
-                                  ? 'bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200'
-                                  : log.method === 'POST'
-                                    ? 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200'
-                                    : log.method === 'DELETE'
-                                      ? 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200'
-                                      : log.method === 'PUT'
-                                        ? 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200'
-                                        : 'bg-gray-100 text-gray-800 dark:bg-gray-700 dark:text-gray-200'
-                              }`}
-                            >
-                              {log.method}
-                            </span>
-                          </TableCell>
-                          <TableCell className="max-w-[320px] truncate font-mono text-sm">
-                            <span title={`https://${log.host}${log.path}`}>
-                              https://{log.host}
-                              {log.path}
-                            </span>
-                          </TableCell>
-                          <TableCell>
-                            <span
-                              className={`rounded-full px-2 py-1 text-xs font-medium ${STATUS_BADGE_CLASSES[httpStatusClass(log.status_code)]}`}
-                            >
-                              {log.status_code}
-                            </span>
-                          </TableCell>
-                          <TableCell className="tabular-nums text-muted-foreground">
-                            {log.response_time_ms
-                              ? `${log.response_time_ms}ms`
-                              : '-'}
-                          </TableCell>
-                          <TableCell className="max-w-[280px]">
-                            {log.bot_name ? (
-                              <span className="inline-flex items-center gap-1.5 truncate text-xs font-medium">
-                                <AiAgentLogo agent={log.bot_name} size={14} />
-                                {log.bot_name}
-                              </span>
-                            ) : (
-                              <span
-                                className="block truncate font-mono text-xs text-muted-foreground"
-                                title={log.user_agent || ''}
-                              >
-                                {log.user_agent || '-'}
-                              </span>
-                            )}
-                          </TableCell>
-                        </TableRow>
-                      ))}
-                </TableBody>
-              </Table>
-            </div>
-          </div>
-        )}
-
-        {/* Pagination */}
-        {totalPages > 1 && (
-          <div className="flex flex-col sm:flex-row items-center justify-between gap-4 mt-6">
-            <div className="text-xs sm:text-sm text-muted-foreground text-center sm:text-left">
-              Showing {(page - 1) * limit + 1} to{' '}
-              {Math.min(page * limit, logs?.total || 0)} of {logs?.total || 0}{' '}
-              logs
-            </div>
-            <div className="flex items-center gap-1 sm:gap-2">
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => setPage((p) => Math.max(1, p - 1))}
-                disabled={page === 1}
-                className="h-8 px-2 sm:h-9 sm:px-3"
-              >
-                <ChevronLeft className="h-4 w-4" />
-                <span className="max-sm:sr-only ml-1">Previous</span>
-              </Button>
-              {/* Desktop only: Show numbered page buttons */}
-              <div className="hidden sm:flex items-center gap-1">
-                {getPaginationPages(page, totalPages).map((pageNum) => (
-                  <Button
-                    key={pageNum}
-                    variant={pageNum === page ? 'default' : 'outline'}
-                    size="sm"
-                    onClick={() => setPage(pageNum)}
-                    className="w-10"
-                  >
-                    {pageNum}
-                  </Button>
-                ))}
-              </div>
-              {/* Mobile only: Show current page info */}
-              <span className="sm:hidden text-xs text-muted-foreground px-2">
-                {page} / {totalPages}
-              </span>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
-                disabled={page === totalPages}
-                className="h-8 px-2 sm:h-9 sm:px-3"
-              >
-                <span className="max-sm:sr-only mr-1">Next</span>
-                <ChevronRight className="h-4 w-4" />
-              </Button>
-            </div>
-          </div>
-        )}
-      </div>
+        </Callout>
+      )}
+      {error && !logs ? (
+        <div className="rounded-lg border bg-card text-card-foreground">
+          <PageState
+            size="compact"
+            variant="failed"
+            icon={AlertCircle}
+            title="Could not load request logs"
+            description="Try again to load requests for this project."
+            action={<Button onClick={() => void query.refetch()}>Retry</Button>}
+          />
+        </div>
+      ) : !isLoading && logs?.logs.length === 0 ? (
+        <div className="rounded-lg border bg-card text-card-foreground">
+          <PageState
+            size="compact"
+            variant="empty"
+            icon={FileSearch}
+            title={
+              hasFilters ? 'No matching request logs' : 'No request logs yet'
+            }
+            description={
+              hasFilters
+                ? 'Try another time range or clear the filters.'
+                : 'Requests handled by this project will appear here.'
+            }
+            action={
+              hasFilters ? (
+                <Button variant="outline" onClick={clearFilters}>
+                  Clear filters
+                </Button>
+              ) : undefined
+            }
+          />
+        </div>
+      ) : (
+        <DataTable
+          aria-label="Request logs"
+          columns={columns}
+          rows={logs?.logs ?? []}
+          rowKey={(log) => log.request_id}
+          isLoading={isLoading}
+        />
+      )}
+      {logs && (
+        <ResponsivePagination
+          page={page}
+          pageSize={limit}
+          total={logs.total}
+          totalPages={totalPages}
+          onPageChange={setPage}
+          onPageSizeChange={(value) =>
+            patch({
+              limit: value === 25 ? undefined : value,
+              page: undefined,
+            })
+          }
+          pageSizeOptions={[10, 25, 50, 100]}
+          ariaLabel="Request log pagination"
+          pageSizeAriaLabel="Request logs per page"
+        />
+      )}
     </div>
   )
 }

@@ -212,6 +212,19 @@ impl BackupService {
     /// Why running a backup of external service `service_id` with
     /// `engine_key` would restart its database now, or `None`. Only the
     /// WAL-G PostgreSQL engine can restart a service (to turn archiving on).
+    /// The backup engine of `service`: [`crate::engines::dispatch`]'s choice,
+    /// asking a worker's agent where the service runs on one.
+    pub async fn resolve_engine_key(
+        &self,
+        service: &temps_entities::external_services::Model,
+    ) -> Result<&'static str, crate::engines::dispatch::ResolveEngineError> {
+        crate::engines::dispatch::resolve_engine_key_on_this_host(
+            service,
+            self.external_service_manager.as_ref(),
+        )
+        .await
+    }
+
     pub async fn backup_restart_reason(
         &self,
         service_id: i32,

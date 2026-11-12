@@ -5,7 +5,8 @@
 //!
 //! Containers on this worker resolve `<env>.<project>.temps.local` to
 //! the bridge gateway IP via the per-node Hickory resolver. They open a
-//! plain HTTP connection on `:80`. This module is what answers.
+//! plain HTTP connection on `:80`, which nftables redirects to this proxy's
+//! own port (ADR-098). This module is what answers.
 //!
 //! ## Routing decision
 //!
@@ -41,7 +42,9 @@
 //!
 //! ## Listen scope
 //!
-//! The private listener binds only to `<bridge_ip>:80`. Public ingress reuses
+//! The private listener binds only to the bridge address, on the proxy's own
+//! port; containers' port-80 calls are redirected to it (ADR-098,
+//! [`crate::internal_routing`]). Public ingress reuses
 //! the routing and streaming code through [`public_router`], but its caller
 //! identity, host/SNI checks, connection limits, ACME budget, and forwarding
 //! metadata come from the explicitly configured public listeners.
@@ -60,9 +63,10 @@ use futures::StreamExt;
 use parking_lot::RwLock;
 use rand::prelude::SliceRandom;
 use tokio::net::TcpListener;
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::{watch, Notify, Semaphore};
 use tracing::{debug, error, info, warn};
 
+use crate::internal_access::{AccessDecision, DenyReason, CROSS_PROJECT_DENIED};
 use crate::route_store::{RouteEntry, SharedRouteStore};
 use crate::worker_metrics::RequestRecorder;
 
@@ -304,20 +308,18 @@ fn duration_micros(duration: Duration) -> u64 {
     duration.as_micros().min(u128::from(u64::MAX)) as u64
 }
 
-/// Spawn the proxy on `<bridge_ip>:80`. Returns once the listener is
-/// bound; the request loop runs in a background task and exits when
-/// `shutdown` is notified.
-///
-/// Idempotent at the call site: callers should only invoke this once
-/// per agent process.
-pub async fn spawn(
-    bridge_ip: IpAddr,
-    port: u16,
+/// Spawn the private listener on `addr` (a port of the bridge address, see
+/// [`crate::internal_routing`]). Returns once the listener is bound; the
+/// request loop and its identity tasks run in the background until `stop`
+/// turns true or its sender is dropped. A watch value, not a `Notify`: the
+/// supervisor releases the fallback listener while it is running, and a
+/// stop must not be missed because a task was between two waits.
+pub(crate) async fn spawn(
+    addr: SocketAddr,
     store: SharedRouteStore,
     docker: bollard::Docker,
-    shutdown: Arc<Notify>,
-) -> std::io::Result<()> {
-    let addr = SocketAddr::new(bridge_ip, port);
+    stop: watch::Receiver<bool>,
+) -> std::io::Result<tokio::task::JoinHandle<()>> {
     let listener = TcpListener::bind(addr).await?;
     info!(%addr, "internal edge proxy listening");
 
@@ -354,7 +356,7 @@ pub async fn spawn(
     });
     let app = axum::Router::new().fallback(handle).with_state(state);
 
-    let identity_shutdown = Arc::clone(&shutdown);
+    let mut identity_stop = stop.clone();
     tokio::spawn(async move {
         loop {
             let options = bollard::query_parameters::EventsOptionsBuilder::new().build();
@@ -364,7 +366,7 @@ pub async fn spawn(
 
             let reconnect = loop {
                 tokio::select! {
-                    _ = identity_shutdown.notified() => return,
+                    _ = stopped(&mut identity_stop) => return,
                     _ = interval.tick() => {
                         refresh_source_identities(&docker, &caller_identities).await;
                     }
@@ -392,20 +394,20 @@ pub async fn spawn(
 
             if reconnect {
                 tokio::select! {
-                    _ = identity_shutdown.notified() => return,
+                    _ = stopped(&mut identity_stop) => return,
                     _ = tokio::time::sleep(Duration::from_secs(1)) => {}
                 }
             }
         }
     });
 
-    let budget_shutdown = Arc::clone(&shutdown);
+    let mut budget_stop = stop.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(IDENTITY_INSPECTION_REFILL_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
-                _ = budget_shutdown.notified() => return,
+                _ = stopped(&mut budget_stop) => return,
                 _ = interval.tick() => {
                     let quotas = inspection_quotas.read().values().cloned().collect::<Vec<_>>();
                     for quota in quotas {
@@ -420,20 +422,28 @@ pub async fn spawn(
         }
     });
 
-    tokio::spawn(async move {
+    // The supervisor watches this task: it ends only when told to stop, or
+    // when the server fails, and then the supervisor starts it again.
+    let server = tokio::spawn(async move {
         let server = axum::serve(
             listener,
             app.into_make_service_with_connect_info::<SocketAddr>(),
         )
         .with_graceful_shutdown(async move {
-            shutdown.notified().await;
-            info!("internal edge proxy shutting down");
+            let mut stop = stop;
+            stopped(&mut stop).await;
+            info!(%addr, "internal edge proxy shutting down");
         });
         if let Err(e) = server.await {
-            error!(error = %e, "internal edge proxy exited with error");
+            error!(%addr, error = %e, "internal edge proxy exited with error");
         }
     });
-    Ok(())
+    Ok(server)
+}
+
+/// Resolves once `stop` is true or its sender is gone.
+async fn stopped(stop: &mut watch::Receiver<bool>) {
+    let _ = stop.wait_for(|stop| *stop).await;
 }
 
 /// Set on what the private listener refuses, so the worker's inside check
@@ -815,12 +825,31 @@ async fn handle(State(state): State<Arc<ProxyState>>, mut req: Request) -> Respo
         }
     };
 
-    if !caller_may_access_route(&state, req.extensions(), &entry).await {
-        warn!(%host, route_project_id = ?entry.project_id, "blocked cross-project internal proxy request");
-        return error_body(
-            StatusCode::FORBIDDEN,
-            "internal route is not accessible from this workload",
-        );
+    match caller_access(&state, req.extensions(), &entry).await {
+        AccessDecision::SameProject { .. } => {}
+        AccessDecision::Granted {
+            caller_project_id,
+            caller_environment_id,
+        } => {
+            debug!(
+                %host,
+                route_project_id = ?entry.project_id,
+                route_environment_id = ?entry.environment_id,
+                caller_project_id,
+                caller_environment_id = ?caller_environment_id,
+                "internal proxy request allowed by an internal access grant"
+            );
+        }
+        AccessDecision::Denied(reason) => {
+            warn!(
+                %host,
+                route_project_id = ?entry.project_id,
+                route_has_grants = !entry.allowed_callers.is_empty(),
+                reason = reason.as_str(),
+                "blocked cross-project internal proxy request"
+            );
+            return error_body(StatusCode::FORBIDDEN, CROSS_PROJECT_DENIED);
+        }
     }
 
     if entry.backends.is_empty() {
@@ -1256,34 +1285,34 @@ fn cache_acme_result(state: &ProxyState, key: String, value: Option<String>, ttl
     });
 }
 
-async fn caller_may_access_route(
+/// Who the caller is and whether it may call `entry` (ADR 101 D6). The
+/// Docker re-check runs only for an allowed caller, charged to the caller's
+/// own project.
+async fn caller_access(
     state: &ProxyState,
     extensions: &axum::http::Extensions,
     entry: &RouteEntry,
-) -> bool {
-    let Some(route_project_id) = entry.project_id else {
-        // Legacy or malformed snapshots without project metadata are not
-        // safe to expose through the workload-to-workload proxy.
-        return false;
-    };
+) -> AccessDecision {
     let Some(peer) = extensions.get::<ConnectInfo<SocketAddr>>().map(|c| c.0) else {
-        return false;
+        return AccessDecision::Denied(DenyReason::UnknownCaller);
     };
-    let Some(container_id) = candidate_container_id(&state.caller_identities, peer.ip()) else {
-        return false;
-    };
-    // Reject cross-project callers from memory before they can consume any
-    // Docker inspection capacity.
-    if !state
-        .store
-        .container_id_has_project(&container_id, route_project_id)
-    {
-        return false;
-    }
-    if !source_container_is_current(state, peer.ip(), &container_id, route_project_id).await {
-        return false;
-    }
-    true
+    let container_id = candidate_container_id(&state.caller_identities, peer.ip());
+    let container = container_id.as_deref();
+    crate::internal_access::authorize(
+        &state.store,
+        container,
+        entry,
+        |caller_project_id| async move {
+            match container {
+                Some(container_id) => {
+                    source_container_is_current(state, peer.ip(), container_id, caller_project_id)
+                        .await
+                }
+                None => false,
+            }
+        },
+    )
+    .await
 }
 
 /// Verify the cached candidate against Docker's current running-container and
@@ -2250,7 +2279,28 @@ mod tests {
             environment_id: Some(project_id * 100),
             gate: None,
             shield: None,
+            allowed_callers: Vec::new(),
         }
+    }
+
+    /// A held port fails the spawn with the bind error, before Docker is
+    /// contacted, so the supervisor can explain it and fall back.
+    #[tokio::test]
+    async fn a_held_port_fails_the_spawn_with_its_bind_error() {
+        let blocker = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = blocker.local_addr().unwrap();
+        let store = Arc::new(RouteStore::new(PathBuf::from("/tmp/unused-routes.json")));
+        // Never contacted: the bind fails before the proxy touches Docker.
+        let docker = bollard::Docker::connect_with_http(
+            "http://127.0.0.1:9",
+            1,
+            bollard::API_DEFAULT_VERSION,
+        )
+        .unwrap();
+        let (_stop, stopped) = watch::channel(false);
+        let error = spawn(addr, store, docker, stopped).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+        drop(blocker);
     }
 
     #[test]
@@ -2496,6 +2546,7 @@ mod tests {
                 environment_id: Some(1),
                 gate: None,
                 shield: None,
+                allowed_callers: Vec::new(),
             };
             let service = hyper::service::service_fn(move |mut request| {
                 request

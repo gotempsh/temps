@@ -29,6 +29,8 @@ temps-file-store = { path = "../temps-file-store" }
 temps-git = { path = "../temps-git" }
 temps-deployment-logs = { path = "../temps-deployment-logs" }
 temps-metrics = { path = "../temps-metrics" }
+# ADR-095: the DNS observability service behind the node admin routes.
+temps-dns = { path = "../temps-dns" }
 temps-queue = { path = "../temps-queue" }
 temps-providers = { path = "../temps-providers" }
 temps-presets = { path = "../temps-presets", features = ["openapi"] }

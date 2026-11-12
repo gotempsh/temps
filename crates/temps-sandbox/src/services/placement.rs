@@ -795,6 +795,7 @@ pub(crate) mod tests {
             overlay_ready_cidr: None,
             overlay_remediation: None,
             overlay_network_name: None,
+            overlay_vxlan_vni: None,
             created_at: now,
             updated_at: now,
         }

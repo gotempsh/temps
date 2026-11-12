@@ -32,7 +32,7 @@ the number of the ADR they belong to; they do not take a number of their own.
 | [008](./008-pty-agent.md) | In-Sandbox PTY Agent Replaces `docker exec` + `dtach` | Proposed |  |
 | [009](./009-sandbox-api-versioning.md) | Sandbox API Versioning Policy | Accepted |  |
 | [010](./010-provider-boundary-traits.md) | Provider Boundary Traits | Accepted |  |
-| [011](./011-internal-dns-ha-databases.md) | Internal DNS for HA Database Resolution | Accepted |  |
+| [011](./011-internal-dns-ha-databases.md) | Internal DNS for HA Database Resolution | Accepted | amended by [097](./097-internal-dns-canary-corrections.md) |
 | [012](./012-clickhouse-analytics-backend.md) | ClickHouse as an external analytics backend | Accepted |  |
 | [013](./013-sandbox-egress-credential-proxy.md) | Sandbox Egress Credential Proxy | Proposed |  |
 | [014](./014-unified-backup-architecture.md) | Unified Backup Execution Architecture | Proposed |  |
@@ -45,7 +45,7 @@ the number of the ADR they belong to; they do not take a number of their own.
 | [021](./021-humanized-alert-notifications.md) | Humanized alert notification text (deterministic default, optional AI enrichment) | Proposed |  |
 | [022](./022-ai-foundation-structured-output.md) | A general AI foundation for typed/structured output (`AiService`) | Proposed |  |
 | [023](./023-ai-debugging-conversations.md) | Persistent AI debugging conversations (chat per interaction) | Proposed |  |
-| [024](./024-control-plane-dns-resolver.md) | Control-plane DNS resolver for single-node *.temps.local resolution | Proposed |  |
+| [024](./024-control-plane-dns-resolver.md) | Control-plane DNS resolver for single-node *.temps.local resolution | Proposed | amended by [097](./097-internal-dns-canary-corrections.md) |
 | [025](./025-unified-alarm-log.md) | Unified alarm log (one queryable firing history across all sources) | Proposed |  |
 | [026](./026-metric-alert-label-filters-and-dynamic-alerting.md) | Label filters and per-series ("dynamic") alerting for OTel metrics | Proposed |  |
 | [027](./027-cross-project-trace-linking.md) | Cross-project trace linking | Proposed |  |
@@ -74,18 +74,19 @@ the number of the ADR they belong to; they do not take a number of their own.
 | [052](./052-common-workload-model.md) | A common workload model for deployed containers and sandboxes | Proposed | superseded in part by [055](./055-workload-plane-and-runtime-drivers.md) |
 | [053](./053-distributed-runtime-health-and-worker-uptime.md) | Distributed Runtime Health and Worker Uptime | Implemented for process/HTTP/TCP |  |
 | [054](./054-plugin-builds-on-worker-nodes.md) | Plugin builds run on a worker node when the control plane has no Docker | Proposed |  |
-| [055](./055-workload-plane-and-runtime-drivers.md) | A workload plane with pluggable runtime drivers | Proposed | supersedes in part [052](./052-common-workload-model.md) |
+| [055](./055-workload-plane-and-runtime-drivers.md) | A workload plane with pluggable runtime drivers | Proposed | supersedes in part [052](./052-common-workload-model.md); amended by [099](./099-worker-backups-run-the-local-engines.md) |
 | [056](./056-compute-pool-that-avoids-collisions.md) | A Compute Pool That Avoids Collisions and Can Be Changed | Accepted |  |
 | [057](./057-removing-a-node-that-is-gone.md) | Removing a worker node that is gone | Accepted |  |
 | [058](./058-ingress-modes-and-a-shared-app-domain.md) | Ingress modes, edge nodes and a shared app domain | Proposed |  |
 | [059](./059-configurable-overlay-network-name.md) | A configurable overlay network name, and a join that looks first | Accepted |  |
 | [060](./060-rejoining-the-same-control-plane.md) | Re-joining the same control plane, and removing an empty node | Accepted |  |
 | [061](./061-worker-metrics.md) | Worker proxy and host metrics, pulled by the control plane | Accepted |  |
+| [062](./062-one-host-several-clusters-overlays.md) | One host, several clusters' overlays | Accepted |  |
 | [063](./063-sandboxes-on-a-control-plane-without-workloads.md) | Sandboxes on a control plane that runs no workloads | Accepted |  |
 | [064](./064-making-a-project-reachable.md) | Making a project reachable: who first, then how | Proposed |  |
 | [065](./065-tailnet-names-and-signed-in-addresses.md) | Tailnet names, tailnet users and signed-in addresses | Proposed |  |
 | [066](./066-shield-reputation-and-challenges.md) | Shield: reputation, fingerprints and challenges at every ingress | Proposed |  |
-| [068](./068-environment-addresses-without-a-public-preview-domain.md) | Environment addresses without a public preview domain | Proposed |  |
+| [068](./068-environment-addresses-without-a-public-preview-domain.md) | Environment addresses without a public preview domain | Proposed | amended by [096](./096-worker-health-for-environments-without-ingress.md) |
 | [069](./069-make-it-reachable-is-a-page.md) | *Make it reachable* is a page, and asks what is possible first | Proposed |  |
 | [070](./070-https-only-tunnel-addresses.md) | HTTPS only, on standard ports, for addresses published through a Cloudflare tunnel | Proposed |  |
 | [071](./071-git-provider-expansion.md) | Git Provider Expansion — Gitea, Bitbucket, and Generic Providers | Proposed |  |
@@ -111,7 +112,16 @@ the number of the ADR they belong to; they do not take a number of their own.
 | [091](./091-change-worker-labels-after-join.md) | Changing a Worker's Labels After It Joined | Accepted |  |
 | [092](./092-plugin-ai-tools.md) | Plugin AI tools are marked API operations | Accepted |  |
 | [093](./093-managed-database-tls.md) | Server-Side TLS for Managed Databases | Proposed |  |
-| [094](./094-general-access-vaults.md) | General access vaults with explicit consumer links | Proposed |  |
+| [094](./094-cloud-console-session-revocation.md) | Temps Cloud console sessions end when Cloud revokes the user | Accepted |  |
+| [095](./095-internal-dns-observability.md) | Internal DNS observability: resolver health, records, query log, traffic and alerts | Proposed | amended by [097](./097-internal-dns-canary-corrections.md); amended by [098](./098-internal-proxy-own-port.md) |
+| [096](./096-worker-health-for-environments-without-ingress.md) | Worker health for environments without ingress | Accepted | amends [068](./068-environment-addresses-without-a-public-preview-domain.md) |
+| [097](./097-internal-dns-canary-corrections.md) | Internal DNS canary corrections | Accepted | amends [011](./011-internal-dns-ha-databases.md); amends [024](./024-control-plane-dns-resolver.md); amends [095](./095-internal-dns-observability.md) |
+| [098](./098-internal-proxy-own-port.md) | The worker's internal proxy listens on its own port, and containers' port 80 is redirected to it | Proposed | amends [095](./095-internal-dns-observability.md) |
+| [099](./099-worker-backups-run-the-local-engines.md) | Backups of a worker's services run the local engines through its agent | Proposed | amends [055](./055-workload-plane-and-runtime-drivers.md); amended by [102](./102-scoped-s3-credentials-for-worker-jobs.md) |
+| [100](./100-control-plane-backup-without-docker.md) | The control-plane backup dumps with the local PostgreSQL client when there is no Docker | Accepted |  |
+| [101](./101-internal-access-grants.md) | Internal access grants let another project call a project's `*.temps.local` routes | Proposed |  |
+| [102](./102-scoped-s3-credentials-for-worker-jobs.md) | A worker receives S3 credentials scoped to the job, never the source's own | Proposed | amends [099](./099-worker-backups-run-the-local-engines.md) |
+| [103](./103-general-access-vaults.md) | General access vaults with explicit consumer links | Proposed |  |
 
 ## Supporting documents
 

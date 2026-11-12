@@ -85,11 +85,39 @@ async fn golden_worker_postgres_service() {
     );
     let creates = fake.creates();
     assert_eq!(creates.len(), 1, "{:?}", fake.calls());
+    let golden: Vec<Value> = creates
+        .iter()
+        .map(golden_value)
+        .map(with_stable_create_attempt)
+        .collect();
     assert_golden(
         &Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/golden/worker-postgres-service.json"),
-        &Value::Array(creates.iter().map(golden_value).collect()),
+        &Value::Array(golden),
     );
+}
+
+/// Label that tags a container with the create call that made it, so a
+/// cleanup removes only its own container.
+const CREATE_ATTEMPT_LABEL: &str = "sh.temps.service.create-attempt";
+
+/// The create-attempt label is a fresh random ID per create. Check its
+/// shape here and record a placeholder, so the fixture stays stable while
+/// still showing that the label is sent.
+fn with_stable_create_attempt(mut create: Value) -> Value {
+    let Some(label) = create
+        .pointer_mut("/body/Labels")
+        .and_then(|labels| labels.get_mut(CREATE_ATTEMPT_LABEL))
+    else {
+        panic!("the create request carries no {CREATE_ATTEMPT_LABEL} label: {create}");
+    };
+    let attempt = label.as_str().unwrap_or_default();
+    assert!(
+        attempt.len() == 32 && attempt.chars().all(|c| c.is_ascii_hexdigit()),
+        "the create attempt is a random 32-hex-digit ID, got {attempt:?}"
+    );
+    *label = Value::String("<random per create>".to_string());
+    create
 }
 
 /// These tests never compile a plugin.

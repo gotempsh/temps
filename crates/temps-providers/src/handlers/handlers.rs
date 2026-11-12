@@ -198,6 +198,8 @@ fn data_safety_problem(error: &crate::services::ExternalServiceError) -> Option<
         | E::DockerError { .. }
         | E::DuplicateServiceType { .. }
         | E::InternalError { .. }
+        | E::AgentUnanswered { .. }
+        | E::NodeBusy { .. }
         | E::DockerUnavailable(_)
         | E::LocalWorkloadsDisabled { .. }
         | E::ControlPlaneAddressRequired { .. }
@@ -259,6 +261,8 @@ fn service_name_problem(error: &crate::services::ExternalServiceError) -> Option
         | E::DockerError { .. }
         | E::DuplicateServiceType { .. }
         | E::InternalError { .. }
+        | E::AgentUnanswered { .. }
+        | E::NodeBusy { .. }
         | E::DockerUnavailable(_)
         | E::LocalWorkloadsDisabled { .. }
         | E::ControlPlaneAddressRequired { .. }
@@ -295,6 +299,9 @@ fn cluster_placement_problem(error: &crate::services::ExternalServiceError) -> O
         E::ClusterNotSettled { .. } => "Cluster Not Ready",
         E::ClusterBusy { .. } => "Cluster Busy",
         E::LockTimeout { .. } => "Service Busy",
+        // A worker node at its limit of backups and restores: retry once
+        // one finishes.
+        E::NodeBusy { .. } => "Node Busy",
         // The request itself is invalid, not in conflict with any state.
         E::ClusterMemberLimitExceeded { .. } => {
             return Some(
@@ -346,6 +353,7 @@ fn cluster_placement_problem(error: &crate::services::ExternalServiceError) -> O
         | E::DockerError { .. }
         | E::DuplicateServiceType { .. }
         | E::InternalError { .. }
+        | E::AgentUnanswered { .. }
         | E::DockerUnavailable(_)
         | E::LocalWorkloadsDisabled { .. }
         | E::Engine { .. } => return None,
@@ -1963,6 +1971,9 @@ async fn trigger_service_health_check(
     }
 }
 
+/// Problem type of a `/wal-health` 404 whose last check could not run.
+pub const WAL_HEALTH_NOT_CHECKED_TYPE: &str = "https://temps.sh/probs/wal-health-not-checked";
+
 /// Postgres WAL & archive health snapshot
 ///
 /// Returns the latest WAL/archive health snapshot recorded by the background
@@ -1971,7 +1982,10 @@ async fn trigger_service_health_check(
 /// replication slots, archive backlog, or misconfigured `archive_command`.
 ///
 /// Returns 404 when no snapshot exists yet (probe hasn't run, or the service
-/// isn't Postgres).
+/// isn't Postgres). When the last check could not run (a database on a
+/// worker whose agent predates the WAL probe, or cannot be reached), the 404
+/// has type `https://temps.sh/probs/wal-health-not-checked` and carries
+/// `reason` and `checked_at`, so the page can say the check is not happening.
 #[utoipa::path(
     get,
     path = "/external-services/{id}/wal-health",
@@ -1979,7 +1993,7 @@ async fn trigger_service_health_check(
     tag = "External Services",
     responses(
         (status = 200, description = "Latest WAL health snapshot", body = crate::externalsvc::postgres_wal_health::PostgresWalHealth),
-        (status = 404, description = "Service not found, or no WAL snapshot available"),
+        (status = 404, description = "Service not found, or no WAL snapshot available. Type `https://temps.sh/probs/wal-health-not-checked` with `reason` and `checked_at` when the last check could not run"),
         (status = 500, description = "Internal server error"),
     ),
     params(
@@ -1996,11 +2010,22 @@ async fn get_postgres_wal_health(
 
     match app_state
         .external_service_manager
-        .get_postgres_wal_health(id)
+        .get_postgres_wal_health_reading(id)
         .await
     {
-        Ok(Some(snapshot)) => Ok((StatusCode::OK, Json(snapshot))),
-        Ok(None) => Err(not_found()
+        Ok(crate::services::WalHealthReading::Snapshot(snapshot)) => {
+            Ok((StatusCode::OK, Json(snapshot)))
+        }
+        Ok(crate::services::WalHealthReading::Unchecked(unchecked)) => {
+            Err(ErrorBuilder::new(StatusCode::NOT_FOUND)
+                .type_(WAL_HEALTH_NOT_CHECKED_TYPE)
+                .title("WAL Health Not Checked")
+                .detail(unchecked.reason.clone())
+                .value("reason", &unchecked.reason)
+                .value("checked_at", unchecked.checked_at)
+                .build())
+        }
+        Ok(crate::services::WalHealthReading::Missing) => Err(not_found()
             .detail(format!(
                 "No WAL health snapshot available for service {}",
                 id
@@ -3411,23 +3436,12 @@ async fn get_service_preview_environment_variable_names(
     permission_guard!(auth, ExternalServicesRead);
     super::metrics_handlers::assert_service_owned_by_caller(id, &auth, &app_state).await?;
 
-    let options = EnvironmentVariableOptions {
-        include_docker: false,
-        include_runtime: false,
-        // names_only, so values aren't returned regardless.
-        mask_sensitive: true,
-        names_only: true,
-    };
-
     match app_state
         .external_service_manager
-        .get_environment_variables(id, None, None, options)
+        .get_service_preview_environment_variable_names(id)
         .await
     {
-        Ok(response) => {
-            let variable_names: Vec<String> = response.variables.keys().cloned().collect();
-            Ok((StatusCode::OK, Json(variable_names)))
-        }
+        Ok(variable_names) => Ok((StatusCode::OK, Json(variable_names))),
         Err(e) => match e.to_string().as_str() {
             "Service not found" => Err(not_found().detail("Service not found").build()),
             _ => Err(external_service_problem(

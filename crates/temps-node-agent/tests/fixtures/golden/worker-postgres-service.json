@@ -29,6 +29,7 @@
       "Labels": {
         "sh.temps.managed": "true",
         "sh.temps.service": "true",
+        "sh.temps.service.create-attempt": "<random per create>",
         "sh.temps.service.name": "postgres-golden",
         "sh.temps.service.type": "postgres"
       }

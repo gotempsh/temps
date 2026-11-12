@@ -1214,6 +1214,9 @@ mod tests {
             // MCP regression routers exercise the same project guard as REST replay.
             "temps-mcp-server",
             "temps-monitoring",
+            // Naming another project in an internal access grant (ADR 101)
+            // requires being able to reach that project.
+            "temps-network-policy",
             "temps-observability",
             "temps-otel",
             "temps-projects",
@@ -1339,6 +1342,10 @@ mod tests {
             // Reachability (ADR 064) reads and changes how one project's
             // environment reaches visitors.
             "temps-ingress",
+            // Internal access grants (ADR 101) are a project's own setting:
+            // listing them narrows ProjectsRead, and granting or revoking
+            // narrows ProjectsWrite, to the project being called.
+            "temps-network-policy",
             // Reading where a Compose stack runs and moving it between nodes
             // act on one project's environment, so each handler narrows
             // EnvironmentsRead/EnvironmentsWrite to that project.

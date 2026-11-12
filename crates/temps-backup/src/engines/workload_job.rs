@@ -21,15 +21,15 @@
 //!
 //! ## The gate
 //!
-//! [`takes_job_path`] selects this path only for a standalone PostgreSQL
-//! database whose `external_services.workload_mode` is `enforce` **and**
-//! that lives on a worker node. Every other database resolves exactly the
-//! engine it did before (the default mode is `legacy`), control-plane
-//! databases keep their local WAL-G/pg_dump chain, and the databases this
-//! path serves are precisely the ones whose backups could not run at all
-//! (the engines drive the control plane's local Docker). Rolling back is
-//! setting the database's mode back to `legacy` through the existing audited
-//! API: backup jobs stop being scheduled and the local path is unchanged.
+//! [`takes_job_path`] selects this path for a standalone PostgreSQL database
+//! that lives on a worker node, whatever its `workload_mode`. Control-plane
+//! databases keep their local WAL-G/pg_dump chain unchanged, and the
+//! databases this path serves are precisely the ones whose backups could not
+//! run at all: the other engines drive the control plane's local Docker,
+//! where a worker's container is not (and a `--profile control-plane` server
+//! has no Docker to try). The job needs nothing the mode changes: it runs the
+//! database's image on the app network the worker's agent attached the
+//! database to, and reaches it by its container name.
 //!
 //! ## Secrets
 //!
@@ -44,13 +44,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
+use sea_orm::{DatabaseConnection, EntityTrait};
 use serde_json::{json, Value};
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
 use crate::execution::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
-use temps_entities::external_service_workload_mode::ServiceWorkloadMode;
 use temps_workload::{
     Artifact, ConditionKind, EnvSpec, Isolation, Lifetime, PlacementSpec, Process, WorkloadKind,
     WorkloadPhase, WorkloadRef, WorkloadSpec,
@@ -62,6 +61,7 @@ use temps_workload_plane::{
 use temps_workload_volumes::VolumePin;
 
 use super::v2_common;
+use temps_providers::externalsvc::postgres_dump_filter;
 
 /// Engine key stored in `backup_jobs.engine` for a backup taken as a job.
 pub const ENGINE_KEY: &str = "postgres_workload_job";
@@ -92,14 +92,22 @@ pub mod exit {
     /// truncated). Found by a verification pass before anything is applied;
     /// see [`super::restore_script`].
     pub const CORRUPT_DUMP: i64 = 7;
+    /// Keeping the job's login on its own password through the dump failed
+    /// (the filter that drops the dump's password for that login exited
+    /// non-zero); `psql` may have applied part of the dump. See
+    /// [`super::restore_script`].
+    pub const KEEP_LOGIN_FAILED: i64 = 8;
 }
+
+/// The login of a PostgreSQL service whose config names none, as the
+/// provider creates it.
+pub const DEFAULT_PG_USERNAME: &str = "postgres";
 
 /// Whether a backup (and an in-place restore) of `service` runs as a job on
 /// its node. See the module docs for why this is the gate.
 pub fn takes_job_path(service: &temps_entities::external_services::Model) -> bool {
     is_postgres(&service.service_type)
         && service.topology.as_str() != "cluster"
-        && service.workload_mode == ServiceWorkloadMode::Enforce
         && worker_node(service).is_some()
 }
 
@@ -358,6 +366,13 @@ pub fn backup_script(target: &PgJobTarget, object_key: &str) -> String {
     )
 }
 
+/// The variables of a restore job: those of [`job_env`]. The job applies the
+/// dump as the target's own login, with the target's own password, whatever
+/// the dump's roles say ([`restore_script`]).
+pub fn restore_env(password: &str, s3: &S3JobTarget) -> Vec<(String, String)> {
+    job_env(password, s3)
+}
+
 /// The restore script: the object streams through gunzip into `psql`, as
 /// the local pg_dump restore applies a `pg_dumpall --clean` dump (errors on
 /// objects that already exist are reported, not fatal).
@@ -375,16 +390,33 @@ pub fn backup_script(target: &PgJobTarget, object_key: &str) -> String {
 /// database: a `--clean` dump drops every object first, and half of one
 /// would leave the database emptier than before. Applying it cannot be made
 /// atomic instead: `pg_dumpall` output runs `CREATE DATABASE` and
-/// `\connect`, which cannot run inside `--single-transaction`, and the local
-/// restore deliberately runs without `ON_ERROR_STOP` (TimescaleDB rejects
-/// the dump's `DROP ... ONLY` on hypertables, harmlessly), so this one
-/// matches it. The second pass checks every stage again, in case the object
-/// changed in between. Memory stays constant: both passes stream.
+/// `\connect`, which cannot run inside `--single-transaction`. It runs with
+/// `ON_ERROR_STOP`, so a failed statement fails the job instead of `psql`
+/// exiting 0 with the dump half applied; the statements a live server
+/// refuses by design (an existing role's `CREATE ROLE`, dropping the
+/// connected role, dropping a database an application holds open) are made
+/// to succeed by the dump filter (`postgres_dump_filter`). The second pass
+/// checks every stage again, in case the object changed in between. Memory
+/// stays constant: both passes stream.
 ///
 /// A `gunzip` failure whose fetch either succeeded or was killed by SIGPIPE
 /// (status 141: gunzip stopped reading first) is a corrupt object
 /// ([`exit::CORRUPT_DUMP`]); any other fetch failure is a download failure.
+///
+/// The dump runs `ALTER ROLE ... PASSWORD` for every role it holds, with
+/// the password that role had when the backup was taken: of another
+/// database, or of this one before its password was changed. When the job's
+/// login is one of them, applying that would change the login's password
+/// midway, so the dump's next `\connect` (made with the target's password)
+/// would be refused with the dump half applied, and the target would be left
+/// with a password Temps does not know. The job therefore keeps its login on
+/// the target's own password: the dump filter drops the `PASSWORD` clause
+/// of that login's `ALTER ROLE` line (`TEMPS_KEEP_BARE`/`TEMPS_KEEP_QUOTED`). Nothing about the login is
+/// changed before the dump is applied, so a failed download or apply never
+/// leaves it with another password. The filter's own failure exits with
+/// [`exit::KEEP_LOGIN_FAILED`].
 pub fn restore_script(target: &PgJobTarget, object_key: &str) -> String {
+    let (bare, quoted) = postgres_dump_filter::alter_role_prefixes(&target.username);
     format!(
         "{REQUIRE_WALG}\n\
          fetch_rc=\"${{TMPDIR:-/tmp}}/temps-restore-fetch.rc\"\n\
@@ -400,19 +432,31 @@ pub fn restore_script(target: &PgJobTarget, object_key: &str) -> String {
          ${{fetch:-without a status}}$1\" >&2; exit 4; }}; \
          [ \"$unzip\" = 0 ] || {{ echo \"temps: decompressing the dump failed: gunzip exited \
          ${{unzip:-without a status}}$1\" >&2; exit 7; }}; }}\n\
+         keep_rc=\"${{TMPDIR:-/tmp}}/temps-restore-keep-login.rc\"\n\
          stream -t\n\
          check '; nothing was applied'\n\
-         stream | psql -X -q --no-password --host={host} --port={port} --username={user} \
-         --dbname=postgres >/dev/null\n\
+         rm -f \"$keep_rc\"\n\
+         stream | {{ TEMPS_KEEP_BARE={bare} TEMPS_KEEP_QUOTED={quoted} awk {awk}; \
+         echo $? > \"$keep_rc\"; }} \
+         | psql -X -q -v ON_ERROR_STOP=1 --no-password --host={host} --port={port} \
+         --username={user} --dbname=postgres >/dev/null\n\
          psql_rc=$?\n\
          check '; psql may have applied part of it'\n\
+         keep=$(cat \"$keep_rc\" 2>/dev/null)\n\
+         [ \"$keep\" = 0 ] || {{ echo \"temps: filtering the dump (keeping the login on its own \
+         password) failed: awk exited ${{keep:-without a status}}; psql may have applied part of \
+         it\" >&2; exit {keep_code}; }}\n\
          [ \"$psql_rc\" = 0 ] || {{ echo \"temps: psql could not apply the dump: psql exited \
-         $psql_rc\" >&2; exit 5; }}\n\
+         $psql_rc at the first failed statement\" >&2; exit 5; }}\n\
          echo 'temps: restore applied'",
         host = q(&target.host),
         port = target.port,
         user = q(&target.username),
         key = q(object_key),
+        bare = q(&bare),
+        quoted = q(&quoted),
+        awk = q(postgres_dump_filter::PG_DUMPALL_RESTORE_FILTER_AWK),
+        keep_code = exit::KEEP_LOGIN_FAILED,
     )
 }
 
@@ -463,10 +507,7 @@ pub fn job_spec(
             labels.insert("sh.temps.backup_id".to_string(), backup_id.to_string());
         }
         JobPurpose::Restore { restore_run_id } => {
-            labels.insert(
-                "sh.temps.restore_run_id".to_string(),
-                restore_run_id.to_string(),
-            );
+            labels.insert(RESTORE_RUN_LABEL.to_string(), restore_run_id.to_string());
         }
     }
     WorkloadSpec {
@@ -779,6 +820,102 @@ impl DatabaseJobControl for WorkloadPlane {
     }
 }
 
+/// The label a restore job carries with its restore run's id.
+pub const RESTORE_RUN_LABEL: &str = "sh.temps.restore_run_id";
+
+/// A restore run's job, as the plane still has it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreJobRecord {
+    pub workload_id: i64,
+    /// Its latest status (phase and exit code).
+    pub status: temps_workload::WorkloadStatus,
+}
+
+/// Finding the job a restore run started, for a run whose waiting process
+/// restarted: the plane keeps the job, running or finished (until its
+/// time-to-live), labelled with the run's id. A trait so a resumed restore
+/// can be tested without a plane.
+#[async_trait]
+pub trait RestoreJobLookup: Send + Sync {
+    /// The jobs of database `service_id` labelled with `restore_run_id`,
+    /// oldest first.
+    async fn restore_jobs(
+        &self,
+        service_id: i32,
+        restore_run_id: i32,
+    ) -> Result<Vec<RestoreJobRecord>, PlaneError>;
+}
+
+#[async_trait]
+impl RestoreJobLookup for WorkloadPlane {
+    async fn restore_jobs(
+        &self,
+        service_id: i32,
+        restore_run_id: i32,
+    ) -> Result<Vec<RestoreJobRecord>, PlaneError> {
+        let owner = Owner::new(DATABASE_OWNER_KIND, i64::from(service_id));
+        let run = restore_run_id.to_string();
+        // One listing carries each job's status, exit code included: no
+        // read per job.
+        Ok(self
+            .list_owned(&owner)
+            .await?
+            .into_iter()
+            .filter(|view| view.spec.labels.get(RESTORE_RUN_LABEL) == Some(&run))
+            .map(|view| RestoreJobRecord {
+                workload_id: view.id,
+                status: view.status,
+            })
+            .collect())
+    }
+}
+
+/// Where a restore run's job stands, from the plane's records of it.
+#[derive(Debug)]
+pub enum RestoreJobProgress {
+    /// The plane has no job for the run: it was never started, or it
+    /// finished longer ago than its time-to-live and was removed. Either
+    /// way nothing runs.
+    NoJob,
+    /// A job is running (or being stopped): it may be writing.
+    Running,
+    /// The latest job applied the dump.
+    Succeeded { workload_id: i64 },
+    /// The latest job failed, as this says.
+    Failed(DatabaseJobError),
+}
+
+/// What became of the job restore run `restore_run_id` started on database
+/// `service_id` (on node `node_id`), as `jobs` records it.
+pub async fn restore_job_progress(
+    jobs: &dyn RestoreJobLookup,
+    service_id: i32,
+    node_id: i32,
+    restore_run_id: i32,
+) -> Result<RestoreJobProgress, PlaneError> {
+    let records = jobs.restore_jobs(service_id, restore_run_id).await?;
+    if records.iter().any(|job| !job.status.phase.is_terminal()) {
+        return Ok(RestoreJobProgress::Running);
+    }
+    let Some(latest) = records.iter().max_by_key(|job| job.workload_id) else {
+        return Ok(RestoreJobProgress::NoJob);
+    };
+    Ok(if latest.status.phase == WorkloadPhase::Succeeded {
+        RestoreJobProgress::Succeeded {
+            workload_id: latest.workload_id,
+        }
+    } else {
+        RestoreJobProgress::Failed(failed_on(
+            service_id,
+            node_id,
+            "restore",
+            latest.workload_id,
+            &latest.status,
+            None,
+        ))
+    })
+}
+
 /// How long to wait for a stopped job to be removed, and how often to look.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RemovalTiming {
@@ -845,14 +982,40 @@ fn failed(
     status: &temps_workload::WorkloadStatus,
     fallback: Option<String>,
 ) -> DatabaseJobError {
+    failed_on(
+        target.service_id,
+        target.node_id,
+        operation,
+        workload_id,
+        status,
+        fallback,
+    )
+}
+
+/// [`failed`], for the job of database `service_id` on node `node_id`.
+fn failed_on(
+    service_id: i32,
+    node_id: i32,
+    operation: &'static str,
+    workload_id: i64,
+    status: &temps_workload::WorkloadStatus,
+    fallback: Option<String>,
+) -> DatabaseJobError {
     let step = match status.exit_code {
         Some(exit::DUMP_FAILED) => Some("pg_dumpall failed"),
         Some(exit::UPLOAD_FAILED) => Some("uploading the dump to S3 failed"),
         Some(exit::DOWNLOAD_FAILED) => Some("downloading the dump from S3 failed"),
-        Some(exit::APPLY_FAILED) => Some("psql could not apply the dump"),
+        Some(exit::APPLY_FAILED) => Some(
+            "psql could not apply the dump: it stops at the first failed statement, which its \
+             output names",
+        ),
         Some(exit::CORRUPT_DUMP) => Some(
             "the dump in S3 is corrupt or truncated (gunzip could not decompress it); \
              restore from another backup",
+        ),
+        Some(exit::KEEP_LOGIN_FAILED) => Some(
+            "filtering the dump (keeping the login on its own password) failed; psql may have \
+             applied part of it",
         ),
         Some(exit::NO_WALG) => Some(
             "the database's image has no wal-g; backups of a database on a worker node need \
@@ -869,10 +1032,10 @@ fn failed(
         .collect::<Vec<_>>()
         .join("; ");
     DatabaseJobError::Failed {
-        service_id: target.service_id,
+        service_id,
         operation,
         workload_id,
-        node_id: target.node_id,
+        node_id,
         exit_code: status.exit_code,
         reason: if reason.is_empty() {
             format!("the job ended in phase {}", status.phase.as_str())
@@ -899,7 +1062,7 @@ pub fn pg_target(
             .to_string(),
         host: super::dispatch::service_container_name(service),
         port: 5432,
-        username: text("username").unwrap_or("postgres").to_string(),
+        username: text("username").unwrap_or(DEFAULT_PG_USERNAME).to_string(),
         database: text("database")
             .or_else(|| text("db_name"))
             .unwrap_or("postgres")
@@ -908,46 +1071,28 @@ pub fn pg_target(
     (target, text("password").unwrap_or_default().to_string())
 }
 
-/// The S3 source `s3_source_id`, decrypted, refused when a job on
-/// `node_id` could not reach it.
+/// The S3 source `s3_source_id` as a job on a worker node receives it: a
+/// credential derived for `grant` (ADR-102), never the source's own unless
+/// the source allows it and cannot scope. Refused when the job could not
+/// reach the source.
 pub async fn s3_target(
+    scoper: &temps_providers::worker_s3_scope::WorkerCredentialScoper,
     db: &DatabaseConnection,
-    encryption: &Arc<temps_core::EncryptionService>,
     s3_source_id: i32,
-    service_id: i32,
-    node_id: i32,
+    grant: temps_providers::worker_s3_scope::WorkerS3Grant,
     operation: &'static str,
 ) -> Result<S3JobTarget, BackupError> {
-    let source = v2_common::load_s3_source(db, s3_source_id).await?;
-    let decrypt = |field: &str, value: &str| {
-        encryption
-            .decrypt_string(value)
-            .map_err(|e| BackupError::PermanentFailure {
-                reason: format!("decrypting the {field} of S3 source {s3_source_id}: {e}"),
-            })
-    };
-    let access_key_id = decrypt("access key", &source.access_key_id)?;
-    let secret_access_key = decrypt("secret key", &source.secret_key)?;
-    let session_token = v2_common::decrypt_session_token(&source, encryption)?;
-    if let Some(endpoint) = source.endpoint.as_ref().filter(|e| is_loopback_endpoint(e)) {
-        return Err(DatabaseJobError::EndpointUnreachable {
-            service_id,
-            operation,
-            node_id,
-            s3_source_id,
-            endpoint: endpoint.clone(),
-        }
-        .into());
-    }
+    let destination =
+        super::worker_agent::scoped_destination(scoper, db, s3_source_id, grant, operation).await?;
     Ok(S3JobTarget {
         s3_source_id,
-        bucket: source.bucket_name.clone(),
-        region: source.region.clone(),
-        endpoint: source.endpoint.clone(),
-        force_path_style: source.force_path_style.unwrap_or(true),
-        access_key_id,
-        secret_access_key,
-        session_token,
+        bucket: destination.bucket,
+        region: destination.region,
+        endpoint: destination.endpoint,
+        force_path_style: destination.force_path_style,
+        access_key_id: destination.access_key_id,
+        secret_access_key: destination.secret_access_key,
+        session_token: destination.session_token,
     })
 }
 
@@ -1238,6 +1383,8 @@ pub struct PostgresWorkloadJobDeps {
     pub encryption_service: Arc<temps_core::EncryptionService>,
     /// The workload plane, bound once `temps serve` starts it.
     pub plane: Arc<PlaneSlot>,
+    /// Derives the job's S3 credential (ADR-102).
+    pub worker_credentials: Arc<temps_providers::worker_s3_scope::WorkerCredentialScoper>,
 }
 
 /// `postgres_workload_job`: a backup of a database on a worker node, as a
@@ -1330,16 +1477,6 @@ impl BackupEngine for PostgresWorkloadJobEngine {
         )
         .await?;
         v2_common::assert_bucket_reachable(&s3_client, &s3_source.bucket_name).await?;
-        let s3 = s3_target(
-            deps.db.as_ref(),
-            &deps.encryption_service,
-            s3_source_id,
-            service_id,
-            node_id,
-            "backup",
-        )
-        .await?;
-
         let backup_uuid = v2_common::load_backup_uuid(deps.db.as_ref(), backup_id).await?;
         let s3_key = v2_common::build_external_service_s3_key(
             &s3_source.bucket_path,
@@ -1348,6 +1485,21 @@ impl BackupEngine for PostgresWorkloadJobEngine {
             &backup_uuid,
             DUMP_FILE_SUFFIX,
         );
+        // The job can write this dump's own directory and nothing else.
+        let s3 = s3_target(
+            &deps.worker_credentials,
+            deps.db.as_ref(),
+            s3_source_id,
+            temps_providers::worker_s3_scope::WorkerS3Grant::job(
+                service_id,
+                node_id,
+                temps_providers::worker_s3_scope::key_directory(&s3_key),
+                temps_core::ScopedS3Access::Write,
+                "backup",
+            ),
+            "backup",
+        )
+        .await?;
         let config_json = deps
             .encryption_service
             .decrypt_string(service.config.as_deref().unwrap_or("{}"))
@@ -1512,22 +1664,10 @@ pub fn restore_takes_job_path(
     takes_job_path(target) && backup_location.ends_with(".sql.gz")
 }
 
-/// The origin database of backup `backup_id`, from its producer link.
-pub async fn backup_origin(
-    db: &DatabaseConnection,
-    backup_id: i32,
-) -> Result<Option<i32>, sea_orm::DbErr> {
-    use temps_entities::external_service_backups::{Column, Entity};
-    Ok(Entity::find()
-        .filter(Column::BackupId.eq(backup_id))
-        .one(db)
-        .await?
-        .map(|link| link.service_id))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use temps_entities::external_service_workload_mode::ServiceWorkloadMode;
 
     fn service(
         node_id: Option<i32>,
@@ -1577,20 +1717,18 @@ mod tests {
     }
 
     #[test]
-    fn only_enforce_databases_on_a_worker_take_the_job_path() {
-        assert!(takes_job_path(&service(
-            Some(3),
-            ServiceWorkloadMode::Enforce
-        )));
-        // The default, and shadow, keep today's engine.
-        assert!(!takes_job_path(&service(
-            Some(3),
-            ServiceWorkloadMode::Legacy
-        )));
-        assert!(!takes_job_path(&service(
-            Some(3),
-            ServiceWorkloadMode::Shadow
-        )));
+    fn postgres_databases_on_a_worker_take_the_job_path_in_every_mode() {
+        // The live failure: a `legacy` database on a worker (the default
+        // mode, and what the worker's agent creates) resolved the local
+        // engines, which inspect this host's Docker, where its container is
+        // not. Every mode takes the job path now.
+        for mode in [
+            ServiceWorkloadMode::Legacy,
+            ServiceWorkloadMode::Shadow,
+            ServiceWorkloadMode::Enforce,
+        ] {
+            assert!(takes_job_path(&service(Some(3), mode)), "{mode:?}");
+        }
         // A control-plane database keeps its local chain, in every mode.
         assert!(!takes_job_path(&service(
             None,
@@ -1702,7 +1840,11 @@ mod tests {
         // Verified before anything is applied, then applied.
         assert!(script.contains("stream -t\n"), "{script}");
         assert!(
-            script.contains("stream | psql -X -q --no-password"),
+            script.contains("stream | { TEMPS_KEEP_BARE='ALTER ROLE app WITH '"),
+            "{script}"
+        );
+        assert!(
+            script.contains("| psql -X -q -v ON_ERROR_STOP=1 --no-password"),
             "{script}"
         );
         assert!(script.contains("--dbname=postgres"), "{script}");
@@ -2002,6 +2144,223 @@ mod tests {
         if !std::path::Path::new("/usr/bin/wal-g").exists() {
             assert_eq!(code, exit::NO_WALG as i32);
         }
+    }
+
+    /// A dump's `ALTER ROLE` for the job's own login keeps the attributes
+    /// it restores but never the password it had at backup time (another
+    /// database's, or this one's before its password changed): the login
+    /// stays on the target's password, so the dump's `\connect` keeps
+    /// working and Temps keeps handing out a password that works. Other
+    /// roles' passwords, and every line after the first `\connect` (table
+    /// data), are applied exactly as dumped. Runs the host's real `awk`.
+    #[cfg(unix)]
+    #[test]
+    fn the_dump_never_changes_the_password_of_the_jobs_login() {
+        let stubs = Stubs::with_walg_and_psql();
+        stubs.add("gunzip", "cat");
+        let dump = "--\n-- Roles\n--\n\n\
+             CREATE ROLE app;\n\
+             ALTER ROLE app WITH SUPERUSER INHERIT CREATEROLE CREATEDB LOGIN PASSWORD 'SCRAM-SHA-256$4096:c2FsdA==$c3RvcmVk:c2VydmVy' VALID UNTIL 'infinity';\n\
+             CREATE ROLE application;\n\
+             ALTER ROLE application WITH LOGIN PASSWORD 'md5aaaa';\n\
+             CREATE ROLE \"App-Admin\";\n\
+             ALTER ROLE \"App-Admin\" WITH SUPERUSER LOGIN PASSWORD 'md5bbbb';\n\
+             \\connect orders\n\
+             COPY public.notes (body) FROM stdin;\n\
+             ALTER ROLE app WITH LOGIN PASSWORD 'a row, not a role';\n\
+             \\.\n";
+        let object = tempfile::NamedTempFile::new().expect("object");
+        std::fs::write(object.path(), dump).expect("writing the object");
+        let object_path = object.path().to_str().expect("utf-8 path");
+
+        let (code, stderr, applied) = stubs.run(
+            &restore_script(&target(), "p/dump.sql.gz"),
+            &[("STUB_OBJECT", object_path)],
+        );
+        assert_eq!(code, 0, "{stderr}");
+        let applied = String::from_utf8(applied.expect("psql ran")).expect("utf-8");
+        assert!(
+            applied.contains(
+                "ALTER ROLE app WITH SUPERUSER INHERIT CREATEROLE CREATEDB LOGIN VALID UNTIL 'infinity';\n"
+            ),
+            "the login's attributes stay, its dumped password goes: {applied}"
+        );
+        assert!(!applied.contains("c2VydmVy"), "{applied}");
+        assert!(
+            applied.contains("ALTER ROLE application WITH LOGIN PASSWORD 'md5aaaa';"),
+            "another role whose name starts like the login's keeps its password: {applied}"
+        );
+        assert!(
+            applied.contains("ALTER ROLE \"App-Admin\" WITH SUPERUSER LOGIN PASSWORD 'md5bbbb';"),
+            "{applied}"
+        );
+        assert!(
+            applied.contains("ALTER ROLE app WITH LOGIN PASSWORD 'a row, not a role';"),
+            "table data after the first \\connect is never rewritten: {applied}"
+        );
+
+        // A login whose name pg_dumpall quotes.
+        let quoted = PgJobTarget {
+            username: "App-Admin".into(),
+            ..target()
+        };
+        let (code, stderr, applied) = stubs.run(
+            &restore_script(&quoted, "p/dump.sql.gz"),
+            &[("STUB_OBJECT", object_path)],
+        );
+        assert_eq!(code, 0, "{stderr}");
+        let applied = String::from_utf8(applied.expect("psql ran")).expect("utf-8");
+        assert!(
+            applied.contains("ALTER ROLE \"App-Admin\" WITH SUPERUSER LOGIN;\n"),
+            "{applied}"
+        );
+        assert!(
+            applied.contains("c2VydmVy"),
+            "the other login is left alone"
+        );
+    }
+
+    /// Nothing about the login is changed before the dump is applied: a
+    /// download that fails after the verify pass (the object changed or the
+    /// connection dropped) leaves the login's password as it was, so the
+    /// stored one still works. A failing filter fails the job with its own
+    /// code.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_restore_never_leaves_the_login_on_another_password() {
+        let script = restore_script(&target(), "p/dump.sql.gz");
+        assert_eq!(
+            script.matches("psql -X").count(),
+            1,
+            "psql runs once, only to apply the dump; the job itself never changes a role: \
+             {script}"
+        );
+        assert!(!script.contains("ALTER ROLE CURRENT_USER"), "{script}");
+        let s3 = S3JobTarget {
+            s3_source_id: 1,
+            bucket: "b".into(),
+            region: "us-east-1".into(),
+            endpoint: None,
+            force_path_style: false,
+            access_key_id: "a".into(),
+            secret_access_key: "s".into(),
+            session_token: None,
+        };
+        assert_eq!(
+            restore_env("target-secret", &s3),
+            job_env("target-secret", &s3),
+            "the job carries no other password than the target's"
+        );
+
+        let stubs = Stubs::with_walg_and_psql();
+        stubs.add("gunzip", "cat");
+        // The first fetch (the verify pass) succeeds, the second fails.
+        stubs.add(
+            "wal-g",
+            "count=\"$TMPDIR/fetches\"; n=$(cat \"$count\" 2>/dev/null || echo 0); \
+             echo $((n + 1)) > \"$count\"; cat \"$STUB_OBJECT\"; [ \"$n\" = 0 ] || exit 1",
+        );
+        let object = tempfile::NamedTempFile::new().expect("object");
+        std::fs::write(
+            object.path(),
+            b"ALTER ROLE app WITH LOGIN PASSWORD 'md5old';\n",
+        )
+        .expect("writing the object");
+        let object_path = object.path().to_str().expect("utf-8 path");
+        let (code, stderr, applied) = stubs.run(&script, &[("STUB_OBJECT", object_path)]);
+        assert_eq!(code, exit::DOWNLOAD_FAILED as i32, "{stderr}");
+        let applied = String::from_utf8(applied.unwrap_or_default()).expect("utf-8");
+        assert!(!applied.contains("md5old"), "{applied}");
+
+        let stubs = Stubs::with_walg_and_psql();
+        stubs.add("gunzip", "cat");
+        stubs.add("awk", "cat >/dev/null; exit 2");
+        let (code, stderr, _) = stubs.run(&script, &[("STUB_OBJECT", object_path)]);
+        assert_eq!(code, exit::KEEP_LOGIN_FAILED as i32, "{stderr}");
+        assert!(stderr.contains("awk exited 2"), "{stderr}");
+    }
+
+    #[test]
+    fn a_failed_login_filter_names_its_step() {
+        let status = temps_workload::WorkloadStatus {
+            phase: WorkloadPhase::Failed,
+            exit_code: Some(exit::KEEP_LOGIN_FAILED),
+            ..Default::default()
+        };
+        let error = failed(&target(), "restore", 9, &status, None);
+        assert!(
+            error
+                .to_string()
+                .contains("keeping the login on its own password"),
+            "{error}"
+        );
+    }
+
+    /// `psql` applies the dump with `ON_ERROR_STOP`, so a failed statement
+    /// fails the job instead of exiting 0 half applied, and the statements a
+    /// live server refuses by design reach it in a form that succeeds: the
+    /// existing role's `CREATE ROLE`, dropping the connected role, dropping a
+    /// database an application holds open. Runs the host's real `awk`.
+    #[cfg(unix)]
+    #[test]
+    fn the_dump_is_applied_with_on_error_stop_through_the_live_server_filter() {
+        let script = restore_script(&target(), "p/dump.sql.gz");
+        assert!(
+            script.contains("| psql -X -q -v ON_ERROR_STOP=1 --no-password "),
+            "{script}"
+        );
+        let stubs = Stubs::with_walg_and_psql();
+        stubs.add("gunzip", "cat");
+        let dump = "--\n-- PostgreSQL database cluster dump\n--\n\n\
+             DROP DATABASE IF EXISTS orders;\n\
+             DROP ROLE IF EXISTS app;\n\
+             CREATE ROLE app;\n\
+             ALTER ROLE app WITH LOGIN PASSWORD 'md5old';\n\
+             \\connect orders\n\
+             COPY public.notes (body) FROM stdin;\n\
+             CREATE ROLE app;\n\
+             \\.\n";
+        let object = tempfile::NamedTempFile::new().expect("object");
+        std::fs::write(object.path(), dump).expect("writing the object");
+        let object_path = object.path().to_str().expect("utf-8 path");
+        let (code, stderr, applied) = stubs.run(&script, &[("STUB_OBJECT", object_path)]);
+        assert_eq!(code, 0, "{stderr}");
+        let applied = String::from_utf8(applied.expect("psql ran")).expect("utf-8");
+        assert!(
+            applied.contains(
+                "SELECT pg_catalog.pg_terminate_backend(pid) FROM pg_catalog.pg_stat_activity \
+                 WHERE datname = 'orders' AND pid <> pg_catalog.pg_backend_pid();\n\
+                 DROP DATABASE IF EXISTS orders;\n"
+            ),
+            "{applied}"
+        );
+        assert!(
+            applied
+                .contains("DO $temps$ BEGIN DROP ROLE IF EXISTS app; EXCEPTION WHEN object_in_use"),
+            "{applied}"
+        );
+        assert!(
+            applied.contains(
+                "DO $temps$ BEGIN CREATE ROLE app; EXCEPTION WHEN duplicate_object THEN NULL; END $temps$;"
+            ),
+            "{applied}"
+        );
+        assert!(
+            applied.contains("ALTER ROLE app WITH LOGIN;\n"),
+            "{applied}"
+        );
+        assert!(
+            applied.contains("FROM stdin;\nCREATE ROLE app;\n\\.\n"),
+            "table data is never rewritten: {applied}"
+        );
+
+        // psql stopping at a failed statement fails the job.
+        let (code, stderr, _) = stubs.run(
+            &script,
+            &[("STUB_OBJECT", object_path), ("STUB_PSQL_RC", "3")],
+        );
+        assert_eq!(code, exit::APPLY_FAILED as i32, "{stderr}");
+        assert!(stderr.contains("first failed statement"), "{stderr}");
     }
 
     /// The reported failure itself, with the host's real `gunzip`: S3 serves
@@ -2349,6 +2708,12 @@ mod tests {
                     .expect("encryption"),
             ),
             plane: Arc::new(PlaneSlot::new()),
+            worker_credentials: Arc::new(
+                temps_providers::worker_s3_scope::WorkerCredentialScoper::new(Arc::new(
+                    temps_core::EncryptionService::new("test_encryption_key_1234567890ab")
+                        .expect("encryption"),
+                )),
+            ),
         });
         {
             let mut guard = AttemptGuard::new(attempt(jobs, &log), Arc::clone(&engine.abandoned));

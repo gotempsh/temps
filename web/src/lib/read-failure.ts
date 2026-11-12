@@ -26,6 +26,21 @@ export function isVerifiedNotFound(error: unknown): boolean {
   )
 }
 
+/**
+ * The server answered 403: this role may not do it. Unlike
+ * {@link isForbiddenRead} this leaves out 401 (the session ending, which has
+ * its own flow), and it also reads the status line copied onto the error, so a
+ * 403 whose body names neither a status nor a title is still recognised.
+ */
+export function isRoleRefusal(error: unknown): boolean {
+  const problem = extractProblemDetails(error)
+  return (
+    httpStatusOf(error) === 403 ||
+    problem?.status === 403 ||
+    problem?.title === 'Forbidden'
+  )
+}
+
 export function isForbiddenRead(error: unknown): boolean {
   const problem = extractProblemDetails(error)
   return (

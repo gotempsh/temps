@@ -99,6 +99,28 @@ const ALLOWED_FILTER_OPERATORS: [&str; 15] = [
     "$exists", "$type", "$regex",
 ];
 
+/// The one database a source is pinned to, or `None` when it may browse
+/// every non-system database.
+///
+/// The explicit scope wins, then the URI's `/dbname` segment; an empty name
+/// pins nothing. A system database pins nothing either: it is the login's
+/// authentication database (a managed MongoDB's `database` defaults to
+/// `admin`, where its root user lives), not a database the browser may open,
+/// so pinning to it would refuse every application database and list none.
+/// The server's root login reaches them all anyway; the system databases
+/// themselves stay refused by [`MongoDBSource::assert_database_allowed`].
+fn browse_scope(explicit: Option<&str>, from_uri: Option<String>) -> Option<String> {
+    explicit
+        .map(str::to_string)
+        .or(from_uri)
+        .filter(|database| !database.is_empty())
+        .filter(|database| {
+            !SYSTEM_DATABASES
+                .iter()
+                .any(|system| system.eq_ignore_ascii_case(database))
+        })
+}
+
 /// Maximum nesting depth of a filter document.
 ///
 /// Deep nesting is both a parser-stack risk and a way to hide an operator from
@@ -221,11 +243,7 @@ impl MongoDBSource {
         // not per-cluster, so direct connection is the correct semantic.
         client_options.direct_connection = Some(true);
 
-        // Explicit scope wins; fall back to the URI's `/dbname` segment.
-        let default_database = database
-            .map(str::to_string)
-            .or_else(|| client_options.default_database.clone())
-            .filter(|d| !d.is_empty());
+        let default_database = browse_scope(database, client_options.default_database.clone());
 
         let client = Client::with_options(client_options).map_err(|e| {
             error!("Failed to create MongoDB client: {}", e);
@@ -1191,26 +1209,111 @@ mod tests {
         // real connection — the guard looked right and never engaged. Assert on
         // the resolution rule directly, since constructing a source needs a
         // live server.
-        let from_uri_only: Option<String> = None;
-        let explicit = Some("app_prod");
-
-        let resolved = explicit
-            .map(str::to_string)
-            .or_else(|| from_uri_only.clone())
-            .filter(|d| !d.is_empty());
         assert_eq!(
-            resolved.as_deref(),
+            browse_scope(Some("app_prod"), None).as_deref(),
             Some("app_prod"),
             "an explicit scope must pin even when the URI carries no database"
         );
+        assert_eq!(
+            browse_scope(None, Some("from_uri".to_string())).as_deref(),
+            Some("from_uri")
+        );
+        assert_eq!(
+            browse_scope(Some("app_prod"), Some("from_uri".to_string())).as_deref(),
+            Some("app_prod")
+        );
 
         // An empty configured database must not be mistaken for a real pin.
-        let empty: Option<&str> = Some("");
-        let resolved_empty = empty
-            .map(str::to_string)
-            .or_else(|| from_uri_only.clone())
-            .filter(|d| !d.is_empty());
-        assert_eq!(resolved_empty, None);
+        assert_eq!(browse_scope(Some(""), None), None);
+    }
+
+    /// A managed MongoDB's configured database is `admin`, its root user's
+    /// authentication database: that pins nothing, so the browser lists and
+    /// opens the application databases, never the system ones.
+    #[test]
+    fn an_authentication_database_scope_pins_nothing() {
+        for system in ["admin", "ADMIN", "local", "config"] {
+            assert_eq!(browse_scope(Some(system), None), None, "{system}");
+            assert_eq!(
+                browse_scope(None, Some(system.to_string())),
+                None,
+                "{system}"
+            );
+        }
+    }
+
+    /// End to end against a real server, as the data browser connects to a
+    /// managed MongoDB (scoped to its configured `admin`): the root lists the
+    /// application databases and not the system ones, an application
+    /// database opens, and a system database is still refused.
+    #[tokio::test]
+    async fn real_mongodb_scoped_to_admin_browses_application_databases() -> anyhow::Result<()> {
+        let container = match GenericImage::new("mongo", "8")
+            .with_exposed_port(ContainerPort::Tcp(27017))
+            .with_wait_for(WaitFor::message_on_stdout("Waiting for connections"))
+            .start()
+            .await
+        {
+            Ok(container) => container,
+            Err(error) if container_runtime_unavailable(&error.to_string()) => {
+                eprintln!("Skipping Docker-dependent MongoDB browse test: {error}");
+                return Ok(());
+            }
+            Err(error) if mongodb_incompatible_with_host_kernel(&error.to_string()) => {
+                eprintln!(
+                    "Skipping MongoDB browse test: this MongoDB image does not run on the host \
+                     kernel (SERVER-121912): {error}"
+                );
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let host = container.get_host().await?;
+        let port = container.get_host_port_ipv4(27017).await?;
+        let url = format!("mongodb://{host}:{port}");
+        let mut source = None;
+        for _ in 0..20 {
+            match MongoDBSource::new_scoped(&url, Some("admin")).await {
+                Ok(connected) => {
+                    source = Some(connected);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(250)).await,
+            }
+        }
+        let source = source.ok_or_else(|| anyhow::anyhow!("MongoDB did not become reachable"))?;
+        source
+            .client
+            .database("shop_production")
+            .collection::<Document>("orders")
+            .insert_one(doc! { "order": 1_i32 })
+            .await?;
+
+        let databases: Vec<String> = source
+            .list_containers(&ContainerPath::root())
+            .await?
+            .into_iter()
+            .map(|container| container.name)
+            .collect();
+        assert!(
+            databases.contains(&"shop_production".to_string()),
+            "{databases:?}"
+        );
+        for system in SYSTEM_DATABASES {
+            assert!(!databases.contains(&system.to_string()), "{databases:?}");
+        }
+        let collections = source
+            .list_entities(&ContainerPath::from_slice(&["shop_production"]))
+            .await?;
+        assert!(
+            collections.iter().any(|c| c.name == "orders"),
+            "{collections:?}"
+        );
+        assert!(source
+            .list_entities(&ContainerPath::from_slice(&["admin"]))
+            .await
+            .is_err());
+        Ok(())
     }
 
     #[test]

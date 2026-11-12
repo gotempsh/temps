@@ -23,4 +23,13 @@ mod readiness;
 mod remote;
 mod runtime_limits;
 mod server_tls;
+mod stats_poll;
+mod wal_health;
+
 pub(super) use server_tls::ServiceTlsLocks;
+pub use stats_poll::{
+    cpu_utilization_percent, ContainerStatsBaseline, CpuLimit, PolledContainerStats,
+    CPU_LIMIT_REFRESH,
+};
+pub(crate) use wal_health::record_wal_outcome;
+pub use wal_health::{WalHealthReading, WalHealthUnchecked, WalProbeOutcome};

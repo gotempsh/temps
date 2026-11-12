@@ -10,7 +10,6 @@ import {
   deleteServiceMutation,
   getClusterHealthQueryKey,
   getProjectsOptions,
-  listS3SourcesOptions,
   getServiceOptions,
   getServicePreviewEnvironmentVariablesMaskedOptions,
   linkServiceToProjectMutation,
@@ -32,7 +31,6 @@ import { MonitoringCard } from '@/components/storage/MonitoringCard'
 import { EditServiceDialog } from '@/components/storage/EditServiceDialog'
 import { ServiceResourcesPanel } from '@/components/storage/ServiceResourcesPanel'
 import { ServiceTlsCard } from '@/components/storage/ServiceTlsCard'
-import { ServiceWorkloadModeCard } from '@/components/storage/ServiceWorkloadModeCard'
 import { ResponsivePagination } from '@/components/ui/responsive-pagination'
 import { MajorUpgradeDialog } from '@/components/storage/MajorUpgradeDialog'
 import {
@@ -40,6 +38,7 @@ import {
   ServiceHealthCard,
 } from '@/components/storage/ServiceHealthCard'
 import { WalHealthPanel } from '@/components/storage/WalHealthPanel'
+import { backupDestinationsOptions } from '@/components/storage/backup-destinations-query'
 import { TriggerBackupDialog } from '@/components/storage/TriggerBackupDialog'
 import {
   ScheduleBackupsAction,
@@ -370,7 +369,7 @@ export function ServiceDetail() {
   // Backup destinations decide whether the Backups card can offer to back
   // this database up or must onboard a destination first.
   const backupSourcesQuery = useQuery({
-    ...listS3SourcesOptions(),
+    ...backupDestinationsOptions(),
     retry: false,
   })
   const backupSources = backupSourcesQuery.data ?? []
@@ -1063,7 +1062,13 @@ export function ServiceDetail() {
               <WalHealthPanel
                 serviceId={parseInt(id!)}
                 serviceType={service.service.service_type}
-                onUpgrade={() => setIsUpgradeDialogOpen(true)}
+                // A service on a worker node cannot change its image here
+                // (the server refuses it), so it gets no upgrade action.
+                onUpgrade={
+                  service.service.node_id
+                    ? undefined
+                    : () => setIsUpgradeDialogOpen(true)
+                }
                 onBackup={() => setIsBackupDialogOpen(true)}
                 isImported={!!service.current_parameters?.container_name}
               />
@@ -1078,6 +1083,7 @@ export function ServiceDetail() {
                 }
                 metricsEnabled={service.service.metrics_enabled ?? false}
                 onMonitoringChange={() => refetch()}
+                cluster={service.service.topology === 'cluster'}
               />
             )}
 
@@ -1326,16 +1332,6 @@ export function ServiceDetail() {
                 serviceStatus={service.service.status}
               />
             )}
-
-            {/*
-              How the database's container is built (ADR-055 workload plane)
-              and the recreate from its workload spec. Instance-admin only;
-              other roles see what it is and who can change it.
-            */}
-            <ServiceWorkloadModeCard
-              serviceId={service.service.id}
-              serviceName={service.service.name}
-            />
 
             {/* Backups Section */}
             <Card id={SERVICE_BACKUPS_ANCHOR} className="scroll-mt-20">

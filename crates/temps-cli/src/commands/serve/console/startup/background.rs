@@ -327,6 +327,32 @@ async fn start_metrics_pipeline(
                 );
                 tokio::spawn(worker_metrics.run());
 
+                // ADR-095: internal DNS observability. Registered before
+                // the routes are built, so the Settings → DNS handlers read
+                // the same store the collector writes. Node 0 reports from
+                // the proxy process (`serve/proxy.rs`).
+                let dns_observability = Arc::new(temps_dns::DnsObservabilityService::new(
+                    db.clone(),
+                    metrics_store.clone(),
+                ));
+                service_context.register_service(dns_observability.clone());
+                let cluster_dns = Arc::new(
+                    temps_deployments::services::cluster_dns::ClusterDnsService::new(
+                        db.clone(),
+                        dns_observability,
+                        cfg_svc.clone(),
+                        enc_svc.clone(),
+                    ),
+                );
+                tokio::spawn(
+                    temps_deployments::services::cluster_dns::ClusterDnsCollector::new(
+                        db.clone(),
+                        cluster_dns,
+                        alarm_service.clone(),
+                    )
+                    .run(),
+                );
+
                 let mut scraper =
                     MetricsScraper::new(db.clone(), metrics_store.clone(), cfg_svc, enc_svc);
                 // HA clusters are scraped at their elected primary, which

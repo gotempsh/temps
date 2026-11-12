@@ -40,6 +40,7 @@
 //! }
 //! ```
 
+pub mod cp_dns_report;
 pub mod cp_resolver;
 pub mod errors;
 pub mod handlers;
@@ -50,6 +51,7 @@ pub mod proxy_sync;
 pub mod services;
 
 // Re-export main types
+pub use cp_dns_report::{control_plane_report, ControlPlaneDnsReporter, CP_REPORT_INTERVAL};
 pub use cp_resolver::{
     probe_control_plane_resolver, start_control_plane_resolver,
     start_control_plane_resolver_with_config, ControlPlaneResolver, OverlayDnsSlot,
@@ -64,6 +66,7 @@ pub use providers::{
     PebbleCredentials, PebbleDnsProvider, ProviderCredentials,
 };
 pub use proxy_sync::{proxy_dns_sync_router, start_proxy_dns_sync_service, ProxyDnsSyncError};
+pub use services::observability::{DnsObservabilityError, DnsObservabilityService};
 pub use services::{
     ChangeSet, DeploymentDnsPublisher, DnsOperationResult, DnsProviderService, DnsRecordService,
     DnsRegistry, DnsRegistryError, EndpointDraft, ManagedDnsRecordService, ManualDnsInstructions,

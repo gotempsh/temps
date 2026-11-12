@@ -218,12 +218,12 @@ pub fn reachability_warning(facts: &WarningFacts<'_>) -> Option<ReachabilityWarn
     }
     let reason = no_address_reason(facts.addresses)?;
     let mut fixes = Vec::new();
-    if let Some(tunnel) = facts.tunnels.first() {
+    for tunnel in facts.tunnels {
         fixes.push(ReachabilityFix {
             kind: ReachabilityFixKind::TunnelEnvironmentHosts,
             label: format!(
-                "Publish it through tunnel '{}' as {}",
-                tunnel.name, tunnel.hostname
+                "Add domain {} through tunnel '{}'",
+                tunnel.hostname, tunnel.name
             ),
             href: Some(INGRESS_SETUP_PATH.to_string()),
             command: None,
@@ -247,6 +247,11 @@ pub fn reachability_warning(facts: &WarningFacts<'_>) -> Option<ReachabilityWarn
         connector_id: None,
         hostname: None,
     });
+    // With public ingress already configured, adding this environment's domain
+    // is a smaller change than configuring an installation-wide wildcard.
+    if facts.tunnels.is_empty() && facts.public_ingress {
+        fixes.swap(0, 1);
+    }
     if !facts.public_ingress {
         fixes.push(ReachabilityFix {
             kind: ReachabilityFixKind::WorkerIngress,
@@ -260,7 +265,7 @@ pub fn reachability_warning(facts: &WarningFacts<'_>) -> Option<ReachabilityWarn
     Some(ReachabilityWarning {
         environment_id: facts.environment_id,
         environment: facts.label.to_string(),
-        headline: format!("Deployed, but nobody can reach {} yet", facts.label),
+        headline: format!("Make {} reachable", facts.label),
         reason,
         fixes,
     })
@@ -598,6 +603,38 @@ mod tests {
     }
 
     #[test]
+    fn every_tunnel_zone_is_offered_in_preference_order() {
+        let local = [public(
+            "app.localho.st",
+            AddressSource::Generated,
+            ReachState::NotReachable,
+        )];
+        let tunnels = [
+            TunnelOffer {
+                connector_id: 7,
+                name: "preferred".into(),
+                hostname: "app.example.com".into(),
+            },
+            TunnelOffer {
+                connector_id: 3,
+                name: "other".into(),
+                hostname: "app.example.org".into(),
+            },
+        ];
+        let warning = reachability_warning(&warning_facts(&local, &tunnels)).expect("warning");
+        let ids: Vec<_> = warning
+            .fixes
+            .iter()
+            .filter_map(|f| f.connector_id)
+            .collect();
+        assert_eq!(ids, vec![7, 3]);
+        assert_eq!(
+            warning.fixes[0].label,
+            "Add domain app.example.com through tunnel 'preferred'"
+        );
+    }
+
+    #[test]
     fn a_deploy_nobody_can_open_warns_with_the_fixes_in_order() {
         let local = [public(
             "hello-temps-production.localho.st",
@@ -610,10 +647,7 @@ mod tests {
             hostname: "hello-temps-production.example.com".into(),
         }];
         let warning = reachability_warning(&warning_facts(&local, &tunnels)).expect("warning");
-        assert_eq!(
-            warning.headline,
-            "Deployed, but nobody can reach hello-temps-production yet"
-        );
+        assert_eq!(warning.headline, "Make hello-temps-production reachable");
         assert_eq!(warning.reason, "hello-temps-production.localho.st reason");
         let kinds: Vec<_> = warning.fixes.iter().map(|f| f.kind).collect();
         assert_eq!(
@@ -629,6 +663,9 @@ mod tests {
             warning.fixes[2].href.as_deref(),
             Some("/projects/hello-temps/settings/domains")
         );
+
+        let direct = reachability_warning(&warning_facts(&local, &[])).expect("warning");
+        assert_eq!(direct.fixes[0].kind, ReachabilityFixKind::CustomDomain);
 
         // No tunnel, no public ingress: the worker command comes last.
         let mut facts = warning_facts(&local, &[]);

@@ -38,27 +38,28 @@ use async_trait::async_trait;
 use aws_sdk_s3::Client as S3Client;
 use sea_orm::{DatabaseConnection, EntityTrait};
 use serde_json::{json, Value};
-use temps_docker_util::{
-    exec_capture, DockerUtilError, ExecCaptureOptions, ExitCodePolicy, OutputLimit,
-    StreamErrorPolicy,
+use temps_providers::externalsvc::mariadb_node as node_half;
+use temps_providers::remote_service_client::{
+    MariadbBinlogCoordinate, MariadbPhysicalBackupResult,
 };
 use tracing::{info, warn};
 
 use super::dispatch::service_container_name;
-use super::mariadb_exec::BinlogCoord;
-use super::postgres_walg::run_walg_exec;
 use super::v2_common;
 use crate::execution::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
 
 pub(crate) const ENGINE_KEY: &str = "mariadb_physical";
-const WALG_STREAM_CREATE_COMMAND: &str = "sh -ceu 'if command -v mariadb-backup >/dev/null 2>&1; then BK=mariadb-backup; else BK=mariabackup; fi; rm -rf /var/tmp/temps-mariadb-backup; mkdir -p /var/tmp/temps-mariadb-backup; exec \"$BK\" --backup --stream=mbstream --target-dir=/var/tmp/temps-mariadb-backup --user=root --host=127.0.0.1'";
-const WALG_STREAM_RESTORE_COMMAND: &str = "mbstream -x -C /data";
-const WALG_PREPARE_COMMAND: &str = "mariadb-backup --prepare --target-dir=/data";
 
 pub struct MariadbPhysicalDeps {
     pub db: Arc<DatabaseConnection>,
     pub encryption_service: Arc<temps_core::EncryptionService>,
-    pub docker: bollard::Docker,
+    /// This host's Docker, for services on this host. `None` on a server
+    /// without one, which backs up only services on worker nodes.
+    pub docker: Option<bollard::Docker>,
+    /// Reaches a worker service's node through its agent.
+    pub manager: Arc<temps_providers::ExternalServiceManager>,
+    /// Derives the per-job credential a worker's agent receives (ADR-102).
+    pub worker_credentials: Arc<temps_providers::worker_s3_scope::WorkerCredentialScoper>,
 }
 
 pub struct MariadbPhysicalEngine {
@@ -125,15 +126,12 @@ impl BackupEngine for MariadbPhysicalEngine {
         v2_common::assert_bucket_reachable(&s3_client, &s3_source.bucket_name).await?;
 
         let backup_uuid = v2_common::load_backup_uuid(deps.db.as_ref(), backup_id).await?;
-        let bucket_path = s3_source.bucket_path.trim_matches('/');
-        let service_root = format!("external_services/mariadb/{}/walg", service.name);
-        let repository_key = if bucket_path.is_empty() {
-            service_root
-        } else {
-            format!("{bucket_path}/{service_root}")
-        };
-        let walg_prefix = format!("s3://{}/{}", s3_source.bucket_name, repository_key);
-        let list_prefix = format!("{repository_key}/");
+        let walg_prefix = node_half::walg_prefix(
+            &s3_source.bucket_name,
+            &s3_source.bucket_path,
+            &service.name,
+        );
+        let list_prefix = node_half::walg_key_prefix(&s3_source.bucket_path, &service.name);
 
         info!(
             backup_id,
@@ -149,72 +147,31 @@ impl BackupEngine for MariadbPhysicalEngine {
         )?;
         let root_password = root_password_from_config(service_id, &config_json)?;
 
-        let container_name = service_container_name(&service);
-        let access_key = deps
-            .encryption_service
-            .decrypt_string(&s3_source.access_key_id)
-            .map_err(|error| BackupError::PermanentFailure {
-                reason: format!("decrypt MariaDB WAL-G access key: {error}"),
-            })?;
-        let secret_key = deps
-            .encryption_service
-            .decrypt_string(&s3_source.secret_key)
-            .map_err(|error| BackupError::PermanentFailure {
-                reason: format!("decrypt MariaDB WAL-G secret key: {error}"),
-            })?;
-        let session_token = v2_common::decrypt_session_token(&s3_source, &deps.encryption_service)?;
-        let container_endpoint = temps_providers::externalsvc::S3Credentials {
-            access_key_id: access_key.clone(),
-            secret_key: secret_key.clone(),
-            session_token: session_token.clone(),
-            region: s3_source.region.clone(),
-            endpoint: s3_source.endpoint.clone(),
-            bucket_name: s3_source.bucket_name.clone(),
-            bucket_path: s3_source.bucket_path.clone(),
-            force_path_style: s3_source.force_path_style.unwrap_or(true),
-        }
-        .resolve_endpoint_for_container(&deps.docker, &container_name)
-        .await;
-        let mut env = build_walg_env(
-            &walg_prefix,
-            &s3_source.region,
-            &access_key,
-            &secret_key,
-            session_token.as_deref(),
-            &root_password,
-            &backup_uuid,
-        );
-        if let Some(endpoint) = container_endpoint {
-            env.push(format!(
-                "AWS_ENDPOINT={}",
-                if endpoint.starts_with("http") {
-                    endpoint
-                } else {
-                    format!("http://{endpoint}")
-                }
-            ));
-        }
-        if s3_source.force_path_style.unwrap_or(true) {
-            env.push("AWS_S3_FORCE_PATH_STYLE=true".into());
-        }
-
-        let exec = run_walg_exec(
-            &deps.docker,
-            &container_name,
-            "wal-g backup-push",
-            &env,
-            &ctx.cancel,
-        )
-        .await?;
-        if exec.exit_code != 0 {
-            return Err(BackupError::Failed {
-                reason: format!(
-                    "MariaDB wal-g backup-push exited with code {}. stderr: {}",
-                    exec.exit_code,
-                    stderr_tail(&exec.stderr),
-                ),
-            });
-        }
+        let coord = match super::workload_job::worker_node(&service) {
+            None => {
+                physical_backup_on_this_host(
+                    &deps,
+                    ctx,
+                    &service,
+                    &s3_source,
+                    root_password,
+                    &backup_uuid,
+                )
+                .await?
+            }
+            Some(node_id) => {
+                physical_backup_on_worker(
+                    &deps,
+                    ctx,
+                    &service,
+                    node_id,
+                    s3_source_id,
+                    &s3_source.bucket_path,
+                    &backup_uuid,
+                )
+                .await?
+            }
+        };
         let file_size =
             list_total_s3_size(&s3_client, &s3_source.bucket_name, &list_prefix).await?;
         if file_size <= 0 {
@@ -227,12 +184,6 @@ impl BackupEngine for MariadbPhysicalEngine {
         // Binlog coordinates anchor PITR replay. Absence means binary logging
         // is off on the source — the base is still a valid full backup, but
         // PITR will not be possible until binlog archiving is enabled.
-        let coord = query_binlog_status(&deps.docker, &container_name, &root_password)
-            .await
-            .unwrap_or_else(|e| {
-                warn!(backup_id, error = %e, "mariadb: could not query binlog status");
-                None
-            });
         match &coord {
             Some(c) => info!(
                 backup_id,
@@ -288,16 +239,6 @@ impl BackupEngine for MariadbPhysicalEngine {
     }
 }
 
-fn stderr_tail(stderr: &str) -> String {
-    const TAIL: usize = 2000;
-    let trimmed = stderr.trim();
-    if trimmed.len() <= TAIL {
-        return trimmed.to_string();
-    }
-    let start = trimmed.len() - TAIL;
-    format!("…{}", &trimmed[start..])
-}
-
 fn decrypt_service_config(
     encryption: &temps_core::EncryptionService,
     service_id: i32,
@@ -332,113 +273,142 @@ fn root_password_from_config(service_id: i32, config_json: &str) -> Result<Strin
         })
 }
 
-fn build_walg_env(
-    prefix: &str,
-    region: &str,
-    access_key: &str,
-    secret_key: &str,
-    session_token: Option<&str>,
-    root_password: &str,
+/// The node half, here, against this host's Docker.
+async fn physical_backup_on_this_host(
+    deps: &MariadbPhysicalDeps,
+    ctx: &BackupContext,
+    service: &temps_entities::external_services::Model,
+    s3_source: &temps_entities::s3_sources::Model,
+    root_password: String,
     backup_uuid: &str,
-) -> Vec<String> {
-    let mut env = vec![
-        format!("WALG_S3_PREFIX={prefix}"),
-        format!("AWS_ACCESS_KEY_ID={access_key}"),
-        format!("AWS_SECRET_ACCESS_KEY={secret_key}"),
-        format!("AWS_REGION={region}"),
-        format!("MYSQL_PWD={root_password}"),
-        format!("MARIADB_PWD={root_password}"),
-        format!("WALG_MYSQL_DATASOURCE_NAME=root:{root_password}@tcp(127.0.0.1:3306)/mysql"),
-        format!("WALG_STREAM_CREATE_COMMAND={WALG_STREAM_CREATE_COMMAND}"),
-        format!("WALG_STREAM_RESTORE_COMMAND={WALG_STREAM_RESTORE_COMMAND}"),
-        format!("WALG_MYSQL_BACKUP_PREPARE_COMMAND={WALG_PREPARE_COMMAND}"),
-        "WALG_UPLOAD_CONCURRENCY=4".into(),
-        "WALG_UPLOAD_DISK_CONCURRENCY=1".into(),
-        "WALG_UPLOAD_QUEUE=2".into(),
-        "WALG_TAR_SIZE_THRESHOLD=134217728".into(),
-    ];
-    // Only a temporary (STS-style) credential contributes an
-    // `AWS_SESSION_TOKEN`; for a long-lived one the variable is absent, not
-    // empty, so the container environment is unchanged.
-    env.extend(temps_providers::externalsvc::aws_session_token_env(
-        session_token,
-    ));
-    env.extend(v2_common::walg_identity_env(backup_uuid));
-    env
-}
-
-/// Query the binlog coordinates at (approximately) base-backup time, by
-/// running `SHOW BINLOG STATUS` and `SELECT @@global.gtid_binlog_pos`
-/// directly against the live server.
-///
-/// The credential goes through the exec `env` (`MYSQL_PWD`), never the `cmd`
-/// argv, so it never leaks via `ps`/`/proc/<pid>/cmdline` — same convention
-/// as every other exec in this module. Returns `Ok(None)` (not an error) when
-/// binary logging is off on the source: the base backup is still valid, PITR
-/// just is not possible until archiving is enabled.
-async fn query_binlog_status(
-    docker: &bollard::Docker,
-    container_name: &str,
-    root_password: &str,
-) -> Result<Option<BinlogCoord>, BackupError> {
-    let mysql_pwd = format!("MYSQL_PWD={root_password}");
-    let captured = exec_capture(
+) -> Result<Option<MariadbBinlogCoordinate>, BackupError> {
+    let Some(docker) = deps.docker.as_ref() else {
+        return Err(BackupError::PermanentFailure {
+            reason: format!(
+                "MariaDB service {} ('{}') runs on this server, which has no Docker daemon to \
+                 run its physical backup in",
+                service.id, service.name
+            ),
+        });
+    };
+    let decrypt = |field: &str, value: &str| {
+        deps.encryption_service
+            .decrypt_string(value)
+            .map_err(|error| BackupError::PermanentFailure {
+                reason: format!("decrypt MariaDB WAL-G {field}: {error}"),
+            })
+    };
+    let s3 = temps_providers::externalsvc::S3Credentials {
+        access_key_id: decrypt("access key", &s3_source.access_key_id)?,
+        secret_key: decrypt("secret key", &s3_source.secret_key)?,
+        session_token: v2_common::decrypt_session_token(s3_source, &deps.encryption_service)?,
+        region: s3_source.region.clone(),
+        endpoint: s3_source.endpoint.clone(),
+        bucket_name: s3_source.bucket_name.clone(),
+        bucket_path: s3_source.bucket_path.clone(),
+        force_path_style: s3_source.force_path_style.unwrap_or(true),
+    };
+    node_half::physical_backup(
         docker,
-        container_name,
-        bollard::exec::CreateExecOptions {
-            cmd: Some(vec![
-                "mariadb",
-                "-N",
-                "-B",
-                "--user=root",
-                "--host=127.0.0.1",
-                "-e",
-                "SHOW BINLOG STATUS; SELECT @@global.gtid_binlog_pos",
-            ]),
-            env: Some(vec![mysql_pwd.as_str()]),
-            attach_stdout: Some(true),
-            attach_stderr: Some(false),
-            ..Default::default()
+        &node_half::MariadbPhysicalBackup {
+            service_id: service.id,
+            container_name: service_container_name(service),
+            root_password,
+            s3,
+            backup_uuid: backup_uuid.to_string(),
         },
-        ExecCaptureOptions::separate(OutputLimit::Unbounded, OutputLimit::Head(0))
-            .stream_errors(StreamErrorPolicy::Stop)
-            .exit_code(ExitCodePolicy::NotRead),
+        &service.name,
+        &ctx.cancel,
     )
     .await
-    .map_err(|error| {
-        let stage = match &error {
-            DockerUtilError::ExecCreate { .. } => "create",
-            _ => "start",
-        };
-        BackupError::Failed {
-            reason: format!(
-                "{stage} exec for binlog status on {container_name}: {}",
-                error.cause_text()
-            ),
-        }
-    })?;
-    let output = captured.stdout;
+    .map_err(node_error)
+}
 
-    // Line 1 (batch/tab-separated, no header thanks to -N -B):
-    //   <file>\t<position>\t<binlog_do_db>\t<binlog_ignore_db>
-    // Line 2: the gtid_binlog_pos value, or empty when GTID is unused.
-    let mut lines = output.lines();
-    let Some(status_line) = lines.next() else {
-        return Ok(None);
+/// The node half, on the worker that runs the service, by its agent.
+async fn physical_backup_on_worker(
+    deps: &MariadbPhysicalDeps,
+    ctx: &BackupContext,
+    service: &temps_entities::external_services::Model,
+    node_id: i32,
+    s3_source_id: i32,
+    bucket_path: &str,
+    backup_uuid: &str,
+) -> Result<Option<MariadbBinlogCoordinate>, BackupError> {
+    // A credential for the service's WAL-G repository only (ADR-102), the
+    // one prefix `wal-g backup-push` writes.
+    let mint = || {
+        super::worker_agent::scoped_destination(
+            &deps.worker_credentials,
+            deps.db.as_ref(),
+            s3_source_id,
+            temps_providers::worker_s3_scope::WorkerS3Grant::job(
+                service.id,
+                node_id,
+                node_half::walg_key_prefix(bucket_path, &service.name),
+                temps_core::ScopedS3Access::Write,
+                "backup",
+            ),
+            "backup",
+        )
     };
-    let mut fields = status_line.split('\t');
-    let (Some(file), Some(position)) = (fields.next(), fields.next()) else {
-        return Ok(None);
-    };
-    if file.is_empty() || position.is_empty() {
-        return Ok(None);
+    let target = mint().await?;
+    // A try after a wait for a slot gets a credential minted after it.
+    let request = crate::node_busy::retry_while_node_busy_with_fresh_credential(
+        &crate::node_busy::NodeBusyPolicy::DEFAULT,
+        target,
+        mint,
+        |target| {
+            deps.manager.mariadb_physical_backup_worker(
+                service.id,
+                target,
+                bucket_path.to_string(),
+                backup_uuid.to_string(),
+            )
+        },
+        |wait| super::worker_agent::wait_for_node_slot_minting(ctx.backup_id, service.id, wait),
+    );
+    let result = tokio::select! {
+        // Dropping the request ends it on the node too.
+        _ = ctx.cancel.cancelled() => return Err(BackupError::Cancelled),
+        result = request => result?,
     }
-    let gtid = lines.next().unwrap_or_default().trim().to_string();
-    Ok(Some(BinlogCoord {
-        file: file.to_string(),
-        position: position.to_string(),
-        gtid,
-    }))
+    .map_err(|e| BackupError::Failed {
+        reason: format!(
+            "MariaDB physical backup of service {} ('{}') on node {node_id}: {e}",
+            service.id, service.name
+        ),
+    })?;
+    match result {
+        MariadbPhysicalBackupResult::Completed { binlog } => Ok(binlog),
+        MariadbPhysicalBackupResult::Refused { reason } => Err(BackupError::PermanentFailure {
+            reason: format!(
+                "MariaDB physical backup of service {} ('{}') on node {node_id}: {reason}",
+                service.id, service.name
+            ),
+        }),
+        MariadbPhysicalBackupResult::Failed { reason } => Err(BackupError::Failed {
+            reason: format!(
+                "MariaDB physical backup of service {} ('{}') on node {node_id}: {reason}",
+                service.id, service.name
+            ),
+        }),
+    }
+}
+
+/// The node half's error as the executor's: a refusal is final, a
+/// cancellation is a cancellation, the rest may succeed on a retry.
+pub(crate) fn node_error(error: node_half::MariadbNodeError) -> BackupError {
+    if error.is_cancelled() {
+        BackupError::Cancelled
+    } else if error.is_refusal() {
+        BackupError::PermanentFailure {
+            reason: error.to_string(),
+        }
+    } else {
+        BackupError::Failed {
+            reason: error.to_string(),
+        }
+    }
 }
 
 async fn list_total_s3_size(
@@ -475,92 +445,6 @@ async fn list_total_s3_size(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// PR #149 invariant: the base-backup shell must not contain credentials.
-    /// Connection auth flows through `MYSQL_PWD` in the exec env.
-    #[test]
-    fn walg_stream_command_contains_no_credentials() {
-        // The stream command is a const with no interpolation — guard against a
-        // future refactor hardcoding a password flag. (We can't assert
-        // `!contains("-p")` because `mkdir -p` is a legitimate, benign use.)
-        assert!(!WALG_STREAM_CREATE_COMMAND.contains("MYSQL_PWD"));
-        assert!(!WALG_STREAM_CREATE_COMMAND.contains("--password"));
-        // No mysql-style short password flag (`-p<value>` / `-p'...'`).
-        assert!(!WALG_STREAM_CREATE_COMMAND.contains("-p'"));
-        assert!(!WALG_STREAM_CREATE_COMMAND.contains("-p\""));
-        assert!(WALG_STREAM_CREATE_COMMAND.contains("--user=root"));
-        assert!(WALG_STREAM_CREATE_COMMAND.contains("--stream=mbstream"));
-    }
-
-    #[test]
-    fn walg_env_keeps_password_out_of_commands() {
-        let password = "p4ss-word";
-        let env = build_walg_env(
-            "s3://bucket/path",
-            "auto",
-            "access",
-            "secret",
-            None,
-            password,
-            "id",
-        );
-        let stream = env
-            .iter()
-            .find(|value| value.starts_with("WALG_STREAM_CREATE_COMMAND="))
-            .unwrap();
-        assert!(!stream.contains(password));
-        assert!(env
-            .iter()
-            .any(|value| value == &format!("MYSQL_PWD={password}")));
-        assert!(env.iter().any(|value| value.contains("root:p4ss-word@tcp")));
-    }
-
-    /// The zero-change guarantee for an operator-configured S3 source: the
-    /// `mariabackup`/WAL-G container gets no `AWS_SESSION_TOKEN` at all.
-    #[test]
-    fn walg_env_omits_the_session_token_for_a_long_lived_credential() {
-        let env = build_walg_env(
-            "s3://bucket/path",
-            "auto",
-            "access",
-            "secret",
-            None,
-            "password",
-            "id",
-        );
-        assert!(!env
-            .iter()
-            .any(|value| value.starts_with("AWS_SESSION_TOKEN")));
-    }
-
-    #[test]
-    fn walg_env_carries_a_session_token_for_a_temporary_credential() {
-        let env = build_walg_env(
-            "s3://bucket/path",
-            "auto",
-            "access",
-            "secret",
-            Some("sts-session-token"),
-            "password",
-            "id",
-        );
-        assert!(env
-            .iter()
-            .any(|value| value == "AWS_SESSION_TOKEN=sts-session-token"));
-        // The other two must still be there, in the same form as before.
-        assert!(env.iter().any(|value| value == "AWS_ACCESS_KEY_ID=access"));
-        assert!(env
-            .iter()
-            .any(|value| value == "AWS_SECRET_ACCESS_KEY=secret"));
-    }
-
-    #[test]
-    fn stderr_tail_truncates_long_output() {
-        let long = "x".repeat(5000);
-        let tail = stderr_tail(&long);
-        assert!(tail.starts_with('…'));
-        assert!(tail.len() < 5000);
-    }
 
     #[test]
     fn wrong_encryption_key_is_a_contextual_permanent_failure() {

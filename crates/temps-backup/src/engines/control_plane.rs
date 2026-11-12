@@ -18,7 +18,9 @@
 //!    the same two commands run as host processes instead, using the
 //!    `pg_dumpall`/`pg_dump` on `PATH` if their major is at least the
 //!    server's (see [`super::control_plane_host`]). A reachable daemon always
-//!    takes the sidecar path, so installs with Docker are unaffected.
+//!    takes the sidecar path, so installs with Docker are unaffected. A
+//!    server started without Docker at all (a microVM control plane,
+//!    ADR-100) goes straight to the host tools.
 //! 3. Upload the resulting `.sql.gz` to S3 (single-part or multipart).
 //! 4. Write a `metadata.json` companion object.
 //!
@@ -48,10 +50,12 @@ use sea_orm::DatabaseConnection;
 use tracing::{info, warn};
 
 use super::control_plane_host::{
-    run_host_dump, select_dump_runner, DumpRunner, HostDumpRequest, LocalDumpToolProbe,
+    run_host_dump, select_dump_runner, DumpRunner, DumpToolProbe, HostDumpRequest,
+    LocalDumpToolProbe, PG_DUMP, PG_DUMPALL,
 };
 use super::dump_capture::{capture_dump, CaptureRequest, DumpAttempt, DumpCaptureError};
 use super::oneshot::OneShotSpec;
+use super::pg_client_tools::{self, HostToolProbe};
 use super::v2_common;
 use crate::execution::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
 
@@ -111,6 +115,24 @@ pub struct ControlPlaneDeps {
     pub db: Arc<DatabaseConnection>,
     pub encryption_service: Arc<temps_core::EncryptionService>,
     pub config_service: Arc<temps_config::ConfigService>,
+    /// This server's Docker daemon, for the dump sidecar. `None` on a server
+    /// without one: the dump then runs from the local PostgreSQL client.
+    pub docker: Option<bollard::Docker>,
+}
+
+/// The probe for a server started without Docker (ADR-100): no daemon to
+/// try, so the dump goes straight to this host's PostgreSQL client tools.
+struct NoDockerProbe;
+
+#[async_trait]
+impl DumpToolProbe for NoDockerProbe {
+    async fn docker(&self) -> Result<(), String> {
+        Err("this server runs without Docker".to_string())
+    }
+
+    async fn host_tool(&self, program: &'static str) -> HostToolProbe {
+        pg_client_tools::probe_host_tool(program).await
+    }
 }
 
 // ── Engine ────────────────────────────────────────────────────────────────────
@@ -139,6 +161,18 @@ impl BackupEngine for ControlPlaneEngine {
 
         // ── Params + S3 client ───────────────────────────────────────────────
         let s3_source_id = v2_common::require_i32_param(&ctx.params, "s3_source_id")?;
+
+        // Match the running server's major so the dump tools are
+        // version-compatible, and settle how the dump runs before any other
+        // work: without Docker and without a usable client nothing below can
+        // succeed, so say so now.
+        let server_major = detect_postgres_major(&deps).await;
+        // Docker whenever its daemon answers; host client tools only when it
+        // does not, or when this server was started without Docker at all.
+        let runner = match &deps.docker {
+            Some(_) => select_dump_runner(&LocalDumpToolProbe, server_major).await?,
+            None => select_dump_runner(&NoDockerProbe, server_major).await?,
+        };
         let (s3_source, s3_client) = v2_common::load_and_build_s3_client(
             deps.db.as_ref(),
             &deps.encryption_service,
@@ -163,11 +197,6 @@ impl BackupEngine for ControlPlaneEngine {
         let target =
             ControlPlaneTarget::from_database_url(&deps.config_service.get_database_url())?;
 
-        // Match the running server's major so pg_dumpall is version-compatible.
-        let server_major = detect_postgres_major(&deps).await;
-        // Docker whenever its daemon answers (the sidecar path below is
-        // unchanged); host client tools only when it does not.
-        let runner = select_dump_runner(&LocalDumpToolProbe, server_major).await?;
         let image_tag = format!("postgres:{}", server_major);
         if runner == DumpRunner::Docker {
             super::image_pull::ensure_image_pulled_v2(&image_tag, ENGINE_KEY).await?;
@@ -205,11 +234,14 @@ impl BackupEngine for ControlPlaneEngine {
                     &excluded.patterns,
                 );
 
-                let docker = bollard::Docker::connect_with_local_defaults().map_err(|e| {
-                    BackupError::Failed {
-                        reason: format!("failed to connect to Docker: {}", e),
-                    }
-                })?;
+                let docker = match &deps.docker {
+                    Some(docker) => docker.clone(),
+                    None => bollard::Docker::connect_with_local_defaults().map_err(|e| {
+                        BackupError::Failed {
+                            reason: format!("failed to connect to Docker: {}", e),
+                        }
+                    })?,
+                };
 
                 capture_dump(
                     &docker,
@@ -331,6 +363,36 @@ impl BackupEngine for ControlPlaneEngine {
             size_bytes: Some(file_size),
             compression: "gzip".to_string(),
         })
+    }
+}
+
+/// What control-plane backups will do on a server without Docker, for the
+/// startup log: probes this server's PostgreSQL client once.
+pub(crate) async fn no_docker_summary() -> String {
+    let mut found = Vec::new();
+    let mut problems = Vec::new();
+    for tool in [PG_DUMP, PG_DUMPALL] {
+        match NoDockerProbe.host_tool(tool).await {
+            HostToolProbe::Found(t) => found.push(format!("{tool} {}", t.major)),
+            HostToolProbe::Unusable { binary, reason } => problems.push(format!(
+                "`{tool}` at {} is not usable: {reason}",
+                binary.display()
+            )),
+            HostToolProbe::Missing => problems.push(format!("there is no `{tool}` on PATH")),
+        }
+    }
+    if problems.is_empty() {
+        format!(
+            "control_plane backups run with this server's PostgreSQL client ({}), which must \
+             be at least the database's major version",
+            found.join(", ")
+        )
+    } else {
+        format!(
+            "control_plane backups will fail: there is no Docker to run the dump image and {}; \
+             install the PostgreSQL client tools of the database's major version on this server",
+            problems.join(" and ")
+        )
     }
 }
 
@@ -563,6 +625,9 @@ pub async fn resolve_excluded_data(db: &DatabaseConnection) -> Result<ExcludedDa
     Ok(ExcludedData { tables, patterns })
 }
 
+/// Major version assumed when the server's cannot be read.
+const DEFAULT_PG_MAJOR: u32 = 18;
+
 /// Detect the PostgreSQL major version via `current_setting('server_version')`.
 /// Falls back to `18` if detection fails — pg_dumpall is
 /// backwards-compatible so the worst case is a slightly-wrong sidecar tag
@@ -589,10 +654,12 @@ async fn detect_postgres_major(deps: &ControlPlaneDeps) -> u32 {
             .split('.')
             .next()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(18),
+            .unwrap_or(DEFAULT_PG_MAJOR),
         Ok(None) | Err(_) => {
-            warn!("ControlPlaneEngine: could not detect PG version, defaulting to pg18");
-            18
+            warn!(
+                "ControlPlaneEngine: could not detect PG version, defaulting to pg{DEFAULT_PG_MAJOR}"
+            );
+            DEFAULT_PG_MAJOR
         }
     }
 }

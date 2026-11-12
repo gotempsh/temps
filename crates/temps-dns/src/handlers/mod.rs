@@ -44,6 +44,31 @@ use crate::services::{
     UpdateManagedDomainRequest, UpdateProviderRequest,
 };
 
+/// The DNS observability service's errors (ADR-095) as problem details,
+/// for the handlers that serve them (in `temps-nodes`).
+impl From<crate::services::observability::DnsObservabilityError> for Problem {
+    fn from(error: crate::services::observability::DnsObservabilityError) -> Self {
+        use crate::services::observability::DnsObservabilityError;
+        match &error {
+            DnsObservabilityError::InvalidFilter { .. } => {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Invalid filter")
+                    .with_detail(error.to_string())
+            }
+            DnsObservabilityError::Database { .. } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("DNS observability database error")
+                    .with_detail(error.to_string())
+            }
+            DnsObservabilityError::Metrics { .. } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("DNS traffic unavailable")
+                    .with_detail(error.to_string())
+            }
+        }
+    }
+}
+
 /// Audit record for managed-domain write operations.
 #[derive(Debug, Clone, serde::Serialize)]
 struct DnsGovernanceAudit {

@@ -49,6 +49,7 @@ import {
   testS3SourceConnection,
 } from '@/lib/s3-sources'
 import { runScheduleNow } from '@/lib/schedule-runs'
+import { workerCredentialsPresentation } from '@/lib/s3-source-presentation'
 import { cn, isPitrCapableFormat } from '@/lib/utils'
 import {
   iconForServiceType,
@@ -117,6 +118,28 @@ function formatTimeoutSecs(secs: number): string {
   if (hours > 0 && minutes > 0) return `${hours}h ${minutes}m`
   if (hours > 0) return `${hours}h`
   return `${minutes}m`
+}
+
+function WorkerCredentialsFact({ source }: { source: S3SourceResponse }) {
+  const presentation = workerCredentialsPresentation(
+    source.worker_credentials,
+    source.managed_by_cloud
+  )
+  return (
+    <div className="min-w-0">
+      <dt className="text-base font-medium text-muted-foreground sm:text-sm">
+        Worker node credentials
+      </dt>
+      <dd className="space-y-1 text-base sm:text-sm">
+        <Badge variant={presentation.warning ? 'warning-subtle' : 'secondary'}>
+          {presentation.label}
+        </Badge>
+        <p className="text-sm text-muted-foreground">
+          {presentation.description}
+        </p>
+      </dd>
+    </div>
+  )
 }
 
 function sourceFacts(source: S3SourceResponse): DetailFact[] {
@@ -1001,6 +1024,7 @@ export function S3SourceDetail() {
                   </Badge>
                 </dd>
               </div>
+              <WorkerCredentialsFact source={source} />
               <div className="min-w-0">
                 <dt className="text-base font-medium text-muted-foreground sm:text-sm">
                   Access key ID

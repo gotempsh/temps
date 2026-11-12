@@ -1,0 +1,112 @@
+export const metadata = {
+  title: 'Deploy From Local Files',
+  description:
+    'Deploy a folder, an HTML file or a ZIP archive to Temps without a Git account: where to start, the size limits, what is left out of the upload, and how to ship a new version.',
+  alternates: {
+    canonical: '/docs/deploy-from-local-files',
+  },
+}
+
+export const sections = [
+  { title: 'Where to start', id: 'where-to-start' },
+  { title: 'What you can drop', id: 'what-you-can-drop' },
+  { title: 'What is left out', id: 'what-is-left-out' },
+  { title: 'Review and deploy', id: 'review-and-deploy' },
+  { title: 'Static sites and other apps', id: 'static-and-other-apps' },
+  { title: 'Ship a new version', id: 'ship-a-new-version' },
+]
+
+# Deploy From Local Files
+
+You do not need a Git account or a repository to deploy on Temps. Drop a source folder, a single HTML file or a `.zip` archive into the console, review what Temps detected, and deploy. {{ className: 'lead' }}
+
+---
+
+## Where to start {{ anchor: true, id: 'where-to-start' }}
+
+The same flow is available in three places:
+
+- **First run.** On a fresh install the first screen offers **From local files**: "No Git account needed. Review the detected settings before deploying."
+- **New service.** Open **Projects** and click **Create service** to reach the **New service** page, then choose the **Drop files** tab.
+- **From the top bar.** The **Drop files to deploy** button in the console's top bar.
+
+<Note>
+  **Deploy a sample app in one click**, also on the first-run screen, is a different path: it runs a public sample image and does not use your files.
+</Note>
+
+<Note>
+  Dropping files needs durable storage on the Temps server. On a stateless control plane, uploaded source archives, static bundles and Docker image archives are unavailable and the drop zone is disabled. Push a prebuilt image to a registry and deploy it by image reference instead.
+</Note>
+
+---
+
+## What you can drop {{ anchor: true, id: 'what-you-can-drop' }}
+
+The drop zone, headed **Drag your app here**, accepts a source folder, one HTML file, or a `.zip` archive. Use **Choose folder** or **Choose file**, or drag them in. A folder is packaged in your browser before it is uploaded.
+
+| Limit | Value |
+|-------|-------|
+| An uploaded archive | 500 MB |
+| A folder | 100 MB of files that will be uploaded, counted after the [left-out files](#what-is-left-out) are removed. For anything larger, zip it first. |
+
+---
+
+## What is left out {{ anchor: true, id: 'what-is-left-out' }}
+
+What is left out depends on how the files arrive.
+
+**A folder** is packaged in your browser, so these are removed before anything is uploaded:
+
+| Left out | Examples | Why |
+|----------|----------|-----|
+| Version control | `.git/` | History is not part of the build. |
+| Installed dependencies | `node_modules/` | The build installs its own. |
+| Environment files | `.env`, `.env.local`, `.env.production` | They may hold secrets. Set the variables in the environment's settings instead. Template files such as `.env.example`, `.env.sample`, `.env.template` and `.env.dist` are kept. |
+| Operating system metadata | `__MACOSX/`, `.DS_Store`, `Thumbs.db` | Written by the OS, not part of the project. |
+| Keys and credentials | `*.pem`, `*.key`, `credentials.json` | Never upload a private key with your source. |
+
+The console lists what it skipped under **Left out of the upload**, with the reason for each.
+
+These rules match file names only. Any other secret in the folder, such as an SSH key named `id_rsa`, a `service-account.json` or a config file that holds a token, is uploaded with the rest. Remove every secret from the folder before you drop it.
+
+**A ZIP** is uploaded exactly as it is. Your browser does not open or filter it, and Temps stores the original archive on the server. The server inspects it, and a ZIP that contains `*.pem`, `*.key` or `credentials.json` is refused with the entry named. A key inside a left-out folder such as `node_modules/` or `.git/` is skipped instead of refused, but it is still in the archive that is stored. Those three patterns are the only entries that make Temps refuse a ZIP: an SSH key such as `id_rsa` or a token in another file is accepted. The server skips the other entries in the table above, `.env` files included, when it builds, but they are still inside the archive you uploaded. Remove every secret from the folder before you zip it.
+
+---
+
+## Review and deploy {{ anchor: true, id: 'review-and-deploy' }}
+
+Temps inspects the files and shows what it detected before anything is deployed: the app, its preset and its directory. If the folder holds several apps, choose the one to deploy. The deploy button names the detected app. If Temps finds nothing it can build, it says so and offers **Choose different files**: add a `Dockerfile` or a build manifest such as `package.json`, then drop the files again. **Retry preset detection** appears only when detection itself failed for another reason.
+
+Name the service, then deploy. Temps takes you to the new deployment.
+
+---
+
+## Static sites and other apps {{ anchor: true, id: 'static-and-other-apps' }}
+
+What happens next depends on what was detected:
+
+| Detected | What Temps does | Service source |
+|----------|-----------------|----------------|
+| Plain static files (for example an `index.html` with no build step) | Uploads the files as a static bundle and serves them directly from the proxy, with no container at runtime. See [Static sites](/docs/static-sites). | **Static files** |
+| Anything else (a framework app, a `Dockerfile`, and so on) | Uploads the source and builds it on the server, then runs the result like any other deployment. | **Uploaded source** |
+
+<Note>
+  A ZIP that holds a plain static site is published as a static bundle without the left-out rules above: `node_modules/` and similar folders are not removed. Temps does not serve files and folders whose names start with a dot (such as `.env` and `.git`), with one exception: a top-level `.well-known/` folder is served, so anything you put in it is public. It also does not serve private keys and certificates (`*.pem`, `*.key`, `id_rsa`) or a short list of well-known credential files such as `credentials` and `credentials.json`. Anything else in the archive can be published, including a file like `credentials.yaml` or a config file that holds a token. Remove anything you do not want public before you zip it.
+</Note>
+
+If a service was created some other way, for example from Git or a Docker image, it accepts an uploaded source archive only when **Other sources** is turned on under **Settings > Build & deploy**. Static bundles and Docker image archives do not need that setting.
+
+See [Projects](/docs/projects#service-sources) for all the ways a service can get its code.
+
+---
+
+## Ship a new version {{ anchor: true, id: 'ship-a-new-version' }}
+
+Open the service and start a new deployment. For a service created from files, this opens **Upload new source** instead of the Git deploy dialog: drop the folder or ZIP again, choose the environment, and deploy. Only the build directory and the preset can change on this page. Ports, resource limits and environment variables stay as configured.
+
+**Redeploy** works differently depending on how the service was created:
+
+- A **static** drop can be redeployed from the bundle Temps stored.
+- An **uploaded source** deployment cannot be rebuilt by the console's **Redeploy**. The dialog says "Uploaded source archives cannot be redeployed without uploading the source again" and offers **Upload source again**. This also applies after you change an environment variable and want it to take effect now.
+
+Temps keeps the archive you uploaded on the server. It is used when Temps has to move a workload itself, such as when it drains or fails over a node in a [multi-node](/docs/multi-node) setup. If the archive is no longer on the server, a drain is refused and names the deployment, and you upload the source again.

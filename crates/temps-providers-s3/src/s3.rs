@@ -4492,6 +4492,7 @@ mod tests {
             managed_by_cloud: false,
             lifecycle_reconcile_failed_at: None,
             lifecycle_reconcile_generation: 0,
+            worker_credentials: "scoped".to_string(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             backing_service_id: None,

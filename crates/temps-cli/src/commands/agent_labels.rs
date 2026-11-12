@@ -356,28 +356,9 @@ fn change(
                 .display()
         );
     }
-    let before = worker.labels()?;
-    let mut after = before.clone();
-    let absent = edit(&mut after)?;
-    for key in &absent {
-        println!("'{key}' is not set on {}.", worker.display_name());
-    }
-    if after == before {
-        println!("Nothing to change: the labels are already as asked.");
+    let Some((after, written_at)) = save_labels(&mut worker, edit)? else {
         return Ok(());
-    }
-    let mut config = worker.config.clone();
-    let object = config.as_object_mut().ok_or_else(|| {
-        anyhow::anyhow!("{} is not an agent config object", worker.path.display())
-    })?;
-    object.insert(
-        "labels".to_string(),
-        serde_json::Value::Object(after.clone()),
-    );
-    let written_at = chrono::Utc::now();
-    write_config_atomically(&worker.path, &config, worker.identity)?;
-    // Written: another edit may go ahead while this one waits for the agent.
-    worker._lock = None;
+    };
     println!("Saved to {}:", worker.path.display());
     if after.is_empty() {
         println!("  (no labels)");
@@ -395,6 +376,39 @@ fn change(
         written_at,
         args.no_restart,
     )
+}
+
+/// The read-edit-write of `change`, under the lock `worker` was loaded
+/// with: apply `edit` to the labels as read, replace `agent.json` with the
+/// result, then release the lock so another edit may go ahead while this
+/// one waits for the agent. `None` when nothing changes; otherwise the new
+/// labels and when they were written.
+fn save_labels(
+    worker: &mut Worker,
+    edit: impl FnOnce(&mut Labels) -> anyhow::Result<Vec<String>>,
+) -> anyhow::Result<Option<(Labels, chrono::DateTime<chrono::Utc>)>> {
+    let before = worker.labels()?;
+    let mut after = before.clone();
+    let absent = edit(&mut after)?;
+    for key in &absent {
+        println!("'{key}' is not set on {}.", worker.display_name());
+    }
+    if after == before {
+        println!("Nothing to change: the labels are already as asked.");
+        return Ok(None);
+    }
+    let mut config = worker.config.clone();
+    let object = config.as_object_mut().ok_or_else(|| {
+        anyhow::anyhow!("{} is not an agent config object", worker.path.display())
+    })?;
+    object.insert(
+        "labels".to_string(),
+        serde_json::Value::Object(after.clone()),
+    );
+    let written_at = chrono::Utc::now();
+    write_config_atomically(&worker.path, &config, worker.identity)?;
+    worker._lock = None;
+    Ok(Some((after, written_at)))
 }
 
 /// What the agent's record says about labels written at `since`.
@@ -2061,6 +2075,54 @@ mod tests {
                     .starts_with(&prefix)
             })
             .count()
+    }
+
+    /// Two `temps agent labels set` runs overlapping: the second reads
+    /// agent.json only after the first has replaced it, so neither loses
+    /// the other's label and neither removes the other's temporary file.
+    #[test]
+    fn overlapping_label_edits_both_survive() {
+        if skip_as_root() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.json");
+        std::fs::write(&path, r#"{"node_id":3,"token":"t","labels":{}}"#).unwrap();
+        let target = Target {
+            data_dir: Some(dir.path().to_path_buf()),
+        };
+        let (editing, started) = std::sync::mpsc::channel();
+        let first = {
+            let target = target.clone();
+            std::thread::spawn(move || {
+                let mut worker = Worker::load(&target, true).unwrap();
+                save_labels(&mut worker, |labels| {
+                    // The second edit starts while this one holds its
+                    // snapshot of the labels.
+                    editing.send(()).unwrap();
+                    std::thread::sleep(Duration::from_millis(300));
+                    labels.insert("gpu".to_string(), serde_json::json!("true"));
+                    Ok(Vec::new())
+                })
+                .unwrap()
+            })
+        };
+        started.recv().unwrap();
+        let mut worker = Worker::load(&target, true).unwrap();
+        let second = save_labels(&mut worker, |labels| {
+            labels.insert("zone".to_string(), serde_json::json!("a"));
+            Ok(Vec::new())
+        })
+        .unwrap();
+        assert!(first.join().unwrap().is_some());
+        assert!(second.is_some());
+        let saved = read_agent_config(&path).unwrap().value;
+        assert_eq!(
+            saved["labels"],
+            serde_json::json!({"gpu": "true", "zone": "a"})
+        );
+        assert_eq!(saved["token"], "t");
+        assert_eq!(own_temp_files(dir.path()), 0);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { projectHealthIndicator } from '@/components/dashboard/project-card-health'
 import { defaultDeployEnvironment } from '@/lib/project-deploy-action'
 import { isActiveDeploymentStatus } from '@/lib/recent-deployments'
 import type { ReachabilityHeadline } from '@/lib/reachability'
@@ -118,6 +119,8 @@ export interface EnvironmentLiveStatus {
   detail: string
   /** Where a problem is explained and fixed. Set for problem states only. */
   explainedAt?: 'deployment' | 'environment' | 'monitors' | 'reachability'
+  /** Keep worker health separate from public reachability. */
+  healthSource?: 'worker'
 }
 
 /** What else is known about an environment, beyond its own record. */
@@ -132,6 +135,8 @@ export interface EnvironmentSignals {
    * watch: the one the project treats as production.
    */
   monitorStatus?: string
+  runtimeStatus?: string | null
+  runtimeReason?: string | null
 }
 
 /**
@@ -177,6 +182,27 @@ export function environmentLiveStatus(
       label: 'Sleeping',
       detail: 'Stopped while idle; the next request wakes it up.',
     }
+  if (signals.runtimeStatus != null && signals.monitorStatus === 'no_address') {
+    const health = projectHealthIndicator({
+      monitor: {
+        status: 'no_address',
+        runtime_status: signals.runtimeStatus,
+        runtime_reason: signals.runtimeReason,
+      },
+    })
+    return {
+      tone:
+        health.tone === 'healthy'
+          ? 'ok'
+          : health.tone === 'down'
+            ? 'error'
+            : 'idle',
+      label: health.label,
+      healthSource: 'worker',
+      detail: health.detail,
+      explainedAt: 'monitors',
+    }
+  }
   const unhealthy = signals.unhealthyContainers ?? 0
   if (unhealthy > 0)
     return {
@@ -219,7 +245,8 @@ export function withReachability(
   status: EnvironmentLiveStatus,
   headline: ReachabilityHeadline | undefined
 ): EnvironmentLiveStatus {
-  if (status.tone !== 'ok' || !headline) return status
+  if (status.healthSource === 'worker' || status.tone !== 'ok' || !headline)
+    return status
   switch (headline.kind) {
     case 'public':
       return { ...status, detail: `Public at ${headline.address}.` }

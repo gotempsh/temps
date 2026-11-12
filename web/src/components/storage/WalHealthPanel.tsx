@@ -20,6 +20,8 @@ import { Button } from '@/components/ui/button'
 import { CopyButton } from '@/components/ui/copy-button'
 import { TimeAgo } from '@/components/utils/TimeAgo'
 import { getErrorMessage } from '@/utils/errorHandling'
+import { isRoleRefusal } from '@/lib/read-failure'
+import { ROUTE_FAILURE_IGNORE } from '@/lib/route-query-failures'
 import { useQuery } from '@tanstack/react-query'
 import { AlertTriangle, ShieldAlert } from 'lucide-react'
 
@@ -55,16 +57,32 @@ export function WalHealthPanel({
     refetchInterval: 60_000,
     staleTime: 55_000,
     retry: false,
+    // This panel explains a failed check itself, and stays quiet about a
+    // refusal, so the shell must not report the same read a second time.
+    meta: { routeFailure: ROUTE_FAILURE_IGNORE },
   })
 
+  // The check is refused for a caller who may not use backups of this service
+  // (for example a database not yet linked to one of their projects). Nothing
+  // went wrong and a retry cannot change it, so only a real failure of the
+  // check is shown as one.
+  const checkFailed =
+    backupCapability.isError && !isRoleRefusal(backupCapability.error)
+
   const snapshot = data?.wal_health ?? null
+  const notChecked = data?.not_checked ?? null
   const incompatible = backupCapability.data?.cloud_backup_compatible === false
+  // An image upgrade fixes only what an image can: the capability names the
+  // image when it does. A service on a worker node gets none (its image
+  // cannot be changed from here), so it never gets the upgrade action.
+  const upgradeImage = backupCapability.data?.recommended_image ?? null
   const archivingDisabled = snapshot?.archive_mode === 'off' && !incompatible
   if (
     (!snapshot || snapshot.warnings.length === 0) &&
+    !notChecked &&
     !incompatible &&
     !archivingDisabled &&
-    !backupCapability.isError
+    !checkFailed
   ) {
     return null
   }
@@ -74,7 +92,29 @@ export function WalHealthPanel({
 
   return (
     <div className="space-y-3">
-      {backupCapability.isError ? (
+      {notChecked ? (
+        <Alert>
+          <AlertTriangle className="h-4 w-4" />
+          <AlertDescription>
+            <div className="flex items-baseline justify-between gap-3">
+              <p className="font-medium">WAL health is not being checked</p>
+              {notChecked.checked_at ? (
+                <p className="text-xs text-muted-foreground">
+                  Last tried <TimeAgo date={notChecked.checked_at} />
+                </p>
+              ) : null}
+            </div>
+            <p className="mt-1 text-xs text-muted-foreground">
+              {notChecked.reason}
+            </p>
+            <p className="mt-1 text-xs text-muted-foreground">
+              Until it is, this page cannot warn you when WAL fills the disk
+              or archiving stops.
+            </p>
+          </AlertDescription>
+        </Alert>
+      ) : null}
+      {checkFailed ? (
         <Alert variant="destructive">
           <AlertTriangle className="h-4 w-4" />
           <AlertDescription className="space-y-3">
@@ -103,7 +143,11 @@ export function WalHealthPanel({
           <AlertTriangle className="h-4 w-4" />
           <AlertDescription className="space-y-3">
             <div>
-              <p className="font-medium">Cloud backups need WAL-G</p>
+              <p className="font-medium">
+                {upgradeImage
+                  ? 'Cloud backups need WAL-G'
+                  : 'Cloud backups are not available for this service'}
+              </p>
               <p className="mt-1 text-xs text-muted-foreground">
                 {backupCapability.data?.reason}
               </p>
@@ -113,7 +157,7 @@ export function WalHealthPanel({
                 </p>
               ) : null}
             </div>
-            {onUpgrade ? (
+            {onUpgrade && upgradeImage ? (
               <Button size="sm" onClick={onUpgrade}>
                 Upgrade backup engine
               </Button>
@@ -132,18 +176,19 @@ export function WalHealthPanel({
               <p className="mt-1 text-xs text-muted-foreground">
                 {isImported ? (
                   <>
-                    This imported database’s startup settings are managed outside
-                    Temps. Enable archive_mode in its external PostgreSQL startup
-                    settings and restart it before creating a full backup.
-                    Alternatively, restore into a new managed service. Temps
-                    cannot change the imported container’s startup command.
+                    This imported database’s startup settings are managed
+                    outside Temps. Enable archive_mode in its external
+                    PostgreSQL startup settings and restart it before creating a
+                    full backup. Alternatively, restore into a new managed
+                    service. Temps cannot change the imported container’s
+                    startup command.
                   </>
                 ) : (
                   <>
                     A restore disables WAL pushes to protect its source backup.
-                    Point-in-time recovery needs a new full backup to configure and
-                    verify this service’s pinned archive destination. Restarting
-                    alone keeps archiving disabled.
+                    Point-in-time recovery needs a new full backup to configure
+                    and verify this service’s pinned archive destination.
+                    Restarting alone keeps archiving disabled.
                   </>
                 )}
               </p>

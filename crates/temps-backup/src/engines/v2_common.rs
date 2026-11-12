@@ -426,13 +426,7 @@ pub async fn record_walg_identity(
 /// Explicitly disabling deltas overrides any inherited container setting;
 /// otherwise deleting one target may also delete newer dependent snapshots.
 pub fn walg_identity_env(backup_uuid: &str) -> [String; 2] {
-    [
-        "WALG_DELTA_MAX_STEPS=0".to_string(),
-        format!(
-            "WALG_SENTINEL_USER_DATA={}",
-            json!({ "temps_backup_id": backup_uuid })
-        ),
-    ]
+    temps_providers::externalsvc::postgres_walg_backup::walg_identity_env(backup_uuid)
 }
 
 /// Decrypt the optional STS session token on an S3 source row.
@@ -1233,6 +1227,7 @@ mod tests {
             managed_by_cloud: false,
             lifecycle_reconcile_failed_at: None,
             lifecycle_reconcile_generation: 0,
+            worker_credentials: "scoped".to_string(),
             created_at: now,
             updated_at: now,
         }

@@ -39,6 +39,8 @@ ebpf = ["temps-workload-netpol/ebpf"]
 
 [dev-dependencies]
 temps-test-utils = { path = "../temps-test-utils" }
+# Handler tests send requests through the router.
+tower = { workspace = true }
 
 [lints]
 workspace = true

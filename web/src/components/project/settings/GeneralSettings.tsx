@@ -8,6 +8,7 @@ import {
   deleteProjectMutation,
   updateProjectSettingsMutation,
 } from '@/api/client/@tanstack/react-query.gen'
+import { AdminOnlyNote } from '@/components/ui/admin-only-note'
 import { Button } from '@/components/ui/button'
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { CloudTelemetryBackfillCard } from './CloudTelemetryBackfillCard'
@@ -22,7 +23,9 @@ import {
   FormMessage,
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
+import { useCurrentUserRole } from '@/hooks/useCurrentUserRole'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
+import { canDeleteProjects } from '@/lib/instance-admin'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation } from '@tanstack/react-query'
 import { useEffect, useRef, useState } from 'react'
@@ -199,6 +202,12 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
     refetch()
   }
 
+  // `projects:delete` is held by the `admin` role alone: `platform_admin` is
+  // read-only on deployable resources, so `useIsInstanceAdmin` would offer it
+  // a button the server refuses. Gate on the exact role instead of letting the
+  // user type the service name first and be refused on confirm.
+  const role = useCurrentUserRole()
+  const canDeleteProject = canDeleteProjects(role)
   const [isDeleteDialogOpen, setIsDeleteDialogOpen] = useState(false)
   const deleteProjectMutationM = useMutation({
     ...deleteProjectMutation(),
@@ -334,13 +343,17 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
         title="Danger zone"
         description="Permanently delete this service and everything in it. This cannot be undone."
       >
-        <div>
+        <div className="space-y-3">
           <Button
             variant="destructive"
+            disabled={!canDeleteProject}
             onClick={() => setIsDeleteDialogOpen(true)}
           >
             Delete service
           </Button>
+          {!canDeleteProject && (
+            <AdminOnlyNote action="delete a service" role={role} />
+          )}
         </div>
         <ConfirmDeleteDialog
           open={isDeleteDialogOpen}

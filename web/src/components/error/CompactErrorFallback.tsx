@@ -4,6 +4,7 @@
 import { AlertCircle, RefreshCw } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
+import { DiscordHelpLink } from '@/components/support/DiscordHelpLink'
 
 interface CompactErrorFallbackProps {
   error: Error
@@ -25,7 +26,7 @@ export function CompactErrorFallback({
   if (minimal) {
     // Ultra-minimal version for very constrained spaces (e.g., header)
     return (
-      <div className="flex items-center gap-2 px-4 py-2 bg-destructive/10 border-l-4 border-destructive">
+      <div className="flex flex-wrap items-center gap-2 px-4 py-2 bg-destructive/10 border-l-4 border-destructive">
         <AlertCircle className="h-4 w-4 text-destructive flex-shrink-0" />
         <span className="text-sm text-destructive font-medium flex-1 truncate">
           {componentName} error
@@ -39,6 +40,7 @@ export function CompactErrorFallback({
           <RefreshCw className="h-3 w-3 mr-1" />
           Retry
         </Button>
+        <DiscordHelpLink className="text-xs" />
       </div>
     )
   }
@@ -59,6 +61,7 @@ export function CompactErrorFallback({
           <RefreshCw className="h-3 w-3 mr-1" />
           Try again
         </Button>
+        <DiscordHelpLink />
       </AlertDescription>
     </Alert>
   )

@@ -227,6 +227,7 @@ fn problem(error: CloudServiceError) -> Problem {
         ) => StatusCode::FORBIDDEN,
         CloudServiceError::Client(
             temps_cloud_client::CloudError::Rejected { .. }
+            | temps_cloud_client::CloudError::RouteUnavailable { .. }
             | temps_cloud_client::CloudError::InvalidAcknowledgement { .. }
             | temps_cloud_client::CloudError::InvalidBackupTarget { .. },
         ) => StatusCode::BAD_GATEWAY,

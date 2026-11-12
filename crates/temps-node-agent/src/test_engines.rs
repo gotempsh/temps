@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use bollard::Docker;
 use temps_service_protocol::{
     AdmittedWorkload, ContainerSnapshot, HealthProbeResult, NodeServiceError, NodeServiceRuntime,
-    ServiceConfig, ServiceType,
+    RemoteWalHealthResponse, ServiceConfig, ServiceType,
 };
 
 use crate::handlers::AgentState;
@@ -32,6 +32,74 @@ pub(crate) struct StubRuntime {
     pub(crate) admission: Admission,
     /// The plans handed to admission.
     pub(crate) admitted: Mutex<Vec<serde_json::Value>>,
+    /// The published address each runtime provisioning was given.
+    pub(crate) provisioned_through: Mutex<Vec<Option<std::net::IpAddr>>>,
+    /// The WAL-G base backups asked for, with the attachment a recreate
+    /// would use and the published address.
+    pub(crate) walg_backups: Mutex<
+        Vec<(
+            temps_service_protocol::PostgresWalgBackupRequest,
+            temps_service_protocol::NodeAttachment,
+            Option<std::net::IpAddr>,
+        )>,
+    >,
+    /// When set, a WAL-G base backup waits for a permit here and then
+    /// completes, so a test can keep one running.
+    pub(crate) walg_backup_hold: Option<Arc<tokio::sync::Semaphore>>,
+    /// The WAL-G archive re-points asked for, with the attachment.
+    pub(crate) walg_archives: Mutex<
+        Vec<(
+            temps_service_protocol::PostgresWalgArchiveRequest,
+            temps_service_protocol::NodeAttachment,
+        )>,
+    >,
+    /// The MongoDB backups asked for, with the published address.
+    pub(crate) mongodb_backups: Mutex<
+        Vec<(
+            temps_service_protocol::MongodbBackupRequest,
+            Option<std::net::IpAddr>,
+        )>,
+    >,
+    /// The MongoDB restores asked for, with the published address.
+    pub(crate) mongodb_restores: Mutex<
+        Vec<(
+            temps_service_protocol::MongodbRestoreRequest,
+            Option<std::net::IpAddr>,
+        )>,
+    >,
+    /// The WAL-G restores asked for, with the attachment and published
+    /// address.
+    pub(crate) walg_restores: Mutex<
+        Vec<(
+            temps_service_protocol::PostgresWalgRestoreRequest,
+            temps_service_protocol::NodeAttachment,
+            Option<std::net::IpAddr>,
+        )>,
+    >,
+    /// The WAL-G archiving credential refreshes asked for.
+    pub(crate) walg_credentials: Mutex<Vec<temps_service_protocol::PostgresWalgCredentialsRequest>>,
+    /// The Redis operations asked for, by route.
+    pub(crate) redis_walg_backups: Mutex<Vec<temps_service_protocol::RedisWalgBackupRequest>>,
+    pub(crate) redis_rdb_backups: Mutex<Vec<temps_service_protocol::RedisRdbBackupRequest>>,
+    pub(crate) redis_restores: Mutex<Vec<temps_service_protocol::RedisRestoreRequest>>,
+    /// The MariaDB node operations asked for, by route.
+    pub(crate) mariadb_operations: Mutex<Vec<(&'static str, i32)>>,
+    /// The write boundary each Redis or MariaDB restore was handed: its
+    /// target, and whether it still let the restore write.
+    pub(crate) write_boundaries: Mutex<Vec<(String, bool)>>,
+}
+
+impl StubRuntime {
+    /// Record the boundary a restore was handed: its target, and whether it
+    /// still lets the restore enter its write phase (it is not past the
+    /// node's deadline).
+    fn record_write_boundary(&self, writes: &temps_service_protocol::TargetWriteBoundary) {
+        let writable = !writes.is_expired();
+        self.write_boundaries
+            .lock()
+            .expect("write_boundaries")
+            .push((writes.target().to_string(), writable));
+    }
 }
 
 fn not_available(operation: &str) -> NodeServiceError {
@@ -74,8 +142,30 @@ impl NodeServiceRuntime for StubRuntime {
         _project_slug: &str,
         _environment_slug: &str,
         _docker: Arc<Docker>,
+        published_address: Option<std::net::IpAddr>,
     ) -> Result<HashMap<String, String>, NodeServiceError> {
+        self.provisioned_through
+            .lock()
+            .expect("provisioned_through")
+            .push(published_address);
         Err(not_available("provision"))
+    }
+
+    async fn preview_runtime_environment(
+        &self,
+        _name: String,
+        _service_type: ServiceType,
+        _config: ServiceConfig,
+        _project_slug: &str,
+        _environment_slug: &str,
+        _docker: Arc<Docker>,
+        published_address: Option<std::net::IpAddr>,
+    ) -> Result<HashMap<String, String>, NodeServiceError> {
+        self.provisioned_through
+            .lock()
+            .expect("provisioned_through")
+            .push(published_address);
+        Err(not_available("preview"))
     }
 
     async fn revoke_runtime_environment(
@@ -97,6 +187,222 @@ impl NodeServiceRuntime for StubRuntime {
         _published_address: Option<std::net::IpAddr>,
     ) -> Result<HealthProbeResult, NodeServiceError> {
         Err(not_available("probe"))
+    }
+
+    async fn probe_postgres_wal(
+        &self,
+        _config: ServiceConfig,
+        _docker: Arc<Docker>,
+        _published_address: Option<std::net::IpAddr>,
+    ) -> Result<RemoteWalHealthResponse, NodeServiceError> {
+        Err(not_available("WAL probe"))
+    }
+
+    async fn backup_service(
+        &self,
+        _request: temps_service_protocol::RemoteServiceBackupRequest,
+        _docker: Arc<Docker>,
+        _published_address: Option<std::net::IpAddr>,
+    ) -> Result<temps_service_protocol::RemoteServiceBackupResponse, NodeServiceError> {
+        Err(not_available("backup_service"))
+    }
+
+    async fn restore_service(
+        &self,
+        _request: temps_service_protocol::RemoteServiceRestoreRequest,
+        _docker: Arc<Docker>,
+        _published_address: Option<std::net::IpAddr>,
+    ) -> Result<temps_service_protocol::RemoteServiceRestoreResponse, NodeServiceError> {
+        Err(not_available("restore_service"))
+    }
+
+    async fn postgres_walg_backup(
+        &self,
+        request: temps_service_protocol::PostgresWalgBackupRequest,
+        _docker: Arc<Docker>,
+        node: temps_service_protocol::NodeAttachment,
+        _after_create: temps_service_protocol::RecreateHook,
+        published_address: Option<std::net::IpAddr>,
+    ) -> Result<temps_service_protocol::PostgresWalgBackupResult, NodeServiceError> {
+        self.walg_backups
+            .lock()
+            .expect("walg_backups")
+            .push((request, node, published_address));
+        if let Some(hold) = &self.walg_backup_hold {
+            let _released = hold.acquire().await;
+            return Ok(
+                temps_service_protocol::PostgresWalgBackupResult::Completed {
+                    restarted: false,
+                    stdout: "Wrote backup with name base_000000010000000000000004".to_string(),
+                    stderr: String::new(),
+                    lsn: Some("0/4000100".to_string()),
+                },
+            );
+        }
+        Err(not_available("postgres_walg_backup"))
+    }
+
+    async fn postgres_walg_archive(
+        &self,
+        request: temps_service_protocol::PostgresWalgArchiveRequest,
+        _docker: Arc<Docker>,
+        node: temps_service_protocol::NodeAttachment,
+        _after_create: temps_service_protocol::RecreateHook,
+        _published_address: Option<std::net::IpAddr>,
+    ) -> Result<temps_service_protocol::PostgresWalgArchiveResult, NodeServiceError> {
+        self.walg_archives
+            .lock()
+            .expect("walg_archives")
+            .push((request, node));
+        Err(not_available("postgres_walg_archive"))
+    }
+
+    async fn postgres_walg_credentials(
+        &self,
+        request: temps_service_protocol::PostgresWalgCredentialsRequest,
+        _docker: Arc<Docker>,
+        _published_address: Option<std::net::IpAddr>,
+    ) -> Result<temps_service_protocol::PostgresWalgCredentialsResult, NodeServiceError> {
+        self.walg_credentials
+            .lock()
+            .expect("walg_credentials")
+            .push(request);
+        Ok(temps_service_protocol::PostgresWalgCredentialsResult::Refreshed)
+    }
+
+    async fn postgres_walg_restore(
+        &self,
+        request: temps_service_protocol::PostgresWalgRestoreRequest,
+        _docker: Arc<Docker>,
+        node: temps_service_protocol::NodeAttachment,
+        _after_create: temps_service_protocol::RecreateHook,
+        published_address: Option<std::net::IpAddr>,
+        _writes: Arc<temps_service_protocol::TargetWriteBoundary>,
+    ) -> Result<temps_service_protocol::PostgresWalgRestoreResult, NodeServiceError> {
+        self.walg_restores
+            .lock()
+            .expect("walg_restores")
+            .push((request, node, published_address));
+        Err(not_available("postgres_walg_restore"))
+    }
+
+    async fn mongodb_backup(
+        &self,
+        request: temps_service_protocol::MongodbBackupRequest,
+        _docker: Arc<Docker>,
+        published_address: Option<std::net::IpAddr>,
+    ) -> Result<temps_service_protocol::MongodbBackupResult, NodeServiceError> {
+        self.mongodb_backups
+            .lock()
+            .expect("mongodb_backups")
+            .push((request, published_address));
+        Err(not_available("mongodb_backup"))
+    }
+
+    async fn mongodb_restore(
+        &self,
+        request: temps_service_protocol::MongodbRestoreRequest,
+        _docker: Arc<Docker>,
+        published_address: Option<std::net::IpAddr>,
+        _writes: Arc<temps_service_protocol::TargetWriteBoundary>,
+    ) -> Result<temps_service_protocol::MongodbRestoreResult, NodeServiceError> {
+        self.mongodb_restores
+            .lock()
+            .expect("mongodb_restores")
+            .push((request, published_address));
+        Err(not_available("mongodb_restore"))
+    }
+
+    async fn redis_walg_backup(
+        &self,
+        request: temps_service_protocol::RedisWalgBackupRequest,
+        _docker: Arc<Docker>,
+    ) -> Result<temps_service_protocol::RedisWalgBackupResult, NodeServiceError> {
+        self.redis_walg_backups
+            .lock()
+            .expect("redis_walg_backups")
+            .push(request);
+        Err(not_available("redis_walg_backup"))
+    }
+
+    async fn redis_rdb_backup(
+        &self,
+        request: temps_service_protocol::RedisRdbBackupRequest,
+        _docker: Arc<Docker>,
+    ) -> Result<temps_service_protocol::RedisRdbBackupResult, NodeServiceError> {
+        self.redis_rdb_backups
+            .lock()
+            .expect("redis_rdb_backups")
+            .push(request);
+        Err(not_available("redis_rdb_backup"))
+    }
+
+    async fn redis_restore(
+        &self,
+        request: temps_service_protocol::RedisRestoreRequest,
+        _docker: Arc<Docker>,
+        writes: Arc<temps_service_protocol::TargetWriteBoundary>,
+    ) -> Result<temps_service_protocol::RedisRestoreResult, NodeServiceError> {
+        self.record_write_boundary(&writes);
+        self.redis_restores
+            .lock()
+            .expect("redis_restores")
+            .push(request);
+        Err(not_available("redis_restore"))
+    }
+
+    async fn mariadb_physical_backup(
+        &self,
+        request: temps_service_protocol::MariadbPhysicalBackupRequest,
+        _docker: Arc<Docker>,
+        _published_address: Option<std::net::IpAddr>,
+    ) -> Result<temps_service_protocol::MariadbPhysicalBackupResult, NodeServiceError> {
+        self.mariadb_operations
+            .lock()
+            .expect("mariadb_operations")
+            .push(("physical-backup", request.service_id));
+        Err(not_available("mariadb_physical_backup"))
+    }
+
+    async fn mariadb_dump_backup(
+        &self,
+        request: temps_service_protocol::MariadbDumpBackupRequest,
+        _docker: Arc<Docker>,
+        _published_address: Option<std::net::IpAddr>,
+    ) -> Result<temps_service_protocol::MariadbDumpBackupResult, NodeServiceError> {
+        self.mariadb_operations
+            .lock()
+            .expect("mariadb_operations")
+            .push(("dump-backup", request.service_id));
+        Err(not_available("mariadb_dump_backup"))
+    }
+
+    async fn mariadb_restore(
+        &self,
+        request: temps_service_protocol::MariadbRestoreRequest,
+        _docker: Arc<Docker>,
+        _published_address: Option<std::net::IpAddr>,
+        writes: Arc<temps_service_protocol::TargetWriteBoundary>,
+    ) -> Result<temps_service_protocol::MariadbRestoreResult, NodeServiceError> {
+        self.record_write_boundary(&writes);
+        self.mariadb_operations
+            .lock()
+            .expect("mariadb_operations")
+            .push(("restore", request.service_id));
+        Err(not_available("mariadb_restore"))
+    }
+
+    async fn mariadb_binlog_archive(
+        &self,
+        request: temps_service_protocol::MariadbBinlogArchiveRequest,
+        _docker: Arc<Docker>,
+        _published_address: Option<std::net::IpAddr>,
+    ) -> Result<temps_service_protocol::MariadbBinlogArchiveResult, NodeServiceError> {
+        self.mariadb_operations
+            .lock()
+            .expect("mariadb_operations")
+            .push(("binlog-archive", request.service_id));
+        Err(not_available("mariadb_binlog_archive"))
     }
 }
 
@@ -149,6 +455,21 @@ pub(crate) fn agent_state(
     service_runtime: Arc<dyn NodeServiceRuntime>,
     plugin_builder: Arc<dyn PluginContainerBuilder>,
 ) -> Arc<AgentState> {
+    agent_state_with_docker(
+        service_runtime,
+        plugin_builder,
+        Docker::connect_with_http("http://127.0.0.1:1", 1, bollard::API_DEFAULT_VERSION)
+            .expect("build an unused Docker client"),
+    )
+}
+
+/// Agent state whose Docker client is `docker` (a stub daemon, for a test
+/// that drives the service paths). The deployer points at nothing.
+pub(crate) fn agent_state_with_docker(
+    service_runtime: Arc<dyn NodeServiceRuntime>,
+    plugin_builder: Arc<dyn PluginContainerBuilder>,
+    docker: Docker,
+) -> Arc<AgentState> {
     let remote = Arc::new(
         temps_deployer::remote::RemoteNodeDeployer::new(
             "http://127.0.0.1:1".into(),
@@ -162,10 +483,7 @@ pub(crate) fn agent_state(
         plugin_builder,
         container_deployer: remote.clone(),
         image_builder: remote,
-        docker: Some(
-            Docker::connect_with_http("http://127.0.0.1:1", 1, bollard::API_DEFAULT_VERSION)
-                .expect("build an unused Docker client"),
-        ),
+        docker: Some(docker),
         overlay_bridge_address: Default::default(),
         overlay_peers: Default::default(),
         platform: Default::default(),

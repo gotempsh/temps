@@ -11,7 +11,17 @@
 //!
 //! At boot, before the API serves requests, [`active_restore_run_ids`]
 //! snapshots the runs that are still `pending`/`running` — by construction
-//! none of them has an owner in the new process. For each, reconciliation:
+//! none of them has an owner in the new process.
+//!
+//! A restore run on a worker node is not orphaned by the restart: the node
+//! keeps restoring, and its agent (or, for a job, the workload plane)
+//! records the outcome. It is handed to [`WorkerRestoreResume`], which keeps
+//! it active and settles it from that outcome (credential reconcile
+//! included), so it is never marked interrupted here. A worker run whose
+//! outcome cannot be established stays active, holding its service, until
+//! the outcome is known or an operator releases it. Only runs that wrote in
+//! this process (its own Docker helpers, a restore into a new service)
+//! reach the steps below. For each of them, reconciliation:
 //!
 //! 1. **Fences** the restore: stops any restore helper container that is
 //!    still writing into the target (see
@@ -68,6 +78,20 @@ pub trait RestoreHelperFence: Send + Sync {
     async fn fence(&self, target: &FenceTarget) -> Result<RestoreFenceReport, RestoreFenceError>;
 }
 
+/// Resumes a worker restore run whose node keeps restoring across this
+/// process's restart.
+#[async_trait]
+pub trait WorkerRestoreResume: Send + Sync {
+    /// Whether `run` (into `service`, its target) is a worker restore whose
+    /// node records its outcome. If so its settlement has started in the
+    /// background, and the run must be left active.
+    async fn resume(
+        &self,
+        run: &temps_entities::restore_runs::Model,
+        service: Option<&temps_entities::external_services::Model>,
+    ) -> bool;
+}
+
 /// Production fence: asks the external-service manager, which owns the
 /// Docker handle and the engines' container naming.
 pub struct ManagerRestoreFence {
@@ -111,6 +135,9 @@ pub struct RestoreReconcileReport {
     pub interrupted: Vec<i32>,
     /// Runs left active because their helpers could not be fenced; retry them.
     pub deferred: Vec<i32>,
+    /// Worker restore runs left active and resumed: settled from their
+    /// node's outcome in the background, never retried here.
+    pub resumed: Vec<i32>,
 }
 
 /// Ids of every run still `pending`/`running`. Call once at boot, before
@@ -128,11 +155,13 @@ pub async fn active_restore_run_ids(db: &DatabaseConnection) -> Result<Vec<i32>,
         .collect())
 }
 
-/// Fence and mark as interrupted each of `run_ids` that is still active.
+/// Resume each of `run_ids` that is a worker restore still active, and
+/// fence and mark as interrupted every other one.
 pub async fn reconcile_interrupted_restores(
     db: &DatabaseConnection,
     run_ids: &[i32],
     fence: &dyn RestoreHelperFence,
+    workers: &dyn WorkerRestoreResume,
 ) -> Result<RestoreReconcileReport, RestoreError> {
     use temps_entities::restore_runs::{Column, Entity};
 
@@ -163,6 +192,17 @@ pub async fn reconcile_interrupted_restores(
 
     for run in runs {
         let service = services.get(&run.source_service_id);
+        if workers.resume(&run, service).await {
+            info!(
+                restore_run_id = run.id,
+                service_id = run.source_service_id,
+                phase = %run.phase,
+                "Restore run left active across a restart: its worker node keeps restoring, \
+                 and its outcome there settles the run"
+            );
+            report.resumed.push(run.id);
+            continue;
+        }
         let stopped = match fence_run_helpers(&run, service, fence).await {
             Ok(stopped) => stopped,
             Err(e) => {
@@ -264,6 +304,7 @@ fn phase_description(phase: &str) -> &str {
     match phase {
         "prepare" => "preparation",
         "download" => "the backup download",
+        "waiting_for_node" => "the wait for its worker node to free a slot",
         "provision" => "provisioning of the new service",
         "restore" => "the data restore",
         "recover" => "point-in-time recovery",
@@ -304,6 +345,22 @@ pub(crate) fn interrupted_message(
     message
 }
 
+/// A resumer with no worker restores: every run is reconciled locally.
+#[cfg(test)]
+pub(crate) struct NoWorkerRestores;
+
+#[cfg(test)]
+#[async_trait]
+impl WorkerRestoreResume for NoWorkerRestores {
+    async fn resume(
+        &self,
+        _run: &temps_entities::restore_runs::Model,
+        _service: Option<&temps_entities::external_services::Model>,
+    ) -> bool {
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,6 +396,7 @@ mod tests {
             updated_at: now,
             cancel_requested_at: None,
             cancel_requested_by: None,
+            restored_login_encrypted: None,
         }
     }
 
@@ -421,6 +479,10 @@ mod tests {
     fn message_names_each_phase_and_never_claims_rollback() {
         for (phase, description) in [
             ("prepare", "preparation"),
+            (
+                "waiting_for_node",
+                "the wait for its worker node to free a slot",
+            ),
             ("provision", "provisioning of the new service"),
             ("restore", "the data restore"),
             ("recover", "point-in-time recovery"),
@@ -513,7 +575,7 @@ mod tests {
             .into_connection();
         let fence = RecordingFence::default();
 
-        let report = reconcile_interrupted_restores(&db, &[1, 2, 3, 4], &fence)
+        let report = reconcile_interrupted_restores(&db, &[1, 2, 3, 4], &fence, &NoWorkerRestores)
             .await
             .expect("reconcile should succeed");
 
@@ -551,7 +613,7 @@ mod tests {
             ..Default::default()
         };
 
-        let report = reconcile_interrupted_restores(&db, &[7], &fence)
+        let report = reconcile_interrupted_restores(&db, &[7], &fence, &NoWorkerRestores)
             .await
             .expect("a fence failure is reported per run, not as an error");
 
@@ -573,7 +635,7 @@ mod tests {
             .into_connection();
         let fence = RecordingFence::default();
 
-        let report = reconcile_interrupted_restores(&db, &[1, 2], &fence)
+        let report = reconcile_interrupted_restores(&db, &[1, 2], &fence, &NoWorkerRestores)
             .await
             .expect("reconcile should succeed");
 
@@ -589,9 +651,14 @@ mod tests {
             .append_exec_results([update_result(0)])
             .into_connection();
 
-        let report = reconcile_interrupted_restores(&db, &[5], &RecordingFence::default())
-            .await
-            .expect("reconcile should succeed");
+        let report = reconcile_interrupted_restores(
+            &db,
+            &[5],
+            &RecordingFence::default(),
+            &NoWorkerRestores,
+        )
+        .await
+        .expect("reconcile should succeed");
 
         assert!(report.interrupted.is_empty());
         assert!(report.deferred.is_empty());
@@ -600,10 +667,72 @@ mod tests {
     #[tokio::test]
     async fn empty_snapshot_skips_the_database() {
         let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
-        let report = reconcile_interrupted_restores(&db, &[], &RecordingFence::default())
-            .await
-            .expect("nothing to do");
+        let report =
+            reconcile_interrupted_restores(&db, &[], &RecordingFence::default(), &NoWorkerRestores)
+                .await
+                .expect("nothing to do");
         assert_eq!(report, RestoreReconcileReport::default());
         assert!(db.into_transaction_log().is_empty());
+    }
+
+    /// Resumes the runs whose ids it was given, recording each.
+    struct ResumingWorkers {
+        workers: Vec<i32>,
+        resumed: Mutex<Vec<i32>>,
+    }
+
+    #[async_trait]
+    impl WorkerRestoreResume for ResumingWorkers {
+        async fn resume(
+            &self,
+            run: &temps_entities::restore_runs::Model,
+            _service: Option<&temps_entities::external_services::Model>,
+        ) -> bool {
+            if !self.workers.contains(&run.id) {
+                return false;
+            }
+            if let Ok(mut resumed) = self.resumed.lock() {
+                resumed.push(run.id);
+            }
+            true
+        }
+    }
+
+    /// A worker restore run keeps running on its node across the restart:
+    /// it is resumed, never fenced locally nor marked interrupted, so it
+    /// keeps holding its service. A local run beside it is reconciled as
+    /// before.
+    #[tokio::test]
+    async fn a_worker_restore_is_resumed_not_interrupted() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![
+                run(1, "in_place", "restore", None),
+                run(2, "in_place", "restore", None),
+            ]])
+            .append_query_results(vec![vec![service(10, "orders", "postgres")]])
+            .append_exec_results([update_result(1)])
+            .into_connection();
+        let fence = RecordingFence::default();
+        let workers = ResumingWorkers {
+            workers: vec![1],
+            resumed: Mutex::default(),
+        };
+
+        let report = reconcile_interrupted_restores(&db, &[1, 2], &fence, &workers)
+            .await
+            .expect("reconcile should succeed");
+
+        assert_eq!(report.resumed, vec![1]);
+        assert_eq!(report.interrupted, vec![2]);
+        assert!(report.deferred.is_empty());
+        assert_eq!(*workers.resumed.lock().unwrap(), vec![1]);
+        assert_eq!(fence.calls.lock().map(|c| c.len()).unwrap_or(0), 1);
+        let log = db.into_transaction_log();
+        let updates = log
+            .iter()
+            .map(|t| format!("{t:?}"))
+            .filter(|s| s.contains("UPDATE"))
+            .count();
+        assert_eq!(updates, 1, "only the local run is marked interrupted");
     }
 }

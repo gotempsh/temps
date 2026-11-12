@@ -181,6 +181,14 @@ pub struct ClusterOverlayNetworkNameChangedAudit {
     pub to: String,
 }
 
+/// An operator gave the cluster a new VXLAN network ID (ADR 062).
+#[derive(Debug, Clone, Serialize)]
+pub struct ClusterNetworkIdChangedAudit {
+    pub context: AuditContext,
+    pub from: u32,
+    pub to: u32,
+}
+
 /// An operator confirmed the cluster compute pool for the first time
 /// (ADR 056), whether or not they changed it.
 #[derive(Debug, Clone, Serialize)]
@@ -328,6 +336,7 @@ impl_audit_operation!(
     ClusterOverlayNetworkNameChangedAudit,
     "CLUSTER_OVERLAY_NETWORK_NAME_CHANGED"
 );
+impl_audit_operation!(ClusterNetworkIdChangedAudit, "CLUSTER_NETWORK_ID_CHANGED");
 impl_audit_operation!(
     ClusterComputePoolConfirmedAudit,
     "CLUSTER_COMPUTE_POOL_CONFIRMED"

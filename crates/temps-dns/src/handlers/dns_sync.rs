@@ -255,11 +255,17 @@ async fn authenticate_node(
     let token_hash = sha256_hex(token);
     if !constant_time_eq(node.token_hash.as_bytes(), token_hash.as_bytes()) {
         warn!(node_id, "Invalid DNS sync token");
-        return Err(problemdetails::new(StatusCode::UNAUTHORIZED)
+        return Err(worker_auth_problem()
             .with_title("Invalid Token")
-            .with_detail(format!("Invalid authentication token for node {}", node_id)));
+            .with_detail(format!("Worker credential rejected for node {node_id}. Check the node ID and control-plane address in the worker join configuration; rejoin if the token was revoked.")));
     }
     Ok(())
+}
+
+fn worker_auth_problem() -> Problem {
+    problemdetails::new(StatusCode::UNAUTHORIZED)
+        .with_value("code", "WORKER_CREDENTIAL_REQUIRED")
+        .with_value("remedy", "Use this node's operator-issued bearer token. Check that the worker's node ID and control-plane address match its join configuration; rejoin the worker if its credential was revoked. Console sign-in does not authorize this endpoint.")
 }
 
 fn extract_bearer_token(headers: &HeaderMap) -> Result<&str, Problem> {
@@ -267,17 +273,17 @@ fn extract_bearer_token(headers: &HeaderMap) -> Result<&str, Problem> {
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .ok_or_else(|| {
-            problemdetails::new(StatusCode::UNAUTHORIZED)
+            worker_auth_problem()
                 .with_title("Missing Authorization")
                 .with_detail("Bearer token required for node authentication")
         })?;
     let token = auth_header.strip_prefix("Bearer ").ok_or_else(|| {
-        problemdetails::new(StatusCode::UNAUTHORIZED)
+        worker_auth_problem()
             .with_title("Invalid Authorization")
             .with_detail("Authorization header must use Bearer scheme")
     })?;
     if token.is_empty() || token.len() > 256 {
-        return Err(problemdetails::new(StatusCode::UNAUTHORIZED)
+        return Err(worker_auth_problem()
             .with_title("Invalid Authorization")
             .with_detail("Bearer token length is invalid"));
     }
@@ -347,5 +353,12 @@ mod tests {
             HeaderValue::from_static("Basic Zm9vOmJhcg=="),
         );
         assert!(extract_bearer_token(&h).is_err());
+    }
+    #[test]
+    fn worker_auth_failure_has_worker_remediation() {
+        let problem = extract_bearer_token(&HeaderMap::new()).unwrap_err();
+        assert_eq!(problem.status_code, StatusCode::UNAUTHORIZED);
+        assert_eq!(problem.body["code"], "WORKER_CREDENTIAL_REQUIRED");
+        assert!(problem.body["remedy"].as_str().unwrap().contains("rejoin"));
     }
 }

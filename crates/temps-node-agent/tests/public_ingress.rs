@@ -53,6 +53,7 @@ impl IngressHarness {
                 environment_id: Some(43),
                 gate: None,
                 shield: None,
+                allowed_callers: Vec::new(),
             }],
             certificates: None,
             unsupported_route_count: 0,
@@ -561,6 +562,7 @@ fn test_public_ingress_invalid_disk_lease_fails_closed() {
                 environment_id: None,
                 gate: None,
                 shield: None,
+                allowed_callers: Vec::new(),
             }],
             certificates: None,
             unsupported_route_count: 0,
@@ -752,6 +754,7 @@ async fn test_public_ingress_https_uses_synced_certificate_and_forwards_request(
             environment_id: Some(53),
             gate: None,
             shield: None,
+            allowed_callers: Vec::new(),
         }],
         certificates: Some(PublicIngressCertificates {
             ephemeral_public_key: encryption.ephemeral_public_key().to_string(),
@@ -1420,6 +1423,7 @@ fn private_route(host: &str, backend: std::net::SocketAddr, range: &str) -> Priv
             environment_id: Some(53),
             gate: None,
             shield: None,
+            allowed_callers: Vec::new(),
         },
         address_id: "custom:9".to_string(),
         range: range.to_string(),
@@ -1647,6 +1651,7 @@ fn serve_snapshot(
                 environment_id: Some(63),
                 gate: None,
                 shield: None,
+                allowed_callers: Vec::new(),
             }),
             addrs: Vec::new(),
             principals,
@@ -1918,6 +1923,7 @@ async fn test_public_ingress_runs_shield_before_the_backend() {
             exempt_paths: Vec::new(),
             bypass_token_hashes: Vec::new(),
         }),
+        allowed_callers: Vec::new(),
     };
     store.apply_public_snapshot(PublicIngressSnapshot {
         enabled: true,

@@ -156,6 +156,10 @@ fn audit_context(auth: &AuthContext, metadata: &RequestMetadata) -> AuditContext
     }
 }
 
+/// Get a database's workload mode (internal, operator-only)
+///
+/// An ADR-055 migration control for operators and the CLI; the console does
+/// not show it. Databases default to `legacy` and need no change here.
 #[utoipa::path(
     tag = "External Services",
     get,
@@ -184,6 +188,10 @@ pub async fn get_workload_mode(
     Ok(Json(WorkloadModeResponse::from(status)))
 }
 
+/// Change a database's workload mode (internal, operator-only)
+///
+/// An ADR-055 migration control for operators and the CLI; the console does
+/// not show it. Databases default to `legacy` and need no change here.
 #[utoipa::path(
     tag = "External Services",
     put,
@@ -247,6 +255,10 @@ pub async fn update_workload_mode(
     }))
 }
 
+/// List what a recreate from the workload spec would change (internal, operator-only)
+///
+/// An ADR-055 migration control for operators and the CLI; the console does
+/// not show it. Databases default to `legacy` and need no change here.
 #[utoipa::path(
     tag = "External Services",
     get,
@@ -276,6 +288,10 @@ pub async fn get_workload_pending_changes(
     Ok(Json(pending))
 }
 
+/// Recreate a database's container from its workload spec (internal, operator-only)
+///
+/// An ADR-055 migration control for operators and the CLI; the console does
+/// not show it. Databases default to `legacy` and need no change here.
 #[utoipa::path(
     tag = "External Services",
     post,

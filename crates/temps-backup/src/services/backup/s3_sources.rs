@@ -197,6 +197,16 @@ impl BackupService {
         .map_err(|error| BackupError::Internal {
             message: format!("Failed to create S3 source '{}': {}", request.name, error),
         })?;
+        // ADR-102: `scoped` is the column's default; only the operator's
+        // explicit choice widens it, in the same transaction.
+        let source = match request.worker_credentials {
+            Some(policy @ crate::handlers::backup_handler::WorkerCredentialsPolicy::AllowFull) => {
+                let mut active = source.into_active_model();
+                active.worker_credentials = sea_orm::Set(policy.as_column().to_string());
+                active.update(&txn).await?
+            }
+            _ => source,
+        };
         txn.commit().await?;
 
         debug!(
@@ -600,6 +610,7 @@ impl BackupService {
                 force_path_style: request.force_path_style.or(current.force_path_style),
                 is_default: None,
                 backing_service_id: current.backing_service_id,
+                worker_credentials: None,
             };
             self.verify_s3_destination(&probe, crate::services::s3_probe::MissingBucket::Create)
                 .await?;
@@ -644,6 +655,9 @@ impl BackupService {
         }
         if let Some(force_path_style) = request.force_path_style {
             active.force_path_style = Set(Some(force_path_style));
+        }
+        if let Some(policy) = request.worker_credentials {
+            active.worker_credentials = Set(policy.as_column().to_string());
         }
 
         active.updated_at = Set(chrono::Utc::now());

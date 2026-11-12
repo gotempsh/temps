@@ -366,6 +366,7 @@ mod tests {
             updated_at: Utc::now(),
             cancel_requested_at: None,
             cancel_requested_by: None,
+            restored_login_encrypted: None,
         }
     }
 

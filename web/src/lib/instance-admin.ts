@@ -17,6 +17,15 @@ const INSTANCE_ADMIN_ROLES: ReadonlySet<string> = new Set([
   'platform_admin',
 ])
 
+/**
+ * Whether a role may delete a project (`projects:delete`). Only `admin` holds
+ * it -- `platform_admin` administers the instance but is read-only on
+ * projects -- so this is deliberately narrower than `isInstanceAdmin`.
+ */
+export function canDeleteProjects(role: string | null | undefined): boolean {
+  return role === 'admin'
+}
+
 /** Whether a signed-in user's effective role administers the instance. */
 export function isInstanceAdmin(role: string | null | undefined): boolean {
   return typeof role === 'string' && INSTANCE_ADMIN_ROLES.has(role)

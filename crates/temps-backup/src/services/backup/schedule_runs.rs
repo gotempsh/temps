@@ -511,7 +511,7 @@ OFFSET $3
     /// 3. Insert a control-plane `backups` row with `schedule_run_id = run_id`.
     ///    Enqueue a `backup_jobs` row for `engine = "control_plane"`.
     /// 4. Load every `external_services` row and attempt to resolve its engine
-    ///    key via [`resolve_engine_key`]. Skip rows where resolution returns
+    ///    key via [`BackupService::resolve_engine_key`]. Skip rows where resolution returns
     ///    `Err` (unsupported type) — log at `warn` with the service id and type.
     /// 5. For each supported service, insert an `external_service_backups` row +
     ///    parent `backups` row (`schedule_run_id = run_id`), then enqueue a
@@ -615,17 +615,11 @@ UPDATE schedule_runs sr
             return Ok(ScheduleRunOutcome::AlreadyInFlight { existing_run_id });
         }
 
-        // ── Step 2: connect to Docker for engine resolution ───────────────────
-        // We connect once per tick, not per service, to amortise the socket
-        // setup cost. `connect_with_local_defaults()` is fast (no round-trip).
-        let docker =
-            bollard::Docker::connect_with_local_defaults().map_err(|e| BackupError::Internal {
-                message: format!(
-                    "enqueue_scheduled_run: failed to connect to Docker for engine resolution \
-                     (schedule {}): {}",
-                    schedule.id, e
-                ),
-            })?;
+        // ── Step 2: engine resolution ──────────────────────────────────────────
+        // Each service opens this host's Docker only when its engine choice
+        // inspects a local container (`connect_with_local_defaults()` makes
+        // no round-trip). A database on a worker node needs none, so a
+        // server without Docker still backs those up.
 
         // Load the external services this schedule should fan out to.
         // Two modes (set on `backup_schedules.target_all_services`):
@@ -672,7 +666,7 @@ UPDATE schedule_runs sr
             Vec::with_capacity(external_services.len());
 
         for svc in external_services {
-            match crate::engines::dispatch::resolve_engine_key(&svc, &docker).await {
+            match self.resolve_engine_key(&svc).await {
                 Ok(engine_key) => {
                     resolved_services.push((svc, engine_key));
                 }

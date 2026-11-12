@@ -528,6 +528,9 @@ pub mod admin_test_support {
         let enrollment_token_service =
             Arc::new(temps_config::EnrollmentTokenService::new(db.clone()));
         let docker = bollard::Docker::connect_with_local_defaults().expect("docker client");
+        let db_for_dns = db.clone();
+        let dns_config_service = config_service.clone();
+        let dns_encryption_service = encryption_service.clone();
         Arc::new(crate::handlers::types::NodeAdminState {
             db: db.clone(),
             node_public_ingress_service: Arc::new(NodePublicIngressService::new(
@@ -561,6 +564,15 @@ pub mod admin_test_support {
             audit_service: Arc::new(RecordingAuditLogger::default()),
             metrics_store: None,
             sensitive_action_authorizer: Arc::new(AllowSensitiveActions),
+            cluster_dns: Arc::new(crate::services::cluster_dns::ClusterDnsService::new(
+                db_for_dns.clone(),
+                Arc::new(temps_dns::DnsObservabilityService::new(
+                    db_for_dns.clone(),
+                    Arc::new(temps_metrics::TimescaleMetricsStore::new(db_for_dns)),
+                )),
+                dns_config_service,
+                dns_encryption_service,
+            )),
         })
     }
 
@@ -611,6 +623,7 @@ pub mod admin_test_support {
             overlay_ready_cidr: None,
             overlay_remediation: None,
             overlay_network_name: None,
+            overlay_vxlan_vni: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }

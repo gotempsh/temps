@@ -1,0 +1,12 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+# actionlint configuration, read automatically from .github/actionlint.yaml.
+self-hosted-runner:
+  # GitHub-hosted labels that are generally available but missing from
+  # actionlint's built-in list (v1.7.12, pinned in workflows/actionlint.yml).
+  # Without them actionlint rejects the label as unknown. Remove an entry once
+  # the pinned actionlint knows it.
+  labels:
+    - ubuntu-26.04
+    - ubuntu-26.04-arm
