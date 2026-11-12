@@ -2527,27 +2527,32 @@ fn scanned_relations(node: &serde_json::Value, out: &mut Vec<String>) {
     }
 }
 
-/// Runs `EXPLAIN (ANALYZE, TIMING OFF, FORMAT JSON)` on `sql` and returns
-/// the root plan node with the relations it read.
+/// One plan of [`explain_analyze`]: which one it was, its root node and the
+/// relations it read.
+struct ExplainedPlan {
+    mode: &'static str,
+    root: serde_json::Value,
+    read: Vec<String>,
+}
+
+/// [`explain_custom_and_generic`] with the relations each plan read. Chunk
+/// exclusion differs between the two: a custom plan drops chunks while
+/// planning, a generic one only when the executor starts or runs, so the
+/// time-bound checks hold for both.
 async fn explain_analyze(
     db: &sea_orm::DatabaseConnection,
     sql: &str,
     values: Vec<sea_orm::Value>,
-) -> anyhow::Result<(serde_json::Value, Vec<String>)> {
-    use sea_orm::ConnectionTrait;
-    let row = db
-        .query_one(Statement::from_sql_and_values(
-            DatabaseBackend::Postgres,
-            format!("EXPLAIN (ANALYZE, TIMING OFF, FORMAT JSON) {sql}"),
-            values,
-        ))
+) -> anyhow::Result<Vec<ExplainedPlan>> {
+    Ok(explain_custom_and_generic(db, sql, values)
         .await?
-        .expect("EXPLAIN returns one row");
-    let plan: serde_json::Value = row.try_get("", "QUERY PLAN")?;
-    let root = plan[0]["Plan"].clone();
-    let mut relations = Vec::new();
-    scanned_relations(&root, &mut relations);
-    Ok((root, relations))
+        .into_iter()
+        .map(|(mode, root)| {
+            let mut read = Vec::new();
+            scanned_relations(&root, &mut read);
+            ExplainedPlan { mode, root, read }
+        })
+        .collect())
 }
 
 /// The TimescaleDB chunks of `hypertable` whose time range holds `ts`
@@ -2856,7 +2861,7 @@ async fn test_visitor_sessions_and_journey_read_only_the_visitors_time_range() -
     let recent_proxy_logs = chunks_holding(db, "proxy_logs", min(1)).await?;
     let bound = earliest_row_time(t0);
 
-    let (_, read) = explain_analyze(
+    for ExplainedPlan { mode, read, .. } in explain_analyze(
         db,
         VISITOR_SESSIONS_SQL,
         vec![
@@ -2867,17 +2872,19 @@ async fn test_visitor_sessions_and_journey_read_only_the_visitors_time_range() -
             ANALYTICS_ROW_CLOCK_SLACK_HOURS.into(),
         ],
     )
-    .await?;
-    assert!(
-        reads_any(&read, &recent_events) && reads_any(&read, &recent_proxy_logs),
-        "visitor sessions must read the visitor's chunks: {read:?}"
-    );
-    assert!(
-        !reads_any(&read, &old_events) && !reads_any(&read, &old_proxy_logs),
-        "visitor sessions read a chunk from before the visitor existed: {read:?}"
-    );
+    .await?
+    {
+        assert!(
+            reads_any(&read, &recent_events) && reads_any(&read, &recent_proxy_logs),
+            "{mode} plan: visitor sessions must read the visitor's chunks: {read:?}"
+        );
+        assert!(
+            !reads_any(&read, &old_events) && !reads_any(&read, &old_proxy_logs),
+            "{mode} plan: visitor sessions read a chunk from before the visitor existed: {read:?}"
+        );
+    }
 
-    let (_, read) = explain_analyze(
+    for ExplainedPlan { mode, read, .. } in explain_analyze(
         db,
         VISITOR_JOURNEY_SESSIONS_SQL,
         vec![
@@ -2887,14 +2894,16 @@ async fn test_visitor_sessions_and_journey_read_only_the_visitors_time_range() -
             bound.into(),
         ],
     )
-    .await?;
-    assert!(reads_any(&read, &recent_events), "{read:?}");
-    assert!(
-        !reads_any(&read, &old_events),
-        "the journey's session list read a chunk from before the visitor existed: {read:?}"
-    );
+    .await?
+    {
+        assert!(reads_any(&read, &recent_events), "{mode} plan: {read:?}");
+        assert!(
+            !reads_any(&read, &old_events),
+            "{mode} plan: the journey's session list read a chunk from before the visitor existed: {read:?}"
+        );
+    }
 
-    let (_, read) = explain_analyze(
+    for ExplainedPlan { mode, read, .. } in explain_analyze(
         db,
         &visitor_journey_events_sql(3),
         vec![
@@ -2907,12 +2916,14 @@ async fn test_visitor_sessions_and_journey_read_only_the_visitors_time_range() -
             a.into(),
         ],
     )
-    .await?;
-    assert!(reads_any(&read, &recent_events), "{read:?}");
-    assert!(
-        !reads_any(&read, &old_events),
-        "the journey's events read a chunk outside its sessions: {read:?}"
-    );
+    .await?
+    {
+        assert!(reads_any(&read, &recent_events), "{mode} plan: {read:?}");
+        assert!(
+            !reads_any(&read, &old_events),
+            "{mode} plan: the journey's events read a chunk outside its sessions: {read:?}"
+        );
+    }
 
     cleanup_test_analytics!(db);
     Ok(())
@@ -3100,23 +3111,29 @@ async fn test_get_session_events_reads_only_the_requested_page() -> anyhow::Resu
     let old_chunks = chunks_holding(db, "events", long_ago).await?;
     let session_chunks = chunks_holding(db, "events", t0).await?;
 
-    let (plan, read) = explain_analyze(db, &queries.page_sql, queries.page_values).await?;
-    let max_rows = max_rows_handled(&plan);
-    assert!(
-        max_rows <= 20.0,
-        "the page query handled {max_rows} rows for a page of 10 out of {SESSION_EVENTS}"
-    );
-    assert!(reads_any(&read, &session_chunks), "{read:?}");
-    assert!(
-        !reads_any(&read, &old_chunks),
-        "the page query read a chunk from before the session: {read:?}"
-    );
-    let (_, read) = explain_analyze(db, &queries.count_sql, queries.count_values).await?;
-    assert!(reads_any(&read, &session_chunks), "{read:?}");
-    assert!(
-        !reads_any(&read, &old_chunks),
-        "the count read a chunk from before the session: {read:?}"
-    );
+    for ExplainedPlan { mode, root, read } in
+        explain_analyze(db, &queries.page_sql, queries.page_values).await?
+    {
+        let max_rows = max_rows_handled(&root);
+        assert!(
+            max_rows <= 20.0,
+            "{mode} plan: the page query handled {max_rows} rows for a page of 10 out of {SESSION_EVENTS}"
+        );
+        assert!(reads_any(&read, &session_chunks), "{mode} plan: {read:?}");
+        assert!(
+            !reads_any(&read, &old_chunks),
+            "{mode} plan: the page query read a chunk from before the session: {read:?}"
+        );
+    }
+    for ExplainedPlan { mode, read, .. } in
+        explain_analyze(db, &queries.count_sql, queries.count_values).await?
+    {
+        assert!(reads_any(&read, &session_chunks), "{mode} plan: {read:?}");
+        assert!(
+            !reads_any(&read, &old_chunks),
+            "{mode} plan: the count read a chunk from before the session: {read:?}"
+        );
+    }
 
     cleanup_test_analytics!(db);
     Ok(())
@@ -3196,7 +3213,7 @@ async fn test_get_page_path_visitors_flags_see_the_whole_session_within_its_life
     );
 
     let (context_start, context_end) = page_path_visitors_context_bounds(w0, window_end);
-    let (_, read) = explain_analyze(
+    for ExplainedPlan { mode, read, .. } in explain_analyze(
         db,
         PAGE_PATH_VISITORS_SQL,
         vec![
@@ -3212,22 +3229,24 @@ async fn test_get_page_path_visitors_flags_see_the_whole_session_within_its_life
             ANALYTICS_ROW_CLOCK_SLACK_HOURS.into(),
         ],
     )
-    .await?;
-    let window_chunks = chunks_holding(db, "events", min(10)).await?;
-    let long_ago_chunks = chunks_holding(db, "events", min(-30 * 60)).await?;
-    assert!(reads_any(&read, &window_chunks), "{read:?}");
-    assert!(
-        reads_any(&read, &long_ago_chunks),
-        "the earlier-page-view check must reach the session's start: {read:?}"
-    );
-    assert!(
-        !reads_any(&read, &chunks_holding(db, "events", before).await?),
-        "a check read a chunk from before any listed session started: {read:?}"
-    );
-    assert!(
-        !reads_any(&read, &chunks_holding(db, "events", after).await?),
-        "a check read a chunk from after every listed session ended: {read:?}"
-    );
+    .await?
+    {
+        let window_chunks = chunks_holding(db, "events", min(10)).await?;
+        let long_ago_chunks = chunks_holding(db, "events", min(-30 * 60)).await?;
+        assert!(reads_any(&read, &window_chunks), "{mode} plan: {read:?}");
+        assert!(
+            reads_any(&read, &long_ago_chunks),
+            "{mode} plan: the earlier-page-view check must reach the session's start: {read:?}"
+        );
+        assert!(
+            !reads_any(&read, &chunks_holding(db, "events", before).await?),
+            "{mode} plan: a check read a chunk from before any listed session started: {read:?}"
+        );
+        assert!(
+            !reads_any(&read, &chunks_holding(db, "events", after).await?),
+            "{mode} plan: a check read a chunk from after every listed session ended: {read:?}"
+        );
+    }
 
     cleanup_test_analytics!(db);
     Ok(())
