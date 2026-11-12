@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use tokenless_core::{
     injection::{
         validate_header_name, InjectedHeader, InjectedHeaders, InjectionSpec, SecretFields,
-        ALWAYS_STRIPPED,
+        SecretMaterial, ALWAYS_STRIPPED,
     },
     variables::{validate_custom_headers, CustomHeader},
 };
@@ -168,11 +168,13 @@ pub fn render(
         // Bearer tokens keep the 16384-byte limit older services were saved
         // under; the SDK's header renderer stops at 8192.
         let mut headers = InjectedHeaders {
-            headers: vec![InjectedHeader {
-                name: "authorization".into(),
-                value: format!("Bearer {secret}"),
-            }],
+            headers: vec![InjectedHeader::credential(
+                "authorization",
+                format!("Bearer {secret}"),
+            )],
             substitutions: Vec::new(),
+            // The worker redacts the token from responses in any form.
+            secrets: vec![SecretMaterial::new(secret)],
         };
         return Ok(with_fixed_headers(&mut headers, delivery, &spec));
     }
@@ -203,16 +205,19 @@ pub fn render(
 
 /// Appends the fixed headers and returns everything the worker must strip from
 /// sandbox requests: the base set, the credential header and every fixed header.
+/// Fixed headers are marked as such: they hold no secret (validation refuses
+/// credential header names and variables), so the worker does not redact their
+/// values from responses, which would break e.g. a reflected `Accept` type.
 fn with_fixed_headers(
     rendered: &mut InjectedHeaders,
     delivery: &CredentialDelivery,
     spec: &InjectionSpec,
 ) -> (InjectedHeaders, Vec<String>) {
     for header in &delivery.headers {
-        rendered.headers.push(InjectedHeader {
-            name: header.name.to_ascii_lowercase(),
-            value: header.value.clone(),
-        });
+        rendered.headers.push(InjectedHeader::fixed(
+            &header.name.to_ascii_lowercase(),
+            header.value.clone(),
+        ));
     }
     let mut strip = vec![
         "authorization".to_string(),
@@ -232,6 +237,7 @@ fn with_fixed_headers(
         InjectedHeaders {
             headers: std::mem::take(&mut rendered.headers),
             substitutions: Vec::new(),
+            secrets: std::mem::take(&mut rendered.secrets),
         },
         strip,
     )
@@ -334,6 +340,69 @@ mod tests {
         }
         validate_credential_shape(None, "token-only").unwrap();
         assert!(render(login.as_ref(), "token-only").is_err());
+    }
+
+    /// The worker redacts each format's credential from responses that
+    /// reflect it, with the same data plane it runs, and leaves the fixed
+    /// headers' values alone (redacting a reflected `Accept` would break
+    /// clients that read it back).
+    #[test]
+    fn every_format_is_redacted_from_responses_and_fixed_headers_are_not() {
+        use tokenless_dataplane::scrub::{Scratch, Scrubber};
+        let accept = "application/vnd.test+json";
+        for (format, stored, raw) in [
+            (
+                CredentialFormat::Bearer,
+                "xoxb-test-0000",
+                vec!["xoxb-test-0000"],
+            ),
+            (
+                CredentialFormat::Header {
+                    name: "x-api-key".into(),
+                    prefix: Some("key=".into()),
+                },
+                "test+key/0000=",
+                vec!["test+key/0000="],
+            ),
+            (
+                CredentialFormat::BasicToken {
+                    username: "x-access-token".into(),
+                },
+                "ghp_test0000aaaa",
+                vec!["ghp_test0000aaaa", "x-access-token:ghp_test0000aaaa"],
+            ),
+            (
+                CredentialFormat::Basic,
+                "test-user:test-pass/0000",
+                vec!["test-pass/0000", "test-user:test-pass/0000"],
+            ),
+        ] {
+            let value = delivery(format.clone(), &[("Accept", accept)]);
+            let (headers, _) = render(value.as_ref(), stored).unwrap();
+            assert!(!headers.headers[0].fixed, "{format:?}");
+            assert!(headers.headers[1].fixed, "{format:?}");
+            let listed: Vec<&str> = headers.secrets.iter().map(|s| s.expose()).collect();
+            assert_eq!(listed, raw, "{format:?}");
+            let scrubber = Scrubber::for_rule(&headers).unwrap();
+            let sent = headers.headers[0].value.clone();
+            for reflected in [
+                raw[0].to_string(),
+                raw[0].replace('/', r"\/"),
+                raw[0]
+                    .replace('/', "%2F")
+                    .replace('+', "%2B")
+                    .replace('=', "%3D"),
+                sent,
+            ] {
+                let mut body =
+                    format!("{{\"echo\":\"{reflected}\",\"accept\":\"{accept}\"}}").into_bytes();
+                let count = scrubber.redact_all(&mut body, &mut Scratch::default());
+                let body = String::from_utf8(body).unwrap();
+                assert!(count >= 1, "{format:?}: {reflected} not found");
+                assert!(!body.contains(raw[0]), "{format:?}: {body}");
+                assert!(body.contains(accept), "{format:?}: {body}");
+            }
+        }
     }
 
     #[test]

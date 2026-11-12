@@ -12,7 +12,7 @@ use temps_service_access_runtime::{
 use tokenless_core::{
     egress::EgressPolicy,
     ids::{CredentialId, NodeId},
-    injection::{InjectedHeader, InjectedHeaders},
+    injection::{InjectedHeader, InjectedHeaders, SecretMaterial},
     seal::{seal, SealPublicKey},
     session::SessionSigner,
     snapshot::{
@@ -200,15 +200,20 @@ impl AuthorityStore {
                     let basic = Zeroizing::new(format!("x-access-token:{}", credential.expose()));
                     (
                         InjectedHeaders {
-                            headers: vec![InjectedHeader {
-                                name: "authorization".into(),
-                                value: format!(
+                            headers: vec![InjectedHeader::credential(
+                                "authorization",
+                                format!(
                                     "Basic {}",
                                     base64::engine::general_purpose::STANDARD
                                         .encode(basic.as_bytes())
                                 ),
-                            }],
+                            )],
                             substitutions: Vec::new(),
+                            // The worker redacts these from Git responses.
+                            secrets: vec![
+                                SecretMaterial::new(credential.expose()),
+                                SecretMaterial::new(basic.as_str()),
+                            ],
                         },
                         vec![
                             "authorization".to_string(),

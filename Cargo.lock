@@ -15819,6 +15819,7 @@ dependencies = [
  "temps-test-utils",
  "thiserror 2.0.21",
  "tokenless-core",
+ "tokenless-dataplane",
  "tokio",
  "tower",
  "tracing",
@@ -16449,7 +16450,7 @@ dependencies = [
 [[package]]
 name = "tokenless-auth"
 version = "0.1.0"
-source = "git+https://github.com/gotempsh/tokenless?rev=03c94edcd6ec214164863540d7b372dac219b3ac#03c94edcd6ec214164863540d7b372dac219b3ac"
+source = "git+https://github.com/gotempsh/tokenless?rev=1475fa0fa9684124976e2e68e472e5bf529029d2#1475fa0fa9684124976e2e68e472e5bf529029d2"
 dependencies = [
  "argon2 0.5.3",
  "base64 0.22.1",
@@ -16469,7 +16470,7 @@ dependencies = [
 [[package]]
 name = "tokenless-control"
 version = "0.1.0"
-source = "git+https://github.com/gotempsh/tokenless?rev=03c94edcd6ec214164863540d7b372dac219b3ac#03c94edcd6ec214164863540d7b372dac219b3ac"
+source = "git+https://github.com/gotempsh/tokenless?rev=1475fa0fa9684124976e2e68e472e5bf529029d2#1475fa0fa9684124976e2e68e472e5bf529029d2"
 dependencies = [
  "aes-gcm 0.10.3",
  "async-trait",
@@ -16499,7 +16500,7 @@ dependencies = [
 [[package]]
 name = "tokenless-core"
 version = "0.1.0"
-source = "git+https://github.com/gotempsh/tokenless?rev=03c94edcd6ec214164863540d7b372dac219b3ac#03c94edcd6ec214164863540d7b372dac219b3ac"
+source = "git+https://github.com/gotempsh/tokenless?rev=1475fa0fa9684124976e2e68e472e5bf529029d2#1475fa0fa9684124976e2e68e472e5bf529029d2"
 dependencies = [
  "aes-gcm 0.10.3",
  "base64 0.22.1",
@@ -16520,7 +16521,7 @@ dependencies = [
 [[package]]
 name = "tokenless-dataplane"
 version = "0.1.0"
-source = "git+https://github.com/gotempsh/tokenless?rev=03c94edcd6ec214164863540d7b372dac219b3ac#03c94edcd6ec214164863540d7b372dac219b3ac"
+source = "git+https://github.com/gotempsh/tokenless?rev=1475fa0fa9684124976e2e68e472e5bf529029d2#1475fa0fa9684124976e2e68e472e5bf529029d2"
 dependencies = [
  "arc-swap",
  "async-trait",

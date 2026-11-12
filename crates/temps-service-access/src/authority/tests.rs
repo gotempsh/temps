@@ -264,14 +264,26 @@ async fn signed_policy_seals_credentials_and_preserves_independent_scope_and_dea
             .iter()
             .find(|header| header.name == "authorization")
             .unwrap();
+        // The worker redacts the credential, in every form these list, from
+        // whatever the upstream sends back to the sandbox.
+        assert!(!authorization.fixed);
+        let secrets: Vec<&str> = headers.secrets.iter().map(|s| s.expose()).collect();
         if rule.allow.git.is_some() {
             let value = authorization.value.strip_prefix("Basic ").unwrap();
             assert_eq!(
                 STANDARD.decode(value).unwrap(),
                 b"x-access-token:upstream-test-secret"
             );
+            assert_eq!(
+                secrets,
+                [
+                    "upstream-test-secret",
+                    "x-access-token:upstream-test-secret"
+                ]
+            );
         } else {
             assert_eq!(authorization.value, "Bearer upstream-test-secret");
+            assert_eq!(secrets, ["upstream-test-secret"]);
         }
         let (_, other) = self::identity();
         assert!(open(&other, &rule.headers, &aad).is_err());
@@ -708,6 +720,7 @@ async fn credential_formats_and_fixed_headers_are_sealed_and_stripped_from_the_s
         .unwrap();
     assert_eq!(body.rules.len(), 4);
     let mut by_host = BTreeMap::new();
+    let mut fixed_by_host = BTreeMap::new();
     for rule in &body.rules {
         let aad = rule_aad(&body.node_id, &rule.rule_id, &rule.credential_id);
         let headers: tokenless_core::injection::InjectedHeaders =
@@ -725,8 +738,36 @@ async fn credential_formats_and_fixed_headers_are_sealed_and_stripped_from_the_s
             );
         }
         assert!(rule.strip_headers.contains(&"authorization".to_string()));
+        // Fixed headers are configuration and stay unredacted in responses;
+        // the credential header and its raw secret are redacted.
+        let fixed: BTreeMap<_, _> = headers
+            .headers
+            .iter()
+            .map(|header| (header.name.clone(), header.fixed))
+            .collect();
+        let secrets: Vec<String> = headers
+            .secrets
+            .iter()
+            .map(|s| s.expose().to_string())
+            .collect();
+        assert!(
+            secrets.iter().any(|s| s == "upstream-test-secret"),
+            "{secrets:?}"
+        );
+        fixed_by_host.insert(rule.allow.hosts[0].to_string(), (fixed, secrets));
         by_host.insert(rule.allow.hosts[0].to_string(), injected);
     }
+    let fixed = |host: &str, name: &str| fixed_by_host[host].0[name];
+    assert!(fixed("api-header.example.com", "anthropic-version"));
+    assert!(!fixed("api-header.example.com", "x-api-key"));
+    assert!(!fixed("api-prefix.example.com", "x-token"));
+    assert!(!fixed("api-basic.example.com", "authorization"));
+    assert!(fixed("api-bearer.example.com", "notion-version"));
+    assert!(!fixed("api-bearer.example.com", "authorization"));
+    assert_eq!(
+        fixed_by_host["api-basic.example.com"].1,
+        ["upstream-test-secret", "account:upstream-test-secret"]
+    );
     let header_rule = &by_host["api-header.example.com"];
     assert_eq!(header_rule["x-api-key"], "upstream-test-secret");
     assert_eq!(header_rule["anthropic-version"], "2023-06-01");

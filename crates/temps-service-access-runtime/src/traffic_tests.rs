@@ -482,3 +482,299 @@ injection:
         .unwrap();
     new_connection_is_denied(&attachment).await;
 }
+
+/// An upstream that reflects the credential header it received, the way an
+/// echo endpoint, a token check or an error page does: as is in JSON,
+/// JSON-escaped, percent-encoded, base64-encoded, in a response header, in a
+/// redirect, and in a chunked body cut inside the value.
+async fn reflector(credential_header: &'static str) -> Upstream {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+    let der = cert.cert.der().clone();
+    let config =
+        ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![der.clone()],
+                PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()).into(),
+            )
+            .unwrap();
+    let acceptor = TlsAcceptor::from(Arc::new(config));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let host = listener.local_addr().unwrap().to_string();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&calls);
+    let task = tokio::spawn(async move {
+        let mut requests = JoinSet::new();
+        loop {
+            tokio::select! {
+                _ = requests.join_next(), if !requests.is_empty() => {},
+                accepted = listener.accept() => {
+                    let (tcp, _) = accepted.unwrap();
+                    assert!(requests.len() < 8, "fixture admission is bounded");
+                    let acceptor = acceptor.clone();
+                    let seen = Arc::clone(&seen);
+                    requests.spawn(async move {
+                        let mut tls = tokio::time::timeout(Duration::from_secs(5), acceptor.accept(tcp)).await.unwrap().unwrap();
+                        let request = head(&mut tls).await;
+                        seen.fetch_add(1, Ordering::SeqCst);
+                        let value = request.lines().filter_map(|line| line.split_once(':'))
+                            .find(|(name, _)| name.eq_ignore_ascii_case(credential_header))
+                            .map(|(_, value)| value.trim().to_string())
+                            .unwrap_or_default();
+                        let path = request.split(' ').nth(1).unwrap_or("/").to_string();
+                        let encoded: String = value.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect();
+                        let whole = |extra: String, body: String| format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n{extra}\r\n{body}", body.len()).into_bytes();
+                        let response = match path.as_str() {
+                            "/allowed/echo" => whole(
+                                format!("X-Echo: {value}\r\n"),
+                                format!("{{\"args\":{{\"token\":\"{value}\"}},\"escaped\":\"{}\",\"query\":\"{encoded}\",\"b64\":\"{}\"}}", value.replace('/', "\\/"), STANDARD.encode(&value)),
+                            ),
+                            "/allowed/redirect" => format!("HTTP/1.1 302 Found\r\nLocation: https://callback.test/cb?v={encoded}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").into_bytes(),
+                            "/allowed/chunked" => {
+                                let _ = tls.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").await;
+                                let body = format!("{{\"token\":\"{value}\"}}");
+                                let cut = 10 + value.len() / 2;
+                                for piece in [&body[..cut], &body[cut..]] {
+                                    let _ = tls.write_all(format!("{:x}\r\n{piece}\r\n", piece.len()).as_bytes()).await;
+                                    let _ = tls.flush().await;
+                                    tokio::time::sleep(Duration::from_millis(20)).await;
+                                }
+                                b"0\r\n\r\n".to_vec()
+                            }
+                            "/allowed/gzip" => whole("Content-Encoding: gzip\r\n".into(), "upstream-gzip-bytes".into()),
+                            _ => whole(String::new(), "plain body, nothing reflected".into()),
+                        };
+                        let _ = tls.write_all(&response).await;
+                        let _ = tls.shutdown().await;
+                    });
+                }
+            }
+        }
+    });
+    Upstream {
+        host,
+        cert: der,
+        calls,
+        task,
+    }
+}
+
+/// The guest's whole response: head, and body without chunked framing.
+async fn exchange(
+    f: &Fixture,
+    attachment: &UnixAttachment,
+    host: &str,
+    path: &str,
+) -> (String, Vec<u8>) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut stream = UnixStream::connect(attachment.directory().join("proxy.sock"))
+            .await
+            .unwrap();
+        stream
+            .write_all(format!("CONNECT {host} HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        assert!(head(&mut stream).await.starts_with("HTTP/1.1 200"));
+        let mut tls = guest_tls(f)
+            .connect(ServerName::try_from("127.0.0.1").unwrap(), stream)
+            .await
+            .unwrap();
+        tls.write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let response_head = head(&mut tls).await;
+        let mut body = Vec::new();
+        let _ = tls.read_to_end(&mut body).await;
+        if response_head
+            .to_ascii_lowercase()
+            .contains("transfer-encoding: chunked")
+        {
+            let (mut decoded, mut rest) = (Vec::new(), &body[..]);
+            while let Some(line) = rest.windows(2).position(|w| w == b"\r\n") {
+                let size =
+                    usize::from_str_radix(std::str::from_utf8(&rest[..line]).unwrap(), 16).unwrap();
+                if size == 0 {
+                    break;
+                }
+                decoded.extend_from_slice(&rest[line + 2..line + 2 + size]);
+                rest = &rest[line + 2 + size + 2..];
+            }
+            body = decoded;
+        }
+        (response_head, body)
+    })
+    .await
+    .expect("guest HTTPS exchange must finish")
+}
+
+/// Regression: a sandbox linked to a vault service read the stored credential
+/// back from an endpoint that echoes its request. Each delivery format the
+/// worker injects must reach the upstream, and no form of it may reach the
+/// guest; a response with nothing to redact arrives byte for byte, and one the
+/// worker cannot scan is refused, not relayed.
+#[tokio::test]
+async fn a_reflected_credential_never_reaches_the_sandbox_in_any_delivery_format() {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    // (header the upstream reflects, injection, credential fields, the
+    // secret, the header value the upstream must receive)
+    let formats: [(&str, &str, &str, &str, String); 4] = [
+        (
+            "authorization",
+            "method: bearer\n  field: token",
+            "  - name: token\n    label: Token",
+            "xoxb-test/0000+aaaa",
+            "Bearer xoxb-test/0000+aaaa".into(),
+        ),
+        (
+            "x-api-key",
+            "method: header\n  name: X-Api-Key\n  field: token\n  prefix: \"key=\"",
+            "  - name: token\n    label: Token",
+            "test+key/0000=bbbb",
+            "key=test+key/0000=bbbb".into(),
+        ),
+        (
+            "authorization",
+            "method: basic_token\n  username: x-access-token\n  password_field: token",
+            "  - name: token\n    label: Token",
+            "ghp_test/0000cccc",
+            format!(
+                "Basic {}",
+                STANDARD.encode("x-access-token:ghp_test/0000cccc")
+            ),
+        ),
+        (
+            "authorization",
+            "method: basic\n  username_field: username\n  password_field: password",
+            "  - name: username\n    label: Username\n  - name: password\n    label: Password",
+            "test-pass/0000dddd",
+            format!("Basic {}", STANDARD.encode("test-user:test-pass/0000dddd")),
+        ),
+    ];
+    for (index, (header, injection, fields, secret, sent)) in formats.into_iter().enumerate() {
+        let upstream = reflector(header).await;
+        let mut f = fixture(&upstream).await;
+        let id = format!("fixture-reflect-{index}");
+        let yaml = format!(
+            "id: {id}\nversion: 1\nname: Reflecting fixture\nhosts: [\"{}\"]\nallow:\n  paths: [\"/*\"]\n  methods: [\"GET\"]\ncredential_fields:\n{fields}\ninjection:\n  {injection}\n",
+            upstream.host
+        );
+        f.control
+            .policy
+            .import_template(&f.caller, &yaml)
+            .await
+            .unwrap();
+        f.control
+            .policy
+            .approve_template(&f.caller, &id, 1)
+            .await
+            .unwrap();
+        let values = if index == 3 {
+            [
+                ("username".into(), "test-user".into()),
+                ("password".into(), secret.into()),
+            ]
+            .into()
+        } else {
+            [("token".into(), secret.into())].into()
+        };
+        let credential = f
+            .control
+            .policy
+            .create_credential(
+                &f.caller,
+                &f.vault,
+                CreateCredential {
+                    name: id.clone(),
+                    template_id: id.clone(),
+                    template_version: None,
+                    host_override: vec![],
+                    fields: values,
+                    custom_headers: vec![],
+                    substitutions: vec![],
+                    not_after: None,
+                },
+            )
+            .await
+            .unwrap();
+        f.rule = f
+            .control
+            .policy
+            .create_rule(
+                &f.caller,
+                &f.vault,
+                CreateRule {
+                    name: id.clone(),
+                    credential_id: credential.id,
+                    hosts: None,
+                    paths: None,
+                    methods: None,
+                    mcp_tools: None,
+                    git: None,
+                },
+            )
+            .await
+            .unwrap()
+            .id;
+        let token = f.mint(true).await;
+        let binding = f
+            .proxy
+            .bind(f.spec(token), f.install().await)
+            .await
+            .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let attachment = UnixAttachment::bind(root.path(), binding).unwrap();
+
+        let forms = [
+            secret.to_string(),
+            sent.clone(),
+            secret.replace('/', "\\/"),
+            sent.replace('/', "\\/"),
+            secret
+                .replace('/', "%2F")
+                .replace('+', "%2B")
+                .replace('=', "%3D"),
+            STANDARD.encode(&sent),
+        ];
+        let tail = &secret[secret.len() - 4..];
+        for path in ["/allowed/echo", "/allowed/redirect", "/allowed/chunked"] {
+            let (head, body) = exchange(&f, &attachment, &upstream.host, path).await;
+            assert!(
+                head.starts_with("HTTP/1.1 200") || head.starts_with("HTTP/1.1 302"),
+                "{id} {path}: {head}"
+            );
+            let seen = format!("{head}{}", String::from_utf8_lossy(&body));
+            for form in &forms {
+                assert!(
+                    !seen.contains(form.as_str()),
+                    "{id} {path} leaked {form}: {seen}"
+                );
+            }
+            assert!(!seen.contains(tail), "{id} {path} leaked part: {seen}");
+            assert!(seen.contains("[redacted]"), "{id} {path}: {seen}");
+        }
+        let (head, body) = exchange(&f, &attachment, &upstream.host, "/allowed/plain").await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{id}: {head}");
+        assert!(
+            head.to_ascii_lowercase().contains("content-length: 29"),
+            "{head}"
+        );
+        assert_eq!(body, b"plain body, nothing reflected", "{id}");
+        let (head, body) = exchange(&f, &attachment, &upstream.host, "/allowed/gzip").await;
+        assert!(head.starts_with("HTTP/1.1 502"), "{id}: {head}");
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("withheld"), "{id}: {body}");
+        assert!(!body.contains("upstream-gzip-bytes"), "{id}: {body}");
+        // Every exchange reached the upstream with the stored credential.
+        assert_eq!(upstream.calls.load(Ordering::SeqCst), 5, "{id}");
+        attachment
+            .revoke_and_wait(Duration::from_secs(2))
+            .await
+            .unwrap();
+    }
+}
