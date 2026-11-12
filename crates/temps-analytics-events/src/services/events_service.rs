@@ -2411,26 +2411,33 @@ WHERE project_id = $1
         Ok(())
     }
 
-    /// Moves an existing session row's `last_accessed_at` forward to `now`.
-    /// The `WHERE` makes a concurrent refresh of the same session a no-op and
-    /// never moves the value backwards.
+    /// Moves an existing session row's `last_accessed_at` forward to `now` if
+    /// the stored value is still older than the refresh interval, and returns
+    /// whether it did. The caller's check uses the value it read earlier;
+    /// repeating it in the `WHERE` keeps concurrent events of one stale session
+    /// to a single write per interval (the row lock makes the later ones
+    /// re-check the committed value), and never moves the value backwards.
     async fn refresh_session_last_access(
         &self,
         session_id: &str,
         now: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(), EventsError> {
+    ) -> Result<bool, EventsError> {
         use sea_orm::ConnectionTrait;
 
         let stmt = Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
             r#"UPDATE request_sessions
                SET last_accessed_at = $2
-               WHERE session_id = $1 AND last_accessed_at < $2"#,
-            [session_id.to_string().into(), now.into()],
+               WHERE session_id = $1 AND last_accessed_at < $3"#,
+            [
+                session_id.to_string().into(),
+                now.into(),
+                session_last_access_refresh_threshold(now).into(),
+            ],
         );
 
-        self.db.execute(stmt).await.map_err(EventsError::Database)?;
-        Ok(())
+        let result = self.db.execute(stmt).await.map_err(EventsError::Database)?;
+        Ok(result.rows_affected() > 0)
     }
 }
 
@@ -2447,14 +2454,26 @@ WHERE project_id = $1
 /// instead of one per event.
 const SESSION_LAST_ACCESS_REFRESH_SECONDS: i64 = 5 * 60;
 
+/// The `last_accessed_at` below which an event ingested at `now` moves a
+/// session row forward (see [`SESSION_LAST_ACCESS_REFRESH_SECONDS`]),
+/// saturated at the minimum timestamp.
+fn session_last_access_refresh_threshold(
+    now: chrono::DateTime<chrono::Utc>,
+) -> chrono::DateTime<chrono::Utc> {
+    now.checked_sub_signed(chrono::Duration::seconds(
+        SESSION_LAST_ACCESS_REFRESH_SECONDS,
+    ))
+    .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC)
+}
+
 /// Whether an event ingested at `now` should move a session row's
-/// `last_accessed_at` forward (see [`SESSION_LAST_ACCESS_REFRESH_SECONDS`]).
+/// `last_accessed_at` forward. The same threshold is repeated in the `UPDATE`
+/// of [`AnalyticsEventsService::refresh_session_last_access`].
 fn session_last_access_is_stale(
     last_accessed_at: chrono::DateTime<chrono::Utc>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> bool {
-    now.signed_duration_since(last_accessed_at)
-        > chrono::Duration::seconds(SESSION_LAST_ACCESS_REFRESH_SECONDS)
+    last_accessed_at < session_last_access_refresh_threshold(now)
 }
 
 /// Computes the percentage change between two visitor counts for the dashboard
@@ -6266,6 +6285,73 @@ mod tests {
         assert_eq!(
             unchanged.last_accessed_at, refreshed.last_accessed_at,
             "an event within the refresh interval must not rewrite last_accessed_at"
+        );
+
+        // ── Case (e): concurrent events of one stale session write once ──────
+        // Each of them read the stale row before any refresh landed, so each
+        // passed the caller's check; the UPDATE's own threshold must stop all
+        // but the first, whatever timestamps they carry.
+        request_sessions::ActiveModel {
+            id: Set(created_session.id),
+            last_accessed_at: Set(aged),
+            ..Default::default()
+        }
+        .update(db.as_ref())
+        .await
+        .expect("Failed to age the request_sessions row again");
+        let race_base = chrono::Utc::now();
+        assert!(session_last_access_is_stale(aged, race_base));
+        let racers = tokio::join!(
+            service.refresh_session_last_access(&fresh_session_id, race_base),
+            service.refresh_session_last_access(
+                &fresh_session_id,
+                race_base + chrono::Duration::milliseconds(1)
+            ),
+            service.refresh_session_last_access(
+                &fresh_session_id,
+                race_base + chrono::Duration::milliseconds(2)
+            ),
+            service.refresh_session_last_access(
+                &fresh_session_id,
+                race_base + chrono::Duration::milliseconds(3)
+            ),
+        );
+        let writes = [racers.0, racers.1, racers.2, racers.3]
+            .into_iter()
+            .map(|r| r.expect("concurrent refresh must not fail"))
+            .filter(|wrote| *wrote)
+            .count();
+        assert_eq!(
+            writes, 1,
+            "concurrent refreshes of one stale session must write exactly once"
+        );
+
+        // A later refresh still inside the interval of the stored value is a
+        // no-op even though its timestamp is newer; one past it writes again.
+        let stored = request_sessions::Entity::find()
+            .filter(request_sessions::Column::SessionId.eq(fresh_session_id.clone()))
+            .one(db.as_ref())
+            .await
+            .expect("query raced session")
+            .expect("request_sessions row must still exist")
+            .last_accessed_at;
+        let interval = chrono::Duration::seconds(SESSION_LAST_ACCESS_REFRESH_SECONDS);
+        assert!(
+            !service
+                .refresh_session_last_access(&fresh_session_id, stored + interval)
+                .await
+                .expect("refresh at the interval edge"),
+            "a refresh exactly one interval after the stored value must not write"
+        );
+        assert!(
+            service
+                .refresh_session_last_access(
+                    &fresh_session_id,
+                    stored + interval + chrono::Duration::seconds(1)
+                )
+                .await
+                .expect("refresh past the interval"),
+            "a refresh past the interval must write"
         );
 
         println!("✅ record_event session-race regression test passed!");
