@@ -74,6 +74,7 @@ export function severityOf(warning: WalWarning): WalWarningSeverity {
     case 'wal_bloat':
       return warning.ratio >= 10 ? 'critical' : 'warning'
     case 'stale_slot':
+    case 'archive_failing':
       return 'critical'
     default:
       return 'warning'
@@ -91,4 +92,26 @@ export function formatBytes(bytes: number): string {
     unit++
   }
   return `${n < 10 ? n.toFixed(1) : Math.round(n)} ${units[unit]}`
+}
+
+export type ArchivingState = 'archiving' | 'failing' | 'waiting'
+
+/** Stall threshold, the server's `ARCHIVE_STALL_SECS`. */
+export const ARCHIVE_STALL_SECS = 300
+
+/**
+ * Failing when the last failure is newer than the last success, or when a
+ * segment has waited five minutes (WAL-G retrying without failing yet).
+ */
+export function archivingState(snapshot: PostgresWalHealth): ArchivingState {
+  const failedAt = snapshot.archiver_last_failed_at
+  const archivedAt = snapshot.archiver_last_archived_at
+  if (
+    failedAt &&
+    (!archivedAt || Date.parse(failedAt) > Date.parse(archivedAt))
+  )
+    return 'failing'
+  if ((snapshot.archive_oldest_ready_age_secs ?? 0) >= ARCHIVE_STALL_SECS)
+    return 'failing'
+  return archivedAt ? 'archiving' : 'waiting'
 }

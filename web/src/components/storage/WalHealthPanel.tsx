@@ -24,6 +24,7 @@ import { isRoleRefusal } from '@/lib/read-failure'
 import { ROUTE_FAILURE_IGNORE } from '@/lib/route-query-failures'
 import { useQuery } from '@tanstack/react-query'
 import { AlertTriangle, ShieldAlert } from 'lucide-react'
+import { WalArchivingStatus } from './WalArchivingStatus'
 
 interface Props {
   serviceId: number
@@ -77,8 +78,11 @@ export function WalHealthPanel({
   // cannot be changed from here), so it never gets the upgrade action.
   const upgradeImage = backupCapability.data?.recommended_image ?? null
   const archivingDisabled = snapshot?.archive_mode === 'off' && !incompatible
+  // Archiving is on: always show where it stands, not only once it breaks.
+  const archivingOn = !!snapshot && snapshot.archive_mode !== 'off'
   if (
     (!snapshot || snapshot.warnings.length === 0) &&
+    !archivingOn &&
     !notChecked &&
     !incompatible &&
     !archivingDisabled &&
@@ -253,6 +257,9 @@ export function WalHealthPanel({
           </AlertDescription>
         </Alert>
       ) : null}
+      {snapshot && archivingOn ? (
+        <WalArchivingStatus serviceId={serviceId} snapshot={snapshot} />
+      ) : null}
     </div>
   )
 }
@@ -320,6 +327,20 @@ function describeWarning(
         body: archiveCommand?.trim()
           ? 'The no-op archive command reports success without storing WAL. Continuous recovery coverage is unavailable. Create a full backup to configure and verify the pinned archive destination.'
           : 'An empty archive command leaves WAL waiting for a destination and can fill disk. Create a full backup to configure and verify the pinned archive destination.',
+      }
+    case 'archive_failing':
+      return {
+        title: w.last_failed_wal
+          ? `WAL archiving is failing at segment ${w.last_failed_wal}`
+          : w.stalled_secs
+            ? `WAL archiving has stalled: a segment has waited ${Math.round(w.stalled_secs / 60)} min`
+            : 'WAL archiving is failing',
+        body:
+          w.stalled_secs && !w.last_failed_wal
+            ? 'archive_command has not finished archiving the oldest waiting segment and has reported no error yet; WAL-G is likely retrying an endpoint it cannot reach. PostgreSQL keeps every WAL segment until archiving succeeds, so pg_wal grows until the disk is full. Test the archive target below to see why.'
+            : w.last_archived_at
+              ? 'archive_command has failed since the last segment it archived. PostgreSQL keeps every WAL segment until archiving succeeds, so pg_wal grows until the disk is full. Test the archive target below to see why.'
+              : 'archive_command has never archived a segment. PostgreSQL keeps every WAL segment until archiving succeeds, so pg_wal grows until the disk is full. Test the archive target below to see why.',
       }
     case 'wal_not_recycled':
       return {
