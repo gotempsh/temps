@@ -49,13 +49,15 @@ export function publishDecision(
       kind: 'blocked',
       reason: `The plan for ${address} was not saved. Try again.`,
     }
-  if (option.confirmation)
-    return {
-      kind: 'confirm',
-      planId: plan.plan_id,
-      option,
-      message: option.confirmation,
-    }
+  // The banner always plans a public address, so an audience step means the
+  // address is signed-in or private today and this would open it to anyone:
+  // the planner's warning names the address and says so.
+  const opens = option.steps.some((s) => s.kind === 'set_audience')
+    ? (option.warnings[0] ??
+      `${address} is not public now. Adding it here makes it open to anyone.`)
+    : null
+  const message = [option.confirmation, opens].filter(Boolean).join(' ')
+  if (message) return { kind: 'confirm', planId: plan.plan_id, option, message }
   return { kind: 'apply', planId: plan.plan_id, option }
 }
 
@@ -65,7 +67,7 @@ export function publishDecision(
  */
 export function deliveryStatus(
   run: Pick<RunView, 'steps'>,
-  option: Pick<PlanOption, 'kind' | 'way_in' | 'steps'>
+  option: Pick<PlanOption, 'kind' | 'way_in' | 'steps' | 'fields'>
 ): string {
   const step = (kind: string) => run.steps.find((s) => s.kind === kind)
   const cert = step('issue_certificate')
@@ -76,7 +78,9 @@ export function deliveryStatus(
         ? `Certificate failed${cert.detail ? `: ${cert.detail}` : ''}`
         : 'Certificate pending'
     : option.way_in.startsWith('tunnel:')
-      ? 'HTTPS by Cloudflare'
+      ? cloudflareCovers(option)
+        ? 'HTTPS by Cloudflare'
+        : "No HTTPS: Cloudflare's free certificate does not cover it"
       : 'HTTPS'
   const record = step('wait_for_publication') ?? step('set_dns_record')
   const dns =
@@ -86,4 +90,15 @@ export function deliveryStatus(
         ? `DNS not published${record.detail ? `: ${record.detail}` : ''}`
         : dnsHandling(option).replace(/\.$/, '')
   return `${https} · ${dns}`
+}
+
+/**
+ * Whether Cloudflare's free certificate covers a tunnel option's address.
+ * The planner leaves HTTPS only out of the `http_policy` choices exactly
+ * when it does not (a hostname more than one level below the zone).
+ */
+function cloudflareCovers(option: Pick<PlanOption, 'fields'>): boolean {
+  const field = option.fields.find((f) => f.key === 'http_policy')
+  if (!field || field.kind.type !== 'choice') return true
+  return field.kind.choices.some((c) => c.value === 'https_only')
 }

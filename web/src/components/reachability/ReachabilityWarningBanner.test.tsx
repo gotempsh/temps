@@ -5,9 +5,10 @@ import { afterEach, beforeEach, expect, test } from 'bun:test'
 import { cleanup, fireEvent, render, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter, useLocation } from 'react-router'
-import type { ReachabilityWarning } from '@/api/client'
+import type { PlanOption, ReachabilityWarning, RunView } from '@/api/client'
 import { client } from '@/api/client/client.gen'
 import { installBrowserWindow } from '@/test/dom'
+import { deliveryStatus } from './publish-domain'
 import {
   ReachabilityWarningBanner,
   tunnelSuggestions,
@@ -303,6 +304,67 @@ test('a plan that changes someone else’s choice asks inline, then applies', as
   } finally {
     server.restore()
   }
+})
+
+test('making a signed-in address public asks inline before applying', async () => {
+  const server = mockServer(({ url }) => ({
+    body: url.endsWith('/plan')
+      ? {
+          plan_id: 'p5',
+          options: [
+            tunnelOption({
+              steps: [{ kind: 'set_audience', label: 'Make it public' }],
+              warnings: [
+                'store.example.com is for signed-in users now; this makes it open to anyone.',
+              ],
+            }),
+          ],
+        }
+      : run('succeeded'),
+  }))
+  try {
+    const view = renderWithLocation()
+    fireEvent.click(view.getByText('Add domain'))
+    await waitFor(() =>
+      expect(view.container.textContent).toContain(
+        'this makes it open to anyone'
+      )
+    )
+    // Nothing is applied until the user confirms.
+    expect(server.calls.some((c) => c.url.endsWith('/apply'))).toBe(false)
+    fireEvent.click(view.getByText('Add anyway'))
+    await waitFor(() => expect(view.container.textContent).toContain('Live at'))
+    const apply = server.calls.find((c) => c.url.endsWith('/apply'))
+    expect(apply?.body).toMatchObject({ plan_id: 'p5', confirmed: true })
+  } finally {
+    server.restore()
+  }
+})
+
+test('a tunnel address outside Cloudflare’s free certificate never claims HTTPS', () => {
+  const steps = [
+    { kind: 'wait_for_publication', label: 'Publish', status: 'done' },
+  ] as RunView['steps']
+  const choice = (values: string[]) => ({
+    key: 'http_policy',
+    label: 'What it answers',
+    required: false,
+    kind: {
+      type: 'choice' as const,
+      choices: values.map((value) => ({ value, label: value })),
+    },
+  })
+  const option = (values: string[]) =>
+    ({
+      ...tunnelOption(),
+      fields: [choice(values)],
+    }) as unknown as PlanOption
+  expect(
+    deliveryStatus({ steps }, option(['https_only', 'allow_http']))
+  ).toStartWith('HTTPS by Cloudflare')
+  expect(
+    deliveryStatus({ steps }, option(['allow_http', 'allow_all']))
+  ).toStartWith("No HTTPS: Cloudflare's free certificate does not cover it")
 })
 
 test('a refused apply shows the server’s reason in place and can retry', async () => {

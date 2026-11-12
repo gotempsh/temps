@@ -354,7 +354,8 @@ function PublishProgress({
   const settled = SETTLED.includes(view.state)
   // The environment has an address now: what shows its reachability and
   // its domains asks again. The deployment's warning is left alone so the
-  // result stays on screen until the page next loads it.
+  // result stays on screen until the page next loads it. Keyed on the state
+  // too, so a run that waits first and then succeeds asks again.
   useEffect(() => {
     if (!settled) return
     client.invalidateQueries({
@@ -367,7 +368,7 @@ function PublishProgress({
         )
       },
     })
-  }, [settled, client])
+  }, [settled, view.state, client])
   const details = (
     <Link
       className="text-xs underline"
