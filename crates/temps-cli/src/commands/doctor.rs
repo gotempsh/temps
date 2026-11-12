@@ -87,6 +87,30 @@ impl DiagnosticReport {
         self.checks.push((label.into(), result));
     }
 
+    /// Downgrade the checks from index `start` on, which ran against a
+    /// guessed `dir`: a pass there does not show the server's own files are
+    /// fine (Info), and a failure may not be the server's (Warn).
+    fn mark_unverified_since(&mut self, start: usize, dir: &Path) {
+        let note = format!(
+            "for {}, not confirmed to be the server's data directory",
+            dir.display()
+        );
+        for (_, result) in self.checks.iter_mut().skip(start) {
+            *result = match std::mem::replace(result, CheckResult::Info(String::new())) {
+                CheckResult::Pass(message) => {
+                    self.pass_count -= 1;
+                    CheckResult::Info(format!("{message} ({note})"))
+                }
+                CheckResult::Fail(message) => {
+                    self.fail_count -= 1;
+                    self.warn_count += 1;
+                    CheckResult::Warn(format!("{message} ({note})"))
+                }
+                other => other,
+            };
+        }
+    }
+
     fn print(&self) {
         for (label, result) in &self.checks {
             match result {
@@ -359,7 +383,7 @@ impl DoctorCommand {
             CheckResult::Info(format!("{} ({source})", data_dir.display())),
         );
         // A guess, while an installed server exists: a pass below says
-        // nothing about the server's own files.
+        // nothing about the server's own files, so none is reported as one.
         if unverified {
             report.add(
                 "Server's data directory",
@@ -370,7 +394,21 @@ impl DoctorCommand {
                 )),
             );
         }
+        let first = report.checks.len();
+        self.check_data_dir_files(data_dir, unverified, service, secrets_env, report);
+        if unverified {
+            report.mark_unverified_since(first, data_dir);
+        }
+    }
 
+    fn check_data_dir_files(
+        &self,
+        data_dir: &Path,
+        unverified: bool,
+        service: Option<&ServiceDefinition>,
+        secrets_env: SecretsEnvironment<'_>,
+        report: &mut DiagnosticReport,
+    ) {
         if let Some(result) = data_dir_absence(data_dir, unverified, service.is_some()) {
             report.add("Directory", result);
             return;

@@ -688,6 +688,28 @@ fn a_guessed_data_dir_is_flagged_when_an_installed_server_exists() {
                 && matches!(result, CheckResult::Warn(message) if message.contains("--data-dir"))
         });
         assert_eq!(flagged, unverified, "{:?}", report.checks);
+        // A guess never reports a pass or a failure as the server's.
+        let verdicts = report
+            .checks
+            .iter()
+            .filter(|(_, result)| matches!(result, CheckResult::Pass(_) | CheckResult::Fail(_)))
+            .count();
+        if unverified {
+            assert_eq!(verdicts, 0, "{:?}", report.checks);
+            assert_eq!((report.pass_count, report.fail_count), (0, 0));
+            assert!(
+                report
+                    .checks
+                    .iter()
+                    .any(|(label, result)| label == "Writable"
+                        && matches!(result, CheckResult::Info(message)
+                        if message.contains("not confirmed to be the server's"))),
+                "{:?}",
+                report.checks
+            );
+        } else {
+            assert!(verdicts > 0, "{:?}", report.checks);
+        }
     }
 
     // No installed server: the default layout is the answer, not a guess.

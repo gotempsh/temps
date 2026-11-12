@@ -542,15 +542,14 @@ fn systemd_definition(unit: &Path, sources: &[(PathBuf, String)]) -> ServiceDefi
     let mut problems = Vec::new();
     let mut environment_gaps = Vec::new();
 
-    // LoadCredential=<id>:<path>; the first entry for an id wins.
+    // LoadCredential=<id>[:<path>]; a later entry for an id replaces the
+    // earlier one's path (exec_context_put_load_credential). Without a path
+    // the credential comes from the credential store under its id.
     let mut credentials: BTreeMap<String, PathBuf> = BTreeMap::new();
     for entry in &service.load_credentials {
         let entry = specifiers(entry);
-        if let Some((id, path)) = entry.split_once(':') {
-            credentials
-                .entry(id.trim().to_string())
-                .or_insert_with(|| PathBuf::from(path.trim()));
-        }
+        let (id, path) = entry.split_once(':').unwrap_or((&entry, &entry));
+        credentials.insert(id.trim().to_string(), PathBuf::from(path.trim()));
     }
 
     let mut environment = BTreeMap::new();
@@ -667,16 +666,19 @@ fn systemd_definition(unit: &Path, sources: &[(PathBuf, String)]) -> ServiceDefi
         let exec_start = exec_start.trim_start_matches(['@', '-', ':', '+', '!']);
         split_words(&specifiers(exec_start))
             .into_iter()
-            .map(|word| expand_variables(&word, &environment, &mut referenced))
+            .flat_map(|word| expand_word(&word, &environment, &mut referenced))
             .collect::<Vec<_>>()
     });
     let serve_arguments = arguments.as_deref().filter(|args| runs_serve(args));
-    if arguments.is_some() && serve_arguments.is_none() {
+    let not_serve = arguments.is_some() && serve_arguments.is_none();
+    if not_serve {
         problems.push("ExecStart= does not run `temps serve`".to_string());
     }
 
     let environment_gap = (!environment_gaps.is_empty()).then(|| environment_gaps.join("; "));
     let (database_url, data_dir) = match &environment_gap {
+        // The unit runs something else: its environment is not a server's.
+        _ if not_serve => (Ok(None), Err(NOT_SERVE.to_string())),
         // ExecStart= expands variables, and the unreadable file, which
         // systemd applies after Environment=, may set or override any of them.
         Some(gap) if serve_arguments.is_some() && !referenced.is_empty() => {
@@ -1007,9 +1009,46 @@ fn split_words(value: &str) -> Vec<String> {
     words
 }
 
-/// `${NAME}` and `$NAME` from the service environment; `$$` is a literal `$`.
-/// An unset variable expands to nothing, as in systemd. Every name used is
-/// added to `referenced`.
+/// Why a definition that does not run `temps serve` has no data directory.
+const NOT_SERVE: &str = "it does not run `temps serve`";
+
+/// One `ExecStart=` word with variables expanded, as systemd's
+/// `replace_env_argv` does: a word that is exactly `$NAME` becomes the
+/// value split into words (none when unset or not a valid name); any other
+/// word becomes one argument, with `${NAME}` replaced and `$NAME` left as
+/// written. Every valid name used is added to `referenced`.
+fn expand_word(
+    word: &str,
+    environment: &BTreeMap<String, String>,
+    referenced: &mut Vec<String>,
+) -> Vec<String> {
+    let Some(name) = word
+        .strip_prefix('$')
+        .filter(|name| !name.starts_with(['{', '$']))
+    else {
+        return vec![expand_variables(word, environment, referenced)];
+    };
+    let valid = name
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if !valid {
+        return Vec::new();
+    }
+    if !referenced.iter().any(|known| known == name) {
+        referenced.push(name.to_string());
+    }
+    environment
+        .get(name)
+        .map(|value| split_words(value))
+        .unwrap_or_default()
+}
+
+/// `${NAME}` from the service environment, within a word; `$$` is a literal
+/// `$`, and `$NAME` is left as written (systemd only expands it as a word of
+/// its own, see [`expand_word`]). An unset variable expands to nothing, as in
+/// systemd. Every name used is added to `referenced`.
 fn expand_variables(
     word: &str,
     environment: &BTreeMap<String, String>,
@@ -1037,17 +1076,6 @@ fn expand_variables(
             Some('{') => {
                 chars.next();
                 let name: String = chars.by_ref().take_while(|c| *c != '}').collect();
-                out.push_str(&lookup(name));
-            }
-            Some(c) if c.is_ascii_alphabetic() || *c == '_' => {
-                let mut name = String::new();
-                while let Some(c) = chars
-                    .peek()
-                    .filter(|c| c.is_ascii_alphanumeric() || **c == '_')
-                {
-                    name.push(*c);
-                    chars.next();
-                }
                 out.push_str(&lookup(name));
             }
             _ => out.push('$'),
@@ -1201,15 +1229,20 @@ fn launchd_definition(agent: &Path, contents: &str, home: Option<&Path>) -> Serv
 
     let mut problems = Vec::new();
     let serve_arguments = arguments.as_deref().filter(|args| runs_serve(args));
-    if arguments.is_some() && serve_arguments.is_none() {
+    let (database_url, data_dir) = if arguments.is_some() && serve_arguments.is_none() {
+        // The agent runs something else: its environment is not a server's.
         problems.push("ProgramArguments does not run `temps serve`".to_string());
-    }
-    let database_url = serve_database_url(serve_arguments, &environment, None, &[], None, &cwd);
-    let home = environment
-        .get("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| "the agent's HOME is unknown".to_string());
-    let data_dir = serve_data_dir(serve_arguments, &environment, None, home, &cwd);
+        (Ok(None), Err(NOT_SERVE.to_string()))
+    } else {
+        let home = environment
+            .get("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| "the agent's HOME is unknown".to_string());
+        (
+            serve_database_url(serve_arguments, &environment, None, &[], None, &cwd),
+            serve_data_dir(serve_arguments, &environment, None, home, &cwd),
+        )
+    };
     ServiceDefinition {
         path: agent.to_path_buf(),
         kind: ServiceKind::Launchd,

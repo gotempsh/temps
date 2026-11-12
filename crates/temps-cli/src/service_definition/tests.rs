@@ -216,7 +216,7 @@ fn variables_in_exec_start_expand_from_the_service_environment() {
         &unit,
         &format!(
             "[Service]\nEnvironment=DB={URL} HOME=/home/svc\n\
-             ExecStart=-/usr/bin/temps serve --database-url=${{DB}} --data-dir $HOME/data\n"
+             ExecStart=-/usr/bin/temps serve --database-url=${{DB}} --data-dir ${{HOME}}/data\n"
         ),
     );
     let definition = found(probe(&systemd_at(&unit)));
@@ -228,6 +228,132 @@ fn variables_in_exec_start_expand_from_the_service_environment() {
             DataDirLocation::CommandLine
         ))
     );
+}
+
+#[test]
+fn a_variable_alone_in_exec_start_splits_into_words_as_systemd_does() {
+    let root = tempfile::tempdir().unwrap();
+    let unit = root.path().join("temps.service");
+    // `$ARGS` as a word of its own becomes two arguments; `${ARGS}` would
+    // stay one.
+    write(
+        &unit,
+        &format!(
+            "[Service]\nEnvironment=\"ARGS=--database-url={URL} --data-dir=/srv/temps\"\n\
+             ExecStart=/usr/bin/temps serve $ARGS\n"
+        ),
+    );
+    let definition = found(probe(&systemd_at(&unit)));
+    assert_eq!(definition.url(), Some(URL));
+    assert_eq!(
+        definition.data_dir,
+        Ok((PathBuf::from("/srv/temps"), DataDirLocation::CommandLine))
+    );
+
+    // Within a word, `$NAME` is passed as written: only `${NAME}` expands.
+    write(
+        &unit,
+        &format!(
+            "[Service]\nEnvironment=DB={URL} DIR=/srv/temps\n\
+             ExecStart=/usr/bin/temps serve --database-url=$DB --data-dir=$DIR\n"
+        ),
+    );
+    let definition = found(probe(&systemd_at(&unit)));
+    assert_eq!(definition.url(), Some("$DB"));
+    assert_eq!(
+        definition.data_dir,
+        Ok((PathBuf::from("/$DIR"), DataDirLocation::CommandLine))
+    );
+
+    // `${ARGS}` is a single argument, spaces and all.
+    write(
+        &unit,
+        "[Service]\nEnvironment=\"ARGS=--data-dir=/srv/temps --database-url=unused\"\n\
+         ExecStart=/usr/bin/temps serve ${ARGS}\n",
+    );
+    let definition = found(probe(&systemd_at(&unit)));
+    assert_eq!(
+        definition.data_dir,
+        Ok((
+            PathBuf::from("/srv/temps --database-url=unused"),
+            DataDirLocation::CommandLine
+        ))
+    );
+}
+
+#[test]
+fn a_later_load_credential_for_the_database_url_replaces_the_earlier_one() {
+    let root = tempfile::tempdir().unwrap();
+    let old = root.path().join("old-url");
+    let new = root.path().join("new-url");
+    write(&old, "postgresql://temps@127.0.0.1:5432/old\n");
+    write(&new, &format!("{URL}\n"));
+    let unit = root.path().join("temps.service");
+    write(
+        &unit,
+        &format!(
+            "[Service]\nLoadCredential=temps_database_url:{}\nExecStart=/usr/bin/temps serve\n",
+            old.display()
+        ),
+    );
+    let drop_in = root.path().join("temps.service.d/50-database.conf");
+    write(
+        &drop_in,
+        &format!(
+            "[Service]\nLoadCredential=temps_database_url:{}\n",
+            new.display()
+        ),
+    );
+    let definition = found(probe(&systemd_at(&unit)));
+    assert_eq!(definition.url(), Some(URL));
+    assert_eq!(
+        definition.database_url.unwrap().unwrap().1,
+        UrlLocation::Credential(new)
+    );
+
+    // Without a path the credential comes from the credential store, which
+    // this command cannot read: the URL is unknown, never the earlier file.
+    write(&drop_in, "[Service]\nLoadCredential=temps_database_url\n");
+    let definition = found(probe(&systemd_at(&unit)));
+    assert!(definition.database_url.is_err(), "{definition:?}");
+}
+
+#[test]
+fn a_unit_that_does_not_run_serve_supplies_no_url_from_its_environment() {
+    let root = tempfile::tempdir().unwrap();
+    let unit = root.path().join("temps.service");
+    write(
+        &unit,
+        &format!(
+            "[Service]\nEnvironment=TEMPS_DATABASE_URL={URL} TEMPS_DATA_DIR=/srv/temps\n\
+             ExecStart=/usr/bin/temps proxy\n"
+        ),
+    );
+    let definition = found(probe(&systemd_at(&unit)));
+    assert_eq!(definition.url(), None);
+    assert!(definition.data_dir.is_err(), "{definition:?}");
+
+    let agent = root.path().join("dev.temps.temps.plist");
+    write(
+        &agent,
+        &format!(
+            "<?xml version=\"1.0\"?>\n<plist version=\"1.0\">\n<dict>\n\
+             <key>ProgramArguments</key>\n<array>\n\
+             <string>/usr/local/bin/temps</string>\n<string>proxy</string>\n</array>\n\
+             <key>EnvironmentVariables</key>\n<dict>\n\
+             <key>TEMPS_DATABASE_URL</key>\n<string>{URL}</string>\n</dict>\n\
+             </dict>\n</plist>\n"
+        ),
+    );
+    let definition = found(probe(&ServiceLocations {
+        systemd_unit: None,
+        launchd_agent: Some(agent),
+    }));
+    assert_eq!(definition.url(), None);
+    assert!(definition
+        .problems
+        .iter()
+        .any(|p| p.contains("temps serve")));
 }
 
 #[test]
@@ -271,7 +397,7 @@ fn the_home_comes_from_user_as_systemd_and_the_server_find_it() {
     // User= sets HOME, which ExecStart= can use.
     write(
         &unit,
-        "[Service]\nUser=root\nExecStart=/usr/bin/temps serve --data-dir=$HOME/data\n",
+        "[Service]\nUser=root\nExecStart=/usr/bin/temps serve --data-dir=${HOME}/data\n",
     );
     let definition = found(probe(&systemd_at(&unit)));
     assert_eq!(
