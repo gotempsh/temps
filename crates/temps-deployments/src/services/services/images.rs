@@ -263,7 +263,7 @@ impl DeploymentService {
             let budget = RUNTIME_REMOVAL_TIMEOUT
                 .min(deadline.saturating_duration_since(tokio::time::Instant::now()));
             let outcomes = match tokio::time::timeout(budget, deployer.remove_unused_images(batch))
-            .await
+                .await
             {
                 Ok(Ok(outcomes)) => outcomes,
                 Ok(Err(temps_deployer::DeployerError::DockerUnavailable(_)))
