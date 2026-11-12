@@ -120,3 +120,21 @@ test('Refresh keeps the numbers on screen while the moved window loads', async (
   moved.release(1_300)
   await screen.findByText('1.3K')
 })
+
+test('a failed usage read says so instead of showing zero usage', async () => {
+  globalThis.fetch = (async (input: Request | string | URL) => {
+    const url = new URL(String(input), 'http://localhost')
+    if (url.pathname === '/api/ai/usage/recent')
+      return json({ entries: [], total: 0 })
+    if (url.pathname.startsWith('/api/ai/usage/'))
+      return new Response('{}', { status: 500 })
+    return new Response('{}', { status: 404 })
+  }) as typeof fetch
+  renderUsage()
+
+  await screen.findByText("Couldn't load requests over time.")
+  expect(screen.getAllByText("Couldn't load")).toHaveLength(5)
+  expect(screen.queryByText('No usage data')).toBeNull()
+  expect(screen.queryByText('$0.00')).toBeNull()
+  expect(screen.getAllByRole('button', { name: 'Retry' }).length).toBe(5)
+})

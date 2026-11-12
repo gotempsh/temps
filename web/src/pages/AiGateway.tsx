@@ -967,6 +967,32 @@ const providerChartConfig = {
   request_count: { label: 'Requests', color: 'var(--chart-1)' },
 } satisfies ChartConfig
 
+/**
+ * A usage read that failed with nothing loaded. Says so instead of showing
+ * zero or "no data", which would read as a quiet gateway.
+ */
+function UsageReadFailed({
+  label,
+  onRetry,
+}: {
+  label: string
+  onRetry: () => void
+}) {
+  return (
+    <div className="flex h-[200px] flex-col items-center justify-center gap-2 text-center text-sm">
+      <p className="text-destructive">Couldn&apos;t load {label}.</p>
+      <Button variant="outline" size="sm" onClick={onRetry}>
+        Retry
+      </Button>
+    </div>
+  )
+}
+
+/** A stat card's value when its read failed with nothing loaded. */
+function UsageStatFailed() {
+  return <p className="text-sm text-destructive">Couldn&apos;t load</p>
+}
+
 function LogCostCell({
   log,
   pricingMap,
@@ -996,7 +1022,11 @@ export function UsageAnalytics() {
 
   // The window is named in each key ({ from, to }), so a Refresh that moves
   // it keeps the numbers on screen and picking another range does not.
-  const { data: summary, isLoading: summaryLoading } = useWindowQuery({
+  const {
+    data: summary,
+    isLoading: summaryLoading,
+    isError: summaryError,
+  } = useWindowQuery({
     queryKey: [
       'aiUsage',
       'summary',
@@ -1008,7 +1038,12 @@ export function UsageAnalytics() {
       ),
   })
 
-  const { data: timeseries, isLoading: timeseriesLoading } = useWindowQuery({
+  const {
+    data: timeseries,
+    isLoading: timeseriesLoading,
+    isError: timeseriesError,
+    refetch: refetchTimeseries,
+  } = useWindowQuery({
     queryKey: [
       'aiUsage',
       'timeseries',
@@ -1024,7 +1059,11 @@ export function UsageAnalytics() {
       ),
   })
 
-  const { data: byProvider } = useWindowQuery({
+  const {
+    data: byProvider,
+    isError: byProviderError,
+    refetch: refetchByProvider,
+  } = useWindowQuery({
     queryKey: [
       'aiUsage',
       'by-provider',
@@ -1039,7 +1078,11 @@ export function UsageAnalytics() {
       ),
   })
 
-  const { data: topModels } = useWindowQuery({
+  const {
+    data: topModels,
+    isError: topModelsError,
+    refetch: refetchTopModels,
+  } = useWindowQuery({
     queryKey: [
       'aiUsage',
       'top-models',
@@ -1165,6 +1208,12 @@ export function UsageAnalytics() {
     )
   }, [topModels, pricingMap])
 
+  // Failed with nothing to show: never rendered as zero usage.
+  const summaryFailed = summaryError && !summary
+  const timeseriesFailed = timeseriesError && !timeseries
+  const byProviderFailed = byProviderError && !byProvider
+  const topModelsFailed = topModelsError && !topModels
+
   const chartTimeseries = useMemo(
     () =>
       (timeseries ?? []).map((b) => ({
@@ -1210,6 +1259,8 @@ export function UsageAnalytics() {
           <CardContent>
             {summaryLoading ? (
               <Skeleton className="h-7 w-16" />
+            ) : summaryFailed ? (
+              <UsageStatFailed />
             ) : (
               <div className="text-2xl font-bold">
                 {formatTokenCount(summary?.total_requests ?? 0)}
@@ -1227,6 +1278,8 @@ export function UsageAnalytics() {
           <CardContent>
             {summaryLoading ? (
               <Skeleton className="h-7 w-16" />
+            ) : summaryFailed ? (
+              <UsageStatFailed />
             ) : (
               <div className="text-2xl font-bold">
                 {formatTokenCount(summary?.total_tokens ?? 0)}
@@ -1244,6 +1297,8 @@ export function UsageAnalytics() {
           <CardContent>
             {summaryLoading ? (
               <Skeleton className="h-7 w-16" />
+            ) : summaryFailed ? (
+              <UsageStatFailed />
             ) : (
               <div className="text-2xl font-bold">
                 {Math.round(summary?.avg_latency_ms ?? 0)}ms
@@ -1261,6 +1316,8 @@ export function UsageAnalytics() {
           <CardContent>
             {summaryLoading ? (
               <Skeleton className="h-7 w-16" />
+            ) : summaryFailed ? (
+              <UsageStatFailed />
             ) : (
               <div className="text-2xl font-bold">
                 {summary && summary.total_requests > 0
@@ -1280,6 +1337,8 @@ export function UsageAnalytics() {
           <CardContent>
             {summaryLoading ? (
               <Skeleton className="h-7 w-16" />
+            ) : topModelsFailed ? (
+              <UsageStatFailed />
             ) : (
               <div className="text-2xl font-bold">
                 {formatCost(totalEstimatedCost)}
@@ -1297,6 +1356,11 @@ export function UsageAnalytics() {
         <CardContent>
           {timeseriesLoading ? (
             <Skeleton className="h-[200px] w-full" />
+          ) : timeseriesFailed ? (
+            <UsageReadFailed
+              label="requests over time"
+              onRetry={() => void refetchTimeseries()}
+            />
           ) : chartTimeseries.length === 0 ? (
             <EmptyState
               icon={Activity}
@@ -1338,6 +1402,11 @@ export function UsageAnalytics() {
           <CardContent>
             {timeseriesLoading ? (
               <Skeleton className="h-[200px] w-full" />
+            ) : timeseriesFailed ? (
+              <UsageReadFailed
+                label="usage over time"
+                onRetry={() => void refetchTimeseries()}
+              />
             ) : chartTimeseries.length === 0 ? (
               <div className="h-[200px] flex items-center justify-center text-sm text-muted-foreground">
                 No data
@@ -1389,6 +1458,11 @@ export function UsageAnalytics() {
           <CardContent>
             {timeseriesLoading ? (
               <Skeleton className="h-[200px] w-full" />
+            ) : timeseriesFailed ? (
+              <UsageReadFailed
+                label="usage over time"
+                onRetry={() => void refetchTimeseries()}
+              />
             ) : chartTimeseries.length === 0 ? (
               <div className="h-[200px] flex items-center justify-center text-sm text-muted-foreground">
                 No data
@@ -1434,7 +1508,12 @@ export function UsageAnalytics() {
             <CardTitle className="text-base">By provider</CardTitle>
           </CardHeader>
           <CardContent>
-            {!byProvider || byProvider.length === 0 ? (
+            {byProviderFailed ? (
+              <UsageReadFailed
+                label="usage by provider"
+                onRetry={() => void refetchByProvider()}
+              />
+            ) : !byProvider || byProvider.length === 0 ? (
               <div className="h-[200px] flex items-center justify-center text-sm text-muted-foreground">
                 No data
               </div>
@@ -1483,7 +1562,12 @@ export function UsageAnalytics() {
             <CardTitle className="text-base">Top models</CardTitle>
           </CardHeader>
           <CardContent>
-            {!topModels || topModels.length === 0 ? (
+            {topModelsFailed ? (
+              <UsageReadFailed
+                label="top models"
+                onRetry={() => void refetchTopModels()}
+              />
+            ) : !topModels || topModels.length === 0 ? (
               <div className="h-[200px] flex items-center justify-center text-sm text-muted-foreground">
                 No data
               </div>
