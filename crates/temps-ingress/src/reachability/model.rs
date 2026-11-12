@@ -623,6 +623,16 @@ impl PreviousChoice {
             Some(Some(connector_id)) => PreviousChoice::Tunnel { connector_id },
         }
     }
+
+    /// The choice as `hostname_choice` returns it: the inverse of
+    /// [`PreviousChoice::from_choice`].
+    pub fn as_choice(&self) -> Option<Option<i32>> {
+        match self {
+            PreviousChoice::Automatic => None,
+            PreviousChoice::Off => Some(None),
+            PreviousChoice::Tunnel { connector_id } => Some(Some(*connector_id)),
+        }
+    }
 }
 
 /// A DNS record as the provider had it when Temps read it: what a run
