@@ -192,3 +192,30 @@ fn the_snapshot_lives_under_the_data_directory() {
     let path = snapshot_path(Path::new("/data"));
     assert_eq!(path, PathBuf::from("/data/internal-routing/routes.json"));
 }
+
+/// A supervisor that ignores shutdown (a pass stuck on a slow Docker daemon)
+/// is aborted once the grace period ends, and is gone, with everything it
+/// held, by the time the wait returns. Dropping the handle instead would leave
+/// it running.
+#[tokio::test(start_paused = true)]
+async fn a_supervisor_stuck_in_a_pass_is_aborted_not_detached() {
+    let (held, released) = tokio::sync::oneshot::channel::<()>();
+    let mut task = tokio::spawn(async move {
+        let _listener = held;
+        std::future::pending::<()>().await;
+    });
+    assert!(finish_or_abort(&mut task, Duration::from_secs(10)).await);
+    assert!(task.is_finished());
+    // What the task held was dropped with it.
+    assert!(released.await.is_err());
+}
+
+/// A supervisor that ends within the grace period is not aborted.
+#[tokio::test(start_paused = true)]
+async fn a_supervisor_that_stops_in_time_is_left_to_finish() {
+    let mut task = tokio::spawn(async {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    });
+    assert!(!finish_or_abort(&mut task, Duration::from_secs(10)).await);
+    assert!(task.is_finished());
+}

@@ -39,6 +39,10 @@ use tracing::{debug, info, warn};
 /// reconcile would.
 const SAFETY_REFRESH: Duration = Duration::from_secs(60);
 
+/// How long a stopping supervisor may take to finish its current pass before
+/// it is aborted.
+const STOP_GRACE: Duration = Duration::from_secs(10);
+
 /// Where the store keeps its last snapshot, so a restart serves the last
 /// routes before the first rebuild.
 pub(crate) fn snapshot_path(data_dir: &Path) -> PathBuf {
@@ -181,18 +185,46 @@ impl ControlPlaneRouting {
 
     /// Stop serving. The redirect is left to expire on its own (ADR-098 D3):
     /// until then calls are refused, never delivered elsewhere.
-    pub(crate) async fn stop(self) {
+    ///
+    /// Returns only once the supervisor has ended. A supervisor still inside a
+    /// pass after [`STOP_GRACE`] (a slow Docker daemon) is aborted rather than
+    /// left running: otherwise it could finish that pass after this returns,
+    /// bind and redirect for the old gateway, and overwrite the status of the
+    /// supervisor that replaces it.
+    pub(crate) async fn stop(mut self) {
         self.feeder.abort();
         self.shutdown.notify_one();
-        if tokio::time::timeout(Duration::from_secs(10), self.supervisor)
-            .await
-            .is_err()
-        {
-            warn!(gateway = %self.gateway, "control-plane internal routing did not stop within 10 s");
+        if finish_or_abort(&mut self.supervisor, STOP_GRACE).await {
+            warn!(
+                gateway = %self.gateway,
+                grace = ?STOP_GRACE,
+                "control-plane internal routing did not stop within its grace period; aborted it"
+            );
         }
+        // The feeder only writes the store, but nothing of this instance
+        // outlives stop().
+        let _ = (&mut self.feeder).await;
+        // Cleared after the supervisor has ended, so its last pass cannot
+        // record a status after this.
         temps_node_agent::internal_routing::clear_status();
         info!(gateway = %self.gateway, "control-plane internal routing stopped");
     }
+}
+
+/// Wait up to `grace` for `task` to end after it was asked to stop, then abort
+/// it and wait until it is gone, so nothing it owns (listeners, a bind in
+/// progress) outlives the caller. Dropping a [`JoinHandle`] would detach the
+/// task instead. Returns whether it had to be aborted.
+///
+/// An aborted task ends at its next await; every wait in a supervisor pass is
+/// async I/O (Docker, `nft` through `tokio::process`), so that is prompt.
+async fn finish_or_abort(task: &mut JoinHandle<()>, grace: Duration) -> bool {
+    if tokio::time::timeout(grace, &mut *task).await.is_ok() {
+        return false;
+    }
+    task.abort();
+    let _ = task.await;
+    true
 }
 
 #[cfg(test)]
