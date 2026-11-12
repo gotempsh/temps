@@ -45,7 +45,7 @@ import {
   TooltipTrigger,
 } from '@/components/ui/tooltip'
 import { Skeleton } from '@/components/ui/skeleton'
-import { useQuery } from '@tanstack/react-query'
+import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import { cn } from '@/lib/utils'
 import {
@@ -91,6 +91,7 @@ export function EventDetail({
 
   // Fetch event detail analytics
   const { data: detailData, isLoading: detailLoading } = useQuery({
+    placeholderData: keepPreviousData,
     ...getEventDetailOptions({
       query: {
         event_name: eventName,
@@ -105,6 +106,7 @@ export function EventDetail({
 
   // Fetch visitors for this event
   const { data: visitorsData, isLoading: visitorsLoading } = useQuery({
+    placeholderData: keepPreviousData,
     ...getEventVisitorsOptions({
       query: {
         event_name: eventName,
@@ -459,6 +461,7 @@ function EventEntriesCard({
   }
 
   const { data: entriesData, isLoading: entriesLoading } = useQuery({
+    placeholderData: keepPreviousData,
     ...getEventEntriesOptions({
       query: {
         event_name: eventName,

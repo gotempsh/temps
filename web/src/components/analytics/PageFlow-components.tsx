@@ -34,7 +34,7 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from '@/components/ui/tooltip'
-import { useQuery } from '@tanstack/react-query'
+import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import { useMemo, useState } from 'react'
 import {
   ArrowRight,
@@ -494,6 +494,7 @@ export function PageFlow({
   environment,
 }: PageFlowProps) {
   const { data, isLoading, isError } = useQuery({
+    placeholderData: keepPreviousData,
     ...getPageFlowOptions({
       query: {
         project_id: project.id,

@@ -13,7 +13,7 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
-import { useQuery } from '@tanstack/react-query'
+import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import { useNavigate, useSearchParams } from 'react-router'
 import { buildAnalyticsDimensionUrl } from './viewAllUrl'
@@ -110,6 +110,7 @@ export function ChannelsChart({
   const groupBy = selectedChannel ? 'referrer_hostname' : 'channel'
 
   const { data, isLoading, error } = useQuery({
+    placeholderData: keepPreviousData,
     ...getPropertyBreakdownOptions({
       path: {
         project_id: project.id,

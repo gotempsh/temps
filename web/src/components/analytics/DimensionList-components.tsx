@@ -27,7 +27,7 @@ import {
   SortableTableHead,
   type SortDirection,
 } from '@/components/ui/sortable-table-head'
-import { useQuery } from '@tanstack/react-query'
+import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import { ArrowLeft, ChevronRight, Search } from 'lucide-react'
 import * as React from 'react'
@@ -96,6 +96,7 @@ export function DimensionList({
     dimensionRowHref(project.slug, dimension, value, searchParams)
 
   const breakdownQuery = useQuery({
+    placeholderData: keepPreviousData,
     ...getPropertyBreakdownOptions({
       path: { project_id: project.id },
       query: {
@@ -112,6 +113,7 @@ export function DimensionList({
   })
 
   const eventsQuery = useQuery({
+    placeholderData: keepPreviousData,
     ...getEventsCountOptions({
       path: { project_id: project.id },
       query: {

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   getDateRangeFromFilter,
   type AnalyticsDateFilter,
@@ -16,16 +16,24 @@ export const RANGE_ADVANCE_MS = 5 * 60_000
  * visible again, so a page left open keeps showing new visits without a
  * refresh button. Each advance changes the range, and so the queries keyed on
  * it, which is what reloads the data. A custom range never moves.
+ *
+ * `advance` moves a relative range to now on demand (a Refresh button). Pass
+ * `intervalMs: null` for a page that only moves when asked.
  */
 export function useAdvancingDateRange(
   dateFilter: AnalyticsDateFilter,
-  intervalMs = RANGE_ADVANCE_MS
-): { startDate: Date | undefined; endDate: Date | undefined } {
+  intervalMs: number | null = RANGE_ADVANCE_MS
+): {
+  startDate: Date | undefined
+  endDate: Date | undefined
+  advance: () => void
+} {
   const [tick, setTick] = useState(0)
   const relative = dateFilter.quickFilter !== 'custom'
+  const advance = useCallback(() => setTick((t) => t + 1), [])
 
   useEffect(() => {
-    if (!relative) return
+    if (!relative || intervalMs === null) return
     const advance = () => {
       if (document.visibilityState === 'visible') setTick((t) => t + 1)
     }
@@ -37,7 +45,7 @@ export function useAdvancingDateRange(
     }
   }, [relative, intervalMs])
 
-  return useMemo(
+  const range = useMemo(
     () => {
       void tick
       return getDateRangeFromFilter(dateFilter)
@@ -45,4 +53,5 @@ export function useAdvancingDateRange(
     // `tick` is the advance: it recomputes `now` for a relative range.
     [dateFilter, tick]
   )
+  return useMemo(() => ({ ...range, advance }), [range, advance])
 }

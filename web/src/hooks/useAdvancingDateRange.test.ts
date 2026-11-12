@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { afterEach, expect, test } from 'bun:test'
-import { cleanup, renderHook, waitFor } from '@testing-library/react'
+import { act, cleanup, renderHook, waitFor } from '@testing-library/react'
 import { installBrowserWindow } from '@/test/dom'
 import { useAdvancingDateRange } from './useAdvancingDateRange'
 
@@ -29,6 +29,34 @@ test('a custom range never moves', async () => {
     )
   )
   await new Promise((resolve) => setTimeout(resolve, 80))
+  expect(result.current.startDate).toBe(from)
+  expect(result.current.endDate).toBe(to)
+})
+
+test('without an interval a relative range moves only when advanced', async () => {
+  const filter = { quickFilter: '24hours', dateRange: undefined } as const
+  const { result } = renderHook(() => useAdvancingDateRange(filter, null))
+  const first = result.current.endDate!.getTime()
+  await new Promise((resolve) => setTimeout(resolve, 40))
+  expect(result.current.endDate!.getTime()).toBe(first)
+
+  act(() => result.current.advance())
+
+  expect(result.current.endDate!.getTime()).toBeGreaterThan(first)
+})
+
+test('advancing a custom range keeps its dates', () => {
+  const from = new Date('2026-10-01T00:00:00Z')
+  const to = new Date('2026-10-02T00:00:00Z')
+  const { result } = renderHook(() =>
+    useAdvancingDateRange(
+      { quickFilter: 'custom', dateRange: { from, to } },
+      null
+    )
+  )
+
+  act(() => result.current.advance())
+
   expect(result.current.startDate).toBe(from)
   expect(result.current.endDate).toBe(to)
 })

@@ -13,7 +13,7 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
-import { useQuery } from '@tanstack/react-query'
+import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import { ChevronLeft } from 'lucide-react'
 import * as React from 'react'
@@ -41,6 +41,7 @@ export function OperatingSystemChart({
   const groupBy = selectedOs ? 'operating_system_version' : 'operating_system'
 
   const { data, isLoading, error } = useQuery({
+    placeholderData: keepPreviousData,
     ...getPropertyBreakdownOptions({
       path: {
         project_id: project.id,

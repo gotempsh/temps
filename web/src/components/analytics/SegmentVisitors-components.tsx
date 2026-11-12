@@ -21,7 +21,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { useQuery } from '@tanstack/react-query'
+import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import { format, formatDistanceToNow } from 'date-fns'
 import {
   ArrowLeft,
@@ -106,6 +106,7 @@ export function SegmentVisitors({
   }
 
   const { data, isLoading, error } = useQuery({
+    placeholderData: keepPreviousData,
     ...getVisitorsOptions({
       query: {
         project_id: project.id,

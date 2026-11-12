@@ -31,7 +31,7 @@ import {
   type TableSort,
 } from '@/lib/client-table-sort'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
-import { useQuery } from '@tanstack/react-query'
+import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import {
   ArrowLeft,
@@ -105,6 +105,7 @@ export function AiAgentsDetail({
   const [expandedPath, setExpandedPath] = React.useState<string | null>(null)
 
   const agentsQuery = useQuery({
+    placeholderData: keepPreviousData,
     ...getAiAgentBreakdownOptions({
       query: {
         project_id: project.id,
@@ -118,6 +119,7 @@ export function AiAgentsDetail({
   })
 
   const pagesQuery = useQuery({
+    placeholderData: keepPreviousData,
     ...getAiPageBreakdownOptions({
       query: {
         project_id: project.id,
@@ -131,6 +133,7 @@ export function AiAgentsDetail({
   })
 
   const statusQuery = useQuery({
+    placeholderData: keepPreviousData,
     ...getAiStatusBreakdownOptions({
       query: {
         project_id: project.id,
@@ -919,6 +922,7 @@ function PageAgentBreakdown({
   onViewAll,
 }: PageAgentBreakdownProps) {
   const { data, isLoading, error } = useQuery({
+    placeholderData: keepPreviousData,
     ...getAiAgentBreakdownOptions({
       query: {
         project_id: project.id,

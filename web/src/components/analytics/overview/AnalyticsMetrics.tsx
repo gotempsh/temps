@@ -7,7 +7,7 @@ import { Button } from '@/components/ui/button'
 import { getUniqueCountsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { ProjectResponse } from '@/api/client/types.gen'
 
-import { useQuery } from '@tanstack/react-query'
+import { keepPreviousData, useQuery } from '@tanstack/react-query'
 
 interface AnalyticsMetricsProps {
   project: ProjectResponse
@@ -24,6 +24,7 @@ export function AnalyticsMetrics({
 }: AnalyticsMetricsProps) {
   // Fetch unique visitors
   const visitorsQuery = useQuery({
+    placeholderData: keepPreviousData,
     ...getUniqueCountsOptions({
       path: {
         project_id: project.id,
@@ -40,6 +41,7 @@ export function AnalyticsMetrics({
 
   // Fetch unique sessions
   const sessionsQuery = useQuery({
+    placeholderData: keepPreviousData,
     ...getUniqueCountsOptions({
       path: {
         project_id: project.id,
@@ -56,6 +58,7 @@ export function AnalyticsMetrics({
 
   // Fetch visitors who were seen before the selected range
   const returningVisitorsQuery = useQuery({
+    placeholderData: keepPreviousData,
     ...getUniqueCountsOptions({
       path: {
         project_id: project.id,
@@ -72,6 +75,7 @@ export function AnalyticsMetrics({
 
   // Fetch unique paths
   const pathsQuery = useQuery({
+    placeholderData: keepPreviousData,
     ...getUniqueCountsOptions({
       path: {
         project_id: project.id,

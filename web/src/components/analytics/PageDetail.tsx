@@ -30,7 +30,7 @@ import {
   TooltipTrigger,
 } from '@/components/ui/tooltip'
 import { Skeleton } from '@/components/ui/skeleton'
-import { useQuery } from '@tanstack/react-query'
+import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import {
   ArrowLeft,
@@ -98,6 +98,7 @@ export function PageDetail({
 
   // Fetch page detail analytics
   const { data: detailData, isLoading: detailLoading } = useQuery({
+    placeholderData: keepPreviousData,
     ...getPagePathDetailOptions({
       query: {
         page_path: pagePath,
@@ -112,6 +113,7 @@ export function PageDetail({
 
   // Fetch visitor sessions for this page
   const { data: visitorsData, isLoading: visitorsLoading } = useQuery({
+    placeholderData: keepPreviousData,
     ...getPagePathVisitorsOptions({
       query: {
         page_path: pagePath,
@@ -129,6 +131,7 @@ export function PageDetail({
   // AI crawler activity for this exact path (from proxy logs, not the visitor
   // JS SDK — bots don't run the SDK). `path`-scoped so the count is precise.
   const { data: aiPageData, isLoading: aiLoading } = useQuery({
+    placeholderData: keepPreviousData,
     ...getAiPageBreakdownOptions({
       query: {
         project_id: project.id,

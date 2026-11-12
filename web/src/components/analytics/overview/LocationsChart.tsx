@@ -15,7 +15,7 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
-import { useQuery } from '@tanstack/react-query'
+import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import { ChevronLeft, ChevronRight } from 'lucide-react'
 import * as React from 'react'
@@ -48,6 +48,7 @@ export function LocationsChart({
   const [drill, setDrill] = React.useState<DrillState>({ level: 'country' })
 
   const { data, isLoading, error } = useQuery({
+    placeholderData: keepPreviousData,
     ...getPropertyBreakdownOptions({
       path: {
         project_id: project.id,

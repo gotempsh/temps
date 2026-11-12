@@ -8,6 +8,7 @@ import {
   getApiRoutesOptions,
   getApiSummaryOptions,
   getApiTimeseriesOptions,
+  getApiTimeseriesQueryKey,
   getProjectBySlugQueryKey,
   getProjectDeploymentsOptions,
   updateProjectSettingsMutation,
@@ -52,15 +53,21 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
+import { queryKeyPrefix } from '@/lib/refresh'
 import { SortableTableHead } from '@/components/ui/sortable-table-head'
 import { Link } from 'react-router'
+import { useAdvancingDateRange } from '@/hooks/useAdvancingDateRange'
 import {
-  getDateRangeFromFilter,
   QUICK_FILTERS,
   type AnalyticsDateFilter,
   type QuickFilter,
 } from '@/hooks/useAnalyticsDateRange'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import {
+  keepPreviousData,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from '@tanstack/react-query'
 import {
   AlertTriangle,
   ChevronLeft,
@@ -274,7 +281,6 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
   const [mainChartMetric, setMainChartMetric] =
     React.useState<MainChartMetric>('latency')
   const [selectedEnvironment, setSelectedEnvironment] = useEnvironmentFilter()
-  const [isRefreshing, setIsRefreshing] = React.useState(false)
   const [summaryRequested, setSummaryRequested] = React.useState(false)
   const [summaryRefreshNonce, setSummaryRefreshNonce] = React.useState(0)
   const forceCliSummaryRefresh = React.useRef(false)
@@ -305,15 +311,16 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
   }
   const queryClient = useQueryClient()
 
-  // getDateRangeFromFilter computes `new Date()` internally, so calling it
+  // `getDateRangeFromFilter` computes `new Date()` internally, so calling it
   // unmemoized would produce a new (millisecond-different) ISO string on
   // every render for the relative quick-filters — a different React Query
   // key each time, which refetches, which re-renders, which recomputes a new
   // "now" again: an infinite fetch loop. Memoizing on `dateFilter` freezes
   // the range for as long as the user's selection is unchanged.
-  const { startDate, endDate } = React.useMemo(
-    () => getDateRangeFromFilter(dateFilter),
-    [dateFilter]
+  // The hook keeps that memo and moves the range to now only on Refresh.
+  const { startDate, endDate, advance } = useAdvancingDateRange(
+    dateFilter,
+    null
   )
   const startIso = startDate?.toISOString()
   const endIso = endDate?.toISOString()
@@ -343,21 +350,6 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
     },
     [searchParams, setSearchParams]
   )
-
-  const handleRefresh = React.useCallback(() => {
-    setIsRefreshing(true)
-    queryClient.invalidateQueries({
-      predicate: (query) => {
-        const key = query.queryKey[0] as { _id?: string } | string
-        const id = typeof key === 'string' ? key : key?._id
-        return (
-          (typeof key === 'string' && key === 'api-traffic-query') ||
-          (!!id && /getApi(Timeseries|Routes|Callers)/.test(id))
-        )
-      },
-    })
-    setTimeout(() => setIsRefreshing(false), 1000)
-  }, [queryClient])
 
   const handleSummaryRefresh = React.useCallback(() => {
     forceCliSummaryRefresh.current = true
@@ -391,6 +383,8 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
       },
     }),
     enabled,
+    // Refresh moves the window: keep the charts and tables on screen.
+    placeholderData: keepPreviousData,
   })
 
   const routesQuery = useQuery({
@@ -440,6 +434,7 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
       }),
     enabled,
     retry: retryUnlessClientError,
+    placeholderData: keepPreviousData,
   })
 
   const callersQuery = useQuery({
@@ -486,6 +481,7 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
       }),
     enabled,
     retry: retryUnlessClientError,
+    placeholderData: keepPreviousData,
   })
 
   const detailQuery = useQuery({
@@ -840,8 +836,13 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
           })
         }
         onEnvironmentChange={setSelectedEnvironment}
-        onRefresh={handleRefresh}
-        isRefreshing={isRefreshing}
+        refreshQueryKeys={[
+          ['api-traffic-query', project.id],
+          queryKeyPrefix(getApiTimeseriesQueryKey, {
+            path: { project_id: project.id },
+          }),
+        ]}
+        onRefresh={advance}
         actions={
           <Button
             variant={summaryRequested ? 'secondary' : 'outline'}

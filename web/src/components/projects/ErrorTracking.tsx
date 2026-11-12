@@ -7,19 +7,24 @@ import { ProjectResponse } from '@/api/client'
 import {
   getEnvironmentsOptions,
   getErrorDashboardStatsOptions,
+  getErrorDashboardStatsQueryKey,
+  getErrorTimeSeriesQueryKey,
   getOrCreateDsnMutation,
   hasErrorGroupsOptions,
+  hasErrorGroupsQueryKey,
   listErrorGroupsOptions,
+  listErrorGroupsQueryKey,
   listDsnsOptions,
   listUsersOptions,
   updateErrorGroupMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { ErrorTimeSeriesChart } from '@/components/error-tracking/ErrorTimeSeriesChart'
 import { AnalyticsFilters } from '@/components/project/ProjectAnalytics'
+import { queryKeyPrefix } from '@/lib/refresh'
 import { useProjectTourActive } from '@/components/project/ProjectTour'
 import { useAuth } from '@/contexts/AuthContext'
+import { useAdvancingDateRange } from '@/hooks/useAdvancingDateRange'
 import {
-  getDateRangeFromFilter,
   QUICK_FILTERS,
   type AnalyticsDateFilter,
   type QuickFilter,
@@ -59,7 +64,12 @@ import {
 } from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
 import { cn } from '@/lib/utils'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import {
+  keepPreviousData,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from '@tanstack/react-query'
 import { format } from 'date-fns'
 import {
   AlertTriangle,
@@ -140,7 +150,6 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
     })
   }
   const [environmentFilter, setEnvironmentFilter] = useEnvironmentFilter()
-  const [isRefreshing, setIsRefreshing] = useState(false)
   const [statusFilter, setStatusFilter] = useState<
     'unresolved' | 'resolved' | 'all'
   >('unresolved')
@@ -151,6 +160,7 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
   // Source maps and SDK setup are tabs of the Errors section; this page
   // shows the issues, with their trend on top.
   const openSetup = () => navigate(`/projects/${project.slug}/errors/setup`)
+  const projectPath = { project_id: project.id }
 
   // Convert the quick-filter/custom-range selection into concrete start/end
   // timestamps. MUST be memoized: this component (unlike e.g. ProjectAnalytics's
@@ -159,9 +169,10 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
   // every render — including the re-renders a settling useQuery itself
   // triggers — would produce a new start_date/end_date on every render,
   // change the query key, refire the fetch, and loop forever.
-  const { startDate, endDate } = useMemo(
-    () => getDateRangeFromFilter(dateFilter),
-    [dateFilter]
+  // Memoized by the hook; it moves to now only when the user refreshes.
+  const { startDate, endDate, advance } = useAdvancingDateRange(
+    dateFilter,
+    null
   )
   const timeRange = {
     startTime: (startDate ?? new Date()).toISOString(),
@@ -247,6 +258,8 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
       },
     }),
     enabled: hasErrors,
+    // Refresh moves the window: keep the issues on screen meanwhile.
+    placeholderData: keepPreviousData,
   })
 
   // Fetch error dashboard statistics (only if we have errors)
@@ -262,24 +275,9 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
         },
       }),
       enabled: hasErrors,
+      placeholderData: keepPreviousData,
     }
   )
-
-  const refreshableIds = new Set([
-    'listErrorGroups',
-    'getErrorDashboardStats',
-    'getErrorTimeSeries',
-  ])
-  const handleRefresh = () => {
-    setIsRefreshing(true)
-    queryClient.invalidateQueries({
-      predicate: (query) => {
-        const key = query.queryKey[0] as { _id?: string } | undefined
-        return !!key?._id && refreshableIds.has(key._id)
-      },
-    })
-    setTimeout(() => setIsRefreshing(false), 800)
-  }
 
   // Shared mutation for the assignee quick-actions on each row ("Assign to
   // me" / "Unassign"). `assigned_to: ''` is the backend's clear-assignment
@@ -707,8 +705,15 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
             })
           }
           onEnvironmentChange={setEnvironmentFilter}
-          onRefresh={handleRefresh}
-          isRefreshing={isRefreshing}
+          refreshQueryKeys={[
+            queryKeyPrefix(hasErrorGroupsQueryKey, { path: projectPath }),
+            queryKeyPrefix(listErrorGroupsQueryKey, { path: projectPath }),
+            queryKeyPrefix(getErrorDashboardStatsQueryKey, {
+              path: projectPath,
+            }),
+            queryKeyPrefix(getErrorTimeSeriesQueryKey, { path: projectPath }),
+          ]}
+          onRefresh={advance}
           leftActions={
             <div className="flex gap-2">
               <Select

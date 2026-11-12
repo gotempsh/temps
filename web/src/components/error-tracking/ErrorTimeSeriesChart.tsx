@@ -21,7 +21,7 @@ import {
   CardTitle,
 } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
-import { useQuery } from '@tanstack/react-query'
+import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import { useMemo, useState } from 'react'
 
@@ -64,6 +64,7 @@ export function ErrorTimeSeriesChart({
   }
 
   const { data, isLoading, error } = useQuery({
+    placeholderData: keepPreviousData,
     ...getErrorTimeSeriesOptions({
       path: {
         project_id: project.id,

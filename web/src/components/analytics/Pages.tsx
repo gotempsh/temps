@@ -16,7 +16,7 @@ import {
   CardTitle,
 } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
-import { useQuery } from '@tanstack/react-query'
+import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import { FileText } from 'lucide-react'
 import { useMemo } from 'react'
@@ -47,6 +47,7 @@ export function Pages({
 
   // Fetch page paths
   const { data, isLoading, error, refetch } = useQuery({
+    placeholderData: keepPreviousData,
     ...getPagePathsOptions({
       query: {
         project_id: project.id,
@@ -69,6 +70,7 @@ export function Pages({
 
   // Fetch all sparklines in a single batch request
   const { data: sparklineData } = useQuery({
+    placeholderData: keepPreviousData,
     ...getPagePathsSparklinesOptions({
       query: {
         project_id: project.id,
