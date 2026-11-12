@@ -927,3 +927,121 @@ async fn update_s3_source_sets_only_the_worker_credentials_policy() {
         "the credential columns must not be rewritten: {update}"
     );
 }
+
+fn tls_only_request(
+    name: Option<&str>,
+    use_tls: bool,
+) -> crate::handlers::backup_handler::UpdateS3SourceRequest {
+    crate::handlers::backup_handler::UpdateS3SourceRequest {
+        name: name.map(str::to_string),
+        bucket_name: None,
+        bucket_path: None,
+        access_key_id: None,
+        secret_key: None,
+        region: None,
+        endpoint: None,
+        force_path_style: None,
+        worker_credentials: None,
+        use_tls: Some(use_tls),
+    }
+}
+
+/// Turning TLS on without retyping the endpoint applies it to the stored
+/// endpoint: the `https://` form is what gets verified, and a destination
+/// that refuses it leaves the row untouched.
+#[tokio::test]
+async fn test_update_s3_source_tls_alone_probes_the_stored_endpoint_with_https() {
+    let encryption = EncryptionService::new("test_encryption_key_1234567890ab").unwrap();
+    let mut source = operator_s3_source(&encryption);
+    source.endpoint = Some("http://temps-s3-probe.invalid:9000".to_string());
+    let db = Arc::new(
+        MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![source]])
+            .into_connection(),
+    );
+    let Ok(service) = build_service_for_mock(db.clone()) else {
+        return;
+    };
+
+    let error = service
+        .update_s3_source(31, tls_only_request(None, true))
+        .await
+        .expect_err("the https endpoint is unreachable, so nothing may be saved");
+
+    match &error {
+        BackupError::S3Unreachable { endpoint, .. } => {
+            assert_eq!(endpoint, "https://temps-s3-probe.invalid:9000");
+        }
+        other => panic!("expected S3Unreachable, got {other:?}"),
+    }
+    drop(service);
+    let db = Arc::try_unwrap(db).expect("service must release the mock database");
+    assert_eq!(
+        db.into_transaction_log().len(),
+        1,
+        "only the source lookup may run; nothing is written"
+    );
+}
+
+/// A TLS choice that matches the stored scheme is not a change: nothing is
+/// probed (the destination here is unreachable) and the stored endpoint is
+/// written back as it was.
+#[tokio::test]
+async fn test_update_s3_source_tls_matching_the_stored_scheme_changes_nothing() {
+    let encryption = EncryptionService::new("test_encryption_key_1234567890ab").unwrap();
+    let mut source = operator_s3_source(&encryption);
+    source.endpoint = Some("http://temps-s3-probe.invalid:9000".to_string());
+    let renamed = s3_sources::Model {
+        name: "renamed".to_string(),
+        ..source.clone()
+    };
+    let db = Arc::new(
+        MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![source]])
+            .append_query_results(vec![vec![renamed]])
+            .into_connection(),
+    );
+    let Ok(service) = build_service_for_mock(db.clone()) else {
+        return;
+    };
+
+    let updated = service
+        .update_s3_source(31, tls_only_request(Some("renamed"), false))
+        .await
+        .expect("an unchanged scheme needs no connectivity check");
+    assert_eq!(updated.name, "renamed");
+    drop(service);
+    let db = Arc::try_unwrap(db).expect("service must release the mock database");
+    let log = format!("{:?}", db.into_transaction_log());
+    assert!(log.contains("http://temps-s3-probe.invalid:9000"), "{log}");
+    assert!(!log.contains("https://"), "{log}");
+}
+
+/// An AWS S3 source has no endpoint for a TLS choice to apply to; the flag
+/// is ignored and the update saves without a probe.
+#[tokio::test]
+async fn test_update_s3_source_tls_on_an_aws_source_is_ignored() {
+    let encryption = EncryptionService::new("test_encryption_key_1234567890ab").unwrap();
+    let mut source = operator_s3_source(&encryption);
+    source.endpoint = None;
+    let renamed = s3_sources::Model {
+        name: "renamed".to_string(),
+        ..source.clone()
+    };
+    let db = Arc::new(
+        MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![source]])
+            .append_query_results(vec![vec![renamed]])
+            .into_connection(),
+    );
+    let Ok(service) = build_service_for_mock(db.clone()) else {
+        return;
+    };
+
+    let updated = service
+        .update_s3_source(31, tls_only_request(Some("renamed"), true))
+        .await
+        .expect("no endpoint, so nothing to verify");
+    assert_eq!(updated.name, "renamed");
+    assert_eq!(updated.endpoint, None);
+}
