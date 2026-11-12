@@ -1401,11 +1401,7 @@ impl MongodbService {
         // Non-zero exit. mongorestore can exit non-zero after warnings even
         // when every document landed. Look for its completion markers in the
         // captured tail and salvage success if present.
-        let looks_like_success = captured.contains("done restoring")
-            || captured.contains("finished restoring")
-            || captured.contains("0 document(s) failed to restore");
-
-        if looks_like_success {
+        if mongorestore_reported_success(&captured) {
             warn!(
                 "wal-g backup-fetch exited {} but mongorestore output indicates the restore completed. Treating as success. Output tail:\n{}",
                 exit_code,
@@ -1499,27 +1495,68 @@ impl MongodbService {
             ..Default::default()
         };
 
-        let exec = self
+        let restored = self
+            .run_legacy_mongorestore(&container_name, exec_config)
+            .await;
+
+        // Remove the staged archive whether or not mongorestore succeeded.
+        match self
             .docker
-            .create_exec(&container_name, exec_config)
-            .await?;
+            .create_exec(
+                &container_name,
+                CreateExecOptions {
+                    cmd: Some(vec!["rm", "-f", "/tmp/backup.gz"]),
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(cleanup) => {
+                if let Err(e) = self.docker.start_exec(&cleanup.id, None).await {
+                    warn!(
+                        "Could not remove the staged archive of legacy restore {} from '{}': {}",
+                        backup_location, container_name, e
+                    );
+                }
+            }
+            Err(e) => warn!(
+                "Could not remove the staged archive of legacy restore {} from '{}': {}",
+                backup_location, container_name, e
+            ),
+        }
+        restored?;
 
+        info!("MongoDB legacy restore completed successfully");
+        Ok(())
+    }
+
+    /// Run the legacy restore's `mongorestore` exec, logging its output as
+    /// it streams, and fail unless it exited 0: a corrupt archive, a refused
+    /// login or a failed insert must not read as a restored database.
+    async fn run_legacy_mongorestore(
+        &self,
+        container_name: &str,
+        exec_config: CreateExecOptions<&str>,
+    ) -> Result<()> {
+        let exec = self.docker.create_exec(container_name, exec_config).await?;
         let output = self.docker.start_exec(&exec.id, None).await?;
-
+        let mut stderr_tail = String::new();
         if let bollard::exec::StartExecResults::Attached { mut output, .. } = output {
             while let Some(result) = output.next().await {
                 match result {
-                    Ok(log_output) => match log_output {
-                        bollard::container::LogOutput::StdOut { message } => {
-                            let stdout_str = String::from_utf8_lossy(&message);
-                            info!("mongorestore stdout: {}", stdout_str);
-                        }
-                        bollard::container::LogOutput::StdErr { message } => {
-                            let stderr_str = String::from_utf8_lossy(&message);
-                            info!("mongorestore stderr: {}", stderr_str);
-                        }
-                        _ => {}
-                    },
+                    Ok(bollard::container::LogOutput::StdOut { message }) => {
+                        info!("mongorestore stdout: {}", String::from_utf8_lossy(&message));
+                    }
+                    Ok(bollard::container::LogOutput::StdErr { message }) => {
+                        let stderr = String::from_utf8_lossy(&message);
+                        info!("mongorestore stderr: {}", stderr);
+                        super::exec_util::keep_tail(
+                            &mut stderr_tail,
+                            &stderr,
+                            super::exec_util::RESTORE_ERROR_TAIL,
+                        );
+                    }
+                    Ok(_) => {}
                     Err(e) => {
                         error!("Error reading exec output: {}", e);
                         return Err(EngineError::failed(
@@ -1530,27 +1567,20 @@ impl MongodbService {
                 }
             }
         }
-
-        // Clean up temporary file in container
-        let cleanup_exec = self
-            .docker
-            .create_exec(
-                &container_name,
-                CreateExecOptions {
-                    cmd: Some(vec!["rm", "/tmp/backup.gz"]),
-                    ..Default::default()
-                },
-            )
-            .await?;
-
-        self.docker.start_exec(&cleanup_exec.id, None).await?;
-
-        info!("MongoDB legacy restore completed successfully");
-        Ok(())
+        let inspect = self.docker.inspect_exec(&exec.id).await?;
+        super::exec_util::restore_tool_outcome(
+            &self.name,
+            "mongorestore",
+            container_name,
+            inspect.exit_code,
+            &stderr_tail,
+        )
     }
 
-    /// Check if the WAL-G binary is available inside a container.
-    async fn container_has_walg(&self, container_name: &str) -> bool {
+    /// Check if the WAL-G binary is available inside a container: what a
+    /// backup checks to choose between a WAL-G stream and a mongodump
+    /// archive, on the control plane and on every worker.
+    pub async fn container_has_walg(&self, container_name: &str) -> bool {
         use bollard::exec::{CreateExecOptions, StartExecOptions};
 
         let exec = match self
@@ -1852,6 +1882,34 @@ fn build_mongodb_url(
 /// Pinned to the 7.0 minor series to prevent silent upgrades to 7.1+.
 /// Ideally this should be pinned to an immutable SHA-256 digest
 /// (e.g. `mongo@sha256:<hash>`); update when rotating the image version.
+/// The last ~500 bytes of mongorestore's output, on a character boundary:
+/// where its final outcome is printed.
+fn mongorestore_output_tail(output: &str) -> &str {
+    let cut = output.len().saturating_sub(500);
+    let cut = (cut..=cut.saturating_add(3))
+        .find(|&i| output.is_char_boundary(i))
+        .unwrap_or(output.len());
+    &output[cut..]
+}
+
+/// Whether mongorestore, which exited non-zero, still restored everything:
+/// it can exit 1 after warnings once every document landed. Only the tail
+/// counts, so an early "done restoring" of one collection cannot mask a
+/// later failure; and a `Failed:` line is never salvaged, because
+/// mongorestore prints its "0 document(s) failed to restore" summary after
+/// a fatal error too (a corrupt or non-archive input: nothing was restored,
+/// and nothing was changed).
+fn mongorestore_reported_success(output: &str) -> bool {
+    let tail = mongorestore_output_tail(output);
+    let failed = tail
+        .lines()
+        .any(|line| line.trim_start().starts_with("Failed:") || line.contains("\tFailed:"));
+    !failed
+        && (tail.contains("done restoring")
+            || tail.contains("finished restoring")
+            || tail.contains("0 document(s) failed to restore"))
+}
+
 const MONGO_SIDECAR_IMAGE: &str = "mongo:7.0";
 /// Directory inside the mongorestore sidecar that receives the uploaded
 /// archive and config file. Exists in every image; never bind-mounted.
@@ -2271,32 +2329,14 @@ impl MongodbService {
 
         if exit_code != 0 {
             // mongorestore can exit 1 after warnings even when every
-            // document restored successfully.  Salvage success on the same
-            // markers the WAL-G restore path uses — BUT only check the TAIL
-            // of the output (~500 bytes).  A large restore that partially
-            // fails after an earlier successful collection can emit "done
-            // restoring" early in the log; checking the full output would
-            // then mask the later failure.  Checking only the tail ensures
-            // the final outcome is what we act on.
-            let salvage_region: &str = {
-                // Advance the byte index to the next valid UTF-8 char boundary
-                // so the slice operation is always safe.
-                let cut = captured_output.len().saturating_sub(500);
-                let cut = (cut..=cut.saturating_add(3))
-                    .find(|&i| captured_output.is_char_boundary(i))
-                    .unwrap_or(captured_output.len());
-                &captured_output[cut..]
-            };
-            let looks_like_success = salvage_region.contains("done restoring")
-                || salvage_region.contains("finished restoring")
-                || salvage_region.contains("0 document(s) failed to restore");
-
-            if looks_like_success {
+            // document restored successfully; see
+            // `mongorestore_reported_success` for what is salvaged.
+            if mongorestore_reported_success(&captured_output) {
                 warn!(
                     "mongorestore sidecar exited {} but output tail indicates success. \
                      Treating as success. Output tail:\n{}",
                     exit_code,
-                    salvage_region.trim()
+                    mongorestore_output_tail(&captured_output).trim()
                 );
                 return Ok(());
             }
@@ -4538,13 +4578,7 @@ mod tests {
         output.push_str(&"x".repeat(600));
         output.push_str(tail_failure);
 
-        let salvage_region: &str = {
-            let cut = output.len().saturating_sub(500);
-            let cut = (cut..=cut.saturating_add(3))
-                .find(|&i| output.is_char_boundary(i))
-                .unwrap_or(output.len());
-            &output[cut..]
-        };
+        let salvage_region = mongorestore_output_tail(&output);
 
         assert!(
             !salvage_region.contains("done restoring"),
@@ -4556,6 +4590,31 @@ mod tests {
             salvage_region.contains(tail_failure),
             "Salvage region must include the tail failure message"
         );
+        assert!(!mongorestore_reported_success(&output));
+    }
+
+    /// mongorestore prints its "0 document(s) failed" summary after a fatal
+    /// error too: an input that is not an archive restored nothing and must
+    /// fail the restore, not be salvaged as a success.
+    #[test]
+    fn a_fatal_mongorestore_error_is_never_salvaged() {
+        for fatal in [
+            "Failed: gzip: invalid header",
+            "Failed: stream or file does not appear to be a mongodump archive",
+        ] {
+            let output = format!(
+                "2026-01-01T00:00:00.000+0000\t{fatal}\n\
+                 2026-01-01T00:00:00.000+0000\t0 document(s) restored successfully. 0 \
+                 document(s) failed to restore.\n"
+            );
+            assert!(!mongorestore_reported_success(&output), "{output}");
+        }
+        // A non-zero exit after warnings, with every document restored.
+        let warned = "2026-01-01T00:00:00.000+0000\tdone restoring shop.proof (2 documents, 0 \
+                      failures)\n2026-01-01T00:00:00.000+0000\t2 document(s) restored \
+                      successfully. 0 document(s) failed to restore.\n";
+        assert!(mongorestore_reported_success(warned));
+        assert!(!mongorestore_reported_success(""));
     }
 
     #[test]
@@ -5218,7 +5277,7 @@ mod tests {
                 &s3_creds,
                 legacy_key,
                 &minio.s3_source,
-                legacy_service_config,
+                legacy_service_config.clone(),
             )
             .await
             .expect("legacy archive restore");
@@ -5231,6 +5290,33 @@ mod tests {
             "legacy restore must bring back 3 documents"
         );
         println!("✓ Legacy archive restore verified");
+
+        // Step 8c: a legacy archive mongorestore cannot read is a failed
+        // restore, not a completed one.
+        let corrupt_key = "legacy/corrupt.archive.gz";
+        minio
+            .s3_client
+            .put_object()
+            .bucket(&minio.s3_source.bucket_name)
+            .key(corrupt_key)
+            .body(b"not a mongodump archive".to_vec().into())
+            .send()
+            .await
+            .expect("upload corrupt archive");
+        let corrupt = service
+            .restore_from_s3(
+                &minio.s3_client,
+                &s3_creds,
+                corrupt_key,
+                &minio.s3_source,
+                legacy_service_config,
+            )
+            .await;
+        assert!(
+            corrupt.is_err(),
+            "a corrupt legacy archive must fail the restore: {corrupt:?}"
+        );
+        println!("✓ Corrupt legacy archive restore failed as it must");
 
         // Step 9: Cleanup
         println!("Step 9: Cleaning up...");

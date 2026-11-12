@@ -124,6 +124,10 @@ pub struct OverlayReport {
     /// This host's occupied IPv4 ranges (ADR 056), already normalized; the
     /// heartbeat sends them when they differ from what it last sent.
     pub occupied_ranges: Option<Vec<temps_network::occupied::OccupiedRange>>,
+    /// The VXLAN network ID of the last peer list this loop acted on
+    /// (ADR 062): 42 when the control plane sent none. `None` until the
+    /// first poll.
+    pub vxlan_vni: Option<u32>,
 }
 
 pub type SharedOverlayReport = Arc<std::sync::RwLock<OverlayReport>>;
@@ -134,6 +138,8 @@ pub type SharedOverlayReport = Arc<std::sync::RwLock<OverlayReport>>;
 pub struct HealthSlots {
     pub dns: SharedDnsHealth,
     pub overlay: SharedOverlayReport,
+    /// The resolver and its query observer, for `/agent/dns/*` (ADR-095).
+    pub dns_report: crate::dns_report::SharedAgentDns,
 }
 
 /// Longest wait between overlay attempts while the same failure persists.
@@ -220,6 +226,7 @@ fn overlay_fingerprint(
         &payload.alloc,
         &payload.peers,
         &payload.wireguard,
+        &payload.vxlan,
     ))
     .unwrap_or_default()
     .hash(&mut hasher);
@@ -227,46 +234,71 @@ fn overlay_fingerprint(
     hasher.finish()
 }
 
-/// The overlay the occupied-range collection leaves out: the built manager's,
-/// else the latest snapshot's (the manager may not be built yet, and until it
-/// is `overlay_name::current()` still says `temps0`), else `temps0`'s.
-fn occupied_scan_config(
-    built: Option<&NetworkConfig>,
-    snapshot_names: Option<&OverlayNames>,
-) -> NetworkConfig {
-    match (built, snapshot_names) {
-        (Some(config), _) => config.clone(),
-        (None, Some(names)) => NetworkConfig::default().with_overlay_names(names),
-        (None, None) => NetworkConfig::default().with_overlay_names(&overlay_name::current()),
-    }
-}
-
 /// The ranges this host already uses outside Temps, for the control plane
 /// (ADR 056). Routes the overlay itself installed towards peers (a native
 /// transport puts them on the underlay device) are left out: they are
 /// Temps' own, not a collision.
+///
+/// `owned` are the overlays this node runs or is bringing up (see
+/// [`owned_overlay_names`]): their bridges, VXLAN devices and Docker
+/// networks are this node's own, never a collision (ADR 062).
 async fn collect_occupied_ranges(
-    config: &NetworkConfig,
+    owned: &[OverlayNames],
     routed_peers: &[Ipv4Net],
 ) -> Result<Vec<temps_network::occupied::OccupiedRange>, String> {
     let docker = Docker::connect_with_local_defaults().ok();
-    let owned_devices = [
-        config.bridge_name.as_str(),
-        config.vxlan_dev_name.as_str(),
-        temps_network::mesh::MESH_INTERFACE,
-    ];
-    let mut ranges = temps_network::occupied::collect(
-        docker.as_ref(),
-        &owned_devices,
-        &config.docker_network_name,
-    )
-    .await
-    .map_err(|error| error.to_string())?;
+    let mut owned_devices: Vec<&str> = vec![temps_network::mesh::MESH_INTERFACE];
+    owned_devices.extend(
+        owned
+            .iter()
+            .flat_map(|names| [names.bridge.as_str(), names.vxlan.as_str()]),
+    );
+    let owned_networks: Vec<&str> = owned
+        .iter()
+        .map(|names| names.docker_network.as_str())
+        .collect();
+    let mut ranges =
+        temps_network::occupied::collect(docker.as_ref(), &owned_devices, &owned_networks)
+            .await
+            .map_err(|error| error.to_string())?;
     ranges.retain(|range| {
         range.source != temps_network::occupied::OccupiedSource::Route
             || !routed_peers.contains(&range.cidr)
     });
     Ok(ranges)
+}
+
+/// The overlays whose devices and Docker networks this node owns (ADR 062):
+/// the one its manager runs, the one the allocation just polled (or
+/// restored) names, the one in the last applied snapshot (the manager may
+/// not be built yet, and until it is `overlay_name::current()` still says
+/// `temps0`), and the one a rename leaves behind for this same node. Only
+/// when none of the first three is known the name the process last ran is
+/// assumed. Collecting with just the manager's names (or
+/// the default) after a restart or a failed bootstrap reported the node's
+/// own half-built bridge as a foreign route, and the control plane moved its
+/// allocation on every retry.
+fn owned_overlay_names(
+    built: Option<OverlayNames>,
+    polled: Option<OverlayNames>,
+    snapshot: Option<OverlayNames>,
+    previous: Option<OverlayNames>,
+    current: impl FnOnce() -> OverlayNames,
+) -> Vec<OverlayNames> {
+    let mut owned: Vec<OverlayNames> = Vec::new();
+    let known = built.is_some() || polled.is_some() || snapshot.is_some();
+    for names in [built, polled, snapshot, previous].into_iter().flatten() {
+        if !owned.contains(&names) {
+            owned.push(names);
+        }
+    }
+    if !known {
+        let names = current();
+        if !owned.contains(&names) {
+            owned.push(names);
+        }
+    }
+    owned
 }
 
 /// Wire types — match the server's `handlers::network::PeerListResponse`.
@@ -294,6 +326,39 @@ struct WirePeerListResponse {
     /// or with it off: the node keeps its registered address as underlay.
     #[serde(default)]
     wireguard: Option<WireMesh>,
+    /// The cluster's VXLAN network ID and port (ADR 062). Absent from
+    /// control planes that predate per-cluster network IDs: 42/4789.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    vxlan: Option<WireVxlan>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+struct WireVxlan {
+    vni: u32,
+    port: u16,
+}
+
+impl WirePeerListResponse {
+    /// The transport the control plane asks for: VXLAN on the cluster's
+    /// network ID, 42/4789 when it sent none. Out-of-range values refuse the
+    /// payload rather than building an overlay nobody else is on.
+    fn transport(&self) -> Result<temps_network::Transport, SyncError> {
+        let Some(WireVxlan { vni, port }) = self.vxlan else {
+            return Ok(temps_network::Transport::DEFAULT_VXLAN);
+        };
+        temps_network::validate_vxlan(vni, port)
+            .map_err(|e| SyncError::WireParse(format!("vxlan: {e}")))?;
+        Ok(temps_network::Transport::Vxlan { vni, port })
+    }
+}
+
+/// The VXLAN port of `transport`; the default for a native one, whose
+/// lockdown has no VXLAN traffic to admit anyway.
+fn vxlan_port_of(transport: &temps_network::Transport) -> u16 {
+    match transport {
+        temps_network::Transport::Vxlan { port, .. } => *port,
+        temps_network::Transport::Native => temps_network::DEFAULT_VXLAN_PORT,
+    }
 }
 
 /// Managed WireGuard mesh section of the peer list (absent when off).
@@ -524,6 +589,7 @@ async fn run(
     let HealthSlots {
         dns: dns_health,
         overlay: overlay_report,
+        dns_report: agent_dns,
     } = health;
     info!(
         node_id = config.node_id,
@@ -564,6 +630,7 @@ async fn run(
         shared_peers: &shared_peers,
         dns_health: &dns_health,
         dns_policy: &dns_policy,
+        agent_dns: &agent_dns,
     };
 
     let mesh_url = format!(
@@ -607,12 +674,69 @@ async fn run(
     let mut applied_peer_subnets: Vec<Ipv4Net> = Vec::new();
 
     loop {
+        let (polled, offline) = match poll_once(&client, &url, &config.token).await {
+            Ok(payload) => (Ok(payload), false),
+            Err(e) if !applied_once && !restore_attempted && e.control_plane_unreachable() => {
+                restore_attempted = true;
+                let path = snapshot_path.clone();
+                match tokio::task::spawn_blocking(move || load_snapshot(&path))
+                    .await
+                    .ok()
+                    .flatten()
+                {
+                    Some(payload) => {
+                        warn!(
+                            error = %e,
+                            snapshot = %snapshot_path.display(),
+                            "control plane unreachable at startup; restoring the last applied \
+                             network snapshot so this node reaches its peers meanwhile"
+                        );
+                        (Ok(payload), true)
+                    }
+                    None => (Err(e), false),
+                }
+            }
+            Err(e) => (Err(e), false),
+        };
+        // ADR 062: the network ID to follow comes with every payload, also
+        // one without an allocation, and is reported from the first poll on
+        // so the control plane knows this node can follow a change.
+        let polled =
+            polled.and_then(|payload| payload.transport().map(|transport| (payload, transport)));
+        if let Ok((payload, transport)) = &polled {
+            if let (temps_network::Transport::Vxlan { vni, .. }, Ok(mut report)) =
+                (transport, overlay_report.write())
+            {
+                report.vxlan_vni = Some(*vni);
+            }
+            peer_subnets = payload
+                .peers
+                .iter()
+                .filter_map(|peer| Ipv4Net::from_str(&peer.compute_cidr).ok())
+                .collect();
+        }
+        // Collected after the poll, so the overlay the allocation names is
+        // this node's own even before (or after a failed) bootstrap.
         let occupied = {
-            let net_config = occupied_scan_config(
-                manager.as_ref().map(|(manager, _)| manager.config()),
-                snapshot_names.as_ref(),
+            let polled_alloc = polled
+                .as_ref()
+                .ok()
+                .and_then(|(payload, _)| payload.alloc.as_ref());
+            let owned = owned_overlay_names(
+                manager
+                    .as_ref()
+                    .map(|(manager, _)| manager.config().overlay_names()),
+                polled_alloc.and_then(|alloc| alloc.overlay_names().ok()),
+                snapshot_names.clone(),
+                renamed_from
+                    .as_ref()
+                    .filter(|previous| {
+                        polled_alloc.is_some_and(|alloc| alloc.node_id == previous.node_id)
+                    })
+                    .map(|previous| previous.names.clone()),
+                overlay_name::current,
             );
-            match collect_occupied_ranges(&net_config, &peer_subnets).await {
+            match collect_occupied_ranges(&owned, &peer_subnets).await {
                 Ok(ranges) => {
                     if occupied_error.take().is_some() {
                         info!("collecting this host's occupied network ranges works again");
@@ -636,43 +760,16 @@ async fn run(
                 }
             }
         };
-        let (polled, offline) = match poll_once(&client, &url, &config.token).await {
-            Ok(payload) => (Ok(payload), false),
-            Err(e) if !applied_once && !restore_attempted && e.control_plane_unreachable() => {
-                restore_attempted = true;
-                let path = snapshot_path.clone();
-                match tokio::task::spawn_blocking(move || load_snapshot(&path))
-                    .await
-                    .ok()
-                    .flatten()
-                {
-                    Some(payload) => {
-                        warn!(
-                            error = %e,
-                            snapshot = %snapshot_path.display(),
-                            "control plane unreachable at startup; restoring the last applied \
-                             network snapshot so this node reaches its peers meanwhile"
-                        );
-                        (Ok(Some(payload)), true)
-                    }
-                    None => (Err(e), false),
-                }
-            }
-            Err(e) => (Err(e), false),
-        };
+        let polled = polled
+            .map(|(payload, transport)| actionable(payload).map(|payload| (payload, transport)));
         match polled {
-            Ok(Some(payload)) => {
+            Ok(Some((payload, transport))) => {
                 let on_mesh = payload.wireguard.is_some();
                 let fingerprint = overlay_fingerprint(&payload, occupied.as_deref());
                 let attempted_cidr = payload
                     .alloc
                     .as_ref()
                     .map(|alloc| alloc.compute_cidr.clone());
-                peer_subnets = payload
-                    .peers
-                    .iter()
-                    .filter_map(|peer| Ipv4Net::from_str(&peer.compute_cidr).ok())
-                    .collect();
                 if !on_mesh {
                     publish_mesh_address(&mesh_address, None);
                 }
@@ -687,6 +784,7 @@ async fn run(
                         &config,
                         wire,
                         compute_pool,
+                        vxlan_port_of(&transport),
                         &mut mesh,
                         offline,
                     )
@@ -858,9 +956,23 @@ async fn run(
                     manager = None;
                     bootstrapped = None;
                 }
+                if manager
+                    .as_ref()
+                    .is_some_and(|(built, _)| built.config().transport != transport)
+                {
+                    // ADR 062: the kernel's VXLAN device carries the network
+                    // ID, so the overlay is rebuilt; bootstrapping replaces
+                    // this node's device with one on the new ID.
+                    info!(
+                        transport = ?transport,
+                        "the cluster's VXLAN network ID changed; rebuilding the overlay on it"
+                    );
+                    manager = None;
+                    bootstrapped = None;
+                }
                 let manager = match &manager {
                     Some((manager, _)) => manager,
-                    None => match build_manager(&config, on_mesh, &names).await {
+                    None => match build_manager(&config, on_mesh, &names, transport).await {
                         Ok(built) => {
                             overlay_name::set_current(names.clone());
                             &manager.insert((built, on_mesh)).0
@@ -1050,8 +1162,13 @@ async fn build_manager(
     config: &AgentConfig,
     on_mesh: bool,
     names: &OverlayNames,
+    transport: temps_network::Transport,
 ) -> Result<NetworkManager, SyncError> {
-    let mut net_config = NetworkConfig::default().with_overlay_names(names);
+    let mut net_config = NetworkConfig {
+        transport,
+        ..NetworkConfig::default()
+    }
+    .with_overlay_names(names);
     match (on_mesh, &config.underlay_dev) {
         (true, _) => {
             info!(
@@ -1126,7 +1243,7 @@ async fn poll_once(
     client: &reqwest::Client,
     url: &str,
     token: &str,
-) -> Result<Option<WirePeerListResponse>, SyncError> {
+) -> Result<WirePeerListResponse, SyncError> {
     let resp = client
         .get(url)
         .bearer_auth(token)
@@ -1140,18 +1257,17 @@ async fn poll_once(
         return Err(SyncError::HttpStatus { status, body });
     }
 
-    let payload: WirePeerListResponse = resp
-        .json()
+    resp.json()
         .await
-        .map_err(|e| SyncError::Parse(e.to_string()))?;
+        .map_err(|e| SyncError::Parse(e.to_string()))
+}
 
-    // A node on the WireGuard mesh must see the mesh section before it has an
-    // allocation: registering there is what gives a node that joined with a
-    // public address its private underlay (and so its allocation).
-    if payload.alloc.is_none() && payload.wireguard.is_none() {
-        return Ok(None);
-    }
-    Ok(Some(payload))
+/// Whether a polled payload has anything for this node to act on. A node on
+/// the WireGuard mesh must see the mesh section before it has an allocation:
+/// registering there is what gives a node that joined with a public address
+/// its private underlay (and so its allocation).
+fn actionable(payload: WirePeerListResponse) -> Option<WirePeerListResponse> {
+    (payload.alloc.is_some() || payload.wireguard.is_some()).then_some(payload)
 }
 
 /// Pause before re-polling after the control plane changed our mesh
@@ -1250,12 +1366,14 @@ fn mesh_endpoint(
 /// not hold them, bring up the interface on our mesh address, and make the
 /// interface's peers exactly the cluster's (which also revokes removed
 /// nodes).
+#[allow(clippy::too_many_arguments)]
 async fn reconcile_mesh(
     client: &reqwest::Client,
     registration_url: &str,
     config: &AgentConfig,
     wire: &WireMesh,
     compute_pool: Option<Ipv4Net>,
+    vxlan_port: u16,
     state: &mut MeshState,
     offline: bool,
 ) -> Result<MeshTick, SyncError> {
@@ -1327,7 +1445,7 @@ async fn reconcile_mesh(
     // The lockdown comes before the interface: the tunnel must never exist
     // as an open way into this host. Checked every tick so a flushed
     // ruleset is repaired.
-    temps_network::mesh::ensure_lockdown(&mesh_lockdown(config, cidr, wire.hub))
+    temps_network::mesh::ensure_lockdown(&mesh_lockdown(config, cidr, wire.hub, vxlan_port))
         .await
         .map_err(|e| SyncError::Mesh(format!("mesh firewall: {e}")))?;
 
@@ -1492,9 +1610,10 @@ fn mesh_lockdown(
     config: &AgentConfig,
     cidr: Ipv4Net,
     relay: bool,
+    vxlan_port: u16,
 ) -> temps_network::mesh::MeshLockdown {
     temps_network::mesh::MeshLockdown {
-        vxlan_port: overlay_vxlan_port(),
+        vxlan_port,
         mesh: cidr,
         node_api_port: None,
         agent_api: crate::mesh_listener::mesh_agent_api(config, cidr),
@@ -1657,14 +1776,6 @@ async fn warn_containers_on_previous_bind_address(
     );
 }
 
-/// The VXLAN port this agent's overlay listens on.
-fn overlay_vxlan_port() -> u16 {
-    match NetworkConfig::default().transport {
-        temps_network::Transport::Vxlan { port, .. } => port,
-        temps_network::Transport::Native => 4789,
-    }
-}
-
 fn parse_mesh_peer(wire: &WireMeshPeer) -> Result<MeshPeer, SyncError> {
     let endpoint = wire
         .endpoint
@@ -1783,15 +1894,26 @@ pub async fn bootstrap_mesh(
     // and endpoint, so the interface comes up from it directly.
     // The pairing carries no compute pool; the control plane's peer list
     // brings it on the first sync.
-    reconcile_mesh(&client, "", config, &wire, None, &mut state, true)
-        .await
-        .map_err(MeshBootstrapError::Mesh)?;
+    // Nor the cluster's VXLAN port: the default until that sync.
+    reconcile_mesh(
+        &client,
+        "",
+        config,
+        &wire,
+        None,
+        temps_network::DEFAULT_VXLAN_PORT,
+        &mut state,
+        true,
+    )
+    .await
+    .map_err(MeshBootstrapError::Mesh)?;
     let snapshot = WirePeerListResponse {
         network: None,
         alloc: None,
         peers: Vec::new(),
         cluster_dns_enabled: false,
         wireguard: Some(wire),
+        vxlan: None,
     };
     let path = snapshot_path(config);
     tokio::task::spawn_blocking(move || save_snapshot(&path, &snapshot))
@@ -1829,6 +1951,7 @@ pub fn mesh_doctor_expectations(
             path.display()
         )
     })?;
+    let vxlan_port = vxlan_port_of(&snapshot.transport().map_err(|e| e.to_string())?);
     let Some(wire) = snapshot.wireguard else {
         return Ok(None);
     };
@@ -1862,7 +1985,7 @@ pub fn mesh_doctor_expectations(
             .as_deref()
             .and_then(|endpoint| temps_network::mesh::parse_endpoint(endpoint).ok()),
         peers,
-        lockdown: mesh_lockdown(config, cidr, wire.hub),
+        lockdown: mesh_lockdown(config, cidr, wire.hub, vxlan_port),
     }))
 }
 
@@ -1942,11 +2065,13 @@ fn save_snapshot(path: &std::path::Path, snapshot: &WirePeerListResponse) -> std
 /// module (`agent.rs`'s CLI wiring, `service_handlers.rs`'s container-attach
 /// path) — this struct doesn't change their meaning, just groups the
 /// references for one function call.
+#[derive(Clone, Copy)]
 struct SharedSlots<'a> {
     overlay_bridge_address: &'a Arc<std::sync::RwLock<Option<IpAddr>>>,
     shared_peers: &'a SharedPeers,
     dns_health: &'a SharedDnsHealth,
     dns_policy: &'a DnsPolicySlot,
+    agent_dns: &'a crate::dns_report::SharedAgentDns,
 }
 
 async fn apply(
@@ -2084,9 +2209,7 @@ async fn apply(
         bridge_address,
         resolver,
         config,
-        slots.overlay_bridge_address,
-        slots.dns_health,
-        slots.dns_policy,
+        slots,
     )
     .await;
 
@@ -2255,10 +2378,15 @@ async fn reconcile_resolver(
     bridge_address: IpAddr,
     resolver: &mut Option<DnsResolverHandle>,
     config: &AgentConfig,
-    overlay_bridge_address: &Arc<std::sync::RwLock<Option<IpAddr>>>,
-    dns_health: &SharedDnsHealth,
-    dns_policy: &DnsPolicySlot,
+    slots: &SharedSlots<'_>,
 ) {
+    let SharedSlots {
+        overlay_bridge_address,
+        dns_health,
+        dns_policy,
+        agent_dns,
+        ..
+    } = *slots;
     if !cluster_dns_enabled {
         if let Some(handle) = resolver.take() {
             info!(
@@ -2271,6 +2399,7 @@ async fn reconcile_resolver(
             }
         }
         publish_dns_health(dns_health, false, None, None);
+        agent_dns.publish_stopped(None);
         return;
     }
 
@@ -2294,6 +2423,7 @@ async fn reconcile_resolver(
                     "{error}; new containers use Docker's embedded DNS until it answers"
                 );
             }
+            agent_dns.publish_running(handle.view(), status.tasks_alive, probe_error.clone());
             publish_dns_health(dns_health, answering, Some(&status), probe_error);
             return;
         }
@@ -2320,7 +2450,13 @@ async fn reconcile_resolver(
     apply_dns_control_plane_trust(config, &mut dns_cfg).await;
     let snapshot_path = dns_cfg.snapshot_path();
     let mut start_error = None;
-    match DnsResolverHandle::start_with_policy(dns_cfg, Some(dns_policy.clone())).await {
+    match DnsResolverHandle::start_observed(
+        dns_cfg,
+        Some(dns_policy.clone()),
+        Some(agent_dns.observer()),
+    )
+    .await
+    {
         Ok(handle) => {
             info!(
                 snapshot = %snapshot_path.display(),
@@ -2365,6 +2501,14 @@ async fn reconcile_resolver(
 
     let status = resolver.as_ref().map(|h| h.status());
     let running = resolver.is_some() && start_error.is_none();
+    match resolver.as_ref() {
+        Some(handle) => agent_dns.publish_running(
+            handle.view(),
+            status.as_ref().is_some_and(|s| s.tasks_alive),
+            start_error.clone(),
+        ),
+        None => agent_dns.publish_stopped(start_error.clone()),
+    }
     publish_dns_health(dns_health, running, status.as_ref(), start_error);
 }
 
@@ -2887,16 +3031,20 @@ mod tests {
     // `temps0`; the collection must leave out the snapshot's overlay instead.
     #[test]
     fn the_occupied_scan_leaves_out_the_snapshot_overlay_before_a_build() {
+        let temps0 = OverlayNames::default();
         let temps1 = OverlayNames::new("temps1").unwrap();
-        let config = occupied_scan_config(None, Some(&temps1));
-        assert_eq!(config.docker_network_name, "temps1");
-        assert_eq!(config.bridge_name, "br-temps1");
-        assert_eq!(config.vxlan_dev_name, "vxlan-temps1");
-        // A built manager is authoritative.
-        let built =
-            NetworkConfig::default().with_overlay_names(&OverlayNames::new("temps2").unwrap());
-        let config = occupied_scan_config(Some(&built), Some(&temps1));
-        assert_eq!(config.docker_network_name, "temps2");
+        let owned = owned_overlay_names(None, None, Some(temps1.clone()), None, || temps0.clone());
+        assert_eq!(owned, std::slice::from_ref(&temps1));
+        // A built manager is owned too, beside the snapshot's.
+        let temps2 = OverlayNames::new("temps2").unwrap();
+        let owned = owned_overlay_names(
+            Some(temps2.clone()),
+            None,
+            Some(temps1.clone()),
+            None,
+            || temps0.clone(),
+        );
+        assert_eq!(owned, [temps2, temps1]);
     }
 
     #[test]
@@ -2925,6 +3073,7 @@ mod tests {
             peers: vec![wire_peer()],
             cluster_dns_enabled: false,
             wireguard: None,
+            vxlan: None,
         };
         let previous = PreviousOverlay::from_snapshot(&snapshot).unwrap();
         assert_eq!(previous.node_id, "00000000-0000-0000-0000-00000000002a");
@@ -3326,6 +3475,7 @@ mod tests {
             &config,
             &wire,
             None,
+            4789,
             &mut state,
             true,
         )
@@ -3442,6 +3592,7 @@ mod tests {
             peers: vec![wire_peer()],
             cluster_dns_enabled: false,
             wireguard: None,
+            vxlan: None,
         };
         let base = overlay_fingerprint(&payload, None);
         assert_eq!(base, overlay_fingerprint(&payload.clone(), None));
@@ -3458,6 +3609,114 @@ mod tests {
         );
         payload.alloc.as_mut().unwrap().compute_cidr = "10.202.9.0/24".into();
         assert_ne!(base, overlay_fingerprint(&payload, None));
+        let moved = overlay_fingerprint(&payload, None);
+        payload.vxlan = Some(WireVxlan {
+            vni: 700_001,
+            port: 4789,
+        });
+        assert_ne!(
+            moved,
+            overlay_fingerprint(&payload, None),
+            "a new network ID is retried at once, not backed off"
+        );
+    }
+
+    // ADR 062: a control plane that predates per-cluster network IDs sends
+    // no `vxlan`; the overlay stays on 42/4789, as before.
+    #[test]
+    fn a_payload_without_vxlan_means_the_default_network_id() {
+        let json = r#"{"peers": [], "cluster_dns_enabled": false}"#;
+        let payload: WirePeerListResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(payload.vxlan, None);
+        assert_eq!(
+            payload.transport().unwrap(),
+            temps_network::Transport::Vxlan {
+                vni: 42,
+                port: 4789
+            }
+        );
+        // And a snapshot written without it reads back the same way.
+        assert!(!serde_json::to_string(&payload).unwrap().contains("vxlan"));
+    }
+
+    #[test]
+    fn the_payload_network_id_is_followed_and_validated() {
+        let json = r#"{"peers": [], "vxlan": {"vni": 5000123, "port": 4790}}"#;
+        let payload: WirePeerListResponse = serde_json::from_str(json).unwrap();
+        let transport = payload.transport().unwrap();
+        assert_eq!(
+            transport,
+            temps_network::Transport::Vxlan {
+                vni: 5_000_123,
+                port: 4790
+            }
+        );
+        assert_eq!(vxlan_port_of(&transport), 4790);
+        for bad in [
+            r#"{"vxlan": {"vni": 0, "port": 4789}}"#,
+            r#"{"vxlan": {"vni": 16777216, "port": 4789}}"#,
+            r#"{"vxlan": {"vni": 42, "port": 0}}"#,
+        ] {
+            let payload: WirePeerListResponse = serde_json::from_str(bad).unwrap();
+            assert!(
+                matches!(payload.transport(), Err(SyncError::WireParse(_))),
+                "{bad} must be refused"
+            );
+        }
+    }
+
+    // ADR 062 regression: after a restart, or when the bootstrap failed, the
+    // agent has no manager and the process-wide name is still `temps0`. The
+    // overlay the allocation names (`temps1`) is still this node's own: its
+    // half-built `br-temps1` route must not be reported as a collision, or
+    // the control plane moves the allocation on every retry.
+    #[test]
+    fn the_polled_overlay_is_owned_before_the_manager_exists() {
+        let temps0 = OverlayNames::default();
+        let temps1 = OverlayNames::new("temps1").unwrap();
+        let owned = owned_overlay_names(None, Some(temps1.clone()), None, None, || temps0.clone());
+        assert_eq!(owned, vec![temps1.clone()]);
+        assert!(
+            !owned.contains(&temps0),
+            "another cluster's leftover temps0 stays reportable"
+        );
+
+        // A manager on the old name while the allocation names a new one:
+        // both are this node's until the rename releases the old one.
+        let owned = owned_overlay_names(
+            Some(temps0.clone()),
+            Some(temps1.clone()),
+            None,
+            None,
+            || unreachable!("names are known"),
+        );
+        assert_eq!(owned, vec![temps0.clone(), temps1.clone()]);
+
+        // Same names from every source are listed once.
+        let owned = owned_overlay_names(
+            Some(temps1.clone()),
+            Some(temps1.clone()),
+            Some(temps1.clone()),
+            Some(temps1.clone()),
+            || unreachable!("names are known"),
+        );
+        assert_eq!(owned, vec![temps1.clone()]);
+
+        // Nothing known yet (no allocation): what this process last ran.
+        let owned = owned_overlay_names(None, None, None, None, || temps1.clone());
+        assert_eq!(owned, vec![temps1]);
+    }
+
+    #[test]
+    fn only_payloads_with_an_allocation_or_a_mesh_are_acted_on() {
+        let empty: WirePeerListResponse =
+            serde_json::from_str(r#"{"vxlan": {"vni": 5000, "port": 4789}}"#).unwrap();
+        assert!(actionable(empty.clone()).is_none());
+        let allocated = WirePeerListResponse {
+            alloc: Some(wire_alloc()),
+            ..empty
+        };
+        assert!(actionable(allocated).is_some());
     }
 
     #[test]

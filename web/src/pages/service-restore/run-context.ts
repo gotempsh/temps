@@ -16,22 +16,29 @@ export const RESTORE_NOT_ACTIVE_TYPE =
   'https://temps.sh/probs/restore-not-active'
 
 /**
- * `available`: the server would accept a cancellation now. `past_safe_point`:
- * the run is active but stopping it is no longer safe (or was already
- * requested). `none`: nothing to cancel (finished, or its status is not
- * currently known).
+ * `available`: the server would accept a cancellation now. `release`: the
+ * run's outcome on its worker node is unknown, and cancelling it releases the
+ * database while it may be partially restored. `past_safe_point`: the run is
+ * active but stopping it is no longer safe (or was already requested).
+ * `none`: nothing to cancel (finished, or its status is not currently known).
  *
  * The server decides (`cancellable` on the run): an in-place restore stays
  * cancellable while it prepares and downloads the backup, a restore into a
- * new service until that service is registered. The console never re-derives
- * those phases.
+ * new service until that service is registered, and a worker restore whose
+ * outcome is unknown can be released. The console never re-derives those
+ * phases; it only words the one that releases data differently.
  */
-export type CancelAvailability = 'available' | 'past_safe_point' | 'none'
+export type CancelAvailability =
+  'available' | 'release' | 'past_safe_point' | 'none'
+
+/** The phase of a worker restore whose outcome Temps cannot establish. */
+export const OUTCOME_UNKNOWN_PHASE = 'outcome_unknown'
 
 export function cancelAvailability(view: RunTrackingView): CancelAvailability {
   if (view.kind !== 'tracking') return 'none'
   if (!isActiveRunStatus(view.run.status)) return 'none'
-  return view.run.cancellable ? 'available' : 'past_safe_point'
+  if (!view.run.cancellable) return 'past_safe_point'
+  return view.run.phase === OUTCOME_UNKNOWN_PHASE ? 'release' : 'available'
 }
 
 const DEFAULT_NOT_CANCELLABLE =

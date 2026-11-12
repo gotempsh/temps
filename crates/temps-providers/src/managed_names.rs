@@ -703,6 +703,8 @@ pub fn enable_failure_problem(kind: ManagedServiceKind, error: &ExternalServiceE
         | ExternalServiceError::DockerError { .. }
         | ExternalServiceError::DuplicateServiceType { .. }
         | ExternalServiceError::InternalError { .. }
+        | ExternalServiceError::AgentUnanswered { .. }
+        | ExternalServiceError::NodeBusy { .. }
         | ExternalServiceError::DockerUnavailable { .. }
         | ExternalServiceError::LocalWorkloadsDisabled { .. }
         | ExternalServiceError::ControlPlaneAddressRequired { .. }

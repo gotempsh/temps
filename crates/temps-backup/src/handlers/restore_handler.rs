@@ -101,6 +101,12 @@ impl From<RestoreError> for Problem {
             | RestoreError::UnsupportedMode { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
                 .with_title("Validation Error")
                 .with_detail(error.to_string()),
+            RestoreError::CapabilitiesUnavailable { .. } => {
+                problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+                    .with_type("https://temps.sh/probs/restore-capabilities-unavailable")
+                    .with_title("Restore Options Unavailable")
+                    .with_detail(error.to_string())
+            }
             internal_error @ (RestoreError::Database(_)
             | RestoreError::Encryption { .. }
             | RestoreError::ExternalService { .. }
@@ -208,6 +214,7 @@ pub struct RestoreCapabilitiesResponse {
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 404, description = "Service not found", body = ProblemDetails),
+        (status = 503, description = "The service's engine cannot be reached to read its restore options", body = ProblemDetails),
     ),
     security(("bearer_auth" = []))
 )]

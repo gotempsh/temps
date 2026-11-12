@@ -12,6 +12,7 @@ pub mod access_keys;
 pub mod gate;
 pub mod gate_sync;
 pub mod ingress;
+pub mod internal_access_grants;
 pub mod project_change_listener;
 pub mod public_ingress_store;
 pub mod public_ingress_sync;

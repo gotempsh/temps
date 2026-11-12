@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 import { PageTitle } from '@temps-sdk/ds'
 import { HighlightedCode } from '@/components/ui/code-block'
+import { FixErrorWithAgentButton } from '@/components/ai/FixErrorWithAgentButton'
 
 import {
   ErrorEventResponse,
@@ -342,6 +343,26 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
             aria-label="Error actions"
             className="flex shrink-0 items-center gap-2"
           >
+            {(errorGroup as any).status !== 'resolved' && (
+              <FixErrorWithAgentButton
+                error={{
+                  id: errorGroup.id,
+                  title: errorGroup.title,
+                  error_type: errorGroup.error_type,
+                  environment_name:
+                    errorGroup.environment_id != null
+                      ? environments?.find(
+                          (e) => e.id === errorGroup.environment_id
+                        )?.name
+                      : undefined,
+                  project: {
+                    id: project.id,
+                    slug: project.slug,
+                    name: project.name,
+                  },
+                }}
+              />
+            )}
             <AssigneeControl
               assignedTo={errorGroup.assigned_to}
               userByIdentity={userByIdentity}

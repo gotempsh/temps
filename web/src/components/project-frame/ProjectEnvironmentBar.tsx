@@ -46,7 +46,7 @@ import {
   type EnvironmentLiveStatus,
   withReachability,
 } from '@/lib/project-environment-selection'
-import { reachabilityHeadline } from '@/lib/reachability'
+import { reachabilityHeadline, visitUrl } from '@/lib/reachability'
 import { reachabilityPath } from '@/lib/reachability-page'
 import {
   describeDockerSocket,
@@ -143,9 +143,6 @@ export function ProjectEnvironmentBar({
   // why they cannot. A worker serves nothing to visit.
   const checkReachability =
     !!environment?.current_deployment_id && !external && !health.isWorker
-  // The environment keeps its address when it runs only a worker, but
-  // nothing answers there: offer no Visit for it.
-  const visitUrl = health.isWorker ? undefined : environment?.main_url
   const reachability = useQuery({
     ...getEnvironmentReachabilityOptions({
       path: { project_id: project.id, environment_id: environment?.id ?? 0 },
@@ -163,6 +160,16 @@ export function ProjectEnvironmentBar({
         ? reachabilityHeadline(reachability.data)
         : undefined
     )
+  // The environment keeps its address when it runs only a worker, but
+  // nothing answers there: offer no Visit for it. Otherwise Visit opens the
+  // address visitors really reach, a configured domain before the generated
+  // one, never a generated `localho.st` that no ingress serves.
+  const visit = health.isWorker
+    ? undefined
+    : visitUrl(
+        checkReachability ? reachability.data : undefined,
+        environment?.main_url
+      )
   const href =
     status && environment
       ? statusHref(project.slug, status, environment, health.latestDeploymentId)
@@ -256,7 +263,7 @@ export function ProjectEnvironmentBar({
       </nav>
 
       <div className="ml-auto flex shrink-0 items-center gap-2">
-        {visitUrl && (
+        {visit && (
           // Icon only: the environment it visits is named right beside it.
           <Button
             variant="outline"
@@ -265,10 +272,10 @@ export function ProjectEnvironmentBar({
             asChild
           >
             <a
-              href={visitUrl}
+              href={visit}
               target="_blank"
               rel="noopener noreferrer"
-              title={`Visit ${visitUrl}`}
+              title={`Visit ${visit}`}
               aria-label={`Visit ${environment?.name}`}
             >
               <ExternalLink className="size-4" aria-hidden="true" />
@@ -302,9 +309,9 @@ export function ProjectEnvironmentBar({
                 Deploy
               </DropdownMenuItem>
             )}
-            {visitUrl && (
+            {visit && (
               <DropdownMenuItem className="sm:hidden" asChild>
-                <a href={visitUrl} target="_blank" rel="noopener noreferrer">
+                <a href={visit} target="_blank" rel="noopener noreferrer">
                   <ExternalLink className="size-4" aria-hidden="true" />
                   Visit {environment?.name}
                 </a>

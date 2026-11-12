@@ -25,6 +25,41 @@ use std::sync::Arc;
 use temps_entities::external_service_backups;
 use temps_entities::{external_services, settings};
 
+/// An image change of a service on a worker node is refused before any
+/// engine is built: the engine would find no container on this server's
+/// Docker and create an empty one. The refusal names the service and node
+/// and says nothing changed; the handler maps it to 400.
+#[tokio::test]
+async fn an_image_change_of_a_worker_service_is_refused_naming_its_node() {
+    let mut service = encrypted_service_model(7, serde_json::json!({"port": "6379"}));
+    service.name = "cache".to_string();
+    service.service_type = "redis".to_string();
+    service.node_id = Some(3);
+    let db = Arc::new(
+        sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results::<temps_entities::postgres_major_upgrades::Model, _, _>(vec![
+                vec![],
+            ])
+            .append_query_results(vec![vec![service]])
+            .into_connection(),
+    );
+    let manager = control_plane_manager_with_db(db);
+
+    let error = manager
+        .upgrade_service(7, "redis:8-alpine".to_string())
+        .await
+        .expect_err("a worker service's image is not changed from this server");
+
+    assert!(
+        matches!(&error, ExternalServiceError::UpgradeRejected { id: 7, .. }),
+        "{error}"
+    );
+    let rendered = error.to_string();
+    assert!(rendered.contains("'cache'"), "{rendered}");
+    assert!(rendered.contains("worker node 3"), "{rendered}");
+    assert!(rendered.contains("Nothing was changed"), "{rendered}");
+}
+
 #[test]
 fn generated_schedule_is_disabled_only_after_its_last_target_is_deleted() {
     assert!(generated_schedule_loses_last_target(
@@ -2394,5 +2429,59 @@ async fn create_cluster_with_too_many_members_writes_nothing() {
             ExternalServiceError::ClusterMemberLimitExceeded { requested: 11, .. }
         ),
         "{err:?}"
+    );
+}
+
+/// A new service whose parameters are refused while it initializes reports
+/// the refusal as a validation failure under its own ID, not as a failed
+/// start wrapping a placeholder ID.
+#[test]
+fn a_refused_parameter_is_reported_under_the_new_services_id() {
+    let error = ExternalServiceManager::creation_failure(
+        10,
+        ExternalServiceError::ParameterValidationFailed {
+            service_id: 0,
+            reason: "managed S3 backend 'garage' cannot be created on a worker node".to_string(),
+        },
+    );
+    assert!(
+        matches!(
+            error,
+            ExternalServiceError::ParameterValidationFailed { service_id: 10, .. }
+        ),
+        "{error:?}"
+    );
+    assert_eq!(
+        error.to_string(),
+        "Parameter validation failed for service 10: managed S3 backend 'garage' cannot be created on a worker node"
+    );
+
+    let conflict = ExternalServiceManager::creation_failure(
+        10,
+        ExternalServiceError::ServiceResourceConflict {
+            name: "orders".to_string(),
+            resource: "volume postgres-orders_data".to_string(),
+        },
+    );
+    assert!(
+        matches!(
+            conflict,
+            ExternalServiceError::ServiceResourceConflict { .. }
+        ),
+        "{conflict:?}"
+    );
+
+    let failed = ExternalServiceManager::creation_failure(
+        10,
+        ExternalServiceError::InternalError {
+            reason: "agent unreachable".to_string(),
+        },
+    );
+    assert!(
+        matches!(
+            failed,
+            ExternalServiceError::InitializationFailed { id: 10, .. }
+        ),
+        "{failed:?}"
     );
 }

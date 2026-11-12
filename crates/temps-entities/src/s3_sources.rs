@@ -72,7 +72,20 @@ pub struct Model {
     /// Backup schedules must never target this service because doing so would
     /// recursively write a backup into itself.
     pub backing_service_id: Option<i32>,
+    /// Whether a worker node may receive this source's own credential when
+    /// the source cannot mint a job-scoped one (ADR-102):
+    /// [`WORKER_CREDENTIALS_SCOPED`] (the default, refuse) or
+    /// [`WORKER_CREDENTIALS_ALLOW_FULL`].
+    #[sea_orm(default_value = "scoped")]
+    pub worker_credentials: String,
 }
+
+/// `worker_credentials`: a worker only ever receives a credential scoped to
+/// its job; a job the source cannot scope is refused.
+pub const WORKER_CREDENTIALS_SCOPED: &str = "scoped";
+/// `worker_credentials`: when the source cannot scope, the worker receives
+/// the source's own credential, with a warning on every job.
+pub const WORKER_CREDENTIALS_ALLOW_FULL: &str = "allow_full";
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {
@@ -314,6 +327,7 @@ pub async fn insert_encrypted<C: ConnectionTrait>(
         managed_by_cloud: Set(managed_by_cloud),
         lifecycle_reconcile_failed_at: Set(None),
         lifecycle_reconcile_generation: Set(0),
+        worker_credentials: Set(WORKER_CREDENTIALS_SCOPED.to_string()),
         backing_service_id: Set(backing_service_id),
         created_at: Set(now),
         updated_at: Set(now),
@@ -407,6 +421,7 @@ mod tests {
             managed_by_cloud: false,
             lifecycle_reconcile_failed_at: None,
             lifecycle_reconcile_generation: 0,
+            worker_credentials: "scoped".to_string(),
             created_at: now,
             updated_at: now,
             backing_service_id: None,

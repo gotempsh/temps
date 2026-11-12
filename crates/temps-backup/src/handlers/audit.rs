@@ -15,6 +15,8 @@ pub struct S3SourceCreatedAudit {
     pub source_id: i32,
     pub name: String,
     pub bucket_name: String,
+    /// `scoped` or `allow_full` (ADR-102).
+    pub worker_credentials: String,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -795,10 +795,19 @@ pub async fn verify_step_up(
 )]
 pub struct AuthApiDoc;
 
+/// Per-IP budget for the OIDC login start and callback routes, which take no
+/// credentials (see `configure_routes`). The credential routes keep the default
+/// of 10 a minute.
+const OIDC_LOGIN_MAX_REQUESTS_PER_MINUTE: u32 = 120;
+
 pub fn configure_routes() -> Router<Arc<AuthState>> {
     use crate::rate_limit::{auth_rate_limit_middleware, AuthRateLimitConfig, AuthRateLimiter};
 
     let rate_limiter = AuthRateLimiter::new(AuthRateLimitConfig::default());
+    let oidc_rate_limiter = AuthRateLimiter::new(AuthRateLimitConfig {
+        max_requests: OIDC_LOGIN_MAX_REQUESTS_PER_MINUTE,
+        ..Default::default()
+    });
 
     // Auth-sensitive routes that are rate limited to prevent brute force attacks.
     // These are the public-facing endpoints that accept credentials or tokens.
@@ -816,13 +825,26 @@ pub fn configure_routes() -> Router<Arc<AuthState>> {
             "/auth/password-change-required",
             post(change_required_password),
         )
+        // `Extension` must be added last (outermost) so it runs before
+        // `auth_rate_limit_middleware` on the way in — Axum composes
+        // `.layer()` calls like an onion, and the layer added last wraps
+        // everything before it, seeing the request first.
+        .layer(axum::middleware::from_fn(auth_rate_limit_middleware))
+        .layer(axum::Extension(rate_limiter));
+
+    // OIDC login start and callback take no credentials: the start routes only
+    // redirect to the identity provider and the callback checks a signed
+    // `state`, so there is nothing to brute-force. They get a larger budget of
+    // their own because behind a container bridge or gateway every browser
+    // shares one peer IP, and ten redirects a minute would lock out everyone.
+    // Same layer order as above.
+    let oidc_login_routes = Router::new()
         .route(
             "/auth/oidc/login/{slug}",
             get(crate::oidc_handler::start_oidc_login_by_slug),
         )
         // Fixed address for the Cloud-managed provider (Cloud's "Open
-        // console" links here); rate-limited with the slug route because it
-        // is the same login start.
+        // console" links here); same login start as the slug route.
         .route(
             "/auth/oidc/cloud/login",
             get(crate::oidc_handler::start_managed_cloud_login),
@@ -831,12 +853,8 @@ pub fn configure_routes() -> Router<Arc<AuthState>> {
             "/auth/oidc/callback",
             get(crate::oidc_handler::oidc_callback),
         )
-        // `Extension` must be added last (outermost) so it runs before
-        // `auth_rate_limit_middleware` on the way in — Axum composes
-        // `.layer()` calls like an onion, and the layer added last wraps
-        // everything before it, seeing the request first.
         .layer(axum::middleware::from_fn(auth_rate_limit_middleware))
-        .layer(axum::Extension(rate_limiter));
+        .layer(axum::Extension(oidc_rate_limiter));
 
     // Device polling runs every few seconds for the whole login, so it has
     // its own budget instead of the brute-force limiter above; see
@@ -891,6 +909,7 @@ pub fn configure_routes() -> Router<Arc<AuthState>> {
         .route("/users/{user_id}/roles/{role_type}", delete(remove_role));
 
     rate_limited_auth_routes
+        .merge(oidc_login_routes)
         .merge(device_poll_routes)
         .merge(authenticated_routes)
 }
@@ -3179,6 +3198,16 @@ async fn disable_mfa(
 
 #[cfg(test)]
 mod tests {
+    /// The OIDC login start/callback routes carry no credentials and live
+    /// behind a shared proxy IP, so they get a bigger budget than the
+    /// brute-force limiter on the credential routes, which must stay strict.
+    #[test]
+    fn oidc_login_budget_is_larger_than_the_credential_budget() {
+        let credentials = crate::rate_limit::AuthRateLimitConfig::default().max_requests;
+        assert_eq!(credentials, 10, "credential routes must stay at 10/min");
+        assert!(super::OIDC_LOGIN_MAX_REQUESTS_PER_MINUTE > credentials);
+    }
+
     use super::{
         assign_role, authorize_admin_target, authorize_role_assignment, bounded_audit_identity,
         create_user, delete_user, login, normalized_login_email, parse_user_roles,
@@ -4353,6 +4382,63 @@ mod tests {
             status,
             StatusCode::TOO_MANY_REQUESTS,
             "the 11th request in the window should have been rate limited"
+        );
+    }
+
+    /// Regression: the OIDC login start and callback shared the 10-per-minute
+    /// brute-force limiter, so behind a container bridge (one peer IP for every
+    /// browser) a few redirects locked the whole console out of SSO. Through
+    /// the real router: the callback takes its own 120-a-minute budget, is
+    /// still limited past it, and spending it leaves `/auth/login` untouched.
+    #[tokio::test]
+    async fn test_oidc_login_routes_have_their_own_budget() {
+        use tower::ServiceExt;
+
+        let app = super::configure_routes().with_state(admin_owner_state());
+        let peer: std::net::SocketAddr = "203.0.113.3:12345".parse().unwrap();
+        // No `RequestMetadata` extension and no body, so an allowed request is
+        // rejected by an extractor before the mock database is touched; only
+        // the rate-limit decision is under test.
+        let send = |app: axum::Router, method: &'static str, uri: &'static str| async move {
+            let mut request = axum::http::Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from("{}"))
+                .unwrap();
+            request
+                .extensions_mut()
+                .insert(axum::extract::ConnectInfo(peer));
+            app.oneshot(request).await.unwrap().status()
+        };
+
+        for i in 0..super::OIDC_LOGIN_MAX_REQUESTS_PER_MINUTE {
+            let status = send(app.clone(), "GET", "/auth/oidc/callback").await;
+            assert_ne!(
+                status,
+                StatusCode::TOO_MANY_REQUESTS,
+                "OIDC callback {i} was rate limited within its own budget"
+            );
+        }
+        assert_eq!(
+            send(app.clone(), "GET", "/auth/oidc/callback").await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "the OIDC routes must still be limited past their budget"
+        );
+
+        // The OIDC requests must not have spent the credential budget.
+        for i in 0..10 {
+            let status = send(app.clone(), "POST", "/auth/login").await;
+            assert_ne!(
+                status,
+                StatusCode::TOO_MANY_REQUESTS,
+                "login {i} was rate limited by OIDC traffic from the same IP"
+            );
+        }
+        assert_eq!(
+            send(app.clone(), "POST", "/auth/login").await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "credential routes keep the 10-a-minute limit"
         );
     }
 

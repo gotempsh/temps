@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 pub use temps_service_protocol::{
-    HealthProbeResult, HealthProbeStatus, ServiceConfig, ServiceType,
+    HealthProbeResult, HealthProbeStatus, RecoveryTarget, ServiceConfig, ServiceType,
 };
 use utoipa::ToSchema;
 
@@ -754,26 +754,6 @@ pub enum RestoreMode {
     },
 }
 
-/// Engine-specific recovery target for PITR.
-///
-/// Postgres honors all variants; Redis/Mongo/S3 will likely reject non-Time
-/// variants or define their own semantics when they grow PITR support.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum RecoveryTarget {
-    /// Recover to a specific timestamp.
-    Time {
-        #[schema(value_type = String, format = DateTime)]
-        time: chrono::DateTime<chrono::Utc>,
-    },
-    /// Recover to a specific transaction id (Postgres).
-    Xid { xid: String },
-    /// Recover to a specific log sequence number (Postgres).
-    Lsn { lsn: String },
-    /// Recover to a named restore point created via `pg_create_restore_point` (Postgres).
-    Name { name: String },
-}
-
 /// Context passed to restore methods: database handle, S3 clients, and
 /// supporting services the orchestrator needs.
 ///
@@ -875,6 +855,27 @@ impl RestoreGate for NoopRestoreGate {
 
     async fn begin_target_writes(&self) -> std::result::Result<(), RestoreCancelled> {
         Ok(())
+    }
+}
+
+/// A restore on a node is gated by its deadline: once the deadline expired
+/// it counts as cancelled, so an engine still staging unwinds and is refused
+/// the write phase; once it entered the write phase the deadline no longer
+/// stops it (see [`temps_service_protocol::TargetWriteBoundary`]).
+#[async_trait]
+impl RestoreGate for temps_service_protocol::TargetWriteBoundary {
+    fn is_cancelled(&self) -> bool {
+        self.is_expired()
+    }
+
+    async fn begin_target_writes(&self) -> std::result::Result<(), RestoreCancelled> {
+        if temps_service_protocol::TargetWriteBoundary::begin_target_writes(self) {
+            Ok(())
+        } else {
+            Err(RestoreCancelled {
+                target: self.target().to_string(),
+            })
+        }
     }
 }
 

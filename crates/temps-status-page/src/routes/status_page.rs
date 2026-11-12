@@ -1203,6 +1203,8 @@ where
 pub struct ProjectsHealthQuery {
     /// Comma-separated list of project IDs
     pub project_ids: String,
+    /// Select one environment within the authorized projects; defaults to production.
+    pub environment_id: Option<i32>,
 }
 
 /// Batch response for projects health
@@ -1264,7 +1266,7 @@ where
     let summaries = app_state
         .status_page_service()
         .monitor_service()
-        .get_projects_monitor_health(&project_ids)
+        .get_projects_monitor_health_for_environment(&project_ids, query.environment_id)
         .await
         .map_err(map_error)?;
 

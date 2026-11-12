@@ -229,8 +229,8 @@ impl EnvironmentAddressService {
                 Vec::new()
             };
             // The host a tunnel's environment hosts would give it (D3). A
-            // tunnel that already has them on is the only one offered (at
-            // most one may), and an environment with a private or
+            // tunnel that already has them on is preferred, and an environment
+            // with a private or
             // signed-in address is never offered a public tunnel host.
             let restricted = addresses.iter().any(|a| a.audience != Audience::Public);
             let label = super::environment_hosts::environment_host_label(
@@ -238,16 +238,10 @@ impl EnvironmentAddressService {
                 &scope.environment,
                 settings.production_hostname_template.as_deref(),
             );
-            let connectors: Vec<_> = if restricted {
-                Vec::new()
-            } else if connectors.iter().any(|c| c.environment_hosts) {
-                connectors
-                    .into_iter()
-                    .filter(|c| c.environment_hosts)
-                    .collect()
-            } else {
-                connectors
-            };
+            let mut connectors = if restricted { Vec::new() } else { connectors };
+            // Keep the configured environment-host tunnel first, but offer the
+            // other zones too: adding one domain does not change that opt-in.
+            connectors.sort_by_key(|c| (!c.environment_hosts, c.id));
             let tunnels: Vec<TunnelOffer> = connectors
                 .into_iter()
                 .map(|c| TunnelOffer {
@@ -378,11 +372,11 @@ fn notification(project_id: i32, warning: &ReachabilityWarning) -> NotificationD
     );
     metadata.insert("kind".to_string(), "reachability_warning".to_string());
     NotificationData {
-        title: format!("Nobody can reach {} yet", warning.environment),
+        title: format!("Make {} reachable", warning.environment),
         message: warning.message(),
-        notification_type: NotificationType::Warning,
+        notification_type: NotificationType::Info,
         priority: NotificationPriority::Normal,
-        severity: Some("warning".to_string()),
+        severity: Some("info".to_string()),
         metadata,
         ..Default::default()
     }
@@ -472,8 +466,10 @@ mod tests {
             }],
         };
         let data = notification(3, &warning);
-        assert_eq!(data.title, "Nobody can reach shop-production yet");
-        assert!(data.message.contains("only resolves to this computer"));
+        assert_eq!(data.title, "Make shop-production reachable");
+        assert!(matches!(data.notification_type, NotificationType::Info));
+        assert_eq!(data.severity.as_deref(), Some("info"));
+        assert!(!data.message.contains("only resolves to this computer"));
         assert!(data.message.contains("add a domain to this environment"));
         assert_eq!(
             data.metadata.get("environment_id").map(String::as_str),

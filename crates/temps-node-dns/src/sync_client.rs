@@ -80,10 +80,24 @@ pub struct SyncStatus {
     /// growing count here has lost contact with the control plane's DNS
     /// change feed and is serving an increasingly stale zone.
     pub consecutive_failures: u32,
-    /// The most recent tick error, kept even after a subsequent success so
-    /// "it failed once and recovered" stays visible for one heartbeat cycle
-    /// rather than disappearing the instant it clears.
+    /// Current sync error, cleared on recovery. One initial failure is
+    /// withheld to allow startup reconciliation to finish.
     pub last_error: Option<String>,
+}
+
+impl SyncStatus {
+    fn succeeded(&mut self) {
+        self.last_success_at = Some(SystemTime::now());
+        self.consecutive_failures = 0;
+        self.last_error = None;
+    }
+
+    fn failed(&mut self, error: String) {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        if self.last_success_at.is_some() || self.consecutive_failures >= 2 {
+            self.last_error = Some(error);
+        }
+    }
 }
 
 /// `last_acked` before this process has had an ACK accepted. Generations are
@@ -158,8 +172,7 @@ impl SyncClient {
                 Ok(()) => {
                     backoff = self.config.initial_backoff;
                     if let Ok(mut s) = self.status.write() {
-                        s.last_success_at = Some(SystemTime::now());
-                        s.consecutive_failures = 0;
+                        s.succeeded();
                     }
                     if select_sleep(self.config.poll_interval, &self.shutdown).await {
                         info!(node_id = self.config.node_id, "DNS sync loop shutting down");
@@ -174,8 +187,7 @@ impl SyncClient {
                         "DNS sync tick failed; backing off"
                     );
                     if let Ok(mut s) = self.status.write() {
-                        s.consecutive_failures += 1;
-                        s.last_error = Some(e.to_string());
+                        s.failed(e.to_string());
                     }
                     if select_sleep(backoff, &self.shutdown).await {
                         info!(
@@ -372,6 +384,20 @@ mod tests {
         .err()
         .expect("an unusable CA is refused, not silently replaced by public roots");
         assert!(error.to_string().contains("control-plane CA"), "{error}");
+    }
+
+    #[test]
+    fn startup_errors_wait_for_retry_and_clear_on_recovery() {
+        let mut status = SyncStatus::default();
+        status.failed("starting".into());
+        assert!(status.last_error.is_none());
+        status.failed("still unavailable".into());
+        assert_eq!(status.last_error.as_deref(), Some("still unavailable"));
+        status.succeeded();
+        assert!(status.last_error.is_none());
+        assert_eq!(status.consecutive_failures, 0);
+        status.failed("lost connection".into());
+        assert_eq!(status.last_error.as_deref(), Some("lost connection"));
     }
 
     #[tokio::test]

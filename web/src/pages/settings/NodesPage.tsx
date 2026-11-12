@@ -20,6 +20,7 @@ import {
 } from '@/lib/cluster-network'
 import { AddWorkerNode } from '@/components/nodes/AddWorkerNode'
 import { MeshHubCard } from '@/components/nodes/MeshHubCard'
+import { NetworkIdAction } from '@/components/nodes/NetworkIdAction'
 import { NodeAddressRanges } from '@/components/nodes/NodeAddressRanges'
 import { meshRangeToShow } from '@/lib/node-address-ranges'
 import { RotateClusterCaDialog } from '@/components/nodes/RotateClusterCaDialog'
@@ -1961,6 +1962,7 @@ export function NodesPage() {
                       </li>
                     ))}
                   </ul>
+                  <NetworkIdAction status={clusterNetwork} />
                 </AlertDescription>
               </Alert>
             )}

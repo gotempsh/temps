@@ -3348,6 +3348,7 @@ mod tests {
             managed_by_cloud: Set(true),
             lifecycle_reconcile_failed_at: Set(None),
             lifecycle_reconcile_generation: Set(0),
+            worker_credentials: sea_orm::ActiveValue::Set("scoped".to_string()),
             created_at: Set(now),
             updated_at: Set(now),
             backing_service_id: Set(None),
@@ -3500,6 +3501,7 @@ mod tests {
                 managed_by_cloud: Set(managed_by_cloud),
                 lifecycle_reconcile_failed_at: Set(None),
                 lifecycle_reconcile_generation: Set(0),
+                worker_credentials: sea_orm::ActiveValue::Set("scoped".to_string()),
                 created_at: Set(now),
                 updated_at: Set(now),
                 backing_service_id: Set(None),
@@ -3917,6 +3919,7 @@ mod tests {
             managed_by_cloud: false,
             lifecycle_reconcile_failed_at: None,
             lifecycle_reconcile_generation: 0,
+            worker_credentials: "scoped".to_string(),
             created_at: now,
             updated_at: now,
         };
@@ -4092,6 +4095,7 @@ mod tests {
             managed_by_cloud: Set(true),
             lifecycle_reconcile_failed_at: Set(None),
             lifecycle_reconcile_generation: Set(0),
+            worker_credentials: sea_orm::ActiveValue::Set("scoped".to_string()),
             created_at: Set(now),
             updated_at: Set(now),
             backing_service_id: Set(None),
@@ -4327,6 +4331,7 @@ mod tests {
             managed_by_cloud: Set(true),
             lifecycle_reconcile_failed_at: Set(None),
             lifecycle_reconcile_generation: Set(0),
+            worker_credentials: sea_orm::ActiveValue::Set("scoped".to_string()),
             created_at: Set(now),
             updated_at: Set(now),
         }
@@ -4505,6 +4510,7 @@ mod tests {
             managed_by_cloud: Set(true),
             lifecycle_reconcile_failed_at: Set(None),
             lifecycle_reconcile_generation: Set(0),
+            worker_credentials: sea_orm::ActiveValue::Set("scoped".to_string()),
             created_at: Set(now),
             updated_at: Set(now),
         }
@@ -4620,6 +4626,7 @@ mod tests {
             managed_by_cloud: Set(true),
             lifecycle_reconcile_failed_at: Set(None),
             lifecycle_reconcile_generation: Set(0),
+            worker_credentials: sea_orm::ActiveValue::Set("scoped".to_string()),
             created_at: Set(now),
             updated_at: Set(now),
         }
@@ -6763,6 +6770,7 @@ mod tests {
             managed_by_cloud: Set(true),
             lifecycle_reconcile_failed_at: Set(None),
             lifecycle_reconcile_generation: Set(0),
+            worker_credentials: sea_orm::ActiveValue::Set("scoped".to_string()),
             created_at: Set(now),
             updated_at: Set(now),
         }

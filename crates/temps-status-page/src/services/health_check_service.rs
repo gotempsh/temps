@@ -636,6 +636,13 @@ fn primary_probe_url(address: Option<&EnvironmentAddress>) -> Option<String> {
     }
 }
 
+/// Only a settled absence of ingress permits substituting runtime health.
+/// A broken configured route or an unavailable reachability provider keeps
+/// the external check authoritative. Local installations keep proxy checks.
+fn use_worker_health(no_address: bool, has_worker: bool) -> bool {
+    no_address && has_worker
+}
+
 impl HealthCheckService {
     /// Match deployment-readiness semantics: a redirect is a valid public
     /// application response (login/setup redirects are common), while 4xx/5xx
@@ -1018,6 +1025,59 @@ impl HealthCheckService {
             );
             return Ok(());
         }
+        let probe = MonitorProbeSnapshot {
+            monitor_id: monitor.id,
+            deployment_id: current_deployment_id,
+            monitor_updated_at: monitor.updated_at,
+        };
+
+        // ADR-096: without configured ingress, remote workloads use their
+        // existing worker runtime observations. Local installations retain
+        // proxy checks. A broken configured route or uncertain address lookup
+        // still uses the external monitor, so runtime success cannot hide it.
+        let address = match &addresses {
+            Some(addresses) => match addresses.address(environment.project_id, env_id).await {
+                Ok(address) => Some(address),
+                Err(error) => {
+                    warn!(
+                        monitor_id = monitor.id,
+                        environment_id = env_id,
+                        %error,
+                        "Could not tell the primary address; probing the generated URL"
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+        let no_address = address
+            .as_ref()
+            .is_some_and(EnvironmentAddress::has_no_address);
+        let has_worker = if no_address {
+            deployment_containers::Entity::find()
+                .filter(deployment_containers::Column::DeploymentId.eq(current_deployment_id))
+                .filter(deployment_containers::Column::DeletedAt.is_null())
+                .filter(deployment_containers::Column::NodeId.is_not_null())
+                .one(db.as_ref())
+                .await?
+                .is_some()
+        } else {
+            false
+        };
+        if use_worker_health(no_address, has_worker) {
+            // Runtime probes already run on the owning worker (ADR-053).
+            // Keep external uptime neutral; readers use fresh runtime state,
+            // never copy a worker observation into external uptime history.
+            return Self::record_check(
+                &db,
+                probe,
+                NO_ADDRESS_STATUS.to_string(),
+                None,
+                Some(NO_ADDRESS_MESSAGE.to_string()),
+                &job_queue,
+            )
+            .await;
+        }
         if deployment.static_dir_location.is_none()
             && Self::is_portless_deployment(db.as_ref(), current_deployment_id).await?
         {
@@ -1058,35 +1118,6 @@ impl HealthCheckService {
                 })?;
             return Ok(());
         }
-        let probe = MonitorProbeSnapshot {
-            monitor_id: monitor.id,
-            deployment_id: current_deployment_id,
-            monitor_updated_at: monitor.updated_at,
-        };
-
-        // ADR 068 D4: probe the environment's primary address when it has a
-        // reachable one; otherwise probe exactly as before. `no_address` only
-        // replaces the one failure that means nothing was ever set up: the
-        // target hostname does not resolve and the environment has no
-        // address at all. Without an answer, probe as before.
-        let address = match &addresses {
-            Some(addresses) => match addresses.address(environment.project_id, env_id).await {
-                Ok(address) => Some(address),
-                Err(error) => {
-                    warn!(
-                        monitor_id = monitor.id,
-                        environment_id = env_id,
-                        %error,
-                        "Could not tell the primary address; probing the generated URL"
-                    );
-                    None
-                }
-            },
-            None => None,
-        };
-        let no_address = address
-            .as_ref()
-            .is_some_and(EnvironmentAddress::has_no_address);
         let primary_url = primary_probe_url(address.as_ref());
 
         // IMPORTANT: Always use the public URL for health checks
@@ -3263,6 +3294,7 @@ mod tests {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results([vec![make_env(1, false)]])
             .append_query_results([vec![health_probe_deployment()]])
+            .append_query_results([Vec::<deployment_containers::Model>::new()])
             .append_query_results([vec![health_probe_counts(1, 1)]])
             .append_query_results([vec![settings_row(temps_config::AppSettings {
                 preview_domain: "localho.st".into(),
@@ -3328,6 +3360,7 @@ mod tests {
             let db = MockDatabase::new(DatabaseBackend::Postgres)
                 .append_query_results([vec![make_env(1, false)]])
                 .append_query_results([vec![health_probe_deployment()]])
+                .append_query_results([Vec::<deployment_containers::Model>::new()])
                 .append_query_results([vec![health_probe_counts(1, 1)]])
                 .append_query_results([vec![settings_row(temps_config::AppSettings {
                     preview_domain: "apps.example.invalid".into(),
@@ -4134,5 +4167,18 @@ mod probe_auth_tests {
             local.headers().get("cache-control").unwrap(),
             "no-cache, no-store"
         );
+    }
+}
+
+#[cfg(test)]
+mod worker_selection_tests {
+    use super::use_worker_health;
+
+    #[test]
+    fn worker_checks_only_replace_an_absent_address_on_remote_placements() {
+        assert!(use_worker_health(true, true));
+        assert!(!use_worker_health(false, true)); // public, broken, or unknown
+        assert!(!use_worker_health(true, false)); // combined local install
+        assert!(!use_worker_health(false, false));
     }
 }

@@ -227,6 +227,22 @@ impl ServeProfile {
     }
 }
 
+/// `PR_SET_DUMPABLE(0)`. Failure is logged, never fatal: the process is still
+/// what it was before this existed.
+fn make_process_non_dumpable() {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: prctl with integer arguments has no memory preconditions.
+        if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+            warn!(
+                "Could not mark the Temps process non-dumpable; other processes of this user \
+                 can still read its environment: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+}
+
 #[derive(Args)]
 pub struct ServeCommand {
     /// Address to bind the server to
@@ -269,6 +285,14 @@ pub struct ServeCommand {
     /// Data directory for storing configuration and runtime files
     #[arg(long, env = "TEMPS_DATA_DIR")]
     pub data_dir: Option<PathBuf>,
+
+    /// Program that runs each external plugin as a separate, unprivileged
+    /// user (verbs `exec`, `signal` and `probe`; see the
+    /// `temps_external_plugins::launcher` docs). When set, Temps refuses to
+    /// start plugins unless that user provably cannot read this process's
+    /// environment, memory or secret files. Fixed by how the host is built.
+    #[arg(long, env = "TEMPS_PLUGIN_LAUNCHER")]
+    pub plugin_launcher: Option<PathBuf>,
 
     /// Console/Admin address (defaults to random port on localhost).
     ///
@@ -487,6 +511,16 @@ impl ServeCommand {
         // Install the rustls crypto provider once at startup, before any
         // dependency (e.g. temps-domains) constructs a rustls client.
         crate::install_crypto_provider();
+
+        // No other process of this user may read this one's environment or
+        // memory (`/proc/<pid>/environ`, `/proc/<pid>/mem`, ptrace): it holds
+        // the database URL, the encryption key and the Cloud credential.
+        // Children reset this on exec, so plugins and builds are unaffected.
+        make_process_non_dumpable();
+
+        if let Some(ref launcher) = self.plugin_launcher {
+            std::env::set_var("TEMPS_PLUGIN_LAUNCHER", launcher);
+        }
 
         // Set screenshot provider from CLI flag (takes precedence over env var)
         // This allows: temps serve --screenshot-provider=noop

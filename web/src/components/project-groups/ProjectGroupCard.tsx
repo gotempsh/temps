@@ -3,7 +3,14 @@
 
 import { useState } from 'react'
 import { Link } from 'react-router'
-import { Boxes, FolderGit2, MoreHorizontal, Plus } from 'lucide-react'
+import {
+  Boxes,
+  FolderGit2,
+  MoreHorizontal,
+  Network,
+  Plus,
+  Users,
+} from 'lucide-react'
 import type {
   ProjectGroupMemberResponse,
   ProjectGroupResponse,
@@ -19,9 +26,17 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { groupHref, serviceCount } from '@/lib/terminology'
 import { AddServicesDialog } from './AddServicesDialog'
-import { ExternalBadge } from '@/components/dashboard/ProjectCard'
+import {
+  ExternalBadge,
+  ProjectHealth,
+} from '@/components/dashboard/ProjectCard'
+import { VisitorSparkline } from '@/components/dashboard/VisitorSparkline'
 import { ServicePresetIcon } from './ServicePresetIcon'
 import { ServiceIcon } from '@/components/project/ServiceIcon'
+import {
+  groupServiceTrafficLabel,
+  type GroupServiceLive,
+} from './group-service-live'
 
 /** Service rows shown before collapsing the rest into "+N more". */
 const VISIBLE_SERVICES = 4
@@ -32,8 +47,18 @@ const STACKED_LOGOS = 3
  * One project (group) on the projects list, sized like a service card: the
  * services' preset logos, a row per service, and the latest deployment. The
  * card opens the project's overview; each service row opens that service.
+ *
+ * `live` carries each service's health dot and 24-hour traffic, from the same
+ * batched reads the standalone service cards use, so putting services in a
+ * project never hides whether they are up.
  */
-export function ProjectGroupCard({ group }: { group: ProjectGroupResponse }) {
+export function ProjectGroupCard({
+  group,
+  live,
+}: {
+  group: ProjectGroupResponse
+  live?: Record<number, GroupServiceLive>
+}) {
   const [adding, setAdding] = useState(false)
   const services = group.projects
   const shown = services.slice(0, VISIBLE_SERVICES)
@@ -126,6 +151,11 @@ export function ProjectGroupCard({ group }: { group: ProjectGroupResponse }) {
                   <span className="ml-auto">
                     <ExternalBadge />
                   </span>
+                ) : live?.[service.id] ? (
+                  <ServiceLiveStatus
+                    live={live[service.id]}
+                    preset={service.preset}
+                  />
                 ) : (
                   <span className="ml-auto flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground">
                     <ServicePresetIcon
@@ -165,6 +195,48 @@ export function ProjectGroupCard({ group }: { group: ProjectGroupResponse }) {
 
       <AddServicesDialog group={group} open={adding} onOpenChange={setAdding} />
     </div>
+  )
+}
+
+/**
+ * The dot sits beside the name, as on a service card; traffic and the preset
+ * logo go to the right. The framework's name moves into the logo's alt text
+ * and tooltip to make room for the sparkline.
+ */
+function ServiceLiveStatus({
+  live,
+  preset,
+}: {
+  live: GroupServiceLive
+  preset?: string | null
+}) {
+  const traffic = groupServiceTrafficLabel(live)
+  // The same icons as a service card's "API requests" and "visitors" lines,
+  // without the words: in a three-column grid the name needs that room. The
+  // count has a fixed width so the sparklines line up from row to row.
+  const TrafficIcon = live.traffic.kind === 'visitors' ? Users : Network
+  return (
+    <>
+      <ProjectHealth indicator={live.indicator} />
+      <span className="ml-auto flex shrink-0 items-center gap-2 text-xs text-muted-foreground">
+        <span className="w-10" aria-hidden="true">
+          <VisitorSparkline
+            data={live.traffic.data}
+            className="w-full"
+            height={16}
+          />
+        </span>
+        <span
+          className="inline-flex min-w-[3.25rem] items-center justify-end gap-1 tabular-nums"
+          title={traffic.full}
+        >
+          <TrafficIcon className="size-3" aria-hidden="true" />
+          <span aria-hidden="true">{traffic.short}</span>
+          <span className="sr-only">{traffic.full}</span>
+        </span>
+        <ServicePresetIcon preset={preset} className="size-4 rounded" />
+      </span>
+    </>
   )
 }
 

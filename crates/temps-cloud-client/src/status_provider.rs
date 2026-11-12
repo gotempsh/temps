@@ -4,16 +4,9 @@
 //! What the host layer must supply so [`crate::heartbeat`] can build a
 //! [`StatusReport`](temps_cloud_protocol::StatusReport) (ADR-039).
 //!
-//! # Why this is a trait and not a direct dependency
-//!
-//! `temps-cloud-client` is a deliberately dependency-light leaf crate (see its
-//! own module docs): it has no `sea-orm` entity access to the deployments,
-//! services, or projects tables, and no platform code to read host memory or
-//! disk usage. Counting those and reading resource usage only exists at the
-//! `temps-cli`/`temps-core` layer, which owns the database connection and the
-//! system. [`StatusProvider`] is the seam that lets that layer hand this
-//! crate a snapshot without this crate taking on a database or system
-//! dependency of its own.
+//! The host may supply additional status via the provider trait. The default
+//! worker provider uses the existing local database dependency only from the
+//! background reporting task; it never participates in local request handling.
 //!
 //! `temps_version` and `uptime_seconds` are deliberately **not** on this
 //! trait: this crate already knows its own agent version
@@ -37,6 +30,7 @@ pub struct StatusSnapshot {
     pub deployment_count: u32,
     pub service_count: u32,
     pub project_count: u32,
+    pub worker_node_count: Option<u32>,
     /// `None` when the instance cannot compute a resource summary at all.
     pub resources: Option<StatusResourceSummary>,
     /// `None` on a host with no `SelfUpdater` registered at all (e.g. the
@@ -86,6 +80,7 @@ mod tests {
         let snapshot = StatusSnapshot {
             deployment_count: 3,
             service_count: 5,
+            worker_node_count: None,
             project_count: 1,
             resources: None,
             self_update: Some(StatusSelfUpdate {
@@ -109,5 +104,78 @@ mod tests {
         assert_eq!(snapshot.deployment_count, 0);
         assert!(snapshot.resources.is_none());
         assert!(snapshot.self_update.is_none());
+    }
+}
+
+/// Reads only a bounded aggregate in the optional background reporter.
+pub struct WorkerStatusProvider(pub std::sync::Arc<sea_orm::DatabaseConnection>);
+
+fn worker_count_query() -> sea_orm::Select<temps_entities::nodes::Entity> {
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    use temps_entities::nodes;
+    nodes::Entity::find()
+        .filter(nodes::Column::Role.eq("worker"))
+        .filter(nodes::Column::Status.is_in(["active", "online"]))
+}
+
+#[async_trait]
+impl StatusProvider for WorkerStatusProvider {
+    async fn snapshot(&self) -> StatusSnapshot {
+        use sea_orm::PaginatorTrait;
+        let worker_node_count = match tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            worker_count_query().count(self.0.as_ref()),
+        )
+        .await
+        {
+            Ok(Ok(count)) => u32::try_from(count).ok(),
+            _ => None,
+        };
+        StatusSnapshot {
+            worker_node_count,
+            ..Default::default()
+        }
+    }
+}
+
+#[cfg(test)]
+mod worker_count_tests {
+    use super::*;
+    use sea_orm::{DatabaseBackend, QueryTrait};
+    #[tokio::test]
+    async fn count_is_reported_and_database_failure_is_unknown() {
+        use sea_orm::{DbErr, MockDatabase};
+        use std::{collections::BTreeMap, sync::Arc};
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([[BTreeMap::from([(
+                "num_items",
+                sea_orm::Value::BigInt(Some(2)),
+            )])]])
+            .into_connection();
+        assert_eq!(
+            WorkerStatusProvider(Arc::new(db))
+                .snapshot()
+                .await
+                .worker_node_count,
+            Some(2)
+        );
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors([DbErr::Custom("count unavailable".into())])
+            .into_connection();
+        assert_eq!(
+            WorkerStatusProvider(Arc::new(db))
+                .snapshot()
+                .await
+                .worker_node_count,
+            None
+        );
+    }
+    #[test]
+    fn count_selects_only_active_workers() {
+        let sql = worker_count_query()
+            .build(DatabaseBackend::Postgres)
+            .to_string();
+        assert!(sql.contains("\"role\" = 'worker'"));
+        assert!(sql.contains("\"status\" IN ('active', 'online')"));
     }
 }

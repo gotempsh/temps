@@ -147,6 +147,11 @@ pub fn container_create_body(
     let host_config = HostConfig {
         port_bindings: Some(port_bindings),
         network_mode: attach.network.primary.clone(),
+        dns_search: attach
+            .network
+            .dns
+            .as_ref()
+            .map(|_| vec!["temps.local".to_string()]),
         dns: attach.network.dns.clone(),
         restart_policy: Some(bollard::models::RestartPolicy {
             name: Some(restart_policy_name(spec.restart)),
@@ -765,6 +770,15 @@ fn docker_entrypoint_override(entrypoint: Option<&[String]>) -> Option<Vec<Strin
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn container_dns_search_is_internal_only() {
+        let mut attach = Attachments::default();
+        attach.network.dns = Some(vec!["10.0.0.1".into()]);
+        let body = container_create_body(&spec(), &attach, vec![]);
+        let host = body.host_config.unwrap();
+        assert_eq!(host.dns_search, Some(vec!["temps.local".into()]));
+    }
+
     #[tokio::test]
     async fn entrypoint_override_inherits_image_command() {
         use serde_json::json;

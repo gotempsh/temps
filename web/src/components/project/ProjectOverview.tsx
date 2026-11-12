@@ -41,6 +41,7 @@ import { useMemo } from 'react'
 import { Link } from 'react-router'
 import { formatAxisNumber } from '@/lib/chart-axis-ticks'
 import { PROJECT_TOUR_EVENT } from './ProjectTour'
+import { errorRatePoints, errorRateTone } from './error-rate-chart'
 
 interface ProjectOverviewProps {
   project: ProjectResponse
@@ -286,23 +287,30 @@ export function ProjectOverview({
                             : 'text-muted-foreground'
                         )}
                       >
-                        {formatPercent(apiTraffic?.overall_error_rate)} overall
+                        {(apiTraffic?.total_requests ?? 0) > 0
+                          ? `${formatPercent(apiTraffic?.overall_error_rate)} overall`
+                          : 'No requests'}
                       </p>
                     </div>
                     <ThresholdLineChart
-                      data={trafficHealthData}
+                      data={errorRatePoints(
+                        trafficHealthData,
+                        apiTraffic?.total_requests
+                      )}
                       xKey="time"
                       series={{
                         dataKey: 'errorRate',
                         label: 'Error rate',
-                        tone: 'poor',
+                        tone: errorRateTone(apiTraffic?.overall_error_rate),
                       }}
                       height={190}
                       yTickFormatter={(value, ctx) =>
                         `${formatAxisNumber(value, ctx.decimals)}%`
                       }
                       tooltipValueFormatter={(value) => `${value.toFixed(1)}%`}
-                      emptyMessage={<CompactEmpty label="No error samples" />}
+                      emptyMessage={
+                        <CompactEmpty label="No requests in this window" />
+                      }
                     />
                   </div>
                 </div>

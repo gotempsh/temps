@@ -1,13 +1,14 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { afterEach, expect, test } from 'bun:test'
+import { afterEach, describe, expect, test } from 'bun:test'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { cleanup, render, screen, waitFor } from '@testing-library/react'
+import { renderToStaticMarkup } from 'react-dom/server'
 import { MemoryRouter } from 'react-router'
 import { installBrowserWindow } from '@/test/dom'
 import { jsonResponse, mockApi } from '@/test/fetch-mock'
-import { ServiceResourcesPanel } from './ServiceResourcesPanel'
+import { ServiceResourcesPanel, UnavailableNote } from './ServiceResourcesPanel'
 
 installBrowserWindow()
 afterEach(cleanup)
@@ -127,3 +128,28 @@ test('a healthy panel stays live between polls', async () => {
   await new Promise((resolve) => setTimeout(resolve, 4_500))
   expect(screen.queryByText('live')).not.toBeNull()
 }, 10_000)
+
+describe('UnavailableNote', () => {
+  test('says why the container state could not be read', () => {
+    const markup = renderToStaticMarkup(
+      <UnavailableNote
+        runtimeReason="the agent on node worker-3 (id 3) does not report container runtime state; update the agent on node worker-3 to this release"
+        statsReason="stats unavailable: the agent on node worker-3 (id 3) does not report resource usage; update the agent on node worker-3 to this release"
+      />
+    )
+    expect(markup).toContain('Container state unavailable')
+    expect(markup).toContain('does not report container runtime state')
+    expect(markup).toContain('stats unavailable')
+  })
+
+  test('only usage missing is labelled as usage', () => {
+    const markup = renderToStaticMarkup(
+      <UnavailableNote statsReason="stats unavailable: agent unreachable" />
+    )
+    expect(markup).toContain('Resource usage unavailable')
+  })
+
+  test('renders nothing when everything was read', () => {
+    expect(renderToStaticMarkup(<UnavailableNote />)).toBe('')
+  })
+})

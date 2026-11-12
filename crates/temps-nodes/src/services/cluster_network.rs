@@ -34,6 +34,25 @@ pub enum ClusterNetworkError {
 
     #[error("{0}")]
     InvalidOverlayNetworkName(String),
+
+    /// ADR 062: a node that cannot follow a new network ID would be cut off
+    /// from the overlay.
+    #[error("{}", network_id_blocked_message(.blocked_by))]
+    NetworkIdChangeBlocked { blocked_by: Vec<String> },
+}
+
+fn network_id_blocked_message(blocked_by: &[String]) -> String {
+    format!(
+        "This cluster's network ID cannot change yet: {}.",
+        blocked_by.join("; ")
+    )
+}
+
+/// `POST /settings/cluster-network/network-id` answer.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct NetworkIdChange {
+    pub from: u32,
+    pub to: u32,
 }
 
 /// One worker's view of the overlay.
@@ -58,6 +77,13 @@ pub struct ClusterNetworkNode {
     pub in_use_reason: Option<String>,
     /// What the node reported it already uses outside Temps.
     pub occupied_ranges: Vec<OccupiedRangeReport>,
+    /// The VXLAN network ID its agent reports it follows (ADR 062). `None`:
+    /// its agent predates per-cluster network IDs, or never reported.
+    pub vxlan_network_id: Option<u32>,
+    /// Whether its overlay is unavailable because another VXLAN device on
+    /// its host holds the cluster's network ID; giving the cluster its own
+    /// network ID fixes that without touching the host.
+    pub vxlan_id_in_use: bool,
 }
 
 /// The control plane's overlay.
@@ -83,6 +109,13 @@ pub struct ClusterNetworkStatus {
     /// `<name>`, bridge `br-<name>` and VXLAN device `vxlan-<name>` on each
     /// host whose node does not override it.
     pub overlay_network_name: String,
+    /// The cluster's VXLAN network ID and UDP port (ADR 062).
+    pub vxlan_network_id: u32,
+    pub vxlan_port: u16,
+    /// Whether `POST /settings/cluster-network/network-id` can assign a new
+    /// network ID now, and why not: the nodes that could not follow it.
+    pub can_change_network_id: bool,
+    pub network_id_change_blocked_by: Vec<String>,
     /// Whether an operator has confirmed the pool, or a member already uses
     /// it. The console asks for it once before adding the first node.
     pub pool_confirmed: bool,
@@ -193,6 +226,44 @@ impl ClusterNetworkService {
         Ok(previous)
     }
 
+    /// Give the cluster a fresh random VXLAN network ID (ADR 062), unless a
+    /// node could not follow it. Every overlay rebuilds on the new one at
+    /// its next poll; the control plane's when its reconciler sees it.
+    pub async fn assign_new_network_id(&self) -> Result<NetworkIdChange, ClusterNetworkError> {
+        use sea_orm::{ActiveModelTrait, QuerySelect, TransactionTrait};
+        let txn = self.db.begin().await?;
+        // Two concurrent changes must not both pass the gate on stale rows.
+        let cfg = network_config::Entity::find_by_id(1)
+            .lock_exclusive()
+            .one(&txn)
+            .await?
+            .ok_or(AllocatorError::InvalidConfig {
+                reason: "network_config singleton row missing".into(),
+            })?;
+        let members = nodes::Entity::find()
+            .order_by_asc(nodes::Column::Id)
+            .all(&txn)
+            .await?;
+        let blocked_by = network_id_change_blockers(&cfg, &members);
+        if !blocked_by.is_empty() {
+            return Err(ClusterNetworkError::NetworkIdChangeBlocked { blocked_by });
+        }
+        let from = u32::try_from(cfg.vxlan_vni).map_err(|_| AllocatorError::InvalidConfig {
+            reason: format!("network_config.vxlan_vni {} is negative", cfg.vxlan_vni),
+        })?;
+        let to = temps_network::random_vxlan_vni(from);
+        let stored = i32::try_from(to).map_err(|_| AllocatorError::InvalidConfig {
+            reason: format!("random VXLAN network ID {to} does not fit network_config.vxlan_vni"),
+        })?;
+        let mut active: network_config::ActiveModel = cfg.into();
+        active.vxlan_vni = sea_orm::ActiveValue::Set(stored);
+        // Saving bumps `updated_at`: a setup parked on a configuration
+        // error retries on it.
+        active.update(&txn).await?;
+        txn.commit().await?;
+        Ok(NetworkIdChange { from, to })
+    }
+
     /// Record that an operator chose the pool. Saving it, changed or not, is
     /// the confirmation; the first one is kept. True when this was it.
     async fn confirm_pool(&self) -> Result<bool, ClusterNetworkError> {
@@ -232,21 +303,34 @@ pub(crate) fn status_of(
                     .unwrap_or_else(|| cfg.docker_network_name.clone()),
                 in_use: in_use_reason.is_some(),
                 in_use_reason,
-                occupied_ranges: temps_network::allocator::occupied_of(node)
-                    .into_iter()
-                    .map(|range| OccupiedRangeReport {
-                        cidr: range.cidr.to_string(),
-                        source: match range.source {
-                            temps_network::occupied::OccupiedSource::Route => "route",
-                            temps_network::occupied::OccupiedSource::Docker => "docker",
-                        }
-                        .to_owned(),
-                        name: range.name,
-                    })
-                    .collect(),
+                occupied_ranges: temps_network::allocator::occupied_of(
+                    node,
+                    &cfg.docker_network_name,
+                )
+                .into_iter()
+                .map(|range| OccupiedRangeReport {
+                    cidr: range.cidr.to_string(),
+                    source: match range.source {
+                        temps_network::occupied::OccupiedSource::Route => "route",
+                        temps_network::occupied::OccupiedSource::Docker => "docker",
+                    }
+                    .to_owned(),
+                    name: range.name,
+                })
+                .collect(),
+                vxlan_network_id: node
+                    .overlay_vxlan_vni
+                    .and_then(|vni| u32::try_from(vni).ok()),
+                vxlan_id_in_use: node.overlay_status.as_deref()
+                    == Some(crate::services::node_service::OVERLAY_UNAVAILABLE)
+                    && node
+                        .overlay_last_error
+                        .as_deref()
+                        .is_some_and(temps_network::vxlan_holder::reports_id_in_use),
             }
         })
         .collect();
+    let network_id_change_blocked_by = network_id_change_blockers(cfg, members);
     let mut change_blocked_by: Vec<String> = Vec::new();
     if cfg.control_plane_overlay_ready {
         change_blocked_by.push(format!(
@@ -273,6 +357,10 @@ pub(crate) fn status_of(
         mesh_pool_cidr: cfg.wireguard_cidr.clone(),
         mesh_enabled: cfg.wireguard_enabled,
         overlay_network_name: cfg.docker_network_name.clone(),
+        vxlan_network_id: u32::try_from(cfg.vxlan_vni).unwrap_or(0),
+        vxlan_port: u16::try_from(cfg.vxlan_port).unwrap_or(0),
+        can_change_network_id: network_id_change_blocked_by.is_empty(),
+        network_id_change_blocked_by,
         pool_confirmed: cfg.compute_pool_confirmed_at.is_some() || !change_blocked_by.is_empty(),
         can_change: change_blocked_by.is_empty(),
         change_blocked_by,
@@ -283,6 +371,32 @@ pub(crate) fn status_of(
         },
         nodes,
     }
+}
+
+/// Why the cluster's network ID cannot change now (ADR 062): every node must
+/// have reported the network ID it follows, so it is known to apply a new
+/// one. Offline nodes count: they apply it when they come back.
+pub(crate) fn network_id_change_blockers(
+    cfg: &network_config::Model,
+    members: &[nodes::Model],
+) -> Vec<String> {
+    if cfg.transport != "vxlan" {
+        return vec![format!(
+            "the cluster uses the {} transport, which has no VXLAN network ID",
+            cfg.transport
+        )];
+    }
+    members
+        .iter()
+        .filter(|node| node.overlay_vxlan_vni.is_none())
+        .map(|node| {
+            format!(
+                "node '{}' has not reported that it can follow a new network ID; upgrade \
+                 Temps on it (`sudo temps upgrade`) and restart its agent, or remove it",
+                node.name
+            )
+        })
+        .collect()
 }
 
 /// The allocations a pool change moved, for the API answer and the audit.

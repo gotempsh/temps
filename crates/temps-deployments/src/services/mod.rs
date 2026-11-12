@@ -13,6 +13,7 @@ pub use container_operations::*;
 pub mod types;
 pub use types::*;
 
+pub use temps_nodes::services::cluster_dns;
 pub use temps_nodes::services::cluster_network;
 pub use temps_nodes::services::node_pairing;
 pub use temps_nodes::services::node_pairing_admin;

@@ -5,10 +5,8 @@
 //!
 //! Two consumers need it, from two different network namespaces:
 //!
-//! * containers get the host's servers as fallbacks *after* the cluster
-//!   resolver ([`dns_with_fallback`]), so the resolver is never a single point
-//!   of failure for outbound DNS. Loopback servers are dropped there: inside a
-//!   container's netns they point at the container itself.
+//! * containers use only their configured internal resolver. The legacy
+//!   [`dns_with_fallback`] name remains for callers but adds no host servers.
 //! * the resolver forwards names outside `temps.local` to the host's servers
 //!   first ([`host_upstream_resolvers`]). It runs in the host netns, so a
 //!   loopback stub such as systemd-resolved's `127.0.0.53` is reachable and is
@@ -83,10 +81,10 @@ pub fn merge_dns_with_fallback(mut primary: Vec<String>, fallback_pool: &[String
     primary
 }
 
-/// Appends the host's own DNS servers to `primary` (the cluster resolver),
-/// so the resolver is never the only nameserver a container has.
+/// Keep containers on their internal resolver. External queries are forwarded
+/// by that resolver; host DNS configuration must not bypass internal policy.
 pub fn dns_with_fallback(primary: Vec<String>) -> Vec<String> {
-    merge_dns_with_fallback(primary, &host_default_dns_servers())
+    primary
 }
 
 /// Upstreams for the resolver's forwarder: the host's configured servers

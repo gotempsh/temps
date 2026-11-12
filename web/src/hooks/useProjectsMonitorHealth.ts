@@ -13,10 +13,16 @@ import { useQuery } from '@tanstack/react-query'
  * and explicitly excludes Temps' own monitor requests, so a healthy but quiet
  * project has nothing to derive a status from.
  */
-export function useProjectsMonitorHealth(projectIds: number[]) {
+export function useProjectsMonitorHealth(
+  projectIds: number[],
+  environmentId?: number
+) {
   return useQuery({
     ...getProjectsMonitorHealthOptions({
-      query: { project_ids: projectIds.join(',') },
+      query: {
+        project_ids: projectIds.join(','),
+        environment_id: environmentId,
+      },
     }),
     enabled: projectIds.length > 0,
     staleTime: 1000 * 30,

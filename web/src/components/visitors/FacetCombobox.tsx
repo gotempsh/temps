@@ -36,6 +36,8 @@ interface FacetComboboxProps {
   /** Show a flag emoji derived from `option.code` (country code). */
   withFlag?: boolean
   loading?: boolean
+  error?: boolean
+  onRetry?: () => void
   placeholder?: string
   /** Optional explicit ID/label for the trigger (for a11y). */
   id?: string
@@ -77,6 +79,8 @@ export function FacetCombobox({
   onChange,
   withFlag,
   loading,
+  error,
+  onRetry,
   placeholder,
   id,
   className,
@@ -92,12 +96,6 @@ export function FacetCombobox({
   // of the top N), still render the chip so the user can clear it.
   const showSelectedNotInList = value && !selected
   const selectedFlag = withFlag ? codeToFlag(selected?.code) : ''
-
-  const handleClear = (e: React.MouseEvent) => {
-    e.stopPropagation()
-    e.preventDefault()
-    onChange(undefined)
-  }
 
   return (
     <div className={cn('flex items-center gap-1.5', className)}>
@@ -137,23 +135,6 @@ export function FacetCombobox({
               )}
             </span>
             <span className="flex items-center gap-1 shrink-0">
-              {value && (
-                <span
-                  role="button"
-                  tabIndex={0}
-                  aria-label={`Clear ${label} filter`}
-                  onClick={handleClear}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter' || e.key === ' ') {
-                      e.preventDefault()
-                      onChange(undefined)
-                    }
-                  }}
-                  className="inline-flex h-5 w-5 items-center justify-center rounded hover:bg-muted text-muted-foreground hover:text-foreground"
-                >
-                  <X className="h-3 w-3" />
-                </span>
-              )}
               <ChevronsUpDown className="h-3.5 w-3.5 opacity-50" />
             </span>
           </Button>
@@ -168,6 +149,15 @@ export function FacetCombobox({
               {loading ? (
                 <div className="py-6 text-center text-sm text-muted-foreground">
                   Loading...
+                </div>
+              ) : error ? (
+                <div className="space-y-2 p-4 text-sm" role="alert">
+                  <p>Could not load {label.toLowerCase()} options.</p>
+                  {onRetry && (
+                    <Button variant="outline" size="sm" onClick={onRetry}>
+                      Retry
+                    </Button>
+                  )}
                 </div>
               ) : options.length === 0 ? (
                 <CommandEmpty>No values in this range.</CommandEmpty>
@@ -231,6 +221,18 @@ export function FacetCombobox({
           </Command>
         </PopoverContent>
       </Popover>
+      {value && (
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon"
+          className="size-9 shrink-0"
+          aria-label={`Clear ${label} filter`}
+          onClick={() => onChange(undefined)}
+        >
+          <X className="size-4" aria-hidden="true" />
+        </Button>
+      )}
     </div>
   )
 }

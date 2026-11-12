@@ -18,6 +18,7 @@ import {
   formatTimestamp,
   serviceColor,
 } from './SpanWaterfall-shared'
+import { spanTarget } from './span-target'
 
 function countDescendants(node: SpanTreeNode): number {
   return node.children.reduce(
@@ -89,7 +90,7 @@ export function SpanWaterfall({
   }, [flatSpans, collapsedIds])
 
   return (
-    <div className={cn('overflow-auto', className)}>
+    <div className={cn('@container overflow-auto', className)}>
       <div className="sticky top-0 z-10 flex min-w-[360px] items-center border-b bg-background px-3 py-2 text-xs text-muted-foreground sm:min-w-[560px] sm:px-4">
         {/* The name column takes every pixel the timeline does not need. Span
             names are the part you read — deep trees indent them 16px per level
@@ -97,13 +98,15 @@ export function SpanWaterfall({
             name — while the timeline is mostly empty space once a trace has
             one dominant span.
             So the timeline gets a fixed, modest width and the names get the
-            rest, instead of the other way round. */}
+            rest, instead of the other way round. The widths follow this
+            panel's own width, not the viewport's, so opening a detail panel
+            beside the waterfall narrows the timeline rather than the names. */}
         <div className="min-w-[90px] flex-1">Span Name</div>
-        <div className="flex w-[110px] shrink-0 justify-between sm:w-[230px] lg:w-[360px]">
+        <div className="flex w-[110px] shrink-0 justify-between @xl:w-[230px] @4xl:w-[360px]">
           <span className="truncate">
             {formatTimestamp(new Date(traceStart).toISOString())}
           </span>
-          <span className="hidden truncate sm:inline">
+          <span className="hidden truncate @xl:inline">
             {formatDuration(traceDuration)}
           </span>
           <span className="truncate">
@@ -193,6 +196,11 @@ export function SpanWaterfall({
                       {renderRowBadge?.(node.span)}
                       <span className="min-w-0 flex-1 truncate text-xs">
                         {node.span.name}
+                        {spanTarget(node.span.name, node.span.attributes) && (
+                          <span className="ml-1.5 text-muted-foreground">
+                            {spanTarget(node.span.name, node.span.attributes)}
+                          </span>
+                        )}
                       </span>
                       {isCollapsed && (
                         <span className="shrink-0 rounded-sm bg-muted px-1 text-[10px] text-muted-foreground">
@@ -200,7 +208,7 @@ export function SpanWaterfall({
                         </span>
                       )}
                     </div>
-                    <div className="relative h-6 w-[110px] shrink-0 sm:w-[230px] lg:w-[360px]">
+                    <div className="relative h-6 w-[110px] shrink-0 @xl:w-[230px] @4xl:w-[360px]">
                       <div
                         className={cn(
                           'absolute top-1 h-4 min-w-[2px] rounded-sm',

@@ -225,9 +225,27 @@ pub fn build_router(
             "/agent/services/{name}/snapshot",
             get(service_handlers::service_snapshot),
         )
+        // Read-only observation for the service page: runtime state,
+        // resource samples and the Postgres WAL probe.
+        .route(
+            "/agent/services/{name}/runtime",
+            get(crate::service_observe_handlers::service_runtime),
+        )
+        .route(
+            "/agent/services/{name}/stats",
+            get(crate::service_observe_handlers::service_stats),
+        )
+        .route(
+            "/agent/services/wal-health",
+            post(crate::service_observe_handlers::wal_health),
+        )
         .route(
             "/agent/services/runtime-env",
             post(service_handlers::runtime_env),
+        )
+        .route(
+            "/agent/services/runtime-env-preview",
+            post(service_handlers::runtime_env_preview),
         )
         .route(
             "/agent/services/revoke-s3-access",
@@ -236,7 +254,8 @@ pub fn build_router(
         .route(
             "/agent/services/health-probe",
             post(service_handlers::health_probe),
-        )
+        );
+    let api_routes = service_data_routes(api_routes)
         .route(
             "/agent/services/backup",
             post(service_handlers::backup_service),
@@ -295,6 +314,82 @@ pub fn build_router(
         .merge(runtime_health_routes)
         .merge(worker_metrics_routes)
         .merge(swagger_ui)
+}
+
+/// The agent's backup and in-place restore routes of a worker's services:
+/// the control plane's own engines run on this node (ADR-099). Every body is
+/// sealed, because it carries a credential (one scoped to the job, ADR-102).
+fn service_data_routes(router: Router<Arc<AgentState>>) -> Router<Arc<AgentState>> {
+    router
+        .route(
+            "/agent/services/data-backup",
+            post(crate::service_data_handlers::data_backup),
+        )
+        .route(
+            "/agent/services/data-restore",
+            post(crate::service_data_handlers::data_restore),
+        )
+        .route(
+            "/agent/services/postgres/walg-backup",
+            post(crate::service_data_handlers::postgres_walg_backup),
+        )
+        .route(
+            "/agent/services/postgres/walg-backup/outcome",
+            post(crate::service_data_handlers::postgres_walg_backup_outcome),
+        )
+        .route(
+            "/agent/services/postgres/walg-restore",
+            post(crate::service_data_handlers::postgres_walg_restore),
+        )
+        .route(
+            "/agent/services/restore/outcome",
+            post(crate::service_data_handlers::worker_restore_outcome),
+        )
+        .route(
+            "/agent/services/postgres/walg-archive",
+            post(crate::service_data_handlers::postgres_walg_archive),
+        )
+        // The control plane's MariaDB engines, run on this node (ADR-099).
+        .route(
+            "/agent/services/mariadb/physical-backup",
+            post(crate::service_mariadb_handlers::mariadb_physical_backup),
+        )
+        .route(
+            "/agent/services/mariadb/dump-backup",
+            post(crate::service_mariadb_handlers::mariadb_dump_backup),
+        )
+        .route(
+            "/agent/services/mariadb/restore",
+            post(crate::service_mariadb_handlers::mariadb_restore),
+        )
+        .route(
+            "/agent/services/mariadb/binlog-archive",
+            post(crate::service_mariadb_handlers::mariadb_binlog_archive),
+        )
+        .route(
+            "/agent/services/postgres/walg-credentials",
+            post(crate::service_data_handlers::postgres_walg_credentials),
+        )
+        .route(
+            "/agent/services/mongodb/backup",
+            post(crate::service_data_handlers::mongodb_backup),
+        )
+        .route(
+            "/agent/services/mongodb/restore",
+            post(crate::service_data_handlers::mongodb_restore),
+        )
+        .route(
+            "/agent/services/redis/walg-backup",
+            post(crate::service_data_handlers::redis_walg_backup),
+        )
+        .route(
+            "/agent/services/redis/rdb-backup",
+            post(crate::service_data_handlers::redis_rdb_backup),
+        )
+        .route(
+            "/agent/services/redis/restore",
+            post(crate::service_data_handlers::redis_restore),
+        )
 }
 
 /// ADR-048 sandbox host API — same auth as every other agent route. File
@@ -574,7 +669,8 @@ fn spawn_heartbeat_loop(
         let mut addresses_sent: Option<Vec<crate::overlay_addresses::OverlayAddress>> = None;
         let mut beats_since_addresses_sent: u32 = 0;
         let mut capacity_sampler = CapacitySampler::new();
-        let mut resolver_coverage = temps_deployer::resolver_coverage::ResolverCoverage::new();
+        let mut resolver_coverage =
+            temps_deployer::resolver_coverage::ResolverCoverage::for_node(node_id);
 
         let mut last_beat: Option<tokio::time::Instant> = None;
 
@@ -637,6 +733,14 @@ fn spawn_heartbeat_loop(
                 capacity.as_object_mut(),
             ) {
                 fields.insert(temps_core::node_address::AGENT_HOST_KEY.to_string(), host);
+            }
+            // Whether `<env>.<project>.temps.local` names, which resolve to
+            // this node's bridge, are actually served here, and why not.
+            if let (Some(proxy), Some(fields)) = (
+                crate::internal_routing::heartbeat_value(),
+                capacity.as_object_mut(),
+            ) {
+                fields.insert(crate::internal_routing::HEARTBEAT_KEY.to_string(), proxy);
             }
             // The node runtime's reports: only those that changed since the
             // last accepted beat.
@@ -806,6 +910,11 @@ fn spawn_heartbeat_loop(
                 .unwrap_or_default();
             if let Some(overlay) = &overlay_snapshot.overlay {
                 body["overlay"] = serde_json::json!(overlay);
+            }
+            // ADR 062: the network ID this node follows, from the first poll
+            // on, so the control plane knows it can change the cluster's.
+            if let Some(vni) = overlay_snapshot.vxlan_vni {
+                body["overlay_vxlan_vni"] = serde_json::json!(vni);
             }
             let occupied_to_send = overlay_snapshot
                 .occupied_ranges
@@ -1279,13 +1388,23 @@ pub async fn start_agent_server_with(
         platform.clone(),
         options.engines.clone(),
     );
+    // ADR-095: the resolver's report and test resolution. The same slot
+    // goes to the network-sync loop, which starts the resolver.
+    let agent_dns: crate::dns_report::SharedAgentDns = Arc::default();
+    let router = router.merge(crate::dns_report::router(
+        agent_dns.clone(),
+        Arc::new(AgentAuth::new(&config.token)),
+    ));
 
     // Shared DNS resolver health (ADR-024) and overlay report (ADR 056)
     // slots. Written by the network-sync loop below on every tick, read by
     // the heartbeat loop so the control plane learns resolver and overlay
     // health without an operator SSHing in to read logs. Live for the
     // agent's process lifetime, same as `platform`.
-    let health = crate::network_sync::HealthSlots::default();
+    let health = crate::network_sync::HealthSlots {
+        dns_report: agent_dns,
+        ..Default::default()
+    };
 
     // This node's mesh address (published by the network-sync loop) and the
     // address the agent API is served on over the mesh (reported by the
@@ -1984,6 +2103,14 @@ pub(crate) mod tests {
             "/agent/services",
             "/agent/services/exec",
             "/agent/services/workload",
+            "/agent/services/wal-health",
+            "/agent/services/data-backup",
+            "/agent/services/data-restore",
+            "/agent/services/restore/outcome",
+            "/agent/services/mariadb/physical-backup",
+            "/agent/services/mariadb/dump-backup",
+            "/agent/services/mariadb/restore",
+            "/agent/services/mariadb/binlog-archive",
             "/agent/sandboxes",
             "/agent/sandboxes/exec",
             "/agent/sandboxes/write-file",
@@ -2012,6 +2139,78 @@ pub(crate) mod tests {
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "{path}"
             );
+        }
+    }
+
+    /// A restore this node never received (or ran before its agent
+    /// restarted) is reported as unknown, not as running or failed: the
+    /// control plane must not guess its outcome.
+    #[tokio::test]
+    async fn a_restore_outcome_the_node_never_recorded_is_unknown() {
+        use axum::http::StatusCode;
+        use temps_core::sealed_request::NodeSealing;
+        use tower::ServiceExt;
+        let (private, public) = temps_core::worker_ingress::generate_ingress_key().unwrap();
+        let token = test_agent_config(false).token;
+        let path = "/agent/services/restore/outcome";
+        let sealed = NodeSealing::Key(public)
+            .seal(
+                "test-node",
+                path,
+                br#"{"engine":"mongodb","service":"orders","operation_id":"restore-run-404"}"#,
+            )
+            .unwrap();
+        let response = sealed_test_app(Some(private))
+            .oneshot(sealed_request(path, Some(&token), sealed))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["success"], true, "{body}");
+        assert_eq!(
+            body["data"],
+            serde_json::json!({"state": "unknown"}),
+            "{body}"
+        );
+    }
+
+    /// The service page's read-only routes take the node token like every
+    /// other `/agent/services/*` route: a container's state and usage are
+    /// not public.
+    #[tokio::test]
+    async fn service_observation_routes_require_the_node_token() {
+        use axum::http::StatusCode;
+        use tower::ServiceExt;
+        let token = test_agent_config(false).token;
+        for path in [
+            "/agent/services/postgres-orders/runtime",
+            "/agent/services/postgres-orders/stats?samples=2",
+        ] {
+            let response = sealed_test_app(None)
+                .oneshot(
+                    axum::http::Request::get(path)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+
+            // With the token the handler answers: this test router has no
+            // Docker, so it says so instead of 401.
+            let response = sealed_test_app(None)
+                .oneshot(
+                    axum::http::Request::get(path)
+                        .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
         }
     }
 

@@ -220,6 +220,13 @@ const UNMARKED: &[&str] = &[
 const NOT_CREDENTIALS: &[&str] = &[
     "createHttpCheck:spec.credential_header",
     "createHttpCheck:spec.credential_prefix",
+    // The S3 source's worker credential policy (ADR-102): the enum
+    // `scoped` | `allow_full`, which kind of credential a worker node is
+    // given, never a credential itself. `test_s3_connection_preview` takes the
+    // create request.
+    "create_s3_source:worker_credentials",
+    "test_s3_connection_preview:worker_credentials",
+    "update_s3_source:worker_credentials",
     "updateHttpCheck:spec.credential_header",
     "updateHttpCheck:spec.credential_prefix",
     "upsert_secret:secret_type",

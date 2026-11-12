@@ -11,78 +11,20 @@ import {
   createVolumeBody,
   deleteEnvironmentVolume,
   detachEnvironmentVolume,
-  explainPlacement,
-  getPinningRecommendation,
-  getWorkloadIsolation,
-  isolationSummary,
   isPermissionDenied,
   listEnvironmentVolumes,
   mountPathError,
-  nodeLabel,
-  nodeNamesOf,
-  placementSummary,
-  recommendationSummary,
-  setWorkloadIsolation,
-  setWorkloadMode,
   toCreateVolumeRequest,
   volumeDeleteConsequence,
+  volumeBlockerText,
   volumeDeletedMessage,
   volumeNameError,
-  workloadModeSummary,
+  VOLUMES_REQUIREMENT,
   type EnvironmentVolume,
-  type PinningRecommendation,
-  type PlacementExplanation,
+  type EnvironmentVolumeStatus,
 } from './environment-workload'
 
 afterEach(() => restoreAllMockApis())
-
-function explanation(
-  overrides: Partial<PlacementExplanation> = {}
-): PlacementExplanation {
-  return {
-    environment_id: 3,
-    recommended: [
-      {
-        node_id: 0,
-        node_name: 'primary',
-        score: 0.9,
-        reasons: ['least loaded'],
-      },
-      { node_id: 4, node_name: 'worker-a', score: 0.4, reasons: [] },
-    ],
-    excluded: [
-      {
-        node_id: 5,
-        node_name: 'worker-b',
-        reason: 'NodeDraining',
-        message: 'node 5 is draining',
-        excluded: true,
-      },
-    ],
-    placement: [0],
-    unschedulable: null,
-    unschedulable_reason: null,
-    warnings: [],
-    pinned_by: null,
-    ...overrides,
-  }
-}
-
-function recommendation(
-  overrides: Partial<PinningRecommendation> = {}
-): PinningRecommendation {
-  return {
-    environment_id: 3,
-    window_days: 7,
-    nodes_used: [0],
-    moved_between_nodes: false,
-    recommended_nodes: [],
-    reasons: [],
-    current_nodes: [],
-    changes_placement: false,
-    ...overrides,
-  }
-}
 
 function volume(overrides: Partial<EnvironmentVolume> = {}): EnvironmentVolume {
   return {
@@ -102,61 +44,6 @@ function volume(overrides: Partial<EnvironmentVolume> = {}): EnvironmentVolume {
 }
 
 describe('requests', () => {
-  test('sets the workload mode with the server field name', async () => {
-    let body: unknown
-    const api = mockApi({
-      'PUT /internal/environments/3/workload-mode': async (request) => {
-        body = await request.json()
-        return jsonResponse({ environment_id: 3, workload_mode: 'enforce' })
-      },
-    })
-    const saved = await setWorkloadMode(3, 'enforce')
-    expect(body).toEqual({ workload_mode: 'enforce' })
-    expect(saved.workload_mode).toBe('enforce')
-    expect(api.called('PUT', '/internal/environments/3/workload-mode')).toBe(
-      true
-    )
-  })
-
-  test('reads and sets the isolation', async () => {
-    let body: unknown
-    mockApi({
-      'GET /internal/environments/3/workload-isolation': () =>
-        jsonResponse({
-          environment_id: 3,
-          workload_isolation: 'process',
-          applies: false,
-        }),
-      'PUT /internal/environments/3/workload-isolation': async (request) => {
-        body = await request.json()
-        return jsonResponse({
-          environment_id: 3,
-          workload_isolation: 'micro_vm',
-          applies: true,
-        })
-      },
-    })
-    expect((await getWorkloadIsolation(3)).applies).toBe(false)
-    const saved = await setWorkloadIsolation(3, 'micro_vm')
-    expect(body).toEqual({ workload_isolation: 'micro_vm' })
-    expect(saved.workload_isolation).toBe('micro_vm')
-  })
-
-  test('explains placement and passes the recommendation window', async () => {
-    let query = ''
-    mockApi({
-      'GET /internal/environments/3/placement/explain': () =>
-        jsonResponse(explanation()),
-      'GET /internal/environments/3/placement/recommendation': (request) => {
-        query = new URL(request.url).search
-        return jsonResponse(recommendation({ window_days: 14 }))
-      },
-    })
-    expect((await explainPlacement(3)).placement).toEqual([0])
-    expect((await getPinningRecommendation(3, 14)).window_days).toBe(14)
-    expect(query).toBe('?window_days=14')
-  })
-
   test('lists volumes with page and page size', async () => {
     let query = ''
     mockApi({
@@ -216,13 +103,15 @@ describe('requests', () => {
 
   test('a refused read is recognised as a permission error', async () => {
     mockApi({
-      'GET /internal/environments/3/placement/explain': () =>
+      'GET /internal/environments/3/volumes': () =>
         jsonResponse(
           { title: 'Forbidden', detail: 'Requires settings:read' },
           403
         ),
     })
-    const error = await explainPlacement(3).catch((e: unknown) => e)
+    const error = await listEnvironmentVolumes(3, 1, 20).catch(
+      (e: unknown) => e
+    )
     expect(isPermissionDenied(error)).toBe(true)
     expect(isPermissionDenied(new Error('network'))).toBe(false)
   })
@@ -254,83 +143,6 @@ describe('validation', () => {
     expect(mountPathError('data')).toContain('absolute')
     expect(mountPathError('/')).toContain('root')
     expect(mountPathError('/data/../etc')).toContain('".."')
-  })
-})
-
-describe('summaries', () => {
-  test('each mode says what it does', () => {
-    expect(workloadModeSummary('legacy')).toContain('exactly as before')
-    expect(workloadModeSummary('shadow')).toContain('disagreement is logged')
-    expect(workloadModeSummary('enforce')).toContain(
-      'created and run by the workload plane'
-    )
-  })
-
-  test('isolation is recorded but ignored outside enforce', () => {
-    expect(
-      isolationSummary({
-        environment_id: 3,
-        workload_isolation: 'micro_vm',
-        applies: false,
-      })
-    ).toContain('ignored until the workload mode is Enforce')
-    expect(
-      isolationSummary({
-        environment_id: 3,
-        workload_isolation: 'micro_vm',
-        applies: true,
-      })
-    ).toContain('Firecracker microVM')
-  })
-
-  test('names nodes, the control plane included', () => {
-    const names = nodeNamesOf(explanation())
-    expect(nodeLabel(0, names)).toBe('primary (control plane)')
-    expect(nodeLabel(0, new Map())).toBe('Control plane')
-    expect(nodeLabel(5, names)).toBe('worker-b')
-    expect(nodeLabel(8, names)).toBe('Node 8')
-  })
-
-  test('placement says where the next deployment runs', () => {
-    expect(placementSummary(explanation())).toBe(
-      'The next deployment would run on primary (control plane).'
-    )
-    expect(placementSummary(explanation({ placement: [4, 4, 0] }))).toBe(
-      "The next deployment's 3 replicas would run on worker-a (2 replicas), primary (control plane)."
-    )
-    expect(
-      placementSummary(
-        explanation({
-          placement: null,
-          unschedulable: 'no node provides a Firecracker microVM',
-        })
-      )
-    ).toBe(
-      'The next deployment could not be placed: no node provides a Firecracker microVM'
-    )
-  })
-
-  test('recommendation names the nodes to pin to', () => {
-    const names = nodeNamesOf(explanation())
-    expect(
-      recommendationSummary(
-        recommendation({
-          nodes_used: [0, 4],
-          moved_between_nodes: true,
-          recommended_nodes: [4],
-          changes_placement: true,
-        }),
-        names
-      )
-    ).toBe(
-      'Recommended: pin this environment to worker-a. It moved between nodes in the last 7 days.'
-    )
-    expect(
-      recommendationSummary(recommendation({ nodes_used: [] }), names)
-    ).toContain('nothing to recommend')
-    expect(recommendationSummary(recommendation(), names)).toContain(
-      'No change recommended'
-    )
   })
 })
 
@@ -417,5 +229,40 @@ describe('volume deletion', () => {
         backing_kept_reason: 'retain_on_delete is set',
       })
     ).toBe('Deleted volume data; its data was kept: retain_on_delete is set')
+  })
+})
+
+describe('volume status', () => {
+  const status = (
+    overrides: Partial<EnvironmentVolumeStatus>
+  ): EnvironmentVolumeStatus => ({
+    environment_id: 3,
+    workload_mode: 'enforce',
+    replicas: 1,
+    attached: 1,
+    active: false,
+    ...overrides,
+  })
+
+  test('never names the internal workload mode', () => {
+    for (const workload_mode of ['legacy', 'shadow'] as const) {
+      const text = volumeBlockerText(
+        status({
+          workload_mode,
+          reason: `Environment 3 has workload_mode '${workload_mode}'; set workload_mode to enforce`,
+        })
+      )
+      expect(text).toBe(
+        "This environment's deployments do not mount volumes yet."
+      )
+      expect(text).not.toMatch(/workload|enforce|legacy|shadow/i)
+    }
+  })
+
+  test('otherwise passes on the server reason, or the requirement', () => {
+    expect(
+      volumeBlockerText(status({ reason: 'Environment 3 runs 2 replicas' }))
+    ).toBe('Environment 3 runs 2 replicas')
+    expect(volumeBlockerText(status({}))).toBe(VOLUMES_REQUIREMENT)
   })
 })

@@ -85,12 +85,18 @@ import {
   Users as UserIcon,
 } from 'lucide-react'
 import * as React from 'react'
+import { PageHeader } from '@temps-sdk/ds'
+import {
+  useListBack,
+  type ListReturnState,
+} from '@/components/table/list-navigation'
 import { useNavigate, useSearchParams } from 'react-router'
 import { crawlerLabel } from '@/components/analytics/traffic-filters-shared'
 
 interface VisitorDetailProps {
   project: ProjectResponse
   visitorId: number
+  listState?: ListReturnState | null
 }
 
 // Helper function to parse user agent for browser/OS/device info
@@ -199,8 +205,16 @@ function BrowserDeviceInfo({
   )
 }
 
-export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
+export function VisitorDetail({
+  project,
+  visitorId,
+  listState,
+}: VisitorDetailProps) {
   const navigate = useNavigate()
+  const handleBack = useListBack(
+    `/projects/${project.slug}/analytics/visitors`,
+    listState
+  )
   const queryClient = useQueryClient()
   const [searchParams, setSearchParams] = useSearchParams()
   const [page, setPage] = React.useState(1)
@@ -405,121 +419,120 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
 
   return (
     <div className="space-y-6">
-      {/* Header */}
-      <div className="flex items-center gap-4">
-        <Button
-          aria-label="Back"
-          variant="ghost"
-          size="icon"
-          onClick={() =>
-            navigate(`/projects/${project.slug}/analytics/visitors`)
-          }
-        >
-          <ArrowLeft className="h-4 w-4" />
-        </Button>
-        <div className="flex-1">
-          <h2 className="text-2xl font-semibold flex items-center gap-2">
-            {visitorDetails?.is_crawler ? (
-              <Bug className="h-6 w-6" />
-            ) : (
-              <UserIcon className="h-6 w-6" />
+      <PageHeader
+        headingLevel="h2"
+        title="Visitor details"
+        description={
+          <span className="break-all font-mono text-xs">
+            {visitorDetails?.visitor_id || `Visitor ${visitorId}`}
+          </span>
+        }
+        actions={
+          <>
+            <Button variant="ghost" size="sm" onClick={handleBack}>
+              <ArrowLeft className="mr-2 size-4" aria-hidden="true" />
+              Back to visitors
+            </Button>
+            {visitorDetails && (
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    aria-label="Exclude from analytics"
+                  >
+                    <ShieldOff className="h-4 w-4 sm:mr-2" />
+                    <span className="hidden sm:inline">
+                      Exclude from analytics
+                    </span>
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end" className="w-72">
+                  <DropdownMenuLabel>
+                    Leave this traffic out of analytics
+                  </DropdownMenuLabel>
+                  {visitorDetails.ip_address ? (
+                    <DropdownMenuItem
+                      onSelect={() =>
+                        setExcludeTarget({
+                          kind: 'ip',
+                          value: visitorDetails.ip_address ?? '',
+                        })
+                      }
+                    >
+                      This IP ({visitorDetails.ip_address})
+                    </DropdownMenuItem>
+                  ) : (
+                    <DropdownMenuItem disabled>
+                      This IP (not recorded for this visitor)
+                    </DropdownMenuItem>
+                  )}
+                  {visitorDetails.asn_number != null ? (
+                    <DropdownMenuItem
+                      onSelect={() =>
+                        setExcludeTarget({
+                          kind: 'asn',
+                          value: String(visitorDetails.asn_number),
+                          detail: visitorDetails.asn_org ?? undefined,
+                        })
+                      }
+                    >
+                      <span className="truncate">
+                        Network AS{visitorDetails.asn_number}
+                        {visitorDetails.asn_org
+                          ? ` (${visitorDetails.asn_org})`
+                          : ''}
+                      </span>
+                    </DropdownMenuItem>
+                  ) : (
+                    <DropdownMenuItem disabled>
+                      Network (unknown: no ASN database data)
+                    </DropdownMenuItem>
+                  )}
+                  {visitorDetails.first_referrer_hostname && (
+                    <DropdownMenuItem
+                      onSelect={() =>
+                        setExcludeTarget({
+                          kind: 'referrer',
+                          value: visitorDetails.first_referrer_hostname ?? '',
+                        })
+                      }
+                    >
+                      <span className="truncate">
+                        Referrer {visitorDetails.first_referrer_hostname}
+                      </span>
+                    </DropdownMenuItem>
+                  )}
+                  {visitorDetails.country_code && (
+                    <DropdownMenuItem
+                      onSelect={() =>
+                        setExcludeTarget({
+                          kind: 'country',
+                          value: visitorDetails.country_code ?? '',
+                          detail: visitorDetails.country ?? undefined,
+                        })
+                      }
+                    >
+                      Country{' '}
+                      {visitorDetails.country ?? visitorDetails.country_code}
+                    </DropdownMenuItem>
+                  )}
+                </DropdownMenuContent>
+              </DropdownMenu>
             )}
-            Visitor details
-          </h2>
-          <p className="text-muted-foreground">ID: {visitorId}</p>
-        </div>
-        {visitorDetails && (
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
+            {visitorDetails && (
               <Button
                 variant="outline"
                 size="sm"
-                aria-label="Exclude from analytics"
+                onClick={handleOpenEnrichDialog}
               >
-                <ShieldOff className="h-4 w-4 sm:mr-2" />
-                <span className="hidden sm:inline">Exclude from analytics</span>
+                <Pencil className="h-4 w-4 mr-2" />
+                Enrich visitor
               </Button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="end" className="w-72">
-              <DropdownMenuLabel>
-                Leave this traffic out of analytics
-              </DropdownMenuLabel>
-              {visitorDetails.ip_address ? (
-                <DropdownMenuItem
-                  onSelect={() =>
-                    setExcludeTarget({
-                      kind: 'ip',
-                      value: visitorDetails.ip_address ?? '',
-                    })
-                  }
-                >
-                  This IP ({visitorDetails.ip_address})
-                </DropdownMenuItem>
-              ) : (
-                <DropdownMenuItem disabled>
-                  This IP (not recorded for this visitor)
-                </DropdownMenuItem>
-              )}
-              {visitorDetails.asn_number != null ? (
-                <DropdownMenuItem
-                  onSelect={() =>
-                    setExcludeTarget({
-                      kind: 'asn',
-                      value: String(visitorDetails.asn_number),
-                      detail: visitorDetails.asn_org ?? undefined,
-                    })
-                  }
-                >
-                  <span className="truncate">
-                    Network AS{visitorDetails.asn_number}
-                    {visitorDetails.asn_org
-                      ? ` (${visitorDetails.asn_org})`
-                      : ''}
-                  </span>
-                </DropdownMenuItem>
-              ) : (
-                <DropdownMenuItem disabled>
-                  Network (unknown: no ASN database data)
-                </DropdownMenuItem>
-              )}
-              {visitorDetails.first_referrer_hostname && (
-                <DropdownMenuItem
-                  onSelect={() =>
-                    setExcludeTarget({
-                      kind: 'referrer',
-                      value: visitorDetails.first_referrer_hostname ?? '',
-                    })
-                  }
-                >
-                  <span className="truncate">
-                    Referrer {visitorDetails.first_referrer_hostname}
-                  </span>
-                </DropdownMenuItem>
-              )}
-              {visitorDetails.country_code && (
-                <DropdownMenuItem
-                  onSelect={() =>
-                    setExcludeTarget({
-                      kind: 'country',
-                      value: visitorDetails.country_code ?? '',
-                      detail: visitorDetails.country ?? undefined,
-                    })
-                  }
-                >
-                  Country{' '}
-                  {visitorDetails.country ?? visitorDetails.country_code}
-                </DropdownMenuItem>
-              )}
-            </DropdownMenuContent>
-          </DropdownMenu>
-        )}
-        {visitorDetails && (
-          <Button variant="outline" size="sm" onClick={handleOpenEnrichDialog}>
-            <Pencil className="h-4 w-4 mr-2" />
-            Enrich visitor
-          </Button>
-        )}
-      </div>
+            )}
+          </>
+        }
+      />
       <ExcludeTrafficDialog
         projectId={project.id}
         projectSlug={project.slug}

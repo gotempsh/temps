@@ -12,13 +12,16 @@ use urlencoding;
 mod backup;
 mod config;
 mod lifecycle;
+mod node_recreate;
 mod restore;
+mod restore_swap;
 pub mod sandbox;
 mod service_impl;
 mod walg;
 
 pub use config::*;
 pub use lifecycle::*;
+pub use node_recreate::{NodeAfterCreate, NodeRecreate};
 use restore::*;
 pub use walg::*;
 
@@ -31,6 +34,10 @@ pub struct PostgresService {
     /// `ServiceConfig::parameters` JSON.
     resource_limits: Arc<RwLock<ServiceResourceLimits>>,
     docker: Arc<Docker>,
+    /// Set when this service runs on a worker node and this instance is its
+    /// agent's: a recreate rebuilds the running container from its own
+    /// inspected specification instead of the provider's control-plane one.
+    node: Option<NodeRecreate>,
 }
 
 impl PostgresService {
@@ -40,7 +47,15 @@ impl PostgresService {
             config: Arc::new(RwLock::new(None)),
             resource_limits: Arc::new(RwLock::new(ServiceResourceLimits::default())),
             docker,
+            node: None,
         }
+    }
+
+    /// This service, as the agent of the worker node running it sees it:
+    /// see [`NodeRecreate`].
+    pub fn on_node(mut self, node: NodeRecreate) -> Self {
+        self.node = Some(node);
+        self
     }
 }
 

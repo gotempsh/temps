@@ -53,6 +53,7 @@ fn polled(cpu_percent: Option<f64>, cpu_limit: Option<CpuLimit>) -> PolledContai
             memory_limit_bytes: Some(34_359_738_368),
             memory_percent: Some(25.8),
             online_cpus: Some(16),
+            unavailable_reason: None,
         },
         cpu_limit,
     }
@@ -366,24 +367,26 @@ async fn baselines_of_unsampled_services_are_dropped() {
     assert!(store.services.lock().await.contains_key(&7));
 }
 
-/// Only running local services with metrics on are sampled; every other
-/// service's baselines are pruned each cycle.
+/// Only running services with metrics on are sampled, on this host or on a
+/// worker (through its agent); every other service's baselines are pruned
+/// each cycle.
 #[test]
-fn only_running_local_services_with_metrics_are_sampled() {
+fn only_running_services_with_metrics_are_sampled() {
     assert!(samples_container_metrics(&running_service()));
-    let stopped = external_services::Model {
-        status: "stopped".to_string(),
+    let on_worker = external_services::Model {
+        node_id: Some(3),
         ..running_service()
     };
-    let remote = external_services::Model {
-        node_id: Some(3),
+    assert!(samples_container_metrics(&on_worker));
+    let stopped = external_services::Model {
+        status: "stopped".to_string(),
         ..running_service()
     };
     let metrics_off = external_services::Model {
         metrics_enabled: false,
         ..running_service()
     };
-    for service in [stopped, remote, metrics_off] {
+    for service in [stopped, metrics_off] {
         assert!(!samples_container_metrics(&service));
     }
 }
@@ -420,42 +423,106 @@ fn failed_and_unknown_services_are_down() {
     assert_eq!(lifecycle_probe("something-new"), LifecycleProbe::Down);
 }
 
-#[test]
-fn merge_writes_new_key_into_empty_metadata() {
-    let merged = merge_health_metadata(None, "postgres_wal", Some(&serde_json::json!({"a": 1})));
-    let merged = merged.expect("expected merged value");
-    assert_eq!(merged["postgres_wal"]["a"], 1);
+fn binlog_source(updated_at: chrono::DateTime<Utc>) -> s3_sources::Model {
+    s3_sources::Model {
+        id: 4,
+        name: "archive".to_string(),
+        bucket_name: "b".to_string(),
+        region: "us-east-1".to_string(),
+        endpoint: None,
+        bucket_path: "fleet".to_string(),
+        access_key_id: String::new(),
+        secret_key: String::new(),
+        session_token: None,
+        credentials_expire_at: None,
+        force_path_style: Some(true),
+        is_default: false,
+        managed_by_cloud: false,
+        lifecycle_reconcile_failed_at: None,
+        lifecycle_reconcile_generation: 0,
+        worker_credentials: s3_sources::WORKER_CREDENTIALS_SCOPED.to_string(),
+        created_at: updated_at,
+        updated_at,
+        backing_service_id: None,
+    }
 }
 
+/// A worker MariaDB's binary-log credential is reused only for exactly
+/// what it was minted for: the same source, unchanged, the same bucket
+/// and prefix (the service's name), the same node.
 #[test]
-fn merge_preserves_sibling_keys() {
-    let existing = serde_json::json!({"redis_memory": {"used_bytes": 42}});
-    let merged = merge_health_metadata(
-        Some(&existing),
-        "postgres_wal",
-        Some(&serde_json::json!({"pg_wal_bytes": 100})),
-    )
-    .expect("expected merged value");
-    assert_eq!(merged["redis_memory"]["used_bytes"], 42);
-    assert_eq!(merged["postgres_wal"]["pg_wal_bytes"], 100);
+fn a_binlog_credential_is_reused_only_for_what_it_was_minted_for() {
+    let now = Utc::now();
+    let source = binlog_source(now);
+    let grant = BinlogCredentialGrant::of("shop", 2, &source);
+    assert_eq!(grant.prefix, "fleet/external_services/mariadb/shop/binlog/");
+    assert_eq!(grant, BinlogCredentialGrant::of("shop", 2, &source));
+    assert_ne!(
+        grant,
+        BinlogCredentialGrant::of("shop", 3, &source),
+        "another node"
+    );
+    let edited = binlog_source(now + chrono::Duration::seconds(1));
+    assert_ne!(
+        grant,
+        BinlogCredentialGrant::of("shop", 2, &edited),
+        "an edited source"
+    );
+    let moved = s3_sources::Model {
+        bucket_name: "other".to_string(),
+        ..source.clone()
+    };
+    assert_ne!(
+        grant,
+        BinlogCredentialGrant::of("shop", 2, &moved),
+        "another bucket"
+    );
+    assert_ne!(
+        grant,
+        BinlogCredentialGrant::of("renamed", 2, &source),
+        "a renamed service"
+    );
 }
 
+/// A scoped credential is reused for the refresh interval, cut short
+/// before its own expiry; a full one, or one about to expire, never.
 #[test]
-fn merge_overwrites_same_key() {
-    let existing = serde_json::json!({"postgres_wal": {"old": true}});
-    let merged = merge_health_metadata(
-        Some(&existing),
-        "postgres_wal",
-        Some(&serde_json::json!({"new": true})),
-    )
-    .expect("expected merged value");
-    assert!(merged["postgres_wal"].get("old").is_none());
-    assert_eq!(merged["postgres_wal"]["new"], true);
-}
-
-#[test]
-fn merge_returns_none_when_snapshot_missing() {
-    let existing = serde_json::json!({"postgres_wal": {"old": true}});
-    let merged = merge_health_metadata::<serde_json::Value>(Some(&existing), "postgres_wal", None);
-    assert!(merged.is_none());
+fn a_binlog_credential_is_reused_within_its_lifetime_only() {
+    use crate::worker_s3_scope::{WorkerCredentialScope, ARCHIVE_CREDENTIAL_REFRESH_INTERVAL};
+    let now = Utc::now();
+    let scoped = |expires_at| WorkerCredentialScope::Scoped {
+        minted_by: "sts",
+        expires_at,
+    };
+    assert_eq!(
+        binlog_credential_reuse_window(&scoped(None), now),
+        Some(ARCHIVE_CREDENTIAL_REFRESH_INTERVAL)
+    );
+    assert_eq!(
+        binlog_credential_reuse_window(&scoped(Some(now + chrono::Duration::hours(24))), now),
+        Some(ARCHIVE_CREDENTIAL_REFRESH_INTERVAL)
+    );
+    assert_eq!(
+        binlog_credential_reuse_window(&scoped(Some(now + chrono::Duration::hours(1))), now),
+        Some(Duration::from_secs(50 * 60)),
+        "a store that grants an hour"
+    );
+    assert_eq!(
+        binlog_credential_reuse_window(&scoped(Some(now + chrono::Duration::minutes(5))), now),
+        None
+    );
+    assert_eq!(
+        binlog_credential_reuse_window(&scoped(Some(now - chrono::Duration::minutes(5))), now),
+        None
+    );
+    assert_eq!(
+        binlog_credential_reuse_window(
+            &WorkerCredentialScope::Full {
+                reason: "no STS".to_string()
+            },
+            now
+        ),
+        None,
+        "the source's own credential is never cached"
+    );
 }

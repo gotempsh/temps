@@ -34,7 +34,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import { BREAKDOWN_STROKES } from '@/components/charts/chart-colors'
+import { orderVolumeGroups, volumeSeriesFill } from './log-volume-series'
 import { TOOLTIP_CONTENT_STYLE, TOOLTIP_LABEL_STYLE } from '@/lib/chart-tooltip'
 import type { AnalyticsCapability } from '@/api/client/types.gen'
 import {
@@ -94,7 +94,9 @@ export function LogHistogram({
   capabilityLoading: boolean
   onRangeSelect: (from: string, to: string) => void
 }) {
-  const [uiGroupBy, setUiGroupBy] = useState<string>(NONE_GROUP)
+  // Stacked by level from the start: the first question about a volume
+  // spike is whether it is errors.
+  const [uiGroupBy, setUiGroupBy] = useState<string>('level')
   const groupBy: HistogramGroupBy =
     uiGroupBy === NONE_GROUP ? '' : (uiGroupBy as HistogramGroupBy)
   const configured = capability?.configured === true
@@ -135,7 +137,7 @@ export function LogHistogram({
     }
     return {
       rows: [...rowsByTs.values()].sort((a, b) => Number(a.ts) - Number(b.ts)),
-      groups: [...groupSet].sort(),
+      groups: orderVolumeGroups([...groupSet], groupBy === 'level'),
     }
   }, [histogram.data, groupBy])
 
@@ -286,7 +288,7 @@ export function LogHistogram({
                   dataKey={groupBy ? group : 'count'}
                   name={group}
                   stackId="lines"
-                  fill={BREAKDOWN_STROKES[index % BREAKDOWN_STROKES.length]}
+                  fill={volumeSeriesFill(group, index, groupBy === 'level')}
                   maxBarSize={18}
                   isAnimationActive={false}
                   onClick={(entry) => {

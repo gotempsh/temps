@@ -157,6 +157,14 @@ pub enum PostgresUpgradeError {
     ImportedService { service_id: i32, container: String },
 
     #[error(
+        "Refusing a major upgrade of PostgreSQL service {service_id}: it runs on worker node \
+         {node_id}, and the migration runs its containers on this server's Docker. Nothing was \
+         changed; take a backup, create a service with the new version on the node and restore \
+         into it"
+    )]
+    WorkerNodeService { service_id: i32, node_id: i32 },
+
+    #[error(
         "Cannot upgrade service {service_id} from {from_image} to {to_image}: OS family mismatch ({from_os} -> {to_os}). Cross-OS-family upgrades are unsupported."
     )]
     OsFamilyMismatch {
@@ -2375,6 +2383,12 @@ impl From<PostgresUpgradeError> for temps_core::problemdetails::Problem {
             PostgresUpgradeError::ImportedService { .. } => {
                 problemdetails::new(StatusCode::CONFLICT)
                     .with_title("Imported Service Not Managed")
+                    .with_detail(error.to_string())
+            }
+
+            PostgresUpgradeError::WorkerNodeService { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Service Runs On A Worker Node")
                     .with_detail(error.to_string())
             }
 

@@ -12,8 +12,11 @@
 //!
 //! What a worker installs is [`WorkerInstall`]: the release this control
 //! plane runs, or, for a build between releases (which no release
-//! contains), the newest nightly build, so a worker never installs an older
-//! Temps than its control plane.
+//! contains), the newest nightly build rather than the older release the
+//! build was made after. A build newer than the latest nightly, or from a
+//! branch that never reached `main`, has no published build that contains
+//! it: its workers get the newest nightly, which may lack its latest
+//! commits.
 //!
 //! A Linux worker installs Temps as root and calls it by its absolute path:
 //! `temps join` sets up WireGuard and the overlay, and `temps agent service
@@ -30,8 +33,8 @@ pub const ROOT_TEMPS_BIN: &str = "/root/.temps/bin/temps";
 pub const USER_TEMPS_BIN: &str = "~/.temps/bin/temps";
 const AS_ROOT: &str = "sudo -H";
 
-/// What a new worker installs, so it never runs an older Temps than its
-/// control plane.
+/// What a new worker installs to match its control plane, as closely as a
+/// published build allows.
 #[derive(
     Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
 )]
@@ -45,7 +48,8 @@ pub enum WorkerInstall {
     /// The newest nightly build. This control plane runs a build made after
     /// release `after` and before the next one: no release contains it, and
     /// `after` is older. Nightly builds are cut every day from `main`, so
-    /// the newest one contains every change merged before it was cut.
+    /// the newest one contains every change merged before it was cut, but
+    /// not commits made since, nor a branch that never reached `main`.
     Nightly {
         #[schema(example = "v0.1.0-beta.61")]
         after: String,

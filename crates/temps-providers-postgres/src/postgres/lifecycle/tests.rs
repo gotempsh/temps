@@ -1751,6 +1751,65 @@ async fn test_available_tls_accepts_verified_tls_and_plaintext() {
             row.get::<_, bool>(0),
             "still encrypted after the restore recreate"
         );
+        drop(client);
+
+        // A WAL-G restore's data-directory swap rebuilds the container the
+        // same way, for the restored server and when it puts the original
+        // back: the plan reads the TLS before anything changes, and the
+        // rebuild serves it again.
+        let mut swap_parameters = parameters(ServerTlsMode::Available);
+        let swap_object = swap_parameters.as_object_mut().unwrap();
+        swap_object.remove("server_tls_mode");
+        swap_object.remove("server_tls_material");
+        let swap_config = ServiceConfig {
+            name: name.clone(),
+            service_type: ServiceType::Postgres,
+            version: None,
+            parameters: swap_parameters,
+        };
+        let (recreate, binds) = service
+            .plan_swap_recreate(&container, &swap_config, &unsaid, &unsaid, &swap_config)
+            .await?;
+        match &recreate {
+            super::super::restore_swap::SwapRecreate::Managed { kept_tls, .. } => assert_eq!(
+                kept_tls,
+                &Some(InstalledServerTls {
+                    fingerprint_sha256: Some(leaf.fingerprint_sha256.clone())
+                }),
+                "the swap plan must keep the TLS the container serves"
+            ),
+            _ => panic!("a control-plane container is rebuilt from its specification"),
+        }
+        service
+            .roll_back_swap(
+                &container,
+                &unsaid.docker_image,
+                &binds,
+                "/var/lib/postgresql/data",
+                &recreate,
+                false,
+                &unsaid,
+            )
+            .await
+            .map_err(|reason| EngineError::failed(&name, reason))?;
+        let (client, conn) =
+            tokio_postgres::connect(&format!("{base} sslmode=require"), tls.clone())
+                .await
+                .map_err(|e| {
+                    EngineError::failed(&name, format!("TLS lost on the swap rebuild: {e}"))
+                })?;
+        tokio::spawn(conn);
+        let row = client
+            .query_one(
+                "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()",
+                &[],
+            )
+            .await
+            .map_err(|e| EngineError::failed(&name, e.to_string()))?;
+        assert!(
+            row.get::<_, bool>(0),
+            "still encrypted after the swap rebuild"
+        );
 
         // Turning TLS off goes through the reconcile-on-start recreate.
         service

@@ -4,7 +4,8 @@
 //! Periodic container stats polling for the health monitor.
 //!
 //! The health monitor samples every service container once per tick with a
-//! Docker `one_shot` read. Docker zeroes `precpu_stats` on such a read, so a
+//! Docker `one_shot` read, on this host or through the agent of the worker
+//! that runs the container. Docker zeroes `precpu_stats` on such a read, so a
 //! lone response only yields the container's lifetime-average CPU. The rate
 //! here always comes from the poller's own previous sample of the same
 //! container: the tick interval is the rate window.
@@ -13,7 +14,11 @@
 //! CPU limit, so CPU can be reported the way the resources card shows it:
 //! cores used against the limit (or the host's cores when uncapped).
 
-use super::runtime_limits::{compute_stats_sample, sample_container_stats_once};
+use super::runtime_limits::{
+    agent_too_old, compute_stats_sample, empty_stats, no_local_docker_reason, MemberContainer,
+    WorkerClients,
+};
+use crate::remote_service_client::{AgentSupport, ServiceContainerRuntime};
 use crate::services::*;
 use bollard::models::{ContainerCpuStats, ContainerStatsResponse, HostConfig};
 use std::collections::HashMap;
@@ -61,6 +66,20 @@ impl CpuLimit {
             }
             _ => Self::Unlimited,
         }
+    }
+
+    /// The limit a worker's agent reports for a container it found: the
+    /// same `HostConfig` fields, carried by the agent's runtime response.
+    /// `None` when the agent found no such container.
+    pub fn from_agent_runtime(runtime: &ServiceContainerRuntime) -> Option<Self> {
+        runtime.found.then(|| {
+            Self::from_host_config(&HostConfig {
+                nano_cpus: runtime.nano_cpus,
+                cpu_quota: runtime.cpu_quota_us,
+                cpu_period: runtime.cpu_period_us,
+                ..Default::default()
+            })
+        })
     }
 
     /// The limit in cores, `None` when uncapped.
@@ -123,6 +142,16 @@ impl ContainerStatsBaseline {
             cpu_limit: None,
         }
     }
+
+    /// A baseline holding `sample`'s counters and no cached CPU limit, as a
+    /// previous tick that could not read the limit leaves it.
+    pub(crate) fn from_sample_for_test(sample: &ContainerStatsResponse) -> Self {
+        Self {
+            container_id: sample.id.clone(),
+            cpu_stats: sample.cpu_stats.clone(),
+            cpu_limit: None,
+        }
+    }
 }
 
 /// One container's result from a polling tick.
@@ -136,17 +165,12 @@ pub struct PolledContainerStats {
 }
 
 impl PolledContainerStats {
-    fn unavailable(role: String, container_name: String) -> Self {
+    /// A container that could not be sampled this tick, and why when known
+    /// (no local Docker, an unreachable or outdated agent). A missing or
+    /// stopped container has no reason.
+    fn unavailable(member: &MemberContainer, reason: Option<String>) -> Self {
         Self {
-            sample: ContainerStatsSample {
-                role,
-                container_name,
-                cpu_percent: None,
-                memory_usage_bytes: None,
-                memory_limit_bytes: None,
-                memory_percent: None,
-                online_cpus: None,
-            },
+            sample: empty_stats(member, reason),
             cpu_limit: None,
         }
     }
@@ -266,19 +290,20 @@ fn poll_step(
     (polled, baseline)
 }
 
-/// Read the CPU limit Docker applies to `name` right now. `Ok(None)` when
-/// the inspect response carries no `HostConfig`: the cap is unknown, which
-/// is not the same as uncapped.
-async fn read_cpu_limit(
+/// Read the CPU limit Docker applies to `name` on this host right now.
+/// `Ok(None)` when the inspect response carries no `HostConfig`: the cap is
+/// unknown, which is not the same as uncapped.
+async fn read_local_cpu_limit(
     docker: &bollard::Docker,
     name: &str,
-) -> Result<Option<CpuLimit>, bollard::errors::Error> {
+) -> Result<Option<CpuLimit>, String> {
     let info = docker
         .inspect_container(
             name,
             None::<bollard::query_parameters::InspectContainerOptions>,
         )
-        .await?;
+        .await
+        .map_err(|error| format!("failed to inspect container '{name}': {error}"))?;
     Ok(info.host_config.as_ref().map(CpuLimit::from_host_config))
 }
 
@@ -306,10 +331,12 @@ impl ExternalServiceManager {
     /// `None` (memory is still reported) and the baseline is seeded.
     ///
     /// The map is replaced once the pass completes, so it never holds more
-    /// entries than the service has containers: entries for containers that no
-    /// longer back the service are dropped, and entries whose sample failed
-    /// this tick (container stopped / remote node) are carried over unchanged,
-    /// since cumulative counters stay valid across a longer window. It is not
+    /// entries than the service has containers: entries for containers that
+    /// no longer back the service are dropped, and entries whose sample
+    /// failed this tick (container stopped, agent unreachable) are carried
+    /// over unchanged, since cumulative counters stay valid across a longer
+    /// window. A container on a worker is sampled, and its CPU limit read,
+    /// through the node's agent. It is not
     /// touched before then, so a caller whose future is dropped mid-pass (a
     /// manual check whose client disconnected) keeps its baselines.
     pub async fn sample_service_stats(
@@ -318,26 +345,32 @@ impl ExternalServiceManager {
         baselines: &mut HashMap<String, ContainerStatsBaseline>,
     ) -> Result<Vec<PolledContainerStats>, ExternalServiceError> {
         let containers = self.resolve_member_containers(service).await?;
-        let docker = self.docker.get();
 
+        let mut clients = WorkerClients::default();
         let mut members = Vec::with_capacity(containers.len());
         let mut next_baselines = HashMap::with_capacity(containers.len());
 
-        for (role, name) in containers {
-            let previous = baselines.get(&name);
-            let current = match docker {
-                Some(docker) => sample_container_stats_once(docker, &name).await,
-                None => None,
-            };
-            let (Some(docker), Some(current)) = (docker, current) else {
-                // Container missing/stopped, on a remote node, or no local
-                // Docker: keep the old baseline so a later success still has a
-                // valid rate window.
-                if let Some(previous) = previous {
-                    next_baselines.insert(name.clone(), previous.clone());
+        for member in &containers {
+            let name = &member.container_name;
+            let previous = baselines.get(name);
+            // One sample per tick, from this host's Docker or through the
+            // agent of the worker that runs the container.
+            let sampled = self
+                .sample_member(&mut clients, member, 1)
+                .await
+                .map(|samples| samples.into_iter().next());
+            let current = match sampled {
+                Ok(Some(current)) => current,
+                failed => {
+                    // Container missing/stopped, no local Docker, or an
+                    // unreachable agent: keep the old baseline so a later
+                    // success still has a valid rate window.
+                    if let Some(previous) = previous {
+                        next_baselines.insert(name.clone(), previous.clone());
+                    }
+                    members.push(PolledContainerStats::unavailable(member, failed.err()));
+                    continue;
                 }
-                members.push(PolledContainerStats::unavailable(role, name));
-                continue;
             };
 
             let now = Instant::now();
@@ -346,7 +379,7 @@ impl ExternalServiceManager {
             let epoch = self.cpu_limits_epoch();
             let cpu_limit = match fresh_cpu_limit(previous, &current, now, epoch) {
                 Some(cached) => Some(cached),
-                None => match read_cpu_limit(docker, &name).await {
+                None => match self.read_member_cpu_limit(&mut clients, member).await {
                     Ok(Some(limit)) => Some(CachedCpuLimit {
                         limit,
                         read_at: now,
@@ -362,28 +395,69 @@ impl ExternalServiceManager {
                         debug!(
                             service_id = service.id,
                             container = %name,
-                            "Container inspect has no HostConfig; keeping the last known CPU limit"
+                            "Container inspect reported no CPU limit; keeping the last known one"
                         );
                         last_known_cpu_limit(previous, &current, epoch)
                     }
-                    Err(e) => {
+                    Err(reason) => {
                         debug!(
                             service_id = service.id,
                             container = %name,
-                            "Reading the container CPU limit failed, keeping the last known one: {}", e
+                            "Reading the container CPU limit failed, keeping the last known one: {reason}"
                         );
                         last_known_cpu_limit(previous, &current, epoch)
                     }
                 },
             };
 
-            let (polled, baseline) = poll_step(role, name.clone(), previous, current, cpu_limit);
+            let (polled, baseline) = poll_step(
+                member.role.clone(),
+                name.clone(),
+                previous,
+                current,
+                cpu_limit,
+            );
             members.push(polled);
-            next_baselines.insert(name, baseline);
+            next_baselines.insert(name.clone(), baseline);
         }
 
         *baselines = next_baselines;
         Ok(members)
+    }
+
+    /// The CPU limit applied to a member container right now: from this
+    /// host's Docker, or from the agent of the worker that runs it.
+    /// `Ok(None)` when it is unknown (no `HostConfig`, or the agent found no
+    /// such container), which is not the same as uncapped.
+    async fn read_member_cpu_limit(
+        &self,
+        clients: &mut WorkerClients,
+        member: &MemberContainer,
+    ) -> Result<Option<CpuLimit>, String> {
+        let name = &member.container_name;
+        match member.worker() {
+            None => {
+                let docker = self
+                    .docker
+                    .require()
+                    .map_err(|error| no_local_docker_reason(&error))?;
+                read_local_cpu_limit(&docker, name).await
+            }
+            Some(node_id) => {
+                let client = clients.get(self, node_id).await?;
+                match client.service_runtime(name).await {
+                    Ok(AgentSupport::Supported(runtime)) => {
+                        Ok(CpuLimit::from_agent_runtime(&runtime))
+                    }
+                    Ok(AgentSupport::Unsupported) => Err(agent_too_old(
+                        client.node_name(),
+                        node_id,
+                        "container runtime state",
+                    )),
+                    Err(error) => Err(error.to_string()),
+                }
+            }
+        }
     }
 }
 

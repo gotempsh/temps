@@ -815,6 +815,7 @@ mod tests {
                     environment_id: None,
                     gate: None,
                     shield: None,
+                    allowed_callers: Vec::new(),
                 },
                 address_id: format!("a{i}"),
                 range: "100.64.0.0/10".into(),

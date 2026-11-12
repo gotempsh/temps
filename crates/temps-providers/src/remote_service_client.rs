@@ -17,9 +17,30 @@ pub use temps_providers_core::remote_params::{RemotePortMapping, RemoteServiceCr
 use crate::services::ExternalServiceError;
 use crate::workload::ServiceWorkloadError;
 pub use temps_service_protocol::{
+    MariadbBinlogArchiveRequest, MariadbBinlogArchiveResult, MariadbBinlogCoordinate,
+    MariadbDumpBackupRequest, MariadbDumpBackupResult, MariadbPhysicalBackupRequest,
+    MariadbPhysicalBackupResult, MariadbRestoreRequest, MariadbRestoreResult, MongodbBackupMode,
+    MongodbBackupRequest, MongodbBackupResult, MongodbRestoreRequest, MongodbRestoreResult,
+    PostgresWalgArchiveRequest, PostgresWalgArchiveResult, PostgresWalgBackupOutcomeRequest,
+    PostgresWalgBackupProgress, PostgresWalgBackupRequest, PostgresWalgBackupResult,
+    PostgresWalgCredentialsRequest, PostgresWalgCredentialsResult, PostgresWalgRestoreRequest,
+    PostgresWalgRestoreResult, RecoveryTarget, RedisRdbBackupRequest, RedisRdbBackupResult,
+    RedisRestoreRequest, RedisRestoreResult, RedisWalgBackupRequest, RedisWalgBackupResult,
     RemoteHealthProbeRequest, RemoteHealthProbeResponse, RemoteRuntimeEnvRequest,
-    RemoteRuntimeEnvResponse,
+    RemoteRuntimeEnvResponse, RemoteServiceBackupRequest, RemoteServiceBackupResponse,
+    RemoteServiceRestoreRequest, RemoteServiceRestoreResponse, RemoteWalHealthRequest,
+    RemoteWalHealthResponse, ServiceContainerRuntime, ServiceContainerStats, WorkerRestoreEngine,
+    WorkerRestoreOutcomeRequest, WorkerRestoreProgress, WorkerRestoreResult, WorkerS3Destination,
 };
+
+/// Whether a node's agent has a route this release added. An agent that
+/// predates it is not failing: the caller says which agent to update rather
+/// than reporting an error.
+#[derive(Debug)]
+pub enum AgentSupport<T> {
+    Supported(T),
+    Unsupported,
+}
 
 /// Response envelope from the agent API (mirrors `AgentResponse` in temps-node-agent).
 #[derive(Deserialize)]
@@ -32,6 +53,20 @@ struct AgentResponse<T> {
 const MAX_AGENT_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_HEALTH_ERROR_BYTES: usize = 2 * 1024;
 const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Runtime and stats are read on every poll of the service page; two stats
+/// samples take a second on the agent.
+const OBSERVE_TIMEOUT: Duration = Duration::from_secs(10);
+/// The WAL probe's connect and its queries are bounded at 5s each on the
+/// agent, after a container inspection.
+const WAL_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+/// A worker backup or restore streams the whole dataset; the agent bounds
+/// its own work by the same deadline.
+pub const DATA_OPERATION_TIMEOUT: Duration = Duration::from_secs(6 * 3600);
+
+/// How long the agent has to say where a restore is: it reads an in-memory
+/// record, so a slow answer means the node is unreachable, and the caller
+/// asks again later.
+const RESTORE_OUTCOME_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Lightweight client for the agent's service endpoints.
 pub struct RemoteServiceClient {
@@ -387,6 +422,17 @@ impl RemoteServiceClient {
             .await
     }
 
+    /// Preview the runtime environment a project environment would receive
+    /// from a service on the remote node, with nothing provisioned there.
+    pub async fn preview_runtime_env_vars(
+        &self,
+        request: RemoteRuntimeEnvRequest,
+    ) -> Result<RemoteRuntimeEnvResponse, ExternalServiceError> {
+        // The service config holds the service's credentials.
+        self.agent_post_sealed("/agent/services/runtime-env-preview", &request)
+            .await
+    }
+
     /// Revoke the per-environment storage credentials a project link
     /// provisioned on the worker that owns the service. Unlinking must not
     /// leave working keys behind, and the control plane has no route to the
@@ -403,6 +449,368 @@ impl RemoteServiceClient {
         self.agent_post_sealed::<_, String>("/agent/services/revoke-s3-access", &request)
             .await
             .map(|_| ())
+    }
+
+    /// Back up a service on the worker that runs it, with the engine's own
+    /// tool, straight into the destination bucket. The destination's
+    /// credentials and the service's travel only in the sealed body.
+    pub async fn backup_service(
+        &self,
+        request: &RemoteServiceBackupRequest,
+    ) -> Result<RemoteServiceBackupResponse, ExternalServiceError> {
+        info!(
+            service = %request.service_config.name,
+            node = %self.node_name,
+            bucket = %request.destination.bucket,
+            key = %request.key,
+            "Backing up an external service on its remote node"
+        );
+        self.agent_post_with_timeout(
+            "/agent/services/data-backup",
+            request,
+            DATA_OPERATION_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Restore a service in place on the worker that runs it, from a backup
+    /// [`Self::backup_service`] wrote.
+    pub async fn restore_service(
+        &self,
+        request: &RemoteServiceRestoreRequest,
+    ) -> Result<RemoteServiceRestoreResponse, ExternalServiceError> {
+        info!(
+            service = %request.service_config.name,
+            node = %self.node_name,
+            location = %request.location,
+            "Restoring an external service on its remote node"
+        );
+        self.agent_post_with_timeout(
+            "/agent/services/data-restore",
+            request,
+            DATA_OPERATION_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Take a WAL-G base backup of a PostgreSQL service on the worker that
+    /// runs it, with the control plane's own engine (ADR-099). The
+    /// destination's credentials and the service's travel only in the
+    /// sealed body.
+    pub async fn postgres_walg_backup(
+        &self,
+        request: &PostgresWalgBackupRequest,
+    ) -> Result<PostgresWalgBackupResult, ExternalServiceError> {
+        info!(
+            service = %request.service_config.name,
+            service_id = request.service_id,
+            node = %self.node_name,
+            bucket = %request.destination.bucket,
+            allow_restart = request.allow_restart,
+            "Taking a WAL-G base backup of a PostgreSQL service on its remote node"
+        );
+        self.agent_post_with_timeout(
+            "/agent/services/postgres/walg-backup",
+            request,
+            DATA_OPERATION_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Where the WAL-G base backup a [`Self::postgres_walg_backup`] request
+    /// started under `backup_uuid` is on the remote node: asked for when
+    /// that request went unanswered, as the node's backup runs on without
+    /// it. Read-only.
+    pub async fn postgres_walg_backup_outcome(
+        &self,
+        request: &PostgresWalgBackupOutcomeRequest,
+    ) -> Result<PostgresWalgBackupProgress, ExternalServiceError> {
+        self.agent_post_with_timeout(
+            "/agent/services/postgres/walg-backup/outcome",
+            request,
+            RESTORE_OUTCOME_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Point a worker PostgreSQL's continuous archiving at another S3
+    /// source, without a base backup. The source's credentials travel
+    /// sealed; an agent without the route is told to update.
+    pub async fn postgres_walg_archive(
+        &self,
+        request: &PostgresWalgArchiveRequest,
+    ) -> Result<PostgresWalgArchiveResult, ExternalServiceError> {
+        info!(
+            service = %request.service_config.name,
+            service_id = request.service_id,
+            node = %self.node_name,
+            bucket = %request.destination.bucket,
+            "Pointing a remote PostgreSQL service's WAL-G archiving at an S3 source"
+        );
+        self.agent_post_with_timeout(
+            "/agent/services/postgres/walg-archive",
+            request,
+            DATA_OPERATION_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Refresh the credential a worker PostgreSQL's continuous archiving
+    /// reads (ADR-102). Travels sealed; an agent without the route is told
+    /// to update.
+    pub async fn postgres_walg_credentials(
+        &self,
+        request: &PostgresWalgCredentialsRequest,
+    ) -> Result<PostgresWalgCredentialsResult, ExternalServiceError> {
+        info!(
+            service = %request.service_config.name,
+            service_id = request.service_id,
+            node = %self.node_name,
+            bucket = %request.destination.bucket,
+            "Refreshing a remote PostgreSQL service's WAL-G archiving credential"
+        );
+        self.agent_post_with_timeout(
+            "/agent/services/postgres/walg-credentials",
+            request,
+            DATA_OPERATION_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Restore a worker's PostgreSQL from WAL-G, in place or to a point in
+    /// time, with the control plane's own restore run by the node's agent.
+    /// The S3 source's credentials and the logins travel sealed; an agent
+    /// without the route is told to update.
+    pub async fn postgres_walg_restore(
+        &self,
+        request: &PostgresWalgRestoreRequest,
+    ) -> Result<PostgresWalgRestoreResult, ExternalServiceError> {
+        info!(
+            service = %request.live_service_config.name,
+            service_id = request.service_id,
+            node = %self.node_name,
+            bucket = %request.source.bucket,
+            pitr = request.recovery_target.is_some(),
+            "Restoring a PostgreSQL service on its remote node from WAL-G"
+        );
+        self.agent_post_with_timeout(
+            "/agent/services/postgres/walg-restore",
+            request,
+            DATA_OPERATION_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Where a worker restore (WAL-G, MongoDB, Redis or MariaDB) started
+    /// with an `operation_id` is on its node: still running, finished with
+    /// an outcome, or ended without one. Asked when the restore's own
+    /// request went unanswered, so the run it belongs to is completed from
+    /// what the node actually did.
+    pub async fn worker_restore_outcome(
+        &self,
+        request: &WorkerRestoreOutcomeRequest,
+    ) -> Result<WorkerRestoreProgress, ExternalServiceError> {
+        self.agent_post_with_timeout(
+            "/agent/services/restore/outcome",
+            request,
+            RESTORE_OUTCOME_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Back up a worker's MongoDB with the control plane's own engine, run
+    /// by the node's agent (ADR-099): a WAL-G stream when the image has
+    /// WAL-G, else a mongodump archive. The destination's credentials and
+    /// the service's travel only in the sealed body; an agent without the
+    /// route is told to update.
+    pub async fn mongodb_backup(
+        &self,
+        request: &MongodbBackupRequest,
+    ) -> Result<MongodbBackupResult, ExternalServiceError> {
+        info!(
+            service = %request.service_config.name,
+            service_id = request.service_id,
+            node = %self.node_name,
+            bucket = %request.destination.bucket,
+            "Backing up a MongoDB service on its remote node"
+        );
+        self.agent_post_with_timeout(
+            "/agent/services/mongodb/backup",
+            request,
+            DATA_OPERATION_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Restore a worker's MongoDB in place with the control plane's own
+    /// restore, run by the node's agent. The source's credentials and the
+    /// logins travel sealed; an agent without the route is told to update.
+    pub async fn mongodb_restore(
+        &self,
+        request: &MongodbRestoreRequest,
+    ) -> Result<MongodbRestoreResult, ExternalServiceError> {
+        info!(
+            service = %request.service_config.name,
+            service_id = request.service_id,
+            node = %self.node_name,
+            bucket = %request.source.bucket,
+            location = %request.location,
+            "Restoring a MongoDB service on its remote node"
+        );
+        self.agent_post_with_timeout(
+            "/agent/services/mongodb/restore",
+            request,
+            DATA_OPERATION_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Push a WAL-G stream backup of a Redis service on the worker that runs
+    /// it, with the control plane's own Redis engine (ADR-099). The source's
+    /// credentials and the service's password travel only sealed; an agent
+    /// without the route is told to update.
+    pub async fn redis_walg_backup(
+        &self,
+        request: &RedisWalgBackupRequest,
+    ) -> Result<RedisWalgBackupResult, ExternalServiceError> {
+        info!(
+            service = %request.service_config.name,
+            service_id = request.service_id,
+            node = %self.node_name,
+            bucket = %request.destination.bucket,
+            "Pushing a WAL-G stream backup of a Redis service on its remote node"
+        );
+        self.agent_post_with_timeout(
+            "/agent/services/redis/walg-backup",
+            request,
+            DATA_OPERATION_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Take an RDB backup of a worker's Redis (an image without WAL-G) with
+    /// the control plane's own pinned helper, run by the node's agent.
+    pub async fn redis_rdb_backup(
+        &self,
+        request: &RedisRdbBackupRequest,
+    ) -> Result<RedisRdbBackupResult, ExternalServiceError> {
+        info!(
+            service = %request.service_config.name,
+            service_id = request.service_id,
+            node = %self.node_name,
+            bucket = %request.destination.bucket,
+            key = %request.key,
+            "Taking an RDB backup of a Redis service on its remote node"
+        );
+        self.agent_post_with_timeout(
+            "/agent/services/redis/rdb-backup",
+            request,
+            DATA_OPERATION_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Restore a worker's Redis in place with the provider's own restore,
+    /// run by the node's agent.
+    pub async fn redis_restore(
+        &self,
+        request: &RedisRestoreRequest,
+    ) -> Result<RedisRestoreResult, ExternalServiceError> {
+        info!(
+            service = %request.service_config.name,
+            service_id = request.service_id,
+            node = %self.node_name,
+            bucket = %request.source.bucket,
+            keep_target_bookkeeping = request.keep_target_bookkeeping,
+            "Restoring a Redis service on its remote node"
+        );
+        self.agent_post_with_timeout(
+            "/agent/services/redis/restore",
+            request,
+            DATA_OPERATION_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Push a WAL-G physical base backup of a worker's MariaDB with the
+    /// control plane's own engine, run by the node's agent. The S3 source's
+    /// credentials travel sealed; an agent without the route is told to
+    /// update.
+    pub async fn mariadb_physical_backup(
+        &self,
+        request: &MariadbPhysicalBackupRequest,
+    ) -> Result<MariadbPhysicalBackupResult, ExternalServiceError> {
+        info!(
+            service = %request.service_config.name,
+            service_id = request.service_id,
+            node = %self.node_name,
+            bucket = %request.destination.bucket,
+            "Backing up a MariaDB service on its remote node with WAL-G"
+        );
+        self.agent_post_with_timeout(
+            "/agent/services/mariadb/physical-backup",
+            request,
+            DATA_OPERATION_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Dump a worker's MariaDB to S3 with the control plane's own dump,
+    /// run by the node's agent.
+    pub async fn mariadb_dump_backup(
+        &self,
+        request: &MariadbDumpBackupRequest,
+    ) -> Result<MariadbDumpBackupResult, ExternalServiceError> {
+        info!(
+            service = %request.service_config.name,
+            service_id = request.service_id,
+            node = %self.node_name,
+            bucket = %request.destination.bucket,
+            key = %request.key,
+            "Dumping a MariaDB service on its remote node"
+        );
+        self.agent_post_with_timeout(
+            "/agent/services/mariadb/dump-backup",
+            request,
+            DATA_OPERATION_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Restore a worker's MariaDB in place, or to a point in time, with the
+    /// control plane's own restore run by the node's agent.
+    pub async fn mariadb_restore(
+        &self,
+        request: &MariadbRestoreRequest,
+    ) -> Result<MariadbRestoreResult, ExternalServiceError> {
+        info!(
+            service = %request.service_config.name,
+            service_id = request.service_id,
+            node = %self.node_name,
+            bucket = %request.source.bucket,
+            pitr = request.recovery_target.is_some(),
+            "Restoring a MariaDB service on its remote node"
+        );
+        self.agent_post_with_timeout(
+            "/agent/services/mariadb/restore",
+            request,
+            DATA_OPERATION_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Ship a worker's MariaDB binary logs to its S3 source with the
+    /// control plane's own archiver, run by the node's agent.
+    pub async fn mariadb_binlog_archive(
+        &self,
+        request: &MariadbBinlogArchiveRequest,
+    ) -> Result<MariadbBinlogArchiveResult, ExternalServiceError> {
+        self.agent_post_with_timeout(
+            "/agent/services/mariadb/binlog-archive",
+            request,
+            DATA_OPERATION_TIMEOUT,
+        )
+        .await
     }
 
     /// Run the provider's authenticated health probe inside the worker that
@@ -448,6 +856,126 @@ impl RemoteServiceClient {
             WORKLOAD_SNAPSHOT_TIMEOUT,
         )
         .await
+    }
+
+    /// The lifecycle state of a service container on the remote node (status,
+    /// restarts, OOM kill, applied limits). An agent from before this route
+    /// answers [`AgentSupport::Unsupported`].
+    pub async fn service_runtime(
+        &self,
+        container_name: &str,
+    ) -> Result<AgentSupport<ServiceContainerRuntime>, ExternalServiceError> {
+        let path = format!("/agent/services/{}/runtime", container_name);
+        let request = self
+            .client
+            .get(format!("{}{}", self.agent_url, path))
+            .timeout(OBSERVE_TIMEOUT);
+        self.agent_call_if_supported(request, &path).await
+    }
+
+    /// Raw one-shot stats samples of a service container on the remote node,
+    /// oldest first, a second apart (`samples` is 1 or 2). An agent from
+    /// before this route answers [`AgentSupport::Unsupported`].
+    pub async fn service_stats(
+        &self,
+        container_name: &str,
+        samples: usize,
+    ) -> Result<AgentSupport<ServiceContainerStats>, ExternalServiceError> {
+        let path = format!("/agent/services/{}/stats", container_name);
+        let samples = samples.clamp(1, temps_service_protocol::MAX_SERVICE_STATS_SAMPLES);
+        let request = self
+            .client
+            .get(format!("{}{}?samples={}", self.agent_url, path, samples))
+            .timeout(OBSERVE_TIMEOUT);
+        self.agent_call_if_supported(request, &path).await
+    }
+
+    /// Run the Postgres WAL and archive probe on the node that owns the
+    /// service. The service config holds its password, so the body is
+    /// sealed to the node. An agent from before this route answers
+    /// [`AgentSupport::Unsupported`].
+    pub async fn probe_wal_health(
+        &self,
+        request: RemoteWalHealthRequest,
+    ) -> Result<AgentSupport<RemoteWalHealthResponse>, ExternalServiceError> {
+        info!(
+            service = %request.service_config.name,
+            node = %self.node_name,
+            "Probing Postgres WAL health on remote node"
+        );
+        let path = "/agent/services/wal-health";
+        let builder = self
+            .client
+            .post(format!("{}{}", self.agent_url, path))
+            .timeout(WAL_PROBE_TIMEOUT);
+        let builder = self
+            .with_sealed_body(builder, path, &request)
+            .map_err(|error| ExternalServiceError::InternalError {
+                reason: error.to_string(),
+            })?;
+        let mut response: AgentSupport<RemoteWalHealthResponse> =
+            self.agent_call_if_supported(builder, path).await?;
+        if let AgentSupport::Supported(RemoteWalHealthResponse {
+            error: Some(error), ..
+        }) = &mut response
+        {
+            truncate_utf8(error, MAX_HEALTH_ERROR_BYTES);
+        }
+        Ok(response)
+    }
+
+    /// Send `builder` with this client's token. A route the agent does not
+    /// have (`404`, or `405` where the path matches another route's pattern)
+    /// is [`AgentSupport::Unsupported`]; any other failure is an error.
+    async fn agent_call_if_supported<T: for<'de> Deserialize<'de>>(
+        &self,
+        builder: reqwest::RequestBuilder,
+        path: &str,
+    ) -> Result<AgentSupport<T>, ExternalServiceError> {
+        let url = format!("{}{}", self.agent_url, path);
+        let response = builder.bearer_auth(&self.token).send().await.map_err(|e| {
+            ExternalServiceError::InternalError {
+                reason: format!(
+                    "Failed to reach agent on node {} at {}: {}",
+                    self.node_name, url, e
+                ),
+            }
+        })?;
+        if matches!(
+            response.status(),
+            reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED
+        ) {
+            return Ok(AgentSupport::Unsupported);
+        }
+        // Only a sealed request gets this: the agent predates sealing.
+        if response.status() == reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE {
+            return Err(self.older_agent_error());
+        }
+        let (status, body): (_, AgentResponse<T>) =
+            self.decode_agent_response(response, &url).await?;
+        if !body.success {
+            let mut error = body.error.unwrap_or_default();
+            truncate_utf8(&mut error, MAX_HEALTH_ERROR_BYTES);
+            return Err(ExternalServiceError::InternalError {
+                reason: format!(
+                    "Agent on node {} returned error ({}): {}",
+                    self.node_name, status, error
+                ),
+            });
+        }
+        body.data
+            .map(AgentSupport::Supported)
+            .ok_or_else(|| ExternalServiceError::InternalError {
+                reason: format!(
+                    "Agent on node {} returned success but no data at {}",
+                    self.node_name, url
+                ),
+            })
+    }
+
+    /// The node this client talks to, for messages.
+    pub fn node_name(&self) -> &str {
+        &self.node_name
     }
 
     /// Create (or, with `replace_existing`, recreate) a database container
@@ -659,20 +1187,53 @@ impl RemoteServiceClient {
             })?
             .send()
             .await
-            .map_err(|error| ExternalServiceError::InternalError {
-                reason: format!(
-                    "Failed to reach agent on node {} at {}: {}",
-                    self.node_name, url, error
-                ),
+            .map_err(|error| {
+                // Not connected: the request never reached the agent.
+                if error.is_connect() {
+                    return ExternalServiceError::InternalError {
+                        reason: format!(
+                            "Failed to reach agent on node {} at {}: {}",
+                            self.node_name, url, error
+                        ),
+                    };
+                }
+                // Sent, then a timeout or a dropped connection: the agent may
+                // have started the operation, and may still be running it.
+                ExternalServiceError::AgentUnanswered {
+                    node: self.node_name.clone(),
+                    route: path.to_string(),
+                    detail: format!("{url}: {error}"),
+                }
             })?;
         if response.status() == reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE {
             return Err(self.older_agent_error());
+        }
+        if matches!(
+            response.status(),
+            reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED
+        ) {
+            return Err(ExternalServiceError::InternalError {
+                reason: format!(
+                    "The agent on node {} has no {path} route: it predates this server. \
+                     Update the node's agent to this release",
+                    self.node_name
+                ),
+            });
         }
         let (status, body): (_, AgentResponse<T>) =
             self.decode_agent_response(response, &url).await?;
         if !body.success {
             let mut error = body.error.unwrap_or_default();
             truncate_utf8(&mut error, MAX_HEALTH_ERROR_BYTES);
+            // The node runs its maximum of backups and restores: nothing ran,
+            // and the caller decides whether to wait for a slot.
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                return Err(ExternalServiceError::NodeBusy {
+                    node: self.node_name.clone(),
+                    route: path.to_string(),
+                    detail: error,
+                });
+            }
             return Err(ExternalServiceError::InternalError {
                 reason: format!(
                     "Agent on node {} returned error ({}): {}",
@@ -820,6 +1381,9 @@ fn truncate_utf8(value: &mut String, max_bytes: usize) {
     value.truncate(boundary);
     value.push('…');
 }
+
+#[cfg(test)]
+mod observe_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1387,6 +1951,1145 @@ mod tests {
             Some("postgres://app:secret@postgres-orders-db:5432/storefront_production")
         );
         server.abort();
+    }
+
+    /// The console's per-environment preview of a worker service reaches the
+    /// agent's preview route, sealed, never the provisioning one.
+    #[tokio::test]
+    async fn a_runtime_preview_is_sealed_to_the_agents_preview_route() {
+        async fn handler(headers: HeaderMap, sealed: axum::body::Bytes) -> Json<serde_json::Value> {
+            let request: RemoteRuntimeEnvRequest =
+                open_for_test(&headers, "/agent/services/runtime-env-preview", &sealed);
+            assert_eq!(request.service_config.name, "orders-db");
+            assert_eq!(request.project_slug, "storefront");
+            Json(serde_json::json!({
+                "success": true,
+                "data": {"environment": {"POSTGRES_DATABASE": "storefront_production"}},
+                "error": null
+            }))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/agent/services/runtime-env-preview", post(handler)),
+            )
+            .await
+            .unwrap();
+        });
+
+        let client = RemoteServiceClient::new(
+            format!("http://{address}"),
+            "node-token".to_string(),
+            "worker-1".to_string(),
+        )
+        .unwrap()
+        .with_sealing(test_sealing());
+        let response = client
+            .preview_runtime_env_vars(RemoteRuntimeEnvRequest {
+                service_config: ServiceConfig {
+                    name: "orders-db".to_string(),
+                    service_type: ServiceType::Postgres,
+                    version: None,
+                    parameters: serde_json::json!({"host": "localhost", "password": "secret"}),
+                },
+                project_slug: "storefront".to_string(),
+                environment_slug: "production".to_string(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response
+                .environment
+                .get("POSTGRES_DATABASE")
+                .map(String::as_str),
+            Some("storefront_production")
+        );
+        server.abort();
+    }
+
+    fn worker_destination() -> WorkerS3Destination {
+        WorkerS3Destination {
+            bucket: "backups".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint: Some("https://s3.example.test".to_string()),
+            force_path_style: true,
+            access_key_id: "AKIAEXAMPLE".to_string(),
+            secret_access_key: "destination-secret".to_string(),
+            session_token: Some("destination-session".to_string()),
+        }
+    }
+
+    /// A worker backup and restore reach the agent sealed, with the node
+    /// token, and nothing secret is readable on the wire.
+    #[tokio::test]
+    async fn worker_backups_and_restores_are_sealed_to_the_node() {
+        async fn backup(headers: HeaderMap, sealed: axum::body::Bytes) -> Json<serde_json::Value> {
+            assert_eq!(
+                headers
+                    .get(AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok()),
+                Some("Bearer node-token")
+            );
+            let wire = String::from_utf8_lossy(&sealed);
+            assert!(!wire.contains("destination-secret"));
+            assert!(!wire.contains("cache-password"));
+            let request: RemoteServiceBackupRequest =
+                open_for_test(&headers, "/agent/services/data-backup", &sealed);
+            assert_eq!(request.service_config.name, "cache");
+            assert_eq!(request.key, "redis/cache/u1/dump.rdb.gz");
+            assert_eq!(
+                request.destination.session_token.as_deref(),
+                Some("destination-session")
+            );
+            Json(serde_json::json!({
+                "success": true,
+                "data": { "size_bytes": 4096, "buckets": [] },
+                "error": null
+            }))
+        }
+        async fn restore(headers: HeaderMap, sealed: axum::body::Bytes) -> Json<serde_json::Value> {
+            let request: RemoteServiceRestoreRequest =
+                open_for_test(&headers, "/agent/services/data-restore", &sealed);
+            assert_eq!(request.location, "redis/cache/u1/dump.rdb.gz");
+            Json(serde_json::json!({ "success": true, "data": {}, "error": null }))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/agent/services/data-backup", post(backup))
+                    .route("/agent/services/data-restore", post(restore)),
+            )
+            .await
+            .unwrap();
+        });
+        let client = RemoteServiceClient::new(
+            format!("http://{address}"),
+            "node-token".to_string(),
+            "worker-1".to_string(),
+        )
+        .unwrap()
+        .with_sealing(test_sealing());
+        let config = ServiceConfig {
+            name: "cache".to_string(),
+            service_type: ServiceType::Redis,
+            version: None,
+            parameters: serde_json::json!({"host": "localhost", "password": "cache-password"}),
+        };
+        let response = client
+            .backup_service(&RemoteServiceBackupRequest {
+                service_config: config.clone(),
+                destination: worker_destination(),
+                key: "redis/cache/u1/dump.rdb.gz".to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(response.size_bytes, 4096);
+        client
+            .restore_service(&RemoteServiceRestoreRequest {
+                service_config: config,
+                source: worker_destination(),
+                location: "redis/cache/u1/dump.rdb.gz".to_string(),
+                operation_id: None,
+            })
+            .await
+            .unwrap();
+        server.abort();
+    }
+
+    /// An agent from before worker backups is named, with what to do.
+    #[tokio::test]
+    async fn an_agent_without_the_backup_route_is_told_to_update() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new()).await.unwrap();
+        });
+        let client = RemoteServiceClient::new(
+            format!("http://{address}"),
+            "node-token".to_string(),
+            "worker-1".to_string(),
+        )
+        .unwrap()
+        .with_sealing(test_sealing());
+        let error = client
+            .backup_service(&RemoteServiceBackupRequest {
+                service_config: ServiceConfig {
+                    name: "cache".to_string(),
+                    service_type: ServiceType::Redis,
+                    version: None,
+                    parameters: serde_json::json!({}),
+                },
+                destination: worker_destination(),
+                key: "k/dump.rdb.gz".to_string(),
+            })
+            .await
+            .expect_err("an older agent cannot back up");
+        server.abort();
+        let message = error.to_string();
+        assert!(message.contains("worker-1"), "{message}");
+        assert!(message.contains("/agent/services/data-backup"), "{message}");
+        assert!(message.contains("Update the node's agent"), "{message}");
+    }
+
+    /// A backup whose request went unanswered is followed under its id: the
+    /// outcome request names the service and the backup, and the node's
+    /// answer comes back as it is.
+    #[tokio::test]
+    async fn a_walg_backup_outcome_is_asked_for_by_its_id() {
+        async fn outcome(headers: HeaderMap, sealed: axum::body::Bytes) -> Json<serde_json::Value> {
+            let request: PostgresWalgBackupOutcomeRequest = open_for_test(
+                &headers,
+                "/agent/services/postgres/walg-backup/outcome",
+                &sealed,
+            );
+            assert_eq!(request.service, "orders");
+            assert_eq!(request.backup_uuid, "u-1");
+            Json(serde_json::json!({
+                "success": true,
+                "data": {"state": "running"},
+                "error": null
+            }))
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/agent/services/postgres/walg-backup/outcome",
+                    post(outcome),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        let progress = RemoteServiceClient::new(
+            format!("http://{address}"),
+            "node-token".to_string(),
+            "worker-1".to_string(),
+        )
+        .unwrap()
+        .with_sealing(test_sealing())
+        .postgres_walg_backup_outcome(&PostgresWalgBackupOutcomeRequest {
+            service: "orders".to_string(),
+            backup_uuid: "u-1".to_string(),
+        })
+        .await
+        .unwrap();
+        server.abort();
+        assert_eq!(progress, PostgresWalgBackupProgress::Running);
+    }
+
+    /// A WAL-G base backup reaches the node sealed, with the destination's
+    /// credentials and nothing the node could run, and the engine's outcome
+    /// comes back as it is. An agent without the route is told to update.
+    #[tokio::test]
+    async fn a_walg_backup_is_sealed_to_the_node_and_its_outcome_returned() {
+        async fn walg(headers: HeaderMap, sealed: axum::body::Bytes) -> Json<serde_json::Value> {
+            let request: PostgresWalgBackupRequest =
+                open_for_test(&headers, "/agent/services/postgres/walg-backup", &sealed);
+            assert_eq!(request.service_id, 8);
+            assert_eq!(request.node_id, 2);
+            assert_eq!(request.bucket_path, "base");
+            assert!(!request.allow_restart);
+            assert_eq!(
+                request.destination.session_token.as_deref(),
+                Some("destination-session")
+            );
+            Json(serde_json::json!({
+                "success": true,
+                "data": {
+                    "status": "completed",
+                    "restarted": false,
+                    "stdout": "",
+                    "stderr": "INFO: Wrote backup with name base_000000010000000000000003",
+                    "lsn": "0/3000060"
+                },
+                "error": null
+            }))
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/agent/services/postgres/walg-backup", post(walg)),
+            )
+            .await
+            .unwrap();
+        });
+        let client = |address: std::net::SocketAddr| {
+            RemoteServiceClient::new(
+                format!("http://{address}"),
+                "node-token".to_string(),
+                "worker-1".to_string(),
+            )
+            .unwrap()
+            .with_sealing(test_sealing())
+        };
+        let request = PostgresWalgBackupRequest {
+            service_id: 8,
+            node_id: 2,
+            service_config: ServiceConfig {
+                name: "orders".to_string(),
+                service_type: ServiceType::Postgres,
+                version: None,
+                parameters: serde_json::json!({"host": "localhost", "password": "db-password"}),
+            },
+            destination: worker_destination(),
+            bucket_path: "base".to_string(),
+            backup_uuid: "u-1".to_string(),
+            allow_restart: false,
+        };
+        let outcome = client(address)
+            .postgres_walg_backup(&request)
+            .await
+            .unwrap();
+        server.abort();
+        assert_eq!(
+            outcome,
+            PostgresWalgBackupResult::Completed {
+                restarted: false,
+                stdout: String::new(),
+                stderr: "INFO: Wrote backup with name base_000000010000000000000003".to_string(),
+                lsn: Some("0/3000060".to_string()),
+            }
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let older = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new()).await.unwrap();
+        });
+        let error = client(older)
+            .postgres_walg_backup(&request)
+            .await
+            .expect_err("an older agent cannot take a WAL-G backup");
+        server.abort();
+        let message = error.to_string();
+        assert!(
+            message.contains("/agent/services/postgres/walg-backup"),
+            "{message}"
+        );
+        assert!(message.contains("Update the node's agent"), "{message}");
+    }
+
+    /// A MongoDB backup and restore reach the node sealed, with the
+    /// destination's credentials and the origin's password unreadable on
+    /// the wire, and their outcomes come back as they are. An agent without
+    /// the routes is told to update, never served another path.
+    #[tokio::test]
+    async fn mongodb_backups_and_restores_are_sealed_to_the_node() {
+        async fn backup(headers: HeaderMap, sealed: axum::body::Bytes) -> Json<serde_json::Value> {
+            for secret in ["destination-secret", "db-password"] {
+                assert!(
+                    !String::from_utf8_lossy(&sealed).contains(secret),
+                    "{secret} readable on the wire"
+                );
+            }
+            let request: MongodbBackupRequest =
+                open_for_test(&headers, "/agent/services/mongodb/backup", &sealed);
+            assert_eq!(request.service_id, 8);
+            assert_eq!(request.bucket_path, "base");
+            assert_eq!(request.backup_uuid, "u-1");
+            Json(serde_json::json!({
+                "success": true,
+                "data": {"status": "walg_stream", "stdout": "", "stderr": "done"},
+                "error": null
+            }))
+        }
+        async fn restore(headers: HeaderMap, sealed: axum::body::Bytes) -> Json<serde_json::Value> {
+            assert!(!String::from_utf8_lossy(&sealed).contains("origin-password"));
+            let request: MongodbRestoreRequest =
+                open_for_test(&headers, "/agent/services/mongodb/restore", &sealed);
+            assert_eq!(request.origin_password.as_deref(), Some("origin-password"));
+            assert_eq!(request.location, "s3://backups/walg");
+            Json(serde_json::json!({
+                "success": true,
+                "data": {"status": "failed", "reason": "no backups"},
+                "error": null
+            }))
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/agent/services/mongodb/backup", post(backup))
+                    .route("/agent/services/mongodb/restore", post(restore)),
+            )
+            .await
+            .unwrap();
+        });
+        let client = |address: std::net::SocketAddr| {
+            RemoteServiceClient::new(
+                format!("http://{address}"),
+                "node-token".to_string(),
+                "worker-1".to_string(),
+            )
+            .unwrap()
+            .with_sealing(test_sealing())
+        };
+        let config = ServiceConfig {
+            name: "orders".to_string(),
+            service_type: ServiceType::Mongodb,
+            version: None,
+            parameters: serde_json::json!({"host": "localhost", "password": "db-password"}),
+        };
+        let backup_request = MongodbBackupRequest {
+            service_id: 8,
+            node_id: 2,
+            service_config: config.clone(),
+            destination: worker_destination(),
+            bucket_path: "base".to_string(),
+            backup_uuid: "u-1".to_string(),
+            mode: MongodbBackupMode::WalgStream,
+        };
+        let restore_request = MongodbRestoreRequest {
+            service_id: 8,
+            node_id: 2,
+            service_config: config,
+            origin_password: Some("origin-password".to_string()),
+            source: worker_destination(),
+            location: "s3://backups/walg".to_string(),
+            operation_id: None,
+        };
+        assert_eq!(
+            client(address)
+                .mongodb_backup(&backup_request)
+                .await
+                .unwrap(),
+            MongodbBackupResult::WalgStream {
+                stdout: String::new(),
+                stderr: "done".to_string()
+            }
+        );
+        assert_eq!(
+            client(address)
+                .mongodb_restore(&restore_request)
+                .await
+                .unwrap(),
+            MongodbRestoreResult::Failed {
+                reason: "no backups".to_string()
+            }
+        );
+        server.abort();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let older = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new()).await.unwrap();
+        });
+        let backup_error = client(older)
+            .mongodb_backup(&backup_request)
+            .await
+            .expect_err("an older agent cannot back up MongoDB with the engine");
+        let restore_error = client(older)
+            .mongodb_restore(&restore_request)
+            .await
+            .expect_err("an older agent cannot restore MongoDB with the engine");
+        server.abort();
+        for (error, route) in [
+            (backup_error, "/agent/services/mongodb/backup"),
+            (restore_error, "/agent/services/mongodb/restore"),
+        ] {
+            let message = error.to_string();
+            assert!(message.contains(route), "{message}");
+            assert!(message.contains("Update the node's agent"), "{message}");
+        }
+    }
+
+    /// Each Redis operation reaches the node sealed, with the credentials
+    /// only in the body, the node's outcome comes back as it is, and an agent
+    /// without the route is told to update rather than falling back.
+    #[tokio::test]
+    async fn redis_operations_are_sealed_to_the_node_and_an_older_agent_is_named() {
+        async fn walg(headers: HeaderMap, sealed: axum::body::Bytes) -> Json<serde_json::Value> {
+            let request: RedisWalgBackupRequest =
+                open_for_test(&headers, "/agent/services/redis/walg-backup", &sealed);
+            assert_eq!(request.service_id, 9);
+            assert_eq!(request.bucket_path, "fleet");
+            assert_eq!(request.backup_uuid, "u-9");
+            assert_eq!(
+                request.destination.session_token.as_deref(),
+                Some("destination-session")
+            );
+            Json(serde_json::json!({
+                "success": true, "data": { "status": "completed" }, "error": null
+            }))
+        }
+        async fn rdb(headers: HeaderMap, sealed: axum::body::Bytes) -> Json<serde_json::Value> {
+            let request: RedisRdbBackupRequest =
+                open_for_test(&headers, "/agent/services/redis/rdb-backup", &sealed);
+            assert!(request.key.ends_with("/dump.rdb.gz"));
+            Json(serde_json::json!({
+                "success": true,
+                "data": { "status": "completed", "size_bytes": 512 },
+                "error": null
+            }))
+        }
+        async fn restore(headers: HeaderMap, sealed: axum::body::Bytes) -> Json<serde_json::Value> {
+            let request: RedisRestoreRequest =
+                open_for_test(&headers, "/agent/services/redis/restore", &sealed);
+            assert!(request.keep_target_bookkeeping);
+            Json(serde_json::json!({
+                "success": true,
+                "data": { "status": "failed", "reason": "staged snapshot is empty" },
+                "error": null
+            }))
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/agent/services/redis/walg-backup", post(walg))
+                    .route("/agent/services/redis/rdb-backup", post(rdb))
+                    .route("/agent/services/redis/restore", post(restore)),
+            )
+            .await
+            .unwrap();
+        });
+        let client = |address: std::net::SocketAddr| {
+            RemoteServiceClient::new(
+                format!("http://{address}"),
+                "node-token".to_string(),
+                "worker-1".to_string(),
+            )
+            .unwrap()
+            .with_sealing(test_sealing())
+        };
+        let config = ServiceConfig {
+            name: "cache".to_string(),
+            service_type: ServiceType::Redis,
+            version: None,
+            parameters: serde_json::json!({ "password": "redis-password" }),
+        };
+        let walg_request = RedisWalgBackupRequest {
+            service_id: 9,
+            service_config: config.clone(),
+            destination: worker_destination(),
+            bucket_path: "fleet".to_string(),
+            backup_uuid: "u-9".to_string(),
+        };
+        let rdb_request = RedisRdbBackupRequest {
+            service_id: 9,
+            service_config: config.clone(),
+            destination: worker_destination(),
+            key: "external_services/redis/cache/2026/11/08/u-9/dump.rdb.gz".to_string(),
+        };
+        let restore_request = RedisRestoreRequest {
+            service_id: 9,
+            service_config: config,
+            source: worker_destination(),
+            location: "s3://bucket/external_services/redis/other/walg".to_string(),
+            keep_target_bookkeeping: true,
+            operation_id: None,
+        };
+        assert_eq!(
+            client(address)
+                .redis_walg_backup(&walg_request)
+                .await
+                .unwrap(),
+            RedisWalgBackupResult::Completed
+        );
+        assert_eq!(
+            client(address)
+                .redis_rdb_backup(&rdb_request)
+                .await
+                .unwrap(),
+            RedisRdbBackupResult::Completed { size_bytes: 512 }
+        );
+        assert_eq!(
+            client(address)
+                .redis_restore(&restore_request)
+                .await
+                .unwrap(),
+            RedisRestoreResult::Failed {
+                reason: "staged snapshot is empty".to_string()
+            }
+        );
+        server.abort();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let older = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new()).await.unwrap();
+        });
+        let messages = [
+            client(older)
+                .redis_walg_backup(&walg_request)
+                .await
+                .expect_err("an older agent has no Redis WAL-G route")
+                .to_string(),
+            client(older)
+                .redis_rdb_backup(&rdb_request)
+                .await
+                .expect_err("an older agent has no Redis RDB route")
+                .to_string(),
+            client(older)
+                .redis_restore(&restore_request)
+                .await
+                .expect_err("an older agent has no Redis restore route")
+                .to_string(),
+        ];
+        server.abort();
+        for (message, path) in messages.iter().zip([
+            "/agent/services/redis/walg-backup",
+            "/agent/services/redis/rdb-backup",
+            "/agent/services/redis/restore",
+        ]) {
+            assert!(message.contains(path), "{message}");
+            assert!(message.contains("Update the node's agent"), "{message}");
+            assert!(!message.contains("redis-password"), "{message}");
+        }
+    }
+
+    /// Every MariaDB operation reaches the node sealed, on its own route,
+    /// and returns the node's outcome; an older agent is told to update.
+    #[tokio::test]
+    async fn mariadb_operations_are_sealed_to_the_node_and_their_outcomes_returned() {
+        async fn physical(
+            headers: HeaderMap,
+            sealed: axum::body::Bytes,
+        ) -> Json<serde_json::Value> {
+            let request: MariadbPhysicalBackupRequest =
+                open_for_test(&headers, "/agent/services/mariadb/physical-backup", &sealed);
+            assert_eq!((request.service_id, request.node_id), (8, 2));
+            assert_eq!(request.backup_uuid, "u-1");
+            assert_eq!(
+                request.destination.session_token.as_deref(),
+                Some("destination-session")
+            );
+            Json(serde_json::json!({"success": true, "error": null, "data": {
+                "status": "completed",
+                "binlog": {"file": "mysql-bin.000002", "position": "385", "gtid": "0-1-4"}
+            }}))
+        }
+        async fn dump(headers: HeaderMap, sealed: axum::body::Bytes) -> Json<serde_json::Value> {
+            let request: MariadbDumpBackupRequest =
+                open_for_test(&headers, "/agent/services/mariadb/dump-backup", &sealed);
+            assert!(request.key.ends_with("dump.sql.gz"));
+            Json(serde_json::json!({"success": true, "error": null, "data": {
+                "status": "completed", "size_bytes": 512
+            }}))
+        }
+        async fn restore(headers: HeaderMap, sealed: axum::body::Bytes) -> Json<serde_json::Value> {
+            let request: MariadbRestoreRequest =
+                open_for_test(&headers, "/agent/services/mariadb/restore", &sealed);
+            assert!(request.recovery_target.is_some());
+            Json(serde_json::json!({"success": true, "error": null, "data": {
+                "status": "failed", "reason": "the original data was put back"
+            }}))
+        }
+        async fn archive(headers: HeaderMap, sealed: axum::body::Bytes) -> Json<serde_json::Value> {
+            let _: MariadbBinlogArchiveRequest =
+                open_for_test(&headers, "/agent/services/mariadb/binlog-archive", &sealed);
+            Json(serde_json::json!({"success": true, "error": null, "data": {
+                "status": "completed", "shipped": 3
+            }}))
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/agent/services/mariadb/physical-backup", post(physical))
+                    .route("/agent/services/mariadb/dump-backup", post(dump))
+                    .route("/agent/services/mariadb/restore", post(restore))
+                    .route("/agent/services/mariadb/binlog-archive", post(archive)),
+            )
+            .await
+            .unwrap();
+        });
+        let client = |address: std::net::SocketAddr| {
+            RemoteServiceClient::new(
+                format!("http://{address}"),
+                "node-token".to_string(),
+                "worker-1".to_string(),
+            )
+            .unwrap()
+            .with_sealing(test_sealing())
+        };
+        let config = ServiceConfig {
+            name: "shop".to_string(),
+            service_type: ServiceType::Mariadb,
+            version: None,
+            parameters: serde_json::json!({"root_password": "root-password"}),
+        };
+        let physical_request = MariadbPhysicalBackupRequest {
+            service_id: 8,
+            node_id: 2,
+            service_config: config.clone(),
+            destination: worker_destination(),
+            bucket_path: "base".to_string(),
+            backup_uuid: "u-1".to_string(),
+        };
+        assert_eq!(
+            client(address)
+                .mariadb_physical_backup(&physical_request)
+                .await
+                .unwrap(),
+            MariadbPhysicalBackupResult::Completed {
+                binlog: Some(MariadbBinlogCoordinate {
+                    file: "mysql-bin.000002".into(),
+                    position: "385".into(),
+                    gtid: "0-1-4".into(),
+                })
+            }
+        );
+        let dumped = client(address)
+            .mariadb_dump_backup(&MariadbDumpBackupRequest {
+                service_id: 8,
+                node_id: 2,
+                service_config: config.clone(),
+                destination: worker_destination(),
+                bucket_path: "base".to_string(),
+                key: "base/external_services/mariadb/shop/u/dump.sql.gz".to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            dumped,
+            MariadbDumpBackupResult::Completed { size_bytes: 512 }
+        );
+        let restored = client(address)
+            .mariadb_restore(&MariadbRestoreRequest {
+                service_id: 8,
+                node_id: 2,
+                service_config: config.clone(),
+                source: worker_destination(),
+                bucket_path: "base".to_string(),
+                location: "s3://b/base/external_services/mariadb/shop/walg".to_string(),
+                recovery_target: Some(RecoveryTarget::Time {
+                    time: "2026-11-08T10:00:00Z".parse().unwrap(),
+                }),
+                target_user_data: None,
+                operation_id: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            restored,
+            MariadbRestoreResult::Failed {
+                reason: "the original data was put back".into()
+            }
+        );
+        let archived = client(address)
+            .mariadb_binlog_archive(&MariadbBinlogArchiveRequest {
+                service_id: 8,
+                node_id: 2,
+                service_config: config,
+                destination: worker_destination(),
+                bucket_path: "base".to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            archived,
+            MariadbBinlogArchiveResult::Completed { shipped: 3 }
+        );
+        server.abort();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let older = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new()).await.unwrap();
+        });
+        let message = client(older)
+            .mariadb_physical_backup(&physical_request)
+            .await
+            .expect_err("an older agent has no MariaDB route")
+            .to_string();
+        server.abort();
+        assert!(
+            message.contains("/agent/services/mariadb/physical-backup"),
+            "{message}"
+        );
+        assert!(message.contains("Update the node's agent"), "{message}");
+    }
+
+    /// An archive re-point reaches the node sealed, with the destination's
+    /// credentials, and an agent without the route is told to update.
+    #[tokio::test]
+    async fn a_walg_archive_repoint_is_sealed_to_the_node() {
+        async fn walg(headers: HeaderMap, sealed: axum::body::Bytes) -> Json<serde_json::Value> {
+            let request: PostgresWalgArchiveRequest =
+                open_for_test(&headers, "/agent/services/postgres/walg-archive", &sealed);
+            assert_eq!(request.service_id, 8);
+            assert_eq!(request.bucket_path, "fleet-b");
+            assert_eq!(
+                request.destination.secret_access_key,
+                worker_destination().secret_access_key
+            );
+            Json(serde_json::json!({
+                "success": true,
+                "data": {"status": "completed", "restarted": true},
+                "error": null
+            }))
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/agent/services/postgres/walg-archive", post(walg)),
+            )
+            .await
+            .unwrap();
+        });
+        let client = |address: std::net::SocketAddr| {
+            RemoteServiceClient::new(
+                format!("http://{address}"),
+                "node-token".to_string(),
+                "worker-1".to_string(),
+            )
+            .unwrap()
+            .with_sealing(test_sealing())
+        };
+        let request = PostgresWalgArchiveRequest {
+            service_id: 8,
+            node_id: 2,
+            service_config: ServiceConfig {
+                name: "orders".to_string(),
+                service_type: ServiceType::Postgres,
+                version: None,
+                parameters: serde_json::json!({"host": "localhost", "password": "db-password"}),
+            },
+            destination: worker_destination(),
+            bucket_path: "fleet-b".to_string(),
+        };
+        let outcome = client(address)
+            .postgres_walg_archive(&request)
+            .await
+            .unwrap();
+        server.abort();
+        assert_eq!(
+            outcome,
+            PostgresWalgArchiveResult::Completed { restarted: true }
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let older = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new()).await.unwrap();
+        });
+        let error = client(older)
+            .postgres_walg_archive(&request)
+            .await
+            .expect_err("an older agent cannot re-point archiving");
+        server.abort();
+        let message = error.to_string();
+        assert!(
+            message.contains("/agent/services/postgres/walg-archive"),
+            "{message}"
+        );
+        assert!(message.contains("Update the node's agent"), "{message}");
+    }
+
+    /// A node at its limit of backups and restores answers 429; the client
+    /// returns the typed `NodeBusy` (nothing ran), so callers can wait for a
+    /// slot instead of failing the run.
+    #[tokio::test]
+    async fn a_busy_node_is_reported_as_node_busy() {
+        async fn busy() -> (reqwest::StatusCode, Json<serde_json::Value>) {
+            (
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({
+                    "success": false,
+                    "data": null,
+                    "error": "Cannot restore service 'orders': this node already runs 2 backups or restores; retry when one finishes"
+                })),
+            )
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/agent/services/data-restore", post(busy)),
+            )
+            .await
+            .unwrap();
+        });
+        let client = RemoteServiceClient::new(
+            format!("http://{address}"),
+            "node-token".to_string(),
+            "worker-1".to_string(),
+        )
+        .unwrap()
+        .with_sealing(test_sealing());
+        let error = client
+            .restore_service(&RemoteServiceRestoreRequest {
+                service_config: ServiceConfig {
+                    name: "orders".to_string(),
+                    service_type: ServiceType::Redis,
+                    version: None,
+                    parameters: serde_json::json!({}),
+                },
+                source: worker_destination(),
+                location: "external_services/redis/orders/dump.rdb.gz".to_string(),
+                operation_id: None,
+            })
+            .await
+            .expect_err("a busy node runs nothing");
+        server.abort();
+        match error {
+            ExternalServiceError::NodeBusy {
+                node,
+                route,
+                detail,
+            } => {
+                assert_eq!(node, "worker-1");
+                assert_eq!(route, "/agent/services/data-restore");
+                assert!(detail.contains("already runs 2"), "{detail}");
+            }
+            other => panic!("expected NodeBusy, got {other:?}"),
+        }
+    }
+
+    /// A WAL-G restore reaches the node sealed, with the source's credentials,
+    /// both logins and the typed recovery target, and the engine's outcome
+    /// comes back as it is. An agent without the route is told to update.
+    #[tokio::test]
+    async fn a_walg_restore_is_sealed_to_the_node_and_its_outcome_returned() {
+        async fn walg(headers: HeaderMap, sealed: axum::body::Bytes) -> Json<serde_json::Value> {
+            let request: PostgresWalgRestoreRequest =
+                open_for_test(&headers, "/agent/services/postgres/walg-restore", &sealed);
+            assert_eq!(request.service_id, 8);
+            assert_eq!(
+                request.service_config.parameters["password"],
+                "origin-password"
+            );
+            assert_eq!(
+                request.live_service_config.parameters["password"],
+                "db-password"
+            );
+            assert_eq!(
+                request.source.session_token.as_deref(),
+                Some("destination-session")
+            );
+            assert!(matches!(
+                request.recovery_target,
+                Some(RecoveryTarget::Lsn { ref lsn }) if lsn == "0/3000060"
+            ));
+            assert_eq!(request.operation_id.as_deref(), Some("restore-run-5"));
+            Json(serde_json::json!({
+                "success": true,
+                "data": {"status": "failed", "reason": "the original database was put back unchanged"},
+                "error": null
+            }))
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/agent/services/postgres/walg-restore", post(walg)),
+            )
+            .await
+            .unwrap();
+        });
+        let client = |address: std::net::SocketAddr| {
+            RemoteServiceClient::new(
+                format!("http://{address}"),
+                "node-token".to_string(),
+                "worker-1".to_string(),
+            )
+            .unwrap()
+            .with_sealing(test_sealing())
+        };
+        let config = |password: &str| ServiceConfig {
+            name: "orders".to_string(),
+            service_type: ServiceType::Postgres,
+            version: None,
+            parameters: serde_json::json!({"host": "localhost", "password": password}),
+        };
+        let request = PostgresWalgRestoreRequest {
+            service_id: 8,
+            node_id: 2,
+            service_config: config("origin-password"),
+            live_service_config: config("db-password"),
+            source: worker_destination(),
+            walg_prefix: "s3://backups/external_services/postgres/billing/walg".to_string(),
+            recovery_target: Some(RecoveryTarget::Lsn {
+                lsn: "0/3000060".to_string(),
+            }),
+            target_user_data: None,
+            operation_id: Some("restore-run-5".to_string()),
+        };
+        let outcome = client(address)
+            .postgres_walg_restore(&request)
+            .await
+            .unwrap();
+        server.abort();
+        assert_eq!(
+            outcome,
+            PostgresWalgRestoreResult::Failed {
+                reason: "the original database was put back unchanged".to_string()
+            }
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let older = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new()).await.unwrap();
+        });
+        let error = client(older)
+            .postgres_walg_restore(&request)
+            .await
+            .expect_err("an older agent cannot restore from WAL-G");
+        server.abort();
+        let message = error.to_string();
+        assert!(
+            message.contains("/agent/services/postgres/walg-restore"),
+            "{message}"
+        );
+        assert!(message.contains("Update the node's agent"), "{message}");
+    }
+
+    /// A restore's request that the agent never answers (a timeout, or a
+    /// connection dropped before the response) is `AgentUnanswered`, not an
+    /// error the agent returned: the restore may still be running there.
+    /// Its outcome is then asked for by its operation id, sealed like every
+    /// worker service request.
+    #[tokio::test]
+    async fn an_unanswered_walg_restore_is_told_apart_and_its_outcome_asked_for() {
+        async fn outcome(headers: HeaderMap, sealed: axum::body::Bytes) -> Json<serde_json::Value> {
+            let request: WorkerRestoreOutcomeRequest =
+                open_for_test(&headers, "/agent/services/restore/outcome", &sealed);
+            assert_eq!(request.engine, WorkerRestoreEngine::PostgresWalg);
+            assert_eq!(request.service, "orders");
+            assert_eq!(request.operation_id, "restore-run-5");
+            Json(serde_json::json!({
+                "success": true,
+                "data": {"state": "running", "writes_began": true},
+                "error": null
+            }))
+        }
+        // Accepts the restore's connection and closes it without answering.
+        let dropping = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dropped = dropping.local_addr().unwrap();
+        let closer = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = dropping.accept().await {
+                let mut buffer = [0u8; 4096];
+                let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut buffer).await;
+                drop(socket);
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let answering = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/agent/services/restore/outcome", post(outcome)),
+            )
+            .await
+            .unwrap();
+        });
+        let client = |address: std::net::SocketAddr| {
+            RemoteServiceClient::new(
+                format!("http://{address}"),
+                "node-token".to_string(),
+                "worker-1".to_string(),
+            )
+            .unwrap()
+            .with_sealing(test_sealing())
+        };
+        let config = ServiceConfig {
+            name: "orders".to_string(),
+            service_type: ServiceType::Postgres,
+            version: None,
+            parameters: serde_json::json!({"host": "localhost"}),
+        };
+        let error = client(dropped)
+            .postgres_walg_restore(&PostgresWalgRestoreRequest {
+                service_id: 8,
+                node_id: 2,
+                service_config: config.clone(),
+                live_service_config: config,
+                source: worker_destination(),
+                walg_prefix: "s3://backups/external_services/postgres/orders/walg".to_string(),
+                recovery_target: None,
+                target_user_data: None,
+                operation_id: Some("restore-run-5".to_string()),
+            })
+            .await
+            .expect_err("a dropped connection has no outcome");
+        closer.abort();
+        match error {
+            ExternalServiceError::AgentUnanswered { node, route, .. } => {
+                assert_eq!(node, "worker-1");
+                assert_eq!(route, "/agent/services/postgres/walg-restore");
+            }
+            other => panic!("expected AgentUnanswered, got {other:?}"),
+        }
+        // Nothing listens: the request was never delivered, and nothing ran.
+        let closed = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.local_addr().unwrap()
+        };
+        let error = client(closed)
+            .worker_restore_outcome(&WorkerRestoreOutcomeRequest {
+                engine: WorkerRestoreEngine::PostgresWalg,
+                service: "orders".to_string(),
+                operation_id: "restore-run-5".to_string(),
+            })
+            .await
+            .expect_err("nothing listens");
+        assert!(
+            matches!(error, ExternalServiceError::InternalError { .. }),
+            "{error:?}"
+        );
+        let progress = client(answering)
+            .worker_restore_outcome(&WorkerRestoreOutcomeRequest {
+                engine: WorkerRestoreEngine::PostgresWalg,
+                service: "orders".to_string(),
+                operation_id: "restore-run-5".to_string(),
+            })
+            .await
+            .unwrap();
+        server.abort();
+        assert_eq!(
+            progress,
+            WorkerRestoreProgress::Running { writes_began: true }
+        );
+    }
+
+    /// A node without a sealing key never receives a backup's credentials.
+    #[tokio::test]
+    async fn a_worker_backup_is_refused_to_a_node_that_cannot_open_sealed_bodies() {
+        let client = RemoteServiceClient::new(
+            "http://127.0.0.1:9".to_string(),
+            "node-token".to_string(),
+            "worker-1".to_string(),
+        )
+        .unwrap();
+        let error = client
+            .backup_service(&RemoteServiceBackupRequest {
+                service_config: ServiceConfig {
+                    name: "cache".to_string(),
+                    service_type: ServiceType::Redis,
+                    version: None,
+                    parameters: serde_json::json!({}),
+                },
+                destination: worker_destination(),
+                key: "k/dump.rdb.gz".to_string(),
+            })
+            .await
+            .expect_err("unsealed delivery must be refused");
+        assert!(!error.to_string().contains("destination-secret"));
     }
 
     #[tokio::test]

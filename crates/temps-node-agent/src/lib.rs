@@ -15,14 +15,19 @@
     )
 )]
 pub mod auth;
+pub(crate) mod backup_outcomes;
 mod build_admission;
 pub mod build_handler;
 pub mod compose_handlers;
 pub mod connectors;
+pub mod dns_report;
 mod exec_timeout;
 pub mod gate;
 pub mod handlers;
+mod internal_access;
 pub mod internal_proxy;
+pub mod internal_redirect;
+pub mod internal_routing;
 pub mod labels;
 pub mod mac_worker;
 pub mod mesh_listener;
@@ -37,6 +42,7 @@ pub mod plugin_build_handler;
 pub mod private_check;
 pub mod public_ingress;
 pub mod public_ingress_manager;
+pub(crate) mod restore_outcomes;
 mod rewind;
 pub mod route_store;
 pub mod route_sync_client;
@@ -44,7 +50,10 @@ mod runtime_health;
 pub mod sandbox_handlers;
 pub mod sealed_requests;
 pub mod server;
+pub mod service_data_handlers;
 pub mod service_handlers;
+pub mod service_mariadb_handlers;
+pub mod service_observe_handlers;
 pub mod shield;
 pub mod tailnet_identity;
 pub mod tailscale_api;

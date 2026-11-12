@@ -7,6 +7,7 @@ pub mod engines;
 pub mod execution;
 pub mod handlers;
 pub mod managed_schedule;
+pub mod node_busy;
 pub mod plugin;
 pub mod pre_migration;
 pub mod services;
