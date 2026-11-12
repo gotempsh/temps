@@ -1875,14 +1875,14 @@ async fn run_project_teardown(
         .plan_project_image_cleanup(id)
         .await
     {
-        Ok(plan) => Some(plan),
+        Ok(plan) => Ok(plan),
         Err(error) => {
             warn!(
                 project_id = id,
                 %error,
                 "Could not read the project's built images; they are left for the nightly sweep"
             );
-            None
+            Err(error.to_string())
         }
     };
 
@@ -1903,23 +1903,30 @@ async fn run_project_teardown(
     // Only once the rows are gone, so nothing can deploy these images again.
     // Cannot fail the deletion: every image kept or not removed is logged
     // with its reason, and stays labelled for the nightly sweep.
-    let images = match &image_plan {
-        Some(plan) => {
-            state
-                .project_image_cleaner
-                .remove_project_images(plan)
-                .await
-        }
-        None => temps_core::ProjectImageCleanupReport::default(),
+    // `None` with the reason when the images could not even be read, so the
+    // audit tells "nothing to remove" from "cleanup never ran".
+    let (images, image_plan_error) = match &image_plan {
+        Ok(plan) => (
+            Some(
+                state
+                    .project_image_cleaner
+                    .remove_project_images(plan)
+                    .await,
+            ),
+            None,
+        ),
+        Err(reason) => (None, Some(reason.clone())),
     };
+    let counts = images.unwrap_or_default();
 
     info!(
         project_id = id,
         project_name = %project.name,
-        images_removed = images.removed,
-        images_skipped = images.skipped,
-        images_failed = images.failed,
-        image_runtimes_unreachable = images.unreachable_runtimes,
+        image_cleanup_planned = image_plan_error.is_none(),
+        images_removed = counts.removed,
+        images_skipped = counts.skipped,
+        images_failed = counts.failed,
+        image_runtimes_unreachable = counts.unreachable_runtimes,
         "Project deleted"
     );
 
@@ -1929,6 +1936,7 @@ async fn run_project_teardown(
         project_name: project.name,
         project_slug: project.slug,
         images,
+        image_plan_error,
     };
 
     if let Err(e) = state.audit_service.create_audit_log(&audit_event).await {
@@ -5470,8 +5478,12 @@ mod tests {
             "a failure to read the images must not fail the deletion"
         );
         assert!(
-            teardown[removal..audit].contains("images_removed = images.removed"),
+            teardown[removal..audit].contains("images_removed = counts.removed"),
             "the deletion log carries the image counts"
+        );
+        assert!(
+            teardown[audit..].contains("image_plan_error,"),
+            "the audit records when the images could not be read"
         );
     }
 

@@ -1305,7 +1305,12 @@ mod tests {
             &remote,
             BuildRequestWithCallback {
                 request: BuildRequest {
-                    labels: Default::default(),
+                    // An ownership label travels; a label outside the image
+                    // namespace is dropped by the control plane.
+                    labels: std::collections::HashMap::from([
+                        ("sh.temps.image.project_id".to_string(), "7".to_string()),
+                        ("maintainer".to_string(), "not-forwarded".to_string()),
+                    ]),
                     build_secrets: Default::default(),
                     cache_from: Vec::new(),
                     image_name: "web:worker".into(),
@@ -1335,6 +1340,14 @@ mod tests {
         assert_eq!(limits.build_admission.available(), 3);
         let requests = builder.requests.lock().unwrap();
         let request = requests.first().expect("the daemon received the build");
+        assert_eq!(
+            request.labels,
+            std::collections::HashMap::from([(
+                "sh.temps.image.project_id".to_string(),
+                "7".to_string()
+            )]),
+            "the worker builds with the forwarded ownership labels"
+        );
         assert_eq!(
             request.build_args,
             std::collections::HashMap::from([

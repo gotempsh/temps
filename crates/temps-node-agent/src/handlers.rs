@@ -2117,7 +2117,7 @@ pub async fn image_exists(
         (status = 400, description = "More images than one call accepts"),
         (status = 401, description = "Unauthorized — invalid or missing bearer token"),
         (status = 503, description = "Docker unavailable on this node"),
-        (status = 500, description = "The node's images or containers could not be listed; nothing was removed")
+        (status = 500, description = "The node's runtime could not remove images; nothing was removed")
     ),
     security(("bearer_auth" = []))
 )]

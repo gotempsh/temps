@@ -132,7 +132,7 @@ pub const BUILT_BY_LABEL: (&str, &str) = ("built-by", "temps");
 
 /// The labels for `request`'s image: the caller's, then `built-by=temps`,
 /// which a caller cannot override.
-fn image_labels(request: &BuildRequest) -> HashMap<String, String> {
+pub(super) fn image_labels(request: &BuildRequest) -> HashMap<String, String> {
     let mut labels = request.labels.clone();
     labels.insert(BUILT_BY_LABEL.0.to_string(), BUILT_BY_LABEL.1.to_string());
     labels

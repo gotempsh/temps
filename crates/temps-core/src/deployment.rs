@@ -166,10 +166,17 @@ pub struct ProjectImageCleanupReport {
 /// Why the images built for a project could not be read before deleting it.
 #[derive(Debug, Error)]
 pub enum ProjectImageCleanupError {
+    /// The source is the implementation's own error (a database error), kept
+    /// whole rather than flattened, behind a box so this crate does not
+    /// depend on the database layer.
     #[error(
-        "Failed to read the images built for project {project_id} before deleting it: {reason}"
+        "Failed to read the images built for project {project_id} before deleting it: {source}"
     )]
-    Plan { project_id: i32, reason: String },
+    Plan {
+        project_id: i32,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 /// Removes the images built for a project when it is deleted. Implemented by

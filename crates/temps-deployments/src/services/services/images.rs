@@ -11,8 +11,9 @@
 //! rows are gone:
 //!
 //! - **Which images**: the `image_tag` (and `image_id`) of each successful
-//!   `BuildImageJob` of the project, the record retention trusts. Pulled or
-//!   uploaded images never run that job and are never touched.
+//!   `BuildImageJob` of the project, the record retention trusts, and each
+//!   platform's own tag and ID of a multi-platform build. Pulled or uploaded
+//!   images never run that job and are never touched.
 //! - **Never another project's**: a tag or image ID that a deployment or build
 //!   of any other project names is skipped, decided in one query.
 //! - **Never one in use**: each runtime removes an image only if no container
@@ -30,6 +31,7 @@ use temps_core::{
     ProjectImage, ProjectImageCleanupError, ProjectImageCleanupReport, ProjectImagePlan,
 };
 use temps_deployer::{ImageRemovalRequest, ImageRemovalStatus, MAX_IMAGE_REMOVAL_BATCH};
+use temps_docker_housekeeping::services::image_references;
 
 /// Most built images one project deletion reads. Newest first: an old image
 /// is the likeliest to have been removed by retention already. A project with
@@ -74,8 +76,9 @@ pub(super) fn partition_shared(
 /// Image IDs in one spelling (`sha256:<hex>`), tags as written.
 fn normalize_ref(reference: &str) -> String {
     let trimmed = reference.trim();
-    let hex = trimmed.trim_start_matches("sha256:");
-    if trimmed.starts_with("sha256:")
+    let lower = trimmed.to_ascii_lowercase();
+    let hex = lower.trim_start_matches("sha256:");
+    if lower.starts_with("sha256:")
         || (hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
     {
         format!("sha256:{}", hex.to_ascii_lowercase())
@@ -90,24 +93,49 @@ impl DeploymentService {
         let build_succeeded = temps_entities::types::JobStatus::Success.to_value();
         let db = self.db.as_ref();
 
+        // Every image the project's successful builds recorded: the primary
+        // tag and, for a multi-platform build, each platform's own tag with
+        // its own ID when recorded. Newest first, one row per tag.
         let rows = db
             .query_all(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
                 r#"
-                SELECT image_tag, image_id FROM (
-                    SELECT DISTINCT ON (dj.outputs ->> 'image_tag')
-                        dj.outputs ->> 'image_tag' AS image_tag,
-                        NULLIF(dj.outputs ->> 'image_id', '') AS image_id,
-                        dj.id
+                WITH builds AS (
+                    SELECT dj.id, dj.outputs
                     FROM deployment_jobs dj
                     JOIN deployments d ON d.id = dj.deployment_id
                     WHERE d.project_id = $1
                       AND dj.job_type = 'BuildImageJob'
                       AND dj.status = $2
-                      AND NULLIF(dj.outputs ->> 'image_tag', '') IS NOT NULL
-                      AND dj.outputs ->> 'image_tag' NOT LIKE '%/%'
-                    ORDER BY dj.outputs ->> 'image_tag', dj.id DESC
-                ) built
+                ),
+                built AS (
+                    SELECT b.id,
+                           b.outputs ->> 'image_tag' AS image_tag,
+                           NULLIF(b.outputs ->> 'image_id', '') AS image_id
+                    FROM builds b
+                    UNION ALL
+                    SELECT b.id, tag.value, NULLIF(platform_id.value, '')
+                    FROM builds b
+                    CROSS JOIN LATERAL json_each_text(
+                        CASE WHEN json_typeof(b.outputs -> 'image_tags_by_platform') = 'object'
+                             THEN b.outputs -> 'image_tags_by_platform' ELSE '{}'::json END
+                    ) AS tag
+                    LEFT JOIN LATERAL (
+                        SELECT ids.value
+                        FROM json_each_text(
+                            CASE WHEN json_typeof(b.outputs -> 'image_ids_by_platform') = 'object'
+                                 THEN b.outputs -> 'image_ids_by_platform' ELSE '{}'::json END
+                        ) AS ids
+                        WHERE ids.key = tag.key
+                    ) AS platform_id ON TRUE
+                )
+                SELECT image_tag, image_id FROM (
+                    SELECT DISTINCT ON (image_tag) image_tag, image_id, id
+                    FROM built
+                    WHERE NULLIF(image_tag, '') IS NOT NULL
+                      AND image_tag NOT LIKE '%/%'
+                    ORDER BY image_tag, id DESC
+                ) latest
                 ORDER BY id DESC
                 LIMIT $3
                 "#,
@@ -135,50 +163,16 @@ impl DeploymentService {
         }
 
         // Every other project's reference to any of these tags or IDs, in
-        // one pass: deployments that run the image (rollbacks, promotions,
-        // an image deployed by ID) and builds that recorded the same tag or
-        // produced the same image.
-        let mut candidates: Vec<String> = Vec::with_capacity(images.len() * 2);
+        // one query shared with the orphan sweep.
+        let mut candidates: Vec<String> = Vec::with_capacity(images.len() * 3);
         for image in &images {
             candidates.push(image.reference.clone());
             if let Some(id) = &image.image_id {
-                candidates.push(normalize_ref(id));
-                candidates.push(normalize_ref(id).trim_start_matches("sha256:").to_string());
+                candidates.extend(image_references::image_id_spellings(id));
             }
         }
-        let shared_rows = db
-            .query_all(Statement::from_sql_and_values(
-                DatabaseBackend::Postgres,
-                r#"
-                SELECT DISTINCT reference FROM (
-                    SELECT d.image_name AS reference
-                    FROM deployments d
-                    WHERE d.project_id <> $1
-                      AND d.image_name = ANY($2::text[])
-                    UNION ALL
-                    SELECT dj.outputs ->> 'image_tag'
-                    FROM deployment_jobs dj
-                    JOIN deployments d ON d.id = dj.deployment_id
-                    WHERE d.project_id <> $1
-                      AND dj.job_type = 'BuildImageJob'
-                      AND dj.outputs ->> 'image_tag' = ANY($2::text[])
-                    UNION ALL
-                    SELECT dj.outputs ->> 'image_id'
-                    FROM deployment_jobs dj
-                    JOIN deployments d ON d.id = dj.deployment_id
-                    WHERE d.project_id <> $1
-                      AND dj.job_type = 'BuildImageJob'
-                      AND dj.outputs ->> 'image_id' = ANY($2::text[])
-                ) refs
-                WHERE reference IS NOT NULL
-                "#,
-                [project_id.into(), candidates.into()],
-            ))
-            .await?;
-        let shared_refs = shared_rows
-            .into_iter()
-            .map(|row| row.try_get::<String>("", "reference"))
-            .collect::<Result<HashSet<_>, DbErr>>()?;
+        let shared_refs =
+            image_references::referenced_images(db, &candidates, Some(project_id)).await?;
         let (images, shared) = partition_shared(images, &shared_refs);
 
         // Runtimes that may hold the images: the nodes that built them and
@@ -243,7 +237,26 @@ impl DeploymentService {
         deadline: tokio::time::Instant,
         report: &mut ProjectImageCleanupReport,
     ) -> bool {
-        let deployer = match self.deployer_for_node(node_id).await {
+        // Resolving a worker reads its row and configuration; bound it by the
+        // same deadline, so a stalled read cannot hold the deletion open.
+        let resolution = tokio::time::timeout(
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
+            self.deployer_for_node(node_id),
+        )
+        .await;
+        let resolved = match resolution {
+            Ok(resolved) => resolved,
+            Err(_) => {
+                warn!(
+                    project_id,
+                    ?node_id,
+                    images = requests.len(),
+                    "Out of time resolving a runtime to remove a deleted project's images; they stay on it"
+                );
+                return false;
+            }
+        };
+        let deployer = match resolved {
             Ok(deployer) => deployer,
             // No local daemon in this process (control-plane profile): this
             // host holds no images of ours.
@@ -337,7 +350,7 @@ impl temps_core::ProjectImageCleaner for DeploymentService {
             .await
             .map_err(|error| ProjectImageCleanupError::Plan {
                 project_id,
-                reason: error.to_string(),
+                source: Box::new(error),
             })
     }
 
@@ -730,6 +743,91 @@ mod tests {
         assert!(held_left, "an image a container was created from must stay");
         assert!(shared_left, "an image another project deploys must stay");
         assert!(unrelated_left, "an image no project recorded must stay");
+        Ok(())
+    }
+
+    /// A multi-platform build's per-platform images are planned with their
+    /// own IDs, and one another project's build also produced is skipped.
+    /// Against a real database; skips without Postgres.
+    #[tokio::test]
+    async fn every_platform_image_of_a_build_is_planned() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) => {
+                println!("Database unavailable, skipping: {error}");
+                return Ok(());
+            }
+        };
+        let db = test_db.connection_arc();
+        let (doomed, doomed_env) = insert_project(db.as_ref(), "multi-arch").await?;
+        let (other, other_env) = insert_project(db.as_ref(), "other").await?;
+        let insert_build =
+            |deployment_id: i32, outputs: serde_json::Value| deployment_jobs::ActiveModel {
+                deployment_id: Set(deployment_id),
+                job_id: Set("build_image".to_string()),
+                job_type: Set("BuildImageJob".to_string()),
+                name: Set("Build Container Image".to_string()),
+                log_id: Set(format!("build-log-{deployment_id}")),
+                status: Set(JobStatus::Success),
+                outputs: Set(Some(outputs)),
+                ..Default::default()
+            };
+        let deployment = record_build(
+            db.as_ref(),
+            &doomed,
+            &doomed_env,
+            "multi-arch-1",
+            "multi-arch-1:latest",
+            Some("sha256:aa"),
+        )
+        .await?;
+        insert_build(
+            deployment.id,
+            serde_json::json!({
+                "image_tag": "multi-arch-1:latest",
+                "image_id": "sha256:aa",
+                "image_tags_by_platform": {
+                    "linux/arm64": "multi-arch-1:latest-arm64",
+                    "linux/riscv64": "multi-arch-1:latest-riscv64"
+                },
+                "image_ids_by_platform": { "linux/arm64": "sha256:bb", "linux/riscv64": "sha256:dd" }
+            }),
+        )
+        .insert(db.as_ref())
+        .await?;
+        // Another project's identical build produced the riscv64 image.
+        let other_deployment = record_build(
+            db.as_ref(),
+            &other,
+            &other_env,
+            "other-1",
+            "other-1:latest",
+            Some("sha256:dd"),
+        )
+        .await?;
+        let _ = other_deployment;
+
+        let runtime: Arc<dyn temps_deployer::ContainerDeployer> = Arc::new(
+            temps_deployer::remote::RemoteNodeDeployer::new(
+                "http://127.0.0.1:9".to_string(),
+                "unused".to_string(),
+                "unused".to_string(),
+            )
+            .expect("create remote deployer"),
+        );
+        let service = super::super::tests::create_cleanup_service_for_test(db.clone(), runtime);
+        let mut plan = service.plan_project_image_cleanup(doomed.id).await?;
+        plan.images.sort_by(|a, b| a.reference.cmp(&b.reference));
+
+        assert_eq!(
+            plan.images,
+            vec![
+                image("multi-arch-1:latest", Some("sha256:aa")),
+                image("multi-arch-1:latest-arm64", Some("sha256:bb")),
+            ]
+        );
+        assert_eq!(plan.shared, vec!["multi-arch-1:latest-riscv64".to_string()]);
         Ok(())
     }
 

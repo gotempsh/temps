@@ -3623,8 +3623,29 @@ mod tests {
         let address = listener.local_addr().expect("mock agent address");
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept request");
-            let mut request = vec![0_u8; 16 * 1024];
-            let read = stream.read(&mut request).await.expect("read request");
+            // One read may return only part of the request: read the head,
+            // then exactly the body its Content-Length announces.
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            let head_end = loop {
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break end + 4;
+                }
+                let read = stream.read(&mut buffer).await.expect("read request head");
+                assert!(read > 0, "connection closed before the request head ended");
+                request.extend_from_slice(&buffer[..read]);
+            };
+            let head = String::from_utf8_lossy(&request[..head_end]).to_ascii_lowercase();
+            let body_len = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            while request.len() < head_end + body_len {
+                let read = stream.read(&mut buffer).await.expect("read request body");
+                assert!(read > 0, "connection closed before the request body ended");
+                request.extend_from_slice(&buffer[..read]);
+            }
             let response = format!(
                 "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
@@ -3634,7 +3655,7 @@ mod tests {
                 .write_all(response.as_bytes())
                 .await
                 .expect("write response");
-            String::from_utf8_lossy(&request[..read]).into_owned()
+            String::from_utf8_lossy(&request).into_owned()
         });
         (address, server)
     }

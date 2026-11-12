@@ -116,8 +116,9 @@ pub enum DockerUtilError {
         waited_secs: u64,
     },
 
-    /// The daemon's images or containers could not be listed, so no image
-    /// can be proved unused and none is removed.
+    /// The daemon could not be reached or queried while checking whether an
+    /// image is still in use, so it cannot be proved unused and is not
+    /// removed.
     #[error("Failed to {operation} while checking which images are still in use: {source}")]
     ImageInventory {
         operation: &'static str,

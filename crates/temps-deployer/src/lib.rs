@@ -1352,9 +1352,11 @@ pub trait ContainerDeployer: Send + Sync {
     /// [`temps_docker_util::image_removal`]). One outcome per request, in
     /// order; at most [`MAX_IMAGE_REMOVAL_BATCH`] requests per call.
     ///
-    /// Fails as a whole, removing nothing, when the runtime's images and
-    /// containers cannot be listed or the runtime cannot remove images at
-    /// all, which is what this default says.
+    /// A request whose image or containers cannot be read is reported
+    /// `Failed` in its outcome and nothing is removed for it. The call fails
+    /// as a whole, removing nothing, only when the runtime cannot be reached,
+    /// the batch is too large, or the runtime cannot remove images at all,
+    /// which is what this default says.
     async fn remove_unused_images(
         &self,
         _requests: &[ImageRemovalRequest],

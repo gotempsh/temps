@@ -3,7 +3,7 @@
 
 //! Builds that serve BuildKit secret mounts, for `RUN --mount=type=secret`.
 
-use super::image_builder::docker_build_args;
+use super::image_builder::{docker_build_args, image_labels};
 use super::DockerRuntime;
 use crate::build_timings::BuildStepTimer;
 use crate::{BuildRequest, BuildResult, BuilderError};
@@ -105,9 +105,15 @@ fn secret_mount_frontend_options(
         .as_ref()
         .and_then(|path| path.strip_prefix(&request.context_path).ok())
         .unwrap_or_else(|| Path::new("Dockerfile"));
-    let mut options = ImageBuildFrontendOptions::builder()
-        .dockerfile(dockerfile)
-        .label("built-by", "temps");
+    let mut options = ImageBuildFrontendOptions::builder().dockerfile(dockerfile);
+    // The same labels as a build without secrets: ownership labels included,
+    // so the orphan sweep can still recognise the image. Sorted, so the same
+    // request always renders the same options.
+    let mut labels: Vec<(String, String)> = image_labels(request).into_iter().collect();
+    labels.sort();
+    for (key, value) in &labels {
+        options = options.label(key, value);
+    }
     for (name, value) in docker_build_args(request, true) {
         options = options.buildarg(&name, &value);
     }
