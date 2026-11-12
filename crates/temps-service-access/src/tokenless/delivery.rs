@@ -51,6 +51,16 @@ pub fn credential_is_login(delivery: Option<&CredentialDelivery>) -> bool {
     matches!(delivery.map(|d| &d.format), Some(CredentialFormat::Basic))
 }
 
+/// True when the credential is base64 encoded into an HTTP Basic header, so it
+/// may hold any printable text (a password with spaces or non-ASCII letters)
+/// rather than the header-safe bytes a token placed verbatim must be.
+pub fn credential_is_encoded(delivery: Option<&CredentialDelivery>) -> bool {
+    matches!(
+        delivery.map(|d| &d.format),
+        Some(CredentialFormat::Basic | CredentialFormat::BasicToken { .. })
+    )
+}
+
 /// Normalizes header names to lower case and rejects anything the SDK would
 /// not inject. A delivery equal to the default (bearer, no headers) is dropped
 /// so such policies keep their original stored shape.

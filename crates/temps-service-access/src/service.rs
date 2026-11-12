@@ -546,17 +546,28 @@ pub fn validate_service(request: &mut SaveAccessService) -> Result<(), AccessErr
             "cannot set and clear a credential together",
         ));
     }
+    let (policy, _) = crate::tokenless::compile_policy(&request.policy)?;
+    request.policy = policy;
     if let Some(secret) = &request.credential {
         let secret = secret.expose();
-        if secret.is_empty()
+        // A Basic credential is base64 encoded before it reaches a header, so
+        // a password may contain spaces or non-ASCII letters; only control
+        // characters (a stray newline from a paste) are refused. A token is
+        // placed in the header as is, so it must be header-safe ASCII.
+        if crate::tokenless::delivery::credential_is_encoded(request.policy.delivery.as_ref()) {
+            if secret.is_empty() || secret.chars().any(char::is_control) {
+                return Err(invalid(
+                    "credential",
+                    "must be nonempty and contain no control characters such as line breaks",
+                ));
+            }
+        } else if secret.is_empty()
             || secret.len() > 16384
             || !secret.bytes().all(|c| (33..=126).contains(&c))
         {
             return Err(invalid("credential", "must be a nonempty value of at most 16384 printable ASCII bytes, without whitespace"));
         }
     }
-    let (policy, _) = crate::tokenless::compile_policy(&request.policy)?;
-    request.policy = policy;
     if let Some(secret) = &request.credential {
         crate::tokenless::delivery::validate_credential_shape(
             request.policy.delivery.as_ref(),

@@ -679,6 +679,47 @@ fn credential_shape_follows_the_selected_format() {
     validate_service(&mut req).unwrap();
 }
 
+#[test]
+fn basic_passwords_may_hold_spaces_and_non_ascii_but_tokens_may_not() {
+    use crate::types::{CredentialDelivery, CredentialFormat};
+    let secret = |value: &str| Some(temps_core::secret_string::SecretString::new(value));
+    let rejected = |req: &mut SaveAccessService| {
+        matches!(
+            validate_service(req),
+            Err(AccessError::Validation {
+                field: "credential",
+                ..
+            })
+        )
+    };
+
+    let mut req = request();
+    req.policy.delivery = Some(CredentialDelivery {
+        format: CredentialFormat::Basic,
+        headers: Vec::new(),
+    });
+    req.credential = secret("account:correct horse battery staple");
+    validate_service(&mut req).unwrap();
+    req.credential = secret("account:contraseña-segura");
+    validate_service(&mut req).unwrap();
+    req.credential = secret("account:pasted\nwith a newline");
+    assert!(rejected(&mut req), "a control character is still refused");
+
+    let mut req = request();
+    req.policy.delivery = Some(CredentialDelivery {
+        format: CredentialFormat::BasicToken {
+            username: "api".into(),
+        },
+        headers: Vec::new(),
+    });
+    req.credential = secret("pass phrase with spaces ü");
+    validate_service(&mut req).unwrap();
+
+    let mut req = request();
+    req.credential = secret("bearer token with spaces");
+    assert!(rejected(&mut req), "a bearer token stays header-safe ASCII");
+}
+
 #[tokio::test]
 async fn origin_edits_allow_explicit_replacement_or_clearing_and_same_origin_retains_secret() {
     for (origin, replacement, clear) in [
