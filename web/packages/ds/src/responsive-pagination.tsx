@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { type FormEvent, useId } from 'react'
+import { type KeyboardEvent, useId, useRef } from 'react'
 import {
   ChevronLeft,
   ChevronRight,
@@ -47,14 +47,23 @@ export function ResponsivePagination({
   className,
 }: ResponsivePaginationProps) {
   const pageInputId = useId()
+  const pageInput = useRef<HTMLInputElement>(null)
 
-  const submitRequestedPage = (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault()
-    const formData = new FormData(event.currentTarget)
-    const parsed = Number(formData.get('page'))
-    const nextPage = clampPage(parsed, totalPages)
-    event.currentTarget.reset()
+  // Not a <form>: a pager often sits inside one (a picker on a settings
+  // page), where a nested form's submit reaches the outer form and saves it.
+  const goToRequestedPage = () => {
+    const input = pageInput.current
+    if (!input) return
+    const nextPage = clampPage(Number(input.value), totalPages)
+    input.value = input.defaultValue
     if (nextPage !== page) onPageChange(nextPage)
+  }
+
+  const goOnEnter = (event: KeyboardEvent<HTMLInputElement>) => {
+    if (event.key !== 'Enter') return
+    // Enter in a text box would otherwise submit the surrounding form.
+    event.preventDefault()
+    goToRequestedPage()
   }
 
   const firstItem = total === 0 ? 0 : (page - 1) * pageSize + 1
@@ -154,15 +163,17 @@ export function ResponsivePagination({
             <ChevronLeft />
           </Button>
 
-          <form
+          <div
             key={page}
+            role="group"
+            aria-label="Go to page"
             className="flex items-center gap-2"
-            onSubmit={submitRequestedPage}
           >
             <label htmlFor={pageInputId} className="text-sm">
               Page
             </label>
             <Input
+              ref={pageInput}
               id={pageInputId}
               name="page"
               type="number"
@@ -172,14 +183,20 @@ export function ResponsivePagination({
               defaultValue={page}
               className="h-9 w-20"
               aria-label="Page number"
+              onKeyDown={goOnEnter}
             />
             <span className="text-sm text-muted-foreground">
               of {totalPages}
             </span>
-            <Button type="submit" variant="outline" size="sm">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={goToRequestedPage}
+            >
               Go
             </Button>
-          </form>
+          </div>
 
           <Button
             type="button"
