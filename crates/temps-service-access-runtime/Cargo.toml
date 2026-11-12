@@ -27,13 +27,13 @@ time.workspace = true
 arc-swap.workspace = true
 rand08 = { package = "rand", version = "0.8" }
 ed25519-dalek = "2"
-tokenless-core = { git = "https://github.com/gotempsh/tokenless", rev = "1475fa0fa9684124976e2e68e472e5bf529029d2" }
-tokenless-dataplane = { git = "https://github.com/gotempsh/tokenless", rev = "1475fa0fa9684124976e2e68e472e5bf529029d2" }
+tokenless-core = { git = "https://github.com/gotempsh/tokenless", rev = "1e2e2946e448dc4bb7c8f778241ad0279fc6bb34" }
+tokenless-dataplane = { git = "https://github.com/gotempsh/tokenless", rev = "1e2e2946e448dc4bb7c8f778241ad0279fc6bb34" }
 
 [dev-dependencies]
 base64.workspace = true
 rustls-pemfile.workspace = true
-tokenless-control = { git = "https://github.com/gotempsh/tokenless", rev = "1475fa0fa9684124976e2e68e472e5bf529029d2" }
+tokenless-control = { git = "https://github.com/gotempsh/tokenless", rev = "1e2e2946e448dc4bb7c8f778241ad0279fc6bb34" }
 tokio = { workspace = true, features = ["test-util"] }
 
 [lints]

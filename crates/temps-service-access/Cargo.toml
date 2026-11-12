@@ -35,12 +35,12 @@ sea-orm.workspace = true
 async-trait.workspace = true
 url.workspace = true
 # Pin the audited SDK contract while upstream enforcement work continues.
-tokenless-core = { git = "https://github.com/gotempsh/tokenless", rev = "1475fa0fa9684124976e2e68e472e5bf529029d2" }
+tokenless-core = { git = "https://github.com/gotempsh/tokenless", rev = "1e2e2946e448dc4bb7c8f778241ad0279fc6bb34" }
 
 [dev-dependencies]
 # Checks that every rendered delivery format is redacted from responses by
 # the same data plane the worker runs.
-tokenless-dataplane = { git = "https://github.com/gotempsh/tokenless", rev = "1475fa0fa9684124976e2e68e472e5bf529029d2" }
+tokenless-dataplane = { git = "https://github.com/gotempsh/tokenless", rev = "1e2e2946e448dc4bb7c8f778241ad0279fc6bb34" }
 temps-migrations = { path = "../temps-migrations" }
 temps-test-utils = { path = "../temps-test-utils" }
 tokio = { workspace = true, features = ["test-util", "macros"] }
