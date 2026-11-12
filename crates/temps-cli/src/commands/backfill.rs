@@ -113,8 +113,9 @@ pub struct ClickhouseBackfillArgs {
     /// PostgreSQL connection URL (system of record).
     // hide_env_values: a Postgres URL embeds credentials
     // (postgres://user:password@host/db), so keep its env value out of --help.
+    /// When unset, the installed `temps serve` service's URL is used.
     #[arg(long, env = "TEMPS_DATABASE_URL", hide_env_values = true)]
-    pub database_url: String,
+    pub database_url: Option<String>,
 
     /// ClickHouse HTTP endpoint URL (e.g. https://ch.example.internal:8443).
     #[arg(long, env = "TEMPS_CLICKHOUSE_URL")]
@@ -242,7 +243,12 @@ async fn run_clickhouse_async(args: ClickhouseBackfillArgs) -> anyhow::Result<()
         single => vec![single],
     };
 
-    let db = temps_schema::establish_connection(&args.database_url).await?;
+    let database = crate::database_url_source::resolve_database_url(
+        args.database_url.as_deref(),
+        crate::database_url_source::UrlDiscovery::InstalledService,
+    )?;
+    database.announce_discovery();
+    let db = temps_schema::establish_connection(database.url()).await?;
     info!("Connected to PostgreSQL");
 
     for domain in domains {

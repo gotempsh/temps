@@ -333,8 +333,9 @@ pub struct ImportCertificateCommand {
     pub private_key: PathBuf,
 
     /// Database URL. Prefer TEMPS_DATABASE_URL (or TEMPS_DATABASE_URL_FILE / the systemd credential temps_database_url): the flag form puts the password in the process command line
+    /// When unset, the installed `temps serve` service's URL is used.
     #[arg(long, env = "TEMPS_DATABASE_URL", hide_env_values = true)]
-    pub database_url: String,
+    pub database_url: Option<String>,
 
     /// Data directory containing the encryption key
     #[arg(long, env = "TEMPS_DATA_DIR")]
@@ -1863,8 +1864,19 @@ async fn execute_import(cmd: ImportCertificateCommand) -> anyhow::Result<()> {
     );
     println!();
 
-    // Get data directory
-    let data_dir = get_data_dir(&cmd.data_dir)?;
+    let database = crate::database_url_source::resolve_database_url(
+        cmd.database_url.as_deref(),
+        crate::database_url_source::UrlDiscovery::InstalledService,
+    )?;
+    database.announce_discovery();
+
+    // The server's data directory with the server's database: its key is the
+    // one the stored private keys must be encrypted with.
+    let data_dir = get_data_dir(&cmd.data_dir.clone().or_else(|| {
+        database
+            .service_data_dir()
+            .map(std::path::Path::to_path_buf)
+    }))?;
 
     // Load encryption key
     let encryption_key = load_encryption_key(&data_dir)?;
@@ -1910,7 +1922,7 @@ async fn execute_import(cmd: ImportCertificateCommand) -> anyhow::Result<()> {
 
     // Connect to database
     println!("{} Connecting to database...", "→".bright_blue());
-    let db = establish_connection(&cmd.database_url).await?;
+    let db = establish_connection(database.url()).await?;
 
     // Check if domain already exists
     let existing = domains::Entity::find()

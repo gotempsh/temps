@@ -10,6 +10,10 @@ use tokio::net::TcpStream;
 use tokio::time::timeout;
 
 use super::upgrade;
+use crate::database_url_source::{
+    resolve_database_url, DatabaseUrlNotFound, DatabaseUrlOrigin, ResolvedDatabaseUrl, UrlDiscovery,
+};
+use crate::service_definition::{self, ServiceDefinition};
 
 mod firecracker;
 mod mesh;
@@ -144,8 +148,25 @@ impl DoctorCommand {
     }
 
     async fn run(self) -> anyhow::Result<()> {
+        // The same sources `temps serve` reads, then the installed service
+        // definition, so a shell finds the server's database and data
+        // directory without repeating its flags.
+        let database =
+            resolve_database_url(self.database_url.as_deref(), UrlDiscovery::InstalledService);
+        let service = database
+            .as_ref()
+            .ok()
+            .and_then(ResolvedDatabaseUrl::service)
+            .cloned()
+            .or_else(service_definition::installed);
+        let (data_dir, data_dir_source) = self.resolve_data_dir(service.as_ref());
+
         if let Some(DoctorScope::Mesh(args)) = &self.scope {
-            return mesh::run(args, self.database_url.as_deref(), &self.resolve_data_dir()).await;
+            let database_url = database
+                .as_ref()
+                .map(ResolvedDatabaseUrl::url)
+                .map_err(ToString::to_string);
+            return mesh::run(args, database_url, &data_dir).await;
         }
         println!();
         println!(
@@ -163,36 +184,42 @@ impl DoctorCommand {
         report.print();
         report.checks.clear();
 
+        // -- Installed service --
+        println!();
+        println!("{}", "  Installed service".bright_yellow().bold());
+        check_installed_service(service.as_ref(), &mut report);
+        report.print();
+        report.checks.clear();
+
         // -- Data Directory --
-        let data_dir = self.resolve_data_dir();
         println!();
         println!("{}", "  Data Directory".bright_yellow().bold());
-        self.check_data_dir(&data_dir, &mut report);
+        self.check_data_dir(&data_dir, &data_dir_source, service.as_ref(), &mut report);
         report.print();
         report.checks.clear();
 
         // -- Docker --
         println!();
         println!("{}", "  Docker".bright_yellow().bold());
-        self.check_docker(&mut report).await;
+        self.check_docker(service.as_ref(), &mut report).await;
         report.print();
         report.checks.clear();
 
         // -- Database --
         println!();
         println!("{}", "  Database".bright_yellow().bold());
-        let db = self.check_database(&mut report).await;
+        let db = self.check_database(&database, &mut report).await;
         report.print();
         report.checks.clear();
 
         // -- Application Settings (requires DB) --
         println!();
         println!("{}", "  Initial admin".bright_yellow().bold());
-        self.check_initial_admin(db.as_ref(), &mut report).await;
+        self.check_initial_admin(&db, &mut report).await;
         report.print();
         report.checks.clear();
 
-        if let Some(ref db) = db {
+        if let DatabaseState::Connected(ref db) = db {
             println!();
             println!("{}", "  Application".bright_yellow().bold());
             self.check_app_settings(db, &mut report).await;
@@ -215,7 +242,7 @@ impl DoctorCommand {
 
             println!();
             println!("{}", "  WireGuard mesh".bright_yellow().bold());
-            let checks = mesh::control_plane_checks(db, &self.resolve_data_dir()).await;
+            let checks = mesh::control_plane_checks(db, &data_dir).await;
             mesh::add_to_report(&checks, &mut report);
             report.print();
             report.checks.clear();
@@ -245,15 +272,12 @@ impl DoctorCommand {
         Ok(())
     }
 
-    fn resolve_data_dir(&self) -> PathBuf {
-        if let Some(ref d) = self.data_dir {
-            d.clone()
-        } else if let Ok(d) = std::env::var("TEMPS_DATA_DIR") {
-            PathBuf::from(d)
-        } else {
-            let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-            default_data_dir(&home)
-        }
+    /// The data directory `temps serve` uses, and where that answer came
+    /// from: `--data-dir` / `TEMPS_DATA_DIR` here, else the installed
+    /// service's, else the default layout.
+    fn resolve_data_dir(&self, service: Option<&ServiceDefinition>) -> (PathBuf, String) {
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        resolve_doctor_data_dir(self.data_dir.as_deref(), service, &home)
     }
 
     // ── Version checks ──────────────────────────────────────────────
@@ -295,8 +319,17 @@ impl DoctorCommand {
 
     // ── Data directory checks ───────────────────────────────────────
 
-    fn check_data_dir(&self, data_dir: &Path, report: &mut DiagnosticReport) {
-        report.add("Path", CheckResult::Info(data_dir.display().to_string()));
+    fn check_data_dir(
+        &self,
+        data_dir: &Path,
+        source: &str,
+        service: Option<&ServiceDefinition>,
+        report: &mut DiagnosticReport,
+    ) {
+        report.add(
+            "Path",
+            CheckResult::Info(format!("{} ({source})", data_dir.display())),
+        );
 
         if !data_dir.exists() {
             report.add(
@@ -323,138 +356,61 @@ impl DoctorCommand {
             }
         }
 
-        let injected_secrets_configured = [
-            temps_config::STATELESS_ENV,
-            temps_config::AUTH_SECRET_ENV,
-            temps_config::AUTH_SECRET_FILE_ENV,
-            temps_config::ENCRYPTION_KEY_ENV,
-            temps_config::ENCRYPTION_KEY_FILE_ENV,
-        ]
-        .iter()
-        .any(|name| std::env::var_os(name).is_some());
-
-        if injected_secrets_configured {
-            match temps_config::resolve_installation_secrets(data_dir) {
-                Ok(_) => {
-                    report.add(
-                        "Encryption key",
-                        CheckResult::Pass("Valid injected secret".to_string()),
-                    );
-                    report.add(
-                        "Auth secret",
-                        CheckResult::Pass("Valid injected secret".to_string()),
-                    );
-                }
-                Err(error) => {
-                    let details = format!("Invalid injected installation secrets: {error}");
-                    report.add("Encryption key", CheckResult::Fail(details.clone()));
-                    report.add("Auth secret", CheckResult::Fail(details));
-                }
-            }
-        } else {
-            // Check encryption_key
-            let enc_key_path = data_dir.join("encryption_key");
-            if enc_key_path.exists() {
-                match std::fs::read_to_string(&enc_key_path) {
-                    Ok(content) => {
-                        let trimmed = content.trim();
-                        if trimmed.len() == 64 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
-                            report.add(
-                                "Encryption key",
-                                CheckResult::Pass("Valid (32 bytes)".to_string()),
-                            );
-                        } else {
-                            report.add(
-                                "Encryption key",
-                                CheckResult::Fail(format!(
-                                    "Invalid format (expected 64 hex chars, got {})",
-                                    trimmed.len()
-                                )),
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        report.add(
-                            "Encryption key",
-                            CheckResult::Fail(format!("Cannot read: {}", e)),
-                        );
-                    }
-                }
-            } else {
-                report.add(
-                    "Encryption key",
-                    CheckResult::Fail("Missing. Run `temps setup` first.".to_string()),
-                );
-            }
-
-            // Check auth_secret
-            let auth_secret_path = data_dir.join("auth_secret");
-            if auth_secret_path.exists() {
-                match std::fs::read_to_string(&auth_secret_path) {
-                    Ok(content) => {
-                        if content.trim().is_empty() {
-                            report.add(
-                                "Auth secret",
-                                CheckResult::Fail("File is empty".to_string()),
-                            );
-                        } else {
-                            report.add("Auth secret", CheckResult::Pass("Present".to_string()));
-                        }
-                    }
-                    Err(e) => {
-                        report.add(
-                            "Auth secret",
-                            CheckResult::Fail(format!("Cannot read: {}", e)),
-                        );
-                    }
-                }
-            } else {
-                report.add(
-                    "Auth secret",
-                    CheckResult::Fail("Missing. Run `temps setup` first.".to_string()),
-                );
-            }
-        }
-
-        // Check GeoLite2 database
-        let geo_paths = [
-            data_dir.join("GeoLite2-City.mmdb"),
-            PathBuf::from("/usr/share/GeoIP/GeoLite2-City.mmdb"),
-        ];
-        let geo_found = geo_paths.iter().find(|p| p.exists());
-        if let Some(path) = geo_found {
+        // The secrets as `temps serve` resolves them (ServerConfig::new):
+        // injected through its environment, else the data directory's files,
+        // which it generates when they are missing. Its environment is this
+        // shell's when that injects any of them, else the installed service's.
+        let secrets_env = SecretsEnvironment::choose(service);
+        if let SecretsEnvironment::Service(service) = &secrets_env {
             report.add(
-                "GeoLite2 database",
-                CheckResult::Pass(path.display().to_string()),
-            );
-        } else {
-            report.add(
-                "GeoLite2 database",
-                CheckResult::Warn("Not found. Geolocation features will be disabled.".to_string()),
+                "Secrets source",
+                CheckResult::Info(format!(
+                    "Checked with the environment of {}",
+                    service.path.display()
+                )),
             );
         }
+        let inspection =
+            temps_config::inspect_installation_secrets_with(data_dir, |name| secrets_env.get(name));
+        let initialized = matches!(
+            inspection.auth_secret,
+            Ok(temps_config::InspectedSecret::Found {
+                source: temps_config::SecretSource::DataDir { .. },
+                ..
+            })
+        );
+        report.add(
+            "Encryption key",
+            encryption_key_result(&inspection.encryption_key, initialized),
+        );
+        report.add("Auth secret", auth_secret_result(&inspection.auth_secret));
 
-        // Check logs directory
-        let logs_dir = data_dir.join("logs");
-        if logs_dir.exists() {
-            report.add("Logs directory", CheckResult::Pass("Present".to_string()));
-        } else {
-            report.add(
-                "Logs directory",
-                CheckResult::Warn("Not found. Will be created on first deployment.".to_string()),
-            );
-        }
+        report.add(
+            "GeoLite2 database",
+            geolite_result(
+                data_dir,
+                service.and_then(|service| service.working_directory.as_deref()),
+            ),
+        );
+        report.add("Logs directory", logs_dir_result(data_dir));
     }
 
     // ── Docker checks ───────────────────────────────────────────────
 
-    async fn check_docker(&self, report: &mut DiagnosticReport) {
+    async fn check_docker(
+        &self,
+        service: Option<&ServiceDefinition>,
+        report: &mut DiagnosticReport,
+    ) {
         // Same endpoint resolution as `temps serve`: DOCKER_HOST (including
         // tcp:// and ssh:// endpoints), else the active Docker context adopted
         // at startup, else the default socket. A doctor that probed a
         // different endpoint than the server would report the wrong answer.
         let endpoint = crate::docker_context::docker_endpoint();
         report.add("Endpoint", CheckResult::Info(endpoint.describe()));
+        if let Some(note) = service_docker_host_mismatch(service, &endpoint.host) {
+            report.add("Service endpoint", CheckResult::Warn(note));
+        }
 
         let docker = match bollard::Docker::connect_with_defaults() {
             Ok(d) => d,
@@ -560,8 +516,10 @@ impl DoctorCommand {
             }
         }
 
-        // Docker network
-        let network_name = temps_core::NETWORK_NAME.as_str();
+        // Docker network: the name the server uses, which its own
+        // environment may override.
+        let network_name = docker_network_name(service);
+        let network_name = network_name.as_str();
         match timeout(
             CHECK_TIMEOUT,
             docker.list_networks(None::<bollard::query_parameters::ListNetworksOptions>),
@@ -603,34 +561,35 @@ impl DoctorCommand {
 
     async fn check_database(
         &self,
+        database: &Result<ResolvedDatabaseUrl, DatabaseUrlNotFound>,
         report: &mut DiagnosticReport,
-    ) -> Option<sea_orm::DatabaseConnection> {
-        let database_url = match &self.database_url {
-            Some(url) => url.clone(),
-            None => {
+    ) -> DatabaseState {
+        let resolved = match database {
+            Ok(resolved) => resolved,
+            Err(not_found) => {
                 report.add(
                     "Connection",
-                    CheckResult::Warn(
-                        "No --database-url provided. Skipping database checks.".to_string(),
-                    ),
+                    CheckResult::Warn(format!("Skipping database checks. {not_found}")),
                 );
-                return None;
+                return DatabaseState::NoUrl;
             }
         };
-
-        // Mask password in display URL
-        let display_url = mask_database_url(&database_url);
-        report.add("URL", CheckResult::Info(display_url));
+        // Where the URL came from, never the URL: it carries the password.
+        report.add("Source", CheckResult::Info(resolved.origin().describe()));
+        if let Some(note) = service_url_mismatch(resolved) {
+            report.add("Installed service", CheckResult::Warn(note));
+        }
+        let database_url = resolved.url();
 
         // Parse host:port
-        let (host, port) = match parse_pg_url(&database_url) {
+        let (host, port) = match parse_pg_url(database_url) {
             Ok(hp) => hp,
             Err(e) => {
                 report.add(
                     "URL parse",
                     CheckResult::Fail(format!("Invalid URL: {}", e)),
                 );
-                return None;
+                return DatabaseState::Unreachable;
             }
         };
 
@@ -648,19 +607,19 @@ impl DoctorCommand {
                     "TCP connectivity",
                     CheckResult::Fail(format!("{}: {}", addr, e)),
                 );
-                return None;
+                return DatabaseState::Unreachable;
             }
             Err(_) => {
                 report.add(
                     "TCP connectivity",
                     CheckResult::Fail(format!("{}: timed out", addr)),
                 );
-                return None;
+                return DatabaseState::Unreachable;
             }
         }
 
         // SeaORM connection (without running migrations)
-        let mut opt = temps_database::connect_options(&database_url);
+        let mut opt = temps_database::connect_options(database_url);
         opt.max_connections(2)
             .min_connections(1)
             .connect_timeout(CHECK_TIMEOUT);
@@ -672,14 +631,14 @@ impl DoctorCommand {
                     "Connection",
                     CheckResult::Fail(format!("Cannot connect: {}", e)),
                 );
-                return None;
+                return DatabaseState::Unreachable;
             }
             Err(_) => {
                 report.add(
                     "Connection",
                     CheckResult::Fail("Connection timed out".to_string()),
                 );
-                return None;
+                return DatabaseState::Unreachable;
             }
         };
 
@@ -780,7 +739,7 @@ impl DoctorCommand {
             );
         }
 
-        Some(db)
+        DatabaseState::Connected(db)
     }
 
     // ── Initial admin bootstrap ─────────────────────────────────────
@@ -788,28 +747,30 @@ impl DoctorCommand {
     /// `temps serve` creates the first admin from TEMPS_ADMIN_EMAIL and
     /// TEMPS_ADMIN_PASSWORD_FILE when no users exist. Doctor checks persisted
     /// bootstrap state without rereading these one-shot input secrets.
-    async fn check_initial_admin(
-        &self,
-        db: Option<&sea_orm::DatabaseConnection>,
-        report: &mut DiagnosticReport,
-    ) {
-        let users: Option<i64> = if let Some(db) = db {
-            db.query_one(Statement::from_string(
-                DatabaseBackend::Postgres,
-                "SELECT COUNT(*) AS count FROM users WHERE deleted_at IS NULL AND id <> 0"
-                    .to_string(),
-            ))
-            .await
-            .ok()
-            .flatten()
-            .and_then(|row| {
+    async fn check_initial_admin(&self, db: &DatabaseState, report: &mut DiagnosticReport) {
+        let users = match db {
+            DatabaseState::NoUrl => UserCount::NoDatabaseUrl,
+            DatabaseState::Unreachable => UserCount::Unreachable,
+            DatabaseState::Connected(db) => {
                 use sea_orm::TryGetable;
-                i64::try_get_by(&row, "count").ok()
-            })
-        } else {
-            None
+                match db
+                    .query_one(Statement::from_string(
+                        DatabaseBackend::Postgres,
+                        "SELECT COUNT(*) AS count FROM users WHERE deleted_at IS NULL AND id <> 0"
+                            .to_string(),
+                    ))
+                    .await
+                {
+                    Ok(Some(row)) => match i64::try_get_by(&row, "count") {
+                        Ok(count) => UserCount::Count(count),
+                        Err(error) => UserCount::QueryFailed(format!("{error:?}")),
+                    },
+                    Ok(None) => UserCount::QueryFailed("the count returned no row".to_string()),
+                    Err(error) => UserCount::QueryFailed(error.to_string()),
+                }
+            }
         };
-        report.add("Initial admin", initial_admin_result(users));
+        report.add("Initial admin", initial_admin_result(&users));
     }
 
     // ── App settings checks ─────────────────────────────────────────
@@ -1282,38 +1243,379 @@ impl DoctorCommand {
     }
 }
 
+/// What the database section left for the checks that need a connection.
+enum DatabaseState {
+    /// No source supplied a URL.
+    NoUrl,
+    /// A URL was found, but the database could not be reached.
+    Unreachable,
+    Connected(sea_orm::DatabaseConnection),
+}
+
+/// The outcome of counting users for the initial-admin check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UserCount {
+    NoDatabaseUrl,
+    Unreachable,
+    QueryFailed(String),
+    Count(i64),
+}
+
 /// Assess persisted bootstrap state without reading first-boot inputs.
-fn initial_admin_result(users: Option<i64>) -> CheckResult {
+fn initial_admin_result(users: &UserCount) -> CheckResult {
     match users {
-        Some(count) if count > 0 => CheckResult::Pass(format!(
+        UserCount::Count(count) if *count > 0 => CheckResult::Pass(format!(
             "{count} user(s) exist; initial user bootstrap has completed"
         )),
-        Some(0) => CheckResult::Warn(
+        UserCount::Count(_) => CheckResult::Warn(
             "No users exist yet. Run `temps serve` to complete initial admin setup; \
-             unattended first boot requires TEMPS_ADMIN_EMAIL and TEMPS_ADMIN_PASSWORD_FILE".to_string()
+             unattended first boot requires TEMPS_ADMIN_EMAIL and TEMPS_ADMIN_PASSWORD_FILE"
+                .to_string(),
         ),
-        _ => CheckResult::Warn(
-            "Could not determine whether users exist. Restore database connectivity to check persisted initial admin setup".to_string()
+        UserCount::NoDatabaseUrl => CheckResult::Warn(
+            "Not checked: no database URL was found (see Database above)".to_string(),
         ),
+        UserCount::Unreachable => CheckResult::Warn(
+            "Not checked: the database could not be reached (see Database above)".to_string(),
+        ),
+        UserCount::QueryFailed(error) => CheckResult::Warn(format!(
+            "Could not count users: {error}. If the schema is not migrated yet, run `temps migrate`"
+        )),
     }
+}
+
+/// A directory's runtime secrets: the auth secret counts double, because
+/// `temps serve` always writes both, while the installer copies only
+/// `encryption_key` up to `~/.temps` beside the real `~/.temps/data`.
+fn runtime_files_score(dir: &Path) -> u8 {
+    u8::from(dir.join(temps_config::AUTH_SECRET_FILE).is_file()) * 2
+        + u8::from(dir.join(temps_config::ENCRYPTION_KEY_FILE).is_file())
 }
 
 /// Resolve the default installation layout without overriding an explicit
 /// `--data-dir` or `TEMPS_DATA_DIR`. Current installs use `~/.temps`, while
-/// older deployment scripts placed runtime secrets in `~/.temps/data`.
+/// the installer (and older deployment scripts) run the server on
+/// `~/.temps/data`; the directory holding more of the server's runtime
+/// files wins, the root on a tie.
 pub(super) fn default_data_dir(home: &Path) -> PathBuf {
     let root = home.join(".temps");
     let nested = root.join("data");
-    let root_has_runtime_files =
-        root.join("auth_secret").is_file() || root.join("encryption_key").is_file();
-    let nested_has_runtime_files =
-        nested.join("auth_secret").is_file() || nested.join("encryption_key").is_file();
-
-    if !root_has_runtime_files && nested_has_runtime_files {
+    if runtime_files_score(&nested) > runtime_files_score(&root) {
         nested
     } else {
         root
     }
+}
+
+/// Doctor's data directory and a description of where it came from:
+/// explicit, else the installed service's (what the server really uses),
+/// else the default layout.
+fn resolve_doctor_data_dir(
+    explicit: Option<&Path>,
+    service: Option<&ServiceDefinition>,
+    home: &Path,
+) -> (PathBuf, String) {
+    if let Some(dir) = explicit {
+        return (
+            dir.to_path_buf(),
+            "from --data-dir / TEMPS_DATA_DIR".to_string(),
+        );
+    }
+    if let Some(service) = service {
+        if let Some((dir, location)) = &service.data_dir {
+            return (
+                dir.clone(),
+                format!("from {} in {}", location.describe(), service.path.display()),
+            );
+        }
+    }
+    (
+        default_data_dir(home),
+        "default layout: no --data-dir, TEMPS_DATA_DIR or installed service".to_string(),
+    )
+}
+
+/// The installed service doctor read, and anything it references that could
+/// not be used.
+fn check_installed_service(service: Option<&ServiceDefinition>, report: &mut DiagnosticReport) {
+    let Some(service) = service else {
+        let checked = service_definition::ServiceLocations::installed()
+            .paths()
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>();
+        report.add(
+            "Definition",
+            CheckResult::Info(if checked.is_empty() {
+                "No installed service location is known on this platform".to_string()
+            } else {
+                format!("None found (checked {})", checked.join(", "))
+            }),
+        );
+        return;
+    };
+    report.add(
+        "Definition",
+        CheckResult::Info(service.path.display().to_string()),
+    );
+    for problem in &service.problems {
+        report.add("Definition", CheckResult::Warn(problem.clone()));
+    }
+}
+
+/// The variables `ServerConfig::new` reads the installation secrets from.
+const SECRET_VARIABLES: [&str; 5] = [
+    temps_config::STATELESS_ENV,
+    temps_config::AUTH_SECRET_ENV,
+    temps_config::AUTH_SECRET_FILE_ENV,
+    temps_config::ENCRYPTION_KEY_ENV,
+    temps_config::ENCRYPTION_KEY_FILE_ENV,
+];
+
+/// Which environment the secrets are checked against: this shell's when it
+/// injects any of them (the operator is testing that), else the installed
+/// service's, which a shell does not inherit.
+enum SecretsEnvironment<'a> {
+    Shell,
+    Service(&'a ServiceDefinition),
+    Empty,
+}
+
+impl<'a> SecretsEnvironment<'a> {
+    fn choose(service: Option<&'a ServiceDefinition>) -> Self {
+        if SECRET_VARIABLES
+            .iter()
+            .any(|name| std::env::var_os(name).is_some())
+        {
+            return SecretsEnvironment::Shell;
+        }
+        match service {
+            Some(service)
+                if SECRET_VARIABLES
+                    .iter()
+                    .any(|name| service.environment.contains_key(*name)) =>
+            {
+                SecretsEnvironment::Service(service)
+            }
+            Some(_) | None => SecretsEnvironment::Empty,
+        }
+    }
+
+    fn get(&self, name: &str) -> Option<String> {
+        match self {
+            SecretsEnvironment::Shell => std::env::var(name).ok(),
+            SecretsEnvironment::Service(service) => service.environment.get(name).cloned(),
+            SecretsEnvironment::Empty => None,
+        }
+    }
+}
+
+fn describe_secret_source(source: &temps_config::SecretSource) -> String {
+    match source {
+        temps_config::SecretSource::Environment { variable } => {
+            format!("injected with {variable}")
+        }
+        temps_config::SecretSource::InjectedFile { variable, path } => {
+            format!("{}, from {variable}", path.display())
+        }
+        temps_config::SecretSource::DataDir { path } => path.display().to_string(),
+    }
+}
+
+/// A read this user is not allowed to make: `temps serve` may well be (it
+/// often runs as root), so it is unverified rather than failed.
+fn unreadable_by_this_user(error: &temps_config::ConfigServiceError) -> Option<&Path> {
+    match error {
+        temps_config::ConfigServiceError::LocalSecretRead { path, source }
+        | temps_config::ConfigServiceError::SecretFileRead { path, source, .. }
+            if source.kind() == std::io::ErrorKind::PermissionDenied =>
+        {
+            Some(path)
+        }
+        _ => None,
+    }
+}
+
+fn unverifiable(path: &Path) -> CheckResult {
+    CheckResult::Warn(format!(
+        "Could not verify: {} cannot be read by this user. Run `sudo temps doctor`, or run it \
+         as the user `temps serve` runs as",
+        path.display()
+    ))
+}
+
+/// FAIL only where `temps serve` would refuse to start: a missing file is
+/// generated at startup, and one this user cannot read may be readable by
+/// the server.
+fn auth_secret_result(
+    inspected: &Result<temps_config::InspectedSecret, temps_config::ConfigServiceError>,
+) -> CheckResult {
+    match inspected {
+        Ok(temps_config::InspectedSecret::Found { source, value }) => {
+            match temps_core::CookieCrypto::new(value) {
+                Ok(_) => CheckResult::Pass(format!("Present ({})", describe_secret_source(source))),
+                Err(error) => CheckResult::Fail(format!(
+                    "{} holds an auth secret `temps serve` rejects: {error}",
+                    describe_secret_source(source)
+                )),
+            }
+        }
+        Ok(temps_config::InspectedSecret::NotCreatedYet { path }) => CheckResult::Warn(format!(
+            "{} does not exist yet. `temps serve` generates it when it starts, so this is \
+             expected before the first start; if the server is already running, it uses a \
+             different data directory (pass --data-dir)",
+            path.display()
+        )),
+        Err(error) => match unreadable_by_this_user(error) {
+            Some(path) => unverifiable(path),
+            None => CheckResult::Fail(format!("`temps serve` would refuse to start: {error}")),
+        },
+    }
+}
+
+/// Like [`auth_secret_result`], except that a missing key on an installation
+/// that already has its auth secret is a failure: the key serve would
+/// generate cannot decrypt the credentials stored with the old one.
+fn encryption_key_result(
+    inspected: &Result<temps_config::InspectedSecret, temps_config::ConfigServiceError>,
+    initialized: bool,
+) -> CheckResult {
+    match inspected {
+        Ok(temps_config::InspectedSecret::Found { source, value }) => {
+            match temps_core::EncryptionService::new(value) {
+                Ok(_) => CheckResult::Pass(format!(
+                    "Valid, 32 bytes ({})",
+                    describe_secret_source(source)
+                )),
+                Err(error) => CheckResult::Fail(format!(
+                    "{} holds an encryption key `temps serve` rejects: {error}",
+                    describe_secret_source(source)
+                )),
+            }
+        }
+        Ok(temps_config::InspectedSecret::NotCreatedYet { path }) if initialized => {
+            CheckResult::Fail(format!(
+                "{} is missing, but this data directory already has an auth secret: \
+                 `temps serve` would generate a new key that cannot decrypt the credentials \
+                 stored with the old one. Restore the original encryption_key",
+                path.display()
+            ))
+        }
+        Ok(temps_config::InspectedSecret::NotCreatedYet { path }) => CheckResult::Warn(format!(
+            "{} does not exist yet. `temps serve` generates it when it starts, so this is \
+             expected before the first start; if the server is already running, it uses a \
+             different data directory (pass --data-dir)",
+            path.display()
+        )),
+        Err(error) => match unreadable_by_this_user(error) {
+            Some(path) => unverifiable(path),
+            None => CheckResult::Fail(format!("`temps serve` would refuse to start: {error}")),
+        },
+    }
+}
+
+/// Where `temps serve` opens GeoLite2 (`resolve_mmdb_path`): its working
+/// directory, then the data directory. Nowhere else, so a copy elsewhere
+/// (such as /usr/share/GeoIP) is not one the server uses.
+fn geolite_result(data_dir: &Path, working_directory: Option<&Path>) -> CheckResult {
+    let candidates: Vec<PathBuf> = working_directory
+        .map(|dir| dir.join(temps_geo::CITY_DB_FILENAME))
+        .into_iter()
+        .chain(std::iter::once(data_dir.join(temps_geo::CITY_DB_FILENAME)))
+        .collect();
+    if let Some(found) = candidates.iter().find(|path| path.is_file()) {
+        return CheckResult::Pass(found.display().to_string());
+    }
+    let looked_in = candidates
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(" or ");
+    let system_copy = Path::new("/usr/share/GeoIP").join(temps_geo::CITY_DB_FILENAME);
+    if system_copy.is_file() {
+        return CheckResult::Warn(format!(
+            "Not in {looked_in}. A copy exists at {}, but `temps serve` does not read that \
+             location: copy it to {}",
+            system_copy.display(),
+            data_dir.join(temps_geo::CITY_DB_FILENAME).display()
+        ));
+    }
+    CheckResult::Warn(format!(
+        "Not found in {looked_in}. `temps serve` tries to download it at startup; until it is \
+         there, geolocation is disabled"
+    ))
+}
+
+/// `temps serve` creates `<data dir>/logs` every time it starts and refuses
+/// to start when it cannot.
+fn logs_dir_result(data_dir: &Path) -> CheckResult {
+    let logs = data_dir.join(temps_config::PIPELINE_LOGS_DIR_NAME);
+    if logs.is_dir() {
+        return CheckResult::Pass(logs.display().to_string());
+    }
+    if logs.exists() {
+        return CheckResult::Fail(format!(
+            "{} is not a directory, so `temps serve` cannot create its logs directory and \
+             refuses to start",
+            logs.display()
+        ));
+    }
+    CheckResult::Warn(format!(
+        "{} does not exist. `temps serve` creates it every time it starts, so either the \
+         server has not started with this data directory yet, or it runs with a different one \
+         (pass --data-dir)",
+        logs.display()
+    ))
+}
+
+/// The Docker network name: this shell's TEMPS_NETWORK_NAME when set, else
+/// the installed service's, else the default — what the server resolves.
+fn docker_network_name(service: Option<&ServiceDefinition>) -> String {
+    if std::env::var_os("TEMPS_NETWORK_NAME").is_some() {
+        return temps_core::NETWORK_NAME.clone();
+    }
+    service
+        .and_then(|service| service.env("TEMPS_NETWORK_NAME"))
+        .map(str::to_string)
+        .unwrap_or_else(|| temps_core::NETWORK_NAME.clone())
+}
+
+/// The installed service talks to a different Docker daemon than the one
+/// these checks probe.
+fn service_docker_host_mismatch(
+    service: Option<&ServiceDefinition>,
+    probed: &str,
+) -> Option<String> {
+    let service = service?;
+    let host = service.env("DOCKER_HOST")?;
+    (host != probed).then(|| {
+        format!(
+            "{} sets DOCKER_HOST to a different endpoint than the one checked here; run with \
+             the same DOCKER_HOST to check the daemon the server uses",
+            service.path.display()
+        )
+    })
+}
+
+/// The URL doctor was given is not the one the installed server uses, so the
+/// database checks describe some other database.
+fn service_url_mismatch(resolved: &ResolvedDatabaseUrl) -> Option<String> {
+    if matches!(
+        resolved.origin(),
+        DatabaseUrlOrigin::InstalledService { .. }
+    ) {
+        return None;
+    }
+    let service = resolved.service()?;
+    let service_url = service.url()?;
+    (service_url != resolved.url()).then(|| {
+        format!(
+            "{} connects to a different database URL than {}; the checks below are for the \
+             one given here",
+            service.path.display(),
+            resolved.origin().describe()
+        )
+    })
 }
 
 /// Other candidate data directories (`~/.temps` and the nested
@@ -1475,23 +1777,6 @@ fn parse_pg_url(url: &str) -> Result<(String, u16), String> {
     } else {
         Ok((host_port.to_string(), 5432))
     }
-}
-
-/// Mask password in a database URL for safe display.
-fn mask_database_url(url: &str) -> String {
-    // Pattern: postgres://user:password@host:port/db
-    if let Some(scheme_end) = url.find("://") {
-        let after_scheme = &url[scheme_end + 3..];
-        if let Some(at_pos) = after_scheme.rfind('@') {
-            let credentials = &after_scheme[..at_pos];
-            let rest = &after_scheme[at_pos..];
-            if let Some(colon_pos) = credentials.find(':') {
-                let user = &credentials[..colon_pos];
-                return format!("{}://{}:***{}", &url[..scheme_end], user, rest);
-            }
-        }
-    }
-    url.to_string()
 }
 
 /// Turn "newest release on the channel" into a doctor line. Only a strictly
@@ -1836,36 +2121,6 @@ mod tests {
     }
 
     #[test]
-    fn test_mask_database_url_with_password() {
-        let url = "postgres://myuser:secret123@localhost:5432/mydb";
-        assert_eq!(
-            mask_database_url(url),
-            "postgres://myuser:***@localhost:5432/mydb"
-        );
-    }
-
-    #[test]
-    fn test_mask_database_url_with_special_chars() {
-        let url = "postgresql://admin:p%40ss%23word@db.example.com:5433/temps";
-        assert_eq!(
-            mask_database_url(url),
-            "postgresql://admin:***@db.example.com:5433/temps"
-        );
-    }
-
-    #[test]
-    fn test_mask_database_url_no_password() {
-        let url = "postgres://localhost:5432/mydb";
-        assert_eq!(mask_database_url(url), "postgres://localhost:5432/mydb");
-    }
-
-    #[test]
-    fn test_mask_database_url_no_credentials() {
-        let url = "postgres://localhost/mydb";
-        assert_eq!(mask_database_url(url), "postgres://localhost/mydb");
-    }
-
-    #[test]
     fn test_parse_pg_url_basic() {
         let (host, port) = parse_pg_url("postgres://user:pass@localhost:5432/db").unwrap();
         assert_eq!(host, "localhost");
@@ -1909,26 +2164,40 @@ mod tests {
 
     #[test]
     fn initial_admin_does_not_treat_a_failed_query_as_an_empty_database() {
-        assert!(
-            matches!(initial_admin_result(None), CheckResult::Warn(message)
-            if message.contains("Could not determine") && message.contains("database connectivity"))
-        );
+        assert!(matches!(
+            initial_admin_result(&UserCount::QueryFailed("relation \"users\" does not exist".into())),
+            CheckResult::Warn(message)
+                if message.contains("Could not count users") && message.contains("temps migrate")
+        ));
+    }
+
+    #[test]
+    fn initial_admin_says_why_it_was_not_checked() {
+        assert!(matches!(
+            initial_admin_result(&UserCount::NoDatabaseUrl),
+            CheckResult::Warn(message) if message.contains("no database URL was found")
+        ));
+        assert!(matches!(
+            initial_admin_result(&UserCount::Unreachable),
+            CheckResult::Warn(message) if message.contains("could not be reached")
+        ));
     }
 
     #[test]
     fn initial_admin_reports_completed_bootstrap_from_persisted_users() {
-        assert!(
-            matches!(initial_admin_result(Some(2)), CheckResult::Pass(message)
-            if message.contains("bootstrap has completed"))
-        );
+        assert!(matches!(
+            initial_admin_result(&UserCount::Count(2)),
+            CheckResult::Pass(message) if message.contains("bootstrap has completed")
+        ));
     }
 
     #[test]
     fn initial_admin_reports_the_required_first_boot_step() {
-        assert!(
-            matches!(initial_admin_result(Some(0)), CheckResult::Warn(message)
-            if message.contains("temps serve") && message.contains("unattended first boot"))
-        );
+        assert!(matches!(
+            initial_admin_result(&UserCount::Count(0)),
+            CheckResult::Warn(message)
+                if message.contains("temps serve") && message.contains("unattended first boot")
+        ));
     }
 
     #[test]
@@ -1995,5 +2264,214 @@ mod tests {
             .expect("write nested auth secret");
 
         assert_eq!(default_data_dir(home.path()), root);
+    }
+
+    /// What the installer leaves on disk once `temps serve` has started: the
+    /// server's secrets in `~/.temps/data`, plus a copy of `encryption_key`
+    /// (only) in `~/.temps`. Returns the unit and the server's data dir.
+    fn installer_layout(home: &Path) -> (ServiceDefinition, PathBuf) {
+        let data_dir = home.join(".temps/data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        // Exactly what serve does at startup.
+        temps_config::resolve_installation_secrets(&data_dir).unwrap();
+        std::fs::copy(
+            data_dir.join("encryption_key"),
+            home.join(".temps/encryption_key"),
+        )
+        .unwrap();
+        let unit = home.join("temps.service");
+        std::fs::write(
+            &unit,
+            format!(
+                "[Service]\nWorkingDirectory={h}/.temps\n\
+                 ExecStart={h}/.temps/bin/temps serve \\\n  \
+                 --database-url=\"postgresql://temps:pw@127.0.0.1:5432/temps\" \\\n  \
+                 --data-dir=\"{h}/.temps/data\"\nEnvironment=HOME={h}\n",
+                h = home.display()
+            ),
+        )
+        .unwrap();
+        let service = match service_definition::probe(&service_definition::ServiceLocations {
+            systemd_unit: Some(unit),
+            launchd_agent: None,
+        })
+        .pop()
+        {
+            Some(service_definition::ServiceProbe::Found(service)) => *service,
+            other => panic!("expected the unit to parse, got {other:?}"),
+        };
+        (service, data_dir)
+    }
+
+    fn no_env(_: &str) -> Option<String> {
+        None
+    }
+
+    #[test]
+    fn the_installers_copied_key_no_longer_hides_the_real_data_dir() {
+        let home = tempfile::tempdir().unwrap();
+        let (_, data_dir) = installer_layout(home.path());
+        // `~/.temps` holds only the copied encryption_key: the layout guess
+        // must pick the directory the server writes both secrets to.
+        assert_eq!(default_data_dir(home.path()), data_dir);
+    }
+
+    #[test]
+    fn doctor_checks_the_data_dir_the_installed_service_uses() {
+        let home = tempfile::tempdir().unwrap();
+        let (service, data_dir) = installer_layout(home.path());
+        let (dir, source) = resolve_doctor_data_dir(None, Some(&service), home.path());
+        assert_eq!(dir, data_dir);
+        assert!(
+            source.contains("--data-dir") && source.contains("temps.service"),
+            "{source}"
+        );
+
+        let explicit = home.path().join("elsewhere");
+        let (dir, _) = resolve_doctor_data_dir(Some(&explicit), Some(&service), home.path());
+        assert_eq!(dir, explicit, "--data-dir / TEMPS_DATA_DIR still win");
+    }
+
+    #[test]
+    fn the_auth_secret_passes_on_the_layout_serve_uses() {
+        let home = tempfile::tempdir().unwrap();
+        let (service, _) = installer_layout(home.path());
+        let (data_dir, _) = resolve_doctor_data_dir(None, Some(&service), home.path());
+        let inspection = temps_config::inspect_installation_secrets_with(&data_dir, no_env);
+        assert!(
+            matches!(
+                auth_secret_result(&inspection.auth_secret),
+                CheckResult::Pass(_)
+            ),
+            "{:?}",
+            auth_secret_result(&inspection.auth_secret)
+        );
+        assert!(matches!(
+            encryption_key_result(&inspection.encryption_key, true),
+            CheckResult::Pass(_)
+        ));
+        assert!(matches!(logs_dir_result(&data_dir), CheckResult::Warn(_)));
+    }
+
+    #[test]
+    fn a_missing_auth_secret_is_a_warning_because_serve_generates_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let inspection = temps_config::inspect_installation_secrets_with(dir.path(), no_env);
+        let CheckResult::Warn(message) = auth_secret_result(&inspection.auth_secret) else {
+            panic!("a missing auth secret must not fail");
+        };
+        assert!(message.contains("generates it when it starts"), "{message}");
+        assert!(
+            !dir.path().join("auth_secret").exists(),
+            "doctor must not create secrets"
+        );
+    }
+
+    #[test]
+    fn an_auth_secret_serve_rejects_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("auth_secret"), "too-short").unwrap();
+        let inspection = temps_config::inspect_installation_secrets_with(dir.path(), no_env);
+        let CheckResult::Fail(message) = auth_secret_result(&inspection.auth_secret) else {
+            panic!("an invalid auth secret must fail");
+        };
+        assert!(
+            !message.contains("too-short"),
+            "the secret is never printed: {message}"
+        );
+    }
+
+    #[test]
+    fn a_conflicting_injected_auth_secret_fails_like_serve() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = |name: &str| match name {
+            "TEMPS_AUTH_SECRET" => Some("a".repeat(64)),
+            "TEMPS_AUTH_SECRET_FILE" => Some("/run/secrets/auth".to_string()),
+            _ => None,
+        };
+        let inspection = temps_config::inspect_installation_secrets_with(dir.path(), env);
+        assert!(matches!(
+            auth_secret_result(&inspection.auth_secret),
+            CheckResult::Fail(message) if message.contains("would refuse to start")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_auth_secret_this_user_cannot_read_is_unverified_not_failed() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping: root reads any file");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth_secret");
+        std::fs::write(&path, "b".repeat(64)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let inspection = temps_config::inspect_installation_secrets_with(dir.path(), no_env);
+        assert!(matches!(
+            auth_secret_result(&inspection.auth_secret),
+            CheckResult::Warn(message) if message.contains("Could not verify")
+        ));
+    }
+
+    #[test]
+    fn a_lost_encryption_key_on_an_initialized_dir_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let inspection = temps_config::inspect_installation_secrets_with(dir.path(), no_env);
+        assert!(matches!(
+            encryption_key_result(&inspection.encryption_key, false),
+            CheckResult::Warn(_)
+        ));
+        assert!(matches!(
+            encryption_key_result(&inspection.encryption_key, true),
+            CheckResult::Fail(message) if message.contains("cannot decrypt")
+        ));
+    }
+
+    #[test]
+    fn the_logs_directory_matches_what_serve_creates_at_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let CheckResult::Warn(message) = logs_dir_result(dir.path()) else {
+            panic!("a missing logs dir warns");
+        };
+        assert!(
+            message.contains("creates it every time it starts"),
+            "{message}"
+        );
+        assert!(!message.contains("first deployment"), "{message}");
+
+        std::fs::create_dir(dir.path().join("logs")).unwrap();
+        assert!(matches!(logs_dir_result(dir.path()), CheckResult::Pass(_)));
+
+        let blocked = tempfile::tempdir().unwrap();
+        std::fs::write(blocked.path().join("logs"), b"").unwrap();
+        assert!(matches!(
+            logs_dir_result(blocked.path()),
+            CheckResult::Fail(_)
+        ));
+    }
+
+    #[test]
+    fn geolite_is_looked_up_where_serve_opens_it() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let working_dir = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            geolite_result(data_dir.path(), Some(working_dir.path())),
+            CheckResult::Warn(_)
+        ));
+        let in_working_dir = working_dir.path().join(temps_geo::CITY_DB_FILENAME);
+        std::fs::write(&in_working_dir, b"mmdb").unwrap();
+        assert!(matches!(
+            geolite_result(data_dir.path(), Some(working_dir.path())),
+            CheckResult::Pass(path) if path == in_working_dir.display().to_string()
+        ));
+        let in_data_dir = data_dir.path().join(temps_geo::CITY_DB_FILENAME);
+        std::fs::write(&in_data_dir, b"mmdb").unwrap();
+        assert!(matches!(
+            geolite_result(data_dir.path(), None),
+            CheckResult::Pass(path) if path == in_data_dir.display().to_string()
+        ));
     }
 }

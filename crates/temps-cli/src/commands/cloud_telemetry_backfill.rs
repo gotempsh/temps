@@ -68,8 +68,9 @@ pub struct CloudTelemetryBackfillArgs {
     /// PostgreSQL connection URL (system of record for project settings, and
     /// the span source unless ClickHouse is configured).
     // hide_env_values: a Postgres URL embeds credentials.
+    /// When unset, the installed `temps serve` service's URL is used.
     #[arg(long, env = "TEMPS_DATABASE_URL", hide_env_values = true)]
-    pub database_url: String,
+    pub database_url: Option<String>,
 
     /// Lower bound of the backfill window (RFC3339, inclusive).
     #[arg(long)]
@@ -153,12 +154,24 @@ async fn run_async(args: CloudTelemetryBackfillArgs) -> anyhow::Result<()> {
     print_header();
 
     let (from, to) = parse_window(&args)?;
-    let data_dir = resolve_data_dir(args.data_dir.clone())?;
+    let database = crate::database_url_source::resolve_database_url(
+        args.database_url.as_deref(),
+        crate::database_url_source::UrlDiscovery::InstalledService,
+    )?;
+    database.announce_discovery();
+    // The server's own data directory with the server's database: its key
+    // decrypts the Cloud link.
+    let data_dir = resolve_data_dir(args.data_dir.clone().or_else(|| {
+        database
+            .service_data_dir()
+            .map(std::path::Path::to_path_buf)
+    }))?;
+    let database_url = database.url();
 
     let bootstrap_stateless = temps_config::bootstrap_stateless_requested()?;
     let _control_plane_owner = if bootstrap_stateless {
         Some(
-            super::serve::stateless::ControlPlaneOwner::acquire(&args.database_url)
+            super::serve::stateless::ControlPlaneOwner::acquire(database_url)
                 .await
                 .map_err(|error| {
                     anyhow::anyhow!(
@@ -169,7 +182,7 @@ async fn run_async(args: CloudTelemetryBackfillArgs) -> anyhow::Result<()> {
     } else {
         None
     };
-    let db = temps_database::connect_without_migrations(&args.database_url).await?;
+    let db = temps_database::connect_without_migrations(database_url).await?;
     let persisted_mode = temps_config::installation_mode(db.as_ref()).await?;
     if persisted_mode.is_stateless() && !bootstrap_stateless {
         return Err(anyhow::anyhow!(
@@ -186,7 +199,7 @@ async fn run_async(args: CloudTelemetryBackfillArgs) -> anyhow::Result<()> {
         temps_schema::ensure_no_unprotected_upgrade(db.as_ref()).await?;
         temps_schema::run_migrations(db.as_ref()).await?;
     }
-    let link = load_cloud_link(&data_dir, db.clone(), &args.database_url, stateless).await?;
+    let link = load_cloud_link(&data_dir, db.clone(), database_url, stateless).await?;
     let compression = temps_config::stored_clickhouse_compression(db.as_ref()).await;
     let source = build_source(&args, db.clone(), compression)?;
 
@@ -938,7 +951,7 @@ mod tests {
     fn args() -> CloudTelemetryBackfillArgs {
         CloudTelemetryBackfillArgs {
             project: 7,
-            database_url: "postgres://localhost/temps".into(),
+            database_url: Some("postgres://localhost/temps".into()),
             from: "2026-08-01T00:00:00Z".into(),
             to: "2026-08-03T00:00:00Z".into(),
             data_dir: None,

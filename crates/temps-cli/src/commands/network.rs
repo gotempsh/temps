@@ -17,7 +17,7 @@
 //!   - `temps network diag`   — ICMP/UDP reachability check against each
 //!     peer's bridge_address
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command as ProcCommand;
 use std::sync::Arc;
 
@@ -266,14 +266,16 @@ impl NetworkCommand {
 
 async fn execute_setup_multi_node(cmd: SetupMultiNodeCommand) -> anyhow::Result<()> {
     let cmd_wireguard = cmd.wireguard;
-    let database_url = cmd
-        .database_url
-        .or_else(|| std::env::var("TEMPS_DATABASE_URL").ok())
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!("TEMPS_DATABASE_URL must be set in the protected process environment")
-        })?;
-    let db = temps_schema::establish_connection(&database_url)
+    // Environment-only (never a flag), then the installed service: run with
+    // sudo, this shell has usually lost TEMPS_DATABASE_URL.
+    let database = crate::database_url_source::resolve_database_url(
+        cmd.database_url
+            .or_else(|| std::env::var(crate::database_url_source::DATABASE_URL_ENV).ok())
+            .as_deref(),
+        crate::database_url_source::UrlDiscovery::InstalledService,
+    )?;
+    database.announce_discovery();
+    let db = temps_schema::establish_connection(database.url())
         .await
         .map_err(|error| anyhow::anyhow!("could not connect to the Temps database: {error}"))?;
 
@@ -351,6 +353,7 @@ async fn execute_setup_multi_node(cmd: SetupMultiNodeCommand) -> anyhow::Result<
     let data_dir = cmd
         .data_dir
         .or_else(|| std::env::var_os("TEMPS_DATA_DIR").map(PathBuf::from))
+        .or_else(|| database.service_data_dir().map(Path::to_path_buf))
         .or_else(|| dirs::home_dir().map(|home| home.join(".temps")))
         .ok_or_else(|| anyhow::anyhow!("could not determine the Temps data directory"))?;
 
