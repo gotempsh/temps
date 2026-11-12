@@ -298,13 +298,6 @@ impl MigrateCommand {
             server_data_dir_unknown,
         } = self.target(&crate::service_definition::ServiceLocations::installed())?;
         database.announce_discovery();
-        // Before connecting, so a backup that cannot go with the server's data
-        // fails with nothing changed.
-        check_backup_destination(
-            configured_data_dir.as_deref(),
-            server_data_dir_unknown.as_deref(),
-            self.pre_migration_backup,
-        )?;
         let database_url = database.into_url();
 
         // Local runtime — keep execute() synchronous (pingora compatibility).
@@ -408,6 +401,21 @@ impl MigrateCommand {
                 return Ok(());
             }
 
+            // Only a run that takes the backup writes into the data directory,
+            // so only it is refused over where that would be, and before the
+            // operator is asked to confirm.
+            let data_dir = resolve_data_dir(configured_data_dir.as_deref())?;
+            let policy =
+                crate::commands::schema_upgrade::BackupPolicy::from_flag(self.pre_migration_backup);
+            if crate::commands::schema_upgrade::takes_backup(&schema_status, policy) {
+                check_backup_destination(
+                    configured_data_dir.as_deref(),
+                    server_data_dir_unknown.as_deref(),
+                    &data_dir,
+                    effective_uid(),
+                )?;
+            }
+
             // Confirmation gate. Skipped with --yes, in JSON mode (machine-driven),
             // or when stdin is not a TTY (piped/CI/systemd) so existing automation
             // never hangs on a prompt.
@@ -422,7 +430,6 @@ impl MigrateCommand {
 
             // Schema guard + pre-migration backup, after the operator agreed
             // to the plan and before the first migration is applied.
-            let data_dir = resolve_data_dir(configured_data_dir.as_deref())?;
             if !use_json {
                 if self.pre_migration_backup {
                     println!(
@@ -449,7 +456,7 @@ impl MigrateCommand {
                 &db,
                 &database_url,
                 &data_dir,
-                crate::commands::schema_upgrade::BackupPolicy::from_flag(self.pre_migration_backup),
+                policy,
             )
             .await
             .map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -580,20 +587,77 @@ struct BackupCompletedLine {
     elapsed_ms: u64,
 }
 
-/// Refuse a pre-migration backup into `~/.temps` for the installed server's
-/// database when its data directory is unknown. Without a backup the data
-/// directory only names leftovers to clean up, so the default is harmless.
+/// Refuse a pre-migration backup that is about to be written to `data_dir`
+/// where it does not belong:
+/// - into `~/.temps` for the installed server's database when the server's
+///   own data directory is unknown, away from its data;
+/// - as root, into a directory another account owns (a `User=` service's):
+///   the backup directory and its lock would be root's, and `temps serve`
+///   running as that account could no longer take its own backups. Root
+///   writing into a directory that account controls is unsafe as well.
+///
+/// Only called when a backup will be taken: otherwise the data directory
+/// only names leftovers to clean up.
 fn check_backup_destination(
     configured: Option<&std::path::Path>,
     server_data_dir_unknown: Option<&str>,
-    backup: bool,
+    data_dir: &std::path::Path,
+    euid: Option<u32>,
 ) -> anyhow::Result<()> {
-    match (configured, server_data_dir_unknown, backup) {
-        (None, Some(reason), true) => Err(anyhow::anyhow!(
+    if let (None, Some(reason)) = (configured, server_data_dir_unknown) {
+        return Err(anyhow::anyhow!(
             "Not taking the pre-migration backup: it would be written to this user's \
              ~/.temps, away from the server's data. {reason}. Nothing was changed"
-        )),
-        _ => Ok(()),
+        ));
+    }
+    if let Some((owner, path)) = euid.and_then(|euid| owned_by_another_account(data_dir, euid)) {
+        return Err(anyhow::anyhow!(
+            "Not taking the pre-migration backup as root: {} belongs to uid {owner}, so the \
+             backup directory and its lock would be root's and `temps serve` running as that \
+             account could no longer take its own backups. Run the command as that account \
+             (`sudo -u '#{owner}' temps migrate {}`), or pass --data-dir with a directory \
+             root owns. Nothing was changed",
+            path.display(),
+            crate::commands::schema_upgrade::BACKUP_FLAG
+        ));
+    }
+    Ok(())
+}
+
+/// This process's effective uid, where there is one.
+fn effective_uid() -> Option<u32> {
+    #[cfg(unix)]
+    {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        Some(unsafe { libc::geteuid() })
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+/// For a root `euid`, the owner of `dir` (or of its nearest existing
+/// ancestor, which a missing `dir` would be created in) when that is not
+/// root, with the path it was read from.
+fn owned_by_another_account(dir: &std::path::Path, euid: u32) -> Option<(u32, std::path::PathBuf)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if euid != 0 {
+            return None;
+        }
+        let (path, metadata) = dir.ancestors().find_map(|path| {
+            std::fs::metadata(path)
+                .ok()
+                .map(|metadata| (path, metadata))
+        })?;
+        (metadata.uid() != 0).then(|| (metadata.uid(), path.to_path_buf()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (dir, euid);
+        None
     }
 }
 
@@ -1363,17 +1427,19 @@ mod tests {
             .expect("the reason it is unknown");
         assert!(reason.contains("--data-dir"), "{reason}");
 
-        let error = super::check_backup_destination(None, Some(&reason), true).unwrap_err();
+        let data = home.path().join(".temps");
+        let error = super::check_backup_destination(None, Some(&reason), &data, None).unwrap_err();
         let message = error.to_string();
         assert!(
             message.contains("Not taking the pre-migration backup")
                 && message.contains("--data-dir"),
             "{message}"
         );
-        // Without a backup, or with --data-dir, nothing is in the way.
-        assert!(super::check_backup_destination(None, Some(&reason), false).is_ok());
+        // With --data-dir, nothing is in the way.
         let explicit = std::path::Path::new("/srv/temps-data");
-        assert!(super::check_backup_destination(Some(explicit), Some(&reason), true).is_ok());
+        assert!(
+            super::check_backup_destination(Some(explicit), Some(&reason), explicit, None).is_ok()
+        );
 
         // With the service's data dir known, there is no reason to refuse.
         let locations = installer_unit(home.path());
@@ -1381,6 +1447,52 @@ mod tests {
             .target(&locations)
             .expect("found in the unit");
         assert!(target.server_data_dir_unknown.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_never_writes_the_backup_into_another_accounts_data_dir() {
+        use std::os::unix::fs::MetadataExt;
+        let home = tempfile::tempdir().unwrap();
+        let owner = std::fs::metadata(home.path()).unwrap().uid();
+        if owner == 0 {
+            // Running as root: no directory here belongs to another account.
+            return;
+        }
+        // A data directory that does not exist yet would be created in its
+        // parent, so the parent's owner is the one that counts.
+        let data = home.path().join(".temps/data");
+        assert_eq!(
+            super::owned_by_another_account(&data, 0),
+            Some((owner, home.path().to_path_buf()))
+        );
+        let error = super::check_backup_destination(None, None, &data, Some(0)).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("uid {owner}"))
+                && message.contains(&format!("sudo -u '#{owner}'"))
+                && message.contains("Nothing was changed"),
+            "{message}"
+        );
+        // The account itself, or any account not root, writes as itself.
+        assert!(super::check_backup_destination(None, None, &data, Some(owner)).is_ok());
+        assert_eq!(super::owned_by_another_account(&data, owner), None);
+    }
+
+    #[test]
+    fn only_a_run_that_takes_the_backup_checks_where_it_goes() {
+        use crate::commands::schema_upgrade::{takes_backup, BackupPolicy};
+        let pending = temps_schema::SchemaStatus::PendingUpgrade {
+            applied: 3,
+            pending: vec!["m20990101_000001_example".to_string()],
+        };
+        assert!(takes_backup(&pending, BackupPolicy::Enabled));
+        assert!(!takes_backup(&pending, BackupPolicy::Disabled));
+        // An up-to-date or fresh database takes none, flag or not.
+        assert!(!takes_backup(
+            &temps_schema::SchemaStatus::Fresh,
+            BackupPolicy::Enabled
+        ));
     }
 
     #[test]

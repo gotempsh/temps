@@ -66,6 +66,12 @@ enum BackupDecision {
     Take,
 }
 
+/// Whether [`prepare_schema_upgrade`] takes the pre-migration backup for this
+/// schema state, so a caller can check where it would go before asking.
+pub fn takes_backup(status: &SchemaStatus, policy: BackupPolicy) -> bool {
+    decide(status, policy) == BackupDecision::Take
+}
+
 fn decide(status: &SchemaStatus, policy: BackupPolicy) -> BackupDecision {
     match (status, policy) {
         (SchemaStatus::Fresh | SchemaStatus::UpToDate { .. }, _) => BackupDecision::NotNeeded,
