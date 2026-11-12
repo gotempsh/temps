@@ -428,23 +428,34 @@ impl PostgresService {
         walg_env: &[String],
         target_path: &str,
     ) -> Result<()> {
-        use bollard::exec::{CreateExecOptions, StartExecOptions};
-
         // Only WAL-G / AWS envs go into the file — PG connection envs (PGHOST,
         // PGUSER, etc.) are not needed by wal-g archive/fetch from inside PG.
-        let env_file_lines: Vec<&String> = walg_env
+        let file_lines: Vec<String> = walg_env
             .iter()
             .filter(|line| line.starts_with("WALG_") || line.starts_with("AWS_"))
+            .filter_map(|line| shell_export_assignment(line))
             .collect();
+        self.write_file_lines_at(container_name, &file_lines, target_path)
+            .await
+    }
+
+    /// Replace the file at `target_path` with `lines`, verbatim, owned by
+    /// `postgres` and readable only by it (it holds credentials).
+    async fn write_file_lines_at(
+        &self,
+        container_name: &str,
+        lines: &[String],
+        target_path: &str,
+    ) -> Result<()> {
+        use bollard::exec::{CreateExecOptions, StartExecOptions};
 
         let walg_env_path = target_path;
 
         let write_cmd = format!(
             "printf '%s\\n' {} > {} && chmod 600 {}",
-            env_file_lines
+            lines
                 .iter()
-                .filter_map(|line| shell_export_assignment(line)
-                    .map(|assignment| shell_escape(&assignment)))
+                .map(|line| shell_escape(line))
                 .collect::<Vec<_>>()
                 .join(" "),
             walg_env_path,
@@ -1422,8 +1433,9 @@ const STALE_WAL_PUSH_SCRIPT: &str = "for p in /proc/[0-9]*; do \
 /// `lines` are the file's `KEY=value` assignments as the shell sees them.
 /// A scheme-less `AWS_ENDPOINT` gets the `http://` the source was validated
 /// with, and an IP-literal endpoint gets `AWS_S3_FORCE_PATH_STYLE=true`.
-/// Credentials, prefix and every other line are kept byte for byte: this
-/// never changes which repository WAL is archived to.
+/// Credentials, prefix and every other assignment are unchanged: this never
+/// changes which repository WAL is archived to. The file itself is patched
+/// by [`patch_walg_env_file`], which keeps every line it does not repair.
 pub(crate) fn repair_walg_env_lines(lines: &[String]) -> Option<Vec<String>> {
     let endpoint = lines
         .iter()
@@ -1454,6 +1466,46 @@ pub(crate) fn repair_walg_env_lines(lines: &[String]) -> Option<Vec<String>> {
         repaired.push("AWS_S3_FORCE_PATH_STYLE=true".to_string());
     }
     Some(repaired)
+}
+
+/// The two settings the start-time repair rewrites.
+const REPAIRED_WALG_KEYS: [&str; 2] = ["AWS_ENDPOINT", "AWS_S3_FORCE_PATH_STYLE"];
+
+/// Whether a `walg.env` line assigns `key` (`KEY=…` or `export KEY=…`).
+fn assigns(line: &str, key: &str) -> bool {
+    let line = line.trim_start();
+    let line = match line.strip_prefix("export") {
+        Some(rest) if rest.starts_with([' ', '\t']) => rest.trim_start(),
+        _ => line,
+    };
+    line.strip_prefix(key)
+        .is_some_and(|rest| rest.starts_with('='))
+}
+
+/// The lines of `walg.env` after the repair: every line of `raw` kept
+/// byte for byte (comments, other variables such as an operator's
+/// `S3_MAX_RETRIES`, quoting) except the `AWS_ENDPOINT` and
+/// `AWS_S3_FORCE_PATH_STYLE` assignments, which are replaced by those in
+/// `repaired` (from [`repair_walg_env_lines`]) at the end of the file, where
+/// they also win over any assignment this did not recognise.
+pub(crate) fn patch_walg_env_file(raw: &str, repaired: &[String]) -> Vec<String> {
+    let mut lines: Vec<String> = raw
+        .lines()
+        .filter(|line| !REPAIRED_WALG_KEYS.iter().any(|key| assigns(line, key)))
+        .map(str::to_string)
+        .collect();
+    lines.extend(
+        repaired
+            .iter()
+            .filter(|line| {
+                REPAIRED_WALG_KEYS.iter().any(|key| {
+                    line.strip_prefix(key)
+                        .is_some_and(|rest| rest.starts_with('='))
+                })
+            })
+            .filter_map(|line| shell_export_assignment(line)),
+    );
+    lines
 }
 
 impl PostgresService {
@@ -1586,6 +1638,26 @@ impl PostgresService {
     /// no restart. Best effort: a failure is logged and the start goes on,
     /// leaving the file as it was; the next backup rewrites it from the S3
     /// source anyway.
+    /// The container's `walg.env` as written, for patching in place.
+    async fn read_raw_walg_env(&self, container_name: &str) -> std::result::Result<String, String> {
+        let result = crate::externalsvc::exec_util::run_exec(
+            &self.docker,
+            container_name,
+            vec![
+                "cat".to_string(),
+                "/var/lib/postgresql/walg.env".to_string(),
+            ],
+            None,
+            Duration::from_secs(15),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        if result.exit_code != 0 {
+            return Err(format!("cat exited with {}", result.exit_code));
+        }
+        Ok(result.output)
+    }
+
     pub(super) async fn repair_walg_env_on_start(&self, container_name: &str) {
         let lines = match self.read_live_walg_env(container_name).await {
             Ok(Some(lines)) => lines,
@@ -1603,7 +1675,24 @@ impl PostgresService {
         let Some(repaired) = repair_walg_env_lines(&lines) else {
             return;
         };
-        match self.write_walg_env_file(container_name, &repaired).await {
+        // Patched, not regenerated, so nothing else in the file is lost.
+        let raw = match self.read_raw_walg_env(container_name).await {
+            Ok(raw) => raw,
+            Err(error) => {
+                warn!(
+                    service = %self.name,
+                    container = container_name,
+                    error = %error,
+                    "Could not read walg.env to repair its S3 endpoint; leaving it unchanged"
+                );
+                return;
+            }
+        };
+        let patched = patch_walg_env_file(&raw, &repaired);
+        match self
+            .write_file_lines_at(container_name, &patched, "/var/lib/postgresql/walg.env")
+            .await
+        {
             Ok(()) => {
                 info!(
                     service = %self.name,
@@ -1900,6 +1989,10 @@ mod plain_http_ip_archive_docker_tests {
                 Duration::from_secs(90),
             )
         };
+        // A line an operator added by hand, which the repair must keep.
+        exec("echo '# kept: operator note' >> /var/lib/postgresql/walg.env")
+            .await
+            .map_err(|e| format!("append to walg.env: {e}"))?;
         exec(
             "head -c 16777216 /dev/zero > /tmp/pg_wal/000000010000000000000002; \
              . /var/lib/postgresql/walg.env && \
@@ -1932,6 +2025,13 @@ mod plain_http_ip_archive_docker_tests {
             || !live.contains(&format!("WALG_S3_PREFIX={prefix}"))
         {
             return Err(format!("walg.env was not repaired in place: {live:?}"));
+        }
+        let raw = service
+            .read_raw_walg_env(walg_name)
+            .await
+            .map_err(|e| format!("read repaired walg.env: {e}"))?;
+        if !raw.contains("# kept: operator note") {
+            return Err(format!("the repair dropped a line it does not fix: {raw}"));
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
         if exec(running)
@@ -2147,7 +2247,56 @@ mod target_check_tests {
 
 #[cfg(test)]
 mod repair_tests {
-    use super::{repair_walg_env_lines, walg_env_drift};
+    use super::{patch_walg_env_file, repair_walg_env_lines, walg_env_drift};
+
+    #[test]
+    fn the_repair_keeps_every_line_it_does_not_fix() {
+        let raw = "# added by an operator\n\
+                   export WALG_S3_PREFIX='s3://archive/pg/walg'\n\
+                   export AWS_ENDPOINT='10.0.0.5:9000'\n\
+                   export S3_MAX_RETRIES='1'\n\
+                   \n\
+                   AWS_S3_FORCE_PATH_STYLE=false\n\
+                   export AWS_ENDPOINT_SUFFIX='kept'\n";
+        let evaluated = lines(&[
+            "WALG_S3_PREFIX=s3://archive/pg/walg",
+            "AWS_ENDPOINT=10.0.0.5:9000",
+            "AWS_S3_FORCE_PATH_STYLE=false",
+            "AWS_ENDPOINT_SUFFIX=kept",
+        ]);
+        let repaired = repair_walg_env_lines(&evaluated).unwrap();
+        let patched = patch_walg_env_file(raw, &repaired);
+        assert_eq!(
+            patched,
+            lines(&[
+                "# added by an operator",
+                "export WALG_S3_PREFIX='s3://archive/pg/walg'",
+                "export S3_MAX_RETRIES='1'",
+                "",
+                "export AWS_ENDPOINT_SUFFIX='kept'",
+                "export AWS_ENDPOINT='http://10.0.0.5:9000'",
+                "export AWS_S3_FORCE_PATH_STYLE='true'",
+            ])
+        );
+    }
+
+    #[test]
+    fn a_scheme_only_repair_leaves_the_path_style_line_alone() {
+        let raw = "export AWS_ENDPOINT='minio.internal.example:9000'\n\
+                   export AWS_S3_FORCE_PATH_STYLE='true'\n";
+        let repaired = repair_walg_env_lines(&lines(&[
+            "AWS_ENDPOINT=minio.internal.example:9000",
+            "AWS_S3_FORCE_PATH_STYLE=true",
+        ]))
+        .unwrap();
+        assert_eq!(
+            patch_walg_env_file(raw, &repaired),
+            lines(&[
+                "export AWS_ENDPOINT='http://minio.internal.example:9000'",
+                "export AWS_S3_FORCE_PATH_STYLE='true'",
+            ])
+        );
+    }
 
     fn lines(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()
