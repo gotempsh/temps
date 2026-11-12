@@ -27,6 +27,7 @@ import {
   getVaultEligibilityOptions,
   getAccessVaultGeneralOptions,
   getAccessVaultOptions,
+  getSandboxOptions,
   listSandboxesOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { accessBundleOptions } from '@/components/service-access/access-bundle-query'
@@ -237,6 +238,20 @@ function SessionForm({
     },
   })
   const selected = useWatch({ control: form.control, name: 'sandbox_id' })
+  // The session is approved for this sandbox, so it is always named here, even
+  // when it is not on the list page shown (a preselected older sandbox, or
+  // after paging away from the choice).
+  const selectedOnPage = sandboxes.data?.sandboxes.find(
+    (s) => s.id === selected
+  )
+  const selectedDetail = useQuery({
+    ...getSandboxOptions({ path: { id: selected } }),
+    enabled: !!selected && sandboxes.isSuccess && !selectedOnPage,
+    retry: false,
+  })
+  const target = selected
+    ? (selectedOnPage ?? selectedDetail.data?.sandbox)
+    : undefined
   const eligibility = useQuery({
     ...getVaultEligibilityOptions({
       path: { vault_id: vaultId, sandbox_id: selected },
@@ -317,7 +332,8 @@ function SessionForm({
         !eligibility.isFetching &&
         !invalidBundle &&
         !unavailable &&
-        !sandboxes.isError
+        !sandboxes.isError &&
+        target?.id === selected
       }
       saving={issue.isPending}
       onCancel={() => {
@@ -399,6 +415,33 @@ function SessionForm({
             Only this sandbox can use the session. Credentials stay in the
             Vault.
           </p>
+          {selected && (
+            <div className="rounded-md border bg-muted/40 p-3">
+              <p className="text-xs text-muted-foreground">Session for</p>
+              {target ? (
+                <>
+                  <p className="break-words text-sm font-medium">
+                    {target.name}
+                  </p>
+                  <p className="break-all font-mono text-xs text-muted-foreground">
+                    {target.id}
+                  </p>
+                  {!selectedOnPage && (
+                    <p className="text-xs text-muted-foreground">
+                      Not on the list page shown below.
+                    </p>
+                  )}
+                </>
+              ) : selectedDetail.isError ? (
+                <p className="break-all text-sm text-destructive">
+                  Could not load sandbox {selected}. Choose a sandbox from the
+                  list.
+                </p>
+              ) : (
+                <Skeleton className="mt-1 h-5 w-48" />
+              )}
+            </div>
+          )}
           {sandboxes.isError && (
             <Callout tone="error" title="Could not load sandboxes">
               <Button type="button" onClick={() => void sandboxes.refetch()}>

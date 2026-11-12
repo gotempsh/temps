@@ -330,3 +330,136 @@ test('a host that cannot host service access says so and stops offering the same
     api.restore()
   }
 })
+
+test.each([true, false])(
+  'a preselected sandbox outside the list page is named before approval (details load: %s)',
+  async (detailLoads) => {
+    const bodies: unknown[] = []
+    const handler = async (request: Request) => {
+      const url = new URL(request.url)
+      if (url.pathname.includes('/consumers/'))
+        return jsonResponse({
+          id: 'link_fixture',
+          vault_id: 'vault_test',
+          sandbox_id: 99,
+          project_id: null,
+          created_at: date,
+        })
+      if (request.method === 'POST') {
+        bodies.push(await request.json())
+        return jsonResponse({ detail: 'Policy changed. Review again.' }, 409)
+      }
+      if (url.pathname.endsWith('/capability'))
+        return jsonResponse({
+          configured: true,
+          can_manage_requests: true,
+          can_manage_services: true,
+        })
+      if (url.pathname.endsWith('/bundles'))
+        return jsonResponse({
+          items: [bundle],
+          total: 1,
+          page: 1,
+          page_size: 100,
+        })
+      if (url.pathname.endsWith('/access-vaults/vault_test'))
+        return jsonResponse({
+          vault: {
+            id: 'vault_test',
+            name: 'Work',
+            project_id: 7,
+            service_ids: ['svc_test'],
+            version: 1,
+          },
+          services: [service],
+        })
+      if (url.pathname.endsWith('/v1/sandboxes/sbx_older'))
+        return detailLoads
+          ? jsonResponse({
+              routes: [],
+              sandbox: {
+                id: 'sbx_older',
+                name: 'Older sandbox',
+                status: 'running',
+              },
+            })
+          : jsonResponse({ detail: 'lookup failed' }, 500)
+      if (url.pathname.endsWith('/v1/sandboxes'))
+        // The first page of 20 holds newer sandboxes only.
+        return jsonResponse({
+          sandboxes: Array.from({ length: 20 }, (_, i) => ({
+            id: `sbx_new_${i}`,
+            name: `Newer sandbox ${i}`,
+            status: 'running',
+          })),
+          pagination: { count: 21 },
+        })
+      return jsonResponse({ detail: 'Unexpected request' }, 500)
+    }
+    const api = mockApi(
+      Object.fromEntries(
+        [
+          'POST /access-vaults/vault_test/sessions',
+          'GET /service-access/capability',
+          'GET /access-vaults/vault_test/bundles',
+          'GET /access-vaults/vault_test',
+          'GET /v1/sandboxes',
+          'GET /v1/sandboxes/sbx_older',
+          'GET /access-vaults/vault_test/consumers/sbx_older',
+        ].map((path) => [path, handler])
+      )
+    )
+    try {
+      const client = new QueryClient({
+        defaultOptions: {
+          queries: { retry: false },
+          mutations: { retry: false },
+        },
+      })
+      render(
+        <QueryClientProvider client={client}>
+          <MemoryRouter
+            initialEntries={[
+              '/vault/vaults/vault_test/bundles/bundle_test/sessions/new?sandbox=sbx_older',
+            ]}
+          >
+            <BreadcrumbProvider>
+              <Routes>
+                <Route
+                  path="/vault/vaults/:vaultId/bundles/:bundleId/sessions/new"
+                  element={<AccessSessionCreatePage />}
+                />
+              </Routes>
+            </BreadcrumbProvider>
+          </MemoryRouter>
+        </QueryClientProvider>
+      )
+      const ui = within(document.body)
+      await waitFor(() =>
+        expect(ui.getByLabelText(/Newer sandbox 0/)).toBeTruthy()
+      )
+      const approve = () =>
+        ui
+          .getByRole('button', { name: 'Approve session' })
+          .getAttribute('aria-disabled')
+      if (!detailLoads) {
+        await waitFor(() =>
+          expect(ui.getByText(/Could not load sandbox sbx_older/)).toBeTruthy()
+        )
+        expect(approve()).toBe('true')
+        return
+      }
+      await waitFor(() => expect(ui.getByText('Older sandbox')).toBeTruthy())
+      expect(ui.getByText('sbx_older')).toBeTruthy()
+      expect(ui.getByText('Not on the list page shown below.')).toBeTruthy()
+      await waitFor(() => expect(approve()).toBe('false'))
+      fireEvent.click(ui.getByRole('button', { name: 'Approve session' }))
+      await waitFor(() => expect(bodies.length).toBe(1))
+      expect(bodies[0]).toMatchObject({
+        consumer: { kind: 'sandbox', sandbox_id: 'sbx_older' },
+      })
+    } finally {
+      api.restore()
+    }
+  }
+)
