@@ -46,7 +46,7 @@ pub mod registry;
 
 pub use overrides::{
     resolve, HealthcheckField, HealthcheckOverrides, HealthcheckSource, HealthcheckSources,
-    HealthcheckValidationError, ResolvedHealthcheck,
+    HealthcheckValidationError, ResolvedHealthcheck, READINESS_POLL_SECS,
 };
 
 const NANOS_PER_SEC: i64 = 1_000_000_000;

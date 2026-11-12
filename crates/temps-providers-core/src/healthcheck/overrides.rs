@@ -150,21 +150,44 @@ pub enum HealthcheckValidationError {
         interval_source: HealthcheckSource,
     },
     #[error(
+        "healthcheck's first check comes {first_check_secs}s after the container starts \
+         ({first_check_field}, from {first_check_source}) and may take timeout_secs \
+         ({timeout_secs}s, from {timeout_source}); with the up to {READINESS_POLL_SECS}s Temps \
+         takes to read the result, it ends after the {readiness_wait_secs}s Temps waits for this \
+         engine's container to become healthy, so every create, upgrade and restore would time out"
+    )]
+    FirstCheckTooLate {
+        first_check_secs: u32,
+        /// `start_interval_secs` with a start period, else `interval_secs`.
+        first_check_field: &'static str,
+        first_check_source: HealthcheckSource,
+        timeout_secs: u32,
+        timeout_source: HealthcheckSource,
+        readiness_wait_secs: u32,
+    },
+    #[error(
         "healthcheck start_period_secs ({start_period_secs}s, from {start_period_source}) plus \
-         interval_secs ({interval_secs}s, from {interval_source}) must not exceed \
-         {readiness_wait_secs}s, how long Temps waits for this engine's container to become \
-         healthy, unless the start period alone covers that wait: after the start period Docker \
-         checks only once per interval, so a container still starting would be seen too late \
-         and every create, upgrade and restore would time out"
+         interval_secs ({interval_secs}s, from {interval_source}) plus timeout_secs \
+         ({timeout_secs}s, from {timeout_source}) and the up to {READINESS_POLL_SECS}s Temps takes \
+         to read the result must not exceed {readiness_wait_secs}s, how long Temps waits for this \
+         engine's container to become healthy, unless the start period lasts that long: after \
+         the start period Docker checks only once per interval, so a container still starting \
+         would be seen too late and every create, upgrade and restore would time out"
     )]
     StartPeriodTooShortForInterval {
         start_period_secs: u32,
         start_period_source: HealthcheckSource,
         interval_secs: u32,
         interval_source: HealthcheckSource,
+        timeout_secs: u32,
+        timeout_source: HealthcheckSource,
         readiness_wait_secs: u32,
     },
 }
+
+/// The longest Temps' readiness waits take to read a container's health once
+/// Docker has it: they poll with a backoff capped at this.
+pub const READINESS_POLL_SECS: u32 = 2;
 
 /// Where an effective healthcheck value comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -212,14 +235,19 @@ impl ResolvedHealthcheck {
     /// built-in default.
     ///
     /// * The timeout must be shorter than the interval, or checks overlap.
-    /// * A check must land inside the readiness wait. Docker checks every
-    ///   start interval inside the start period, and once per interval after
-    ///   it, so the start period covers the wait, or the start period plus
-    ///   one interval fits in it, or the interval is no longer than the start
-    ///   interval (checks never slow down). Otherwise a container that takes
-    ///   longer to start than the start period is first checked after the
-    ///   wait gave up (with a start period of 0, the first check comes one
-    ///   full interval after start).
+    /// * A check must be seen inside the readiness wait. A check started
+    ///   later than `readiness_wait_secs - timeout_secs - READINESS_POLL_SECS`
+    ///   may finish, and be read, only after the wait gave up. So:
+    ///   * the first check must start by then. Docker runs it one start
+    ///     interval after the container starts when there is a start period,
+    ///     else one full interval after;
+    ///   * and checks must keep coming until then. Docker checks every start
+    ///     interval inside the start period and once per interval after it,
+    ///     so the start period lasts until then, or the start period plus one
+    ///     interval fits before it, or the interval is no longer than the
+    ///     start interval (checks never slow down). Otherwise a container
+    ///     that takes longer to start than the start period is checked next
+    ///     only after the wait gave up.
     pub fn validate(&self, readiness_wait_secs: u32) -> Result<(), HealthcheckValidationError> {
         let t = &self.timings;
         if t.timeout_secs >= t.interval_secs {
@@ -230,8 +258,30 @@ impl ResolvedHealthcheck {
                 interval_source: self.sources.interval_secs,
             });
         }
-        let covered = t.start_period_secs >= readiness_wait_secs
-            || t.start_period_secs.saturating_add(t.interval_secs) <= readiness_wait_secs
+        // The latest a check can start and still be seen by the wait.
+        let last_start =
+            readiness_wait_secs.saturating_sub(t.timeout_secs.saturating_add(READINESS_POLL_SECS));
+        let (first_check_secs, first_check_field, first_check_source) = if t.start_period_secs > 0 {
+            (
+                t.start_interval_secs,
+                "start_interval_secs",
+                self.sources.start_interval_secs,
+            )
+        } else {
+            (t.interval_secs, "interval_secs", self.sources.interval_secs)
+        };
+        if first_check_secs > last_start {
+            return Err(HealthcheckValidationError::FirstCheckTooLate {
+                first_check_secs,
+                first_check_field,
+                first_check_source,
+                timeout_secs: t.timeout_secs,
+                timeout_source: self.sources.timeout_secs,
+                readiness_wait_secs,
+            });
+        }
+        let covered = t.start_period_secs >= last_start
+            || t.start_period_secs.saturating_add(t.interval_secs) <= last_start
             || t.interval_secs <= t.start_interval_secs;
         if !covered {
             return Err(HealthcheckValidationError::StartPeriodTooShortForInterval {
@@ -239,6 +289,8 @@ impl ResolvedHealthcheck {
                 start_period_source: self.sources.start_period_secs,
                 interval_secs: t.interval_secs,
                 interval_source: self.sources.interval_secs,
+                timeout_secs: t.timeout_secs,
+                timeout_source: self.sources.timeout_secs,
                 readiness_wait_secs,
             });
         }
@@ -516,7 +568,9 @@ mod tests {
     }
 
     #[test]
-    fn a_check_must_land_inside_the_readiness_wait() {
+    fn a_check_must_be_seen_inside_the_readiness_wait() {
+        // RustFS: a 60 s wait and a 5 s timeout, so a check has to start by
+        // 60 - 5 - READINESS_POLL_SECS = 53 s to be read in time.
         let check = |start_period: u32, interval: u32| {
             let instance = HealthcheckOverrides {
                 start_period_secs: Some(start_period),
@@ -525,13 +579,15 @@ mod tests {
             };
             resolve(&Default::default(), &instance, &builtin()).validate(RUSTFS_WAIT)
         };
-        // The start period covers the whole wait: any interval is fine.
+        // The start period lasts until the last useful check: any interval.
         assert_eq!(check(60, 3600), Ok(()));
         assert_eq!(check(600, 600), Ok(()));
-        // A shorter start period plus one interval still fits in the wait.
-        assert_eq!(check(0, 60), Ok(()));
-        assert_eq!(check(30, 30), Ok(()));
-        // The first check after the start period comes after the wait.
+        assert_eq!(check(53, 3600), Ok(()));
+        assert_eq!(check(55, 10), Ok(()));
+        // A shorter start period plus one interval still leaves the check
+        // time to finish and be read.
+        assert_eq!(check(0, 53), Ok(()));
+        assert_eq!(check(20, 33), Ok(()));
         // Checking as often as while starting needs no start period.
         let never_slower = HealthcheckOverrides {
             start_period_secs: Some(0),
@@ -540,10 +596,12 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            resolve(&never_slower, &Default::default(), &builtin()).validate(5),
+            resolve(&never_slower, &Default::default(), &builtin()).validate(RUSTFS_WAIT),
             Ok(())
         );
-        for (start_period, interval) in [(0, 61), (0, 120), (10, 120), (55, 10)] {
+
+        // The next check after the start period starts too late to be seen.
+        for (start_period, interval) in [(10, 120), (30, 30), (20, 34)] {
             let error = check(start_period, interval).unwrap_err();
             assert_eq!(
                 error,
@@ -552,6 +610,8 @@ mod tests {
                     start_period_source: InstanceDefault,
                     interval_secs: interval,
                     interval_source: InstanceDefault,
+                    timeout_secs: 5,
+                    timeout_source: Builtin,
                     readiness_wait_secs: RUSTFS_WAIT,
                 },
                 "{start_period}+{interval}"
@@ -562,6 +622,71 @@ mod tests {
                 "{message}"
             );
         }
+
+        // Without a start period the first check comes one interval in: one
+        // starting exactly as the wait ends would never be read.
+        for interval in [54, 60, 61, 120] {
+            assert_eq!(
+                check(0, interval).unwrap_err(),
+                HealthcheckValidationError::FirstCheckTooLate {
+                    first_check_secs: interval,
+                    first_check_field: "interval_secs",
+                    first_check_source: InstanceDefault,
+                    timeout_secs: 5,
+                    timeout_source: Builtin,
+                    readiness_wait_secs: RUSTFS_WAIT,
+                },
+                "0+{interval}"
+            );
+        }
+        // With one, it comes one start interval in.
+        let slow_start = HealthcheckOverrides {
+            start_period_secs: Some(30),
+            start_interval_secs: Some(60),
+            interval_secs: Some(60),
+            ..Default::default()
+        };
+        let error = resolve(&slow_start, &Default::default(), &builtin())
+            .validate(RUSTFS_WAIT)
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                HealthcheckValidationError::FirstCheckTooLate {
+                    first_check_secs: 60,
+                    first_check_field: "start_interval_secs",
+                    first_check_source: Service,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("start_interval_secs"), "{error}");
+    }
+
+    #[test]
+    fn a_slow_check_needs_its_timeout_inside_the_wait() {
+        // MongoDB: a 90 s wait and a 10 s timeout. Its first check, 90 s in,
+        // would still be running when the wait ends.
+        let mongo = HealthcheckTimings::builtin(ManagedEngine::MongoDb);
+        let check = |interval: u32| {
+            let instance = HealthcheckOverrides {
+                start_period_secs: Some(0),
+                interval_secs: Some(interval),
+                ..Default::default()
+            };
+            resolve(&Default::default(), &instance, &mongo).validate(90)
+        };
+        assert!(matches!(
+            check(90),
+            Err(HealthcheckValidationError::FirstCheckTooLate {
+                first_check_secs: 90,
+                timeout_secs: 10,
+                ..
+            })
+        ));
+        assert!(check(79).is_err());
+        assert_eq!(check(78), Ok(()));
     }
 
     #[test]

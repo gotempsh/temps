@@ -131,13 +131,19 @@ export interface InheritedHealthcheck {
   readinessWaitSecs: number
 }
 
+/** The longest Temps' readiness waits take to read a container's health
+ * once Docker has it (`READINESS_POLL_SECS` on the server). */
+export const READINESS_POLL_SECS = 2
+
 /**
  * The override form's schema. `inherited` is what an empty field falls back
  * to, one entry per engine the values apply to. For every one of them, as
- * the server checks: the timeout stays shorter than the interval, and a
- * check lands inside the engine's readiness wait (the start period covers
- * it, the start period plus one interval fits in it, or the interval is no
- * longer than the start interval).
+ * the server checks: the timeout stays shorter than the interval, and a check
+ * is seen inside the engine's readiness wait. A check has to start by the
+ * wait minus the timeout and the poll: the first one (one start interval in
+ * with a start period, one interval in without), and checks keep coming
+ * until then (the start period lasts that long, the start period plus one
+ * interval fits, or the interval is no longer than the start interval).
  */
 export function healthcheckFormSchema(inherited: InheritedHealthcheck[]) {
   const shape = Object.fromEntries(
@@ -165,9 +171,21 @@ export function healthcheckFormSchema(inherited: InheritedHealthcheck[]) {
         })
         return
       }
+      const lastStart = Math.max(0, wait - timeout - READINESS_POLL_SECS)
+      const firstField: HealthcheckField =
+        startPeriod > 0 ? 'start_interval_secs' : 'interval_secs'
+      const firstCheck = startPeriod > 0 ? startInterval : interval
+      if (firstCheck > lastStart) {
+        ctx.addIssue({
+          code: 'custom',
+          path: [firstField],
+          message: `The first check comes ${firstCheck}s in and may take ${timeout}s, so it would end after the ${wait}s Temps waits for a new container to become healthy; it has to start by ${lastStart}s`,
+        })
+        return
+      }
       const covered =
-        startPeriod >= wait ||
-        startPeriod + interval <= wait ||
+        startPeriod >= lastStart ||
+        startPeriod + interval <= lastStart ||
         interval <= startInterval
       if (!covered) {
         ctx.addIssue({
@@ -176,7 +194,7 @@ export function healthcheckFormSchema(inherited: InheritedHealthcheck[]) {
             overrides.start_period_secs !== null
               ? ['start_period_secs']
               : ['interval_secs'],
-          message: `Start period (${startPeriod}s) plus interval (${interval}s) must fit in the ${wait}s Temps waits for a new container to become healthy, or the start period must cover it`,
+          message: `Start period (${startPeriod}s) plus interval (${interval}s) must leave the ${timeout}s check time to finish inside the ${wait}s Temps waits for a new container to become healthy (by ${lastStart}s), or the start period must last that long`,
         })
         return
       }

@@ -602,18 +602,27 @@ impl ExternalServiceManager {
         &self,
         service: &external_services::Model,
     ) -> Result<(), ExternalServiceError> {
-        self.recreate_service_container_preserving_data(service, ContainerRecreate::SHM_SIZE)
-            .await
+        self.recreate_service_container_preserving_data(
+            service,
+            ContainerRecreate::SHM_SIZE,
+            |_| Ok(()),
+        )
+        .await
     }
 
     /// Delete and recreate a standalone, control-plane service's container
     /// through the recreate guard, keeping its volumes and configuration, so
     /// a create-time-only setting (`what`) takes effect. See
     /// [`Self::recreate_service_container_for_shm`] for the steps.
+    ///
+    /// `still_applies` is checked on the service as it is once the service's
+    /// lock is held, so a start or stop that finished meanwhile is seen (both
+    /// take the lock) and nothing changes it until the recreate is done.
     pub(super) async fn recreate_service_container_preserving_data(
         &self,
         service: &external_services::Model,
         purpose: ContainerRecreate,
+        still_applies: impl FnOnce(&external_services::Model) -> Result<(), ExternalServiceError>,
     ) -> Result<(), ExternalServiceError> {
         // Remote-node containers live on a worker's Docker daemon, not on
         // `self.docker`. Removing here would target the wrong daemon. The
@@ -639,6 +648,12 @@ impl ExternalServiceManager {
                 ),
             });
         }
+
+        // The TLS lock before the container's: a TLS mode change takes them
+        // in that order, and the recreate reads the TLS mode (ADR 093).
+        let tls_lock = self.service_tls_locks.for_service(service.id).await;
+        let held = tls_lock.lock().await;
+        still_applies(&self.get_service(service.id).await?)?;
 
         let service_type = ServiceType::from_str(&service.service_type).map_err(|_| {
             ExternalServiceError::InvalidServiceType {
@@ -689,10 +704,6 @@ impl ExternalServiceManager {
                 ),
             }
         })?;
-        // The TLS lock before the container's: a TLS mode change takes them
-        // in that order, and the recreate reads the TLS mode (ADR 093).
-        let tls_lock = self.service_tls_locks.for_service(service.id).await;
-        let held = tls_lock.lock().await;
         let report = crate::externalsvc::recreate_guard::recreate_preserving_data(
             crate::externalsvc::recreate_guard::RecreateRequest {
                 docker: docker.as_ref(),

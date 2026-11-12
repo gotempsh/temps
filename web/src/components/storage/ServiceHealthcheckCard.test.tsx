@@ -242,7 +242,9 @@ test('a start period of 0 with a long interval is refused before Save', async ()
   await act(async () => {
     fireEvent.click(view.getByRole('button', { name: 'Save overrides' }))
   })
-  expect(await view.findByText(/must fit in the 90s Temps waits/)).toBeTruthy()
+  expect(
+    await view.findByText(/would end after the 90s Temps waits/)
+  ).toBeTruthy()
   expect(onSave).not.toHaveBeenCalled()
 })
 

@@ -515,28 +515,16 @@ impl ExternalServiceManager {
         service_id: i32,
     ) -> Result<HealthcheckApplied, ExternalServiceError> {
         let service = self.get_service(service_id).await?;
-        // The process policy comes before anything reaches Docker, so the
-        // operator sees why rather than a missing-daemon error.
-        if service.node_id.is_none() && !self.local_workloads_enabled {
-            return Err(ExternalServiceError::LocalWorkloadsDisabled {
-                name: service.name.clone(),
-            });
-        }
-        let target = self.healthcheck_target(&service)?;
-        let (Some(engine), true) = (target.engine, target.capability.can_apply_now) else {
-            return Err(ExternalServiceError::HealthcheckUnsupported {
-                service_id,
-                name: service.name.clone(),
-                operation: "recreate the container to apply the healthcheck",
-                reason: target
-                    .capability
-                    .apply_now_reason
-                    .unwrap_or_else(|| "Temps cannot recreate it from here".to_string()),
-            });
-        };
+        let engine = self.apply_now_engine(&service)?;
         let timings = healthcheck::resolve_for(engine, &service_overrides(&service)).timings;
-        self.recreate_service_container_preserving_data(&service, ContainerRecreate::HEALTHCHECK)
-            .await?;
+        // Checked again once the service's lock is held: a stop that
+        // finished while this waited must not be undone by the recreate.
+        self.recreate_service_container_preserving_data(
+            &service,
+            ContainerRecreate::HEALTHCHECK,
+            |current| self.apply_now_engine(current).map(|_| ()),
+        )
+        .await?;
         info!(
             service_id,
             interval_secs = timings.interval_secs,
@@ -552,13 +540,45 @@ impl ExternalServiceManager {
         })
     }
 
+    /// The engine whose container Apply now recreates, or why it may not:
+    /// local workloads off (before anything reaches Docker, so the operator
+    /// sees the policy rather than a missing-daemon error), not running, a
+    /// cluster, a worker or an imported container.
+    fn apply_now_engine(
+        &self,
+        service: &external_services::Model,
+    ) -> Result<ManagedEngine, ExternalServiceError> {
+        if service.node_id.is_none() && !self.local_workloads_enabled {
+            return Err(ExternalServiceError::LocalWorkloadsDisabled {
+                name: service.name.clone(),
+            });
+        }
+        let target = self.healthcheck_target(service)?;
+        match (target.engine, target.capability.can_apply_now) {
+            (Some(engine), true) => Ok(engine),
+            _ => Err(ExternalServiceError::HealthcheckUnsupported {
+                service_id: service.id,
+                name: service.name.clone(),
+                operation: "recreate the container to apply the healthcheck",
+                reason: target
+                    .capability
+                    .apply_now_reason
+                    .unwrap_or_else(|| "Temps cannot recreate it from here".to_string()),
+            }),
+        }
+    }
+
     /// Load the instance default and every service that overrides its
     /// healthcheck, so the engines create containers with them. Run once at
     /// startup, before routes serve. Reads only rows with an override.
+    ///
+    /// The instance default is published first: when the services cannot be
+    /// read, new containers still get it rather than the built-in timings.
     pub async fn load_healthcheck_registry(
         &self,
         instance_default: HealthcheckOverrides,
     ) -> Result<usize, ExternalServiceError> {
+        registry::set_instance_default(instance_default);
         let rows = self.services_with_healthcheck_overrides().await?;
         let mut entries = Vec::with_capacity(rows.len());
         for row in &rows {
@@ -797,6 +817,106 @@ mod tests {
             None,
             Some(StartIntervalSupport::Supported)
         ));
+    }
+
+    /// A manager over `rows` with no Docker daemon: nothing here can reach a
+    /// real container.
+    fn manager_over(
+        rows: Vec<external_services::Model>,
+    ) -> crate::services::ExternalServiceManager {
+        let db = std::sync::Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results(rows.into_iter().map(|row| vec![row]))
+                .into_connection(),
+        );
+        crate::services::ExternalServiceManager::new_with_handle(
+            db.clone(),
+            std::sync::Arc::new(temps_core::EncryptionService::new_from_password(
+                "service-parameter-reveal-test",
+            )),
+            std::sync::Arc::new(temps_core::DockerHandle::disabled(
+                "control-plane",
+                "apply now test",
+            )),
+            true,
+            std::sync::Arc::new(temps_dns::DnsRegistry::new(db)),
+        )
+    }
+
+    #[tokio::test]
+    async fn apply_now_does_not_undo_a_stop_that_finished_while_it_waited() {
+        use crate::services::test_support::encrypted_service_model;
+        // What Apply now read before waiting for the service's lock...
+        let seen = encrypted_service_model(7, serde_json::json!({}));
+        // ...and the row once it holds it: stopped meanwhile.
+        let stopped = external_services::Model {
+            status: "stopped".to_string(),
+            ..seen.clone()
+        };
+        let manager = manager_over(vec![stopped]);
+        let error = manager
+            .recreate_service_container_preserving_data(
+                &seen,
+                ContainerRecreate::HEALTHCHECK,
+                |current| manager.apply_now_engine(current).map(|_| ()),
+            )
+            .await
+            .unwrap_err();
+        match error {
+            ExternalServiceError::HealthcheckUnsupported { reason, .. } => {
+                assert!(reason.contains("it is stopped"), "{reason}");
+            }
+            other => panic!("expected the stop to be respected, got {other:?}"),
+        }
+
+        // Still running: the check passes and the recreate goes on (to the
+        // missing Docker daemon here).
+        let manager = manager_over(vec![seen.clone(); 4]);
+        let error = manager
+            .recreate_service_container_preserving_data(
+                &seen,
+                ContainerRecreate::HEALTHCHECK,
+                |current| manager.apply_now_engine(current).map(|_| ()),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            !matches!(error, ExternalServiceError::HealthcheckUnsupported { .. }),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_instance_default_is_kept_when_the_services_cannot_be_read() {
+        use sea_orm::{DatabaseBackend, DbErr, MockDatabase};
+        let db = std::sync::Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_errors([DbErr::Custom("connection reset".into())])
+                .into_connection(),
+        );
+        let manager = crate::services::ExternalServiceManager::new_with_handle(
+            db.clone(),
+            std::sync::Arc::new(temps_core::EncryptionService::new_from_password(
+                "healthcheck registry test",
+            )),
+            std::sync::Arc::new(temps_core::DockerHandle::disabled(
+                "control-plane",
+                "healthcheck registry test",
+            )),
+            true,
+            std::sync::Arc::new(temps_dns::DnsRegistry::new(db)),
+        );
+        let saved = HealthcheckOverrides {
+            interval_secs: Some(45),
+            ..Default::default()
+        };
+        let result = manager.load_healthcheck_registry(saved).await;
+        let published = registry::instance_default();
+        // The process-wide default reaches every container this test binary
+        // creates; put it back before asserting.
+        registry::set_instance_default(HealthcheckOverrides::default());
+        assert!(result.is_err(), "the failed query is still reported");
+        assert_eq!(published, saved);
     }
 
     #[test]

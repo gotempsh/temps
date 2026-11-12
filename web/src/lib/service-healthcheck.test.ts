@@ -101,27 +101,72 @@ describe('healthcheck form schema', () => {
   })
 })
 
-describe('a check must land inside the readiness wait', () => {
-  test('a start period of 0 with a long interval is refused before Save', () => {
+describe('a check must be seen inside the readiness wait', () => {
+  // RustFS: a 60s wait and a 5s timeout, so a check has to start by
+  // 60 - 5 - READINESS_POLL_SECS = 53s for Temps to read it in time.
+  test('without a start period, a first check that would end after the wait is refused before Save', () => {
     expect(
       issues({ start_period_secs: '0', interval_secs: '120' }, [redis])
     ).toEqual([
-      'start_period_secs: Start period (0s) plus interval (120s) must fit in the 90s Temps waits for a new container to become healthy, or the start period must cover it',
+      'interval_secs: The first check comes 120s in and may take 5s, so it would end after the 90s Temps waits for a new container to become healthy; it has to start by 83s',
+    ])
+    // Starting exactly as the wait ends is still too late.
+    expect(
+      issues({ start_period_secs: '0', interval_secs: '60' }, [rustfs])[0]
+    ).toStartWith('interval_secs: The first check comes 60s in')
+    expect(
+      issues({ start_period_secs: '0', interval_secs: '54' }, [rustfs]).length
+    ).toBe(1)
+    expect(
+      issues({ start_period_secs: '0', interval_secs: '53' }, [rustfs])
+    ).toEqual([])
+  })
+
+  test('with a start period, the first check comes one start interval in', () => {
+    expect(
+      issues(
+        {
+          start_period_secs: '30',
+          start_interval_secs: '60',
+          interval_secs: '60',
+        },
+        [rustfs]
+      )
+    ).toEqual([
+      'start_interval_secs: The first check comes 60s in and may take 5s, so it would end after the 60s Temps waits for a new container to become healthy; it has to start by 53s',
     ])
   })
 
-  test('the start period covering the wait, or one interval fitting in it, is fine', () => {
+  test('a slower check needs its own timeout inside the wait', () => {
+    // MongoDB: a 90s wait and a 10s timeout.
+    expect(
+      issues({ start_period_secs: '0', interval_secs: '90' }, [mongodb])[0]
+    ).toStartWith(
+      'interval_secs: The first check comes 90s in and may take 10s'
+    )
+    expect(
+      issues({ start_period_secs: '0', interval_secs: '79' }, [mongodb]).length
+    ).toBe(1)
+    expect(
+      issues({ start_period_secs: '0', interval_secs: '78' }, [mongodb])
+    ).toEqual([])
+  })
+
+  test('the start period lasting until the last useful check, or one interval fitting before it, is fine', () => {
     expect(issues({ interval_secs: '3600' }, [redis])).toEqual([])
     expect(
-      issues({ start_period_secs: '0', interval_secs: '60' }, [redis])
+      issues({ start_period_secs: '55', interval_secs: '10' }, [rustfs])
+    ).toEqual([])
+    expect(
+      issues({ start_period_secs: '20', interval_secs: '33' }, [rustfs])
     ).toEqual([])
     // Checking as often as while starting needs no start period.
     expect(
       issues(
         {
           start_period_secs: '0',
-          start_interval_secs: '60',
-          interval_secs: '60',
+          start_interval_secs: '10',
+          interval_secs: '10',
         },
         [rustfs]
       )
@@ -129,24 +174,24 @@ describe('a check must land inside the readiness wait', () => {
   })
 
   test("an instance default is checked against every engine's wait", () => {
-    // 30s + 45s fits Redis' 90s wait but not RustFS' 60s.
+    // 30s + 30s leaves time inside Redis' 90s wait but not RustFS' 60s.
     expect(
-      issues({ start_period_secs: '30', interval_secs: '45' }, [redis])
+      issues({ start_period_secs: '30', interval_secs: '30' }, [redis])
     ).toEqual([])
     expect(
-      issues({ start_period_secs: '30', interval_secs: '45' }, [redis, rustfs])
+      issues({ start_period_secs: '30', interval_secs: '30' }, [redis, rustfs])
     ).toEqual([
-      'start_period_secs: Start period (30s) plus interval (45s) must fit in the 60s Temps waits for a new container to become healthy, or the start period must cover it',
+      'start_period_secs: Start period (30s) plus interval (30s) must leave the 5s check time to finish inside the 60s Temps waits for a new container to become healthy (by 53s), or the start period must last that long',
     ])
   })
 
   test('an inherited start period is blamed on the interval', () => {
-    const noStartPeriod: InheritedHealthcheck = {
-      timings: { ...REDIS, start_period_secs: 0 },
+    const shortStart: InheritedHealthcheck = {
+      timings: { ...REDIS, start_period_secs: 10 },
       readinessWaitSecs: 90,
     }
-    expect(issues({ interval_secs: '120' }, [noStartPeriod])).toEqual([
-      'interval_secs: Start period (0s) plus interval (120s) must fit in the 90s Temps waits for a new container to become healthy, or the start period must cover it',
+    expect(issues({ interval_secs: '120' }, [shortStart])).toEqual([
+      'interval_secs: Start period (10s) plus interval (120s) must leave the 5s check time to finish inside the 90s Temps waits for a new container to become healthy (by 83s), or the start period must last that long',
     ])
   })
 })

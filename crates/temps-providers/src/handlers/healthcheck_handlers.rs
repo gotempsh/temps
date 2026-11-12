@@ -78,25 +78,79 @@ fn audit_context(auth: &AuthContext, metadata: &RequestMetadata) -> AuditContext
 /// container has none (or cannot be recreated from here) a 409. Everything
 /// else takes the shared classification (404, 409 data-safety refusal, 500).
 fn healthcheck_problem(error: ExternalServiceError, operation: &str) -> Problem {
-    match &error {
-        ExternalServiceError::InvalidHealthcheck { .. } => bad_request()
-            .title("Invalid Healthcheck")
-            .detail(error.to_string())
-            .build(),
-        ExternalServiceError::HealthcheckUnsupported { .. } => conflict()
-            .title("Healthcheck Not Available For This Service")
-            .detail(error.to_string())
-            .build(),
-        ExternalServiceError::HealthcheckDefaultConflictsWithService { .. } => conflict()
-            .title("Healthcheck Default Conflicts With A Service Override")
-            .detail(error.to_string())
-            .build(),
-        ExternalServiceError::ServiceNotFound { .. } => not_found()
-            .title("Service Not Found")
-            .detail(error.to_string())
-            .build(),
-        _ => external_service_problem(&error, format!("Failed to {operation}: {error}")),
-    }
+    healthcheck_specific_problem(&error).unwrap_or_else(|| {
+        external_service_problem(&error, format!("Failed to {operation}: {error}"))
+    })
+}
+
+/// The variants these routes answer differently from the shared
+/// classification. Every variant is listed, so a new one is a decision here.
+fn healthcheck_specific_problem(error: &ExternalServiceError) -> Option<Problem> {
+    use ExternalServiceError as E;
+    let (problem, title) = match error {
+        E::InvalidHealthcheck { .. } => (bad_request(), "Invalid Healthcheck"),
+        E::HealthcheckUnsupported { .. } => {
+            (conflict(), "Healthcheck Not Available For This Service")
+        }
+        E::HealthcheckDefaultConflictsWithService { .. } => (
+            conflict(),
+            "Healthcheck Default Conflicts With A Service Override",
+        ),
+        E::ServiceNotFound { .. } => (not_found(), "Service Not Found"),
+        E::Engine { .. }
+        | E::ServiceNameConflict { .. }
+        | E::ServiceNameRestoreConflict { .. }
+        | E::ServiceContainerRestoreConflict { .. }
+        | E::AmbiguousServiceName { .. }
+        | E::ServiceResourceConflict { .. }
+        | E::ServiceContainerConflict { .. }
+        | E::ServiceNotFoundByName { .. }
+        | E::ServiceNotFoundBySlug { .. }
+        | E::ClusterMemberNotFound { .. }
+        | E::NodeNotFound { .. }
+        | E::InitializationFailed { .. }
+        | E::UpgradeRejected { .. }
+        | E::EncryptionFailed { .. }
+        | E::DecryptionFailed { .. }
+        | E::InvalidServiceType { .. }
+        | E::ServiceNotLinkedToProject { .. }
+        | E::NoSandboxAccessEngine { .. }
+        | E::SandboxAccessUnsupported { .. }
+        | E::SandboxNamespaceConflict { .. }
+        | E::ServiceClaimDenied { .. }
+        | E::InvalidDatabaseProvisioning { .. }
+        | E::ProjectNotFound { .. }
+        | E::EnvironmentNotFound { .. }
+        | E::DatabaseError { .. }
+        | E::ArchiveSourceDesynced { .. }
+        | E::ParameterValidationFailed { .. }
+        | E::DataSafetyRefusal { .. }
+        | E::StartFailed { .. }
+        | E::UpgradeInProgress { .. }
+        | E::StopFailed { .. }
+        | E::ClusterMemberProvisioning { .. }
+        | E::ClusterNotSettled { .. }
+        | E::ClusterBusy { .. }
+        | E::LockTimeout { .. }
+        | E::DeletionFailed { .. }
+        | E::ServiceHasLinkedProjects { .. }
+        | E::EnvironmentVariableNotFound { .. }
+        | E::ParameterNotFound { .. }
+        | E::ParameterNotSensitive { .. }
+        | E::EncryptedVariableAccessDenied { .. }
+        | E::DockerError { .. }
+        | E::DuplicateServiceType { .. }
+        | E::InternalError { .. }
+        | E::NodeBusy { .. }
+        | E::AgentUnanswered { .. }
+        | E::DockerUnavailable(_)
+        | E::LocalWorkloadsDisabled { .. }
+        | E::ControlPlaneAddressRequired { .. }
+        | E::ControlPlaneMemberUnreachable { .. }
+        | E::ClusterPortsUnavailable { .. }
+        | E::ClusterMemberLimitExceeded { .. } => return None,
+    };
+    Some(problem.title(title).detail(error.to_string()).build())
 }
 
 /// Get the instance-wide default healthcheck of managed service containers
@@ -946,7 +1000,11 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         let detail = body["detail"].as_str().unwrap_or_default();
-        assert!(detail.contains("start_period_secs"), "{detail}");
+        // Names the value to change and the wait it misses.
+        assert!(
+            detail.contains("first check comes 120s") && detail.contains("interval_secs"),
+            "{detail}"
+        );
         assert!(audit.recorded().is_empty());
     }
 

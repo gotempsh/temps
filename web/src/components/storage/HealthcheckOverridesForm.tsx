@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useEffect, useMemo } from 'react'
+import { useEffect, useMemo, useRef } from 'react'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useForm } from 'react-hook-form'
 import { Field, SaveRow } from '@temps-sdk/ds'
@@ -59,9 +59,22 @@ export function HealthcheckOverridesForm({
     defaultValues: saved,
   })
 
+  // What this form last sent, so its own save coming back is told apart
+  // from a refetch of someone else's.
+  const submitted = useRef<HealthcheckFormValues | null>(null)
   useEffect(() => {
-    reset(saved)
+    // A refetch (another operator's save, a status change) keeps the fields
+    // being edited and updates the rest; this form's own save makes it clean.
+    const ownSave =
+      submitted.current !== null && sameValues(submitted.current, saved)
+    if (ownSave) submitted.current = null
+    reset(saved, { keepDirtyValues: !ownSave })
   }, [saved, reset])
+
+  const save = (overrides: HealthcheckOverrides) => {
+    submitted.current = formValuesOf(overrides)
+    onSave(overrides)
+  }
 
   useEffect(() => {
     onDirtyChange?.(isDirty)
@@ -74,7 +87,9 @@ export function HealthcheckOverridesForm({
     <form
       className="space-y-4"
       aria-label="Healthcheck overrides"
-      onSubmit={handleSubmit((values) => onSave(overridesOf(values)))}
+      onSubmit={(event) =>
+        void handleSubmit((values) => save(overridesOf(values)))(event)
+      }
     >
       <div className="grid grid-cols-2 gap-4 md:grid-cols-5">
         {HEALTHCHECK_FIELDS.map((spec) => (
@@ -118,7 +133,7 @@ export function HealthcheckOverridesForm({
           size="sm"
           variant="outline"
           disabled={disabled || saving}
-          onClick={() => onSave(overridesOf(formValuesOf(undefined)))}
+          onClick={() => save(overridesOf(formValuesOf(undefined)))}
         >
           Clear overrides
         </Button>
@@ -132,4 +147,8 @@ export function HealthcheckOverridesForm({
       />
     </form>
   )
+}
+
+function sameValues(a: HealthcheckFormValues, b: HealthcheckFormValues) {
+  return HEALTHCHECK_FIELDS.every((spec) => a[spec.field] === b[spec.field])
 }
