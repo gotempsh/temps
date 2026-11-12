@@ -395,6 +395,10 @@ impl temps_core::ProjectImageCleaner for DeploymentService {
     }
 }
 
+/// Node statuses whose daemons the nightly sweep covers: every status in
+/// which the node is still part of the cluster and reachable.
+const SWEPT_NODE_STATUSES: &[&str] = &["active", "draining", "drained"];
+
 /// A worker node's Docker daemon, reached through its agent, for the
 /// nightly sweep of images whose project no longer exists. The node itself
 /// checks usage while listing and again before each removal.
@@ -455,25 +459,26 @@ impl OwnedImageDaemon for RemoteImageDaemon {
 
 #[async_trait::async_trait]
 impl WorkerImageDaemons for DeploymentService {
-    /// Active and draining nodes, reached the way container cleanup reaches
-    /// them. A node that cannot be reached is left out and logged; its
-    /// images are swept on a later night.
+    /// Every node still reachable: active, draining, and drained (a drained
+    /// node runs no workloads but can still hold a deleted project's images,
+    /// and stopping new workloads must not stop housekeeping). All rows are
+    /// read in one query and each worker's client is built from its row.
+    /// A node that cannot be reached is left out and logged; its images are
+    /// swept on a later night.
     async fn worker_image_daemons(&self) -> Result<Vec<WorkerImageDaemon>, OrphanSweepError> {
-        let candidates: Vec<(i32, String)> = nodes::Entity::find()
-            .filter(nodes::Column::Status.is_in(["active", "draining"]))
-            .select_only()
-            .column(nodes::Column::Id)
-            .column(nodes::Column::Name)
+        let candidates = nodes::Entity::find()
+            .filter(nodes::Column::Status.is_in(SWEPT_NODE_STATUSES.iter().copied()))
             .order_by_asc(nodes::Column::Id)
-            .into_tuple()
             .all(self.db.as_ref())
             .await
             .map_err(|error| OrphanSweepError::Workers {
                 source: Box::new(error),
             })?;
         let mut daemons = Vec::with_capacity(candidates.len());
-        for (node_id, node_name) in candidates {
-            match self.container_operations_for_node(Some(node_id)).await {
+        for node in candidates {
+            let node_id = node.id;
+            let node_name = node.name.clone();
+            match self.remote_container_operations(node).await {
                 Ok(operations) => match operations.runtime_health_remote() {
                     Some(remote) => daemons.push(WorkerImageDaemon {
                         node_id,
@@ -1112,20 +1117,68 @@ mod tests {
         assert!(error.to_string().contains("worker-9"), "{error}");
     }
 
-    /// Nodes are read in one query; one that cannot be reached is left out
-    /// instead of failing the whole sweep.
+    fn node_row(id: i32, status: &str) -> nodes::Model {
+        let now = chrono::Utc::now();
+        nodes::Model {
+            id,
+            name: format!("worker-{id}"),
+            token_hash: "hash".into(),
+            // No agent token: the node cannot be reached.
+            token_encrypted: None,
+            address: "https://203.0.113.10:3100".into(),
+            private_address: "10.0.0.5".into(),
+            public_endpoint: None,
+            wg_public_key: None,
+            role: "worker".into(),
+            status: status.into(),
+            labels: serde_json::json!({}),
+            capacity: serde_json::json!({}),
+            last_heartbeat: None,
+            edge_public_key: None,
+            compute_cidr: None,
+            architecture: None,
+            underlay_address: None,
+            mesh_wg_public_key: None,
+            mesh_wg_endpoint: None,
+            mesh_wg_address: None,
+            dns_resolver_running: None,
+            dns_resolver_tasks_alive: None,
+            dns_resolver_last_sync_at: None,
+            dns_resolver_consecutive_failures: 0,
+            dns_resolver_last_error: None,
+            dns_resolver_record_count: None,
+            deployments_without_resolver: None,
+            failover_at: None,
+            drain_requested_at: None,
+            build_limits: None,
+            public_ingress_enabled: false,
+            public_ingress_running: None,
+            public_ingress_last_error: None,
+            public_ingress_certificate_count: None,
+            public_ingress_route_count: None,
+            public_ingress_unsupported_route_count: None,
+            public_ingress_unsupported_reasons: serde_json::json!([]),
+            occupied_ranges: None,
+            overlay_status: None,
+            overlay_last_error: None,
+            overlay_ready_cidr: None,
+            overlay_remediation: None,
+            overlay_network_name: None,
+            overlay_vxlan_vni: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// Every reachable status is swept, drained included, and all nodes are
+    /// read in one query: building a worker's client reads no row of its
+    /// own. A node that cannot be reached is left out instead of failing the
+    /// whole sweep.
     #[tokio::test]
-    async fn worker_nodes_that_cannot_be_reached_are_left_out() {
-        use sea_orm::Value;
-        use std::collections::BTreeMap;
+    async fn worker_nodes_are_read_in_one_query_and_unreachable_ones_left_out() {
         let db = Arc::new(
             sea_orm::MockDatabase::new(DatabaseBackend::Postgres)
-                .append_query_results([vec![BTreeMap::from([
-                    ("id".to_string(), Value::from(3_i32)),
-                    ("name".to_string(), Value::from("gone-node".to_string())),
-                ])]])
-                // The node's own row has vanished since: not reachable.
-                .append_query_results([Vec::<BTreeMap<String, Value>>::new()])
+                .append_query_results([vec![node_row(3, "active"), node_row(4, "drained")]])
                 .into_connection(),
         );
         let runtime: Arc<dyn temps_deployer::ContainerDeployer> = Arc::new(
@@ -1136,12 +1189,22 @@ mod tests {
             )
             .expect("remote"),
         );
-        let service = super::super::tests::create_cleanup_service_for_test(db, runtime);
+        let service = super::super::tests::create_cleanup_service_for_test(db.clone(), runtime);
         let daemons = service
             .worker_image_daemons()
             .await
             .expect("the node list is read");
-        assert!(daemons.is_empty());
+        assert!(daemons.is_empty(), "neither node has an agent token");
+        drop(service);
+
+        let log = Arc::try_unwrap(db)
+            .expect("the service released the connection")
+            .into_transaction_log();
+        assert_eq!(log.len(), 1, "one query for every node: {log:?}");
+        let sql = format!("{:?}", log[0]);
+        for status in SWEPT_NODE_STATUSES {
+            assert!(sql.contains(status), "{status} is swept: {sql}");
+        }
 
         let failing = super::super::tests::create_cleanup_service_for_test(
             Arc::new(
