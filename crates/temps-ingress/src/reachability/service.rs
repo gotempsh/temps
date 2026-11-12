@@ -2008,6 +2008,14 @@ impl ReachabilityService {
             tunnel: None,
             new_tunnel: None,
             route_confirmed: option.confirmation.is_some() && request.confirmed,
+            // The fingerprint above proved the choices are as planned.
+            planned_choice: Some(PreviousChoice::from_choice(
+                facts
+                    .choices
+                    .iter()
+                    .find(|(host, _)| *host == address)
+                    .map(|(_, choice)| *choice),
+            )),
             token: None,
             direct: None,
             dns_before: PlannedRecord::Absent,

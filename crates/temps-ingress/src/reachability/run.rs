@@ -629,6 +629,12 @@ pub struct RunInput {
     /// The user confirmed changing the hostname's tunnel choice.
     #[serde(default)]
     pub route_confirmed: bool,
+    /// The hostname's tunnel choice as the plan saw it, which apply checked
+    /// was still current: the choice `route_confirmed` agreed to change. A
+    /// different one found when routing was made after apply and is kept.
+    /// `None` for a run stored before this was recorded.
+    #[serde(default)]
+    pub planned_choice: Option<PreviousChoice>,
     /// In memory for the run only; never stored.
     #[serde(skip)]
     pub token: Option<String>,
@@ -2892,8 +2898,12 @@ impl Runner<'_> {
                             return Outcome::Skipped("Already chosen for this tunnel.".into());
                         }
                         // Another user's choice is changed only when the plan
-                        // said so and it was confirmed.
-                        if current.is_some() && !input.route_confirmed {
+                        // said so and it was confirmed, and only the one the
+                        // plan showed: a choice made after apply is kept.
+                        let moved = input
+                            .planned_choice
+                            .is_some_and(|planned| planned.as_choice() != current);
+                        if moved || (current.is_some() && !input.route_confirmed) {
                             return Outcome::Failed(format!(
                                 "{address} has a tunnel choice that this setup would change, and \
                                  that was not confirmed. Plan again and confirm the change, or \
@@ -5402,6 +5412,7 @@ mod tests {
         RunInput {
             run_id: 0,
             route_confirmed: false,
+            planned_choice: None,
             project_id: 1,
             environment_id: 7,
             environment_name: "production".into(),
@@ -6702,6 +6713,60 @@ mod tests {
         let record = execute(
             &RunInput {
                 route_confirmed: false,
+                ..input
+            },
+            &ops,
+            &Saved::default(),
+            timing(),
+        )
+        .await;
+        assert_eq!(record.state, RunState::Failed);
+        assert!(!ops.calls().iter().any(|c| c.starts_with("route_hostname")));
+    }
+
+    /// The confirmation covers the choice the plan showed. A different one
+    /// made after apply (here: another tunnel, where the plan saw "no
+    /// tunnel") is kept, never replaced under that confirmation.
+    #[tokio::test]
+    async fn a_confirmed_route_keeps_a_choice_made_after_apply() {
+        let input = RunInput {
+            option: PlanOptionKind::ExistingTunnel,
+            steps: steps(&[StepKind::AttachDomain, StepKind::RouteHostname]),
+            tunnel: Some(NamedId {
+                id: 41,
+                name: "homelab".into(),
+            }),
+            new_tunnel: None,
+            token: None,
+            route_confirmed: true,
+            planned_choice: Some(PreviousChoice::Off),
+            ..token_input()
+        };
+        let ops = Fake {
+            choice: Some(Some(7)),
+            ..Default::default()
+        };
+        let record = execute(&input, &ops, &Saved::default(), timing()).await;
+        assert_eq!(record.state, RunState::Failed);
+        assert!(!ops.calls().iter().any(|c| c.starts_with("route_hostname")));
+
+        // Still the choice the plan showed: the confirmed change goes ahead.
+        let ops = Fake {
+            choice: Some(None),
+            ..Default::default()
+        };
+        execute(&input, &ops, &Saved::default(), timing()).await;
+        assert!(ops.calls().contains(&"route_hostname 41".to_string()));
+
+        // Nothing was chosen when planned, and someone chose since.
+        let ops = Fake {
+            choice: Some(Some(7)),
+            ..Default::default()
+        };
+        let record = execute(
+            &RunInput {
+                route_confirmed: false,
+                planned_choice: Some(PreviousChoice::Automatic),
                 ..input
             },
             &ops,
