@@ -486,7 +486,15 @@ mod tests {
                 "{operation} must be available to chat"
             );
         }
-        assert!(playbook.body.contains("list_access_services_general"));
+        // An ordinary sandbox owner may read their sandbox's vaults but not
+        // the instance-wide service list, so the match starts from the vaults.
+        let vaults = playbook.body.find("sandbox_access_vaults").unwrap();
+        let all_services = playbook.body.find("list_access_services_general").unwrap();
+        assert!(
+            vaults < all_services,
+            "the playbook must start from the sandbox's vaults"
+        );
+        assert!(playbook.body.contains("anyone else gets a 403"));
         assert!(playbook
             .body
             .contains("Service access is unavailable for this sandbox"));

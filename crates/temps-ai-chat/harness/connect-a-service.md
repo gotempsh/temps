@@ -7,13 +7,18 @@ contexts: assistant, project
 # Request vault access for a sandbox
 
 Start here when the user wants to use an outside API they connected (for
-example "try Notion"). Read `list_access_services_general` and match the
-provider name or origin host; never start with the project list and never ask
-what "access" means. No match: say no such service is configured and link
-`/vault`; do not substitute an app or a reachability check. A match: continue
-below, then call the service's origin from the sandbox with plain HTTPS and no
-authorization header, because Temps adds the credential. Only the methods and
-paths the service allows will go through.
+example "try Notion"). Read the sandbox_access_vaults operation for this chat's
+sandbox and match the provider name or origin host against the services of the
+vaults it lists; each lists up to four, so read `get_access_vault_general` with
+the sandbox ID query parameter for a vault with more. Never start with the
+project list and never ask what "access" means. Only an instance administrator
+may also read `list_access_services_general`, which lists every service,
+including those in no vault this sandbox can use; anyone else gets a 403 from
+it, so do not call it for them. No match: say no service for it is available to
+this sandbox and link `/vault`; do not substitute an app or a reachability
+check. A match: continue below, then call the service's origin from the sandbox
+with plain HTTPS and no authorization header, because Temps adds the
+credential. Only the methods and paths the service allows will go through.
 
 For a configured credential service in a vault, use the platform API tools to
 complete access approval in this chat. A sandbox does not need a project.
