@@ -119,14 +119,10 @@ pub fn walg_backup_env(
     env.extend(s3.session_token_env());
     env.extend(walg_identity_env(backup_uuid));
     if let Some(endpoint) = container_endpoint {
-        let url = if endpoint.starts_with("http") {
-            endpoint
-        } else {
-            format!("http://{endpoint}")
-        };
+        let url = temps_core::s3_endpoint::endpoint_url(&endpoint);
         env.push(format!("AWS_ENDPOINT={url}"));
     }
-    if s3.force_path_style {
+    if s3.uses_path_style() {
         env.push("AWS_S3_FORCE_PATH_STYLE=true".to_string());
     }
     env

@@ -4,6 +4,10 @@
 'use client'
 
 import { Checkbox } from '@/components/ui/checkbox'
+import {
+  S3EndpointPreviewLine,
+  S3PathStyleField,
+} from '@/components/backups/S3EndpointHints'
 import { PageHeader } from '@/components/layout/PageContainer'
 
 import {
@@ -149,26 +153,17 @@ function S3SourceForm({
               setFormData({ ...formData, endpoint: e.target.value })
             }
           />
+          <S3EndpointPreviewLine endpoint={formData.endpoint} />
         </div>
         <div className="grid gap-2">
-          <Label
-            htmlFor="forcePathStyle"
-            className="flex items-center space-x-2"
-          >
-            <Checkbox
-              id="forcePathStyle"
-              checked={formData.force_path_style || false}
-              onCheckedChange={(checked) =>
-                setFormData({ ...formData, force_path_style: checked === true })
-              }
-            />
-            <div>
-              <span>Force Path Style</span>
-              <p className="text-xs text-muted-foreground">
-                Enable for RustFS/MinIO compatibility
-              </p>
-            </div>
-          </Label>
+          <S3PathStyleField
+            id="forcePathStyle"
+            endpoint={formData.endpoint}
+            checked={formData.force_path_style || false}
+            onCheckedChange={(checked) =>
+              setFormData({ ...formData, force_path_style: checked })
+            }
+          />
         </div>
         <div className="grid gap-2">
           <Label

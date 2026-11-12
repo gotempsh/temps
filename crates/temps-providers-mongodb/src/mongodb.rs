@@ -1167,7 +1167,7 @@ impl MongodbService {
         {
             walg_env.push(format!("AWS_ENDPOINT={}", resolved_endpoint));
         }
-        if s3_credentials.force_path_style {
+        if s3_credentials.uses_path_style() {
             walg_env.push("AWS_S3_FORCE_PATH_STYLE=true".to_string());
         }
 
@@ -1306,7 +1306,7 @@ impl MongodbService {
         {
             walg_env.push(format!("AWS_ENDPOINT={}", resolved_endpoint));
         }
-        if s3_credentials.force_path_style {
+        if s3_credentials.uses_path_style() {
             walg_env.push("AWS_S3_FORCE_PATH_STYLE=true".to_string());
         }
 

@@ -159,6 +159,7 @@ async fn update_s3_source_refuses_a_cloud_managed_row() {
                 endpoint: None,
                 force_path_style: None,
                 worker_credentials: None,
+                use_tls: None,
             },
         )
         .await
@@ -316,6 +317,7 @@ async fn test_create_s3_source() {
         is_default: None,
         backing_service_id: None,
         worker_credentials: None,
+        use_tls: None,
     };
 
     let result = backup_service.create_s3_source(request).await;
@@ -359,6 +361,7 @@ async fn test_create_s3_source_empty_name() {
         is_default: None,
         backing_service_id: None,
         worker_credentials: None,
+        use_tls: None,
     };
 
     let result = backup_service.create_s3_source(request).await;
@@ -431,6 +434,7 @@ async fn test_create_s3_client_from_request_valid() {
         is_default: None,
         backing_service_id: None,
         worker_credentials: None,
+        use_tls: None,
     };
 
     let result = backup_service.create_s3_client_from_request(&request).await;
@@ -481,6 +485,7 @@ async fn test_create_s3_source_with_bucket_creation() {
         is_default: None,
         backing_service_id: None,
         worker_credentials: None,
+        use_tls: None,
     };
 
     // This test requires a real MinIO instance running
@@ -531,6 +536,7 @@ async fn test_create_s3_source_request_validation() {
         is_default: None,
         backing_service_id: None,
         worker_credentials: None,
+        use_tls: None,
     };
 
     let result = backup_service.create_s3_source(invalid_request).await;
@@ -562,6 +568,7 @@ fn s3_probe_test_request(endpoint: &str) -> CreateS3SourceRequest {
         is_default: Some(false),
         backing_service_id: None,
         worker_credentials: None,
+        use_tls: None,
     }
 }
 
@@ -676,6 +683,7 @@ async fn test_update_s3_source_to_an_unreachable_endpoint_saves_nothing() {
                 endpoint: Some("http://temps-s3-probe.invalid:9000".to_string()),
                 force_path_style: None,
                 worker_credentials: None,
+                use_tls: None,
             },
         )
         .await
@@ -737,6 +745,7 @@ async fn test_update_s3_source_replaces_credentials_that_cannot_be_decrypted() {
                 endpoint: Some("http://temps-s3-probe.invalid:9000".to_string()),
                 force_path_style: None,
                 worker_credentials: None,
+                use_tls: None,
             },
         )
         .await
@@ -782,6 +791,7 @@ async fn test_update_s3_source_resubmitting_stored_values_does_not_probe() {
                 endpoint: source.endpoint.clone(),
                 force_path_style: source.force_path_style,
                 worker_credentials: None,
+                use_tls: None,
             },
         )
         .await
@@ -823,6 +833,7 @@ async fn test_update_s3_source_keeps_credentials_sent_back_masked() {
                 endpoint: None,
                 force_path_style: None,
                 worker_credentials: None,
+                use_tls: None,
             },
         )
         .await
@@ -894,6 +905,7 @@ async fn update_s3_source_sets_only_the_worker_credentials_policy() {
                 worker_credentials: Some(
                     crate::handlers::backup_handler::WorkerCredentialsPolicy::AllowFull,
                 ),
+                use_tls: None,
             },
         )
         .await

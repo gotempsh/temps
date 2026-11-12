@@ -2735,9 +2735,18 @@ fn build_s3_env(request: &ServiceBackupRequest) -> HashMap<String, String> {
         format!("s3://{}/{}", request.s3.bucket_name, request.s3_path),
     );
     if let Some(ref endpoint) = request.s3.endpoint {
-        env.insert("AWS_ENDPOINT".to_string(), endpoint.clone());
+        env.insert(
+            "AWS_ENDPOINT".to_string(),
+            temps_core::s3_endpoint::endpoint_url(endpoint),
+        );
     }
-    if request.s3.force_path_style {
+    if request.s3.force_path_style
+        || request
+            .s3
+            .endpoint
+            .as_deref()
+            .is_some_and(temps_core::s3_endpoint::endpoint_host_is_ip_literal)
+    {
         env.insert("AWS_S3_FORCE_PATH_STYLE".to_string(), "true".to_string());
     }
     env
@@ -2757,9 +2766,18 @@ fn build_s3_restore_env(request: &ServiceRestoreRequest) -> HashMap<String, Stri
     env.insert("AWS_REGION".to_string(), request.s3.region.clone());
     env.insert("WALG_S3_PREFIX".to_string(), request.s3_location.clone());
     if let Some(ref endpoint) = request.s3.endpoint {
-        env.insert("AWS_ENDPOINT".to_string(), endpoint.clone());
+        env.insert(
+            "AWS_ENDPOINT".to_string(),
+            temps_core::s3_endpoint::endpoint_url(endpoint),
+        );
     }
-    if request.s3.force_path_style {
+    if request.s3.force_path_style
+        || request
+            .s3
+            .endpoint
+            .as_deref()
+            .is_some_and(temps_core::s3_endpoint::endpoint_host_is_ip_literal)
+    {
         env.insert("AWS_S3_FORCE_PATH_STYLE".to_string(), "true".to_string());
     }
     env

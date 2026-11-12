@@ -1025,7 +1025,7 @@ impl ExternalServiceHealthMonitor {
             endpoint: s3_source.endpoint.clone(),
             bucket_name: s3_source.bucket_name.clone(),
             bucket_path: s3_source.bucket_path.clone(),
-            force_path_style: s3_source.force_path_style.unwrap_or(false),
+            force_path_style: s3_source.effective_path_style(false).force_path_style,
         })
     }
 

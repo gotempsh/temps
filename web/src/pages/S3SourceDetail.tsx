@@ -3,6 +3,7 @@
 
 'use client'
 
+import { describePathStyleReason } from '@/lib/s3-endpoint'
 import {
   deleteBackupScheduleMutation,
   disableBackupScheduleMutation,
@@ -1008,7 +1009,7 @@ export function S3SourceDetail() {
                     Endpoint URL
                   </dt>
                   <dd className="break-all text-base sm:text-sm">
-                    {source.endpoint}
+                    {source.effective_endpoint ?? source.endpoint}
                   </dd>
                 </div>
               )}
@@ -1016,12 +1017,21 @@ export function S3SourceDetail() {
                 <dt className="text-base font-medium text-muted-foreground sm:text-sm">
                   Force path style
                 </dt>
-                <dd className="text-base sm:text-sm">
+                <dd className="space-y-1 text-base sm:text-sm">
                   <Badge
-                    variant={source.force_path_style ? 'default' : 'secondary'}
+                    variant={
+                      source.effective_force_path_style
+                        ? 'default'
+                        : 'secondary'
+                    }
                   >
-                    {source.force_path_style ? 'Enabled' : 'Disabled'}
+                    {source.effective_force_path_style ? 'Enabled' : 'Disabled'}
                   </Badge>
+                  {source.path_style_reason !== 'configured' && (
+                    <p className="text-xs text-muted-foreground">
+                      {describePathStyleReason(source.path_style_reason)}
+                    </p>
+                  )}
                 </dd>
               </div>
               <WorkerCredentialsFact source={source} />

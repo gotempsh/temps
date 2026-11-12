@@ -764,11 +764,7 @@ async fn location_sdk_client(location: &S3Location) -> aws_sdk_s3::Client {
     };
     match location.endpoint.as_deref() {
         Some(endpoint) => {
-            let url = if endpoint.starts_with("http") {
-                endpoint.to_string()
-            } else {
-                format!("http://{endpoint}")
-            };
+            let url = temps_core::s3_endpoint::endpoint_url(endpoint);
             build("us-east-1".to_string(), Some(url), true)
         }
         None => {

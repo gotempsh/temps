@@ -2852,7 +2852,7 @@ fn s3_client(
     let mut builder = Config::builder()
         .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
         .region(aws_sdk_s3::config::Region::new(source.region.clone()))
-        .force_path_style(source.force_path_style.unwrap_or(true))
+        .force_path_style(source.effective_path_style(true).force_path_style)
         .credentials_provider(credentials)
         .retry_config(aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(3))
         // Connect attempts are bounded, but no whole-operation timeout is set:
@@ -2863,11 +2863,7 @@ fn s3_client(
                 .build(),
         );
     if let Some(endpoint) = &source.endpoint {
-        builder = builder.endpoint_url(if endpoint.starts_with("http") {
-            endpoint.clone()
-        } else {
-            format!("http://{endpoint}")
-        });
+        builder = builder.endpoint_url(temps_core::s3_endpoint::endpoint_url(endpoint));
     }
     Ok(S3Client::from_conf(builder.build()))
 }

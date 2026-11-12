@@ -543,7 +543,7 @@ impl BackupService {
             endpoint: source.endpoint.clone(),
             bucket_name: source.bucket_name.clone(),
             bucket_path: source.bucket_path.clone(),
-            force_path_style: source.force_path_style.unwrap_or(true),
+            force_path_style: source.effective_path_style(true).force_path_style,
         }
         .resolve_endpoint_for_container(&docker, container)
         .await;
@@ -567,14 +567,10 @@ impl BackupService {
         if let Some(endpoint) = endpoint {
             env.push(format!(
                 "AWS_ENDPOINT={}",
-                if endpoint.starts_with("http") {
-                    endpoint
-                } else {
-                    format!("http://{}", endpoint)
-                }
+                temps_core::s3_endpoint::endpoint_url(&endpoint)
             ));
         }
-        if source.force_path_style.unwrap_or(true) {
+        if source.effective_path_style(true).force_path_style {
             env.push("AWS_S3_FORCE_PATH_STYLE=true".to_string());
         }
         let cancellation = tokio_util::sync::CancellationToken::new();

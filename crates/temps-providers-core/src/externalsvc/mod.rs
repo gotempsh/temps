@@ -370,19 +370,40 @@ impl S3Credentials {
         let mut config_builder = aws_sdk_s3::config::Config::builder()
             .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
             .region(aws_sdk_s3::config::Region::new(self.region.clone()))
-            .force_path_style(self.force_path_style)
+            .force_path_style(self.uses_path_style())
             .credentials_provider(creds);
 
-        if let Some(endpoint) = &self.endpoint {
-            let endpoint_url = if endpoint.starts_with("http") {
-                endpoint.clone()
-            } else {
-                format!("http://{}", endpoint)
-            };
+        if let Some(endpoint_url) = self.endpoint_url() {
             config_builder = config_builder.endpoint_url(endpoint_url);
         }
 
         aws_sdk_s3::Client::from_conf(config_builder.build())
+    }
+
+    /// The endpoint with an explicit scheme, as every client must receive it
+    /// (see [`temps_core::s3_endpoint`]). `None` for AWS S3 itself.
+    pub fn endpoint_url(&self) -> Option<String> {
+        self.endpoint
+            .as_deref()
+            .filter(|endpoint| !endpoint.trim().is_empty())
+            .map(temps_core::s3_endpoint::endpoint_url)
+    }
+
+    /// Path-style addressing as clients must use it, and why: forced for an
+    /// IP-literal endpoint, otherwise `force_path_style` (which a caller
+    /// building these credentials from an S3 source has already resolved
+    /// with [`temps_entities::s3_sources::Model::effective_path_style`]).
+    pub fn path_style(&self) -> temps_core::s3_endpoint::EffectivePathStyle {
+        temps_core::s3_endpoint::effective_path_style(
+            self.endpoint.as_deref(),
+            self.force_path_style,
+            false,
+        )
+    }
+
+    /// Whether a client must send `AWS_S3_FORCE_PATH_STYLE=true`.
+    pub fn uses_path_style(&self) -> bool {
+        self.path_style().force_path_style
     }
 
     /// Resolve the S3 endpoint for use inside a Docker container.
@@ -404,18 +425,18 @@ impl S3Credentials {
     ) -> Option<String> {
         let endpoint = self.endpoint.as_ref()?;
 
-        // Parse the endpoint URL to extract host and port
-        let url = if endpoint.starts_with("http") {
-            endpoint.clone()
-        } else {
-            format!("http://{}", endpoint)
-        };
+        // Always a full URL with an explicit scheme. A bare `host:port` used
+        // to be returned unchanged for a non-loopback host, and WAL-G reads a
+        // scheme-less `AWS_ENDPOINT` as HTTPS: every `wal-push` to a plain
+        // HTTP store failed while Temps's own (HTTP-defaulting) SDK client
+        // reported the source healthy.
+        let url = temps_core::s3_endpoint::endpoint_url(endpoint);
 
         // Check if the host is localhost/127.0.0.1
         let is_localhost = url.contains("://localhost") || url.contains("://127.0.0.1");
         if !is_localhost {
-            // External endpoint (e.g., s3.amazonaws.com) — usable as-is from the container
-            return Some(endpoint.clone());
+            // External endpoint (e.g., s3.amazonaws.com) — usable from the container
+            return Some(url);
         }
 
         // Extract port from the endpoint URL

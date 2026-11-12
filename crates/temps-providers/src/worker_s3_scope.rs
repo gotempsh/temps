@@ -539,7 +539,7 @@ impl WorkerCredentialScoper {
             bucket: source.bucket_name.clone(),
             region: source.region.clone(),
             endpoint: source.endpoint.clone(),
-            force_path_style: source.force_path_style.unwrap_or(true),
+            force_path_style: source.effective_path_style(true).force_path_style,
             access_key_id: String::new(),
             secret_access_key: String::new(),
             session_token: None,

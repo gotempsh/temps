@@ -53,7 +53,7 @@ fn build_walg_env(
     if let Some(endpoint) = resolved_endpoint {
         env.push(export("AWS_ENDPOINT", endpoint)?);
     }
-    if creds.force_path_style {
+    if creds.uses_path_style() {
         env.push("export AWS_S3_FORCE_PATH_STYLE='true'".to_string());
     }
     Ok(env)

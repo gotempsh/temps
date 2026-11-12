@@ -36,10 +36,12 @@ impl BackupService {
             "backup-service",
         );
 
-        // Default to path style for MinIO and other S3-compatible stores.
+        // Default to path style for MinIO and other S3-compatible stores;
+        // forced for an IP endpoint or a managed store, exactly as WAL-G
+        // receives it.
         let config = crate::engines::v2_common::s3_config_builder(
             &s3_source.region,
-            s3_source.force_path_style.unwrap_or(true),
+            s3_source.effective_path_style(true).force_path_style,
             creds,
             s3_source.endpoint.as_deref(),
         )
@@ -63,7 +65,12 @@ impl BackupService {
 
         let config = crate::engines::v2_common::s3_config_builder(
             &request.region,
-            request.force_path_style.unwrap_or(true),
+            temps_core::s3_endpoint::effective_path_style(
+                request.endpoint.as_deref(),
+                request.force_path_style.unwrap_or(true),
+                request.backing_service_id.is_some(),
+            )
+            .force_path_style,
             creds,
             request.endpoint.as_deref(),
         )
@@ -120,6 +127,14 @@ impl BackupService {
                 "S3 source name cannot be empty".into(),
             ));
         }
+        // Store, verify and hand out one string: the endpoint with its
+        // scheme spelled out, so no client has to guess it.
+        let mut request = request;
+        request.endpoint = normalize_request_endpoint(
+            &request.name,
+            request.endpoint.as_deref(),
+            request.use_tls,
+        )?;
 
         if let Some(service_id) = request.backing_service_id {
             let backing_service = temps_entities::external_services::Entity::find_by_id(service_id)
@@ -266,6 +281,14 @@ impl BackupService {
                 "Access key and secret key are required to test connection".into(),
             ));
         }
+        // Test exactly what saving would store.
+        let mut normalized = request.clone();
+        normalized.endpoint = normalize_request_endpoint(
+            &request.name,
+            request.endpoint.as_deref(),
+            request.use_tls,
+        )?;
+        let request = &normalized;
 
         // A missing bucket is not a failure: the credentials work, and
         // creating the source creates the bucket.
@@ -529,6 +552,28 @@ impl BackupService {
         let is_unchanged_credential =
             |value: Option<&str>| value.is_none_or(|v| v.is_empty() || v == "***");
         let mut request = request;
+        // An endpoint entered without a scheme, or a TLS choice made on its
+        // own against the stored endpoint, is normalised before it is
+        // compared, verified or stored. `Some("")` clears the endpoint.
+        let endpoint_change = match (request.endpoint.as_deref(), request.use_tls) {
+            (Some(raw), use_tls) => Some(normalize_request_endpoint(
+                &current.name,
+                Some(raw),
+                use_tls,
+            )?),
+            (None, Some(use_tls)) => match current.endpoint.as_deref() {
+                Some(stored) => {
+                    let bare = stored.split_once("://").map_or(stored, |(_, rest)| rest);
+                    Some(normalize_request_endpoint(
+                        &current.name,
+                        Some(bare),
+                        Some(use_tls),
+                    )?)
+                }
+                None => None,
+            },
+            (None, None) => None,
+        };
         if is_unchanged_credential(request.access_key_id.as_ref().map(SecretString::expose)) {
             request.access_key_id = None;
         }
@@ -576,10 +621,9 @@ impl BackupService {
                 &current.secret_key,
             )
             || differs(&request.region, &current.region)
-            || request
-                .endpoint
-                .as_deref()
-                .is_some_and(|endpoint| current.endpoint.as_deref() != Some(endpoint))
+            || endpoint_change
+                .as_ref()
+                .is_some_and(|endpoint| &current.endpoint != endpoint)
             || request
                 .force_path_style
                 .is_some_and(|path_style| current.force_path_style != Some(path_style));
@@ -603,10 +647,10 @@ impl BackupService {
                     .region
                     .clone()
                     .unwrap_or_else(|| current.region.clone()),
-                endpoint: request
-                    .endpoint
+                endpoint: endpoint_change
                     .clone()
-                    .or_else(|| current.endpoint.clone()),
+                    .unwrap_or_else(|| current.endpoint.clone()),
+                use_tls: None,
                 force_path_style: request.force_path_style.or(current.force_path_style),
                 is_default: None,
                 backing_service_id: current.backing_service_id,
@@ -650,8 +694,8 @@ impl BackupService {
         if let Some(region) = request.region {
             active.region = Set(region);
         }
-        if let Some(endpoint) = request.endpoint {
-            active.endpoint = Set(Some(endpoint));
+        if let Some(endpoint) = endpoint_change {
+            active.endpoint = Set(endpoint);
         }
         if let Some(force_path_style) = request.force_path_style {
             active.force_path_style = Set(Some(force_path_style));
@@ -665,6 +709,21 @@ impl BackupService {
         let updated = active.update(self.db.as_ref()).await?;
         Ok(updated)
     }
+}
+
+/// The endpoint a create/update request stores: with its scheme spelled out,
+/// or `None` for AWS S3 itself.
+fn normalize_request_endpoint(
+    source_name: &str,
+    endpoint: Option<&str>,
+    use_tls: Option<bool>,
+) -> Result<Option<String>, BackupError> {
+    temps_core::s3_endpoint::normalize_endpoint_input(endpoint, use_tls).map_err(|error| {
+        BackupError::InvalidS3Endpoint {
+            source_name: source_name.to_string(),
+            error,
+        }
+    })
 }
 
 /// Verify `bucket` through `client`, turning a failure into
