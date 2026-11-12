@@ -10,6 +10,7 @@ import {
   listIngressHostnamesOptions,
   renewDomainMutation,
 } from '@/api/client/@tanstack/react-query.gen'
+import { ROUTE_FAILURE_IGNORE_REFUSAL } from '@/lib/route-query-failures'
 import { allTunnelsOptions } from '@/lib/tunnel-domains'
 import { DomainResponse } from '@/api/client/types.gen'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
@@ -188,11 +189,15 @@ export function DomainsManagement({
   const connectorsQuery = useQuery({
     ...allTunnelsOptions(),
     retry: false,
+    // Optional context: a role without settings access is refused and sees
+    // certificates only, which is not a failure of this page.
+    meta: { routeFailure: ROUTE_FAILURE_IGNORE_REFUSAL },
   })
   const hostnamesQuery = useQuery({
     ...listIngressHostnamesOptions(),
     refetchInterval: 15_000,
     retry: false,
+    meta: { routeFailure: ROUTE_FAILURE_IGNORE_REFUSAL },
   })
   const tunnels = tunnelRows(
     connectorsQuery.data ?? [],

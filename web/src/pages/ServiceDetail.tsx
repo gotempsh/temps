@@ -10,7 +10,6 @@ import {
   deleteServiceMutation,
   getClusterHealthQueryKey,
   getProjectsOptions,
-  listS3SourcesOptions,
   getServiceOptions,
   getServicePreviewEnvironmentVariablesMaskedOptions,
   linkServiceToProjectMutation,
@@ -39,6 +38,7 @@ import {
   ServiceHealthCard,
 } from '@/components/storage/ServiceHealthCard'
 import { WalHealthPanel } from '@/components/storage/WalHealthPanel'
+import { backupDestinationsOptions } from '@/components/storage/backup-destinations-query'
 import { TriggerBackupDialog } from '@/components/storage/TriggerBackupDialog'
 import {
   ScheduleBackupsAction,
@@ -369,7 +369,7 @@ export function ServiceDetail() {
   // Backup destinations decide whether the Backups card can offer to back
   // this database up or must onboard a destination first.
   const backupSourcesQuery = useQuery({
-    ...listS3SourcesOptions(),
+    ...backupDestinationsOptions(),
     retry: false,
   })
   const backupSources = backupSourcesQuery.data ?? []

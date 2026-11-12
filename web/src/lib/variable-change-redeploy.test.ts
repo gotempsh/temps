@@ -79,5 +79,25 @@ describe('variableChangeRedeployMessage', () => {
 
   test('still says when it applies when nothing is running', () => {
     expect(variableChangeRedeployMessage([])).toBe('Applies on next deploy.')
+    expect(variableChangeRedeployMessage([], false)).toBe(
+      'Applies on next deploy.'
+    )
+  })
+
+  test('says to upload the source again when it cannot be redeployed in place', () => {
+    expect(variableChangeRedeployMessage([{ name: 'production' }], false)).toBe(
+      'Applies on next deploy. Upload the source again to apply it now.'
+    )
+  })
+
+  test('says to turn on Other sources first when the project would refuse the upload', () => {
+    const message = variableChangeRedeployMessage(
+      [{ name: 'production' }],
+      false,
+      false
+    )
+    expect(message).toContain('Other sources')
+    expect(message).toContain('then upload the source again')
+    expect(message).not.toContain('Redeploy production')
   })
 })

@@ -20,6 +20,8 @@ import { Button } from '@/components/ui/button'
 import { CopyButton } from '@/components/ui/copy-button'
 import { TimeAgo } from '@/components/utils/TimeAgo'
 import { getErrorMessage } from '@/utils/errorHandling'
+import { isRoleRefusal } from '@/lib/read-failure'
+import { ROUTE_FAILURE_IGNORE } from '@/lib/route-query-failures'
 import { useQuery } from '@tanstack/react-query'
 import { AlertTriangle, ShieldAlert } from 'lucide-react'
 
@@ -55,7 +57,17 @@ export function WalHealthPanel({
     refetchInterval: 60_000,
     staleTime: 55_000,
     retry: false,
+    // This panel explains a failed check itself, and stays quiet about a
+    // refusal, so the shell must not report the same read a second time.
+    meta: { routeFailure: ROUTE_FAILURE_IGNORE },
   })
+
+  // The check is refused for a caller who may not use backups of this service
+  // (for example a database not yet linked to one of their projects). Nothing
+  // went wrong and a retry cannot change it, so only a real failure of the
+  // check is shown as one.
+  const checkFailed =
+    backupCapability.isError && !isRoleRefusal(backupCapability.error)
 
   const snapshot = data?.wal_health ?? null
   const notChecked = data?.not_checked ?? null
@@ -70,7 +82,7 @@ export function WalHealthPanel({
     !notChecked &&
     !incompatible &&
     !archivingDisabled &&
-    !backupCapability.isError
+    !checkFailed
   ) {
     return null
   }
@@ -102,7 +114,7 @@ export function WalHealthPanel({
           </AlertDescription>
         </Alert>
       ) : null}
-      {backupCapability.isError ? (
+      {checkFailed ? (
         <Alert variant="destructive">
           <AlertTriangle className="h-4 w-4" />
           <AlertDescription className="space-y-3">
@@ -164,18 +176,19 @@ export function WalHealthPanel({
               <p className="mt-1 text-xs text-muted-foreground">
                 {isImported ? (
                   <>
-                    This imported database’s startup settings are managed outside
-                    Temps. Enable archive_mode in its external PostgreSQL startup
-                    settings and restart it before creating a full backup.
-                    Alternatively, restore into a new managed service. Temps
-                    cannot change the imported container’s startup command.
+                    This imported database’s startup settings are managed
+                    outside Temps. Enable archive_mode in its external
+                    PostgreSQL startup settings and restart it before creating a
+                    full backup. Alternatively, restore into a new managed
+                    service. Temps cannot change the imported container’s
+                    startup command.
                   </>
                 ) : (
                   <>
                     A restore disables WAL pushes to protect its source backup.
-                    Point-in-time recovery needs a new full backup to configure and
-                    verify this service’s pinned archive destination. Restarting
-                    alone keeps archiving disabled.
+                    Point-in-time recovery needs a new full backup to configure
+                    and verify this service’s pinned archive destination.
+                    Restarting alone keeps archiving disabled.
                   </>
                 )}
               </p>
