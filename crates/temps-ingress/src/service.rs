@@ -3157,6 +3157,105 @@ mod tests {
             drop(test_db);
         }
 
+        /// A reachability run writes the tunnel choice it decided from only
+        /// while the hostname still has the choice it read: one someone made
+        /// meanwhile is kept and reported, never replaced unseen.
+        #[tokio::test]
+        async fn a_run_never_replaces_a_choice_made_while_it_routed() {
+            let Some((test_db, service, _calls, id)) = setup().await else {
+                return;
+            };
+            let db = test_db.connection_arc();
+            let now = Utc::now();
+            let provider = temps_entities::dns_providers::ActiveModel {
+                name: Set("choice-race".into()),
+                provider_type: Set("cloudflare".into()),
+                credentials: Set("{}".into()),
+                is_active: Set(true),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await
+            .expect("provider");
+            temps_entities::dns_managed_domains::ActiveModel {
+                provider_id: Set(provider.id),
+                domain: Set("example.com".into()),
+                auto_manage: Set(true),
+                proxied_by_default: Set(false),
+                verified: Set(true),
+                generated_hostname_mode: Set("standard".into()),
+                sync_generated_records: Set(false),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await
+            .expect("managed zone");
+            let choose = |host: &'static str, expected| {
+                let service = service.clone();
+                async move { service.choose_tunnel_if_unchanged(host, id, expected).await }
+            };
+            let choice = |host: &'static str| {
+                let service = service.clone();
+                async move { service.hostname_choice(host).await.expect("read") }
+            };
+
+            // Nothing chosen, nothing changed: the choice is recorded.
+            choose("shop.example.com", None)
+                .await
+                .expect("first choice");
+            assert_eq!(choice("shop.example.com").await, Some(Some(id)));
+            // Resumed after the write landed: already done, not a failure.
+            choose("shop.example.com", None).await.expect("resumed");
+
+            // Someone set "no tunnel" after the run read "nothing chosen".
+            ingress_hostname_choices::ActiveModel {
+                hostname: Set("blog.example.com".into()),
+                connector_id: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await
+            .expect("other choice");
+            let error = choose("blog.example.com", None)
+                .await
+                .expect_err("kept the other choice");
+            assert!(
+                error
+                    .to_string()
+                    .contains("blog.example.com's tunnel choice changed"),
+                "{error}"
+            );
+            assert_eq!(choice("blog.example.com").await, Some(None));
+
+            // The run read "no tunnel" and confirmed replacing it: written.
+            choose("blog.example.com", Some(None))
+                .await
+                .expect("confirmed change");
+            assert_eq!(choice("blog.example.com").await, Some(Some(id)));
+
+            // The run read "no tunnel", but it was changed back meanwhile.
+            ingress_hostname_choices::Entity::update_many()
+                .col_expr(
+                    ingress_hostname_choices::Column::ConnectorId,
+                    Expr::value(Option::<i32>::None),
+                )
+                .filter(ingress_hostname_choices::Column::Hostname.eq("shop.example.com"))
+                .exec(db.as_ref())
+                .await
+                .expect("set off");
+            assert!(choose("shop.example.com", Some(Some(id + 1000)))
+                .await
+                .is_err());
+            assert_eq!(choice("shop.example.com").await, Some(None));
+            drop(test_db);
+        }
+
         /// A connector marked `deleting` is not served to nodes and its name
         /// is checked, so a stale undo cannot remove a different tunnel.
         #[tokio::test]
