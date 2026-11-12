@@ -105,6 +105,31 @@ describe('keepPreviousWindow', () => {
     expect(earlier(rows, { queryKey: key(window) })).toBeUndefined()
   })
 
+  test('keeps it when an idle Refresh moves a short window past its own length', () => {
+    const lastHour = (end: string) => ({
+      start_date: new Date(Date.parse(end) - 3_600_000).toISOString(),
+      end_date: end,
+    })
+    const twoHoursLater = '2026-01-02T02:00:00.000Z'
+    const refreshed = keepPreviousWindow(
+      key(lastHour(twoHoursLater)),
+      Date.parse(twoHoursLater)
+    )
+    expect(
+      refreshed(rows, { queryKey: key(lastHour('2026-01-02T00:00:00.000Z')) })
+    ).toBe(rows)
+    // The same hour picked as a custom range long afterwards is another range.
+    const pickedLater = keepPreviousWindow(
+      key(lastHour(twoHoursLater)),
+      Date.parse('2026-01-09T00:00:00.000Z')
+    )
+    expect(
+      pickedLater(rows, {
+        queryKey: key(lastHour('2026-01-02T00:00:00.000Z')),
+      })
+    ).toBeUndefined()
+  })
+
   test('reads a window named in a hand-written key', () => {
     const usageKey = (from: string, to: string) => [
       'aiUsage',

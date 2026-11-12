@@ -39,7 +39,10 @@ export function useWindowQuery<
     result.isError && result.data === undefined
       ? previousWindowQuery(
           queryClient.getQueryCache().getAll(),
-          options.queryKey
+          options.queryKey,
+          // Close to when the moved window was asked for, and stable
+          // across renders.
+          result.errorUpdatedAt
         )
       : undefined
   const keptError = previous ? result.error : null

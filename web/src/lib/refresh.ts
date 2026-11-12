@@ -83,13 +83,16 @@ function windowOf(value: unknown): { start?: number; end?: number } {
 /**
  * Whether `next` is `previous` moved forward the way Refresh moves a relative
  * window: the end later, the start no earlier and moved no more than the end
- * ("last 24 hours" moves both, "today" only its end), still overlapping it.
- * Picking another range (7 days after 24 hours, or 24 hours after 7 days, or
- * a custom range elsewhere) is not. Bounds a key does not name are not judged.
+ * ("last 24 hours" moves both, "today" only its end), and either still
+ * overlapping it or ending about `now`, as a window Refresh moved does even
+ * after an idle hour on "last hour". Picking another range (7 days after 24
+ * hours, 24 hours after 7 days, or a custom range elsewhere in the past) is
+ * not. Bounds a key does not name are not judged.
  */
 function movedForward(
   previous: { start?: number; end?: number },
-  next: { start?: number; end?: number }
+  next: { start?: number; end?: number },
+  now: number
 ): boolean {
   const { start: s0, end: e0 } = previous
   const { start: s1, end: e1 } = next
@@ -97,7 +100,8 @@ function movedForward(
   if (s0 !== undefined && s1 !== undefined && s1 < s0) return false
   if (s0 === undefined || s1 === undefined) return true
   if (e0 === undefined || e1 === undefined) return true
-  return s1 - s0 <= e1 - e0 && s1 < e0
+  if (s1 - s0 > e1 - e0) return false
+  return s1 < e0 || Math.abs(now - e1) <= e1 - s1
 }
 
 /**
@@ -107,7 +111,7 @@ function movedForward(
  * gets no placeholder, so data of one selection never shows, clickable, under
  * another.
  */
-export function keepPreviousWindow(queryKey: QueryKey) {
+export function keepPreviousWindow(queryKey: QueryKey, now = Date.now()) {
   const current = hashKey(withoutWindow(queryKey) as QueryKey)
   const currentWindow = windowOf(queryKey)
   return <T>(
@@ -116,19 +120,21 @@ export function keepPreviousWindow(queryKey: QueryKey) {
   ): T | undefined =>
     previousQuery !== undefined &&
     hashKey(withoutWindow(previousQuery.queryKey) as QueryKey) === current &&
-    movedForward(windowOf(previousQuery.queryKey), currentWindow)
+    movedForward(windowOf(previousQuery.queryKey), currentWindow, now)
       ? previous
       : undefined
 }
 
 /**
  * The query for the last window that loaded before `queryKey`'s window: the
- * same selection, a window `queryKey` moved forward from, with data. When a
- * moved window fails before it loads, the page keeps showing this one.
+ * same selection, a window `queryKey` moved forward from (as of `now`, when
+ * it was asked for), with data. When a moved window fails before it loads,
+ * the page keeps showing this one.
  */
 export function previousWindowQuery(
   queries: readonly Query[],
-  queryKey: QueryKey
+  queryKey: QueryKey,
+  now: number
 ): Query | undefined {
   const current = hashKey(withoutWindow(queryKey) as QueryKey)
   const currentWindow = windowOf(queryKey)
@@ -136,7 +142,7 @@ export function previousWindowQuery(
   for (const query of queries) {
     if (query.state.data === undefined) continue
     if (hashKey(withoutWindow(query.queryKey) as QueryKey) !== current) continue
-    if (!movedForward(windowOf(query.queryKey), currentWindow)) continue
+    if (!movedForward(windowOf(query.queryKey), currentWindow, now)) continue
     if (!latest || query.state.dataUpdatedAt > latest.state.dataUpdatedAt)
       latest = query
   }
