@@ -1182,18 +1182,16 @@ impl MariaDbService {
                 ..host_config
             }),
             networking_config,
-            healthcheck: Some(bollard::models::HealthConfig {
-                test: Some(vec![
-                    "CMD-SHELL".to_string(),
-                    "mariadb-admin ping -h 127.0.0.1 -uroot -p\"$MARIADB_ROOT_PASSWORD\" --silent"
-                        .to_string(),
-                ]),
-                interval: Some(1000000000),
-                timeout: Some(3000000000),
-                retries: Some(5),
-                start_period: Some(30000000000),
-                start_interval: Some(1000000000),
-            }),
+            healthcheck: Some(
+                temps_providers_core::healthcheck::managed_health_config(
+                    docker,
+                    temps_providers_core::externalsvc::recreate_guard::ManagedEngine::MariaDb,
+                    &container_name,
+                    crate::workload::DatabaseEngine::Mariadb
+                        .healthcheck_script(&std::collections::BTreeMap::new()),
+                )
+                .await,
+            ),
             ..Default::default()
         };
 

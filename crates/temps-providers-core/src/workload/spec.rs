@@ -39,8 +39,8 @@ use serde::{Deserialize, Serialize};
 use temps_workload::{
     labels as workload_labels, Artifact, Attachments, EnvSpec, InstanceLimits, InstanceSpec,
     Isolation, Lifetime, LogRotation, NetworkAttachment, PlacementSpec, PortBinding, PortProtocol,
-    PortSpec, Probe, ProbeKind, Probes, Process, ResourceAmounts, Resources, RestartPolicy,
-    SecretRef, SecurityProfile, VolumeMount, WorkloadKind, WorkloadRef, WorkloadSpec,
+    PortSpec, Probes, Process, ResourceAmounts, Resources, RestartPolicy, SecretRef,
+    SecurityProfile, VolumeMount, WorkloadKind, WorkloadRef, WorkloadSpec,
 };
 use temps_workload_docker::{data_container_create_body, ContainerShape, DataExtras};
 use temps_workload_plane::{admit_data_service, AdmissionInput, AdmissionPolicy, Owner};
@@ -141,10 +141,9 @@ impl DatabaseEngine {
         }
     }
 
-    /// The engine's healthcheck, as §13 probes: readiness is the check,
-    /// startup the grace period. The values are the control-plane engines'.
-    pub fn probes(self, env: &BTreeMap<String, String>) -> Probes {
-        let (script, period, timeout, failures, grace, grace_period) = match self {
+    /// The engine's healthcheck command for a container with `env`.
+    pub fn healthcheck_script(self, env: &BTreeMap<String, String>) -> String {
+        match self {
             Self::Postgres => {
                 let user = env
                     .get("POSTGRES_USER")
@@ -152,51 +151,26 @@ impl DatabaseEngine {
                     .unwrap_or("postgres");
                 // The image creates POSTGRES_DB, defaulting to the user.
                 let database = env.get("POSTGRES_DB").map(String::as_str).unwrap_or(user);
-                (
-                    crate::externalsvc::naming::postgres_healthcheck_cmd(user, database),
-                    1,
-                    3,
-                    3,
-                    30,
-                    1,
-                )
+                crate::externalsvc::naming::postgres_healthcheck_cmd(user, database)
             }
-            Self::Redis => ("redis-cli ping".to_string(), 1, 3, 3, 5, 1),
-            Self::Mongodb => (
-                crate::externalsvc::naming::HEALTHCHECK_COMMAND.to_string(),
-                2,
-                10,
-                5,
-                45,
-                2,
-            ),
-            Self::Mariadb => (
+            Self::Redis => "redis-cli ping".to_string(),
+            Self::Mongodb => crate::externalsvc::naming::HEALTHCHECK_COMMAND.to_string(),
+            Self::Mariadb => {
                 "mariadb-admin ping -h 127.0.0.1 -uroot -p\"$MARIADB_ROOT_PASSWORD\" --silent"
-                    .to_string(),
-                1,
-                3,
-                5,
-                30,
-                1,
-            ),
-        };
-        let exec = ProbeKind::Exec {
-            command: vec!["/bin/sh".to_string(), "-c".to_string(), script],
-        };
-        Probes {
-            startup: Some(Probe {
-                initial_delay_secs: grace,
-                period_secs: grace_period,
-                ..Probe::new(exec.clone())
-            }),
-            readiness: Some(Probe {
-                period_secs: period,
-                timeout_secs: timeout,
-                failure_threshold: failures,
-                ..Probe::new(exec)
-            }),
-            liveness: None,
+                    .to_string()
+            }
         }
+    }
+
+    /// The engine's healthcheck, as §13 probes: readiness is the check,
+    /// startup the grace period. The timings are the ones every managed
+    /// container of this engine gets (`crate::healthcheck`).
+    pub fn probes(self, env: &BTreeMap<String, String>, container_name: &str) -> Probes {
+        crate::healthcheck::managed_probes(
+            self.managed_engine(),
+            container_name,
+            self.healthcheck_script(env),
+        )
     }
 }
 
@@ -719,7 +693,7 @@ pub fn database_workload_spec(
             app_protocol: Default::default(),
         }],
         network: Default::default(),
-        probes: identity.engine.probes(&probe_env),
+        probes: identity.engine.probes(&probe_env, &identity.container_name),
         placement: PlacementSpec {
             // Node 0 is the control plane, as in the node list.
             nodes: Some(vec![identity.node_id.unwrap_or(0)]),
@@ -1303,15 +1277,21 @@ mod tests {
             health.test,
             Some(vec!["CMD-SHELL".into(), "redis-cli ping".into()])
         );
-        assert_eq!(health.start_period, Some(5_000_000_000));
+        // The shared managed-service cadence (`crate::healthcheck`).
+        assert_eq!(health.interval, Some(30_000_000_000));
+        assert_eq!(health.start_interval, Some(2_000_000_000));
+        assert_eq!(health.start_period, Some(90_000_000_000));
     }
 
     #[test]
     fn a_postgres_healthcheck_uses_the_configured_user_and_database() {
-        let probes = DatabaseEngine::Postgres.probes(&BTreeMap::from([
-            ("POSTGRES_USER".to_string(), "app".to_string()),
-            ("POSTGRES_DB".to_string(), "shop".to_string()),
-        ]));
+        let probes = DatabaseEngine::Postgres.probes(
+            &BTreeMap::from([
+                ("POSTGRES_USER".to_string(), "app".to_string()),
+                ("POSTGRES_DB".to_string(), "shop".to_string()),
+            ]),
+            "postgres-shop",
+        );
         let health = temps_workload_docker::data::healthcheck(&probes).unwrap();
         assert_eq!(
             health.test,
@@ -1321,12 +1301,14 @@ mod tests {
             ])
         );
         assert_eq!(health.retries, Some(3));
-        assert_eq!(health.start_period, Some(30_000_000_000));
+        assert_eq!(health.interval, Some(30_000_000_000));
+        assert_eq!(health.start_interval, Some(2_000_000_000));
+        assert_eq!(health.start_period, Some(120_000_000_000));
         // Without POSTGRES_DB the image's database is the user's.
-        let probes = DatabaseEngine::Postgres.probes(&BTreeMap::from([(
-            "POSTGRES_USER".to_string(),
-            "app".to_string(),
-        )]));
+        let probes = DatabaseEngine::Postgres.probes(
+            &BTreeMap::from([("POSTGRES_USER".to_string(), "app".to_string())]),
+            "postgres-app",
+        );
         let health = temps_workload_docker::data::healthcheck(&probes).unwrap();
         assert_eq!(
             health.test.unwrap()[1],
