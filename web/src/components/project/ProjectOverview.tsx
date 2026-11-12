@@ -20,6 +20,7 @@ import {
   getErrorDashboardStatsQueryKey,
   getHourlyVisitsOptions,
   getHourlyVisitsQueryKey,
+  getLastDeploymentQueryKey,
   getProjectDeploymentsQueryKey,
   getUniqueCountsOptions,
   getUniqueCountsQueryKey,
@@ -236,6 +237,8 @@ export function ProjectOverview({
             // Every query the cards show; only those on screen refetch.
             queryKeys={[
               queryKeyPrefix(getProjectDeploymentsQueryKey),
+              // The latest-deployment card's data comes from the project page.
+              getLastDeploymentQueryKey({ path: { id: project.id } }),
               queryKeyPrefix(hasAnalyticsEventsQueryKey),
               queryKeyPrefix(getUniqueCountsQueryKey),
               queryKeyPrefix(getHourlyVisitsQueryKey),
