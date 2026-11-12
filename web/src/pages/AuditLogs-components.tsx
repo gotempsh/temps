@@ -94,7 +94,6 @@ export function AuditLogs() {
       },
     }),
     enabled: canViewAuditLogs,
-    // Refresh moves the window: keep the entries on screen meanwhile.
   })
 
   const hasMore = data?.length === ITEMS_PER_PAGE

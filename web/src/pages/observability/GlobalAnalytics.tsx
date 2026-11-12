@@ -64,7 +64,6 @@ function Breakdown({
         page: expanded ? view.page : 1,
       },
     }),
-    // Refresh moves the window: keep the numbers on screen meanwhile.
   })
   return (
     <DataSection
@@ -136,17 +135,14 @@ export default function GlobalAnalytics() {
   }
   const summary = useWindowQuery({
     ...getGlobalAnalyticsOptions({ query: { ...common, facet: 'summary' } }),
-    // Refresh moves the window: keep the numbers on screen meanwhile.
   })
   const traffic = useWindowQuery({
     ...getGlobalAnalyticsOptions({ query: { ...common, facet: 'traffic' } }),
-    // Refresh moves the window: keep the numbers on screen meanwhile.
   })
   const pages = useWindowQuery({
     ...getGlobalAnalyticsOptions({
       query: { ...common, facet: 'pages', per_page: 1 },
     }),
-    // Refresh moves the window: keep the numbers on screen meanwhile.
   })
   const totals = summary.data?.rows[0]
   const grid = (children: ReactNode) => (

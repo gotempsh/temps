@@ -303,7 +303,6 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
     }),
     enabled: !!monitorId && !!startDate && !!endDate,
     refetchInterval: 30000, // Refresh every 30 seconds
-    // Refresh moves the window: keep the timeline on screen meanwhile.
   })
   // Calculate uptime stats from status data (filtered by date range)
   const uptimePercentage = currentMonitorStatus?.uptime_percentage ?? null

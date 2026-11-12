@@ -13,7 +13,9 @@ import {
   nextTrafficSort,
   trafficPageCount,
   trafficQueryNeedsCompatibilityRetry,
+  trafficTableQueryKey,
 } from '@/lib/api-traffic-sort'
+import { keepPreviousWindow } from '@/lib/refresh'
 
 describe('API traffic server-side sorting', () => {
   test('toggles an active metric from descending to ascending', () => {
@@ -183,5 +185,47 @@ describe('API traffic summary request gating', () => {
         consentEnabled: true,
       })
     ).toBe(true)
+  })
+})
+
+describe('API traffic tables on Refresh', () => {
+  const table = {
+    projectId: 7,
+    startIso: '2026-01-01T00:00:00.000Z',
+    endIso: '2026-01-02T00:00:00.000Z',
+    environmentId: 3,
+    kind: 'routes' as const,
+    page: 2,
+    sort: { metric: 'requests', direction: 'desc' as const },
+  }
+  const rows = { rows: ['GET /orders'] }
+
+  test('a moved window keeps the current routes on screen', () => {
+    const moved = trafficTableQueryKey({
+      ...table,
+      startIso: '2026-01-01T00:05:00.000Z',
+      endIso: '2026-01-02T00:05:00.000Z',
+    })
+    expect(
+      keepPreviousWindow(moved)(rows, {
+        queryKey: trafficTableQueryKey(table),
+      })
+    ).toBe(rows)
+  })
+
+  test('another page, sort or environment loads from scratch', () => {
+    for (const change of [
+      { page: 3 },
+      { sort: { metric: 'errors', direction: 'desc' as const } },
+      { environmentId: 4 },
+      { kind: 'callers' as const },
+    ]) {
+      expect(
+        keepPreviousWindow(trafficTableQueryKey({ ...table, ...change }))(
+          rows,
+          { queryKey: trafficTableQueryKey(table) }
+        )
+      ).toBeUndefined()
+    }
   })
 })

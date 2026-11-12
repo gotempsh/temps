@@ -81,6 +81,7 @@ import {
 } from '@/lib/ai-summary'
 import {
   nextTrafficSort,
+  trafficTableQueryKey,
   trafficPageCount,
   trafficQueryNeedsCompatibilityRetry,
   type TrafficSort,
@@ -379,21 +380,18 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
       },
     }),
     enabled,
-    // Refresh moves the window: keep the charts and tables on screen.
   })
 
   const routesQuery = useWindowQuery({
-    queryKey: [
-      'api-traffic-query',
-      project.id,
+    queryKey: trafficTableQueryKey({
+      projectId: project.id,
       startIso,
       endIso,
-      selectedEnvironment,
-      'routes',
-      routePage,
-      routeSort.metric,
-      routeSort.direction,
-    ],
+      environmentId: selectedEnvironment,
+      kind: 'routes',
+      page: routePage,
+      sort: routeSort,
+    }),
     queryFn: () =>
       queryTraffic(project.id, {
         start_time: startIso ?? '',
@@ -432,17 +430,15 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
   })
 
   const callersQuery = useWindowQuery({
-    queryKey: [
-      'api-traffic-query',
-      project.id,
+    queryKey: trafficTableQueryKey({
+      projectId: project.id,
       startIso,
       endIso,
-      selectedEnvironment,
-      'callers',
-      callerPage,
-      callerSort.metric,
-      callerSort.direction,
-    ],
+      environmentId: selectedEnvironment,
+      kind: 'callers',
+      page: callerPage,
+      sort: callerSort,
+    }),
     queryFn: () =>
       queryTraffic(project.id, {
         start_time: startIso ?? '',

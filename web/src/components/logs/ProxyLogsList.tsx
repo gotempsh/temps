@@ -201,8 +201,6 @@ export default function ProxyLogsList({
         sort_order: sortOrder,
       },
     }),
-    // A refresh moves the window, so the key changes: keep the current rows
-    // and count on screen until the next ones arrive.
   })
   const { data: logs, isLoading, error } = query
   const totalPages = Math.max(1, Math.ceil((logs?.total ?? 0) / limit))

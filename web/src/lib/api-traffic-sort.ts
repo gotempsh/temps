@@ -46,3 +46,30 @@ export function trafficQueryNeedsCompatibilityRetry(
     JSON.stringify(error)
   )
 }
+
+/**
+ * Query key of one paged, sorted API traffic table (routes or callers). The
+ * window is a named object so Refresh, which moves only the window, keeps the
+ * current rows on screen (`keepPreviousWindow`), while a new page, sort or
+ * environment still loads from scratch.
+ */
+export function trafficTableQueryKey<TMetric extends string>(table: {
+  projectId: number
+  startIso: string | undefined
+  endIso: string | undefined
+  environmentId: number | undefined
+  kind: 'routes' | 'callers'
+  page: number
+  sort: TrafficSort<TMetric>
+}) {
+  return [
+    'api-traffic-query',
+    table.projectId,
+    { start_time: table.startIso, end_time: table.endIso },
+    table.environmentId,
+    table.kind,
+    table.page,
+    table.sort.metric,
+    table.sort.direction,
+  ] as const
+}

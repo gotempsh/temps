@@ -255,7 +255,6 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
         },
       }),
       enabled: hasErrors,
-      // Refresh moves the window: keep the issues on screen meanwhile.
     })
 
   // Fetch error dashboard statistics (only if we have errors)
