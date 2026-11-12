@@ -31,6 +31,7 @@ import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { useKeyboardShortcut } from '@/hooks/useKeyboardShortcut'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useQuery } from '@tanstack/react-query'
+import { Callout } from '@temps-sdk/ds'
 import {
   Cpu,
   Database,
@@ -71,6 +72,7 @@ export function Storage() {
     isLoading,
     error,
     refetch,
+    isFetching,
   } = useQuery({
     ...listServicesOptions(),
   })
@@ -127,7 +129,9 @@ export function Storage() {
       )
     }
 
-    if (error) {
+    // A failed refresh keeps the loaded cards; only a list that never
+    // loaded is replaced by the error.
+    if (error && !services) {
       return (
         <div className="flex flex-col items-center justify-center py-12 text-center">
           <p className="text-sm text-muted-foreground mb-4">
@@ -146,7 +150,20 @@ export function Storage() {
     }
 
     return (
-      <>
+      <div className="space-y-4">
+        {error ? (
+          <Callout tone="error" title="Couldn't refresh services">
+            Showing the last loaded services.{' '}
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => void refetch()}
+              disabled={isFetching}
+            >
+              Retry services
+            </Button>
+          </Callout>
+        ) : null}
         <ServicesCardGrid
           services={services}
           healthMap={healthMap}
@@ -157,7 +174,7 @@ export function Storage() {
           }}
           onDeleteSuccess={() => refetch()}
         />
-      </>
+      </div>
     )
   }
 

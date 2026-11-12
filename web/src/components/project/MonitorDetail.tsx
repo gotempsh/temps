@@ -33,6 +33,7 @@ import {
   PopoverTrigger,
 } from '@/components/ui/popover'
 import { useQuery } from '@tanstack/react-query'
+import { Callout } from '@temps-sdk/ds'
 import {
   Activity,
   AlertCircle,
@@ -260,6 +261,7 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
     isLoading: isLoadingMonitor,
     error: monitorError,
     refetch: refetchMonitor,
+    isFetching: isFetchingMonitor,
   } = useQuery({
     ...getMonitorOptions({
       path: {
@@ -318,7 +320,12 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
     [currentMonitorStatus]
   )
 
-  if (monitorError || currentMonitorStatusError) {
+  // A failed refresh keeps the loaded page (and the path form); only data
+  // that never loaded is replaced by the error.
+  if (
+    (monitorError && !monitor) ||
+    (currentMonitorStatusError && !currentMonitorStatus)
+  ) {
     return (
       <div>
         <ErrorAlert
@@ -376,6 +383,19 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
 
   return (
     <div className="space-y-6">
+      {monitorError ? (
+        <Callout tone="error" title="Couldn't refresh monitor">
+          Showing the last loaded monitor.{' '}
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => void refetchMonitor()}
+            disabled={isFetchingMonitor}
+          >
+            Retry monitor
+          </Button>
+        </Callout>
+      ) : null}
       {/* Header */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-4">

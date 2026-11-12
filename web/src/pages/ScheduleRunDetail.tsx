@@ -59,7 +59,7 @@ import {
   listScheduleRunJobsOptions,
 } from '@/lib/schedule-runs'
 import { formatBytes } from '@/lib/utils'
-import { PageState } from '@temps-sdk/ds'
+import { Callout, PageState } from '@temps-sdk/ds'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import {
@@ -140,6 +140,8 @@ export function ScheduleRunDetail() {
     isPending: isJobsPending,
     isError: isJobsError,
     error: jobsError,
+    refetch: refetchJobs,
+    isFetching: isFetchingJobs,
   } = useQuery({
     ...jobsQueryOptions,
     // Auto-refresh every 5s while any child is still pending/running. The
@@ -400,7 +402,7 @@ export function ScheduleRunDetail() {
                       <Skeleton key={i} className="h-10 w-full" />
                     ))}
                   </div>
-                ) : isJobsError ? (
+                ) : isJobsError && !jobs ? (
                   <div className="px-4 pb-6 text-base text-destructive sm:px-6 sm:text-sm">
                     Failed to load jobs:{' '}
                     {jobsError instanceof Error
@@ -414,6 +416,22 @@ export function ScheduleRunDetail() {
                   </div>
                 ) : (
                   <div className="overflow-x-auto">
+                    {isJobsError ? (
+                      // A failed refresh keeps the loaded jobs.
+                      <div className="px-4 pb-4 sm:px-6">
+                        <Callout tone="error" title="Couldn't refresh jobs">
+                          Showing the last loaded jobs.{' '}
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => void refetchJobs()}
+                            disabled={isFetchingJobs}
+                          >
+                            Retry jobs
+                          </Button>
+                        </Callout>
+                      </div>
+                    ) : null}
                     <Table className="min-w-[560px]">
                       <TableHeader>
                         <TableRow>

@@ -265,6 +265,7 @@ export function ServiceDetail() {
     isLoading,
     error: queryError,
     refetch,
+    isFetching: isFetchingService,
   } = useQuery({
     ...getServiceOptions({
       path: { id: parseInt(id!) },
@@ -692,7 +693,9 @@ export function ServiceDetail() {
     )
   }
 
-  if (queryError || !service) {
+  // A failed refresh keeps the loaded page (and its open dialogs); only a
+  // service that never loaded is replaced by the error.
+  if (!service) {
     return (
       <PageState
         variant="failed"
@@ -1035,6 +1038,19 @@ export function ServiceDetail() {
         main={
           <>
             {error ? <Callout tone="error">{error}</Callout> : null}
+            {queryError ? (
+              <Callout tone="error" title="Couldn't refresh service">
+                Showing the last loaded service.{' '}
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => void refetch()}
+                  disabled={isFetchingService}
+                >
+                  Retry service
+                </Button>
+              </Callout>
+            ) : null}
 
             <ActiveRestoreBanner serviceId={service.service.id} />
 
