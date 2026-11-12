@@ -254,19 +254,6 @@ impl ResolvedDatabaseUrl {
         })
     }
 
-    /// The installed server's data directory, when this URL is the one that
-    /// server connects with. A command that reads the encryption key must
-    /// use the server's data directory with the server's database: with any
-    /// other, it would find no key (or create a new one) and fail to decrypt
-    /// what the server wrote.
-    pub(crate) fn service_data_dir(&self) -> Option<&Path> {
-        self.serving_service()?
-            .data_dir
-            .as_ref()
-            .ok()
-            .map(|(dir, _)| dir.as_path())
-    }
-
     /// A one-line notice for stderr when the URL was not given to this
     /// command but read from the installed service, so it never connects to
     /// a database silently.
@@ -802,8 +789,8 @@ mod tests {
             }
         );
         assert_eq!(
-            resolved.service_data_dir(),
-            Some(dir.path().join(".temps/data").as_path())
+            crate::server_secrets::service_data_dir(&resolved).unwrap(),
+            Some(dir.path().join(".temps/data"))
         );
         let notice = resolved.discovery_notice().unwrap();
         assert!(notice.contains("temps.service"), "{notice}");
@@ -934,7 +921,10 @@ mod tests {
         )
         .unwrap();
         assert!(resolved.service().is_none());
-        assert_eq!(resolved.service_data_dir(), None);
+        assert_eq!(
+            crate::server_secrets::service_data_dir(&resolved).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -949,8 +939,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            same.service_data_dir(),
-            Some(dir.path().join(".temps/data").as_path())
+            crate::server_secrets::service_data_dir(&same).unwrap(),
+            Some(dir.path().join(".temps/data"))
         );
         let other = resolve(
             Some(&url("staging-db")),
@@ -959,7 +949,10 @@ mod tests {
             &locations,
         )
         .unwrap();
-        assert_eq!(other.service_data_dir(), None);
+        assert_eq!(
+            crate::server_secrets::service_data_dir(&other).unwrap(),
+            None
+        );
     }
 
     #[test]

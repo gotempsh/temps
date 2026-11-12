@@ -69,8 +69,9 @@ pub struct MigrateCommand {
     /// Data directory of the installation (same as `temps serve`). With
     /// `--pre-migration-backup` the backup is written to
     /// `<data dir>/backups/pre-migration/`. Defaults to the installed
-    /// server's data directory when the database URL is read from its
-    /// service definition, else `~/.temps`.
+    /// server's data directory when the database is that server's, else
+    /// `~/.temps`. When it is (or may be) the server's but that directory
+    /// cannot be read, a backup is refused rather than written to `~/.temps`.
     #[arg(long, env = "TEMPS_DATA_DIR")]
     pub data_dir: Option<std::path::PathBuf>,
 
@@ -125,6 +126,10 @@ struct MigrateTarget {
     database: crate::database_url_source::ResolvedDatabaseUrl,
     /// `--data-dir`, else the installed server's; `None` means `~/.temps`.
     data_dir: Option<std::path::PathBuf>,
+    /// Why the installed server's data directory is unknown, when this is
+    /// (or may be) its database: a backup in `~/.temps` would land away
+    /// from the server's data, where nobody looks for it.
+    server_data_dir_unknown: Option<String>,
 }
 
 enum MaintenanceRace<T> {
@@ -274,20 +279,32 @@ impl MigrateCommand {
             crate::database_url_source::UrlDiscovery::InstalledService,
             locations,
         )?;
-        let data_dir = self.data_dir.clone().or_else(|| {
-            database
-                .service_data_dir()
-                .map(std::path::Path::to_path_buf)
-        });
-        Ok(MigrateTarget { database, data_dir })
+        let (service_dir, server_data_dir_unknown) =
+            match crate::server_secrets::service_data_dir(&database) {
+                Ok(dir) => (dir, None),
+                Err(error) => (None, Some(error.to_string())),
+            };
+        Ok(MigrateTarget {
+            data_dir: self.data_dir.clone().or(service_dir),
+            database,
+            server_data_dir_unknown,
+        })
     }
 
     pub fn execute(self) -> anyhow::Result<()> {
         let MigrateTarget {
             database,
             data_dir: configured_data_dir,
+            server_data_dir_unknown,
         } = self.target(&crate::service_definition::ServiceLocations::installed())?;
         database.announce_discovery();
+        // Before connecting, so a backup that cannot go with the server's data
+        // fails with nothing changed.
+        check_backup_destination(
+            configured_data_dir.as_deref(),
+            server_data_dir_unknown.as_deref(),
+            self.pre_migration_backup,
+        )?;
         let database_url = database.into_url();
 
         // Local runtime — keep execute() synchronous (pingora compatibility).
@@ -561,6 +578,23 @@ struct BackupCompletedLine {
     path: String,
     size_bytes: u64,
     elapsed_ms: u64,
+}
+
+/// Refuse a pre-migration backup into `~/.temps` for the installed server's
+/// database when its data directory is unknown. Without a backup the data
+/// directory only names leftovers to clean up, so the default is harmless.
+fn check_backup_destination(
+    configured: Option<&std::path::Path>,
+    server_data_dir_unknown: Option<&str>,
+    backup: bool,
+) -> anyhow::Result<()> {
+    match (configured, server_data_dir_unknown, backup) {
+        (None, Some(reason), true) => Err(anyhow::anyhow!(
+            "Not taking the pre-migration backup: it would be written to this user's \
+             ~/.temps, away from the server's data. {reason}. Nothing was changed"
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// `--data-dir`/`TEMPS_DATA_DIR` (or the installed server's data directory,
@@ -1302,6 +1336,51 @@ mod tests {
             .target(&locations)
             .expect("explicit url");
         assert_eq!(target.data_dir, None);
+    }
+
+    #[test]
+    fn a_backup_never_goes_to_home_when_the_servers_data_dir_is_unknown() {
+        let home = tempfile::tempdir().unwrap();
+        let unit = home.path().join("temps.service");
+        // No --data-dir and an account without a home: serve's data
+        // directory cannot be told.
+        crate::service_definition::test_support::write_trusted(
+            &unit,
+            "[Service]\nUser=temps-test-no-such-user\n\
+             ExecStart=/usr/bin/temps serve --database-url=postgresql://temps:pw@127.0.0.1:5432/temps\n",
+        )
+        .unwrap();
+        let locations = crate::service_definition::ServiceLocations {
+            systemd_unit: Some(unit),
+            launchd_agent: None,
+        };
+        let target = parse_isolated(&[])
+            .target(&locations)
+            .expect("found in the unit");
+        assert_eq!(target.data_dir, None);
+        let reason = target
+            .server_data_dir_unknown
+            .expect("the reason it is unknown");
+        assert!(reason.contains("--data-dir"), "{reason}");
+
+        let error = super::check_backup_destination(None, Some(&reason), true).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("Not taking the pre-migration backup")
+                && message.contains("--data-dir"),
+            "{message}"
+        );
+        // Without a backup, or with --data-dir, nothing is in the way.
+        assert!(super::check_backup_destination(None, Some(&reason), false).is_ok());
+        let explicit = std::path::Path::new("/srv/temps-data");
+        assert!(super::check_backup_destination(Some(explicit), Some(&reason), true).is_ok());
+
+        // With the service's data dir known, there is no reason to refuse.
+        let locations = installer_unit(home.path());
+        let target = parse_isolated(&[])
+            .target(&locations)
+            .expect("found in the unit");
+        assert!(target.server_data_dir_unknown.is_none());
     }
 
     #[test]
