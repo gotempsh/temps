@@ -154,10 +154,12 @@ it the way the server does (the service's `TEMPS_ENCRYPTION_KEY` /
 If this shell sets any of `TEMPS_STATELESS`, `TEMPS_AUTH_SECRET`,
 `TEMPS_AUTH_SECRET_FILE`, `TEMPS_ENCRYPTION_KEY` or `TEMPS_ENCRYPTION_KEY_FILE`,
 the shell's settings replace all of the service's secret settings (to test an
-injected secret), and the command and `temps doctor` say so. When the service's
-own URL cannot be read (for example a root-only `EnvironmentFile=` read without
-sudo), these commands cannot tell whether the database is the server's, so they
-ask for `--data-dir` and never create a key.
+injected secret). These commands print to stderr which key they used and from
+which environment, and `temps doctor` reports the same. When the service's own
+URL cannot be read (for example a root-only `EnvironmentFile=` read without
+sudo), they cannot tell whether the database is the server's, so they create no
+key and use only one set in this shell: run them with sudo, or set
+`TEMPS_ENCRYPTION_KEY` / `TEMPS_ENCRYPTION_KEY_FILE` and pass `--data-dir`.
 `temps serve`, `temps proxy`, `temps setup` and `temps backup restore` never
 fall back: they use only their own configuration. When no source supplies a
 URL, the error lists every place that was checked.

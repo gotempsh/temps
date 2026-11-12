@@ -1879,7 +1879,9 @@ async fn execute_import(cmd: ImportCertificateCommand) -> anyhow::Result<()> {
             None => get_data_dir(&None)?,
         },
     };
-    let encryption_key = crate::server_secrets::encryption_key(&data_dir, &database)?;
+    let key = crate::server_secrets::encryption_key(&data_dir, &database)?;
+    key.announce();
+    let encryption_key = key.into_value();
     let encryption_service = EncryptionService::new(&encryption_key)
         .map_err(|e| anyhow::anyhow!("Failed to create encryption service: {}", e))?;
 

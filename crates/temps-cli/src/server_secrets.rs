@@ -15,8 +15,8 @@
 //! it.
 //!
 //! If this shell sets any of the secret variables, its settings replace the
-//! service's (the operator is testing an injected secret), and every message
-//! says so.
+//! service's (the operator is testing an injected secret). The command
+//! prints which key it used, and from which environment, every time.
 
 use std::path::{Path, PathBuf};
 
@@ -132,10 +132,13 @@ pub(crate) enum ServerSecretsError {
     #[error(
         "The installed service {} was found, but the database URL it gives the server could \
          not be read ({reason}), so this command cannot tell whether it uses the server's \
-         database, or which data directory holds the server's encryption key. Run it as a user \
-         that can read the service's files (usually with sudo), or pass --data-dir with the \
-         server's data directory",
-        definition.display()
+         database, nor which encryption key to use. Run it as a user that can read the \
+         service's files (usually with sudo). Or set {} or {} in this shell to the key of the \
+         installation the database belongs to, and pass --data-dir with that installation's \
+         data directory",
+        definition.display(),
+        temps_config::ENCRYPTION_KEY_ENV,
+        temps_config::ENCRYPTION_KEY_FILE_ENV
     )]
     ServerUnknown { definition: PathBuf, reason: String },
     #[error(
@@ -223,14 +226,50 @@ pub(crate) fn service_data_dir(
     }
 }
 
+/// An encryption key, and for the installed server's where it was read from.
+pub(crate) struct ServerKey {
+    value: String,
+    notice: Option<String>,
+}
+
+impl std::fmt::Debug for ServerKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ServerKey")
+            .field("notice", &self.notice)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ServerKey {
+    /// Which key was used and from which environment, never the key.
+    pub(crate) fn notice(&self) -> Option<&str> {
+        self.notice.as_deref()
+    }
+
+    /// Print [`Self::notice`] to stderr, so the key a command encrypts with
+    /// is never chosen silently, and scripted stdout is unchanged.
+    pub(crate) fn announce(&self) {
+        if let Some(notice) = self.notice() {
+            eprintln!("{notice}");
+        }
+    }
+
+    pub(crate) fn into_value(self) -> String {
+        self.value
+    }
+}
+
 /// The encryption key the server uses with `data_dir`. With the installed
-/// server's database, or one that may be it, it is read as that server
-/// reads it and never created; otherwise it is resolved as `temps serve`
-/// would on this host, creating a missing one.
+/// server's database it is read as that server reads it and never created.
+/// With one that may be the server's (its URL could not be read) only a key
+/// this shell sets is used, since which key is right cannot be told.
+/// Otherwise it is resolved as `temps serve` would on this host, creating a
+/// missing one.
 pub(crate) fn encryption_key(
     data_dir: &Path,
     database: &ResolvedDatabaseUrl,
-) -> Result<String, ServerSecretsError> {
+) -> Result<ServerKey, ServerSecretsError> {
     encryption_key_in(data_dir, database, shell_secret_variables())
 }
 
@@ -238,17 +277,31 @@ fn encryption_key_in(
     data_dir: &Path,
     database: &ResolvedDatabaseUrl,
     shell_variables: Vec<&'static str>,
-) -> Result<String, ServerSecretsError> {
+) -> Result<ServerKey, ServerSecretsError> {
     match installed_server(database) {
-        InstalledServer::Serving(service) | InstalledServer::Unknown { service, .. } => {
-            service_encryption_key(
-                data_dir,
-                service,
-                SecretsEnvironment::choose_with(Some(service), shell_variables),
-            )
+        InstalledServer::Serving(service) => service_encryption_key(
+            data_dir,
+            service,
+            SecretsEnvironment::choose_with(Some(service), shell_variables),
+        ),
+        InstalledServer::Unknown { service, reason } => {
+            match SecretsEnvironment::choose_with(Some(service), shell_variables) {
+                environment @ SecretsEnvironment::Shell(_) => {
+                    service_encryption_key(data_dir, service, environment)
+                }
+                SecretsEnvironment::Service(_)
+                | SecretsEnvironment::Unknown { .. }
+                | SecretsEnvironment::Empty => Err(ServerSecretsError::ServerUnknown {
+                    definition: service.path.clone(),
+                    reason: reason.to_string(),
+                }),
+            }
         }
         InstalledServer::Other => temps_config::resolve_installation_secrets(data_dir)
-            .map(|secrets| secrets.encryption_key)
+            .map(|secrets| ServerKey {
+                value: secrets.encryption_key,
+                notice: None,
+            })
             .map_err(|source| ServerSecretsError::Secrets {
                 data_dir: data_dir.to_path_buf(),
                 environment: "as `temps serve` would read it on this host".to_string(),
@@ -257,11 +310,21 @@ fn encryption_key_in(
     }
 }
 
+fn describe_key_source(source: &temps_config::SecretSource) -> String {
+    match source {
+        temps_config::SecretSource::Environment { variable } => variable.to_string(),
+        temps_config::SecretSource::InjectedFile { variable, path } => {
+            format!("{} (named by {variable})", path.display())
+        }
+        temps_config::SecretSource::DataDir { path } => path.display().to_string(),
+    }
+}
+
 fn service_encryption_key(
     data_dir: &Path,
     service: &ServiceDefinition,
     environment: SecretsEnvironment<'_>,
-) -> Result<String, ServerSecretsError> {
+) -> Result<ServerKey, ServerSecretsError> {
     if let SecretsEnvironment::Unknown { reason, .. } = &environment {
         return Err(ServerSecretsError::EnvironmentUnknown {
             definition: service.path.clone(),
@@ -271,7 +334,14 @@ fn service_encryption_key(
     let inspection =
         temps_config::inspect_installation_secrets_with(data_dir, |name| environment.get(name));
     match inspection.encryption_key {
-        Ok(temps_config::InspectedSecret::Found { value, .. }) => Ok(value),
+        Ok(temps_config::InspectedSecret::Found { value, source }) => Ok(ServerKey {
+            value,
+            notice: Some(format!(
+                "Using the encryption key {} ({}).",
+                describe_key_source(&source),
+                environment.describe()
+            )),
+        }),
         Ok(temps_config::InspectedSecret::NotCreatedYet { path }) => {
             Err(ServerSecretsError::KeyNotCreated {
                 definition: service.path.clone(),
@@ -385,7 +455,8 @@ mod tests {
                 service,
                 SecretsEnvironment::of_service(Some(service))
             )
-            .unwrap(),
+            .unwrap()
+            .into_value(),
             KEY
         );
     }
@@ -415,7 +486,8 @@ mod tests {
                 service,
                 SecretsEnvironment::of_service(Some(service))
             )
-            .unwrap(),
+            .unwrap()
+            .into_value(),
             KEY
         );
     }
@@ -448,18 +520,121 @@ mod tests {
             matches!(error, ServerSecretsError::ServerUnknown { .. }),
             "{error}"
         );
-        assert!(error.to_string().contains("--data-dir"), "{error}");
+        // The remedies it names are the ones that work here.
+        let message = error.to_string();
+        assert!(
+            message.contains("sudo")
+                && message.contains(temps_config::ENCRYPTION_KEY_ENV)
+                && message.contains("--data-dir"),
+            "{message}"
+        );
 
+        // --data-dir alone does not tell which key is the server's: no key
+        // is created, and none found there is used.
         let data = root.path().join("explicit-data");
         std::fs::create_dir_all(&data).unwrap();
         let error = encryption_key_in(&data, &database, Vec::new()).unwrap_err();
         assert!(
-            matches!(error, ServerSecretsError::EnvironmentUnknown { .. }),
+            matches!(error, ServerSecretsError::ServerUnknown { .. }),
             "{error}"
         );
         assert!(
             !data.join(temps_config::ENCRYPTION_KEY_FILE).exists(),
             "a key was created"
+        );
+        write(&data.join(temps_config::ENCRYPTION_KEY_FILE), KEY);
+        assert!(encryption_key_in(&data, &database, Vec::new()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_services_injected_key_is_not_used_for_a_database_that_may_be_another() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        // The service's URL is in a file this user cannot read; the key it
+        // injects is readable.
+        let url_file = root.path().join("database-url");
+        write(&url_file, &format!("{URL}\n"));
+        std::fs::set_permissions(&url_file, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&url_file).is_ok() {
+            // Running as root: every file is readable.
+            return;
+        }
+        let service_key = root.path().join("service-key");
+        write(&service_key, KEY);
+        let unit = root.path().join("temps.service");
+        write(
+            &unit,
+            &format!(
+                "[Service]\nEnvironment=TEMPS_DATABASE_URL_FILE={} {}={}\n\
+                 ExecStart=/usr/bin/temps serve\n",
+                url_file.display(),
+                temps_config::ENCRYPTION_KEY_FILE_ENV,
+                service_key.display()
+            ),
+        );
+        // Another installation, named explicitly with its own data dir.
+        let database = resolve(&unit, Some("postgresql://other-install/temps"));
+        let other = root.path().join("other");
+        write(&other.join(temps_config::ENCRYPTION_KEY_FILE), "other-key");
+        let error = encryption_key_in(&other, &database, Vec::new()).unwrap_err();
+        assert!(
+            matches!(error, ServerSecretsError::ServerUnknown { .. }),
+            "{error}"
+        );
+        assert!(!error.to_string().contains(KEY), "{error}");
+    }
+
+    #[test]
+    fn the_key_used_is_announced_without_its_value() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("data");
+        let key_file = root.path().join("injected-key");
+        write(&key_file, KEY);
+        let unit = root.path().join("temps.service");
+        write(
+            &unit,
+            &format!(
+                "[Service]\nEnvironment={}={}\n\
+                 ExecStart=/usr/bin/temps serve --database-url={URL} --data-dir={}\n",
+                temps_config::ENCRYPTION_KEY_FILE_ENV,
+                key_file.display(),
+                data.display()
+            ),
+        );
+        let database = resolve(&unit, None);
+        let service = database.serving_service().unwrap();
+        let key = service_encryption_key(
+            &data,
+            service,
+            SecretsEnvironment::of_service(Some(service)),
+        )
+        .unwrap();
+        let notice = key.notice().unwrap();
+        assert!(
+            notice.contains(&key_file.display().to_string())
+                && notice.contains(temps_config::ENCRYPTION_KEY_FILE_ENV)
+                && notice.contains("temps.service"),
+            "{notice}"
+        );
+        assert!(!notice.contains(KEY), "{notice}");
+        assert!(!format!("{key:?}").contains(KEY));
+
+        // A shell override is named in the notice of a key that was found.
+        write(&data.join(temps_config::ENCRYPTION_KEY_FILE), KEY);
+        let key = service_encryption_key(
+            &data,
+            service,
+            SecretsEnvironment::choose_with(Some(service), vec![temps_config::AUTH_SECRET_ENV]),
+        )
+        .unwrap();
+        let notice = key.notice().unwrap();
+        assert!(
+            notice.contains(&format!(
+                "this shell sets {}",
+                temps_config::AUTH_SECRET_ENV
+            )) && notice.contains("secret settings were not"),
+            "{notice}"
         );
     }
 

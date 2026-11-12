@@ -287,7 +287,9 @@ async fn execute_setup_multi_node(cmd: SetupMultiNodeCommand) -> anyhow::Result<
             .ok_or_else(|| anyhow::anyhow!("could not determine the Temps data directory"))?,
     };
 
-    let encryption_key = crate::server_secrets::encryption_key(&data_dir, &database)?;
+    let key = crate::server_secrets::encryption_key(&data_dir, &database)?;
+    key.announce();
+    let encryption_key = key.into_value();
     let db = temps_schema::establish_connection(database.url())
         .await
         .map_err(|error| anyhow::anyhow!("could not connect to the Temps database: {error}"))?;

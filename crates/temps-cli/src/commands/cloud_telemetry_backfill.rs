@@ -168,9 +168,6 @@ async fn run_async(args: CloudTelemetryBackfillArgs) -> anyhow::Result<()> {
             None => resolve_data_dir(None)?,
         },
     };
-    // Before anything is written (migrations, the checkpoint), so a missing
-    // key fails with nothing changed.
-    let key = crate::server_secrets::encryption_key(&data_dir, &database)?;
     let database_url = database.url();
 
     let bootstrap_stateless = temps_config::bootstrap_stateless_requested()?;
@@ -200,6 +197,12 @@ async fn run_async(args: CloudTelemetryBackfillArgs) -> anyhow::Result<()> {
         ));
     }
     let stateless = persisted_mode.is_stateless();
+    // After the mode checks, which only read, so a run they reject creates
+    // no secret files; before migrations, so a missing key fails with
+    // nothing changed.
+    let key = crate::server_secrets::encryption_key(&data_dir, &database)?;
+    key.announce();
+    let key = key.into_value();
     if !stateless {
         temps_schema::ensure_no_unprotected_upgrade(db.as_ref()).await?;
         temps_schema::run_migrations(db.as_ref()).await?;

@@ -2495,6 +2495,36 @@ mod tests {
     }
 
     #[test]
+    fn doctor_says_when_this_shells_secrets_replace_the_services() {
+        let home = tempfile::tempdir().unwrap();
+        let (service, data_dir) = installer_layout(home.path());
+        let doctor = DoctorCommand {
+            database_url: None,
+            data_dir: None,
+            scope: None,
+        };
+        let mut report = DiagnosticReport::new();
+        doctor.check_data_dir(
+            &data_dir,
+            "test",
+            Some(&service),
+            SecretsEnvironment::choose_with(Some(&service), vec![temps_config::AUTH_SECRET_ENV]),
+            &mut report,
+        );
+        let source = report
+            .checks
+            .iter()
+            .find(|(label, _)| label == "Secrets source");
+        assert!(
+            matches!(source, Some((_, CheckResult::Info(message)))
+                if message.contains(&format!("this shell sets {}", temps_config::AUTH_SECRET_ENV))
+                    && message.contains("secret settings were not")),
+            "{:?}",
+            report.checks
+        );
+    }
+
+    #[test]
     fn the_auth_secret_passes_on_the_layout_serve_uses() {
         let home = tempfile::tempdir().unwrap();
         let (service, _) = installer_layout(home.path());
