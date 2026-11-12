@@ -23,6 +23,7 @@ import {
 } from '@/components/ui/tooltip'
 import { problemDetail } from '@/lib/api-problem'
 import { formatUpdatedAgo } from '@/lib/refresh'
+import { isExpectedQueryFailure } from '@/lib/route-query-failures'
 import { cn } from '@/lib/utils'
 
 export interface RefreshButtonProps {
@@ -78,12 +79,23 @@ export function RefreshButton({
 
   const refresh = useMutation({
     mutationFn: async () => {
+      const startedAt = Date.now()
       // `cancelRefetch: false` joins a fetch already in flight (a poll, or the
       // moved window's first load) instead of throwing it away.
       await queryClient.invalidateQueries(
         { predicate: matches, refetchType: 'active' },
-        { throwOnError: true, cancelRefetch: false }
+        { cancelRefetch: false }
       )
+      // A read the page works without (a role refused optional context) is
+      // not a failed refresh; anything else that failed just now is.
+      const [failed] = queryClient.getQueryCache().findAll({
+        predicate: (query) =>
+          matches(query) &&
+          query.state.status === 'error' &&
+          query.state.errorUpdatedAt >= startedAt &&
+          !isExpectedQueryFailure(query),
+      })
+      if (failed) throw failed.state.error
       return Date.now()
     },
     onSuccess: (at) => setRefreshedAt(at),

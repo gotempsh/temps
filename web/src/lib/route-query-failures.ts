@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import type { QueryClient } from '@tanstack/react-query'
+import type { Query, QueryClient } from '@tanstack/react-query'
 import { httpStatusOf } from './http-error-status'
 import { isForbiddenRead, isRoleRefusal } from './read-failure'
 
@@ -76,6 +76,19 @@ export const ROUTE_FAILURE_IGNORE = 'ignore'
  */
 export const ROUTE_FAILURE_IGNORE_REFUSAL = 'ignore-refusal'
 
+/**
+ * Whether a failed read is one its query says the page works without: any
+ * failure of an `'ignore'` query, or a 403 of an `'ignore-refusal'` one.
+ */
+export function isExpectedQueryFailure(query: Query): boolean {
+  const routeFailure = query.meta?.routeFailure
+  return (
+    routeFailure === ROUTE_FAILURE_IGNORE ||
+    (routeFailure === ROUTE_FAILURE_IGNORE_REFUSAL &&
+      isRoleRefusal(query.state.error))
+  )
+}
+
 export interface RouteQueryFailure {
   queryHash: string
   error: unknown
@@ -100,11 +113,7 @@ export function collectRouteQueryFailures(
         query.state.data === undefined &&
         !query.isDisabled() &&
         query.getObserversCount() > 0 &&
-        query.meta?.routeFailure !== ROUTE_FAILURE_IGNORE &&
-        !(
-          query.meta?.routeFailure === ROUTE_FAILURE_IGNORE_REFUSAL &&
-          isRoleRefusal(query.state.error)
-        ) &&
+        !isExpectedQueryFailure(query) &&
         isReportableReadFailure(query.state.error) &&
         !isHandled(query.state.error),
     })

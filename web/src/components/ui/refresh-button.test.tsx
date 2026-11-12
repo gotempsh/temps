@@ -19,6 +19,7 @@ import {
 import { useState, type ReactNode } from 'react'
 import { toast } from 'sonner'
 import { installBrowserWindow } from '@/test/dom'
+import { ROUTE_FAILURE_IGNORE_REFUSAL } from '@/lib/route-query-failures'
 import { RefreshButton } from './refresh-button'
 
 installBrowserWindow()
@@ -160,6 +161,67 @@ describe('RefreshButton', () => {
       })
     )
     expect(screen.getByText('first rows')).toBeTruthy()
+    expect(screen.queryByText(/Updated/)).toBeNull()
+  })
+
+  test('a refusal the page expects is not a failed refresh', async () => {
+    const failure = spyOn(toast, 'error').mockImplementation(() => 'id')
+    function Page() {
+      const rows = useQuery({ queryKey: ['rows'], queryFn: () => 'rows' })
+      // Optional context this role may not read, as on the Domains page.
+      useQuery({
+        queryKey: ['tunnels'],
+        queryFn: async () => {
+          throw { status: 403, title: 'Forbidden', detail: 'Missing settings' }
+        },
+        meta: { routeFailure: ROUTE_FAILURE_IGNORE_REFUSAL },
+      })
+      return (
+        <>
+          <RefreshButton queryKeys={[['rows'], ['tunnels']]} />
+          <p>{rows.data}</p>
+        </>
+      )
+    }
+    renderWithClient(<Page />)
+    await screen.findByText('rows')
+
+    fireEvent.click(refreshButton())
+
+    await screen.findByText('Updated just now')
+    expect(failure).not.toHaveBeenCalled()
+  })
+
+  test('any other failure of a refusal-tolerant query still fails the refresh', async () => {
+    const failure = spyOn(toast, 'error').mockImplementation(() => 'id')
+    let calls = 0
+    function Page() {
+      const tunnels = useQuery({
+        queryKey: ['tunnels'],
+        queryFn: async () => {
+          if (++calls > 1)
+            throw { status: 500, title: 'Internal', detail: 'Store is down' }
+          return 'tunnels'
+        },
+        meta: { routeFailure: ROUTE_FAILURE_IGNORE_REFUSAL },
+      })
+      return (
+        <>
+          <RefreshButton queryKeys={[['tunnels']]} />
+          <p>{tunnels.data}</p>
+        </>
+      )
+    }
+    renderWithClient(<Page />)
+    await screen.findByText('tunnels')
+
+    fireEvent.click(refreshButton())
+
+    await waitFor(() =>
+      expect(failure).toHaveBeenCalledWith("Couldn't refresh", {
+        description: 'Store is down',
+      })
+    )
     expect(screen.queryByText(/Updated/)).toBeNull()
   })
 
