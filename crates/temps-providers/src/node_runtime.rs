@@ -11,8 +11,18 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bollard::Docker;
 use temps_service_protocol::{
-    AdmittedWorkload, AfterCreate, ContainerSnapshot, HealthProbeResult, NodeAttachment,
-    NodeServiceError, NodeServiceRuntime, ServiceConfig, ServiceType,
+    AdmittedWorkload, AfterCreate, ContainerSnapshot, HealthProbeResult,
+    MariadbBinlogArchiveRequest, MariadbBinlogArchiveResult, MariadbDumpBackupRequest,
+    MariadbDumpBackupResult, MariadbPhysicalBackupRequest, MariadbPhysicalBackupResult,
+    MariadbRestoreRequest, MariadbRestoreResult, MongodbBackupRequest, MongodbBackupResult,
+    MongodbRestoreRequest, MongodbRestoreResult, NodeAttachment, NodeServiceError,
+    NodeServiceRuntime, PostgresWalgArchiveRequest, PostgresWalgArchiveResult,
+    PostgresWalgBackupRequest, PostgresWalgBackupResult, PostgresWalgCredentialsRequest,
+    PostgresWalgCredentialsResult, PostgresWalgRestoreRequest, PostgresWalgRestoreResult,
+    RecreateHook, RedisRdbBackupRequest, RedisRdbBackupResult, RedisRestoreRequest,
+    RedisRestoreResult, RedisWalgBackupRequest, RedisWalgBackupResult, RemoteServiceBackupRequest,
+    RemoteServiceBackupResponse, RemoteServiceRestoreRequest, RemoteServiceRestoreResponse,
+    RemoteWalHealthResponse, ServiceConfig, ServiceType, TargetWriteBoundary,
 };
 
 use crate::externalsvc;
@@ -65,6 +75,7 @@ impl NodeServiceRuntime for ProvidersNodeRuntime {
         project_slug: &str,
         environment_slug: &str,
         docker: Arc<Docker>,
+        published_address: Option<IpAddr>,
     ) -> Result<HashMap<String, String>, NodeServiceError> {
         externalsvc::provision_runtime_environment(
             name,
@@ -73,6 +84,30 @@ impl NodeServiceRuntime for ProvidersNodeRuntime {
             project_slug,
             environment_slug,
             docker,
+            published_address,
+        )
+        .await
+        .map_err(engine_error)
+    }
+
+    async fn preview_runtime_environment(
+        &self,
+        name: String,
+        service_type: ServiceType,
+        config: ServiceConfig,
+        project_slug: &str,
+        environment_slug: &str,
+        docker: Arc<Docker>,
+        published_address: Option<IpAddr>,
+    ) -> Result<HashMap<String, String>, NodeServiceError> {
+        externalsvc::preview_runtime_environment(
+            name,
+            service_type,
+            config,
+            project_slug,
+            environment_slug,
+            docker,
+            published_address,
         )
         .await
         .map_err(engine_error)
@@ -108,6 +143,226 @@ impl NodeServiceRuntime for ProvidersNodeRuntime {
         externalsvc::probe_service_health(config, docker, published_address)
             .await
             .map_err(engine_error)
+    }
+
+    async fn probe_postgres_wal(
+        &self,
+        config: ServiceConfig,
+        docker: Arc<Docker>,
+        published_address: Option<IpAddr>,
+    ) -> Result<RemoteWalHealthResponse, NodeServiceError> {
+        externalsvc::probe_postgres_wal_health(config, docker, published_address)
+            .await
+            .map_err(engine_error)
+    }
+
+    async fn backup_service(
+        &self,
+        request: RemoteServiceBackupRequest,
+        docker: Arc<Docker>,
+        published_address: Option<IpAddr>,
+    ) -> Result<RemoteServiceBackupResponse, NodeServiceError> {
+        externalsvc::worker_data::backup_service_on_node(request, docker, published_address)
+            .await
+            .map_err(engine_error)
+    }
+
+    async fn restore_service(
+        &self,
+        request: RemoteServiceRestoreRequest,
+        docker: Arc<Docker>,
+        published_address: Option<IpAddr>,
+    ) -> Result<RemoteServiceRestoreResponse, NodeServiceError> {
+        externalsvc::worker_data::restore_service_on_node(request, docker, published_address)
+            .await
+            .map_err(engine_error)
+    }
+
+    async fn postgres_walg_backup(
+        &self,
+        request: PostgresWalgBackupRequest,
+        docker: Arc<Docker>,
+        node: NodeAttachment,
+        after_create: RecreateHook,
+        published_address: Option<IpAddr>,
+    ) -> Result<PostgresWalgBackupResult, NodeServiceError> {
+        let recreate = externalsvc::postgres::NodeRecreate {
+            service_id: request.service_id,
+            node_id: request.node_id,
+            attachment: node,
+            after_create,
+        };
+        Ok(externalsvc::postgres_walg_backup::walg_base_backup_on_node(
+            request,
+            docker,
+            recreate,
+            published_address,
+        )
+        .await)
+    }
+
+    async fn postgres_walg_archive(
+        &self,
+        request: PostgresWalgArchiveRequest,
+        docker: Arc<Docker>,
+        node: NodeAttachment,
+        after_create: RecreateHook,
+        published_address: Option<IpAddr>,
+    ) -> Result<PostgresWalgArchiveResult, NodeServiceError> {
+        let recreate = externalsvc::postgres::NodeRecreate {
+            service_id: request.service_id,
+            node_id: request.node_id,
+            attachment: node,
+            after_create,
+        };
+        Ok(externalsvc::postgres_walg_backup::walg_archive_on_node(
+            request,
+            docker,
+            recreate,
+            published_address,
+        )
+        .await)
+    }
+
+    async fn postgres_walg_credentials(
+        &self,
+        request: PostgresWalgCredentialsRequest,
+        docker: Arc<Docker>,
+        published_address: Option<IpAddr>,
+    ) -> Result<PostgresWalgCredentialsResult, NodeServiceError> {
+        Ok(externalsvc::postgres_walg_backup::walg_credentials_on_node(
+            request,
+            docker,
+            published_address,
+        )
+        .await)
+    }
+
+    async fn postgres_walg_restore(
+        &self,
+        request: PostgresWalgRestoreRequest,
+        docker: Arc<Docker>,
+        node: NodeAttachment,
+        after_create: RecreateHook,
+        published_address: Option<IpAddr>,
+        writes: Arc<TargetWriteBoundary>,
+    ) -> Result<PostgresWalgRestoreResult, NodeServiceError> {
+        let recreate = externalsvc::postgres::NodeRecreate {
+            service_id: request.service_id,
+            node_id: request.node_id,
+            attachment: node,
+            after_create,
+        };
+        Ok(externalsvc::postgres_walg_restore::walg_restore_on_node(
+            request,
+            docker,
+            recreate,
+            published_address,
+            writes,
+        )
+        .await)
+    }
+
+    async fn mongodb_backup(
+        &self,
+        request: MongodbBackupRequest,
+        docker: Arc<Docker>,
+        published_address: Option<IpAddr>,
+    ) -> Result<MongodbBackupResult, NodeServiceError> {
+        Ok(
+            externalsvc::mongodb_backup::mongodb_backup_on_node(request, docker, published_address)
+                .await,
+        )
+    }
+
+    async fn mongodb_restore(
+        &self,
+        request: MongodbRestoreRequest,
+        docker: Arc<Docker>,
+        published_address: Option<IpAddr>,
+        writes: Arc<TargetWriteBoundary>,
+    ) -> Result<MongodbRestoreResult, NodeServiceError> {
+        Ok(externalsvc::mongodb_backup::mongodb_restore_on_node(
+            request,
+            docker,
+            published_address,
+            writes,
+        )
+        .await)
+    }
+
+    async fn redis_walg_backup(
+        &self,
+        request: RedisWalgBackupRequest,
+        docker: Arc<Docker>,
+    ) -> Result<RedisWalgBackupResult, NodeServiceError> {
+        Ok(externalsvc::redis_node::walg_backup_on_node(request, docker).await)
+    }
+
+    async fn redis_rdb_backup(
+        &self,
+        request: RedisRdbBackupRequest,
+        docker: Arc<Docker>,
+    ) -> Result<RedisRdbBackupResult, NodeServiceError> {
+        Ok(externalsvc::redis_node::rdb_backup_on_node(request, docker).await)
+    }
+
+    async fn redis_restore(
+        &self,
+        request: RedisRestoreRequest,
+        docker: Arc<Docker>,
+        writes: Arc<TargetWriteBoundary>,
+    ) -> Result<RedisRestoreResult, NodeServiceError> {
+        Ok(externalsvc::redis_node::restore_on_node(request, docker, writes).await)
+    }
+
+    async fn mariadb_physical_backup(
+        &self,
+        request: MariadbPhysicalBackupRequest,
+        docker: Arc<Docker>,
+        published_address: Option<IpAddr>,
+    ) -> Result<MariadbPhysicalBackupResult, NodeServiceError> {
+        Ok(
+            externalsvc::mariadb_node::physical_backup_on_node(request, docker, published_address)
+                .await,
+        )
+    }
+
+    async fn mariadb_dump_backup(
+        &self,
+        request: MariadbDumpBackupRequest,
+        docker: Arc<Docker>,
+        published_address: Option<IpAddr>,
+    ) -> Result<MariadbDumpBackupResult, NodeServiceError> {
+        Ok(
+            externalsvc::mariadb_node::dump_backup_on_node(request, docker, published_address)
+                .await,
+        )
+    }
+
+    async fn mariadb_restore(
+        &self,
+        request: MariadbRestoreRequest,
+        docker: Arc<Docker>,
+        published_address: Option<IpAddr>,
+        writes: Arc<TargetWriteBoundary>,
+    ) -> Result<MariadbRestoreResult, NodeServiceError> {
+        Ok(
+            externalsvc::mariadb_node::restore_on_node(request, docker, published_address, writes)
+                .await,
+        )
+    }
+
+    async fn mariadb_binlog_archive(
+        &self,
+        request: MariadbBinlogArchiveRequest,
+        docker: Arc<Docker>,
+        published_address: Option<IpAddr>,
+    ) -> Result<MariadbBinlogArchiveResult, NodeServiceError> {
+        Ok(
+            externalsvc::mariadb_node::binlog_archive_on_node(request, docker, published_address)
+                .await,
+        )
     }
 }
 

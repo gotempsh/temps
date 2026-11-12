@@ -148,6 +148,9 @@ pub struct Model {
     /// (`network_config.docker_network_name`), ADR 059. Set when the node
     /// joined on a host that already had a network of the cluster's name.
     pub overlay_network_name: Option<String>,
+    /// The VXLAN network ID this node's agent reports it follows (ADR 062).
+    /// `None`: never reported, an agent older than per-cluster network IDs.
+    pub overlay_vxlan_vni: Option<i32>,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
 }
@@ -370,6 +373,7 @@ mod tests {
             overlay_ready_cidr: None,
             overlay_remediation: None,
             overlay_network_name: None,
+            overlay_vxlan_vni: None,
             created_at: now,
             updated_at: now,
         }

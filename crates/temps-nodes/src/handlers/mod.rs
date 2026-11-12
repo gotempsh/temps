@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 pub mod audit;
+pub mod cluster_dns;
 pub mod cluster_network;
 pub mod compose_placement;
 pub mod network;

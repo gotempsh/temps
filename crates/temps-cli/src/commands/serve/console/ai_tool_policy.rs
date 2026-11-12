@@ -60,6 +60,13 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
         &["put_plugin_ai_tools"],
     ),
     (
+        "decides which projects may call another project's internal addresses (ADR 101), a network boundary between projects; the owner of the project being called sets it in the console, and revoking one cuts off a caller that depends on it",
+        &[
+            "create_internal_access_grant",
+            "delete_internal_access_grant",
+        ],
+    ),
+    (
         "revokes every visitor's gate session for an address; a security action the user takes themselves, behind step-up",
         &["sign_everyone_out_of_address"],
     ),
@@ -153,6 +160,9 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
     (
         "cluster topology and node enrollment; operator only",
         &[
+            // Moves every node's overlay to a new VXLAN network ID, pausing
+            // cross-node traffic until each has rebuilt; behind step-up.
+            "ClusterNetworkIdChange",
             "ClusterNetworkUpdate",
             "NodePairingCancel",
             "NodePairingCreate",
@@ -695,7 +705,6 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "get_or_create_dsn",
             "get_provider_key",
             "get_resolved_environment_variable_value",
-            "get_s3_credentials",
             "get_service_environment_variable",
             "get_settings",
             "issue_runtime_credentials",

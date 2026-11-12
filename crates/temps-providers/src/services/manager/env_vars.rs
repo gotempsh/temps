@@ -185,18 +185,16 @@ impl ExternalServiceManager {
             return Ok(cluster_vars);
         }
 
-        let service_instance = self.create_service_instance_for_parameters(
-            service.name.clone(),
-            service_type,
-            &parameters,
-        )?;
+        // Pure computation from the parameters: no Docker daemon, so this
+        // works on a control-plane-profile server and for a worker's service.
+        let metadata =
+            self.service_metadata(service_id_val, &service.name, service_type, &parameters)?;
 
         // Convert parameters to strings for the service
         let params_str = Self::params_to_strings(&parameters);
 
-        // Get connection info from the service instance
-        service_instance
-            .get_environment_variables(&params_str)
+        metadata
+            .environment_variables(&params_str)
             .map_err(|error| {
                 ExternalServiceError::from_engine(service_id_val, error, |e| {
                     ExternalServiceError::InternalError {
@@ -482,17 +480,14 @@ impl ExternalServiceManager {
             return Ok(cluster_vars);
         }
 
-        let service_instance = self.create_service_instance_for_parameters(
-            service.name.clone(),
-            service_type,
-            &parameters,
-        )?;
+        let metadata =
+            self.service_metadata(service_id_val, &service.name, service_type, &parameters)?;
 
         // Convert parameters to strings for the service
         let params_str = Self::params_to_strings(&parameters);
 
-        service_instance
-            .get_docker_environment_variables(&params_str)
+        metadata
+            .docker_environment_variables(&params_str)
             .map_err(|error| {
                 ExternalServiceError::from_engine(service_id_val, error, |e| {
                     ExternalServiceError::InternalError {
@@ -534,16 +529,13 @@ impl ExternalServiceManager {
             });
         }
 
-        let service_instance = self.create_service_instance_for_parameters(
-            service.name.clone(),
-            service_type,
-            &parameters,
-        )?;
+        let metadata =
+            self.service_metadata(service_id_val, &service.name, service_type, &parameters)?;
         // Convert parameters to strings for the service
         let params_str = Self::params_to_strings(&parameters);
 
-        let env_vars = service_instance
-            .get_environment_variables(&params_str)
+        let env_vars = metadata
+            .environment_variables(&params_str)
             .map_err(|error| {
                 ExternalServiceError::from_engine(service_id_val, error, |e| {
                     ExternalServiceError::InternalError {
@@ -717,11 +709,6 @@ impl ExternalServiceManager {
             return Ok(cluster_vars);
         }
 
-        let service_instance = self.create_service_instance_for_parameters(
-            service.name.clone(),
-            service_type,
-            &parameters,
-        )?;
         let service_config = ServiceConfig {
             name: service.name.clone(),
             service_type,
@@ -733,6 +720,32 @@ impl ExternalServiceManager {
             })?,
         };
 
+        // A service on a worker is previewed by its node's agent, as it is
+        // provisioned there (`get_runtime_env_vars`): this server never
+        // builds an engine, let alone a container, for it.
+        if let ServiceExecutionRoute::Remote(node_id) = service_execution_route(service.node_id) {
+            let client = self.get_remote_client(node_id).await?;
+            return client
+                .preview_runtime_env_vars(crate::remote_service_client::RemoteRuntimeEnvRequest {
+                    service_config,
+                    project_slug: project_scope,
+                    environment_slug: environment_scope,
+                })
+                .await
+                .map(|response| response.environment)
+                .map_err(|error| ExternalServiceError::InternalError {
+                    reason: format!(
+                        "Failed to preview the runtime environment of service {} on node {}: {}",
+                        service_id_val, node_id, error
+                    ),
+                });
+        }
+
+        let service_instance = self.create_service_instance_for_parameters(
+            service.name.clone(),
+            service_type,
+            &parameters,
+        )?;
         service_instance
             .init(service_config.clone())
             .await
@@ -792,11 +805,9 @@ impl ExternalServiceManager {
 
         let parameters = self.get_service_parameters(service_id).await?;
         let params_str = Self::params_to_strings(&parameters);
-        let service_instance = self.create_service_instance_for_parameters(
-            service.name.clone(),
-            service_type,
-            &parameters,
-        )?;
+        // Naming and connection variables only: no Docker daemon needed.
+        let metadata =
+            self.service_metadata(service_id, &service.name, service_type, &parameters)?;
 
         let mut all_vars = HashMap::new();
 
@@ -810,8 +821,8 @@ impl ExternalServiceManager {
 
         // Get basic environment variables (standalone only)
         if !is_cluster && !options.include_runtime {
-            let basic_vars = service_instance
-                .get_environment_variables(&params_str)
+            let basic_vars = metadata
+                .environment_variables(&params_str)
                 .map_err(|error| {
                     ExternalServiceError::from_engine(service.id, error, |e| {
                         ExternalServiceError::InternalError {
@@ -842,109 +853,32 @@ impl ExternalServiceManager {
                     });
                 }
 
-                let docker_vars = service_instance
-                    .get_docker_environment_variables(&params_str)
-                    .map_err(|error| {
-                        ExternalServiceError::from_engine(service.id, error, |e| {
-                            ExternalServiceError::InternalError {
-                                reason: format!(
-                                    "Failed to get docker environment variables: {}",
-                                    e
-                                ),
-                            }
-                        })
-                    })?;
+                let docker_vars =
+                    metadata
+                        .docker_environment_variables(&params_str)
+                        .map_err(|error| {
+                            ExternalServiceError::from_engine(service.id, error, |e| {
+                                ExternalServiceError::InternalError {
+                                    reason: format!(
+                                        "Failed to get docker environment variables: {}",
+                                        e
+                                    ),
+                                }
+                            })
+                        })?;
                 all_vars.extend(docker_vars);
             }
         }
 
-        // Get runtime variables if requested (standalone only — clusters already populated above)
+        // Get runtime variables if requested (standalone only — clusters already populated above).
+        // `get_runtime_env_vars` checks the link and the environment, and
+        // provisions on the node that owns the service: through its agent for
+        // a service on a worker, against this host's Docker otherwise.
         if !is_cluster && options.include_runtime {
             if let (Some(proj_id), Some(env_id)) = (project_id, environment_id) {
-                // Verify service is linked to project
-                let link = project_services::Entity::find()
-                    .filter(
-                        project_services::Column::ServiceId
-                            .eq(service_id)
-                            .and(project_services::Column::ProjectId.eq(proj_id)),
-                    )
-                    .one(self.db.as_ref())
+                let runtime_vars = self
+                    .get_runtime_env_vars(service_id, proj_id, env_id)
                     .await?;
-
-                let link = link.ok_or(ExternalServiceError::ServiceNotLinkedToProject {
-                    service_id,
-                    project_id: proj_id,
-                })?;
-
-                let service_config = ServiceConfig {
-                    name: service.name.clone(),
-                    service_type,
-                    version: service.version,
-                    parameters: serde_json::to_value(&parameters).map_err(|e| {
-                        ExternalServiceError::InternalError {
-                            reason: format!("Failed to serialize parameters: {}", e),
-                        }
-                    })?,
-                };
-
-                // Initialize the service to populate its internal config
-                service_instance
-                    .init(service_config.clone())
-                    .await
-                    .map_err(|error| {
-                        ExternalServiceError::from_engine(service.id, error, |e| {
-                            ExternalServiceError::InternalError {
-                                reason: format!("Failed to initialize service: {}", e),
-                            }
-                        })
-                    })?;
-
-                // Get project and environment slugs
-                let project = projects::Entity::find_by_id(proj_id)
-                    .one(self.db.as_ref())
-                    .await?
-                    .ok_or(ExternalServiceError::ProjectNotFound { id: proj_id })?;
-
-                let environment = temps_entities::environments::Entity::find_by_id(env_id)
-                    .filter(temps_entities::environments::Column::ProjectId.eq(proj_id))
-                    .filter(temps_entities::environments::Column::DeletedAt.is_null())
-                    .one(self.db.as_ref())
-                    .await?
-                    .ok_or(ExternalServiceError::EnvironmentNotFound {
-                        environment_id: env_id,
-                        project_id: proj_id,
-                    })?;
-                let provisioning = DatabaseProvisioningConfig::from_link(&link)?;
-                let (project_scope, environment_scope) = provisioning.runtime_scope(
-                    &project.slug,
-                    &environment.slug,
-                    service_id,
-                    proj_id,
-                )?;
-
-                self.ensure_s3_scope_unambiguous(
-                    service_id,
-                    &service.service_type,
-                    &parameters,
-                    proj_id,
-                    &project_scope,
-                    &environment_scope,
-                )
-                .await?;
-                let runtime_vars = service_instance
-                    .get_runtime_env_vars(service_config, &project_scope, &environment_scope)
-                    .await
-                    .map_err(|error| {
-                        ExternalServiceError::from_engine(service.id, error, |e| {
-                            ExternalServiceError::InternalError {
-                                reason: format!(
-                                    "Failed to get runtime environment variables: {}",
-                                    e
-                                ),
-                            }
-                        })
-                    })?;
-
                 all_vars.extend(runtime_vars);
             }
         }
@@ -995,17 +929,14 @@ impl ExternalServiceManager {
             return Ok(cluster_vars.keys().cloned().collect());
         }
 
-        let service_instance = self.create_service_instance_for_parameters(
-            service.name.clone(),
-            service_type,
-            &parameters,
-        )?;
+        let metadata =
+            self.service_metadata(service_id_val, &service.name, service_type, &parameters)?;
 
         // Convert parameters to strings for the service
         let params_str = Self::params_to_strings(&parameters);
 
-        let env_vars = service_instance
-            .get_environment_variables(&params_str)
+        let env_vars = metadata
+            .environment_variables(&params_str)
             .map_err(|error| {
                 ExternalServiceError::from_engine(service_id_val, error, |e| {
                     ExternalServiceError::InternalError {
@@ -1014,7 +945,16 @@ impl ExternalServiceManager {
                 })
             })?;
 
-        Ok(env_vars.keys().cloned().collect())
+        // What a linked app also gets per environment (a storage service's
+        // `S3_BUCKET`, a database's per-environment name): listed so the
+        // preview names every variable an app receives.
+        let mut names: Vec<String> = env_vars
+            .into_keys()
+            .chain(metadata.runtime_variable_names())
+            .collect();
+        names.sort();
+        names.dedup();
+        Ok(names)
     }
 
     /// Get environment variables with masked sensitive values
@@ -1032,26 +972,24 @@ impl ExternalServiceManager {
         let parameters = self.get_service_parameters(service_id_val).await?;
 
         // Cluster services: use multi-host env vars from service_members
-        let env_vars =
-            if let Some(cluster_vars) = self.build_cluster_env_vars(&service, &parameters).await? {
-                cluster_vars
-            } else {
-                let service_instance = self.create_service_instance_for_parameters(
-                    service.name.clone(),
-                    service_type,
-                    &parameters,
-                )?;
-                let params_str = Self::params_to_strings(&parameters);
-                service_instance
-                    .get_environment_variables(&params_str)
-                    .map_err(|error| {
-                        ExternalServiceError::from_engine(service_id_val, error, |e| {
-                            ExternalServiceError::InternalError {
-                                reason: format!("Failed to get environment variables: {}", e),
-                            }
-                        })
-                    })?
-            };
+        let env_vars = if let Some(cluster_vars) =
+            self.build_cluster_env_vars(&service, &parameters).await?
+        {
+            cluster_vars
+        } else {
+            let metadata =
+                self.service_metadata(service_id_val, &service.name, service_type, &parameters)?;
+            let params_str = Self::params_to_strings(&parameters);
+            metadata
+                .environment_variables(&params_str)
+                .map_err(|error| {
+                    ExternalServiceError::from_engine(service_id_val, error, |e| {
+                        ExternalServiceError::InternalError {
+                            reason: format!("Failed to get environment variables: {}", e),
+                        }
+                    })
+                })?
+        };
 
         // Bulk previews never return plaintext. A value can contain embedded
         // credentials even when its variable name looks operational.
@@ -1439,6 +1377,70 @@ mod tests {
     #[tokio::test]
     async fn service_preview_rejects_soft_deleted_environment() {
         assert_preview_rejects_unavailable_environment(21).await;
+    }
+
+    /// The per-environment preview of a database on a worker node, asked of
+    /// a server with no Docker. It used to build a local engine (failing
+    /// here with "Docker unavailable", and on a server with Docker letting
+    /// the engine create a container on the wrong host); the worker service
+    /// was then left out of the preview. It goes to its node's agent now:
+    /// this node has only a plain http:// address, so the request is refused
+    /// by the agent client (credentials are only sent sealed), naming the
+    /// node, and no engine is ever built here.
+    #[tokio::test]
+    async fn a_worker_service_is_previewed_by_its_agent_never_a_local_engine() {
+        let encryption =
+            temps_core::EncryptionService::new_from_password("service-parameter-reveal-test");
+        let mut node = nodes_test_model(3);
+        node.address = "http://127.0.0.1:9".to_string();
+        node.token_encrypted = Some(encryption.encrypt_string("node-token").unwrap());
+        let mut service = encrypted_service_model(
+            11,
+            serde_json::json!({
+                "host": "localhost",
+                "port": "5561",
+                "username": "app",
+                "password": "s3cret",
+                "database": "orders",
+            }),
+        );
+        service.node_id = Some(3);
+        let link = project_services::Model {
+            id: 9,
+            project_id: 10,
+            service_id: 11,
+            database_provisioning_mode: "project_environment".to_string(),
+            custom_database_name: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([vec![service.clone()], vec![service]])
+                .append_query_results([vec![node]])
+                .into_connection(),
+        );
+        let manager = control_plane_manager_with_db(db);
+        assert!(
+            manager.require_docker().is_err(),
+            "no Docker on this server"
+        );
+
+        let error = manager
+            .preview_service_environment_variables(11, &link, "shop", "production")
+            .await
+            .expect_err("a plain-http node is never sent the service's credentials");
+
+        assert!(
+            !matches!(error, ExternalServiceError::DockerUnavailable { .. }),
+            "a local engine was built: {error}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("Failed to preview the runtime environment of service 11 on node 3"),
+            "{message}"
+        );
+        assert!(message.contains("plain http://"), "{message}");
     }
 
     #[tokio::test]

@@ -28,6 +28,8 @@ import { useIsInstanceAdmin } from '@/hooks/useIsInstanceAdmin'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { Badge } from '@/components/ui/badge'
+import { FixErrorWithAgentButton } from '@/components/ai/FixErrorWithAgentButton'
+import { offersFixInList } from '@/components/ai/fix-error-with-agent'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader } from '@/components/ui/card'
 import {
@@ -77,6 +79,7 @@ import { Link, useNavigate, useSearchParams } from 'react-router'
 import { toast } from 'sonner'
 import { TimeAgo } from '../utils/TimeAgo'
 import { errorGroupSortQuery, EVENT_COUNT_SORT } from './error-group-sort'
+import { errorRowText } from './error-row-text'
 
 interface ErrorTrackingProps {
   project: ProjectResponse
@@ -425,8 +428,7 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
 
   const renderErrorRow = (group: ErrorGroupRow, idx: number) => {
     const isSettled = group.status === 'resolved' || group.status === 'ignored'
-    const messageDiffers =
-      group.message_template && group.message_template !== group.title
+    const text = errorRowText(group)
     const onClick = () => handleErrorGroupClick(group.id.toString())
 
     const envName =
@@ -479,11 +481,11 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
             <Badge
               variant="outline"
               className={cn(
-                'text-[10px] font-medium uppercase tracking-wide px-1.5 py-0',
+                'font-mono text-[10px] font-medium px-1.5 py-0',
                 getSeverityColor(group.error_type || 'error')
               )}
             >
-              {group.error_type || 'error'}
+              {text.type}
             </Badge>
             {envName && (
               <Badge
@@ -493,8 +495,14 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
                 {envName}
               </Badge>
             )}
-            <p className="font-medium text-sm leading-snug truncate">
-              {group.title}
+            {/* Basis 0 keeps the message on the badges' line, truncated, so
+                every row is the same height; it only wraps below when the
+                row is too narrow to give it 12rem. */}
+            <p
+              className="min-w-[12rem] flex-1 basis-0 font-medium text-sm leading-snug truncate"
+              title={group.title}
+            >
+              {text.headline}
             </p>
             {group.status === 'resolved' && (
               <span className="flex items-center gap-1 text-xs text-green-700 dark:text-green-500 shrink-0">
@@ -507,9 +515,9 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
               </span>
             )}
           </div>
-          {messageDiffers && (
+          {text.detail && (
             <p className="mt-1 text-xs text-muted-foreground truncate">
-              {group.message_template}
+              {text.detail}
             </p>
           )}
           <div className="mt-1 flex items-center gap-3 text-xs text-muted-foreground">
@@ -567,6 +575,23 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
             </span>
           )}
         </div>
+
+        {offersFixInList(group.status) && (
+          <FixErrorWithAgentButton
+            className="shrink-0"
+            error={{
+              id: group.id,
+              title: group.title,
+              error_type: group.error_type,
+              environment_name: envName,
+              project: {
+                id: project.id,
+                slug: project.slug,
+                name: project.name,
+              },
+            }}
+          />
+        )}
 
         <DropdownMenu>
           <DropdownMenuTrigger asChild>

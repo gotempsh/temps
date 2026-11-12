@@ -350,6 +350,40 @@ impl AuditOperation for ExternalServiceWorkloadModeChangedAudit {
     }
 }
 
+/// A service's server TLS mode changed (ADR 093). Records both modes; the
+/// certificate and its key are never part of the payload.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExternalServiceTlsModeChangedAudit {
+    pub context: AuditContext,
+    pub service_id: i32,
+    pub name: String,
+    pub service_type: String,
+    pub previous_mode: temps_providers_core::externalsvc::server_tls::ServerTlsMode,
+    pub new_mode: temps_providers_core::externalsvc::server_tls::ServerTlsMode,
+}
+
+impl AuditOperation for ExternalServiceTlsModeChangedAudit {
+    fn operation_type(&self) -> String {
+        "EXTERNAL_SERVICE_TLS_MODE_CHANGED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
+    }
+}
+
 /// An administrator confirmed, and Temps performed, the recreate of an
 /// `enforce`-mode database's container from its workload spec.
 #[derive(Debug, Clone, Serialize)]

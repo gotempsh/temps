@@ -374,7 +374,12 @@ pub struct PostgresParameterStrategy;
 
 impl ParameterStrategy for PostgresParameterStrategy {
     fn validate_for_creation(&self, params: &HashMap<String, JsonValue>) -> Result<(), String> {
-        reject_internal_only_keys(params, &["container_name"])?;
+        // `server_tls_*` are injected by the control plane from the TLS record
+        // (ADR 093) and never stored with the parameters.
+        reject_internal_only_keys(
+            params,
+            &["container_name", "server_tls_mode", "server_tls_material"],
+        )?;
         reject_non_loopback_host(params)?;
         if !params.contains_key("database") || is_empty_value(params.get("database")) {
             return Err("'database' is required for PostgreSQL".to_string());
@@ -510,11 +515,10 @@ impl ParameterStrategy for MariaDbParameterStrategy {
         reject_internal_only_keys(params, &["container_name"])?;
         reject_non_loopback_host(params)?;
         // Absent/empty is fine here -- `auto_generate_missing` (which runs
-        // after this) fills it with `MARIADB_DEFAULT_IMAGE`, same as every
-        // other optional field on this strategy. Only a caller-supplied
-        // image is held to the immutable-digest bar: our own default is a
-        // known-safe, logical-backup-only image we control, not something
-        // that needs pinning against drift.
+        // after this) fills it with `MARIADB_DEFAULT_IMAGE`, the pinned
+        // managed WAL-G image, same as every other optional field on this
+        // strategy. A caller-supplied image, including that default sent
+        // back from the schema, is held to the immutable-digest bar.
         if let Some(image) = params
             .get("docker_image")
             .and_then(JsonValue::as_str)
@@ -674,7 +678,7 @@ impl ParameterStrategy for MariaDbParameterStrategy {
                 },
                 "docker_image": {
                     "type": "string",
-                    "description": "MariaDB image (updateable). Defaults to a plain upstream tag; set an immutable repository@sha256:<64-hex-digest> reference to enable continuous archiving (mariadb_physical backups).",
+                    "description": "MariaDB image (updateable), an immutable repository@sha256:<64-hex-digest> reference. Defaults to the managed MariaDB 11.4 image with WAL-G, which supports logical and physical backups and continuous archiving.",
                     "default": MARIADB_DEFAULT_IMAGE
                 },
                 "size_profile": {
@@ -1692,6 +1696,25 @@ mod tests {
         assert!(strategy.updateable_keys().contains(&"ssl_mode"));
     }
 
+    /// ADR 093: the TLS mode and certificate are injected by the control
+    /// plane; a client can neither create nor update them as parameters, so
+    /// they can never land in the stored parameter blob.
+    #[test]
+    fn test_postgres_rejects_client_supplied_server_tls_parameters() {
+        let strategy = PostgresParameterStrategy;
+        for key in ["server_tls_mode", "server_tls_material"] {
+            let params = HashMap::from([
+                ("database".to_string(), JsonValue::String("app".into())),
+                ("username".to_string(), JsonValue::String("app".into())),
+                (key.to_string(), JsonValue::String("available".into())),
+            ]);
+            let err = strategy.validate_for_creation(&params).unwrap_err();
+            assert!(err.contains(key), "{err}");
+            let updates = HashMap::from([(key.to_string(), JsonValue::String("off".into()))]);
+            assert!(strategy.validate_for_update(&updates).is_err());
+        }
+    }
+
     #[test]
     fn test_postgres_rejects_readonly_update() {
         let strategy = PostgresParameterStrategy;
@@ -1800,7 +1823,7 @@ mod tests {
 
     #[test]
     fn test_mariadb_missing_image_defaults_instead_of_failing() {
-        // A caller who names no image at all gets the safe, mutable
+        // A caller who names no image at all gets the pinned
         // MARIADB_DEFAULT_IMAGE from auto_generate_missing -- creation must
         // not require every caller to already know about WAL-G pinning.
         let strategy = MariaDbParameterStrategy;
@@ -1815,6 +1838,23 @@ mod tests {
             params.get("docker_image"),
             Some(&JsonValue::String(MARIADB_DEFAULT_IMAGE.to_string()))
         );
+    }
+
+    /// A client that fills in the schema's advertised default and sends it
+    /// back, as the console and CLI do, is accepted: the default is pinned.
+    #[test]
+    fn test_mariadb_accepts_the_advertised_default_image() {
+        let strategy = MariaDbParameterStrategy;
+        let schema = strategy.get_schema().expect("a MariaDB schema");
+        let advertised = schema["properties"]["docker_image"]["default"]
+            .as_str()
+            .expect("an advertised default image")
+            .to_string();
+        assert_eq!(advertised, MARIADB_DEFAULT_IMAGE);
+        let params = HashMap::from([("docker_image".to_string(), JsonValue::String(advertised))]);
+        strategy
+            .validate_for_creation(&params)
+            .expect("the advertised default must be accepted");
     }
 
     #[test]

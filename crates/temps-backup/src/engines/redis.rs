@@ -2,68 +2,66 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! `RedisEngine`: direct-to-S3 WAL-G stream backups for managed Redis
-//! images, with a logical `redis-cli --rdb` fallback for arbitrary OSS images.
+//! images, with a `redis-cli --rdb` snapshot for images without WAL-G,
+//! wherever the service runs (ADR-099).
 //!
 //! ## Flow
 //!
-//! 1. Load the external-service row, decrypt its config to find the auth
-//!    password (if any), and validate the S3 source.
-//! 2. When the service image contains WAL-G, execute `wal-g backup-push`
-//!    inside Redis. WAL-G streams `redis-cli --rdb -` directly to S3 without
-//!    a database-sized host file. This is the Cloud-verifiable path.
-//! 3. Otherwise run a one-shot `redis:7-alpine` sidecar over the user-defined bridge
-//!    network. The sidecar issues `redis-cli -h redis-<name> --rdb
-//!    /tmp/temps-backup/<attempt>/dump.rdb` into its own filesystem, then
-//!    `gzip`s it. Temps streams the `.rdb.gz` out through the Docker archive
-//!    API into an attempt-scoped host directory (see `dump_capture`); no host
-//!    path is bind-mounted, so Docker in a VM or on a remote host works.
-//! 4. Upload the gzipped `.rdb.gz` to S3.
-//! 5. Write the `metadata.json` companion.
+//! 1. Load the external-service row and validate the S3 source.
+//! 2. Check for WAL-G in the service's container: on this host's Docker, or,
+//!    for a Redis on a worker, the same check through the node's agent.
+//! 3. With WAL-G, `wal-g backup-push` runs in the container, streaming
+//!    `redis-cli --rdb -` to S3 with no database-sized file. This is the
+//!    Cloud-verifiable path. Then the repository's size is listed, the
+//!    `metadata.json` companion written and the WAL-G identity recorded.
+//! 4. Without WAL-G, a pinned `redis-cli` helper takes an RDB snapshot over
+//!    the service network and its gzipped output is streamed into one
+//!    object, a part at a time. Then the object is tagged and the companion
+//!    written. Usable in OSS, not eligible for managed Cloud restore
+//!    verification.
 //!
-//! ## Notes
+//! The container steps (3's push, 4's helper) are the node half,
+//! `temps_providers::externalsvc::redis_node`: run here with this host's
+//! Docker, or on the worker by its agent. Everything else, the engine
+//! choice included, is this plane half, the same for both. Redis is never
+//! stopped by a backup.
 //!
-//! - `redis-cli --rdb` triggers a `SYNC` and streams the RDB snapshot
-//!   over the wire. This works against any Redis ≥ 2.8 and does not
-//!   require WAL-G to be installed on the target.
-//! - The logical fallback remains usable in OSS but cannot provide the exact
-//!   immutable WAL-G identity required by managed Cloud restore verification.
+//! A worker never receives the S3 source's own credential (ADR-102): the
+//! plane makes the engine choice, so it scopes the credential it sends to
+//! that backup alone, the service's WAL-G repository for a stream, or the
+//! one directory of the RDB snapshot's key, which the plane chose.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use sea_orm::{DatabaseConnection, EntityTrait};
 use serde_json::{json, Value};
+use temps_providers::externalsvc::redis_node::{
+    self, RedisNodeError, RedisRdbBackup, RedisWalgBackup, RDB_DUMP_FILE,
+};
+use temps_providers::remote_service_client::{
+    RedisRdbBackupResult, RedisWalgBackupResult, WorkerS3Destination,
+};
 use tracing::{info, warn};
 
-use super::dispatch::{container_has_walg, service_container_name};
-use super::dump_capture::{capture_dump, CaptureRequest, DumpAttempt, DumpCaptureError};
-use super::oneshot::OneShotSpec;
-use super::postgres_walg::run_walg_exec;
+use super::dispatch::{container_has_walg, service_container_name, WorkerToolProbe};
 use super::v2_common;
+use super::workload_job::worker_node;
 use crate::execution::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
 
 pub(crate) const ENGINE_KEY: &str = "redis";
-const DUMP_FILE_SUFFIX: &str = "dump.rdb.gz";
-/// Database name used in user-facing dump errors.
-const REDIS_TOOL: &str = "Redis";
-/// Uncompressed and gzipped dump names inside the sidecar's attempt dir.
-const SIDECAR_DUMP_RDB: &str = "dump.rdb";
-const SIDECAR_DUMP_GZ: &str = "dump.rdb.gz";
-const REDIS_SIDECAR_IMAGE: &str =
-    "redis:7.4.10-alpine@sha256:e7723ff73d963f5cc6d9c4643ea3d989527a402a319239054e9472a7fb9219a2";
-// `redis-cli --rdb -` negotiates Redis diskless replication and writes the
-// valid RDB followed by Redis's 40-byte hexadecimal EOF marker. The standalone
-// `redis-check-rdb` command accepts that trailing marker, but Redis rejects the
-// same bytes when the snapshot is used as an AOF base file during restore.
-// `head -c -40` keeps only a 40-byte tail buffer, so this remains a true stream
-// from Redis to WAL-G without creating a database-sized local file.
-const WALG_STREAM_CREATE_COMMAND: &str = "bash -c 'error=$(mktemp); redis-cli --rdb - 2>$error | head -c -40; statuses=(\"${PIPESTATUS[@]}\"); code=${statuses[0]}; if [ ${statuses[1]} -ne 0 ]; then code=${statuses[1]}; fi; cat $error >&2; if [ $code -ne 0 ] && grep -q \"Fail to fsync.*Invalid argument\" $error; then code=0; fi; rm -f $error; exit $code'";
-const WALG_STREAM_RESTORE_COMMAND: &str = "cat > /data/dump.rdb";
 
 pub struct RedisDeps {
     pub db: Arc<DatabaseConnection>,
     pub encryption_service: Arc<temps_core::EncryptionService>,
-    pub docker: bollard::Docker,
+    /// This host's Docker, for a Redis on this host. `None` on a server
+    /// without one (`--profile control-plane`), which backs up only Redis
+    /// services on worker nodes.
+    pub docker: Option<bollard::Docker>,
+    /// Reaches a worker Redis's node through its agent.
+    pub manager: Arc<temps_providers::ExternalServiceManager>,
+    /// Derives a worker backup's S3 credential (ADR-102).
+    pub worker_credentials: Arc<temps_providers::worker_s3_scope::WorkerCredentialScoper>,
 }
 
 pub struct RedisEngine {
@@ -76,6 +74,14 @@ impl RedisEngine {
             deps: Arc::new(deps),
         }
     }
+}
+
+/// Where the node half of a backup runs.
+enum Node {
+    /// This host, with its Docker.
+    Here(bollard::Docker),
+    /// Worker `node_id`, by its agent.
+    Worker(i32),
 }
 
 #[async_trait]
@@ -110,28 +116,41 @@ impl BackupEngine for RedisEngine {
         .await?;
         v2_common::assert_bucket_reachable(&s3_client, &s3_source.bucket_name).await?;
 
-        let config_json = deps
-            .encryption_service
-            .decrypt_string(service.config.as_deref().unwrap_or("{}"))
-            .unwrap_or_else(|_| "{}".to_string());
-        let cfg: Value = serde_json::from_str(&config_json).unwrap_or_else(|_| json!({}));
-        let password = cfg
-            .get("password")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-
         let backup_uuid = v2_common::load_backup_uuid(deps.db.as_ref(), backup_id).await?;
         let target_container = service_container_name(&service);
-        if container_has_walg(&deps.docker, &target_container).await {
+        let node = match worker_node(&service) {
+            Some(node_id) => Node::Worker(node_id),
+            None => match deps.docker.clone() {
+                Some(docker) => Node::Here(docker),
+                None => {
+                    return Err(BackupError::PermanentFailure {
+                        reason: format!(
+                            "Redis service {} ('{}') runs on this server, which has no Docker \
+                             daemon to back it up with",
+                            service.id, service.name
+                        ),
+                    })
+                }
+            },
+        };
+        let has_walg = match &node {
+            Node::Here(docker) => container_has_walg(docker, &target_container).await,
+            Node::Worker(node_id) => {
+                deps.manager
+                    .worker_has_walg(*node_id, &target_container)
+                    .await
+            }
+        };
+
+        if has_walg {
             return run_walg_backup(
                 &deps,
                 ctx,
+                &node,
                 &service,
                 &s3_source,
                 &s3_client,
                 &target_container,
-                &password,
                 &backup_uuid,
             )
             .await;
@@ -147,71 +166,71 @@ impl BackupEngine for RedisEngine {
             "redis",
             &service.name,
             &backup_uuid,
-            DUMP_FILE_SUFFIX,
+            RDB_DUMP_FILE,
         );
-
-        // ── One-shot redis-cli --rdb fallback container ──────────────────────
-        //
-        // The sidecar writes into its own filesystem and the dump is streamed
-        // out through the Docker archive API, so this works when Docker runs
-        // in a VM or on another host whose filesystem does not include the
-        // Temps host's temp dir (see `dump_capture`). Every name is scoped to
-        // this attempt, so a retry never trips over a previous attempt's
-        // container or files.
-        let attempt = DumpAttempt::new(REDIS_TOOL, ENGINE_KEY, &backup_uuid)?;
-        let spec = logical_dump_spec(&attempt, backup_id, &target_container, &password);
-        let container_path = attempt.container_path(SIDECAR_DUMP_GZ);
-        let host_rdb_gz_path = attempt.host_path(SIDECAR_DUMP_GZ);
-
-        super::image_pull::ensure_image_pulled_v2(REDIS_SIDECAR_IMAGE, ENGINE_KEY).await?;
-
-        let file_size = capture_dump(
-            &deps.docker,
-            CaptureRequest {
-                tool: REDIS_TOOL,
-                spec,
-                container_path,
-                host_path: host_rdb_gz_path.clone(),
-                failure_log: None,
-            },
-            &ctx.cancel,
-        )
-        .await
-        .inspect_err(|error| {
-            warn!(
-                backup_id,
-                attempt = attempt.attempt_id(),
-                error = %error,
-                "RedisEngine: logical redis-cli fallback did not produce a dump",
-            )
-        })?;
+        let file_size = match &node {
+            Node::Here(docker) => {
+                let backup = RedisRdbBackup {
+                    service_id: service.id,
+                    service: service.name.clone(),
+                    container_name: target_container.clone(),
+                    password: service_password(&deps, &service),
+                    destination: local_destination(&deps, &s3_source)?,
+                    key: s3_key.clone(),
+                };
+                tokio::select! {
+                    // Dropping the upload removes its helper container.
+                    _ = ctx.cancel.cancelled() => return Err(BackupError::Cancelled),
+                    result = redis_node::redis_rdb_backup(Arc::new(docker.clone()), backup) => {
+                        result.map_err(node_error)?
+                    }
+                }
+            }
+            Node::Worker(node_id) => {
+                // Write access to this snapshot's own directory, nothing else.
+                let mint = || {
+                    worker_destination(
+                        &deps,
+                        s3_source_id,
+                        &service,
+                        *node_id,
+                        temps_providers::worker_s3_scope::key_directory(&s3_key),
+                    )
+                };
+                let destination = mint().await?;
+                let result = on_worker(
+                    ctx,
+                    &service,
+                    *node_id,
+                    "RDB backup",
+                    destination,
+                    mint,
+                    |destination| {
+                        deps.manager.rdb_backup_worker_redis(
+                            service.id,
+                            destination,
+                            s3_key.clone(),
+                        )
+                    },
+                )
+                .await?;
+                match result {
+                    RedisRdbBackupResult::Completed { size_bytes } => size_bytes,
+                    RedisRdbBackupResult::Refused { reason } => {
+                        return Err(worker_refused(&service, *node_id, "RDB backup", &reason))
+                    }
+                    RedisRdbBackupResult::Failed { reason } => {
+                        return Err(worker_failed(&service, *node_id, "RDB backup", &reason))
+                    }
+                }
+            }
+        };
         let file_size = i64::try_from(file_size).map_err(|_| BackupError::Failed {
             reason: format!("Redis dump for backup {backup_id} is larger than i64::MAX bytes"),
         })?;
-        let host_dump_path_str = host_rdb_gz_path.to_string_lossy().into_owned();
 
-        if ctx.cancel.is_cancelled() {
-            return Err(BackupError::Cancelled);
-        }
         let tags = v2_common::BackupTags::load_for_backup(&ctx.db, ctx.backup_id).await;
-        v2_common::upload_file(
-            &s3_client,
-            &s3_source.bucket_name,
-            &s3_key,
-            &host_dump_path_str,
-            "application/x-gzip",
-            file_size,
-            Some(&tags),
-            &ctx.cancel,
-        )
-        .await
-        .map_err(|error| {
-            DumpCaptureError::upload(REDIS_TOOL, &s3_source.bucket_name, &s3_key, error)
-        })?;
-        // The attempt's host directory (and the dump in it) is deleted here,
-        // and on every early return above, when `attempt` is dropped.
-        drop(attempt);
-
+        v2_common::apply_object_tags(&s3_client, &s3_source.bucket_name, &s3_key, &tags).await?;
         let metadata_key = v2_common::derive_metadata_key(&s3_key);
         v2_common::write_metadata_companion(
             &s3_client,
@@ -246,101 +265,80 @@ impl BackupEngine for RedisEngine {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// The plane half of a WAL-G stream backup around its node half.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the backup's inputs, loaded once by the caller"
+)]
 async fn run_walg_backup(
     deps: &RedisDeps,
     ctx: &BackupContext,
+    node: &Node,
     service: &temps_entities::external_services::Model,
     s3_source: &temps_entities::s3_sources::Model,
     s3_client: &aws_sdk_s3::Client,
     container_name: &str,
-    password: &str,
     backup_uuid: &str,
 ) -> Result<BackupOutcome, BackupError> {
-    let bucket_path = s3_source.bucket_path.trim_matches('/');
-    let service_root = format!("external_services/redis/{}/walg", service.name);
-    let repository_key = if bucket_path.is_empty() {
-        service_root
-    } else {
-        format!("{bucket_path}/{service_root}")
-    };
-    let walg_prefix = format!("s3://{}/{}", s3_source.bucket_name, repository_key);
-    let list_prefix = format!("{repository_key}/");
-
-    let access_key = deps
-        .encryption_service
-        .decrypt_string(&s3_source.access_key_id)
-        .map_err(|error| BackupError::PermanentFailure {
-            reason: format!("decrypt Redis WAL-G access key: {error}"),
-        })?;
-    let secret_key = deps
-        .encryption_service
-        .decrypt_string(&s3_source.secret_key)
-        .map_err(|error| BackupError::PermanentFailure {
-            reason: format!("decrypt Redis WAL-G secret key: {error}"),
-        })?;
-    let session_token = v2_common::decrypt_session_token(s3_source, &deps.encryption_service)?;
-    let container_endpoint = temps_providers::externalsvc::S3Credentials {
-        access_key_id: access_key.clone(),
-        secret_key: secret_key.clone(),
-        session_token: session_token.clone(),
-        region: s3_source.region.clone(),
-        endpoint: s3_source.endpoint.clone(),
-        bucket_name: s3_source.bucket_name.clone(),
-        bucket_path: s3_source.bucket_path.clone(),
-        force_path_style: s3_source.force_path_style.unwrap_or(true),
-    }
-    .resolve_endpoint_for_container(&deps.docker, container_name)
-    .await;
-    let mut env = vec![
-        format!("WALG_S3_PREFIX={walg_prefix}"),
-        format!("AWS_ACCESS_KEY_ID={access_key}"),
-        format!("AWS_SECRET_ACCESS_KEY={secret_key}"),
-        format!("AWS_REGION={}", s3_source.region),
-        format!("REDISCLI_AUTH={password}"),
-        format!("WALG_STREAM_CREATE_COMMAND={WALG_STREAM_CREATE_COMMAND}"),
-        format!("WALG_STREAM_RESTORE_COMMAND={WALG_STREAM_RESTORE_COMMAND}"),
-    ];
-    // Absent unless this source holds a temporary credential.
-    env.extend(temps_providers::externalsvc::aws_session_token_env(
-        session_token.as_deref(),
-    ));
-    env.extend(v2_common::walg_identity_env(backup_uuid));
-    if let Some(endpoint) = container_endpoint {
-        env.push(format!(
-            "AWS_ENDPOINT={}",
-            if endpoint.starts_with("http") {
-                endpoint
-            } else {
-                format!("http://{endpoint}")
-            }
-        ));
-    }
-    if s3_source.force_path_style.unwrap_or(true) {
-        env.push("AWS_S3_FORCE_PATH_STYLE=true".into());
-    }
+    let walg_prefix = redis_node::walg_prefix(
+        &s3_source.bucket_name,
+        &s3_source.bucket_path,
+        &service.name,
+    );
+    let list_prefix = redis_node::walg_key_prefix(&s3_source.bucket_path, &service.name);
 
     info!(
         backup_id = ctx.backup_id,
         repository = %walg_prefix,
         "RedisEngine: starting direct WAL-G stream backup",
     );
-    let exec = run_walg_exec(
-        &deps.docker,
-        container_name,
-        "wal-g backup-push",
-        &env,
-        &ctx.cancel,
-    )
-    .await?;
-    if exec.exit_code != 0 {
-        return Err(BackupError::Failed {
-            reason: format!(
-                "Redis wal-g backup-push exited with code {}. stderr: {}",
-                exec.exit_code,
-                bounded_tail(&exec.stderr),
-            ),
-        });
+    match node {
+        Node::Here(docker) => {
+            let backup = RedisWalgBackup {
+                service_id: service.id,
+                service: service.name.clone(),
+                container_name: container_name.to_string(),
+                password: service_password(deps, service),
+                s3: local_credentials(deps, s3_source)?,
+                backup_uuid: backup_uuid.to_string(),
+            };
+            redis_node::redis_walg_backup(docker, backup, &ctx.cancel)
+                .await
+                .map_err(node_error)?;
+        }
+        Node::Worker(node_id) => {
+            // Write access to the service's own WAL-G repository, nothing
+            // else: `backup-push` writes and reads its sentinels there.
+            let mint =
+                || worker_destination(deps, s3_source.id, service, *node_id, list_prefix.clone());
+            let destination = mint().await?;
+            let result = on_worker(
+                ctx,
+                service,
+                *node_id,
+                "WAL-G backup",
+                destination,
+                mint,
+                |destination| {
+                    deps.manager.walg_backup_worker_redis(
+                        service.id,
+                        destination,
+                        s3_source.bucket_path.clone(),
+                        backup_uuid.to_string(),
+                    )
+                },
+            )
+            .await?;
+            match result {
+                RedisWalgBackupResult::Completed => {}
+                RedisWalgBackupResult::Refused { reason } => {
+                    return Err(worker_refused(service, *node_id, "WAL-G backup", &reason))
+                }
+                RedisWalgBackupResult::Failed { reason } => {
+                    return Err(worker_failed(service, *node_id, "WAL-G backup", &reason))
+                }
+            }
+        }
     }
 
     let file_size = list_total_s3_size(s3_client, &s3_source.bucket_name, &list_prefix).await?;
@@ -381,56 +379,167 @@ async fn run_walg_backup(
     })
 }
 
-/// The logical fallback sidecar: `redis-cli --rdb` into the attempt's
-/// directory inside the sidecar's own filesystem, then `gzip`. No bind
-/// mount: the result is read back with the Docker archive API.
-fn logical_dump_spec(
-    attempt: &DumpAttempt,
-    backup_id: i32,
-    target_container: &str,
-    password: &str,
-) -> OneShotSpec {
-    let container_dir = attempt.container_dir();
-    let container_rdb_path = attempt.container_path(SIDECAR_DUMP_RDB);
-    // The password travels in `REDISCLI_AUTH`, not argv, so it never shows
-    // up in `docker inspect`'s command line or `ps` inside the sidecar.
-    let env = if password.is_empty() {
-        vec![]
-    } else {
-        vec![format!("REDISCLI_AUTH={password}")]
+/// The password of a Redis on this host, from its stored configuration
+/// (empty for one without auth). A worker's travels sealed with its config.
+fn service_password(
+    deps: &RedisDeps,
+    service: &temps_entities::external_services::Model,
+) -> String {
+    let config_json = deps
+        .encryption_service
+        .decrypt_string(service.config.as_deref().unwrap_or("{}"))
+        .unwrap_or_else(|_| "{}".to_string());
+    let cfg: Value = serde_json::from_str(&config_json).unwrap_or_else(|_| json!({}));
+    cfg.get("password")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// The decrypted credentials of `s3_source`, for a node half on this host.
+fn local_credentials(
+    deps: &RedisDeps,
+    s3_source: &temps_entities::s3_sources::Model,
+) -> Result<temps_providers::externalsvc::S3Credentials, BackupError> {
+    let decrypt = |field: &str, value: &str| {
+        deps.encryption_service
+            .decrypt_string(value)
+            .map_err(|e| BackupError::PermanentFailure {
+                reason: format!("decrypt {field} of S3 source {}: {e}", s3_source.id),
+            })
     };
-    let dump_cmd = format!(
-        "mkdir -p {dir} && redis-cli -h {host} --rdb {rdb} && gzip {rdb}",
-        dir = v2_common::shell_escape(&container_dir),
-        host = v2_common::shell_escape(target_container),
-        rdb = v2_common::shell_escape(&container_rdb_path),
+    Ok(temps_providers::externalsvc::S3Credentials {
+        access_key_id: decrypt("access key", &s3_source.access_key_id)?,
+        secret_key: decrypt("secret key", &s3_source.secret_key)?,
+        session_token: v2_common::decrypt_session_token(s3_source, &deps.encryption_service)?,
+        region: s3_source.region.clone(),
+        endpoint: s3_source.endpoint.clone(),
+        bucket_name: s3_source.bucket_name.clone(),
+        bucket_path: s3_source.bucket_path.clone(),
+        force_path_style: s3_source.force_path_style.unwrap_or(true),
+    })
+}
+
+/// [`local_credentials`] as the destination an RDB backup streams to.
+fn local_destination(
+    deps: &RedisDeps,
+    s3_source: &temps_entities::s3_sources::Model,
+) -> Result<WorkerS3Destination, BackupError> {
+    let s3 = local_credentials(deps, s3_source)?;
+    Ok(WorkerS3Destination {
+        bucket: s3.bucket_name,
+        region: s3.region,
+        endpoint: s3.endpoint,
+        force_path_style: s3.force_path_style,
+        access_key_id: s3.access_key_id,
+        secret_access_key: s3.secret_key,
+        session_token: s3.session_token,
+    })
+}
+
+/// The S3 source as worker `node_id` receives it for one backup: a
+/// credential that can write `prefix` and nothing else (ADR-102). Refuses an
+/// endpoint on this host's loopback, which the node cannot reach.
+async fn worker_destination(
+    deps: &RedisDeps,
+    s3_source_id: i32,
+    service: &temps_entities::external_services::Model,
+    node_id: i32,
+    prefix: String,
+) -> Result<WorkerS3Destination, BackupError> {
+    super::worker_agent::scoped_destination(
+        &deps.worker_credentials,
+        deps.db.as_ref(),
+        s3_source_id,
+        temps_providers::worker_s3_scope::WorkerS3Grant::job(
+            service.id,
+            node_id,
+            prefix,
+            temps_core::ScopedS3Access::Write,
+            "backup",
+        ),
+        "backup",
+    )
+    .await
+}
+
+/// Ask worker `node_id`'s agent to run a node half: a node already running
+/// its maximum of backups and restores is waited for (bounded) instead of
+/// failing the backup, and a cancelled backup stops waiting. The first try
+/// is sent `first`; a try after a wait, a credential `mint` derives after it.
+async fn on_worker<C, T, Mint, MintFut, Call, CallFut>(
+    ctx: &BackupContext,
+    service: &temps_entities::external_services::Model,
+    node_id: i32,
+    operation: &str,
+    first: C,
+    mint: Mint,
+    call: Call,
+) -> Result<T, BackupError>
+where
+    Mint: FnMut() -> MintFut,
+    MintFut: std::future::Future<Output = Result<C, BackupError>>,
+    Call: FnMut(C) -> CallFut,
+    CallFut: std::future::Future<Output = Result<T, temps_providers::ExternalServiceError>>,
+{
+    let request = crate::node_busy::retry_while_node_busy_with_fresh_credential(
+        &crate::node_busy::NodeBusyPolicy::DEFAULT,
+        first,
+        mint,
+        call,
+        |wait| super::worker_agent::wait_for_node_slot_minting(ctx.backup_id, service.id, wait),
     );
-    OneShotSpec {
-        image: REDIS_SIDECAR_IMAGE.to_string(),
-        name: attempt.container_name("temps-redis-backup"),
-        engine: ENGINE_KEY,
-        backup_id,
-        entrypoint: vec!["sh".to_string(), "-c".to_string()],
-        cmd: vec![dump_cmd],
-        env,
-        binds: vec![],
-        network_mode: Some(temps_core::NETWORK_NAME.to_string()),
-        user: Some("root".to_string()),
-        stderr_watch: None,
+    tokio::select! {
+        _ = ctx.cancel.cancelled() => Err(BackupError::Cancelled),
+        result = request => result?.map_err(|e| BackupError::Failed {
+            reason: format!(
+                "Redis {operation} of service {} ('{}') on node {node_id}: {e}",
+                service.id, service.name
+            ),
+        }),
     }
 }
 
-fn bounded_tail(value: &str) -> String {
-    const MAX_BYTES: usize = 2_000;
-    let trimmed = value.trim();
-    if trimmed.len() <= MAX_BYTES {
-        return trimmed.to_string();
+fn worker_refused(
+    service: &temps_entities::external_services::Model,
+    node_id: i32,
+    operation: &str,
+    reason: &str,
+) -> BackupError {
+    BackupError::PermanentFailure {
+        reason: format!(
+            "Redis {operation} of service {} ('{}') on node {node_id}: {reason}",
+            service.id, service.name
+        ),
     }
-    let mut start = trimmed.len() - MAX_BYTES;
-    while !trimmed.is_char_boundary(start) {
-        start += 1;
+}
+
+fn worker_failed(
+    service: &temps_entities::external_services::Model,
+    node_id: i32,
+    operation: &str,
+    reason: &str,
+) -> BackupError {
+    BackupError::Failed {
+        reason: format!(
+            "Redis {operation} of service {} ('{}') on node {node_id}: {reason}",
+            service.id, service.name
+        ),
     }
-    format!("…{}", &trimmed[start..])
+}
+
+/// The node half's error as the executor's: a refusal is final, a
+/// cancellation is a cancellation, the rest may succeed on a retry.
+fn node_error(error: RedisNodeError) -> BackupError {
+    match error {
+        RedisNodeError::Cancelled { .. } => BackupError::Cancelled,
+        error if error.is_refusal() => BackupError::PermanentFailure {
+            reason: error.to_string(),
+        },
+        error => BackupError::Failed {
+            reason: error.to_string(),
+        },
+    }
 }
 
 async fn list_total_s3_size(
@@ -468,628 +577,106 @@ async fn list_total_s3_size(
 mod tests {
     use super::*;
 
+    fn service(node_id: Option<i32>) -> temps_entities::external_services::Model {
+        let now = chrono::Utc::now();
+        temps_entities::external_services::Model {
+            id: 7,
+            name: "cache".to_string(),
+            service_type: "redis".to_string(),
+            version: None,
+            status: "running".to_string(),
+            created_at: now,
+            updated_at: now,
+            slug: None,
+            config: None,
+            node_id,
+            topology: "standalone".to_string(),
+            error_message: None,
+            health_status: None,
+            last_health_check_at: None,
+            last_health_error: None,
+            consecutive_health_failures: 0,
+            health_metadata: None,
+            metrics_enabled: false,
+            default_backup_provisioned: false,
+            container_name: None,
+            created_by_user_id: None,
+            continuous_archive_s3_source_id: None,
+            continuous_archive_pinned_at: None,
+            workload_mode:
+                temps_entities::external_service_workload_mode::ServiceWorkloadMode::Legacy,
+            log_ingest_lines_per_sec: None,
+            log_ingest_kib_per_sec: None,
+        }
+    }
+
+    /// Both planes write a Redis's backups where the other restores them
+    /// from: the WAL-G repository and the RDB object keys are the ones the
+    /// local engine always wrote.
     #[test]
-    fn redis_sidecar_image_is_release_and_digest_pinned() {
-        assert!(REDIS_SIDECAR_IMAGE.contains("redis:7.4.10-alpine@"));
-        assert!(REDIS_SIDECAR_IMAGE
-            .contains("sha256:e7723ff73d963f5cc6d9c4643ea3d989527a402a319239054e9472a7fb9219a2"));
-    }
-
-    #[test]
-    fn walg_stream_commands_match_cloud_restore_contract() {
-        assert!(WALG_STREAM_CREATE_COMMAND.contains("redis-cli --rdb -"));
-        assert!(WALG_STREAM_CREATE_COMMAND.contains("head -c -40"));
-        assert!(WALG_STREAM_CREATE_COMMAND.contains("PIPESTATUS"));
-        assert_eq!(WALG_STREAM_RESTORE_COMMAND, "cat > /data/dump.rdb");
-    }
-
-    #[test]
-    fn bounded_tail_preserves_utf8_boundaries() {
-        let value = format!("{}END", "é".repeat(1_100));
-        let tail = bounded_tail(&value);
-        assert!(tail.ends_with("END"));
-        assert!(tail.starts_with('…'));
-    }
-
-    // ── Logical fallback spec ────────────────────────────────────────────
-
-    #[test]
-    fn logical_dump_spec_has_no_bind_mount_and_is_attempt_scoped() {
-        let parent = tempfile::tempdir().expect("parent");
-        let first = DumpAttempt::new_in(parent.path(), REDIS_TOOL, ENGINE_KEY, "b-uuid")
-            .expect("first attempt");
-        let retry = DumpAttempt::new_in(parent.path(), REDIS_TOOL, ENGINE_KEY, "b-uuid")
-            .expect("retry attempt");
-
-        let spec = logical_dump_spec(&first, 42, "redis-cache", "s3cr'et");
-        let retry_spec = logical_dump_spec(&retry, 42, "redis-cache", "s3cr'et");
-
-        assert!(
-            spec.binds.is_empty(),
-            "output must not depend on a host bind"
-        );
-        assert_ne!(spec.name, retry_spec.name, "a retry gets its own container");
-        assert_ne!(spec.cmd, retry_spec.cmd, "a retry writes to its own paths");
-        let cmd = &spec.cmd[0];
-        assert!(
-            cmd.contains(&first.container_path(SIDECAR_DUMP_RDB)),
-            "{cmd}"
-        );
-        assert!(cmd.contains("'redis-cache'"), "{cmd}");
-        assert!(
-            !cmd.contains("s3cr"),
-            "the password must not be on argv: {cmd}"
-        );
-        assert_eq!(spec.env, vec!["REDISCLI_AUTH=s3cr'et".to_string()]);
-        assert_eq!(spec.backup_id, 42);
-
-        let no_auth = logical_dump_spec(&first, 42, "redis-cache", "");
-        assert!(no_auth.env.is_empty());
-    }
-
-    // ── Docker-backed tests ──────────────────────────────────────────────
-    //
-    // These run the real fallback sidecar against a real Redis. They skip
-    // (with a message) when no Docker daemon is reachable. Run them with the
-    // OS default temp dir: on macOS with Colima or Docker Desktop that dir is
-    // not shared with the Docker VM, which is exactly the setup the old
-    // bind-mount fallback failed on. Each test prints whether the attempt's
-    // host dir turned out to be visible to Docker.
-
-    const TEST_PASSWORD: &str = "test-pass";
-    const TEST_KEY: &str = "temps:test";
-    const TEST_VALUE: &str = "before-backup";
-
-    async fn docker_or_skip(test: &str) -> Option<bollard::Docker> {
-        let docker = match bollard::Docker::connect_with_local_defaults() {
-            Ok(docker) => docker,
-            Err(e) => {
-                println!("Docker not available, skipping {test}: {e}");
-                return None;
-            }
-        };
-        if let Err(e) = docker.ping().await {
-            println!("Docker daemon not reachable, skipping {test}: {e}");
-            return None;
-        }
-        if let Err(e) =
-            super::super::image_pull::ensure_image_pulled_v2(REDIS_SIDECAR_IMAGE, ENGINE_KEY).await
-        {
-            println!("Could not pull {REDIS_SIDECAR_IMAGE}, skipping {test}: {e}");
-            return None;
-        }
-        Some(docker)
-    }
-
-    /// Run a command in a container and return its combined output.
-    async fn exec_output(docker: &bollard::Docker, container: &str, cmd: &[&str]) -> String {
-        use bollard::exec::{CreateExecOptions, StartExecResults};
-        use futures::StreamExt;
-        let exec = docker
-            .create_exec(
-                container,
-                CreateExecOptions {
-                    cmd: Some(cmd.iter().map(|part| part.to_string()).collect()),
-                    attach_stdout: Some(true),
-                    attach_stderr: Some(true),
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("create exec");
-        let mut text = String::new();
-        if let StartExecResults::Attached { mut output, .. } =
-            docker.start_exec(&exec.id, None).await.expect("start exec")
-        {
-            while let Some(Ok(chunk)) = output.next().await {
-                text.push_str(&chunk.to_string());
-            }
-        }
-        text
-    }
-
-    /// Poll `cmd` in `container` until its output contains `expected`.
-    async fn wait_for_output(
-        docker: &bollard::Docker,
-        container: &str,
-        cmd: &[&str],
-        expected: &str,
-    ) -> String {
-        let mut last = String::new();
-        for _ in 0..60 {
-            last = exec_output(docker, container, cmd).await;
-            if last.contains(expected) {
-                return last;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        }
-        panic!(
-            "{container}: `{}` never printed '{expected}'; last output: {last}",
-            cmd.join(" ")
-        );
-    }
-
-    async fn container_is_gone(docker: &bollard::Docker, name: &str) -> bool {
-        for _ in 0..60 {
-            match docker
-                .inspect_container(
-                    name,
-                    None::<bollard::query_parameters::InspectContainerOptions>,
-                )
-                .await
-            {
-                Err(bollard::errors::Error::DockerResponseServerError {
-                    status_code: 404, ..
-                }) => return true,
-                _ => tokio::time::sleep(std::time::Duration::from_millis(500)).await,
-            }
-        }
-        false
-    }
-
-    /// Containers and the network a test created, removed on drop (also on
-    /// panic) from a dedicated thread with its own runtime.
-    struct DockerLeftovers {
-        containers: Vec<String>,
-        network: Option<String>,
-    }
-
-    impl Drop for DockerLeftovers {
-        fn drop(&mut self) {
-            let containers = std::mem::take(&mut self.containers);
-            let network = self.network.take();
-            let cleanup = std::thread::spawn(move || {
-                let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                else {
-                    return;
-                };
-                runtime.block_on(async move {
-                    let Ok(docker) = bollard::Docker::connect_with_local_defaults() else {
-                        return;
-                    };
-                    for name in containers {
-                        let _ = docker
-                            .remove_container(
-                                &name,
-                                Some(bollard::query_parameters::RemoveContainerOptions {
-                                    force: true,
-                                    v: true,
-                                    ..Default::default()
-                                }),
-                            )
-                            .await;
-                    }
-                    if let Some(network) = network {
-                        let _ = docker.remove_network(&network).await;
-                    }
-                });
-            });
-            let _ = cleanup.join();
-        }
-    }
-
-    /// A password-protected Redis on its own network, seeded with one key.
-    struct SeededRedis {
-        network: String,
-        container: String,
-        _leftovers: DockerLeftovers,
-    }
-
-    async fn seeded_redis(docker: &bollard::Docker, run_id: &str) -> SeededRedis {
-        use bollard::models::{ContainerCreateBody, EndpointSettings, NetworkingConfig};
-        let network = format!("temps-test-rdb-net-{run_id}");
-        let container = format!("temps-test-rdb-redis-{run_id}");
-        let leftovers = DockerLeftovers {
-            containers: vec![container.clone()],
-            network: Some(network.clone()),
-        };
-        docker
-            .create_network(bollard::models::NetworkCreateRequest {
-                name: network.clone(),
-                ..Default::default()
-            })
-            .await
-            .expect("create test network");
-        docker
-            .create_container(
-                Some(
-                    bollard::query_parameters::CreateContainerOptionsBuilder::new()
-                        .name(&container)
-                        .build(),
-                ),
-                ContainerCreateBody {
-                    image: Some(REDIS_SIDECAR_IMAGE.to_string()),
-                    cmd: Some(
-                        ["redis-server", "--requirepass", TEST_PASSWORD, "--save", ""]
-                            .iter()
-                            .map(|part| part.to_string())
-                            .collect(),
-                    ),
-                    networking_config: Some(NetworkingConfig {
-                        endpoints_config: Some(std::collections::HashMap::from([(
-                            network.clone(),
-                            EndpointSettings::default(),
-                        )])),
-                    }),
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("create test redis");
-        docker
-            .start_container(
-                &container,
-                None::<bollard::query_parameters::StartContainerOptions>,
-            )
-            .await
-            .expect("start test redis");
-        wait_for_output(
-            docker,
-            &container,
-            &[
-                "redis-cli",
-                "-a",
-                TEST_PASSWORD,
-                "SET",
-                TEST_KEY,
-                TEST_VALUE,
-            ],
-            "OK",
-        )
-        .await;
-        SeededRedis {
-            network,
-            container,
-            _leftovers: leftovers,
-        }
-    }
-
-    /// Whether a sentinel written into `dir` on this host is visible to a
-    /// container that bind-mounts `dir` -- i.e. whether the old bind-mount
-    /// fallback could have worked here at all.
-    async fn host_dir_is_shared_with_docker(
-        docker: &bollard::Docker,
-        dir: &std::path::Path,
-    ) -> bool {
-        let sentinel = format!("sentinel-{}", uuid::Uuid::new_v4().simple());
-        std::fs::write(dir.join(&sentinel), b"x").expect("write sentinel");
-        let spec = OneShotSpec {
-            image: REDIS_SIDECAR_IMAGE.to_string(),
-            name: format!("temps-test-rdb-probe-{}", uuid::Uuid::new_v4().simple()),
-            engine: ENGINE_KEY,
-            backup_id: 0,
-            entrypoint: vec!["sh".to_string(), "-c".to_string()],
-            cmd: vec![format!("test -f /probe/{sentinel}")],
-            env: vec![],
-            binds: vec![format!("{}:/probe:ro", dir.display())],
-            network_mode: None,
-            user: Some("root".to_string()),
-            stderr_watch: None,
-        };
-        let shared = super::super::oneshot::run_one_shot(
-            docker,
-            spec,
-            &tokio_util::sync::CancellationToken::new(),
-        )
-        .await
-        .map(|result| result.exit_code == 0)
-        .unwrap_or(false);
-        let _ = std::fs::remove_file(dir.join(&sentinel));
-        shared
-    }
-
-    fn gunzip(path: &std::path::Path) -> Vec<u8> {
-        use std::io::Read;
-        let mut rdb = Vec::new();
-        flate2::read::GzDecoder::new(std::fs::File::open(path).expect("open dump"))
-            .read_to_end(&mut rdb)
-            .expect("gunzip dump");
-        rdb
-    }
-
-    /// Load `rdb` into a fresh Redis (uploaded through the archive API, the
-    /// same way the restore helper does) and read the seeded key back.
-    async fn restored_value(docker: &bollard::Docker, run_id: &str, rdb: Vec<u8>) -> String {
-        let name = format!("temps-test-rdb-restore-{run_id}");
-        let _leftovers = DockerLeftovers {
-            containers: vec![name.clone()],
-            network: None,
-        };
-        docker
-            .create_container(
-                Some(
-                    bollard::query_parameters::CreateContainerOptionsBuilder::new()
-                        .name(&name)
-                        .build(),
-                ),
-                bollard::models::ContainerCreateBody {
-                    image: Some(REDIS_SIDECAR_IMAGE.to_string()),
-                    cmd: Some(
-                        [
-                            "redis-server",
-                            "--appendonly",
-                            "no",
-                            "--dbfilename",
-                            "dump.rdb",
-                        ]
-                        .iter()
-                        .map(|part| part.to_string())
-                        .collect(),
-                    ),
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("create restore target");
-        let mut header = tar::Header::new_gnu();
-        header.set_size(rdb.len() as u64);
-        header.set_mode(0o644);
-        header.set_entry_type(tar::EntryType::Regular);
-        header.set_cksum();
-        let mut archive = tar::Builder::new(Vec::new());
-        archive
-            .append_data(&mut header, "dump.rdb", rdb.as_slice())
-            .expect("tar dump");
-        let archive = archive.into_inner().expect("finish tar");
-        docker
-            .upload_to_container(
-                &name,
-                Some(bollard::query_parameters::UploadToContainerOptions {
-                    path: "/data".to_string(),
-                    ..Default::default()
-                }),
-                bollard::body_full(archive.into()),
-            )
-            .await
-            .expect("upload dump into restore target");
-        docker
-            .start_container(
-                &name,
-                None::<bollard::query_parameters::StartContainerOptions>,
-            )
-            .await
-            .expect("start restore target");
-        wait_for_output(docker, &name, &["redis-cli", "GET", TEST_KEY], TEST_VALUE).await
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn logical_fallback_round_trips_without_a_shared_temp_dir() {
-        let Some(docker) =
-            docker_or_skip("logical_fallback_round_trips_without_a_shared_temp_dir").await
-        else {
-            return;
-        };
-        let run_id = uuid::Uuid::new_v4().simple().to_string()[..12].to_string();
-        let redis = seeded_redis(&docker, &run_id).await;
-
-        // The real default: the OS temp dir, whatever TMPDIR says.
-        let attempt = DumpAttempt::new(REDIS_TOOL, ENGINE_KEY, &format!("roundtrip-{run_id}"))
-            .expect("attempt");
-        let shared = host_dir_is_shared_with_docker(&docker, attempt.host_dir()).await;
-        println!(
-            "attempt host dir {} is {} with the Docker daemon",
-            attempt.host_dir().display(),
-            if shared { "SHARED" } else { "NOT shared" }
-        );
-
-        let mut spec = logical_dump_spec(&attempt, 0, &redis.container, TEST_PASSWORD);
-        spec.network_mode = Some(redis.network.clone());
-        let sidecar = spec.name.clone();
-        let host_path = attempt.host_path(SIDECAR_DUMP_GZ);
-        let size = capture_dump(
-            &docker,
-            CaptureRequest {
-                tool: REDIS_TOOL,
-                spec,
-                container_path: attempt.container_path(SIDECAR_DUMP_GZ),
-                host_path: host_path.clone(),
-                failure_log: None,
-            },
-            &tokio_util::sync::CancellationToken::new(),
-        )
-        .await
-        .expect("capture the Redis dump through the Docker API");
-
-        assert!(size > 0);
+    fn the_layout_is_the_local_engines() {
         assert_eq!(
-            std::fs::metadata(&host_path).expect("dump on host").len(),
-            size
+            redis_node::walg_prefix("backups", "tenant/", "cache"),
+            "s3://backups/tenant/external_services/redis/cache/walg"
+        );
+        let key = v2_common::build_external_service_s3_key(
+            "tenant",
+            "redis",
+            "cache",
+            "u-1",
+            RDB_DUMP_FILE,
         );
         assert!(
-            container_is_gone(&docker, &sidecar).await,
-            "sidecar {sidecar} was not removed"
+            key.starts_with("tenant/external_services/redis/cache/"),
+            "{key}"
         );
-        let rdb = gunzip(&host_path);
-        assert!(rdb.starts_with(b"REDIS"), "not an RDB file");
-
-        let host_dir = attempt.host_dir().to_path_buf();
-        drop(attempt);
-        assert!(
-            !host_dir.exists(),
-            "attempt dir {} not cleaned up",
-            host_dir.display()
-        );
-
-        assert!(restored_value(&docker, &run_id, rdb)
-            .await
-            .contains(TEST_VALUE));
+        assert!(key.ends_with("/u-1/dump.rdb.gz"), "{key}");
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn retry_after_failed_attempts_uses_fresh_paths_and_succeeds() {
-        let Some(docker) =
-            docker_or_skip("retry_after_failed_attempts_uses_fresh_paths_and_succeeds").await
-        else {
-            return;
-        };
-        let run_id = uuid::Uuid::new_v4().simple().to_string()[..12].to_string();
-        let redis = seeded_redis(&docker, &run_id).await;
-        let backup_uuid = format!("retry-{run_id}");
-        let cancel = tokio_util::sync::CancellationToken::new();
-
-        // What an older binary left behind after the bind-mount failure. It
-        // must neither block the retry nor be deleted by it.
-        let legacy_dir = std::env::temp_dir().join("temps-redis-backup");
-        std::fs::create_dir_all(&legacy_dir).expect("legacy dir");
-        let legacy = legacy_dir.join(format!("{backup_uuid}.rdb.gz"));
-        std::fs::write(&legacy, b"stale").expect("legacy leftover");
-
-        let request = |attempt: &DumpAttempt, spec: OneShotSpec| CaptureRequest {
-            tool: REDIS_TOOL,
-            spec,
-            container_path: attempt.container_path(SIDECAR_DUMP_GZ),
-            host_path: attempt.host_path(SIDECAR_DUMP_GZ),
-            failure_log: None,
-        };
-
-        // Attempt 1: Redis export fails (unreachable target).
-        let first = DumpAttempt::new(REDIS_TOOL, ENGINE_KEY, &backup_uuid).expect("attempt 1");
-        let mut spec = logical_dump_spec(&first, 0, "temps-test-no-such-redis", TEST_PASSWORD);
-        spec.network_mode = Some(redis.network.clone());
-        let first_sidecar = spec.name.clone();
-        let error = capture_dump(&docker, request(&first, spec), &cancel)
-            .await
-            .expect_err("unreachable Redis");
+    /// A worker's answer is the same error the run here would give: a
+    /// refusal is final, a failure may be retried, both name the service and
+    /// the node.
+    #[test]
+    fn a_worker_answer_is_the_error_of_the_same_run() {
+        let service = service(Some(3));
+        let refused = worker_refused(&service, 3, "WAL-G backup", "imported container");
         assert!(
-            matches!(error, DumpCaptureError::Export { exit_code, .. } if exit_code != 0),
-            "{error}"
+            matches!(&refused, BackupError::PermanentFailure { reason }
+                if reason.contains("service 7 ('cache') on node 3") && reason.contains("imported container")),
+            "{refused:?}"
         );
-        assert!(container_is_gone(&docker, &first_sidecar).await);
-        let first_dir = first.host_dir().to_path_buf();
-        drop(first);
-        assert!(!first_dir.exists());
-
-        // Attempt 2: the command "succeeds" without leaving a readable dump,
-        // the shape of the original bind-mount failure.
-        let second = DumpAttempt::new(REDIS_TOOL, ENGINE_KEY, &backup_uuid).expect("attempt 2");
-        let mut spec = logical_dump_spec(&second, 0, &redis.container, TEST_PASSWORD);
-        spec.network_mode = Some(redis.network.clone());
-        spec.cmd = vec!["true".to_string()];
-        let second_sidecar = spec.name.clone();
-        let error = capture_dump(&docker, request(&second, spec), &cancel)
-            .await
-            .expect_err("no dump written");
+        let failed = worker_failed(&service, 3, "RDB backup", "exit 1");
         assert!(
-            matches!(error, DumpCaptureError::DumpUnreadable { .. }),
-            "{error}"
+            matches!(&failed, BackupError::Failed { reason } if reason.contains("RDB backup")),
+            "{failed:?}"
         );
-        assert!(error.to_string().starts_with(
-            "Redis exported the backup, but Temps could not read the temporary file written by Docker."
+    }
+
+    #[test]
+    fn only_a_refusal_of_the_node_half_is_final() {
+        assert!(matches!(
+            node_error(RedisNodeError::Cancelled {
+                container: "redis-cache".to_string()
+            }),
+            BackupError::Cancelled
         ));
-        assert!(container_is_gone(&docker, &second_sidecar).await);
-        assert!(!second.host_path(SIDECAR_DUMP_GZ).exists());
-        drop(second);
-
-        // Attempt 3: same backup, real dump. No `File exists`, no name clash.
-        let third = DumpAttempt::new(REDIS_TOOL, ENGINE_KEY, &backup_uuid).expect("attempt 3");
-        let mut spec = logical_dump_spec(&third, 0, &redis.container, TEST_PASSWORD);
-        spec.network_mode = Some(redis.network.clone());
-        let size = capture_dump(&docker, request(&third, spec), &cancel)
-            .await
-            .expect("retry succeeds");
-        assert!(size > 0);
-        assert!(gunzip(&third.host_path(SIDECAR_DUMP_GZ)).starts_with(b"REDIS"));
-        drop(third);
-
-        assert_eq!(std::fs::read(&legacy).expect("legacy kept"), b"stale");
-        let _ = std::fs::remove_file(&legacy);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cancelling_the_fallback_removes_its_container() {
-        let Some(docker) = docker_or_skip("cancelling_the_fallback_removes_its_container").await
-        else {
-            return;
-        };
-        let attempt = DumpAttempt::new(REDIS_TOOL, ENGINE_KEY, "cancel-test").expect("attempt");
-        let mut spec = logical_dump_spec(&attempt, 0, "unused", "");
-        spec.network_mode = None;
-        spec.cmd = vec!["sleep 120".to_string()];
-        let sidecar = spec.name.clone();
-        let _leftovers = DockerLeftovers {
-            containers: vec![sidecar.clone()],
-            network: None,
-        };
-
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let trigger = cancel.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            trigger.cancel();
-        });
-        let error = capture_dump(
-            &docker,
-            CaptureRequest {
-                tool: REDIS_TOOL,
-                spec,
-                container_path: attempt.container_path(SIDECAR_DUMP_GZ),
-                host_path: attempt.host_path(SIDECAR_DUMP_GZ),
-                failure_log: None,
-            },
-            &cancel,
-        )
-        .await
-        .expect_err("cancelled");
-
-        assert!(
-            matches!(error, DumpCaptureError::Cancelled { .. }),
-            "{error}"
-        );
-        assert!(matches!(BackupError::from(error), BackupError::Cancelled));
-        assert!(
-            container_is_gone(&docker, &sidecar).await,
-            "cancelled sidecar {sidecar} left behind"
-        );
-        assert!(!attempt.host_path(SIDECAR_DUMP_GZ).exists());
-    }
-
-    /// Shared `dump_capture` behaviour exercised with the Redis sidecar
-    /// image: a failing command's diagnostics file (the PostgreSQL engine's
-    /// redirected `pg_dumpall` stderr) is copied out of the container and
-    /// attached to the export error.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn failure_log_is_copied_out_and_attached_to_the_export_error() {
-        let Some(docker) =
-            docker_or_skip("failure_log_is_copied_out_and_attached_to_the_export_error").await
-        else {
-            return;
-        };
-        let attempt = DumpAttempt::new(REDIS_TOOL, ENGINE_KEY, "failure-log").expect("attempt");
-        let mut spec = logical_dump_spec(&attempt, 0, "unused", "");
-        spec.network_mode = None;
-        spec.cmd = vec![format!(
-            "mkdir -p {dir} && echo 'tool diagnostic: role missing' > {dir}/err.log; exit 3",
-            dir = attempt.container_dir()
-        )];
-        let sidecar = spec.name.clone();
-
-        let error = capture_dump(
-            &docker,
-            CaptureRequest {
-                tool: REDIS_TOOL,
-                spec,
-                container_path: attempt.container_path(SIDECAR_DUMP_GZ),
-                host_path: attempt.host_path(SIDECAR_DUMP_GZ),
-                failure_log: Some((
-                    attempt.container_path("err.log"),
-                    attempt.host_path("err.log"),
-                )),
-            },
-            &tokio_util::sync::CancellationToken::new(),
-        )
-        .await
-        .expect_err("command exits 3");
-
-        assert!(
-            matches!(
-                &error,
-                DumpCaptureError::Export { exit_code: 3, stderr, .. }
-                    if stderr.contains("tool diagnostic: role missing")
-            ),
-            "{error}"
-        );
-        assert!(container_is_gone(&docker, &sidecar).await);
+        assert!(matches!(
+            node_error(RedisNodeError::Refused {
+                service_id: 7,
+                service: "cache".to_string(),
+                operation: "backed up",
+                reason: "not running".to_string(),
+            }),
+            BackupError::PermanentFailure { .. }
+        ));
+        assert!(matches!(
+            node_error(RedisNodeError::BackupPush {
+                service_id: 7,
+                container: "redis-cache".to_string(),
+                exit_code: 1,
+                stderr: "boom".to_string(),
+            }),
+            BackupError::Failed { .. }
+        ));
     }
 }

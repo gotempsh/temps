@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! `GET`/`PUT /settings/cluster-network` (ADR 056): see and change the
-//! cluster compute pool from the console. The logic lives in
+//! cluster compute pool from the console. `POST
+//! /settings/cluster-network/network-id` (ADR 062) gives the cluster a new
+//! VXLAN network ID. The logic lives in
 //! [`ClusterNetworkService`]; these handlers check permissions, require a
 //! step-up for the change, record the audit trail and map errors.
 
@@ -20,13 +22,13 @@ use tracing::error;
 use utoipa::ToSchema;
 
 use crate::handlers::audit::{
-    ClusterComputePoolChangedAudit, ClusterComputePoolConfirmedAudit,
+    ClusterComputePoolChangedAudit, ClusterComputePoolConfirmedAudit, ClusterNetworkIdChangedAudit,
     ClusterOverlayNetworkNameChangedAudit,
 };
 use crate::services::cluster_network::{reassignments, ClusterNetworkError, ClusterNetworkService};
 pub use crate::services::cluster_network::{
     ClusterNetworkChangeResponse, ClusterNetworkControlPlane, ClusterNetworkNode,
-    ClusterNetworkReassignment, ClusterNetworkStatus,
+    ClusterNetworkReassignment, ClusterNetworkStatus, NetworkIdChange,
 };
 
 /// What the cluster network handlers need, as a request extension.
@@ -95,6 +97,11 @@ pub(crate) fn problem(error: ClusterNetworkError) -> Problem {
                     ))
             }
         },
+        ClusterNetworkError::NetworkIdChangeBlocked { .. } => {
+            problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Network ID Change Blocked")
+                .with_detail(error.to_string())
+        }
         ClusterNetworkError::Database(source) => {
             error!(error = %source, "cluster network: database error");
             problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
@@ -240,6 +247,69 @@ pub async fn update_cluster_network(
     }))
 }
 
+/// `POST /settings/cluster-network/network-id` answer.
+#[derive(Debug, Clone, serde::Serialize, ToSchema)]
+pub struct ClusterNetworkIdChangeResponse {
+    pub change: NetworkIdChange,
+    pub status: ClusterNetworkStatus,
+}
+
+/// Give this cluster its own VXLAN network ID (ADR 062)
+///
+/// Assigns a fresh random network ID. Every node's overlay, and the control
+/// plane's, is rebuilt on it at its next reconcile; cross-node traffic pauses
+/// until each one has. Refused while a node's agent has not reported that it
+/// can follow a new network ID.
+#[utoipa::path(
+    tag = "Nodes",
+    post,
+    path = "/settings/cluster-network/network-id",
+    operation_id = "ClusterNetworkIdChange",
+    responses(
+        (status = 200, description = "Network ID changed", body = ClusterNetworkIdChangeResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 409, description = "A node cannot follow a new network ID yet; the detail names it and the fix"),
+        (status = 428, description = "Re-authentication required"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn change_cluster_network_id(
+    RequireAuth(auth): RequireAuth,
+    Extension(state): Extension<ClusterNetworkAdminState>,
+    Extension(metadata): Extension<RequestMetadata>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, SettingsWrite);
+    require_sensitive_action(
+        state.sensitive_action_authorizer.as_ref(),
+        &auth,
+        SensitiveAction::ChangeClusterNetworkId,
+    )
+    .await?;
+    let change = state
+        .service
+        .assign_new_network_id()
+        .await
+        .map_err(problem)?;
+    let audit = ClusterNetworkIdChangedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        from: change.from,
+        to: change.to,
+    };
+    if let Err(error) = state.audit_service.create_audit_log(&audit).await {
+        error!(%error, "cluster network ID changed but audit record failed");
+    }
+    Ok(Json(ClusterNetworkIdChangeResponse {
+        change,
+        status: state.service.status().await.map_err(problem)?,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,6 +412,7 @@ mod tests {
             overlay_ready_cidr: ready_cidr.map(str::to_owned),
             overlay_remediation: None,
             overlay_network_name: None,
+            overlay_vxlan_vni: None,
             created_at: now,
             updated_at: now,
         }
@@ -400,5 +471,110 @@ mod tests {
         assert!(!status.can_change);
         assert!(status.nodes[0].in_use);
         assert!(status.change_blocked_by[0].contains("runs services that hold addresses"));
+    }
+
+    // ADR 062: a node that never reported a network ID (an older agent)
+    // would be cut off by a change, so the change is refused, naming it.
+    #[test]
+    fn a_new_network_id_waits_for_every_node_to_follow() {
+        let mut upgraded = node("web-1", Some("ready"), Some("172.20.0.0/24"));
+        upgraded.overlay_vxlan_vni = Some(42);
+        let old = node("worker-1", Some("ready"), None);
+        let status = crate::services::cluster_network::status_of(
+            &config(),
+            &[upgraded.clone(), old],
+            &Default::default(),
+            None,
+        );
+        assert_eq!(status.vxlan_network_id, 42);
+        assert_eq!(status.vxlan_port, 4789);
+        assert!(!status.can_change_network_id);
+        assert_eq!(status.network_id_change_blocked_by.len(), 1);
+        let reason = &status.network_id_change_blocked_by[0];
+        assert!(reason.contains("'worker-1'"), "{reason}");
+        assert!(reason.contains("sudo temps upgrade"), "{reason}");
+        assert_eq!(status.nodes[0].vxlan_network_id, Some(42));
+        assert_eq!(status.nodes[1].vxlan_network_id, None);
+
+        let status = crate::services::cluster_network::status_of(
+            &config(),
+            std::slice::from_ref(&upgraded),
+            &Default::default(),
+            None,
+        );
+        assert!(status.can_change_network_id);
+        assert!(status.network_id_change_blocked_by.is_empty());
+
+        // A native transport has no network ID to change.
+        let native = network_config::Model {
+            transport: "native".into(),
+            ..config()
+        };
+        let blocked =
+            crate::services::cluster_network::network_id_change_blockers(&native, &[upgraded]);
+        assert!(blocked[0].contains("native"), "{blocked:?}");
+    }
+
+    #[test]
+    fn a_blocked_network_id_change_is_a_conflict_naming_the_fix() {
+        let problem = problem(ClusterNetworkError::NetworkIdChangeBlocked {
+            blocked_by: vec!["node 'worker-1' has not reported ...; upgrade Temps on it".into()],
+        });
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        let body = serde_json::to_value(&problem.body).unwrap().to_string();
+        assert!(body.contains("worker-1"), "{body}");
+        assert!(body.contains("cannot change yet"), "{body}");
+    }
+
+    #[test]
+    fn a_node_blocked_by_a_network_id_in_use_is_flagged() {
+        let mut blocked = node("web-1", Some("unavailable"), None);
+        blocked.overlay_last_error = Some(temps_network::vxlan_holder::describe(
+            &temps_network::vxlan_holder::HolderFacts::device_only("vxlan-temps0"),
+            "vxlan-temps1",
+            42,
+            4789,
+        ));
+        // The wording agents older than ADR 062 used counts too.
+        let mut legacy = node("worker-1", Some("unavailable"), None);
+        legacy.overlay_last_error = Some(
+            "vxlan transport error on 'vxlan-temps1': VXLAN device 'vxlan-temps0' already \
+             holds vni=42, port=4789 on this host"
+                .into(),
+        );
+        let other = node("worker-2", Some("unavailable"), None);
+        let status = crate::services::cluster_network::status_of(
+            &config(),
+            &[blocked, legacy, other],
+            &Default::default(),
+            None,
+        );
+        assert!(status.nodes[0].vxlan_id_in_use);
+        assert!(status.nodes[1].vxlan_id_in_use);
+        assert!(!status.nodes[2].vxlan_id_in_use);
+    }
+
+    // ADR 062 / ADR 056: a node's own overlay devices and network in its
+    // occupied ranges are not shown as collisions.
+    #[test]
+    fn a_nodes_own_overlay_is_not_listed_as_occupied() {
+        let mut edge = node("edge-1", Some("unavailable"), None);
+        edge.occupied_ranges = Some(serde_json::json!([
+            {"cidr": "10.202.5.0/24", "source": "route", "name": "br-temps0"},
+            {"cidr": "10.202.6.0/24", "source": "docker", "name": "temps0"},
+            {"cidr": "172.20.0.0/16", "source": "route", "name": "br-f6051ccc7abf"}
+        ]));
+        let status = crate::services::cluster_network::status_of(
+            &config(),
+            &[edge],
+            &Default::default(),
+            None,
+        );
+        let names: Vec<&str> = status.nodes[0]
+            .occupied_ranges
+            .iter()
+            .map(|range| range.name.as_str())
+            .collect();
+        assert_eq!(names, ["br-f6051ccc7abf"]);
     }
 }

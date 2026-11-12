@@ -222,8 +222,7 @@ pub fn spawn(
             }))
             // The resolver the legacy handlers give their containers: this
             // node's Hickory resolver once `network_sync` has the bridge up,
-            // with public fallbacks so a stopped resolver never takes DNS
-            // down for every instance on the node.
+            // alone, so internal DNS policy cannot be bypassed (ADR-096).
             .with_cluster_dns(temps_workload::ResolverSource::new(move || {
                 overlay_bridge_address
                     .read()

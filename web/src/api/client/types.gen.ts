@@ -5440,6 +5440,26 @@ export type ClusterCapacity = {
 };
 
 /**
+ * `GET /cluster/dns/resolvers`.
+ */
+export type ClusterDnsResolversResponse = {
+    cluster_dns_enabled: boolean;
+    open_alerts: Array<DnsAlertEntry>;
+    /**
+     * How often resolvers report, in seconds.
+     */
+    report_interval_secs: number;
+    /**
+     * Control plane first, then workers by id.
+     */
+    resolvers: Array<DnsResolverEntry>;
+    /**
+     * Records in the zone (`service_endpoints`).
+     */
+    zone_record_count: number;
+};
+
+/**
  * Cluster-DNS resolver settings (ADR-024, experimental beta).
  *
  * When `enabled`, the Temps control plane starts a Hickory DNS resolver and
@@ -5653,6 +5673,14 @@ export type ClusterNetworkControlPlane = {
 };
 
 /**
+ * `POST /settings/cluster-network/network-id` answer.
+ */
+export type ClusterNetworkIdChangeResponse = {
+    change: NetworkIdChange;
+    status: ClusterNetworkStatus;
+};
+
+/**
  * One worker's view of the overlay.
  */
 export type ClusterNetworkNode = {
@@ -5689,6 +5717,17 @@ export type ClusterNetworkNode = {
      * `ready`, `unavailable`, or `None` when its agent never reported it.
      */
     overlay_status?: string | null;
+    /**
+     * Whether its overlay is unavailable because another VXLAN device on
+     * its host holds the cluster's network ID; giving the cluster its own
+     * network ID fixes that without touching the host.
+     */
+    vxlan_id_in_use: boolean;
+    /**
+     * The VXLAN network ID its agent reports it follows (ADR 062). `None`:
+     * its agent predates per-cluster network IDs, or never reported.
+     */
+    vxlan_network_id?: number | null;
 };
 
 /**
@@ -5725,6 +5764,11 @@ export type ClusterNetworkStatus = {
      */
     can_change: boolean;
     /**
+     * Whether `POST /settings/cluster-network/network-id` can assign a new
+     * network ID now, and why not: the nodes that could not follow it.
+     */
+    can_change_network_id: boolean;
+    /**
      * Why it cannot: the members using the pool, or a control-plane setup
      * in progress.
      */
@@ -5740,6 +5784,7 @@ export type ClusterNetworkStatus = {
      * The WireGuard mesh pool; a compute pool may not overlap it.
      */
     mesh_pool_cidr: string;
+    network_id_change_blocked_by: Array<string>;
     nodes: Array<ClusterNetworkNode>;
     /**
      * The cluster's overlay network name (ADR 059): the Docker network
@@ -5753,6 +5798,11 @@ export type ClusterNetworkStatus = {
      */
     pool_confirmed: boolean;
     subnet_prefix_len: number;
+    /**
+     * The cluster's VXLAN network ID and UDP port (ADR 062).
+     */
+    vxlan_network_id: number;
+    vxlan_port: number;
 };
 
 /**
@@ -7052,6 +7102,14 @@ export type ContainerRuntimeInfo = {
      * when the container does not exist.
      */
     status?: string | null;
+    /**
+     * Why the fields above could not be read, when they could not: this
+     * server has no Docker daemon for a local container, the agent on the
+     * container's node could not be reached, or it is too old to report
+     * this. `None` with an empty `container_id` means the container does
+     * not exist.
+     */
+    unavailable_reason?: string | null;
 };
 
 /**
@@ -7107,6 +7165,13 @@ export type ContainerStatsSample = {
      */
     online_cpus?: number | null;
     role: string;
+    /**
+     * Why no sample could be taken, when none could: this server has no
+     * Docker daemon for a local container, the agent on the container's
+     * node could not be reached, or it is too old to report usage. `None`
+     * with empty fields means the container is missing or stopped.
+     */
+    unavailable_reason?: string | null;
 };
 
 export type ContentPart = {
@@ -8300,6 +8365,27 @@ export type CreateIntegrationBody = {
     signing_secret: SecretString;
 };
 
+export type CreateInternalAccessGrantRequest = {
+    /**
+     * Only this environment of the calling project; omit for every
+     * environment, present and future.
+     */
+    caller_environment_id?: number | null;
+    /**
+     * The project whose workloads may call.
+     */
+    caller_project_id: number;
+    /**
+     * Why the grant exists, up to 200 characters.
+     */
+    description?: string | null;
+    /**
+     * The environment of this project that may be called; omit for every
+     * environment, present and future.
+     */
+    target_environment_id?: number | null;
+};
+
 /**
  * Request to create an IP access control rule
  */
@@ -8926,6 +9012,7 @@ export type CreateS3SourceRequest = {
      * provider; stored encrypted and never returned.
      */
     secret_key: SecretString;
+    worker_credentials?: WorkerCredentialsPolicy | null;
 };
 
 export type CreateSandboxBody = {
@@ -11084,6 +11171,24 @@ export type DnsAckResponse = {
 };
 
 /**
+ * An open DNS alarm.
+ */
+export type DnsAlertEntry = {
+    /**
+     * `dns_resolver_down`, `dns_sync_stale`, `dns_query_failures` or
+     * `dns_internal_proxy_down`.
+     */
+    alarm_type: string;
+    fired_at: string;
+    id: number;
+    message?: string | null;
+    node_id?: number | null;
+    severity: string;
+    status: string;
+    title: string;
+};
+
+/**
  * Result of a single DNS TXT record creation for ACME challenge
  */
 export type DnsChallengeRecordResult = {
@@ -11134,6 +11239,25 @@ export type DnsCompletionResponse = {
  * Who makes the published hostnames resolve.
  */
 export type DnsHandling = 'automatic' | 'manual' | 'provider_hostname';
+
+/**
+ * Whether the asking project may call an internal route (ADR 101 D7).
+ */
+export type DnsInternalAccess = {
+    /**
+     * `same_project`, `granted`, `some_environments` or `not_granted`.
+     */
+    reach: string;
+    /**
+     * Where the owning project's grants are managed in the console.
+     */
+    setup_path: string;
+    target_environment_id: number;
+    target_environment_name: string;
+    target_project_id: number;
+    target_project_name: string;
+    target_project_slug: string;
+};
 
 /**
  * Error response for DNS lookup failures
@@ -11205,6 +11329,18 @@ export type DnsNameConflictEntry = {
      * `service_member`, `node` or `static`.
      */
     owner_kind: string;
+};
+
+/**
+ * Queries per outcome in one bucket.
+ */
+export type DnsOutcomeCounts = {
+    error: number;
+    nodata: number;
+    noerror: number;
+    nxdomain: number;
+    refused: number;
+    servfail: number;
 };
 
 /**
@@ -11290,6 +11426,47 @@ export type DnsProviderSettingsMasked = {
  * Supported DNS provider types
  */
 export type DnsProviderType = 'cloudflare' | 'bunny' | 'namecheap' | 'route53' | 'digitalocean' | 'gcp' | 'azure' | 'manual' | 'pebble';
+
+/**
+ * One logged query.
+ */
+export type DnsQueryLogEntry = {
+    answer_count: number;
+    environment_id?: number | null;
+    environment_name?: string | null;
+    id: number;
+    latency_us: number;
+    node_id: number;
+    node_name: string;
+    observed_at: string;
+    outcome: string;
+    project_id?: number | null;
+    project_name?: string | null;
+    /**
+     * The name asked; `None` for a forwarded (outside-zone) name, which is
+     * never stored.
+     */
+    qname?: string | null;
+    qtype: string;
+    service_id?: number | null;
+    service_name?: string | null;
+    source_ip: string;
+    /**
+     * `internal` or `external`.
+     */
+    zone: string;
+};
+
+export type DnsQueryLogResponse = {
+    items: Array<DnsQueryLogEntry>;
+    page: number;
+    page_size: number;
+    /**
+     * How long entries are kept, in hours.
+     */
+    retention_hours: number;
+    total: number;
+};
 
 /**
  * A DNS record
@@ -11486,6 +11663,35 @@ export type DnsRecordContent = {
 };
 
 /**
+ * One record of the internal zone.
+ */
+export type DnsRecordEntry = {
+    created_at: string;
+    environment_id?: number | null;
+    environment_name?: string | null;
+    fqdn: string;
+    generation: number;
+    id: number;
+    node_id?: number | null;
+    node_name?: string | null;
+    owner_id: number;
+    /**
+     * What published it: `environment`, `service_member`, `service_role`,
+     * `node`, `static`.
+     */
+    owner_kind: string;
+    project_id?: number | null;
+    project_name?: string | null;
+    record_type: string;
+    service_id?: number | null;
+    service_name?: string | null;
+    target_ip?: string | null;
+    target_port?: number | null;
+    ttl: number;
+    updated_at: string;
+};
+
+/**
  * A DNS record the operator must create.
  */
 export type DnsRecordInstruction = {
@@ -11505,6 +11711,13 @@ export type DnsRecordInstruction = {
      * Record value.
      */
     value: string;
+};
+
+export type DnsRecordListResponse = {
+    items: Array<DnsRecordEntry>;
+    page: number;
+    page_size: number;
+    total: number;
 };
 
 export type DnsRecordResponse = {
@@ -11597,6 +11810,117 @@ export type DnsRecordStatusResponse = 'unknown' | 'verified' | 'pending' | 'fail
 export type DnsRecordType = 'A' | 'AAAA' | 'CNAME' | 'TXT' | 'MX' | 'NS' | 'SRV' | 'CAA' | 'PTR';
 
 /**
+ * `POST /cluster/dns/resolve`.
+ */
+export type DnsResolveRequest = {
+    /**
+     * The name, e.g. `production.shop.temps.local`.
+     */
+    name: string;
+    /**
+     * The node whose resolver answers; 0 is the control plane.
+     */
+    node_id: number;
+    /**
+     * Answer as one of this project's containers on that node would be
+     * answered, its network policy included.
+     */
+    project_id?: number | null;
+    /**
+     * `A` (default), `AAAA`, `CNAME`, `SRV` or `TXT`.
+     */
+    record_type?: string | null;
+};
+
+export type DnsResolveResponse = {
+    answers: Array<DnsResolvedRecord>;
+    /**
+     * The container address the query was answered as.
+     */
+    asked_as?: string | null;
+    /**
+     * Answered from the internal zone.
+     */
+    authoritative: boolean;
+    internal_access?: DnsInternalAccess | null;
+    latency_ms: number;
+    name: string;
+    node_id: number;
+    /**
+     * A caveat about how the answer was obtained.
+     */
+    note?: string | null;
+    /**
+     * `noerror`, `nodata`, `nxdomain`, `servfail`, `error`.
+     */
+    outcome: string;
+    /**
+     * `NOERROR`, `NXDOMAIN`, `SERVFAIL`...
+     */
+    rcode: string;
+    record_type: string;
+};
+
+/**
+ * One answer record.
+ */
+export type DnsResolvedRecord = {
+    data: string;
+    name: string;
+    record_type: string;
+    ttl: number;
+};
+
+/**
+ * One node's resolver, as last reported.
+ */
+export type DnsResolverEntry = {
+    build_version?: string | null;
+    consecutive_sync_failures: number;
+    /**
+     * Query-log entries the resolver dropped under load.
+     */
+    dropped_log_entries: number;
+    health: ResolverHealth;
+    /**
+     * Why the resolver is not healthy.
+     */
+    health_reason?: string | null;
+    internal_proxy?: InternalProxyState | null;
+    is_control_plane: boolean;
+    last_error?: string | null;
+    last_ok_at?: string | null;
+    /**
+     * Seconds since the zone last synced; `None` for the control plane,
+     * whose zone is fed locally.
+     */
+    last_sync_age_secs?: number | null;
+    listen_address?: string | null;
+    /**
+     * 0 is the control plane.
+     */
+    node_id: number;
+    node_name: string;
+    /**
+     * `active`, `draining`, `offline`...; `active` for the control plane.
+     */
+    node_status: string;
+    /**
+     * Records the resolver serves.
+     */
+    record_count?: number | null;
+    /**
+     * `ok`, `agent_too_old`, `unreachable`, `rejected` or `invalid`;
+     * `None` before the first report.
+     */
+    report_state?: string | null;
+    reported_at?: string | null;
+    running: boolean;
+    tasks_alive: boolean;
+    zone_generation?: number | null;
+};
+
+/**
  * Wire DTO for [`HeartbeatApiRequest::dns_resolver`]. Mirrors
  * `temps_node_agent::network_sync::DnsResolverHeartbeat` field-for-field, but
  * declared separately rather than shared: the agent and control-plane
@@ -11624,6 +11948,31 @@ export type DnsResolverHeartbeat = {
      * meaningful when `running`.
      */
     tasks_alive?: boolean;
+};
+
+export type DnsTrafficBucket = {
+    /**
+     * Forwarded queries.
+     */
+    external: DnsOutcomeCounts;
+    /**
+     * `*.temps.local` queries.
+     */
+    internal: DnsOutcomeCounts;
+    /**
+     * Mean latency of internal queries, in milliseconds.
+     */
+    internal_latency_ms?: number | null;
+    time: string;
+};
+
+export type DnsTrafficResponse = {
+    buckets: Array<DnsTrafficBucket>;
+    from: string;
+    node_id: number;
+    range: string;
+    step_secs: number;
+    to: string;
 };
 
 /**
@@ -16917,6 +17266,12 @@ export type HeartbeatApiRequest = {
      * when the set changes. Absent from older agents.
      */
     overlay_addresses?: Array<OverlayAddressReport> | null;
+    /**
+     * The VXLAN network ID this node's overlay follows (ADR 062): that of
+     * the last peer list it acted on. Absent from older agents, which run
+     * every overlay on 42.
+     */
+    overlay_vxlan_vni?: number | null;
     public_ingress?: PublicIngressHeartbeat | null;
 };
 
@@ -18323,6 +18678,85 @@ export type Intent = {
     type: 'http_policy';
 };
 
+export type InternalAccessGrantListResponse = {
+    items: Array<InternalAccessGrantResponse>;
+    page: number;
+    page_size: number;
+    total: number;
+};
+
+/**
+ * One grant: who (a project, or one environment of it) may call what (this
+ * project, or one environment of it).
+ */
+export type InternalAccessGrantResponse = {
+    /**
+     * `null`: every environment of the caller project.
+     */
+    caller_environment_id?: number | null;
+    caller_environment_name?: string | null;
+    caller_project_id: number;
+    caller_project_name: string;
+    caller_project_slug: string;
+    created_at: string;
+    created_by?: number | null;
+    description?: string | null;
+    id: number;
+    /**
+     * `null`: every environment of the target project.
+     */
+    target_environment_id?: number | null;
+    target_environment_name?: string | null;
+    target_project_id: number;
+    target_project_name: string;
+    target_project_slug: string;
+};
+
+/**
+ * A worker's internal routing, from its heartbeat's
+ * `capacity.internal_proxy`. Every `<env>.<project>.temps.local` name
+ * points at the node's bridge, port 80: the resolver can be healthy while
+ * nothing serves those calls, and then the names resolve and every call to
+ * them fails.
+ */
+export type InternalProxyState = {
+    /**
+     * What containers call, e.g. `10.205.0.1:80`.
+     */
+    address?: string | null;
+    /**
+     * Why the calls are not served; `None` while they are.
+     */
+    error?: string | null;
+    /**
+     * Whether containers' calls to port 80 of the bridge address are
+     * served. `None` when the agent does not report it (an older agent, or
+     * no overlay bridge yet): unknown, never "not listening".
+     */
+    listening?: boolean | null;
+    mode?: InternalRoutingMode | null;
+    /**
+     * The proxy's own listener, e.g. `10.205.0.1:591`, while the agent
+     * holds it.
+     */
+    proxy_address?: string | null;
+    redirect?: InternalRedirectState | null;
+    /**
+     * Why the redirect is missing, also while the fallback serves.
+     */
+    redirect_error?: string | null;
+};
+
+/**
+ * Whether a worker's port-80 redirect is in place.
+ */
+export type InternalRedirectState = 'installed' | 'missing' | 'unsupported';
+
+/**
+ * How a worker serves port 80 of its bridge address (ADR-098 D5).
+ */
+export type InternalRoutingMode = 'redirect' | 'direct' | 'down';
+
 /**
  * One CIDR in a policy, in canonical form (network address, explicit prefix).
  */
@@ -19513,6 +19947,37 @@ export type ManagedBackupSetupAction = 'none' | 'retry' | 'renew_subscription';
 export type ManagedBackupSetupStatus = 'disabled' | 'ready' | 'needs_setup' | 'subscription_required' | 'unavailable';
 
 /**
+ * The managed-services CA certificate, to add to a client's trust store.
+ */
+export type ManagedCaCertificateResponse = {
+    /**
+     * PEM-encoded CA certificate. Public material; the key never leaves
+     * the control plane.
+     */
+    certificate_pem: string;
+    /**
+     * Suggested file name for the download.
+     */
+    file_name: string;
+    fingerprint_sha256: string;
+    not_after: string;
+    not_before: string;
+};
+
+/**
+ * The managed-services CA. Public facts only.
+ */
+export type ManagedCaInfoResponse = {
+    /**
+     * SHA-256 (lowercase hex) of the CA certificate's DER encoding: compare
+     * it with the downloaded file before trusting it.
+     */
+    fingerprint_sha256: string;
+    not_after: string;
+    not_before: string;
+};
+
+/**
  * Response of the container-name settings endpoints.
  */
 export type ManagedContainerNameSettings = {
@@ -20694,6 +21159,14 @@ export type NetworkConfiguration = {
 };
 
 /**
+ * `POST /settings/cluster-network/network-id` answer.
+ */
+export type NetworkIdChange = {
+    from: number;
+    to: number;
+};
+
+/**
  * Information about a network interface
  */
 export type NetworkInterface = {
@@ -21011,6 +21484,34 @@ export type NodeDnsStatusEntry = {
      */
     dns_resolver_running?: boolean | null;
     dns_resolver_tasks_alive?: boolean | null;
+    /**
+     * What containers call, e.g. `10.205.0.1:80`.
+     */
+    internal_proxy_address?: string | null;
+    /**
+     * Why the calls are not served, written for the operator; `None` while
+     * they are.
+     */
+    internal_proxy_error?: string | null;
+    /**
+     * The proxy's own listener, e.g. `10.205.0.1:591`, while the agent
+     * holds it.
+     */
+    internal_proxy_listen_address?: string | null;
+    /**
+     * Whether containers' calls to port 80 of the node's bridge address,
+     * where every `<env>.<project>.temps.local` name points, are served.
+     * The resolver can be healthy while this is `false`: the names resolve
+     * and every call fails. `None` = not reported (older agent, or no
+     * overlay bridge yet).
+     */
+    internal_proxy_listening?: boolean | null;
+    internal_proxy_mode?: InternalRoutingMode | null;
+    internal_proxy_redirect?: InternalRedirectState | null;
+    /**
+     * Why the redirect is missing, also while the fallback serves.
+     */
+    internal_proxy_redirect_error?: string | null;
     node_id: number;
     node_name: string;
     /**
@@ -23094,6 +23595,7 @@ export type PeerListResponse = {
      * All other nodes with a `compute_cidr` set, excluding the caller.
      */
     peers: Array<PeerEntry>;
+    vxlan?: VxlanEntry | null;
     wireguard?: WireguardMeshEntry | null;
 };
 
@@ -23637,7 +24139,8 @@ export type PlanRequest = {
 export type PlanSourceBackup = {
     created_at?: string | null;
     /**
-     * "walg", "pg_dump", "mariadb_physical", "mariadb_dump", "unknown".
+     * "walg", "pg_dump", "mariadb_physical", "mariadb_dump", "mongodump",
+     * "redis_rdb", "s3_mirror", "unknown".
      */
     format: string;
     /**
@@ -23690,6 +24193,16 @@ export type PlaneIdentityResponse = {
      * is off or not up yet.
      */
     control_plane_wg_public_key?: string | null;
+    /**
+     * The cluster's VXLAN UDP port, with `vxlan_vni`.
+     */
+    vxlan_port?: number | null;
+    /**
+     * The cluster's VXLAN network ID (ADR 062), so a join can warn before
+     * spending its token when a device on the host already holds it. Not
+     * secret: it is in every overlay packet. `None` from an older plane.
+     */
+    vxlan_vni?: number | null;
 };
 
 /**
@@ -24884,6 +25397,14 @@ export type ProjectLimitsResponse = {
  */
 export type ProjectMonitorHealth = {
     project_id: number;
+    /**
+     * Short, credential-free explanation of the worker observation.
+     */
+    runtime_reason?: string | null;
+    /**
+     * Worker runtime health when external uptime has no address to check.
+     */
+    runtime_status?: string | null;
     /**
      * Overall status: "operational", "degraded", "down", "not_deployed"
      * (monitors exist but the environment has no deployment to check yet),
@@ -27747,6 +28268,11 @@ export type ResolverCoverageHost = {
 };
 
 /**
+ * What a resolver looks like right now.
+ */
+export type ResolverHealth = 'healthy' | 'stale' | 'down' | 'off' | 'node_unavailable' | 'agent_too_old' | 'not_reporting' | 'no_local_resolver';
+
+/**
  * Quick count of resources involved in the migration
  */
 export type ResourceCounts = {
@@ -28029,7 +28555,9 @@ export type RestorePlan = {
     steps: Array<string>;
     /**
      * How the restore will be performed: "walg_restore", "pg_dump_restore",
-     * "mariadb_physical_restore", "mariadb_dump_restore", or "unsupported".
+     * "mariadb_physical_restore", "mariadb_dump_restore",
+     * "mongodump_restore", "redis_rdb_restore", "s3_mirror_restore", or
+     * "unsupported".
      */
     strategy: string;
     /**
@@ -28699,18 +29227,6 @@ export type S3ConnectionTestResponse = {
 };
 
 /**
- * S3 credentials distributed to agents for backup/restore operations.
- */
-export type S3CredentialsResponse = {
-    access_key_id: string;
-    bucket_name: string;
-    endpoint?: string | null;
-    force_path_style: boolean;
-    region: string;
-    secret_key: string;
-};
-
-/**
  * Outcome of copying one managed S3 service's buckets into another.
  */
 export type S3MigrationReport = {
@@ -28745,6 +29261,10 @@ export type S3SourceResponse = {
     name: string;
     region: string;
     updated_at: number;
+    /**
+     * What a worker node receives from this source (ADR-102).
+     */
+    worker_credentials: WorkerCredentialsPolicy;
 };
 
 /**
@@ -30110,6 +30630,11 @@ export type SeriesStateEntry = {
 };
 
 /**
+ * Server-side TLS mode of one managed service.
+ */
+export type ServerTlsMode = 'off' | 'available' | 'required';
+
+/**
  * Response containing information about how the service is being accessed
  */
 export type ServiceAccessInfo = {
@@ -30734,6 +31259,100 @@ export type ServiceTemplateUpgradeChange = {
     field: string;
     kind: ServiceTemplateChangeKind;
     target?: string | null;
+};
+
+/**
+ * The certificate currently issued for a service. Public facts only.
+ */
+export type ServiceTlsCertificateResponse = {
+    /**
+     * SHA-256 (lowercase hex) of the certificate's DER encoding.
+     */
+    fingerprint_sha256: string;
+    not_after: string;
+    not_before: string;
+    /**
+     * Names the certificate is valid for.
+     */
+    subject_alt_names: Array<string>;
+};
+
+/**
+ * What one data node of a cluster serves.
+ */
+export type ServiceTlsMemberResponse = {
+    /**
+     * Whether it serves the managed certificate. `null` when it could not
+     * be read (see `detail`).
+     */
+    active?: boolean | null;
+    container_name: string;
+    /**
+     * Why its state is unknown, when it is.
+     */
+    detail?: string | null;
+    /**
+     * Whether it lags the setting; the next start applies it.
+     */
+    pending: boolean;
+    /**
+     * Whether it still serves pg_auto_failover's self-signed certificate,
+     * which clients cannot verify.
+     */
+    self_signed: boolean;
+    /**
+     * The member's lifecycle status (`running`, `stopped`, ...).
+     */
+    status: string;
+};
+
+/**
+ * A service's effective server TLS status.
+ */
+export type ServiceTlsStatusResponse = {
+    /**
+     * Whether the server accepts unencrypted connections in this mode.
+     */
+    accepts_plaintext: boolean;
+    /**
+     * Whether the managed certificate is served: by the container, or by
+     * every data node of a cluster. `null` when it cannot be inspected (not
+     * created yet, no Docker daemon here, or cluster members disagree).
+     */
+    active?: boolean | null;
+    /**
+     * Where to download the CA certificate, once it exists.
+     */
+    ca_certificate_path?: string | null;
+    certificate?: ServiceTlsCertificateResponse | null;
+    certificate_authority?: ManagedCaInfoResponse | null;
+    /**
+     * Whether changing the mode restarts the database. False for a
+     * cluster, whose data nodes switch certificates in place.
+     */
+    change_restarts_database: boolean;
+    /**
+     * A cluster's data nodes; empty for a standalone service.
+     */
+    members: Array<ServiceTlsMemberResponse>;
+    /**
+     * `off`, `available` (TLS offered, plaintext still accepted) or
+     * `required` (plaintext rejected; not yet supported).
+     */
+    mode: ServerTlsMode;
+    /**
+     * What runs lags the setting; the next start (or a restart) applies it.
+     */
+    pending_restart: boolean;
+    service_id: number;
+    /**
+     * Whether this service can use managed TLS at all.
+     */
+    supported: boolean;
+    /**
+     * Why not, when `supported` is false.
+     */
+    unsupported_reason?: string | null;
 };
 
 export type ServiceTypeInfo = {
@@ -35311,9 +35930,11 @@ export type UpdateCapabilityResponse = {
      */
     supervisor: SupervisorKind;
     /**
-     * What a new worker installs so it never runs an older Temps than this
-     * server: this release, or the newest nightly build for a build made
-     * between releases.
+     * What a new worker installs to match this server: this release, or,
+     * for a build made between releases (which no release contains), the
+     * newest nightly build. Nightly builds are cut daily from `main`, so a
+     * server built from commits newer than the latest nightly, or from a
+     * branch that never reached `main`, can get a worker without them.
      */
     worker_install: WorkerInstall;
 };
@@ -36317,6 +36938,7 @@ export type UpdateS3SourceRequest = {
      */
     region?: string | null;
     secret_key?: SecretString | null;
+    worker_credentials?: WorkerCredentialsPolicy | null;
 };
 
 /**
@@ -36363,6 +36985,18 @@ export type UpdateServiceTemplateRuntimeRequest = {
     imageRef: string;
     memoryLimit?: number | null;
     memoryRequest?: number | null;
+};
+
+export type UpdateServiceTlsRequest = {
+    /**
+     * The new mode. `required` is rejected until it is supported.
+     */
+    mode: ServerTlsMode;
+};
+
+export type UpdateServiceTlsResponse = {
+    previous_mode: ServerTlsMode;
+    tls: ServiceTlsStatusResponse;
 };
 
 export type UpdateSessionDurationRequest = {
@@ -37439,6 +38073,14 @@ export type VulnerabilityResponse = {
 };
 
 /**
+ * The VXLAN network ID and UDP port every overlay of this cluster uses.
+ */
+export type VxlanEntry = {
+    port: number;
+    vni: number;
+};
+
+/**
  * One actionable warning surfaced to the UI.
  *
  * Each variant carries the data needed to render a remediation hint without
@@ -37819,8 +38461,13 @@ export type WireguardMeshStatusResponse = {
 };
 
 /**
- * What a new worker installs, so it never runs an older Temps than its
- * control plane.
+ * What a worker node may receive from an S3 source (ADR-102).
+ */
+export type WorkerCredentialsPolicy = 'scoped' | 'allow_full';
+
+/**
+ * What a new worker installs to match its control plane, as closely as a
+ * published build allows.
  */
 export type WorkerInstall = {
     kind: 'release';
@@ -38526,6 +39173,10 @@ export type S3SourceResponseWritable = {
     region: string;
     secret_key: string;
     updated_at: number;
+    /**
+     * What a worker node receives from this source (ADR-102).
+     */
+    worker_credentials: WorkerCredentialsPolicy;
 };
 
 export type SaveAccessServiceWritable = {
@@ -49034,6 +49685,204 @@ export type DeleteAccessProviderResponses = {
 
 export type DeleteAccessProviderResponse = DeleteAccessProviderResponses[keyof DeleteAccessProviderResponses];
 
+export type ListDnsQueriesData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Page number (1-indexed).
+         */
+        page?: number;
+        /**
+         * Entries per page, at most 100. Defaults to 20.
+         */
+        page_size?: number;
+        /**
+         * Queries answered by this node's resolver (0 is the control plane).
+         */
+        node_id?: number;
+        /**
+         * `noerror`, `nodata`, `nxdomain`, `servfail`, `refused` or `error`.
+         */
+        outcome?: string;
+        /**
+         * `internal` or `external`.
+         */
+        zone?: string;
+        /**
+         * Substring of the name asked.
+         */
+        name?: string;
+        /**
+         * Queries from this project's containers.
+         */
+        project_id?: number;
+    };
+    url: '/cluster/dns/queries';
+};
+
+export type ListDnsQueriesErrors = {
+    /**
+     * Invalid filter
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListDnsQueriesResponses = {
+    /**
+     * Recent DNS queries
+     */
+    200: DnsQueryLogResponse;
+};
+
+export type ListDnsQueriesResponse = ListDnsQueriesResponses[keyof ListDnsQueriesResponses];
+
+export type ListDnsRecordsData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Page number (1-indexed).
+         */
+        page?: number;
+        /**
+         * Records per page, at most 100. Defaults to 20.
+         */
+        page_size?: number;
+        /**
+         * Substring of the name or target address.
+         */
+        search?: string;
+        /**
+         * Records pinned to this node.
+         */
+        node_id?: number;
+        /**
+         * `environment`, `service_member`, `service_role`, `node` or `static`.
+         */
+        owner_kind?: string;
+    };
+    url: '/cluster/dns/records';
+};
+
+export type ListDnsRecordsErrors = {
+    /**
+     * Invalid filter
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListDnsRecordsResponses = {
+    /**
+     * Records of the internal zone
+     */
+    200: DnsRecordListResponse;
+};
+
+export type ListDnsRecordsResponse = ListDnsRecordsResponses[keyof ListDnsRecordsResponses];
+
+export type ResolveDnsNameData = {
+    body: DnsResolveRequest;
+    path?: never;
+    query?: never;
+    url: '/cluster/dns/resolve';
+};
+
+export type ResolveDnsNameErrors = {
+    /**
+     * Invalid name or record type
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Node not found
+     */
+    404: unknown;
+    /**
+     * The resolver is not running, the agent is too old, or the project has no container on that node
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+    /**
+     * The resolver could not be reached
+     */
+    502: unknown;
+};
+
+export type ResolveDnsNameResponses = {
+    /**
+     * The answer
+     */
+    200: DnsResolveResponse;
+};
+
+export type ResolveDnsNameResponse = ResolveDnsNameResponses[keyof ResolveDnsNameResponses];
+
+export type ListDnsResolversData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/cluster/dns/resolvers';
+};
+
+export type ListDnsResolversErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListDnsResolversResponses = {
+    /**
+     * Resolver health per node
+     */
+    200: ClusterDnsResolversResponse;
+};
+
+export type ListDnsResolversResponse = ListDnsResolversResponses[keyof ListDnsResolversResponses];
+
 export type ClusterDnsStatusData = {
     body?: never;
     path?: never;
@@ -49064,6 +49913,51 @@ export type ClusterDnsStatusResponses = {
 };
 
 export type ClusterDnsStatusResponse2 = ClusterDnsStatusResponses[keyof ClusterDnsStatusResponses];
+
+export type DnsTrafficData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * The node whose resolver to chart; 0 (the default) is the control
+         * plane.
+         */
+        node_id?: number;
+        /**
+         * `1h` (default), `6h`, `24h` or `7d`.
+         */
+        range?: string;
+    };
+    url: '/cluster/dns/traffic';
+};
+
+export type DnsTrafficErrors = {
+    /**
+     * Invalid range
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type DnsTrafficResponses = {
+    /**
+     * DNS traffic over time
+     */
+    200: DnsTrafficResponse;
+};
+
+export type DnsTrafficResponse2 = DnsTrafficResponses[keyof DnsTrafficResponses];
 
 export type GetDashboardProjectsAnalyticsData = {
     body?: never;
@@ -54677,6 +55571,10 @@ export type GetRestoreCapabilitiesErrors = {
      * Service not found
      */
     404: ProblemDetails;
+    /**
+     * The service's engine cannot be reached to read its restore options
+     */
+    503: ProblemDetails;
 };
 
 export type GetRestoreCapabilitiesError = GetRestoreCapabilitiesErrors[keyof GetRestoreCapabilitiesErrors];
@@ -54951,6 +55849,140 @@ export type StopServiceResponses = {
 
 export type StopServiceResponse = StopServiceResponses[keyof StopServiceResponses];
 
+export type GetServiceTlsData = {
+    body?: never;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/tls';
+};
+
+export type GetServiceTlsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Service not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetServiceTlsError = GetServiceTlsErrors[keyof GetServiceTlsErrors];
+
+export type GetServiceTlsResponses = {
+    /**
+     * Effective server TLS status
+     */
+    200: ServiceTlsStatusResponse;
+};
+
+export type GetServiceTlsResponse = GetServiceTlsResponses[keyof GetServiceTlsResponses];
+
+export type UpdateServiceTlsData = {
+    body: UpdateServiceTlsRequest;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/tls';
+};
+
+export type UpdateServiceTlsErrors = {
+    /**
+     * The service cannot use this mode
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Service not found
+     */
+    404: ProblemDetails;
+    /**
+     * A major upgrade is in progress, the service is still being created or starting, or the recreate guard kept its existing container so the mode was not applied
+     */
+    409: ProblemDetails;
+    /**
+     * Applying the mode failed; the previous mode was kept
+     */
+    500: ProblemDetails;
+};
+
+export type UpdateServiceTlsError = UpdateServiceTlsErrors[keyof UpdateServiceTlsErrors];
+
+export type UpdateServiceTlsResponses = {
+    /**
+     * Mode changed and applied (a running database is restarted)
+     */
+    200: UpdateServiceTlsResponse;
+};
+
+export type UpdateServiceTlsResponse2 = UpdateServiceTlsResponses[keyof UpdateServiceTlsResponses];
+
+export type GetManagedCaCertificateData = {
+    body?: never;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/tls/ca-certificate';
+};
+
+export type GetManagedCaCertificateErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Service not found, or no CA exists yet
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetManagedCaCertificateError = GetManagedCaCertificateErrors[keyof GetManagedCaCertificateErrors];
+
+export type GetManagedCaCertificateResponses = {
+    /**
+     * The managed-services CA certificate (public)
+     */
+    200: ManagedCaCertificateResponse;
+};
+
+export type GetManagedCaCertificateResponse = GetManagedCaCertificateResponses[keyof GetManagedCaCertificateResponses];
+
 export type UpgradeServiceData = {
     body: UpgradeExternalServiceRequest;
     path: {
@@ -55005,7 +56037,7 @@ export type GetPostgresWalHealthData = {
 
 export type GetPostgresWalHealthErrors = {
     /**
-     * Service not found, or no WAL snapshot available
+     * Service not found, or no WAL snapshot available. Type `https://temps.sh/probs/wal-health-not-checked` with `reason` and `checked_at` when the last check could not run
      */
     404: unknown;
     /**
@@ -60676,46 +61708,6 @@ export type AdminSetNodeResourcesResponses = {
 
 export type AdminSetNodeResourcesResponse = AdminSetNodeResourcesResponses[keyof AdminSetNodeResourcesResponses];
 
-export type GetS3CredentialsData = {
-    body?: never;
-    path: {
-        /**
-         * Node ID
-         */
-        node_id: number;
-        /**
-         * S3 source ID
-         */
-        s3_source_id: number;
-    };
-    query?: never;
-    url: '/internal/nodes/{node_id}/s3-credentials/{s3_source_id}';
-};
-
-export type GetS3CredentialsErrors = {
-    /**
-     * Unauthorized
-     */
-    401: unknown;
-    /**
-     * S3 source not found
-     */
-    404: unknown;
-    /**
-     * Internal server error
-     */
-    500: unknown;
-};
-
-export type GetS3CredentialsResponses = {
-    /**
-     * S3 credentials
-     */
-    200: S3CredentialsResponse;
-};
-
-export type GetS3CredentialsResponse = GetS3CredentialsResponses[keyof GetS3CredentialsResponses];
-
 export type ReadNodeStateData = {
     body?: never;
     path: {
@@ -62164,6 +63156,10 @@ export type GetProjectsMonitorHealthData = {
          * Comma-separated list of project IDs
          */
         project_ids: string;
+        /**
+         * Select one environment within the authorized projects; defaults to production.
+         */
+        environment_id?: number | null;
     };
     url: '/monitors-health/projects';
 };
@@ -81742,6 +82738,158 @@ export type GetInheritedEnvVarsResponses = {
 
 export type GetInheritedEnvVarsResponse = GetInheritedEnvVarsResponses[keyof GetInheritedEnvVarsResponses];
 
+export type ListInternalAccessGrantsData = {
+    body?: never;
+    path: {
+        /**
+         * The project being called
+         */
+        project_id: number;
+    };
+    query?: {
+        /**
+         * Only grants that cover this environment of the project: its own and
+         * the project-wide ones.
+         */
+        environment_id?: number | null;
+        /**
+         * 1-based page, default 1.
+         */
+        page?: number | null;
+        /**
+         * Default 20, at most 100.
+         */
+        page_size?: number | null;
+    };
+    url: '/projects/{project_id}/internal-access';
+};
+
+export type ListInternalAccessGrantsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project or environment not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type ListInternalAccessGrantsError = ListInternalAccessGrantsErrors[keyof ListInternalAccessGrantsErrors];
+
+export type ListInternalAccessGrantsResponses = {
+    /**
+     * Grants on the project
+     */
+    200: InternalAccessGrantListResponse;
+};
+
+export type ListInternalAccessGrantsResponse = ListInternalAccessGrantsResponses[keyof ListInternalAccessGrantsResponses];
+
+export type CreateInternalAccessGrantData = {
+    body: CreateInternalAccessGrantRequest;
+    path: {
+        /**
+         * The project being called
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/internal-access';
+};
+
+export type CreateInternalAccessGrantErrors = {
+    /**
+     * Invalid grant
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions on either project
+     */
+    403: ProblemDetails;
+    /**
+     * Project or environment not found
+     */
+    404: ProblemDetails;
+    /**
+     * Already granted, or too many grants
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type CreateInternalAccessGrantError = CreateInternalAccessGrantErrors[keyof CreateInternalAccessGrantErrors];
+
+export type CreateInternalAccessGrantResponses = {
+    /**
+     * Grant created
+     */
+    201: InternalAccessGrantResponse;
+};
+
+export type CreateInternalAccessGrantResponse = CreateInternalAccessGrantResponses[keyof CreateInternalAccessGrantResponses];
+
+export type DeleteInternalAccessGrantData = {
+    body?: never;
+    path: {
+        /**
+         * The project being called
+         */
+        project_id: number;
+        /**
+         * Grant ID
+         */
+        grant_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/internal-access/{grant_id}';
+};
+
+export type DeleteInternalAccessGrantErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Grant not found on this project
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type DeleteInternalAccessGrantError = DeleteInternalAccessGrantErrors[keyof DeleteInternalAccessGrantErrors];
+
+export type DeleteInternalAccessGrantResponses = {
+    /**
+     * Grant removed
+     */
+    204: void;
+};
+
+export type DeleteInternalAccessGrantResponse = DeleteInternalAccessGrantResponses[keyof DeleteInternalAccessGrantResponses];
+
 export type DeleteProjectIpAccessData = {
     body?: never;
     path: {
@@ -87927,6 +89075,45 @@ export type ClusterNetworkUpdateResponses = {
 };
 
 export type ClusterNetworkUpdateResponse = ClusterNetworkUpdateResponses[keyof ClusterNetworkUpdateResponses];
+
+export type ClusterNetworkIdChangeData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/settings/cluster-network/network-id';
+};
+
+export type ClusterNetworkIdChangeErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * A node cannot follow a new network ID yet; the detail names it and the fix
+     */
+    409: unknown;
+    /**
+     * Re-authentication required
+     */
+    428: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ClusterNetworkIdChangeResponses = {
+    /**
+     * Network ID changed
+     */
+    200: ClusterNetworkIdChangeResponse;
+};
+
+export type ClusterNetworkIdChangeResponse2 = ClusterNetworkIdChangeResponses[keyof ClusterNetworkIdChangeResponses];
 
 export type GetDiskStatusData = {
     body?: never;

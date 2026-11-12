@@ -179,16 +179,15 @@ async fn resolver_returns_nxdomain_for_unknown_name() {
     let (cfg, listen) = make_resolver_config(server.uri(), dir.path().to_path_buf(), port);
     let handle = ResolverHandle::start(cfg).await.expect("resolver starts");
 
-    let client = client_for(listen);
-    let err = client
-        .lookup_ip("nonexistent.temps.local.")
-        .await
-        .unwrap_err();
-    let msg = err.to_string().to_lowercase();
-    assert!(
-        msg.contains("no record") || msg.contains("nxdomain") || msg.contains("not found"),
-        "expected NXDOMAIN-style error, got: {msg}"
-    );
+    let answer = temps_node_dns::resolve::resolve_over_udp(
+        listen,
+        temps_node_dns::resolve::parse_test_query_name("nonexistent.temps.local.").unwrap(),
+        hickory_proto::rr::RecordType::A,
+    )
+    .await
+    .unwrap();
+    assert_eq!(answer.rcode, "NXDOMAIN");
+    assert!(answer.authoritative);
 
     handle.shutdown().await;
 }

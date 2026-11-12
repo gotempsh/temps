@@ -86,6 +86,20 @@ pub(crate) fn spawn_control_plane_dns_bootstrap(
         let mut active: Option<temps_dns::ControlPlaneResolver> = None;
         let mut failures = 0u32;
         let mut enabled = false;
+        // ADR-095: node 0 reports its resolver through the same store the
+        // console reads, from this process, which owns the resolver.
+        let mut reporter = {
+            let store = temps_proxy::service::metrics_sampler::build_metrics_store(
+                &config_service,
+                &config_service.get_server_config(),
+                db.clone(),
+            )
+            .await;
+            temps_dns::ControlPlaneDnsReporter::new(Arc::new(
+                temps_dns::DnsObservabilityService::new(db.clone(), store),
+            ))
+        };
+        let mut last_error: Option<String> = None;
         loop {
             let read = match config_service.get_settings().await {
                 Ok(settings) => Some(settings.cluster_dns.enabled),
@@ -107,6 +121,12 @@ pub(crate) fn spawn_control_plane_dns_bootstrap(
                 );
                 enabled = wanted;
             }
+            if !enabled {
+                last_error = None;
+            }
+            reporter
+                .maybe_report(active.as_ref(), last_error.as_deref())
+                .await;
             if !enabled {
                 if let Err(error) = publish_dns_gateway(&overlay_dns_slot, None) {
                     warn!(error = %error, "Could not clear the cluster DNS slot");
@@ -148,6 +168,7 @@ pub(crate) fn spawn_control_plane_dns_bootstrap(
                             Err(error) => Err(error),
                             Ok(()) => match temps_dns::start_control_plane_resolver(
                                 db.clone(), gateway, snapshot_dir.clone(), dns_policy.clone(),
+                                Some(reporter.observer()),
                             ).await {
                                 Some(resolver) => {
                                     active = Some(resolver);
@@ -160,6 +181,7 @@ pub(crate) fn spawn_control_plane_dns_bootstrap(
                 }
                 Err(error) => Err(error),
             };
+            last_error = attempt.as_ref().err().map(ToString::to_string);
             match attempt {
                 Ok(()) => failures = 0,
                 Err(error) => {

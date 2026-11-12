@@ -6,7 +6,6 @@
 
 use super::*;
 use std::collections::{HashMap, HashSet};
-use temps_entities::s3_sources;
 
 /// A container running on a node, with its project and environment named.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,15 +23,6 @@ pub struct NodeContainerRecord {
 }
 
 impl NodeService {
-    /// The S3 source a node asked for. The caller has already authorized the
-    /// node for it with [`Self::is_authorized_for_s3_source`].
-    pub async fn s3_source(&self, s3_source_id: i32) -> Result<s3_sources::Model, NodeError> {
-        s3_sources::Entity::find_by_id(s3_source_id)
-            .one(self.db.as_ref())
-            .await?
-            .ok_or(NodeError::S3SourceNotFound { s3_source_id })
-    }
-
     /// Every edge node, whatever its status.
     pub async fn edge_nodes(&self) -> Result<Vec<nodes::Model>, NodeError> {
         Ok(nodes::Entity::find()
@@ -184,28 +174,6 @@ mod tests {
             "docker_socket_mounted": false
         }))
         .expect("deployment fixture matches the entity")
-    }
-
-    #[tokio::test]
-    async fn a_missing_s3_source_is_reported_with_its_id() {
-        let error = service(mock().append_query_results([Vec::<s3_sources::Model>::new()]))
-            .s3_source(12)
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            NodeError::S3SourceNotFound { s3_source_id: 12 }
-        ));
-        assert!(error.to_string().contains("12"));
-    }
-
-    #[tokio::test]
-    async fn a_failed_s3_source_lookup_is_a_database_error() {
-        let error = service(mock().append_query_errors([lost()]))
-            .s3_source(12)
-            .await
-            .unwrap_err();
-        assert!(matches!(error, NodeError::Database(_)));
     }
 
     #[tokio::test]

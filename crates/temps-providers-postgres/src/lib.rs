@@ -10,8 +10,10 @@
         reason = "tests read fixture configuration (database/service URLs) from the environment"
     )
 )]
+pub mod dump_filter;
 pub mod postgres;
 pub mod postgres_cluster;
+pub mod postgres_cluster_tls;
 pub mod postgres_upgrade;
 pub mod postgres_wal_health;
 pub mod query;

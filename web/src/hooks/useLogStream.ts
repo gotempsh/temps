@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { connectLogStream } from './logStreamConnection'
 import { useVirtualizer } from '@tanstack/react-virtual'
 
 export type LiveLogLevel = 'ERROR' | 'WARN' | 'INFO' | 'DEBUG' | 'TRACE'
@@ -43,6 +44,82 @@ export function buildLogStreamUrl(
   return url.toString()
 }
 
+// The buffer after `incoming` arrives, bounded to the last `maxLogs` lines.
+// With `replace`, `incoming` starts a reconnected socket's replay of the same
+// tail, so it takes the buffer's place instead of repeating lines already in
+// it.
+export function mergeLogLines<T>(
+  prev: T[],
+  incoming: T[],
+  maxLogs: number,
+  replace: boolean
+): T[] {
+  const next = replace ? incoming : [...prev, ...incoming]
+  return next.length <= maxLogs ? next : next.slice(-maxLogs)
+}
+
+// One frame of the log stream: a log line, or the server saying the stream
+// failed (`{"error": ..., "detail" | "stack": ...}`, sent when Docker or the
+// worker cannot be reached). Both are shown as rows; only a log line can start
+// a reconnected socket's replay of the tail.
+export interface LogFrame {
+  kind: 'line' | 'error'
+  text: string
+}
+
+const ERROR_FRAME_KEYS = new Set(['error', 'detail', 'stack'])
+
+function isErrorFrame(parsed: unknown): boolean {
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    return false
+  }
+  const frame = parsed as Record<string, unknown>
+  return (
+    typeof frame.error === 'string' &&
+    Object.keys(frame).every((key) => ERROR_FRAME_KEYS.has(key))
+  )
+}
+
+// The row a frame shows, and whether it is a log line or an error. `null`
+// for a blank frame.
+export function parseLogFrame(data: string): LogFrame | null {
+  try {
+    const parsed = JSON.parse(data)
+    const kind = isErrorFrame(parsed) ? 'error' : 'line'
+    if (parsed.error && parsed.stack) {
+      return { kind, text: `ERROR: ${parsed.error}\n${parsed.stack}` }
+    }
+    if (parsed.message) return { kind, text: parsed.message }
+    if (parsed.log) return { kind, text: parsed.log }
+    return { kind, text: JSON.stringify(parsed, null, 2) }
+  } catch {
+    const line = data.trim()
+    return line ? { kind: 'line', text: line } : null
+  }
+}
+
+// Decides which frame replaces the buffer after a reconnect. A replacement
+// socket replays the tail the buffer already holds, so its first log line
+// replaces the buffer. An error sent before that line (the reconnect failed)
+// is appended and leaves the lines on screen alone; the replace stays armed
+// for the replay that follows, on this socket or the next.
+export function createReplayGate() {
+  let armed = false
+  return {
+    socketReplaced() {
+      armed = true
+    },
+    replacesBuffer(frame: LogFrame): boolean {
+      if (!armed || frame.kind !== 'line') return false
+      armed = false
+      return true
+    },
+    reset() {
+      armed = false
+    },
+  }
+}
+
 export interface UseLogStreamReturn {
   logs: LiveLogLine[]
   filteredLogs: LiveLogLine[]
@@ -68,6 +145,7 @@ export interface UseLogStreamReturn {
   handleScroll: (event: React.UIEvent<HTMLDivElement>) => void
   handleNextMatch: () => void
   handlePrevMatch: () => void
+  retry: () => void
 }
 
 // Detect a leading ISO-8601 timestamp the server prepended when the client
@@ -132,7 +210,9 @@ export function useLogStream({
   const [selectedLevels, setSelectedLevels] = useState<LiveLogLevel[]>([])
   const [currentMatchIndex, setCurrentMatchIndex] = useState(-1)
   const [autoScroll, setAutoScroll] = useState(true)
-  const [showTimestamps, setShowTimestamps] = useState(false)
+  const [showTimestamps, setShowTimestamps] = useState(true)
+  const [retryGeneration, setRetryGeneration] = useState(0)
+  const retry = useCallback(() => setRetryGeneration((n) => n + 1), [])
   // Paused = freeze the visible rope and keep accumulating in a background
   // buffer. Implemented as both a ref (read inside the WS onmessage closure
   // without re-subscribing) and a state (so React re-renders the toolbar
@@ -141,13 +221,15 @@ export function useLogStream({
   const pausedRef = useRef(false)
   const [bufferedCount, setBufferedCount] = useState(0)
   const parentRef = useRef<HTMLDivElement>(null)
-  const wsRef = useRef<WebSocket | null>(null)
-  const isConnectingRef = useRef(false)
   // Buffer incoming WS frames and flush once per animation frame. Without this,
   // a high-volume log source produces one setState per line, which makes React
   // re-render the virtualizer for every byte and freezes the tab.
   const pendingLogsRef = useRef<LiveLogLine[]>([])
   const flushHandleRef = useRef<number | null>(null)
+  // Set when a reconnected socket starts replaying the tail: the next commit
+  // replaces the visible lines instead of appending to them.
+  const replaceOnFlushRef = useRef(false)
+  const replayGateRef = useRef(createReplayGate())
 
   const filteredLogs = useMemo(() => {
     if (selectedLevels.length === 0 && !searchTerm) return logs
@@ -176,13 +258,13 @@ export function useLogStream({
 
   // WebSocket connection effect
   useEffect(() => {
-    if (isConnectingRef.current) return
-
     setLogs([])
     setErrorMessage('')
     setBufferedCount(0)
-    isConnectingRef.current = true
+    setConnectionStatus('connecting')
     pendingLogsRef.current = []
+    replaceOnFlushRef.current = false
+    replayGateRef.current.reset()
 
     const scheduleFlush = () => {
       if (flushHandleRef.current != null) return
@@ -202,13 +284,9 @@ export function useLogStream({
           return
         }
         pendingLogsRef.current = []
-        setLogs((prev) => {
-          const next =
-            prev.length + incoming.length <= maxLogs
-              ? [...prev, ...incoming]
-              : [...prev, ...incoming].slice(-maxLogs)
-          return next
-        })
+        const replace = replaceOnFlushRef.current
+        replaceOnFlushRef.current = false
+        setLogs((prev) => mergeLogLines(prev, incoming, maxLogs, replace))
       })
     }
 
@@ -217,84 +295,47 @@ export function useLogStream({
       scheduleFlush()
     }
 
-    try {
-      // Add timestamps query parameter to request server-side timestamps
-      const url = buildLogStreamUrl(
-        wsUrl,
-        typeof window !== 'undefined'
-          ? window.location.origin
-          : 'http://localhost',
-        showTimestamps,
-        maxLogs
-      )
-
-      const ws = new WebSocket(url)
-
-      ws.onopen = () => {
-        setConnectionStatus('connected')
-        setErrorMessage('')
-      }
-
-      ws.onmessage = (event) => {
-        try {
-          const parsed = JSON.parse(event.data)
-
-          if (parsed.error && parsed.stack) {
-            enqueue(`ERROR: ${parsed.error}\n${parsed.stack}`)
-          } else if (parsed.message) {
-            enqueue(parsed.message)
-          } else if (parsed.log) {
-            enqueue(parsed.log)
-          } else {
-            enqueue(JSON.stringify(parsed, null, 2))
-          }
-        } catch {
-          const line = event.data.trim()
-          if (line) {
-            enqueue(line)
-          }
+    const disconnect = connectLogStream(
+      () =>
+        new WebSocket(
+          buildLogStreamUrl(
+            wsUrl,
+            window.location.origin,
+            showTimestamps,
+            maxLogs
+          )
+        ),
+      (status, message = '') => {
+        setConnectionStatus(status)
+        setErrorMessage(message)
+        if (message) onError?.(message)
+      },
+      (event, socketReplaced) => {
+        const gate = replayGateRef.current
+        if (socketReplaced) gate.socketReplaced()
+        const frame = parseLogFrame(event.data)
+        if (!frame) return
+        if (gate.replacesBuffer(frame)) {
+          // Lines queued from the dropped socket are in the replay too.
+          pendingLogsRef.current = []
+          replaceOnFlushRef.current = true
+          if (pausedRef.current) setBufferedCount(0)
         }
+        enqueue(frame.text)
       }
-
-      ws.onerror = () => {
-        setConnectionStatus('error')
-        const msg = 'Failed to connect to logs stream'
-        setErrorMessage(msg)
-        onError?.(msg)
-      }
-
-      ws.onclose = (event) => {
-        setConnectionStatus(event.code === 1000 ? 'complete' : 'error')
-        if (event.code !== 1000) {
-          const msg =
-            event.reason || `Log stream closed unexpectedly (${event.code})`
-          setErrorMessage(msg)
-          onError?.(msg)
-        }
-        isConnectingRef.current = false
-      }
-
-      wsRef.current = ws
-    } catch (error) {
-      setConnectionStatus('error')
-      const msg = error instanceof Error ? error.message : 'Connection failed'
-      setErrorMessage(msg)
-      onError?.(msg)
-      isConnectingRef.current = false
-    }
+    )
 
     return () => {
-      if (wsRef.current) {
-        wsRef.current.close()
-      }
+      disconnect()
       if (flushHandleRef.current != null) {
         cancelAnimationFrame(flushHandleRef.current)
         flushHandleRef.current = null
       }
       pendingLogsRef.current = []
-      isConnectingRef.current = false
+      replaceOnFlushRef.current = false
+      replayGateRef.current.reset()
     }
-  }, [wsUrl, onError, showTimestamps, maxLogs])
+  }, [wsUrl, onError, showTimestamps, maxLogs, retryGeneration])
 
   // Auto-scroll effect with proper timing for virtualizer. Disabled while
   // paused so the user's read position is preserved.
@@ -330,14 +371,10 @@ export function useLogStream({
     const incoming = pendingLogsRef.current
     pendingLogsRef.current = []
     setBufferedCount(0)
-    if (incoming.length > 0) {
-      setLogs((prev) => {
-        const next =
-          prev.length + incoming.length <= maxLogs
-            ? [...prev, ...incoming]
-            : [...prev, ...incoming].slice(-maxLogs)
-        return next
-      })
+    const replace = replaceOnFlushRef.current
+    replaceOnFlushRef.current = false
+    if (incoming.length > 0 || replace) {
+      setLogs((prev) => mergeLogLines(prev, incoming, maxLogs, replace))
     }
     setAutoScroll(true)
     requestAnimationFrame(() => {
@@ -381,6 +418,7 @@ export function useLogStream({
   }
 
   return {
+    retry,
     logs,
     filteredLogs,
     connectionStatus,

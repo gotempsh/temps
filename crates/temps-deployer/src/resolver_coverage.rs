@@ -27,6 +27,7 @@ pub const MAX_REPORTED_DEPLOYMENTS: usize = 200;
 struct Seen {
     deployment_id: i64,
     nameservers: Vec<String>,
+    node_id: Option<i32>,
 }
 
 /// Remembers each running deployment container's nameservers, so a pass
@@ -34,11 +35,20 @@ struct Seen {
 #[derive(Debug, Default)]
 pub struct ResolverCoverage {
     seen: HashMap<String, Seen>,
+    node_id: i32,
 }
 
 impl ResolverCoverage {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Scope a worker's report to its node. Node 0 is the local control plane.
+    pub fn for_node(node_id: i32) -> Self {
+        Self {
+            node_id,
+            ..Self::default()
+        }
     }
 
     /// Deployment ids with a running container whose nameservers do not
@@ -90,6 +100,19 @@ impl ResolverCoverage {
                 }) => continue,
                 Err(error) => return Err(error),
             };
+            // A worker can share Docker with an independent local Temps
+            // installation. Its deployment IDs are not ours. The deployer
+            // injects node identity after user variables; retain compatibility
+            // with older/Compose containers that carry no node identity.
+            let node_id = inspected
+                .config
+                .as_ref()
+                .and_then(|config| config.env.as_ref())
+                .and_then(|env| {
+                    env.iter()
+                        .find_map(|value| value.strip_prefix("TEMPS_NODE_ID="))
+                })
+                .and_then(|value| value.parse().ok());
             let nameservers = inspected
                 .host_config
                 .and_then(|host| host.dns)
@@ -99,16 +122,18 @@ impl ResolverCoverage {
                 Seen {
                     deployment_id,
                     nameservers,
+                    node_id,
                 },
             );
         }
-        Ok(uncovered(self.seen.values(), resolver))
+        Ok(uncovered(self.seen.values(), resolver, self.node_id))
     }
 }
 
-fn uncovered<'a>(seen: impl Iterator<Item = &'a Seen>, resolver: IpAddr) -> Vec<i64> {
+fn uncovered<'a>(seen: impl Iterator<Item = &'a Seen>, resolver: IpAddr, node_id: i32) -> Vec<i64> {
     let resolver = resolver.to_string();
-    seen.filter(|entry| !entry.nameservers.iter().any(|ns| ns == &resolver))
+    seen.filter(|entry| entry.node_id.is_none_or(|owner| owner == node_id))
+        .filter(|entry| !entry.nameservers.iter().any(|ns| ns == &resolver))
         .map(|entry| entry.deployment_id)
         .collect::<BTreeSet<_>>()
         .into_iter()
@@ -123,8 +148,23 @@ mod tests {
     fn seen(deployment_id: i64, nameservers: &[&str]) -> Seen {
         Seen {
             deployment_id,
+            node_id: None,
             nameservers: nameservers.iter().map(|ns| ns.to_string()).collect(),
         }
+    }
+
+    #[test]
+    fn shared_docker_does_not_report_another_nodes_colliding_deployment_id() {
+        let resolver = "10.202.1.1".parse().unwrap();
+        let mut foreign = seen(71, &[]);
+        foreign.node_id = Some(0);
+        let mut ours = seen(71, &["10.202.1.1"]);
+        ours.node_id = Some(1);
+        let mut missing = seen(72, &[]);
+        missing.node_id = Some(1);
+        let entries = [foreign, ours, missing, seen(73, &[])];
+        assert_eq!(uncovered(entries.iter(), resolver, 1), vec![72, 73]);
+        assert_eq!(uncovered(entries.iter(), resolver, 0), vec![71, 73]);
     }
 
     #[test]
@@ -141,7 +181,7 @@ mod tests {
             seen(9, &["10.202.9.1", "1.1.1.1"]),
         ];
 
-        assert_eq!(uncovered(entries.iter(), resolver), vec![7, 9]);
+        assert_eq!(uncovered(entries.iter(), resolver, 0), vec![7, 9]);
     }
 
     #[test]
@@ -151,7 +191,7 @@ mod tests {
             .map(|id| seen(id, &[]))
             .collect();
 
-        let reported = uncovered(entries.iter(), resolver);
+        let reported = uncovered(entries.iter(), resolver, 0);
 
         assert_eq!(reported.len(), MAX_REPORTED_DEPLOYMENTS);
         assert_eq!(reported.first(), Some(&0));

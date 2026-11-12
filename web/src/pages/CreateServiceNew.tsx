@@ -35,6 +35,12 @@ import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { serviceCreationDefaults } from '@/lib/service-creation-defaults'
 import { handleServiceCreateError } from '@/lib/service-create-error'
 import { placementNeedsClusterDns } from '@/lib/cluster-dns'
+import {
+  CONTROL_PLANE_PLACEMENT,
+  placementNodeId,
+  standalonePlacement,
+} from '@/lib/service-placement'
+import { useNodeCapability } from '@/hooks/useNodeCapability'
 import { ClusterDnsOffNotice } from '@/components/settings/ClusterDnsOffNotice'
 import {
   serviceCreateHref,
@@ -318,8 +324,9 @@ export function CreateService() {
   const [topology, setTopology] = useState<'standalone' | 'cluster'>(
     'standalone'
   )
-  const [standaloneNodeId, setStandaloneNodeId] =
-    useState<string>('control-plane')
+  // What the user picked; `null` until they pick, so the default can follow
+  // the capability and the worker list once they load.
+  const [chosenNodeId, setChosenNodeId] = useState<string | null>(null)
   const [clusterMembers, setClusterMembers] = useState<ClusterMemberRequest[]>(
     []
   )
@@ -340,6 +347,17 @@ export function CreateService() {
     [nodesResponse]
   )
   const hasWorkerNodes = useMemo(() => nodes.length > 0, [nodes])
+  const capability = useNodeCapability()
+  const placement = useMemo(
+    () =>
+      standalonePlacement(
+        chosenNodeId,
+        capability.data?.local_workloads,
+        nodes.map((node: NodeInfoResponse) => node.id)
+      ),
+    [chosenNodeId, capability.data?.local_workloads, nodes]
+  )
+  const standaloneNodeId = placement.value
 
   // When switching to cluster topology, pre-populate default members:
   //   - 1 monitor on the control plane (node_id = null)
@@ -360,8 +378,12 @@ export function CreateService() {
     if (clusterMembers.length > 0 || !serviceType) return
     if (!DEFAULT_CLUSTER_ROLES[serviceType]) return
 
+    // A control plane that runs no containers cannot hold the monitor.
+    const monitorNodeId = placement.offerControlPlane
+      ? null
+      : (nodes[0]?.id ?? null)
     const seeded: ClusterMemberRequest[] = [
-      { role: 'monitor', node_id: null },
+      { role: 'monitor', node_id: monitorNodeId },
       ...nodes.map((node) => ({ role: 'replica', node_id: node.id })),
     ]
     setClusterMembers(seeded)
@@ -435,6 +457,15 @@ export function CreateService() {
       toast.error('Select a supported service type')
       return
     }
+    if (topology === 'standalone' && standaloneNodeId === null) {
+      // Never fall back to another machine than the one chosen.
+      toast.error(
+        placement.chosenUnavailable
+          ? 'The machine you chose is no longer available. Choose another deployment node.'
+          : 'Choose the machine that will run this service.'
+      )
+      return
+    }
 
     // Keep numbers as numbers, convert null to empty strings
     const cleanedParameters: Record<string, any> = {}
@@ -461,10 +492,7 @@ export function CreateService() {
         parameters: cleanedParameters,
         ...serviceProjectLink(projectId),
         ...(topology === 'standalone' && {
-          node_id:
-            standaloneNodeId === 'control-plane'
-              ? null
-              : Number(standaloneNodeId),
+          node_id: placementNodeId(standaloneNodeId),
         }),
         ...(topology === 'cluster' && {
           topology: 'cluster',
@@ -728,19 +756,21 @@ export function CreateService() {
               Choose the machine whose Docker daemon will run this service.
             </p>
             <Select
-              value={standaloneNodeId}
-              onValueChange={setStandaloneNodeId}
+              value={standaloneNodeId ?? undefined}
+              onValueChange={setChosenNodeId}
             >
               <SelectTrigger>
                 <SelectValue placeholder="Select node..." />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="control-plane">
-                  <div className="flex items-center gap-2">
-                    <Server className="h-3 w-3" />
-                    Control plane
-                  </div>
-                </SelectItem>
+                {placement.offerControlPlane && (
+                  <SelectItem value={CONTROL_PLANE_PLACEMENT}>
+                    <div className="flex items-center gap-2">
+                      <Server className="h-3 w-3" />
+                      Control plane
+                    </div>
+                  </SelectItem>
+                )}
                 {nodes.map((node) => (
                   <SelectItem key={node.id} value={String(node.id)}>
                     <div className="flex items-center gap-2">
@@ -754,6 +784,31 @@ export function CreateService() {
                 ))}
               </SelectContent>
             </Select>
+            {placement.chosenUnavailable && !placement.noTarget && (
+              <Alert variant="destructive">
+                <AlertTitle>
+                  The machine you chose is no longer available
+                </AlertTitle>
+                <AlertDescription>
+                  It went offline, started draining or can no longer run
+                  services. Choose another deployment node; the service is not
+                  moved to another machine without your choice.
+                </AlertDescription>
+              </Alert>
+            )}
+            {placement.noTarget && (
+              <Alert variant="destructive">
+                <AlertTitle>No machine can run this service</AlertTitle>
+                <AlertDescription>
+                  This control plane runs no services itself, and no worker node
+                  is active.{' '}
+                  <Link to="/settings/nodes" className="underline">
+                    Join a worker node
+                  </Link>{' '}
+                  to create one.
+                </AlertDescription>
+              </Alert>
+            )}
           </div>
         )}
 
@@ -766,10 +821,7 @@ export function CreateService() {
                 }
               : {
                   topology: 'standalone',
-                  nodeId:
-                    standaloneNodeId === 'control-plane'
-                      ? null
-                      : Number(standaloneNodeId),
+                  nodeId: placementNodeId(standaloneNodeId),
                 }
           ) && (
             <ClusterDnsOffNotice title="Apps on other nodes won't reach it">
@@ -802,7 +854,11 @@ export function CreateService() {
               ? `Create ${serviceName.trim()}`
               : 'Create database'
           }
-          submitDisabled={!serviceName.trim() || !!preset.error}
+          submitDisabled={
+            !serviceName.trim() ||
+            !!preset.error ||
+            (topology === 'standalone' && standaloneNodeId === null)
+          }
           isSubmitting={createServiceMut.isPending}
           serviceType={serviceType}
           managedByTemps

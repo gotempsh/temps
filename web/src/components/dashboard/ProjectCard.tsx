@@ -82,7 +82,11 @@ const HEALTH_TONE_STYLES: Record<
  * Always rendered. There is no health state — including "we could not measure
  * it" — that is better communicated by drawing nothing.
  */
-function ProjectHealth({ indicator }: { indicator: ProjectHealthIndicator }) {
+export function ProjectHealth({
+  indicator,
+}: {
+  indicator: ProjectHealthIndicator
+}) {
   const tone = HEALTH_TONE_STYLES[indicator.tone]
 
   return (

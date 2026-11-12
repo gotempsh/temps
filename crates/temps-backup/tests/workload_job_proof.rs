@@ -51,9 +51,9 @@ use bollard::Docker;
 use futures::{FutureExt, StreamExt};
 use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter};
 use temps_backup::engines::workload_job::{
-    backup_script, exit, job_env, restore_script, run_database_job, start_database_job,
-    stop_and_await_removal, DatabaseJobControl, DatabaseJobError, JobPurpose, JobState,
-    PgJobTarget, RemovalTiming, S3JobTarget,
+    backup_script, exit, job_env, restore_env, restore_script, run_database_job,
+    start_database_job, stop_and_await_removal, DatabaseJobControl, DatabaseJobError, JobPurpose,
+    JobState, PgJobTarget, RemovalTiming, S3JobTarget,
 };
 use temps_core::{AuditLogger, AuditOperation};
 use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
@@ -497,6 +497,88 @@ async fn scenario(docker: &Docker, db: &TestDatabase, fixture: &Fixture) {
         .await
         .expect("reading the restored table");
     assert_eq!(restored.trim(), "42", "the restore brought the row back");
+
+    // 4b. A backup of another database, whose login had another password
+    //     when it was taken: its dump would give the login that password
+    //     midway, after which the dump's next `\connect` (made with the
+    //     target's password) would be refused with the dump half applied.
+    //     The job keeps the login on the target's own password, so the dump
+    //     applies whole and the target's stored password keeps working,
+    //     whatever the origin's password is now.
+    const ORIGIN_BACKUP_TIME_PASSWORD: &str = "origin-pw-5678";
+    let origin_key = format!(
+        "external_services/postgres/origin-db/{}/dump.sql.gz",
+        fixture.scope
+    );
+    psql(
+        docker,
+        &fixture.pg,
+        &format!(
+            "alter role postgres password '{ORIGIN_BACKUP_TIME_PASSWORD}'; update proof set x = 43;"
+        ),
+    )
+    .await
+    .expect("making the origin's state");
+    run_database_job(
+        &plane,
+        &target,
+        JobPurpose::Backup { backup_id: 2 },
+        backup_script(&target, &origin_key),
+        job_env(ORIGIN_BACKUP_TIME_PASSWORD, &bucket_target),
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("the origin's backup job succeeds");
+    psql(
+        docker,
+        &fixture.pg,
+        &format!("alter role postgres password '{PG_PASSWORD}'; drop table proof;"),
+    )
+    .await
+    .expect("making the target's state");
+    run_database_job(
+        &plane,
+        &target,
+        JobPurpose::Restore { restore_run_id: 4 },
+        restore_script(&target, &origin_key),
+        restore_env(PG_PASSWORD, &bucket_target),
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("the cross-service restore job succeeds");
+    let restored = psql(docker, &fixture.pg, "select x from proof;")
+        .await
+        .expect("reading the restored table");
+    assert_eq!(restored.trim(), "43", "the origin's data was restored");
+    let login = |password: &str| {
+        let password = format!("PGPASSWORD={password}");
+        let host = fixture.pg.clone();
+        async move {
+            exec(
+                docker,
+                &fixture.pg,
+                &[
+                    "env", &password, "psql", "-U", "postgres", "-h", &host, "-tAc", "select 1",
+                ],
+            )
+            .await
+        }
+    };
+    assert_eq!(
+        login(PG_PASSWORD)
+            .await
+            .expect("the login keeps the target's password over TCP")
+            .trim(),
+        "1"
+    );
+    assert!(
+        login(ORIGIN_BACKUP_TIME_PASSWORD).await.is_err(),
+        "the dump's backup-time password must not have been applied to the login"
+    );
+    // The rest of the proof runs against the target's own state again.
+    psql(docker, &fixture.pg, "update proof set x = 42;")
+        .await
+        .expect("restoring the target's state");
 
     // 5. A corrupt dump that S3 serves successfully fails the restore
     //    before psql touches the database.

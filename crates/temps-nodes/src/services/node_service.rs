@@ -532,9 +532,6 @@ pub enum NodeError {
         placements: Vec<NodePlacementReference>,
     },
 
-    #[error("S3 source {s3_source_id} not found")]
-    S3SourceNotFound { s3_source_id: i32 },
-
     #[error("Database error: {0}")]
     Database(#[from] sea_orm::DbErr),
 
@@ -750,6 +747,9 @@ pub struct HeartbeatRequest {
     /// already bounded. `None` from an older agent leaves the stored value
     /// untouched; an empty list clears it.
     pub deployments_without_resolver: Option<Vec<i64>>,
+    /// The VXLAN network ID the agent follows (ADR 062), already validated.
+    /// `None` from an agent older than per-cluster network IDs.
+    pub overlay_vxlan_vni: Option<u32>,
 }
 
 /// What the agent last saw of its cross-node overlay (ADR 056).
@@ -768,7 +768,25 @@ pub const OVERLAY_UNAVAILABLE: &str = "unavailable";
 
 /// Longest stored overlay error. The agent's messages name the colliding
 /// range, its owner and both fixes, which takes more than a DNS error.
-const OVERLAY_ERROR_MAX_CHARS: usize = 1000;
+const OVERLAY_ERROR_MAX_CHARS: usize = 2000;
+
+/// Why an agent that reports an overlay but no network ID cannot be on this
+/// cluster's overlay (ADR 062): it predates per-cluster network IDs and runs
+/// the overlay on 42 whatever the cluster uses. `None` when it can.
+pub(crate) fn overlay_predates_network_id(
+    reported_vni: Option<u32>,
+    cluster_vni: u32,
+) -> Option<String> {
+    if reported_vni.is_some() || cluster_vni == temps_network::DEFAULT_VXLAN_VNI {
+        return None;
+    }
+    Some(format!(
+        "this node's agent predates per-cluster network IDs: it runs the overlay on network \
+         ID {}, this cluster uses {cluster_vni}. Upgrade Temps on it (`sudo temps upgrade`) \
+         and restart its agent.",
+        temps_network::DEFAULT_VXLAN_VNI
+    ))
+}
 
 #[derive(Debug, Clone)]
 pub struct PublicIngressHeartbeatUpdate {
@@ -1857,9 +1875,43 @@ impl NodeService {
             active.public_ingress_unsupported_reasons =
                 Set(serde_json::json!(ingress.unsupported_reasons));
         }
+        if let Some(vni) = request.overlay_vxlan_vni {
+            // Validated by the handler: 1..=2^24-1 fits an i32.
+            active.overlay_vxlan_vni = Set(i32::try_from(vni).ok());
+        }
+        // ADR 062: an old agent's overlay is on 42, whatever it says.
+        let predates_network_id = match (&request.overlay, request.overlay_vxlan_vni) {
+            (Some(_), None) => {
+                let cluster_vni = temps_entities::network_config::Entity::find_by_id(1)
+                    .one(self.db.as_ref())
+                    .await?
+                    .and_then(|cfg| u32::try_from(cfg.vxlan_vni).ok())
+                    .unwrap_or(temps_network::DEFAULT_VXLAN_VNI);
+                overlay_predates_network_id(None, cluster_vni)
+            }
+            _ => None,
+        };
         // ADR 056: same "absent means not reported" rule.
         let mut ready_cidr = None;
-        if let Some(overlay) = request.overlay {
+        if let Some(reason) = predates_network_id {
+            if node.overlay_last_error.as_deref() != Some(reason.as_str()) {
+                tracing::warn!(
+                    node_id,
+                    node_name = %node.name,
+                    "node's agent runs the overlay on network ID 42, not this cluster's; \
+                     it needs an upgrade"
+                );
+            }
+            // Its bridge still runs on the allocation: that stays recorded
+            // as in use, so a pool change does not move it.
+            if let Some(overlay) = &request.overlay {
+                if overlay.ready {
+                    ready_cidr = overlay.compute_cidr.map(|cidr| cidr.to_string());
+                }
+            }
+            active.overlay_status = Set(Some(OVERLAY_UNAVAILABLE.to_string()));
+            active.overlay_last_error = Set(Some(reason));
+        } else if let Some(overlay) = request.overlay {
             if overlay.ready {
                 active.overlay_status = Set(Some(OVERLAY_READY.to_string()));
                 active.overlay_last_error = Set(None);
@@ -2047,45 +2099,6 @@ impl NodeService {
         db.execute_unprepared("SELECT pg_notify('route_table_changes', '')")
             .await?;
         Ok(updated)
-    }
-
-    /// Authorization check for `get_s3_credentials` (ADR-020 WS-4.1 / analyst-1).
-    ///
-    /// A worker node may only receive the plaintext credentials for an S3 source
-    /// it legitimately needs — i.e. a source used by a backup of a managed
-    /// service that is actually hosted on this node (standalone placement via
-    /// `external_services.node_id`, or a cluster member via
-    /// `service_members.node_id`). Without this gate any single node token could
-    /// enumerate `s3_source_id = 1..N` and exfiltrate every tenant's object-store
-    /// access+secret keys.
-    pub async fn is_authorized_for_s3_source(
-        &self,
-        node_id: i32,
-        s3_source_id: i32,
-    ) -> Result<bool, NodeError> {
-        use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
-
-        // EXISTS: a backup whose destination is `s3_source_id`, linked (via the
-        // external_service_backups join) to a service placed on `node_id`.
-        let sql = r#"
-            SELECT 1
-            FROM backups b
-            JOIN external_service_backups esb ON esb.backup_id = b.id
-            JOIN external_services es ON es.id = esb.service_id
-            LEFT JOIN service_members sm ON sm.service_id = es.id
-            WHERE b.s3_source_id = $1
-              AND (es.node_id = $2 OR sm.node_id = $2)
-            LIMIT 1
-        "#;
-
-        let stmt = Statement::from_sql_and_values(
-            DatabaseBackend::Postgres,
-            sql,
-            [s3_source_id.into(), node_id.into()],
-        );
-
-        let row = self.db.query_one(stmt).await?;
-        Ok(row.is_some())
     }
 
     /// Get a node by its name.
@@ -3985,6 +3998,23 @@ mod tests {
         }
     }
 
+    /// ADR 062: an agent that predates per-cluster network IDs runs every
+    /// overlay on 42; in a cluster on another ID it is told to upgrade.
+    #[test]
+    fn an_agent_without_a_network_id_is_unavailable_off_the_default() {
+        use super::overlay_predates_network_id;
+        assert_eq!(overlay_predates_network_id(None, 42), None);
+        assert_eq!(overlay_predates_network_id(Some(42), 5_000_123), None);
+        assert_eq!(
+            overlay_predates_network_id(Some(5_000_123), 5_000_123),
+            None
+        );
+        let reason = overlay_predates_network_id(None, 5_000_123).unwrap();
+        assert!(reason.contains("network ID 42"), "{reason}");
+        assert!(reason.contains("uses 5000123"), "{reason}");
+        assert!(reason.contains("sudo temps upgrade"), "{reason}");
+    }
+
     /// ADR 045: how an agent's advertised Docker socket grant is persisted
     /// into the node's `capacity` JSON.
     mod docker_socket_advertisement {
@@ -4228,6 +4258,7 @@ mod tests {
             overlay_ready_cidr: None,
             overlay_remediation: None,
             overlay_network_name: None,
+            overlay_vxlan_vni: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
@@ -4828,6 +4859,7 @@ mod tests {
                     public_ingress: None,
                     overlay,
                     occupied_ranges: occupied,
+                    overlay_vxlan_vni: Some(42),
                 }
             };
         let collision = "overlay subnet 10.202.0.0/24, which this node routes, overlaps Docker \
@@ -6340,6 +6372,7 @@ mod tests {
                     docker_socket_projects: None,
                     overlay: None,
                     occupied_ranges: None,
+                    overlay_vxlan_vni: None,
                     public_ingress: None,
                 },
             )
@@ -6373,6 +6406,7 @@ mod tests {
                     docker_socket_projects: None,
                     overlay: None,
                     occupied_ranges: None,
+                    overlay_vxlan_vni: None,
                     public_ingress: None,
                 },
             )
@@ -6415,6 +6449,7 @@ mod tests {
                     docker_socket_projects: None,
                     overlay: None,
                     occupied_ranges: None,
+                    overlay_vxlan_vni: None,
                     public_ingress: None,
                 },
             )
@@ -6476,6 +6511,7 @@ mod tests {
                         docker_socket_projects: None,
                         overlay: None,
                         occupied_ranges: None,
+                        overlay_vxlan_vni: None,
                         public_ingress: None,
                     },
                 )
@@ -6537,6 +6573,7 @@ mod tests {
                     docker_socket_projects: None,
                     overlay: None,
                     occupied_ranges: None,
+                    overlay_vxlan_vni: None,
                     public_ingress: None,
                 },
             )
@@ -6611,6 +6648,7 @@ mod tests {
                         overlay: None,
                         occupied_ranges: None,
                         public_ingress: None,
+                        overlay_vxlan_vni: None,
                     },
                 )
                 .await
@@ -6683,6 +6721,7 @@ mod tests {
                     docker_socket_projects: None,
                     overlay: None,
                     occupied_ranges: None,
+                    overlay_vxlan_vni: None,
                     public_ingress: None,
                 },
             )
@@ -8111,6 +8150,7 @@ mod tests {
             docker_socket_projects: None,
             overlay: None,
             occupied_ranges: None,
+            overlay_vxlan_vni: None,
             public_ingress: Some(PublicIngressHeartbeatUpdate {
                 running: true,
                 last_error: None,

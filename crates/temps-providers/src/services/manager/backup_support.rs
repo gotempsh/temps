@@ -204,8 +204,15 @@ impl ExternalServiceManager {
             ServiceType::from_str(&service.service_type),
             Ok(ServiceType::Postgres)
         );
-        if !is_postgres || service.topology == "cluster" || service.node_id.is_some() {
+        if !is_postgres || service.topology == "cluster" {
             return Ok(None);
+        }
+        // A worker's service: the same question, read through its agent.
+        if let ServiceExecutionRoute::Remote(node_id) = service_execution_route(service.node_id) {
+            return Ok(worker_restart_reason(
+                &service.name,
+                &self.probe_worker_postgres_wal(&service, node_id).await,
+            ));
         }
         let parameters = self.get_service_parameters(service_id).await?;
         let docker = self.require_docker()?;
@@ -250,38 +257,6 @@ impl ExternalServiceManager {
                 )),
             },
         )
-    }
-
-    /// Read the Postgres WAL health snapshot from `health_metadata.postgres_wal`.
-    ///
-    /// Returns `Ok(None)` when the service exists but has no snapshot yet
-    /// (e.g., probe hasn't run, or service isn't Postgres). Returns
-    /// `ServiceNotFound` only when the row doesn't exist at all.
-    pub async fn get_postgres_wal_health(
-        &self,
-        service_id: i32,
-    ) -> Result<
-        Option<crate::externalsvc::postgres_wal_health::PostgresWalHealth>,
-        ExternalServiceError,
-    > {
-        let service = self.get_service(service_id).await?;
-        let Some(metadata) = service.health_metadata else {
-            return Ok(None);
-        };
-        let Some(snapshot) = metadata.get("postgres_wal") else {
-            return Ok(None);
-        };
-        match serde_json::from_value(snapshot.clone()) {
-            Ok(parsed) => Ok(Some(parsed)),
-            Err(e) => {
-                tracing::warn!(
-                    "health_metadata.postgres_wal for service {} did not parse: {}",
-                    service_id,
-                    e
-                );
-                Ok(None)
-            }
-        }
     }
 
     /// Deliberately, explicitly move a service's continuous archiving to a
@@ -401,25 +376,14 @@ impl ExternalServiceManager {
                 force_path_style: s3_source.force_path_style.unwrap_or(true),
             };
 
-            // Layout must match `crates/temps-backup/src/engines/postgres_walg.rs`
-            // exactly: WAL-G requires a base backup and the WAL segments covering
-            // its start/end LSN under the same prefix to be restorable.
-            let subpath_root = format!("external_services/postgres/{}", service.name);
-            let bucket_path_clean = s3_source.bucket_path.trim_matches('/');
-            let walg_prefix = if bucket_path_clean.is_empty() {
-                format!(
-                    "s3://{}/{}/walg",
-                    s3_source.bucket_name,
-                    subpath_root.trim_matches('/'),
-                )
-            } else {
-                format!(
-                    "s3://{}/{}/{}/walg",
-                    s3_source.bucket_name,
-                    bucket_path_clean,
-                    subpath_root.trim_matches('/'),
-                )
-            };
+            // The layout every PostgreSQL WAL-G backup uses, on the control
+            // plane and on workers: a base backup and the WAL covering it
+            // must share one prefix to be restorable.
+            let walg_prefix = crate::externalsvc::postgres_walg_backup::walg_prefix(
+                &s3_source.bucket_name,
+                &s3_source.bucket_path,
+                &service.name,
+            );
 
             let config_json = service
                 .config
@@ -439,16 +403,60 @@ impl ExternalServiceManager {
                 parameters: serde_json::from_str(&config_json).unwrap_or(serde_json::Value::Null),
             };
 
-            let docker = self.require_docker()?;
-            let postgres =
-                crate::externalsvc::postgres::PostgresService::new(service.name.clone(), docker);
-            postgres
-                .force_reenable_continuous_archiving(service_config, &s3_credentials, &walg_prefix)
-                .await
-                .map_err(|e| ExternalServiceError::DockerError {
-                    id: service_id,
-                    reason: format!("failed to repoint WAL archiving: {}", e),
-                })?;
+            if let ServiceExecutionRoute::Remote(node_id) = service_execution_route(service.node_id)
+            {
+                // A worker's container is on its node: its agent runs the
+                // same re-point there, with the node's recreate, holding a
+                // credential for the service's own WAL-G repository only
+                // (ADR-102).
+                let scoped = self
+                    .worker_credentials
+                    .destination(
+                        &s3_source,
+                        crate::worker_s3_scope::WorkerS3Grant::archive(
+                            service_id,
+                            node_id,
+                            crate::externalsvc::postgres_walg_backup::walg_key_prefix(
+                                &s3_source.bucket_path,
+                                &service.name,
+                            ),
+                        ),
+                    )
+                    .await
+                    .map_err(|error| ExternalServiceError::InternalError {
+                        reason: format!(
+                            "could not re-point continuous archiving of service {service_id} \
+                             to S3 source {}: {error}",
+                            s3_source.id
+                        ),
+                    })?;
+                if let Some(warning) = scoped.warning(&s3_source.name, node_id) {
+                    tracing::warn!(service_id, node_id, "{warning}");
+                }
+                self.walg_archive_worker_postgres(
+                    service_id,
+                    scoped.destination,
+                    s3_credentials.bucket_path.clone(),
+                )
+                .await?;
+            } else {
+                let docker = self.require_docker()?;
+                let postgres = crate::externalsvc::postgres::PostgresService::new(
+                    service.name.clone(),
+                    docker,
+                );
+                postgres
+                    .force_reenable_continuous_archiving(
+                        service_config,
+                        &s3_credentials,
+                        &walg_prefix,
+                    )
+                    .await
+                    .map_err(|e| ExternalServiceError::DockerError {
+                        id: service_id,
+                        reason: format!("failed to repoint WAL archiving: {}", e),
+                    })?;
+            }
         }
 
         // The container (when Postgres/Timescale) has already been
@@ -560,6 +568,33 @@ impl ExternalServiceManager {
     }
 }
 
+/// [`ExternalServiceManager::backup_restart_reason`] of a service on a
+/// worker, from its agent's WAL probe. A recreate there rebuilds the running
+/// container on its own volume, so the restart is never refused for its
+/// storage; when the setting cannot be read the answer is "it may".
+fn worker_restart_reason(
+    service_name: &str,
+    probe: &super::wal_health::WalProbeOutcome,
+) -> Option<String> {
+    use crate::externalsvc::postgres_wal_health::ArchiveMode;
+    match probe {
+        super::wal_health::WalProbeOutcome::Snapshot(snapshot) => match snapshot.archive_mode {
+            ArchiveMode::On | ArchiveMode::Always => None,
+            ArchiveMode::Off | ArchiveMode::Unknown => Some(format!(
+                "WAL archiving is off for PostgreSQL service '{service_name}'. The first WAL-G \
+                 backup turns it on, which restarts PostgreSQL in a new container on its node \
+                 (usually under a minute). Temps keeps the current container until the new one \
+                 is verified to hold the same data, and puts it back otherwise"
+            )),
+        },
+        super::wal_health::WalProbeOutcome::Unchecked(reason) => Some(format!(
+            "Temps could not read whether WAL archiving is on for PostgreSQL service \
+             '{service_name}' ({reason}). If it is off, this backup restarts PostgreSQL in a new \
+             container on its node to turn it on"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -625,6 +660,7 @@ mod tests {
             managed_by_cloud: false,
             lifecycle_reconcile_failed_at: None,
             lifecycle_reconcile_generation: 0,
+            worker_credentials: "scoped".to_string(),
             created_at: now,
             updated_at: now,
         }
@@ -837,5 +873,48 @@ mod tests {
             .expect("a daemon is available");
         assert_eq!(report.stopped.len(), 2, "{report:?}");
         assert_eq!(left, 0, "both helpers must be removed");
+    }
+
+    /// A worker's PostgreSQL asks for the same confirmation as a local one,
+    /// read through its agent: archiving off, or unknown, needs it.
+    #[test]
+    fn a_worker_backup_that_turns_archiving_on_asks_for_confirmation() {
+        use super::super::wal_health::WalProbeOutcome;
+        use crate::externalsvc::postgres_wal_health::{ArchiveMode, PostgresWalHealth};
+        let snapshot = |archive_mode| {
+            WalProbeOutcome::Snapshot(PostgresWalHealth {
+                probed_at: chrono::Utc::now(),
+                pg_wal_bytes: 0,
+                max_wal_size_bytes: 0,
+                archive_mode,
+                archive_command: None,
+                archive_backlog: 0,
+                archiver_failed_count: None,
+                archiver_last_failed_at: None,
+                stale_slots: Vec::new(),
+                oldest_wal_age_secs: 0,
+                warnings: Vec::new(),
+            })
+        };
+        assert_eq!(
+            worker_restart_reason("orders", &snapshot(ArchiveMode::On)),
+            None
+        );
+        assert_eq!(
+            worker_restart_reason("orders", &snapshot(ArchiveMode::Always)),
+            None
+        );
+        let off = worker_restart_reason("orders", &snapshot(ArchiveMode::Off))
+            .expect("archiving off restarts");
+        assert!(
+            off.contains("'orders'") && off.contains("on its node"),
+            "{off}"
+        );
+        let unknown = worker_restart_reason(
+            "orders",
+            &WalProbeOutcome::Unchecked("the agent did not answer".to_string()),
+        )
+        .expect("an unknown setting asks");
+        assert!(unknown.contains("the agent did not answer"), "{unknown}");
     }
 }

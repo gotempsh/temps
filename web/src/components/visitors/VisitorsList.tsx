@@ -2,18 +2,21 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import {
+  getEnvironmentsOptions,
   getVisitorFacetsOptions,
   getVisitorsOptions,
 } from '@/api/client/@tanstack/react-query.gen'
-import { ProjectResponse, VisitorInfo } from '@/api/client/types.gen'
+import type {
+  ProjectResponse,
+  VisitorInfo,
+  VisitorFacets,
+  VisitorSegmentFilters,
+} from '@/api/client/types.gen'
 import { Button } from '@/components/ui/button'
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from '@/components/ui/card'
+import { Badge } from '@/components/ui/badge'
+import { Switch } from '@/components/ui/switch'
+import { Label } from '@/components/ui/label'
+import { TimeRangeFilter } from '@/components/ui/time-range-filter'
 import {
   Select,
   SelectContent,
@@ -21,730 +24,599 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
+import { ResponsivePagination } from '@/components/ui/responsive-pagination'
+import { TableColumnPicker } from '@/components/table/TableColumnPicker'
+import { useTableColumns } from '@/components/table/useTableColumns'
 import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from '@/components/ui/table'
+  captureListReturnState,
+  useListScrollRestoration,
+  type ListReturnState,
+} from '@/components/table/list-navigation'
 import {
-  Tooltip,
-  TooltipContent,
-  TooltipProvider,
-  TooltipTrigger,
-} from '@/components/ui/tooltip'
-import { Badge } from '@/components/ui/badge'
-import { Switch } from '@/components/ui/switch'
-import { Label } from '@/components/ui/label'
+  Callout,
+  DataTable,
+  PageHeader,
+  PageState,
+  RecordLink,
+  fmtDateTime,
+  fmtNumber,
+  fmtRelativeTime,
+  useUrlState,
+  type DataTableColumn,
+} from '@temps-sdk/ds'
 import { useQuery } from '@tanstack/react-query'
-import { format, formatDistanceToNow } from 'date-fns'
 import {
-  Globe,
+  AlertCircle,
   Bot,
-  User,
-  ChevronLeft,
-  ChevronRight,
-  ChevronDown,
-  ExternalLink,
+  RefreshCw,
   SlidersHorizontal,
+  User,
+  Users,
   X,
 } from 'lucide-react'
-import * as React from 'react'
-import { Link, useNavigate } from 'react-router'
-import { Skeleton } from '@/components/ui/skeleton'
-import { FacetCombobox, type FacetOption } from './FacetCombobox'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { Link, useLocation } from 'react-router'
+import { resolveTimeRange } from '@/lib/time-range-filter'
+import { FacetCombobox } from './FacetCombobox'
 import { crawlerLabel } from '@/components/analytics/traffic-filters-shared'
+import {
+  VISITOR_COLUMNS,
+  DEFAULT_VISITOR_COLUMNS,
+  VISITOR_COLUMNS_STORAGE_KEY,
+  type VisitorColumn,
+} from './visitor-columns'
 
 interface VisitorsListProps {
   project: ProjectResponse
+  listState?: ListReturnState | null
+  onRememberList?: (state: ListReturnState) => void
 }
 
-function countryCodeToFlag(countryCode: string | null | undefined): string {
-  if (!countryCode || countryCode.length !== 2) return ''
-  const codePoints = countryCode
-    .toUpperCase()
-    .split('')
-    .map((char) => 127397 + char.charCodeAt(0))
-  return String.fromCodePoint(...codePoints)
+const FILTERS = [
+  { key: 'filter_country', label: 'Country', facet: 'country' },
+  { key: 'filter_region', label: 'Region', facet: 'region' },
+  { key: 'filter_city', label: 'City', facet: 'city' },
+  { key: 'filter_channel', label: 'Channel', facet: 'channel' },
+  { key: 'filter_referrer', label: 'Referrer', facet: 'referrer' },
+] as const satisfies readonly {
+  key: keyof VisitorSegmentFilters
+  label: string
+  facet: keyof VisitorFacets
+}[]
+
+type FilterKey = (typeof FILTERS)[number]['key']
+
+function positiveInteger(value: string | undefined, fallback: number) {
+  const parsed = Number(value)
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback
 }
 
-function getBrowserInfo(userAgent: string): { name: string; icon: string } {
-  if (userAgent.includes('Edge') || userAgent.includes('Edg/')) {
-    return { name: 'Edge', icon: 'edge' }
-  } else if (userAgent.includes('Chrome') && !userAgent.includes('Chromium')) {
-    return { name: 'Chrome', icon: 'chrome' }
-  } else if (userAgent.includes('Safari') && !userAgent.includes('Chrome')) {
-    return { name: 'Safari', icon: 'safari' }
-  } else if (userAgent.includes('Firefox')) {
-    return { name: 'Firefox', icon: 'firefox' }
-  } else if (userAgent.includes('Opera') || userAgent.includes('OPR')) {
-    return { name: 'Opera', icon: 'opera' }
-  } else if (userAgent.includes('bot') || userAgent.includes('Bot')) {
-    return { name: 'Bot', icon: 'bot' }
-  }
-  return { name: 'Unknown', icon: 'unknown' }
-}
-
-function getOSName(userAgent: string): string {
-  if (userAgent.includes('Windows')) return 'Windows'
-  if (userAgent.includes('Mac OS')) return 'macOS'
-  if (userAgent.includes('Linux') && !userAgent.includes('Android'))
-    return 'Linux'
-  if (userAgent.includes('Android')) return 'Android'
-  if (userAgent.includes('iPhone') || userAgent.includes('iPad')) return 'iOS'
-  if (userAgent.includes('CrOS')) return 'ChromeOS'
+function browserName(agent: string) {
+  if (/Edg\/|Edge\//.test(agent)) return 'Edge'
+  if (/OPR\/|Opera/.test(agent)) return 'Opera'
+  if (/Firefox\/|FxiOS\//.test(agent)) return 'Firefox'
+  if (/Chrome\/|CriOS\//.test(agent)) return 'Chrome'
+  if (/Safari\//.test(agent)) return 'Safari'
   return 'Unknown'
 }
 
-type SegmentFilters = {
-  filter_country?: string
-  filter_region?: string
-  filter_city?: string
-  filter_channel?: string
-  filter_referrer?: string
+function osName(agent: string) {
+  if (/iPhone|iPad|iPod/.test(agent)) return 'iOS'
+  if (agent.includes('Android')) return 'Android'
+  if (agent.includes('CrOS')) return 'ChromeOS'
+  if (agent.includes('Windows')) return 'Windows'
+  if (agent.includes('Mac OS')) return 'macOS'
+  if (agent.includes('Linux')) return 'Linux'
+  return 'Unknown'
 }
 
-type SegmentFilterKey = keyof SegmentFilters
-
-const FILTER_LABELS: Record<SegmentFilterKey, string> = {
-  filter_country: 'Country',
-  filter_region: 'Region',
-  filter_city: 'City',
-  filter_channel: 'Channel',
-  filter_referrer: 'Referrer',
-}
-
-/** Filter groups rendered inline. Only visitor-row dimensions are supported
- *  — see analytics service: event-row filters were dropped to keep the page
- *  fast at high event volume. */
-const FILTER_GROUPS: {
-  title: string
-  keys: SegmentFilterKey[]
-}[] = [
-  {
-    title: 'Location',
-    keys: ['filter_country', 'filter_region', 'filter_city'],
-  },
-  {
-    title: 'Acquisition',
-    keys: ['filter_channel', 'filter_referrer'],
-  },
-]
-
-/** Filters that should render a country flag next to each option. */
-const FLAG_FILTERS = new Set<SegmentFilterKey>(['filter_country'])
-
-/** Map each filter key to the facet response field on the API. */
-const FILTER_TO_FACET: Record<SegmentFilterKey, string> = {
-  filter_country: 'country',
-  filter_region: 'region',
-  filter_city: 'city',
-  filter_channel: 'channel',
-  filter_referrer: 'referrer',
-}
-
-function activeFilterEntries(filters: SegmentFilters) {
-  return (Object.entries(filters) as [SegmentFilterKey, string | undefined][])
-    .filter(([, value]) => value && value.trim() !== '')
-    .map(([key, value]) => [key, value as string] as const)
-}
-
-export function VisitorsList({ project }: VisitorsListProps) {
-  const navigate = useNavigate()
-  const [page, setPage] = React.useState(1)
-  const [limit, setLimit] = React.useState(25)
-  const [crawlerFilter, setCrawlerFilter] = React.useState<
-    'all' | 'humans' | 'crawlers'
-  >('all')
-  const [hideGhostVisitors, setHideGhostVisitors] = React.useState(true)
-  const [filters, setFilters] = React.useState<SegmentFilters>({})
-  const [filtersExpanded, setFiltersExpanded] = React.useState(false)
-
-  const updateFilter = React.useCallback(
-    (key: SegmentFilterKey, value: string | undefined) => {
-      setPage(1)
-      setFilters((prev) => {
-        const next = { ...prev }
-        if (!value || value.trim() === '') {
-          delete next[key]
-        } else {
-          next[key] = value.trim()
-        }
-        return next
-      })
-    },
-    []
-  )
-
-  const clearFilters = React.useCallback(() => {
-    setPage(1)
-    setFilters({})
-  }, [])
-
-  const activeFilters = React.useMemo(
-    () => activeFilterEntries(filters),
-    [filters]
-  )
-
-  // Default date range: last 30 days
-  const endDate = React.useMemo(() => {
-    const date = new Date()
-    date.setHours(23, 59, 59, 999)
-    return date
-  }, [])
-
-  const startDate = React.useMemo(() => {
-    const date = new Date()
-    date.setDate(date.getDate() - 30)
-    date.setHours(0, 0, 0, 0)
-    return date
-  }, [])
-
-  // Populate filter dropdowns with real values + visitor counts. The query is
-  // re-issued when any filter changes so each dropdown reflects the *other*
-  // filters' narrowed pool — the backend handles excluding the dimension
-  // being aggregated from its own filter.
-  const { data: facetsData, isLoading: facetsLoading } = useQuery({
-    ...getVisitorFacetsOptions({
-      query: {
-        project_id: project.id,
-        start_date: startDate.toISOString(),
-        end_date: endDate.toISOString(),
-        include_crawlers:
-          crawlerFilter === 'all'
-            ? undefined
-            : crawlerFilter === 'crawlers'
-              ? true
-              : false,
-        has_activity_only: hideGhostVisitors ? undefined : false,
-        per_facet_limit: 50,
-        ...filters,
-      },
-    }),
-    // Only fetch facets once the user has expanded the filter section.
-    enabled: filtersExpanded || activeFilters.length > 0,
+export function VisitorsList({
+  project,
+  listState,
+  onRememberList,
+}: VisitorsListProps) {
+  const { state, patch } = useUrlState()
+  const location = useLocation()
+  const url = location.pathname + location.search
+  const containerRef = useRef<HTMLDivElement>(null)
+  const [saved] = useState(() => (listState?.url === url ? listState : null))
+  const [initialNow] = useState(Date.now)
+  const [refreshedAt, setRefreshedAt] = useState<number | null>(null)
+  const page = positiveInteger(state.page, 1)
+  const requestedLimit = positiveInteger(state.limit, 25)
+  const limit = [10, 25, 50, 100].includes(requestedLimit) ? requestedLimit : 25
+  const timeRange = state.time_range || '30d'
+  const visitorType = state.visitor_type === 'humans' ? 'humans' : 'all'
+  const activityOnly = state.activity !== 'all'
+  const environment = positiveInteger(state.environment, 0) || undefined
+  const filters = Object.fromEntries(
+    FILTERS.filter(({ key }) => state[key]?.trim()).map(({ key }) => [
+      key,
+      state[key]!.trim(),
+    ])
+  ) as Partial<Record<FilterKey, string>>
+  const activeFilters = FILTERS.filter(({ key }) => !!filters[key])
+  const filterCount =
+    activeFilters.length +
+    Number(visitorType !== 'all') +
+    Number(!activityOnly) +
+    Number(!!environment)
+  const filtersExpanded = state.filters === 'open'
+  const hasFilters = filterCount > 0 || timeRange !== '30d'
+  const { visibleKeys, changeColumns, resetColumns } = useTableColumns({
+    options: VISITOR_COLUMNS,
+    defaults: DEFAULT_VISITOR_COLUMNS,
+    storageKey: VISITOR_COLUMNS_STORAGE_KEY,
   })
+  const dateRange = useMemo(() => {
+    if (refreshedAt === null && saved?.timeRange === timeRange)
+      return saved.dateRange
+    const resolved = resolveTimeRange(timeRange, refreshedAt ?? initialNow)
+    return { from: resolved.from, to: resolved.to }
+  }, [saved, timeRange, initialNow, refreshedAt])
 
-  const getFacetOptions = React.useCallback(
-    (key: SegmentFilterKey): FacetOption[] => {
-      if (!facetsData) return []
-      const field = FILTER_TO_FACET[key]
-      const list = (facetsData as Record<string, unknown>)[field]
-      if (!Array.isArray(list)) return []
-      return list.map((row) => ({
-        value: String((row as { value: unknown }).value ?? ''),
-        count: Number((row as { count: unknown }).count ?? 0),
-        code: (row as { code?: string | null }).code ?? null,
-      }))
-    },
-    [facetsData]
-  )
-
-  const { data, isLoading, error, refetch } = useQuery({
-    ...getVisitorsOptions({
-      query: {
-        project_id: project.id,
-        start_date: startDate.toISOString(),
-        end_date: endDate.toISOString(),
-        offset: (page - 1) * limit,
-        limit,
-        include_crawlers:
-          crawlerFilter === 'all'
-            ? undefined
-            : crawlerFilter === 'crawlers'
-              ? true
-              : false,
-        has_activity_only: hideGhostVisitors ? undefined : false,
-        ...filters,
-      },
-    }),
-  })
-
-  const totalPages = React.useMemo(() => {
-    if (!data) return 0
-    return Math.ceil(data.filtered_count / limit)
-  }, [data, limit])
-
-  return (
-    <div className="space-y-6">
-      <Card>
-        <CardHeader>
-          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-            <div>
-              <CardTitle>Visitors</CardTitle>
-              <Link
-                to={`/projects/${project.slug}/analytics/activity`}
-                className="text-sm underline underline-offset-4"
-              >
-                Understand visitor activity with AI
-              </Link>
-              <CardDescription>
-                {data
-                  ? `${data.filtered_count.toLocaleString()} visitors found`
-                  : 'Browse and analyze visitor sessions'}
-              </CardDescription>
-            </div>
-            <div className="flex flex-wrap items-center gap-2 sm:gap-4">
-              <div className="flex items-center gap-2">
-                <Switch
-                  id="hide-ghost"
-                  checked={hideGhostVisitors}
-                  onCheckedChange={setHideGhostVisitors}
-                />
-                <Label
-                  htmlFor="hide-ghost"
-                  className="text-sm cursor-pointer whitespace-nowrap"
-                >
-                  Hide ghost visitors
-                </Label>
-              </div>
-              <Button
-                variant={filtersExpanded ? 'secondary' : 'outline'}
-                size="sm"
-                onClick={() => setFiltersExpanded((v) => !v)}
-                className="gap-1.5 whitespace-nowrap"
-                aria-expanded={filtersExpanded}
-                aria-controls="visitors-filter-panel"
-              >
-                <SlidersHorizontal className="h-3.5 w-3.5" />
-                Filters
-                {activeFilters.length > 0 && (
-                  <Badge
-                    variant="secondary"
-                    className="ml-0.5 h-4 min-w-[16px] px-1 text-[10px]"
-                  >
-                    {activeFilters.length}
-                  </Badge>
-                )}
-                <ChevronDown
-                  className={`h-3.5 w-3.5 transition-transform ${
-                    filtersExpanded ? 'rotate-180' : ''
-                  }`}
-                />
-              </Button>
-              <Select
-                value={crawlerFilter}
-                onValueChange={(value: 'all' | 'humans' | 'crawlers') =>
-                  setCrawlerFilter(value)
-                }
-              >
-                <SelectTrigger
-                  aria-label="Visitor type"
-                  className="w-[120px] sm:w-[140px]"
-                >
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="all">All Visitors</SelectItem>
-                  <SelectItem value="humans">Humans Only</SelectItem>
-                  <SelectItem value="crawlers">Crawlers Only</SelectItem>
-                </SelectContent>
-              </Select>
-              <Select
-                value={limit.toString()}
-                onValueChange={(value) => setLimit(parseInt(value))}
-              >
-                <SelectTrigger
-                  aria-label="Visitors per page"
-                  className="w-[90px] sm:w-[100px]"
-                >
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="10">10 / page</SelectItem>
-                  <SelectItem value="25">25 / page</SelectItem>
-                  <SelectItem value="50">50 / page</SelectItem>
-                  <SelectItem value="100">100 / page</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-          </div>
-        </CardHeader>
-        <CardContent>
-          {filtersExpanded && (
-            <div
-              id="visitors-filter-panel"
-              className="mb-5 rounded-lg border bg-muted/20 p-3 sm:p-4"
-            >
-              <div className="flex items-center justify-between mb-3">
-                <div className="flex items-center gap-2">
-                  <span className="text-sm font-medium">Filters</span>
-                  {activeFilters.length > 0 && (
-                    <Badge
-                      variant="secondary"
-                      className="h-5 px-1.5 text-[10px]"
-                    >
-                      {activeFilters.length} active
-                    </Badge>
-                  )}
-                </div>
-                {activeFilters.length > 0 && (
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    className="h-7 px-2 text-xs gap-1"
-                    onClick={clearFilters}
-                  >
-                    <X className="h-3 w-3" /> Clear all
-                  </Button>
-                )}
-              </div>
-
-              {FILTER_GROUPS.map((group) => (
-                <div key={group.title} className="mb-4 last:mb-0">
-                  <div className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground mb-1.5">
-                    {group.title}
-                  </div>
-                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-2">
-                    {group.keys.map((key) => (
-                      <FacetCombobox
-                        key={key}
-                        label={FILTER_LABELS[key]}
-                        value={filters[key]}
-                        options={getFacetOptions(key)}
-                        onChange={(next) => updateFilter(key, next)}
-                        withFlag={FLAG_FILTERS.has(key)}
-                        loading={facetsLoading}
-                      />
-                    ))}
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-          {isLoading ? (
-            <div className="space-y-2">
-              {[...Array(8)].map((_, i) => (
-                <Skeleton key={i} className="h-12 w-full rounded" />
-              ))}
-            </div>
-          ) : error ? (
-            <div className="flex flex-col items-center justify-center py-12">
-              <p className="text-muted-foreground mb-2">
-                Failed to load visitors
-              </p>
-              <Button variant="outline" onClick={() => refetch()}>
-                Try again
-              </Button>
-            </div>
-          ) : !data || data.visitors.length === 0 ? (
-            <div className="flex flex-col items-center justify-center py-12">
-              <User className="h-12 w-12 text-muted-foreground mb-4" />
-              <p className="text-muted-foreground">No visitors found</p>
-            </div>
-          ) : (
-            <>
-              <TooltipProvider>
-                <div className="overflow-x-auto">
-                  <Table>
-                    <TableHeader>
-                      <TableRow>
-                        <TableHead className="w-[200px] sm:w-[280px]">
-                          Visitor
-                        </TableHead>
-                        <TableHead>Location</TableHead>
-                        <TableHead className="hidden md:table-cell">
-                          Source
-                        </TableHead>
-                        <TableHead className="hidden lg:table-cell">
-                          Browser / OS
-                        </TableHead>
-                        <TableHead>First seen</TableHead>
-                        <TableHead>Last seen</TableHead>
-                      </TableRow>
-                    </TableHeader>
-                    <TableBody>
-                      {data.visitors.map((visitor: VisitorInfo) => (
-                        <VisitorRow
-                          key={visitor.visitor_id}
-                          visitor={visitor}
-                          onClick={() =>
-                            navigate(
-                              `/projects/${project.slug}/analytics/visitors/${visitor.id}`
-                            )
-                          }
-                          onFilter={updateFilter}
-                          activeFilters={filters}
-                        />
-                      ))}
-                    </TableBody>
-                  </Table>
-                </div>
-              </TooltipProvider>
-
-              {/* Pagination */}
-              {totalPages > 1 && (
-                <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between mt-6">
-                  <div className="text-sm text-muted-foreground">
-                    <span className="hidden sm:inline">
-                      Showing {(page - 1) * limit + 1} to{' '}
-                      {Math.min(page * limit, data.filtered_count)} of{' '}
-                      {data.filtered_count} visitors
-                    </span>
-                    <span className="sm:hidden">
-                      {page} / {totalPages}
-                    </span>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={() => setPage((p) => Math.max(1, p - 1))}
-                      disabled={page === 1}
-                    >
-                      <ChevronLeft className="h-4 w-4" />
-                      <span className="max-sm:sr-only">Previous</span>
-                    </Button>
-                    <div className="hidden sm:flex items-center gap-1">
-                      {[...Array(Math.min(5, totalPages))].map((_, idx) => {
-                        const pageNum = page - 2 + idx
-                        if (pageNum < 1 || pageNum > totalPages) return null
-                        return (
-                          <Button
-                            key={pageNum}
-                            variant={pageNum === page ? 'default' : 'outline'}
-                            size="sm"
-                            onClick={() => setPage(pageNum)}
-                            className="w-10"
-                          >
-                            {pageNum}
-                          </Button>
-                        )
-                      })}
-                    </div>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={() =>
-                        setPage((p) => Math.min(totalPages, p + 1))
-                      }
-                      disabled={page === totalPages}
-                    >
-                      <span className="max-sm:sr-only">Next</span>
-                      <ChevronRight className="h-4 w-4" />
-                    </Button>
-                  </div>
-                </div>
-              )}
-            </>
-          )}
-        </CardContent>
-      </Card>
-    </div>
-  )
-}
-
-interface VisitorRowProps {
-  visitor: VisitorInfo
-  onClick: () => void
-  onFilter: (key: SegmentFilterKey, value: string | undefined) => void
-  activeFilters: SegmentFilters
-}
-
-function VisitorRow({
-  visitor,
-  onClick,
-  onFilter,
-  activeFilters,
-}: VisitorRowProps) {
-  const browserInfo = visitor.user_agent
-    ? getBrowserInfo(visitor.user_agent)
-    : null
-  const osName = visitor.user_agent ? getOSName(visitor.user_agent) : null
-  const flag = countryCodeToFlag(visitor.country_code)
-  const lastSeenDate = new Date(visitor.last_seen)
-  const firstSeenDate = new Date(visitor.first_seen)
-
-  const handleFilter = (
-    e: React.MouseEvent,
-    key: SegmentFilterKey,
-    value: string | null | undefined
-  ) => {
-    if (!value) return
-    e.stopPropagation()
-    onFilter(key, activeFilters[key] === value ? undefined : value)
+  const queryFilters = {
+    project_id: project.id,
+    start_date: dateRange.from,
+    end_date: dateRange.to,
+    environment_id: environment,
+    include_crawlers: visitorType === 'humans' ? false : undefined,
+    has_activity_only: activityOnly,
+    ...filters,
   }
+  const facets = useQuery({
+    ...getVisitorFacetsOptions({
+      query: { ...queryFilters, per_facet_limit: 50 },
+    }),
+    enabled: filtersExpanded,
+  })
+  const environments = useQuery({
+    ...getEnvironmentsOptions({ path: { project_id: project.id } }),
+    enabled: filtersExpanded || visibleKeys.includes('environment'),
+  })
+  const query = useQuery(
+    getVisitorsOptions({
+      query: { ...queryFilters, offset: (page - 1) * limit, limit },
+    })
+  )
+  const { data, isLoading, error } = query
+  const totalPages = Math.max(1, Math.ceil((data?.filtered_count ?? 0) / limit))
+  useEffect(() => {
+    if (query.isSuccess && page > totalPages)
+      patch({ page: totalPages > 1 ? totalPages : undefined })
+  }, [query.isSuccess, page, totalPages, patch])
+  useListScrollRestoration(containerRef, saved, !!data, url)
 
-  return (
-    <TableRow className="cursor-pointer" onClick={onClick}>
-      {/* Visitor identity */}
-      <TableCell>
-        <div className="flex items-center gap-3">
-          <div
-            className={`flex h-8 w-8 items-center justify-center rounded-full flex-shrink-0 ${
-              visitor.is_crawler
-                ? 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400'
-                : 'bg-blue-100 text-blue-600 dark:bg-blue-900/30 dark:text-blue-400'
-            }`}
+  const updateFilter = (key: FilterKey, value: string | undefined) =>
+    patch({ [key]: value?.trim(), page: undefined })
+  const clearFilters = () =>
+    patch({
+      ...Object.fromEntries(FILTERS.map(({ key }) => [key, undefined])),
+      environment: undefined,
+      visitor_type: undefined,
+      activity: undefined,
+      time_range: undefined,
+      page: undefined,
+    })
+  const rememberList = () =>
+    onRememberList?.(
+      captureListReturnState(containerRef.current, {
+        url,
+        timeRange,
+        dateRange,
+      })
+    )
+  const renderLocationFilter = (key: FilterKey, value: string) => (
+    <Button
+      type="button"
+      variant="link"
+      size="sm"
+      className="h-auto max-w-48 truncate p-0 font-normal text-foreground decoration-muted-foreground underline-offset-4"
+      aria-label={`Filter by ${value}`}
+      aria-pressed={filters[key] === value}
+      onClick={() =>
+        updateFilter(key, filters[key] === value ? undefined : value)
+      }
+    >
+      {value}
+    </Button>
+  )
+
+  const renderValue = (key: VisitorColumn, visitor: VisitorInfo) => {
+    switch (key) {
+      case 'visitor': {
+        const Icon = visitor.is_crawler ? Bot : User
+        const label = visitor.is_crawler
+          ? crawlerLabel(visitor.crawler_name, 'Crawler')
+          : 'Human visitor'
+        return (
+          <RecordLink
+            to={`/projects/${project.slug}/analytics/visitors/${visitor.id}`}
+            state={{ listReturnTo: url }}
+            onClick={rememberList}
+            aria-label={`View ${label} details`}
           >
-            {visitor.is_crawler ? (
-              <Bot className="h-4 w-4" />
-            ) : (
-              <User className="h-4 w-4" />
-            )}
-          </div>
-          <div className="min-w-0">
-            <div className="flex items-center gap-2">
-              <span className="font-mono text-sm truncate">
-                {visitor.visitor_id?.substring(0, 12)}
+            <span className="inline-flex items-center gap-2">
+              <Icon
+                className="size-4 shrink-0 text-muted-foreground"
+                aria-hidden="true"
+              />
+              <span className="block max-w-48 truncate" title={label}>
+                {label}
               </span>
-              <Badge
-                variant={visitor.is_crawler ? 'warning' : 'secondary'}
-                className="text-[10px] px-1.5 py-0"
-              >
-                {visitor.is_crawler
-                  ? crawlerLabel(visitor.crawler_name, 'Bot')
-                  : 'Human'}
-              </Badge>
-            </div>
-          </div>
-        </div>
-      </TableCell>
-
-      {/* Location */}
-      <TableCell>
-        <div className="flex items-center gap-2 min-w-0">
-          {visitor.country ? (
-            <button
-              type="button"
-              onClick={(e) =>
-                handleFilter(e, 'filter_country', visitor.country)
-              }
-              title={`Filter by ${visitor.country}`}
-              className="text-base leading-none hover:scale-110 transition-transform"
-            >
-              {flag || <Globe className="h-4 w-4 text-muted-foreground" />}
-            </button>
-          ) : (
-            <Globe className="h-4 w-4 text-muted-foreground flex-shrink-0" />
-          )}
-          <div className="flex items-center gap-1 text-sm truncate max-w-[220px]">
-            {visitor.city && (
-              <>
-                <button
-                  type="button"
-                  onClick={(e) => handleFilter(e, 'filter_city', visitor.city)}
-                  className="hover:underline truncate"
-                  title={`Filter by ${visitor.city}`}
-                >
-                  {visitor.city}
-                </button>
-                {(visitor.region || visitor.country) && (
-                  <span className="text-muted-foreground">,</span>
-                )}
-              </>
-            )}
-            {visitor.region && visitor.region !== visitor.city && (
-              <>
-                <button
-                  type="button"
-                  onClick={(e) =>
-                    handleFilter(e, 'filter_region', visitor.region)
-                  }
-                  className="hover:underline truncate"
-                  title={`Filter by ${visitor.region}`}
-                >
-                  {visitor.region}
-                </button>
-                {visitor.country && (
-                  <span className="text-muted-foreground">,</span>
-                )}
-              </>
-            )}
-            {visitor.country && (
-              <button
-                type="button"
-                onClick={(e) =>
-                  handleFilter(e, 'filter_country', visitor.country)
-                }
-                className="hover:underline truncate"
-                title={`Filter by ${visitor.country}`}
-              >
-                {visitor.country}
-              </button>
-            )}
+            </span>
+          </RecordLink>
+        )
+      }
+      case 'location': {
+        const parts = [
+          ['filter_city', visitor.city],
+          ['filter_region', visitor.region],
+          ['filter_country', visitor.country],
+        ] as const
+        return (
+          <div className="max-w-64 space-y-1">
+            {parts
+              .filter(
+                ([, value], index) =>
+                  value && (index !== 1 || value !== visitor.city)
+              )
+              .map(([filter, value]) => (
+                <div key={filter}>{renderLocationFilter(filter, value!)}</div>
+              ))}
             {!visitor.city && !visitor.region && !visitor.country && (
               <span className="text-muted-foreground">Unknown</span>
             )}
           </div>
-          {visitor.is_eu && (
-            <Badge variant="outline" className="text-[10px] px-1.5 py-0">
-              EU
-            </Badge>
-          )}
-        </div>
-      </TableCell>
-
-      {/* Source / Referrer */}
-      <TableCell className="hidden md:table-cell">
-        <VisitorSource visitor={visitor} />
-      </TableCell>
-
-      {/* Browser / OS */}
-      <TableCell className="hidden lg:table-cell">
-        <div className="flex items-center gap-1.5">
-          <span className="text-sm">{browserInfo?.name || 'Unknown'}</span>
-          {osName && osName !== 'Unknown' && (
-            <span className="text-xs text-muted-foreground">/ {osName}</span>
-          )}
-        </div>
-      </TableCell>
-
-      {/* First Seen */}
-      <TableCell>
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <span className="text-sm text-muted-foreground cursor-default">
-              {formatDistanceToNow(firstSeenDate, { addSuffix: true })}
+        )
+      }
+      case 'source':
+        return (
+          <div className="max-w-48 space-y-1">
+            {visitor.first_channel && (
+              <div>
+                {renderLocationFilter('filter_channel', visitor.first_channel)}
+              </div>
+            )}
+            {visitor.first_referrer_hostname && (
+              <div>
+                {renderLocationFilter(
+                  'filter_referrer',
+                  visitor.first_referrer_hostname
+                )}
+              </div>
+            )}
+            {!visitor.first_channel && !visitor.first_referrer_hostname && (
+              <span className="text-muted-foreground">Direct</span>
+            )}
+          </div>
+        )
+      case 'browser':
+        return (
+          <div>
+            <p>{browserName(visitor.user_agent ?? '')}</p>
+            <p className="text-xs text-muted-foreground">
+              {osName(visitor.user_agent ?? '')}
+            </p>
+          </div>
+        )
+      case 'first_seen':
+      case 'last_seen': {
+        const value = visitor[key]
+        return (
+          <time
+            dateTime={value}
+            title={value}
+            className="block whitespace-nowrap"
+          >
+            <span className="block">{fmtRelativeTime(value)}</span>
+            <span className="text-xs text-muted-foreground">
+              {fmtDateTime(value)}
             </span>
-          </TooltipTrigger>
-          <TooltipContent>
-            {format(firstSeenDate, 'MMM d, yyyy HH:mm:ss')}
-          </TooltipContent>
-        </Tooltip>
-      </TableCell>
-
-      {/* Last Seen */}
-      <TableCell>
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <span className="text-sm text-muted-foreground cursor-default">
-              {formatDistanceToNow(lastSeenDate, { addSuffix: true })}
-            </span>
-          </TooltipTrigger>
-          <TooltipContent>
-            {format(lastSeenDate, 'MMM d, yyyy HH:mm:ss')}
-          </TooltipContent>
-        </Tooltip>
-      </TableCell>
-    </TableRow>
-  )
-}
-
-function VisitorSource({ visitor }: { visitor: VisitorInfo }) {
-  const channel = visitor.first_channel
-  const hostname = visitor.first_referrer_hostname
-
-  if (!channel && !hostname) {
-    return <span className="text-sm text-muted-foreground">Direct</span>
+          </time>
+        )
+      }
+      case 'environment':
+        return (
+          environments.data?.find((item) => item.id === visitor.environment_id)
+            ?.name ?? `Environment ${visitor.environment_id}`
+        )
+      default:
+        return (
+          <span
+            className={`block max-w-64 truncate ${key === 'current_page' || key === 'ip_address' ? 'font-mono' : ''}`}
+            title={visitor[key] ?? undefined}
+          >
+            {visitor[key] || '—'}
+          </span>
+        )
+    }
   }
+  const columns: DataTableColumn<VisitorInfo>[] = VISITOR_COLUMNS.filter(
+    ({ key }) => visibleKeys.includes(key)
+  ).map(({ key, label }) => ({
+    key,
+    header: label,
+    render: (visitor) => renderValue(key, visitor),
+  }))
 
   return (
-    <div className="flex flex-col gap-0.5">
-      {channel && (
-        <Badge variant="outline" className="text-[10px] px-1.5 py-0 w-fit">
-          {channel}
-        </Badge>
-      )}
-      {hostname && (
-        <div className="flex items-center gap-1">
-          <ExternalLink className="h-3 w-3 text-muted-foreground flex-shrink-0" />
-          <span className="text-xs text-muted-foreground truncate max-w-[150px]">
-            {hostname}
-          </span>
+    <div ref={containerRef} className="w-full min-w-0 space-y-6">
+      <PageHeader
+        headingLevel="h2"
+        title="Visitors"
+        description={
+          data
+            ? `${fmtNumber(data.filtered_count)} ${activityOnly ? 'visitors with activity' : 'visitors'} · ${timeRange === '30d' ? 'Last 30 days' : 'Selected time range'}`
+            : 'Explore visitors and their activity.'
+        }
+        actions={
+          <>
+            <Button variant="outline" size="sm" asChild>
+              <Link to={`/projects/${project.slug}/analytics/activity`}>
+                Explore activity with AI
+              </Link>
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              aria-disabled={query.isFetching}
+              onClick={() => {
+                if (query.isFetching) return
+                if (timeRange.startsWith('custom:')) void query.refetch()
+                else setRefreshedAt(Date.now())
+              }}
+            >
+              <RefreshCw className="mr-2 size-4" aria-hidden="true" />
+              {query.isFetching ? 'Refreshing…' : 'Refresh'}
+            </Button>
+          </>
+        }
+      />
+      <div className="flex flex-wrap items-center gap-2">
+        <fieldset aria-label="Time range" className="min-w-0">
+          <TimeRangeFilter
+            value={timeRange}
+            customLabel={timeRange === '30d' ? '30d' : undefined}
+            onChange={(value) => patch({ time_range: value, page: undefined })}
+          />
+        </fieldset>
+        <Select
+          value={visitorType}
+          onValueChange={(value) =>
+            patch({
+              visitor_type: value === 'all' ? undefined : value,
+              page: undefined,
+            })
+          }
+        >
+          <SelectTrigger aria-label="Visitor type" className="w-40">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">All visitors</SelectItem>
+            <SelectItem value="humans">Humans only</SelectItem>
+          </SelectContent>
+        </Select>
+        <Button
+          type="button"
+          variant={filtersExpanded ? 'secondary' : 'outline'}
+          size="sm"
+          aria-expanded={filtersExpanded}
+          aria-controls="visitors-filter-panel"
+          onClick={() =>
+            patch({ filters: filtersExpanded ? undefined : 'open' })
+          }
+        >
+          <SlidersHorizontal className="mr-2 size-4" aria-hidden="true" />
+          Filters
+          {filterCount > 0 && (
+            <Badge variant="secondary" className="ml-2 tabular-nums">
+              {filterCount}
+            </Badge>
+          )}
+        </Button>
+        <div className="ml-auto">
+          <TableColumnPicker
+            options={VISITOR_COLUMNS}
+            visibleKeys={visibleKeys}
+            onChange={changeColumns}
+            onReset={resetColumns}
+          />
         </div>
+      </div>
+      {filtersExpanded && (
+        <div
+          id="visitors-filter-panel"
+          className="space-y-4 rounded-lg border bg-muted/30 p-4"
+        >
+          <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 xl:grid-cols-3">
+            {FILTERS.map(({ key, label, facet }) => (
+              <FacetCombobox
+                key={key}
+                label={label}
+                value={filters[key]}
+                options={facets.data?.[facet] ?? []}
+                onChange={(value) => updateFilter(key, value)}
+                loading={facets.isLoading}
+                error={!!facets.error}
+                onRetry={() => void facets.refetch()}
+              />
+            ))}
+            <Select
+              value={environment ? String(environment) : 'all'}
+              onValueChange={(value) =>
+                patch({
+                  environment: value === 'all' ? undefined : value,
+                  page: undefined,
+                })
+              }
+            >
+              <SelectTrigger aria-label="Environment">
+                <SelectValue placeholder="All environments" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">All environments</SelectItem>
+                {environments.data?.map((item) => (
+                  <SelectItem key={item.id} value={String(item.id)}>
+                    {item.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          {environments.error && (
+            <Callout tone="error" title="Could not load environments">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => void environments.refetch()}
+              >
+                Retry environments
+              </Button>
+            </Callout>
+          )}
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="space-y-1">
+              <div className="flex items-center gap-2">
+                <Switch
+                  id="visitors-activity-only"
+                  checked={activityOnly}
+                  onCheckedChange={(checked) =>
+                    patch({
+                      activity: checked ? undefined : 'all',
+                      page: undefined,
+                    })
+                  }
+                  aria-describedby="visitors-activity-help"
+                />
+                <Label htmlFor="visitors-activity-only">
+                  Only visitors with activity
+                </Label>
+              </div>
+              <p
+                id="visitors-activity-help"
+                className="text-xs text-muted-foreground"
+              >
+                Exclude visitor records with no recorded events or sessions.
+              </p>
+            </div>
+            {hasFilters && (
+              <Button variant="ghost" size="sm" onClick={clearFilters}>
+                Clear filters
+              </Button>
+            )}
+          </div>
+        </div>
+      )}
+      {(activeFilters.length > 0 || environment || !activityOnly) && (
+        <div
+          role="group"
+          className="flex flex-wrap items-center gap-2"
+          aria-label="Active visitor filters"
+        >
+          {activeFilters.map(({ key, label }) => (
+            <Button
+              key={key}
+              variant="outline"
+              size="sm"
+              onClick={() => updateFilter(key, undefined)}
+              aria-label={`Remove ${label} filter`}
+            >
+              <span className="max-w-48 truncate">
+                {label}: {filters[key]}
+              </span>
+              <X className="ml-1 size-3" aria-hidden="true" />
+            </Button>
+          ))}
+          {environment && (
+            <Badge variant="secondary">
+              Environment:{' '}
+              {environments.data?.find((item) => item.id === environment)
+                ?.name ?? environment}
+            </Badge>
+          )}
+          {!activityOnly && (
+            <Badge variant="secondary">
+              Including visitors without activity
+            </Badge>
+          )}
+          <Button variant="ghost" size="sm" onClick={clearFilters}>
+            Clear filters
+          </Button>
+        </div>
+      )}
+      {error && data && (
+        <Callout tone="error" title="Visitors could not refresh">
+          <div className="flex flex-wrap items-center gap-3">
+            <span>Showing previously loaded visitors.</span>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => void query.refetch()}
+            >
+              Retry
+            </Button>
+          </div>
+        </Callout>
+      )}
+      {error && !data ? (
+        <div className="rounded-lg border bg-card text-card-foreground">
+          <PageState
+            size="compact"
+            variant="failed"
+            icon={AlertCircle}
+            title="Could not load visitors"
+            description="Try again to load visitors for this project."
+            action={<Button onClick={() => void query.refetch()}>Retry</Button>}
+          />
+        </div>
+      ) : !isLoading && data?.visitors.length === 0 ? (
+        <div className="rounded-lg border bg-card text-card-foreground">
+          <PageState
+            size="compact"
+            variant="empty"
+            icon={Users}
+            title={hasFilters ? 'No matching visitors' : 'No visitors yet'}
+            description={
+              hasFilters
+                ? 'Try another time range or clear the filters.'
+                : 'Visitors with recorded activity will appear here.'
+            }
+            action={
+              hasFilters ? (
+                <Button variant="outline" onClick={clearFilters}>
+                  Clear filters
+                </Button>
+              ) : undefined
+            }
+          />
+        </div>
+      ) : (
+        <DataTable
+          aria-label="Visitors"
+          columns={columns}
+          rows={data?.visitors ?? []}
+          rowKey={(visitor) => visitor.id}
+          isLoading={isLoading}
+        />
+      )}
+      {data && (
+        <ResponsivePagination
+          page={page}
+          pageSize={limit}
+          total={data.filtered_count}
+          totalPages={totalPages}
+          onPageChange={(value) =>
+            patch({ page: value > 1 ? value : undefined })
+          }
+          onPageSizeChange={(value) =>
+            patch({ limit: value === 25 ? undefined : value, page: undefined })
+          }
+          pageSizeOptions={[10, 25, 50, 100]}
+          ariaLabel="Visitor pagination"
+          pageSizeAriaLabel="Visitors per page"
+        />
       )}
     </div>
   )

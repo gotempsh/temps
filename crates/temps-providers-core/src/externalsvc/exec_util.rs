@@ -276,6 +276,54 @@ pub async fn run_exec(
     ))
 }
 
+/// The bytes of a restore tool's stderr kept to explain its failure.
+pub const RESTORE_ERROR_TAIL: usize = 4096;
+
+/// Append `chunk` to `tail`, keeping only its last `limit` bytes (on a
+/// character boundary), so a long-running tool's output stays bounded.
+pub fn keep_tail(tail: &mut String, chunk: &str, limit: usize) {
+    tail.push_str(chunk);
+    if tail.len() > limit {
+        let mut start = tail.len() - limit;
+        while !tail.is_char_boundary(start) {
+            start += 1;
+        }
+        tail.drain(..start);
+    }
+}
+
+/// A restore tool's exec result (`mongorestore`, `psql`, `pg_restore`):
+/// success only on exit code 0, so a corrupt backup, a refused login or a
+/// failed load never reads as a restored database. A missing exit code
+/// (Docker lost the exec) fails closed.
+pub fn restore_tool_outcome(
+    service: &str,
+    tool: &str,
+    container: &str,
+    exit_code: Option<i64>,
+    stderr_tail: &str,
+) -> Result<()> {
+    match exit_code {
+        Some(0) => Ok(()),
+        Some(code) => Err(EngineError::failed(
+            service,
+            format!(
+                "{tool} exited with code {code} in container '{container}'; the backup was not \
+                 fully restored: {}",
+                stderr_tail.trim()
+            ),
+        )),
+        None => Err(EngineError::failed(
+            service,
+            format!(
+                "{tool} in container '{container}' finished without an exit code, so the restore \
+                 cannot be confirmed: {}",
+                stderr_tail.trim()
+            ),
+        )),
+    }
+}
+
 fn docker_api_timeout(command_timeout: Duration) -> Duration {
     command_timeout.min(DOCKER_EXEC_API_TIMEOUT)
 }
@@ -297,6 +345,42 @@ fn tail(s: &str, n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A restore tool that failed (a corrupt archive, a refused login) is a
+    /// failed restore, naming the tool, the exit code and what it said; only
+    /// exit code 0 is success, and a lost exit code fails closed.
+    #[test]
+    fn a_failed_restore_tool_is_a_failed_restore() {
+        let failed = restore_tool_outcome(
+            "orders",
+            "mongorestore",
+            "temps-mongodb-orders",
+            Some(1),
+            "Failed: stream or file does not appear to be a mongodump archive\n",
+        )
+        .expect_err("a non-zero exit must fail the restore");
+        let message = failed.to_string();
+        assert!(
+            message.contains("mongorestore exited with code 1"),
+            "{message}"
+        );
+        assert!(message.contains("temps-mongodb-orders"), "{message}");
+        assert!(message.contains("mongodump archive"), "{message}");
+
+        assert!(restore_tool_outcome("orders", "psql", "c", None, "").is_err());
+        assert!(restore_tool_outcome("orders", "pg_restore", "c", Some(0), "").is_ok());
+    }
+
+    /// The stderr kept for the error is bounded however much is written.
+    #[test]
+    fn the_kept_stderr_is_its_bounded_tail() {
+        let mut tail = String::new();
+        for line in 0..1000 {
+            keep_tail(&mut tail, &format!("progress line {line} é\n"), 64);
+        }
+        assert!(tail.len() <= 64);
+        assert!(tail.ends_with("progress line 999 é\n"), "{tail}");
+    }
 
     #[test]
     fn tail_short_returns_input() {

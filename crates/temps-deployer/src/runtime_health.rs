@@ -50,6 +50,30 @@ pub fn data_root() -> PathBuf {
         .join("runtime-health")
 }
 
+fn receipt_for_assignment(
+    receipts: &Path,
+    assignment: &Assignment,
+) -> Result<CreationReceipt, InspectFailure> {
+    if !valid_container_id(&assignment.container_id) {
+        return Err(InspectFailure::Unauthorized);
+    }
+    let receipt: CreationReceipt =
+        read_record(&receipts.join(format!("{}.json", assignment.container_id)))
+            .map_err(|_| InspectFailure::Unauthorized)?
+            .ok_or(InspectFailure::Unauthorized)?;
+    if receipt.container_id != assignment.container_id
+        || receipt.project_id != assignment.project_id
+        || receipt.environment_id != assignment.environment_id
+        || receipt.deployment_id != assignment.deployment_id
+        || assignment
+            .container_port
+            .is_some_and(|port| !receipt.ports.contains(&port))
+    {
+        return Err(InspectFailure::Unauthorized);
+    }
+    Ok(receipt)
+}
+
 fn valid_container_id(id: &str) -> bool {
     id.len() == 64 && id.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
@@ -189,27 +213,7 @@ impl DockerProbeInspector {
     }
 
     fn receipt(&self, assignment: &Assignment) -> Result<CreationReceipt, InspectFailure> {
-        if !valid_container_id(&assignment.container_id) {
-            return Err(InspectFailure::Unauthorized);
-        }
-        let receipt: CreationReceipt = read_record(
-            &self
-                .receipts
-                .join(format!("{}.json", assignment.container_id)),
-        )
-        .map_err(|_| InspectFailure::Unauthorized)?
-        .ok_or(InspectFailure::Unauthorized)?;
-        if receipt.container_id != assignment.container_id
-            || receipt.project_id != assignment.project_id
-            || receipt.environment_id != assignment.environment_id
-            || receipt.deployment_id != assignment.deployment_id
-            || assignment
-                .container_port
-                .is_some_and(|port| !receipt.ports.contains(&port))
-        {
-            return Err(InspectFailure::Unauthorized);
-        }
-        Ok(receipt)
+        receipt_for_assignment(&self.receipts, assignment)
     }
 
     fn lock(&self, name: &str) -> Result<File, InspectFailure> {
@@ -582,5 +586,61 @@ mod tests {
             file.try_lock().is_err(),
             "a live claim must be exclusive across processes"
         );
+    }
+}
+
+#[cfg(test)]
+mod worker_target_tests {
+    use super::*;
+
+    #[test]
+    fn worker_target_requires_a_local_receipt_and_declared_port() {
+        let root = tempfile::tempdir().unwrap();
+        let mut assignment = Assignment {
+            id: Uuid::new_v4(),
+            owner: ExecutionOwner::Agent(Uuid::new_v4()),
+            project_id: 1,
+            environment_id: 2,
+            deployment_id: 3,
+            replica_id: 4,
+            placement_generation: 1,
+            revision: Uuid::new_v4(),
+            epoch: 1,
+            container_id: "a".repeat(64),
+            container_port: Some(8080),
+            probe: temps_runtime_health::Probe::Http {
+                path: "/ready".into(),
+                expected_status: 200,
+            },
+            interval_secs: 30,
+            timeout_secs: 5,
+        };
+        assert!(receipt_for_assignment(root.path(), &assignment).is_err());
+        let receipt = CreationReceipt {
+            container_id: assignment.container_id.clone(),
+            project_id: 1,
+            environment_id: 2,
+            deployment_id: 3,
+            image_id: "fixture".into(),
+            ports: vec![8080],
+        };
+        std::fs::write(
+            root.path()
+                .join(format!("{}.json", assignment.container_id)),
+            serde_json::to_vec(&receipt).unwrap(),
+        )
+        .unwrap();
+        assert!(receipt_for_assignment(root.path(), &assignment).is_ok());
+        assignment.container_port = Some(9090);
+        assert!(receipt_for_assignment(root.path(), &assignment).is_err());
+        assignment.container_port = Some(8080);
+        assignment.deployment_id = 5;
+        assert!(receipt_for_assignment(root.path(), &assignment).is_err());
+        assignment.deployment_id = 3;
+        assignment.container_id = "http://169.254.169.254/".into();
+        assert!(receipt_for_assignment(root.path(), &assignment).is_err());
+        let mut wire = serde_json::to_value(&assignment).unwrap();
+        wire["host"] = serde_json::json!("127.0.0.1");
+        assert!(serde_json::from_value::<Assignment>(wire).is_err());
     }
 }

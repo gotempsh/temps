@@ -48,6 +48,8 @@ fn imported_restore_clone_uses_only_its_new_managed_container() {
         ssl_mode: Some("disable".to_string()),
         docker_image: "gotempsh/postgres-walg:18-bookworm".to_string(),
         container_name: Some("operator-owned-imported-workload".to_string()),
+        server_tls_mode: Default::default(),
+        server_tls_material: None,
     };
     let clone = source.clone().for_managed_clone();
     let service = PostgresService::new(
@@ -522,6 +524,8 @@ fn test_upgrade_version_check() {
         ssl_mode: Some("disable".to_string()),
         docker_image: Some("gotempsh/postgres-walg:18-bookworm".to_string()),
         container_name: None,
+        server_tls_mode: Default::default(),
+        server_tls_material: None,
     };
 
     let downgrade_config = PostgresInputConfig {
@@ -534,6 +538,8 @@ fn test_upgrade_version_check() {
         ssl_mode: Some("disable".to_string()),
         docker_image: Some("gotempsh/postgres-walg:17-bookworm".to_string()),
         container_name: None,
+        server_tls_mode: Default::default(),
+        server_tls_material: None,
     };
 
     let old_version =
@@ -565,6 +571,8 @@ fn test_postgres_v17_to_v18_upgrade_config() {
         ssl_mode: Some("disable".to_string()),
         docker_image: Some("gotempsh/postgres-walg:17-bookworm".to_string()),
         container_name: None,
+        server_tls_mode: Default::default(),
+        server_tls_material: None,
     };
 
     let v18_config = PostgresInputConfig {
@@ -577,6 +585,8 @@ fn test_postgres_v17_to_v18_upgrade_config() {
         ssl_mode: Some("disable".to_string()),
         docker_image: Some("gotempsh/postgres-walg:18-bookworm".to_string()),
         container_name: None,
+        server_tls_mode: Default::default(),
+        server_tls_material: None,
     };
 
     // Convert to runtime configs
@@ -896,6 +906,8 @@ mod recreate_guard_docker {
             ssl_mode: Some("disable".into()),
             docker_image: image.into(),
             container_name: None,
+            server_tls_mode: Default::default(),
+            server_tls_material: None,
         }
     }
 
@@ -1294,4 +1306,524 @@ mod recreate_guard_docker {
         assert!(!again.restarted);
         scope.cleanup().await;
     }
+}
+
+/// ADR 093: server TLS on standalone PostgreSQL.
+mod server_tls {
+    use super::*;
+    use crate::externalsvc::server_tls::{
+        ServerTlsMaterial, ServerTlsMode, SERVER_TLS_FINGERPRINT_LABEL,
+    };
+
+    fn material(fingerprint: &str) -> ServerTlsMaterial {
+        ServerTlsMaterial {
+            cert_pem: "cert".into(),
+            key_pem: "key".into(),
+            fingerprint_sha256: fingerprint.into(),
+        }
+    }
+
+    fn config(mode: ServerTlsMode, material: Option<ServerTlsMaterial>) -> PostgresConfig {
+        PostgresConfig {
+            host: "localhost".into(),
+            port: "5432".into(),
+            database: "app".into(),
+            username: "app".into(),
+            password: "pw".into(),
+            max_connections: 20,
+            ssl_mode: None,
+            docker_image: "gotempsh/postgres-walg:18-bookworm".into(),
+            container_name: None,
+            server_tls_mode: Some(mode),
+            server_tls_material: material,
+        }
+    }
+
+    fn has_ssl_settings(cmd: &[String]) -> bool {
+        cmd.iter().any(|t| t == "ssl=on")
+            && cmd
+                .iter()
+                .any(|t| t == "ssl_cert_file=/var/lib/postgresql/tls/server.crt")
+            && cmd
+                .iter()
+                .any(|t| t == "ssl_key_file=/var/lib/postgresql/tls/server.key")
+    }
+
+    #[test]
+    fn the_cmd_offers_tls_only_when_enabled_with_material() {
+        let on = postgres_container_cmd(
+            &config(ServerTlsMode::Available, Some(material("fp"))),
+            false,
+        );
+        assert!(has_ssl_settings(&on), "{on:?}");
+        // Every setting is passed as its own `-c` pair.
+        let ssl = on.iter().position(|t| t == "ssl=on").unwrap();
+        assert_eq!(on[ssl - 1], "-c");
+
+        let off = postgres_container_cmd(&config(ServerTlsMode::Off, Some(material("fp"))), false);
+        assert!(!off.iter().any(|t| t.starts_with("ssl")), "{off:?}");
+
+        // Asked for, but no material: never point the server at files that
+        // may not exist, which would keep it from starting.
+        let missing = postgres_container_cmd(&config(ServerTlsMode::Available, None), false);
+        assert!(!missing.iter().any(|t| t.starts_with("ssl")), "{missing:?}");
+
+        // The rest of the CMD is unchanged by TLS.
+        assert_eq!(&on[..off.len()], off.as_slice());
+    }
+
+    #[test]
+    fn an_imported_container_is_never_given_tls() {
+        let mut imported = config(ServerTlsMode::Available, Some(material("fp")));
+        imported.container_name = Some("operator-owned".into());
+        assert!(imported.effective_server_tls().is_none());
+        assert_eq!(imported.desired_server_tls(), None);
+        assert!(!has_ssl_settings(&postgres_container_cmd(&imported, false)));
+    }
+
+    #[test]
+    fn the_desired_state_is_unknown_without_material() {
+        assert_eq!(
+            config(ServerTlsMode::Off, None).desired_server_tls(),
+            Some(DesiredServerTls::Off)
+        );
+        assert_eq!(
+            config(ServerTlsMode::Available, Some(material("fp"))).desired_server_tls(),
+            Some(DesiredServerTls::On {
+                fingerprint_sha256: "fp".into()
+            })
+        );
+        // A lifecycle path that does not carry the certificate must not strip
+        // TLS from a container that has it.
+        assert_eq!(
+            config(ServerTlsMode::Available, None).desired_server_tls(),
+            None
+        );
+    }
+
+    #[test]
+    fn drift_detects_enable_disable_and_renewal() {
+        let on_cmd = postgres_container_cmd(
+            &config(ServerTlsMode::Available, Some(material("fp-1"))),
+            false,
+        );
+        let off_cmd = postgres_container_cmd(&config(ServerTlsMode::Off, None), false);
+        let labels =
+            HashMap::from([(SERVER_TLS_FINGERPRINT_LABEL.to_string(), "fp-1".to_string())]);
+        let on = |fp: &str| DesiredServerTls::On {
+            fingerprint_sha256: fp.into(),
+        };
+
+        assert!(!server_tls_drift(&on_cmd, Some(&labels), &on("fp-1")));
+        assert!(!server_tls_drift(&off_cmd, None, &DesiredServerTls::Off));
+        // Enabling.
+        assert!(server_tls_drift(&off_cmd, None, &on("fp-1")));
+        // Disabling.
+        assert!(server_tls_drift(
+            &on_cmd,
+            Some(&labels),
+            &DesiredServerTls::Off
+        ));
+        // A renewed certificate.
+        assert!(server_tls_drift(&on_cmd, Some(&labels), &on("fp-2")));
+        // A container created with TLS but before the label existed.
+        assert!(server_tls_drift(&on_cmd, None, &on("fp-1")));
+    }
+
+    #[test]
+    fn the_injected_parameters_reach_the_runtime_config_and_are_never_persisted() {
+        let input: PostgresInputConfig = serde_json::from_value(serde_json::json!({
+            "database": "app",
+            "username": "app",
+            "password": "pw",
+            "server_tls_mode": "available",
+            "server_tls_material": {
+                "cert_pem": "cert",
+                "key_pem": "key-sentinel",
+                "fingerprint_sha256": "fp"
+            }
+        }))
+        .unwrap();
+        let runtime = PostgresConfig::from(input);
+        assert_eq!(runtime.server_tls_mode, Some(ServerTlsMode::Available));
+        assert_eq!(
+            runtime.effective_server_tls(),
+            Some(&material_with_key("key-sentinel"))
+        );
+
+        // `init()` persists the serialized runtime config as inferred
+        // parameters: neither the key nor the mode may appear in it.
+        let persisted = serde_json::to_string(&runtime).unwrap();
+        assert!(!persisted.contains("key-sentinel"), "{persisted}");
+        assert!(!persisted.contains("server_tls"), "{persisted}");
+    }
+
+    fn material_with_key(key: &str) -> ServerTlsMaterial {
+        ServerTlsMaterial {
+            cert_pem: "cert".into(),
+            key_pem: key.into(),
+            fingerprint_sha256: "fp".into(),
+        }
+    }
+
+    #[test]
+    fn stored_parameters_without_tls_keys_do_not_say_what_tls_should_be() {
+        // Stored parameters never carry TLS keys (services created before
+        // ADR 093, and every engine path that rebuilds from them, such as a
+        // backup enabling WAL archiving). That is not an explicit `off`.
+        let input: PostgresInputConfig = serde_json::from_value(serde_json::json!({
+            "database": "app",
+            "username": "app",
+            "password": "pw"
+        }))
+        .unwrap();
+        let runtime = PostgresConfig::from(input);
+        assert_eq!(runtime.server_tls_mode, None);
+        assert!(runtime.effective_server_tls().is_none());
+        // Start-time drift repair must not strip TLS from such a container.
+        assert_eq!(runtime.desired_server_tls(), None);
+    }
+
+    #[test]
+    fn a_replacement_keeps_the_tls_its_predecessor_serves() {
+        let installed = postgres_container_cmd(
+            &config(ServerTlsMode::Available, Some(material("fp-1"))),
+            false,
+        );
+        let labels =
+            HashMap::from([(SERVER_TLS_FINGERPRINT_LABEL.to_string(), "fp-1".to_string())]);
+        assert_eq!(
+            installed_server_tls(&installed, Some(&labels)),
+            Some(InstalledServerTls {
+                fingerprint_sha256: Some("fp-1".into())
+            })
+        );
+        // Created before the fingerprint label existed: still TLS.
+        assert_eq!(
+            installed_server_tls(&installed, None),
+            Some(InstalledServerTls {
+                fingerprint_sha256: None
+            })
+        );
+        // No TLS, or `ssl=on` without the managed certificate paths (never
+        // point a replacement at files Temps did not install).
+        let plain = postgres_container_cmd(&config(ServerTlsMode::Off, None), false);
+        assert_eq!(installed_server_tls(&plain, None), None);
+        let foreign = vec!["postgres".to_string(), "-c".into(), "ssl=on".into()];
+        assert_eq!(installed_server_tls(&foreign, None), None);
+
+        // A config rebuilt from stored parameters with archiving turned on,
+        // as a backup does, still serves TLS when it keeps the installed one.
+        let mut unsaid = config(ServerTlsMode::Off, None);
+        unsaid.server_tls_mode = None;
+        let replacement = postgres_container_cmd_serving(&unsaid, true, true);
+        assert!(has_ssl_settings(&replacement), "{replacement:?}");
+        assert!(replacement.iter().any(|t| t == "archive_mode=on"));
+        assert!(!has_ssl_settings(&postgres_container_cmd_serving(
+            &unsaid, true, false
+        )));
+    }
+
+    #[test]
+    fn the_create_form_schema_does_not_expose_tls_internals() {
+        let schema = serde_json::to_string(&schemars::schema_for!(PostgresInputConfig)).unwrap();
+        assert!(!schema.contains("server_tls"), "{schema}");
+    }
+}
+
+/// A real server in `available` mode: it accepts a verified TLS connection
+/// (CA trusted, hostname checked) and still accepts plaintext; turning TLS
+/// off through the reconcile path makes it refuse TLS again.
+#[cfg(feature = "docker-tests")]
+#[tokio::test]
+async fn test_available_tls_accepts_verified_tls_and_plaintext() {
+    use crate::externalsvc::server_tls::{ServerTlsMaterial, ServerTlsMode};
+
+    let docker = match Docker::connect_with_local_defaults() {
+        Ok(d) => d,
+        Err(_) => {
+            println!("Docker not available, skipping");
+            return;
+        }
+    };
+    if docker.ping().await.is_err() {
+        println!("Docker not available, skipping");
+        return;
+    }
+    let docker = Arc::new(docker);
+    let name = format!(
+        "tls-avail-{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..8]
+    );
+    let service = PostgresService::new(name.clone(), docker.clone());
+
+    let now = chrono::Utc::now();
+    let ca = temps_core::managed_service_pki::generate_managed_services_ca(now).unwrap();
+    let leaf = temps_core::managed_service_pki::issue_server_certificate(
+        &ca.cert_pem,
+        &ca.key_pem,
+        &postgres_container_name(&name),
+        &[
+            postgres_container_name(&name),
+            "localhost".to_string(),
+            "127.0.0.1".to_string(),
+        ],
+        now,
+    )
+    .unwrap();
+    let port = find_available_port(15432).expect("a free port");
+    let parameters = |mode: ServerTlsMode| {
+        serde_json::json!({
+            "host": "localhost",
+            "port": port.to_string(),
+            "database": "app",
+            "username": "app",
+            "password": "test-password",
+            "max_connections": 20,
+            "docker_image": "gotempsh/postgres-walg:18-bookworm",
+            "server_tls_mode": mode,
+            "server_tls_material": ServerTlsMaterial {
+                cert_pem: leaf.cert_pem.clone(),
+                key_pem: leaf.key_pem.clone(),
+                fingerprint_sha256: leaf.fingerprint_sha256.clone(),
+            },
+        })
+    };
+    let service_config = |mode| ServiceConfig {
+        name: name.clone(),
+        service_type: ServiceType::Postgres,
+        version: None,
+        parameters: parameters(mode),
+    };
+
+    let result = async {
+        service
+            .init(service_config(ServerTlsMode::Available))
+            .await?;
+        service.start().await?;
+
+        let mut roots = rustls::RootCertStore::empty();
+        {
+            use rustls::pki_types::pem::PemObject;
+            roots
+                .add(
+                    rustls::pki_types::CertificateDer::from_pem_slice(ca.cert_pem.as_bytes())
+                        .unwrap(),
+                )
+                .unwrap();
+        }
+        let tls = tokio_postgres_rustls::MakeRustlsConnect::new(
+            rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+        );
+        let base = format!("host=localhost port={port} user=app password=test-password dbname=app");
+
+        // Verified TLS (chain + the `localhost` SAN), as `sslmode=require`
+        // demands encryption: the connection must report SSL in use.
+        let (client, conn) =
+            tokio_postgres::connect(&format!("{base} sslmode=require"), tls.clone())
+                .await
+                .map_err(|e| EngineError::failed(&name, format!("TLS connect failed: {e}")))?;
+        tokio::spawn(conn);
+        let row = client
+            .query_one(
+                "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()",
+                &[],
+            )
+            .await
+            .map_err(|e| EngineError::failed(&name, e.to_string()))?;
+        assert!(
+            row.get::<_, bool>(0),
+            "the TLS connection must be encrypted"
+        );
+
+        // `available` still accepts plaintext.
+        let (plain, conn) =
+            tokio_postgres::connect(&format!("{base} sslmode=disable"), tokio_postgres::NoTls)
+                .await
+                .map_err(|e| {
+                    EngineError::failed(&name, format!("plaintext connect failed: {e}"))
+                })?;
+        tokio::spawn(conn);
+        let row = plain
+            .query_one(
+                "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()",
+                &[],
+            )
+            .await
+            .map_err(|e| EngineError::failed(&name, e.to_string()))?;
+        assert!(
+            !row.get::<_, bool>(0),
+            "the plaintext connection must not be encrypted"
+        );
+
+        // A path that rebuilds from stored parameters (no TLS keys), as a
+        // backup does when it turns WAL archiving on, must keep TLS.
+        let mut stored = parameters(ServerTlsMode::Available);
+        let stored_object = stored.as_object_mut().unwrap();
+        stored_object.remove("server_tls_mode");
+        stored_object.remove("server_tls_material");
+        let unsaid = service.get_postgres_config(ServiceConfig {
+            name: name.clone(),
+            service_type: ServiceType::Postgres,
+            version: None,
+            parameters: stored,
+        })?;
+        assert_eq!(unsaid.server_tls_mode, None);
+        let report = service
+            .recreate_container_guarded(
+                &docker,
+                &unsaid,
+                &ServiceResourceLimits::default(),
+                true,
+                "enabling WAL archiving",
+            )
+            .await?;
+        assert!(report.replaced, "the container must have been replaced");
+        let (client, conn) =
+            tokio_postgres::connect(&format!("{base} sslmode=require"), tls.clone())
+                .await
+                .map_err(|e| {
+                    EngineError::failed(&name, format!("TLS lost on archiving recreate: {e}"))
+                })?;
+        tokio::spawn(conn);
+        let row = client
+            .query_one(
+                "SELECT ssl, current_setting('archive_mode') = 'on' \
+                 FROM pg_stat_ssl WHERE pid = pg_backend_pid()",
+                &[],
+            )
+            .await
+            .map_err(|e| EngineError::failed(&name, e.to_string()))?;
+        assert!(row.get::<_, bool>(0), "still encrypted after the recreate");
+        assert!(row.get::<_, bool>(1), "the recreate turned archiving on");
+        drop(client);
+
+        // An in-place restore removes the container itself and creates a new
+        // one from stored parameters: it reads the TLS first and keeps it.
+        let container = postgres_container_name(&name);
+        let kept = service.installed_server_tls(&docker, &container).await?;
+        assert_eq!(
+            kept,
+            Some(InstalledServerTls {
+                fingerprint_sha256: Some(leaf.fingerprint_sha256.clone())
+            })
+        );
+        docker
+            .remove_container(
+                &container,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .map_err(|e| EngineError::failed(&name, e.to_string()))?;
+        service
+            .create_container_once_keeping_tls(
+                &docker,
+                &unsaid,
+                &ServiceResourceLimits::default(),
+                false,
+                kept.as_ref(),
+            )
+            .await?;
+        let (client, conn) =
+            tokio_postgres::connect(&format!("{base} sslmode=require"), tls.clone())
+                .await
+                .map_err(|e| {
+                    EngineError::failed(&name, format!("TLS lost on restore recreate: {e}"))
+                })?;
+        tokio::spawn(conn);
+        let row = client
+            .query_one(
+                "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()",
+                &[],
+            )
+            .await
+            .map_err(|e| EngineError::failed(&name, e.to_string()))?;
+        assert!(
+            row.get::<_, bool>(0),
+            "still encrypted after the restore recreate"
+        );
+        drop(client);
+
+        // A WAL-G restore's data-directory swap rebuilds the container the
+        // same way, for the restored server and when it puts the original
+        // back: the plan reads the TLS before anything changes, and the
+        // rebuild serves it again.
+        let mut swap_parameters = parameters(ServerTlsMode::Available);
+        let swap_object = swap_parameters.as_object_mut().unwrap();
+        swap_object.remove("server_tls_mode");
+        swap_object.remove("server_tls_material");
+        let swap_config = ServiceConfig {
+            name: name.clone(),
+            service_type: ServiceType::Postgres,
+            version: None,
+            parameters: swap_parameters,
+        };
+        let (recreate, binds) = service
+            .plan_swap_recreate(&container, &swap_config, &unsaid, &unsaid, &swap_config)
+            .await?;
+        match &recreate {
+            super::super::restore_swap::SwapRecreate::Managed { kept_tls, .. } => assert_eq!(
+                kept_tls,
+                &Some(InstalledServerTls {
+                    fingerprint_sha256: Some(leaf.fingerprint_sha256.clone())
+                }),
+                "the swap plan must keep the TLS the container serves"
+            ),
+            _ => panic!("a control-plane container is rebuilt from its specification"),
+        }
+        service
+            .roll_back_swap(
+                &container,
+                &unsaid.docker_image,
+                &binds,
+                "/var/lib/postgresql/data",
+                &recreate,
+                false,
+                &unsaid,
+            )
+            .await
+            .map_err(|reason| EngineError::failed(&name, reason))?;
+        let (client, conn) =
+            tokio_postgres::connect(&format!("{base} sslmode=require"), tls.clone())
+                .await
+                .map_err(|e| {
+                    EngineError::failed(&name, format!("TLS lost on the swap rebuild: {e}"))
+                })?;
+        tokio::spawn(conn);
+        let row = client
+            .query_one(
+                "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()",
+                &[],
+            )
+            .await
+            .map_err(|e| EngineError::failed(&name, e.to_string()))?;
+        assert!(
+            row.get::<_, bool>(0),
+            "still encrypted after the swap rebuild"
+        );
+
+        // Turning TLS off goes through the reconcile-on-start recreate.
+        service
+            .force_recreate(service_config(ServerTlsMode::Off))
+            .await?;
+        let refused = tokio_postgres::connect(&format!("{base} sslmode=require"), tls).await;
+        assert!(
+            refused.is_err(),
+            "TLS must be refused once it is turned off"
+        );
+        Ok::<(), EngineError>(())
+    }
+    .await;
+
+    let _ = service.remove().await;
+    result.expect("available-mode TLS round trip");
 }

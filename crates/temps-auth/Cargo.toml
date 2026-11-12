@@ -45,6 +45,8 @@ openidconnect = { workspace = true }
 reqwest = { workspace = true }
 
 [dev-dependencies]
+# Real RS256 keys for the Cloud logout token tests.
+rsa = { workspace = true, features = ["pem"] }
 temps-test-utils = { path = "../temps-test-utils" }
 # Paused-clock tests (`start_paused`, `time::advance`).
 tokio = { workspace = true, features = ["test-util"] }

@@ -30,7 +30,10 @@ import { Label } from '@/components/ui/label'
 import { ReadFailure } from '@/components/ui/read-failure'
 import { setDefaultS3Source, testS3SourceConnection } from '@/lib/s3-sources'
 import { cn } from '@/lib/utils'
-import { shouldShowS3SourceHeaderAction } from '@/lib/s3-source-presentation'
+import {
+  shouldShowS3SourceHeaderAction,
+  type WorkerCredentialsPolicy,
+} from '@/lib/s3-source-presentation'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import {
   CheckCircle2,
@@ -64,6 +67,7 @@ interface NewS3Source {
   secret_key: string
   endpoint?: string
   force_path_style?: boolean
+  worker_credentials?: WorkerCredentialsPolicy
 }
 
 interface S3SourceFormProps {
@@ -162,6 +166,34 @@ function S3SourceForm({
               <span>Force Path Style</span>
               <p className="text-xs text-muted-foreground">
                 Enable for RustFS/MinIO compatibility
+              </p>
+            </div>
+          </Label>
+        </div>
+        <div className="grid gap-2">
+          <Label
+            htmlFor="allowFullWorkerCredentials"
+            className="flex items-start space-x-2"
+          >
+            <Checkbox
+              id="allowFullWorkerCredentials"
+              checked={formData.worker_credentials === 'allow_full'}
+              onCheckedChange={(checked) =>
+                setFormData({
+                  ...formData,
+                  worker_credentials:
+                    checked === true ? 'allow_full' : 'scoped',
+                })
+              }
+            />
+            <div>
+              <span>Allow full credentials on worker nodes</span>
+              <p className="text-xs text-muted-foreground">
+                Worker nodes get a credential limited to one service&rsquo;s
+                prefix for each backup or restore. If this store cannot mint
+                one, the job is refused. Allowing full credentials sends this
+                source&rsquo;s own key instead, so a worker node could read
+                and delete every backup in the bucket.
               </p>
             </div>
           </Label>
@@ -321,6 +353,7 @@ export function S3SourcesManagement() {
       secret_key: '',
       endpoint: source.endpoint || undefined,
       force_path_style: source.force_path_style || undefined,
+      worker_credentials: source.worker_credentials,
     })
     setIsEditDialogOpen(true)
   }

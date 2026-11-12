@@ -46,6 +46,18 @@ pub enum NetworkError {
     #[error("vxlan transport error on '{device}': {reason}")]
     Vxlan { device: String, reason: String },
 
+    /// Another VXLAN device on this host holds the network ID and port this
+    /// overlay needs (ADR 062). `diagnosis` names the holder, what is
+    /// attached to it, the commands that remove it and the alternative.
+    #[error("{diagnosis}")]
+    VxlanIdInUse {
+        device: String,
+        holder: String,
+        vni: u32,
+        port: u16,
+        diagnosis: String,
+    },
+
     // ----- routes -----
     /// Adding or removing a route failed.
     #[error("route operation '{op}' for {cidr} via {via} failed: {reason}")]

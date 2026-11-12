@@ -364,6 +364,14 @@ describe('run tracking (#1237)', () => {
     expect(markup).not.toContain('Start restore')
   })
 
+  test('an in-place restore lets the user copy the name to type', () => {
+    const markup = renderPage({
+      url: `/storage/${SERVICE_ID}/restore?mode=in_place`,
+    })
+    expect(markup).toContain('Type the service name to confirm')
+    expect(markup).toContain('aria-label="Copy &quot;orders-db&quot;"')
+  })
+
   test('no active run in history shows the restore form', () => {
     const markup = renderPage({
       runs: { data: [runRow({ id: 30, status: 'completed' })] },

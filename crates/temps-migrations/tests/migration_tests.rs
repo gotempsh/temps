@@ -3030,9 +3030,23 @@ async fn test_compute_network_migration() -> anyhow::Result<()> {
     assert_eq!(pool, "10.202.0.0/16");
     assert_eq!(prefix, 24);
     assert_eq!(transport, "vxlan");
-    assert_eq!(vni, 42);
+    // ADR 062: a cluster with no node yet gets its own random network ID.
+    assert!(
+        (4096..=0x00FF_FFFF).contains(&vni),
+        "a new cluster must get a random VXLAN network ID, got {vni}"
+    );
     assert_eq!(port, 4789);
     assert_eq!(mtu, 1500);
+
+    // ----- CHECK keeps the network ID within 24 bits -----
+    for bad in ["0", "16777216"] {
+        let result = db
+            .execute_unprepared(&format!(
+                "UPDATE network_config SET vxlan_vni = {bad} WHERE id = 1"
+            ))
+            .await;
+        assert!(result.is_err(), "vxlan_vni = {bad} must be rejected");
+    }
 
     // ----- CHECK (id = 1) prevents inserting a second row -----
     let second = db
@@ -7445,6 +7459,92 @@ async fn test_ingress_connector_host_suffix_migration_up_and_down() -> anyhow::R
     Ok(())
 }
 
+/// ADR-102: every existing S3 source becomes `scoped` (worker nodes never
+/// receive its own credential), the column takes only `scoped` or
+/// `allow_full`, and down removes it without touching the source.
+#[tokio::test]
+async fn test_s3_sources_worker_credentials_migration_up_and_down() -> anyhow::Result<()> {
+    if external_db_configured() {
+        println!("Skipping worker credentials migration test: external database configured");
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_exposed_port(ContainerPort::Tcp(5432))
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!("Skipping worker credentials migration test: Docker unavailable: {error}");
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    let name = "m20261110_000001_add_s3_sources_worker_credentials";
+    let before = Migrator::migrations().len() as u32 - steps_back_to(name);
+    Migrator::up(&db, Some(before)).await?;
+    db.execute_unprepared(
+        "INSERT INTO s3_sources (id, name, bucket_name, bucket_path, region, access_key_id, \
+         secret_key, created_at, updated_at) VALUES (7201, 'existing', 'bucket', '/', \
+         'us-east-1', 'k', 's', now(), now())",
+    )
+    .await?;
+
+    Migrator::up(&db, Some(1)).await?;
+    let row = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT worker_credentials FROM s3_sources WHERE id = 7201".to_string(),
+        ))
+        .await?
+        .unwrap();
+    assert_eq!(row.try_get::<String>("", "worker_credentials")?, "scoped");
+    db.execute_unprepared(
+        "UPDATE s3_sources SET worker_credentials = 'allow_full' WHERE id = 7201",
+    )
+    .await?;
+    assert!(
+        db.execute_unprepared("UPDATE s3_sources SET worker_credentials = 'full' WHERE id = 7201")
+            .await
+            .is_err(),
+        "the CHECK must refuse anything but scoped or allow_full"
+    );
+
+    Migrator::down(&db, Some(1)).await?;
+    let columns = db
+        .query_all(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT column_name FROM information_schema.columns WHERE table_name = 's3_sources' \
+             AND column_name = 'worker_credentials'"
+                .to_string(),
+        ))
+        .await?;
+    assert!(columns.is_empty(), "down must remove worker_credentials");
+    let survivors = db
+        .query_all(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT id FROM s3_sources WHERE id = 7201".to_string(),
+        ))
+        .await?;
+    assert_eq!(survivors.len(), 1, "down must keep the source");
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_github_manifest_states_migration_is_single_use_and_reversible() -> anyhow::Result<()>
 {
@@ -8138,6 +8238,141 @@ async fn plugin_ai_tools_default_off_and_reversible() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// ADR 062: only a brand-new database gets a random VXLAN network ID. An
+/// install that already ran (it has a user or a node) keeps 42, so no running
+/// cluster's network changes on upgrade, and `down` puts the cluster back on
+/// 42, which binaries older than this assume for every agent.
+#[tokio::test]
+async fn test_cluster_vxlan_network_id_only_moves_a_new_database() -> anyhow::Result<()> {
+    const TARGET: &str = "m20261110_000003_cluster_vxlan_network_id";
+    if external_db_configured() {
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!(
+                "Skipping cluster VXLAN network ID migration test: Docker unavailable: {error}"
+            );
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    let steps = steps_back_to(TARGET);
+    let before = Migrator::migrations().len() as u32 - steps;
+    Migrator::up(&db, Some(before)).await?;
+
+    async fn vni(db: &DatabaseConnection) -> anyhow::Result<i32> {
+        let row = db
+            .query_one(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT vxlan_vni FROM network_config WHERE id = 1".to_string(),
+            ))
+            .await?
+            .expect("network_config row");
+        Ok(row.try_get("", "vxlan_vni")?)
+    }
+    async fn has_column(db: &DatabaseConnection) -> anyhow::Result<bool> {
+        let row = db
+            .query_one(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+                 WHERE table_name = 'nodes' AND column_name = 'overlay_vxlan_vni') AS present"
+                    .to_string(),
+            ))
+            .await?
+            .expect("exists row");
+        Ok(row.try_get("", "present")?)
+    }
+    assert_eq!(vni(&db).await?, 42, "seeded before this migration");
+
+    // An install that already ran, with no worker yet: keeps 42.
+    db.execute_unprepared(
+        "INSERT INTO users (name, email, created_at, updated_at) \
+         VALUES ('Existing admin', 'admin@example.test', now(), now())",
+    )
+    .await?;
+    Migrator::up(&db, Some(1)).await?;
+    assert_eq!(
+        vni(&db).await?,
+        42,
+        "an existing install keeps network ID 42"
+    );
+    assert!(has_column(&db).await?);
+
+    // An install with a worker and no user row (say, users purged): keeps 42.
+    Migrator::down(&db, Some(1)).await?;
+    db.execute_unprepared("DELETE FROM users").await?;
+    db.execute_unprepared(
+        "INSERT INTO nodes (name, token_hash, address, private_address, role, status, labels, capacity) \
+         VALUES ('worker-1', 'h1', '127.0.0.1', '10.0.0.1', 'worker', 'online', '{}', '{}')",
+    )
+    .await?;
+    Migrator::up(&db, Some(1)).await?;
+    assert_eq!(
+        vni(&db).await?,
+        42,
+        "a cluster with a node keeps network ID 42"
+    );
+
+    // A database nothing ran on yet: a random ID, never 42.
+    Migrator::down(&db, Some(1)).await?;
+    db.execute_unprepared("DELETE FROM nodes").await?;
+    Migrator::up(&db, Some(1)).await?;
+    let fresh = vni(&db).await?;
+    assert!(
+        (4096..=0x00FF_FFFF).contains(&fresh),
+        "a new database gets a random network ID, got {fresh}"
+    );
+
+    // The checks keep both columns within 24 bits.
+    for bad in ["0", "16777216"] {
+        assert!(
+            db.execute_unprepared(&format!(
+                "UPDATE network_config SET vxlan_vni = {bad} WHERE id = 1"
+            ))
+            .await
+            .is_err(),
+            "network_config.vxlan_vni = {bad} must be rejected"
+        );
+        assert!(
+            db.execute_unprepared(&format!(
+                "INSERT INTO nodes (name, token_hash, address, private_address, role, status, \
+                 labels, capacity, overlay_vxlan_vni) \
+                 VALUES ('bad-{bad}', 'h-{bad}', '127.0.0.9', '10.0.0.9', 'worker', 'online', \
+                 '{{}}', '{{}}', {bad})"
+            ))
+            .await
+            .is_err(),
+            "nodes.overlay_vxlan_vni = {bad} must be rejected"
+        );
+    }
+
+    // Down: the column goes and the cluster is back on 42.
+    Migrator::down(&db, Some(1)).await?;
+    assert_eq!(vni(&db).await?, 42);
+    assert!(!has_column(&db).await?);
+    Ok(())
+}
+
 #[tokio::test]
 async fn terminal_approval_scheduling_preserves_history_and_guards_downgrade() -> anyhow::Result<()>
 {
@@ -8178,5 +8413,350 @@ INSERT INTO sandbox_service_assignments(id,project_id,sandbox_id,service_id,serv
         .await?;
     migration.down(&manager).await?;
     migration.up(&manager).await?;
+    Ok(())
+}
+
+/// ADR-094: the last Cloud session confirmation is a nullable column on
+/// `oidc_providers`. Existing providers start with none on record, and down
+/// removes it without touching the provider.
+#[tokio::test]
+async fn test_oidc_cloud_sessions_confirmed_at_migration_up_and_down() -> anyhow::Result<()> {
+    if external_db_configured() {
+        println!(
+            "Skipping Cloud session confirmation migration test: external database configured"
+        );
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_exposed_port(ContainerPort::Tcp(5432))
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!(
+                "Skipping Cloud session confirmation migration test: Docker unavailable: {error}"
+            );
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    let name = "m20261110_000005_add_cloud_sessions_confirmed_at_to_oidc_providers";
+    let before = Migrator::migrations().len() as u32 - steps_back_to(name);
+    Migrator::up(&db, Some(before)).await?;
+    db.execute_unprepared(
+        "INSERT INTO oidc_providers (id, name, issuer_url, client_id, client_secret_encrypted, \
+         managed_by_cloud) VALUES (7301, 'Temps Cloud', 'https://cloud.example.com', 'client', \
+         'ciphertext', true)",
+    )
+    .await?;
+
+    Migrator::up(&db, Some(1)).await?;
+    async fn confirmed(db: &DatabaseConnection) -> anyhow::Result<bool> {
+        Ok(db
+            .query_one(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT cloud_sessions_confirmed_at IS NOT NULL AS confirmed FROM oidc_providers \
+                 WHERE id = 7301"
+                    .to_string(),
+            ))
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("provider 7301 is gone"))?
+            .try_get::<bool>("", "confirmed")?)
+    }
+    assert!(!confirmed(&db).await?, "no confirmation on record");
+    db.execute_unprepared(
+        "UPDATE oidc_providers SET cloud_sessions_confirmed_at = now() WHERE id = 7301",
+    )
+    .await?;
+    assert!(confirmed(&db).await?);
+
+    Migrator::down(&db, Some(steps_back_to(name))).await?;
+    let columns = db
+        .query_all(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT column_name FROM information_schema.columns WHERE table_name = \
+             'oidc_providers' AND column_name = 'cloud_sessions_confirmed_at'"
+                .to_string(),
+        ))
+        .await?;
+    assert!(
+        columns.is_empty(),
+        "down must remove cloud_sessions_confirmed_at"
+    );
+    let survivors = db
+        .query_all(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT id FROM oidc_providers WHERE id = 7301".to_string(),
+        ))
+        .await?;
+    assert_eq!(survivors.len(), 1, "down must keep the provider");
+    Ok(())
+}
+
+/// A restore on a worker node records `waiting_for_node` (the node is busy)
+/// and `outcome_unknown` (the run holds its service while its node's outcome
+/// cannot be established). Down maps them to the closest older phases and
+/// restores the previous constraint.
+#[tokio::test]
+async fn test_restore_runs_worker_phases_migration_up_and_down() -> anyhow::Result<()> {
+    if external_db_configured() {
+        println!("Skipping restore run phase migration test: external database configured");
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_exposed_port(ContainerPort::Tcp(5432))
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!("Skipping restore run phase migration test: Docker unavailable: {error}");
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    let name = "m20261111_000001_restore_runs_worker_phases";
+    let before = Migrator::migrations().len() as u32 - steps_back_to(name);
+    Migrator::up(&db, Some(before)).await?;
+    async fn phase_check(db: &DatabaseConnection) -> anyhow::Result<String> {
+        Ok(db
+            .query_one(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT pg_get_constraintdef(oid) AS definition FROM pg_constraint WHERE conname \
+                 = 'restore_runs_phase_check'"
+                    .to_string(),
+            ))
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("restore_runs_phase_check is missing"))?
+            .try_get::<String>("", "definition")?)
+    }
+    let previous = phase_check(&db).await?;
+    assert!(!previous.contains("outcome_unknown"), "{previous}");
+
+    Migrator::up(&db, Some(1)).await?;
+    let applied = phase_check(&db).await?;
+    for phase in ["waiting_for_node", "outcome_unknown", "download", "verify"] {
+        assert!(
+            applied.contains(&format!("'{phase}'")),
+            "{phase}: {applied}"
+        );
+    }
+
+    Migrator::down(&db, Some(steps_back_to(name))).await?;
+    assert_eq!(
+        phase_check(&db).await?,
+        previous,
+        "down restores the constraint"
+    );
+    Ok(())
+}
+
+/// ADR 093: existing services get no TLS row (which means `off`), the mode and
+/// "all certificate columns or none" are enforced by the database, rows go
+/// with their service, the CA purpose is unique, and `down` removes both
+/// tables.
+#[tokio::test]
+async fn test_managed_service_tls_migration_up_and_down() -> anyhow::Result<()> {
+    if external_db_configured() {
+        println!(
+            "⏭️  Skipping test_managed_service_tls_migration_up_and_down: using external database via TEMPS_TEST_DATABASE_URL"
+        );
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!(
+                "⏭️  Skipping test_managed_service_tls_migration_up_and_down: Docker unavailable ({error})"
+            );
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+
+    let target = "m20261110_000001_managed_service_tls";
+    let before = Migrator::migrations()
+        .iter()
+        .position(|migration| migration.name() == target)
+        .unwrap_or_else(|| panic!("migration {target} not found in Migrator"));
+    Migrator::up(&db, Some(before as u32)).await?;
+    // A service that exists before the migration.
+    db.execute_unprepared(
+        "INSERT INTO external_services (name, service_type, status, created_at, updated_at) \
+         VALUES ('existing-db', 'postgres', 'running', now(), now())",
+    )
+    .await?;
+    assert!(!table_exists(&db, "external_service_tls").await?);
+
+    Migrator::up(&db, Some(1)).await?;
+    assert!(table_exists(&db, "external_service_tls").await?);
+    assert!(table_exists(&db, "managed_service_certificate_authorities").await?);
+
+    // No backfill: the existing service has no row, which means `off`.
+    let rows = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*)::int AS count FROM external_service_tls".to_string(),
+        ))
+        .await?
+        .expect("count row");
+    assert_eq!(rows.try_get::<i32>("", "count")?, 0);
+
+    // A row created without a mode is `off`.
+    db.execute_unprepared(
+        "INSERT INTO external_service_tls (service_id) \
+         SELECT id FROM external_services WHERE name = 'existing-db'",
+    )
+    .await?;
+    let mode = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT mode FROM external_service_tls".to_string(),
+        ))
+        .await?
+        .expect("mode row");
+    assert_eq!(mode.try_get::<String>("", "mode")?, "off");
+
+    // Unknown modes and half-written certificates are refused.
+    assert!(db
+        .execute_unprepared("UPDATE external_service_tls SET mode = 'sometimes'")
+        .await
+        .is_err());
+    assert!(db
+        .execute_unprepared("UPDATE external_service_tls SET certificate_pem = 'cert'")
+        .await
+        .is_err());
+
+    // One CA per purpose.
+    let ca = "INSERT INTO managed_service_certificate_authorities \
+              (purpose, certificate_pem, private_key_encrypted, fingerprint_sha256, not_before, not_after) \
+              VALUES ('managed-services', 'c', 'k', 'f', now(), now() + interval '1 day')";
+    db.execute_unprepared(ca).await?;
+    assert!(db.execute_unprepared(ca).await.is_err());
+
+    // A service's TLS row goes with it.
+    db.execute_unprepared("DELETE FROM external_services WHERE name = 'existing-db'")
+        .await?;
+    let rows = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*)::int AS count FROM external_service_tls".to_string(),
+        ))
+        .await?
+        .expect("count row");
+    assert_eq!(rows.try_get::<i32>("", "count")?, 0);
+
+    Migrator::down(&db, Some(steps_back_to(target))).await?;
+    assert!(!table_exists(&db, "external_service_tls").await?);
+    assert!(!table_exists(&db, "managed_service_certificate_authorities").await?);
+    Ok(())
+}
+
+/// A restore run records, encrypted, the login its restored data answers to
+/// (`restored_login_encrypted`), so a worker restore resumed after a restart
+/// patches its target to that login. Existing runs read NULL; down drops it.
+#[tokio::test]
+async fn test_restore_runs_restored_login_migration_up_and_down() -> anyhow::Result<()> {
+    if external_db_configured() {
+        println!("Skipping restored login migration test: external database configured");
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_exposed_port(ContainerPort::Tcp(5432))
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!("Skipping restored login migration test: Docker unavailable: {error}");
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    let name = "m20261111_000002_restore_runs_restored_login";
+    let before = Migrator::migrations().len() as u32 - steps_back_to(name);
+    Migrator::up(&db, Some(before)).await?;
+    async fn has_column(db: &DatabaseConnection) -> anyhow::Result<bool> {
+        Ok(db
+            .query_one(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT 1 AS present FROM information_schema.columns WHERE table_name = \
+                 'restore_runs' AND column_name = 'restored_login_encrypted'"
+                    .to_string(),
+            ))
+            .await?
+            .is_some())
+    }
+    assert!(!has_column(&db).await?, "absent before the migration");
+
+    Migrator::up(&db, Some(1)).await?;
+    assert!(has_column(&db).await?, "added by the migration");
+
+    Migrator::down(&db, Some(steps_back_to(name))).await?;
+    assert!(!has_column(&db).await?, "dropped by down");
     Ok(())
 }

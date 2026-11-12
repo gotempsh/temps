@@ -242,8 +242,9 @@ impl DeploymentsPlugin {
 }
 
 /// The resolvers the legacy deployer gives a container, read from the
-/// proxy's slot at each create: its address with public fallbacks, or
-/// Docker's default while the proxy's resolver is not listening.
+/// proxy's slot at each create: only its address, so internal policy cannot
+/// be bypassed through another nameserver (ADR-096), or Docker's default
+/// while the proxy's resolver is not listening.
 fn cluster_dns_resolver(
     slot: Arc<std::sync::RwLock<Option<std::net::IpAddr>>>,
 ) -> temps_workload::ResolverSource {
@@ -1349,6 +1350,23 @@ impl TempsPlugin for DeploymentsPlugin {
             audit_service: audit_service.clone(),
             metrics_store: metrics_store.clone(),
             sensitive_action_authorizer: sensitive_action_authorizer.clone(),
+            cluster_dns: Arc::new(temps_nodes::services::cluster_dns::ClusterDnsService::new(
+                db.clone(),
+                // Registered with the metrics store at startup; the
+                // TimescaleDB store is the default it falls back to.
+                context
+                    .get_service::<temps_dns::DnsObservabilityService>()
+                    .unwrap_or_else(|| {
+                        Arc::new(temps_dns::DnsObservabilityService::new(
+                            db.clone(),
+                            metrics_store.clone().unwrap_or_else(|| {
+                                Arc::new(temps_metrics::TimescaleMetricsStore::new(db.clone()))
+                            }),
+                        ))
+                    }),
+                config_service.clone(),
+                encryption_service.clone(),
+            )),
         });
         let ci_admin_routes = handlers::ci_dispatch::admin_routes().with_state(Arc::new(
             handlers::ci_dispatch::CiAdminState {
@@ -1543,6 +1561,7 @@ impl TempsPlugin for DeploymentsPlugin {
         let mut nodes_schema = <handlers::nodes::NodesApiDoc as UtoimaOpenApi>::openapi();
         nodes_schema
             .merge(<handlers::node_operations::NodeOperationsApiDoc as UtoimaOpenApi>::openapi());
+        nodes_schema.merge(<handlers::cluster_dns::ClusterDnsApiDoc as UtoimaOpenApi>::openapi());
         let node_state_schema = <handlers::node_state::NodeStateApiDoc as UtoimaOpenApi>::openapi();
         let deployment_tokens_schema =
             <handlers::deployment_tokens::DeploymentTokensApiDoc as UtoimaOpenApi>::openapi();
@@ -1579,6 +1598,10 @@ impl TempsPlugin for DeploymentsPlugin {
 mod tests {
     use super::*;
 
+    /// The container gets the slot's resolver and nothing else: a host or
+    /// public nameserver after it would let a container resolve around
+    /// internal DNS policy (ADR-096); the resolver forwards outside names
+    /// itself.
     #[test]
     fn the_plane_resolver_follows_the_proxy_slot() {
         let slot = Arc::new(std::sync::RwLock::new(None));
@@ -1586,12 +1609,14 @@ mod tests {
         assert_eq!(resolver.resolvers(), None, "no listener, Docker's default");
 
         *slot.write().expect("slot") = Some(std::net::IpAddr::from([10, 0, 0, 53]));
-        let resolvers = resolver.resolvers().expect("the slot's resolver");
-        assert_eq!(resolvers.first().map(String::as_str), Some("10.0.0.53"));
-        assert!(
-            resolvers.len() > 1,
-            "public fallbacks follow: {resolvers:?}"
+        assert_eq!(
+            resolver.resolvers(),
+            Some(vec!["10.0.0.53".to_string()]),
+            "only the internal resolver"
         );
+
+        *slot.write().expect("slot") = None;
+        assert_eq!(resolver.resolvers(), None, "follows the slot back");
     }
 
     #[tokio::test]

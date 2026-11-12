@@ -68,6 +68,20 @@ pub struct RouteEntry {
     /// does not clone them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shield: Option<temps_core::worker_shield::ShieldRoutePolicy>,
+    /// Callers from other projects this internal route admits (ADR 101 D6).
+    /// Empty, the default from a control plane or a `routes.json` that
+    /// predates grants, admits the route's own project only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_callers: Vec<temps_core::internal_access::InternalAccessCaller>,
+}
+
+/// What a container serves, by the control plane's route snapshot: the
+/// caller identity the internal proxy checks (ADR 101 D6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct WorkloadIdentity {
+    pub project_id: i32,
+    /// `None` when the route carried no environment.
+    pub environment_id: Option<i32>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -296,7 +310,7 @@ struct DiskSnapshot {
 
 pub struct RouteStore {
     inner: RwLock<HashMap<String, RouteEntry>>,
-    container_projects: RwLock<HashMap<String, HashSet<i32>>>,
+    container_identities: RwLock<HashMap<String, HashSet<WorkloadIdentity>>>,
     generation: RwLock<u64>,
     public_ingress: RwLock<PublicIngressSnapshot>,
     public_enabled: AtomicBool,
@@ -318,7 +332,7 @@ impl RouteStore {
     pub fn new(snapshot_path: PathBuf) -> Self {
         Self {
             inner: RwLock::new(HashMap::new()),
-            container_projects: RwLock::new(HashMap::new()),
+            container_identities: RwLock::new(HashMap::new()),
             generation: RwLock::new(0),
             public_ingress: RwLock::new(PublicIngressSnapshot::default()),
             public_enabled: AtomicBool::new(false),
@@ -346,12 +360,12 @@ impl RouteStore {
     /// to disk best-effort. Returns the new generation.
     pub fn apply_snapshot(&self, generation: u64, routes: Vec<RouteEntry>) -> u64 {
         let mut map = HashMap::with_capacity(routes.len());
-        let container_projects = container_project_index(&routes);
+        let container_identities = container_identity_index(&routes);
         for r in &routes {
             map.insert(r.host.to_ascii_lowercase(), r.clone());
         }
         *self.inner.write() = map;
-        *self.container_projects.write() = container_projects;
+        *self.container_identities.write() = container_identities;
         *self.generation.write() = generation;
 
         // Best-effort disk persistence. We tolerate any error here —
@@ -532,10 +546,28 @@ impl RouteStore {
     /// identity; backend addresses are destinations and may be hostnames or
     /// shared node IPs, so they must never be used as caller identity.
     pub fn container_id_has_project(&self, container_id: &str, project_id: i32) -> bool {
-        self.container_projects
+        self.container_identities
             .read()
             .get(container_id)
-            .is_some_and(|projects| projects.contains(&project_id))
+            .is_some_and(|identities| {
+                identities
+                    .iter()
+                    .any(|identity| identity.project_id == project_id)
+            })
+    }
+
+    /// Run `decide` over what a container serves, under the read lock, so a
+    /// request allocates nothing for it. `None` when the snapshot does not
+    /// know the container.
+    pub fn with_container_identities<R>(
+        &self,
+        container_id: &str,
+        decide: impl FnOnce(&HashSet<WorkloadIdentity>) -> R,
+    ) -> Option<R> {
+        self.container_identities
+            .read()
+            .get(container_id)
+            .map(decide)
     }
 
     pub fn current_generation(&self) -> u64 {
@@ -578,12 +610,12 @@ impl RouteStore {
             }
         };
         let mut map = HashMap::with_capacity(snap.routes.len());
-        let container_projects = container_project_index(&snap.routes);
+        let container_identities = container_identity_index(&snap.routes);
         for r in &snap.routes {
             map.insert(r.host.to_ascii_lowercase(), r.clone());
         }
         *self.inner.write() = map;
-        *self.container_projects.write() = container_projects;
+        *self.container_identities.write() = container_identities;
         *self.generation.write() = snap.generation;
         let now = chrono::Utc::now().timestamp();
         let valid_expiry = snap.public_ingress_expires_at > now
@@ -861,16 +893,20 @@ fn certificate_covers_domain(certificate: &CertificateDer<'_>, expected: &str) -
         })
 }
 
-fn container_project_index(routes: &[RouteEntry]) -> HashMap<String, HashSet<i32>> {
-    let mut index: HashMap<String, HashSet<i32>> = HashMap::new();
+fn container_identity_index(routes: &[RouteEntry]) -> HashMap<String, HashSet<WorkloadIdentity>> {
+    let mut index: HashMap<String, HashSet<WorkloadIdentity>> = HashMap::new();
     for route in routes {
         if let Some(project_id) = route.project_id {
+            let identity = WorkloadIdentity {
+                project_id,
+                environment_id: route.environment_id,
+            };
             for backend in &route.backends {
                 if let Some(container_id) = backend.container_id.as_deref() {
                     index
                         .entry(container_id.to_string())
                         .or_default()
-                        .insert(project_id);
+                        .insert(identity);
                 }
             }
         }
@@ -902,6 +938,7 @@ mod tests {
             environment_id: Some(1),
             gate: None,
             shield: None,
+            allowed_callers: Vec::new(),
         }
     }
 

@@ -142,6 +142,12 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     // stay out: those return plaintext.
     "get_service",
     "get_service_by_slug",
+    // Server TLS of a managed database: mode, whether each container or
+    // data node serves it, and the certificate's public details. The CA
+    // download is the public certificate clients verify against; no
+    // private key is ever returned.
+    "get_service_tls",
+    "get_managed_ca_certificate",
     // ── Agentic follow-up reads: what a change did, and what to do next ──
     "list_container_history",
     "tail_deployment_job_logs",
@@ -792,6 +798,13 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     "list_email_domain_projects",
     // Cluster and platform
     "cluster_dns_status",
+    // Internal DNS observability (ADR-095), SettingsRead: each node's
+    // resolver health, the records it serves, the query log and traffic.
+    // Names, addresses and counts only, no credential.
+    "list_dns_resolvers",
+    "list_dns_records",
+    "list_dns_queries",
+    "dns_traffic",
     "NodeCapabilityGet",
     "NodeDockerDiskUsageGet",
     "admin_list_nodes",
@@ -822,6 +835,10 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     "admin_get_node_resources",
     "admin_list_environment_volumes",
     "get_effective_policy",
+    // Which projects may call a project's internal addresses (ADR 101):
+    // project and environment ids, names and a description, no credential.
+    // ProjectsRead on the project, narrowed to it.
+    "list_internal_access_grants",
     "get_ingress_settings",
     "get_rule",
     "get_workload_mode",
@@ -987,6 +1004,9 @@ pub const AI_WRITE_ALLOWLIST: &[&str] = &[
     "stop_service",
     "update_service_resources",
     "trigger_service_health_check",
+    // Turning a managed database's server TLS on or off. Takes only the
+    // mode, no credential; like a resize it restarts a standalone database.
+    "update_service_tls",
     "add_cluster_member",
     "unlink_service_from_project",
     // Removing a service is the only way to clean up a cluster that failed
@@ -1273,6 +1293,10 @@ pub const AI_READ_SAFE_POSTS: &[&str] = &[
     // created or stored; the token is a `SecretString`, so the assistant
     // passes it through a secret slot.
     "check_cloudflare_token",
+    // Read-only POST: one test lookup of a *.temps.local name from one
+    // node's resolver (ADR-095), SettingsRead. It stores nothing; the body
+    // is a POST only because it names the node, the name and the type.
+    "resolve_dns_name",
 ];
 
 /// [`AI_READ_SAFE_POSTS`] as owned strings, the shape [`crate::InternalApiCaller`] takes.
@@ -1430,6 +1454,7 @@ mod tests {
             "start_service",
             "stop_service",
             "update_service_resources",
+            "update_service_tls",
             "add_cluster_member",
             "retry_cluster",
             "delete_service",
@@ -1444,7 +1469,13 @@ mod tests {
                 "operating flow cannot stage `{operation}`"
             );
         }
-        for operation in ["get_service", "get_service_by_slug", "get_access_info"] {
+        for operation in [
+            "get_service",
+            "get_service_by_slug",
+            "get_access_info",
+            "get_service_tls",
+            "get_managed_ca_certificate",
+        ] {
             assert!(
                 reads.contains(operation),
                 "operating flow cannot read `{operation}`"

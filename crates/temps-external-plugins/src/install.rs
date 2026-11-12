@@ -1665,11 +1665,16 @@ pub(crate) async fn open_verified_executable(
                 reason: "verified executable must have exactly one hard link".to_string(),
             });
         }
-        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o777 != 0o500 {
+        // 0550 when a plugin launcher runs plugins as another user in the
+        // Temps group (see `crate::launcher`); never writable, never other.
+        if metadata.uid() != unsafe { libc::geteuid() }
+            || !matches!(metadata.mode() & 0o777, 0o500 | 0o550)
+        {
             return Err(InstallError::Io {
                 plugin: plugin.to_string(),
                 path: path.display().to_string(),
-                reason: "verified executable must be owned by the Temps user with mode 0500"
+                reason: "verified executable must be owned by the Temps user with mode 0500 \
+                         (0550 under a plugin launcher)"
                     .to_string(),
             });
         }

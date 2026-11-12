@@ -310,6 +310,7 @@ async fn disable_and_enable_schedule_reconcile_s3_lifecycle_rules() {
             force_path_style: Some(true),
             is_default: None,
             backing_service_id: None,
+            worker_credentials: None,
         })
         .await
         .expect("Failed to create S3 source");
@@ -1143,6 +1144,7 @@ async fn integration_attach_list_detach_round_trip() {
         managed_by_cloud: Set(false),
         lifecycle_reconcile_failed_at: Set(None),
         lifecycle_reconcile_generation: Set(0),
+        worker_credentials: sea_orm::ActiveValue::Set("scoped".to_string()),
         created_at: Set(chrono::Utc::now()),
         updated_at: Set(chrono::Utc::now()),
         backing_service_id: Set(None),
@@ -1337,6 +1339,7 @@ async fn integration_flip_to_all_clears_membership() {
         managed_by_cloud: Set(false),
         lifecycle_reconcile_failed_at: Set(None),
         lifecycle_reconcile_generation: Set(0),
+        worker_credentials: sea_orm::ActiveValue::Set("scoped".to_string()),
         created_at: Set(chrono::Utc::now()),
         updated_at: Set(chrono::Utc::now()),
         backing_service_id: Set(None),
@@ -1547,6 +1550,7 @@ async fn create_rejects_empty_fan_out() {
                 managed_by_cloud: false,
                 lifecycle_reconcile_failed_at: None,
                 lifecycle_reconcile_generation: 0,
+                worker_credentials: "scoped".to_string(),
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
                 backing_service_id: None,
@@ -1689,6 +1693,7 @@ async fn reconcile_default_schedules_provisions_mariadb_once() {
         managed_by_cloud: Set(false),
         lifecycle_reconcile_failed_at: Set(None),
         lifecycle_reconcile_generation: Set(0),
+        worker_credentials: sea_orm::ActiveValue::Set("scoped".to_string()),
         created_at: Set(chrono::Utc::now()),
         updated_at: Set(chrono::Utc::now()),
         backing_service_id: Set(None),

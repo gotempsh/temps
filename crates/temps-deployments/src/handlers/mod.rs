@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 pub mod audit;
+pub use temps_nodes::handlers::cluster_dns;
 pub use temps_nodes::handlers::cluster_network;
 pub mod compose_check;
 pub use temps_docker_housekeeping::handlers::docker_disk_usage;

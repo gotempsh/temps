@@ -983,9 +983,32 @@ async fn a_replacement_another_vxlan_would_collide_with_is_never_started() {
         .bootstrap(alloc, vec![peer])
         .await
         .expect_err("VNI 42 is held by another device");
+    // ADR 062: the refusal names the holder in the wording the console
+    // recognises, so it can offer this cluster its own network ID.
+    match &error {
+        temps_network::NetworkError::VxlanIdInUse {
+            device,
+            holder,
+            vni,
+            port,
+            ..
+        } => {
+            assert_eq!(device, "vxlan-temps0", "{error}");
+            assert_eq!(holder, "temps-it-vx0", "{error}");
+            assert_eq!((*vni, *port), (42, 4789), "{error}");
+        }
+        other => panic!("expected VxlanIdInUse, got {other:?}"),
+    }
+    let message = error.to_string();
     assert!(
-        error.to_string().contains("already holds vni=42"),
-        "{error}"
+        message.contains(
+            "VXLAN network ID 42 (UDP port 4789) is already used on this host by 'temps-it-vx0'"
+        ),
+        "{message}"
+    );
+    assert!(
+        temps_network::vxlan_holder::reports_id_in_use(&message),
+        "{message}"
     );
 
     assert_eq!(

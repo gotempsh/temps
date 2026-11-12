@@ -11,10 +11,64 @@ use std::collections::HashMap;
 use temps_entities::external_services;
 use tracing::{info, warn};
 
+/// Secrets a local engine's `init` generates when the request has none, and
+/// a worker cannot: its agent creates the container from the request alone.
+/// Generated here, before the create, and stored like the local engine's.
+/// Redis is the one engine whose strategy leaves its password to `init`; a
+/// worker Redis without one ran without `requirepass`, and provisioning a
+/// linked app then authenticated with a password the server never had.
+pub(crate) fn remote_generated_secrets(
+    service_type: &ServiceType,
+    parameters: &HashMap<String, String>,
+) -> Vec<(&'static str, String)> {
+    let missing = |key: &str| parameters.get(key).is_none_or(|value| value.is_empty());
+    match service_type {
+        ServiceType::Redis | ServiceType::Kv if missing("password") => {
+            use rand::{distr::Alphanumeric, RngExt};
+            let password: String = rand::rng()
+                .sample_iter(&Alphanumeric)
+                .take(16)
+                .map(char::from)
+                .collect();
+            vec![("password", password)]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Proof that the caller holds the service's TLS lock
+/// ([`ExternalServiceManager::service_tls_locks`]).
+pub(super) type TlsLockHeld<'a> = tokio::sync::MutexGuard<'a, ()>;
+
 impl ExternalServiceManager {
+    /// [`remote_generated_secrets`]: what a worker create adds to a
+    /// service's parameters and stores, because the node's engine cannot.
+    pub fn worker_generated_secrets(
+        service_type: &ServiceType,
+        parameters: &HashMap<String, String>,
+    ) -> Vec<(&'static str, String)> {
+        remote_generated_secrets(service_type, parameters)
+    }
+
+    /// (Re)create and start a service's container from its stored
+    /// configuration, holding the service's TLS lock: the TLS mode and
+    /// certificate it reads cannot change until the container serves them
+    /// (ADR 093).
     pub(super) async fn initialize_service(
         &self,
         service_id: i32,
+    ) -> Result<(), ExternalServiceError> {
+        let lock = self.service_tls_locks.for_service(service_id).await;
+        let held = lock.lock().await;
+        self.initialize_service_holding(service_id, &held).await
+    }
+
+    /// [`Self::initialize_service`] for a caller that already holds the
+    /// service's TLS lock (a TLS mode change, a start).
+    pub(super) async fn initialize_service_holding(
+        &self,
+        service_id: i32,
+        _held: &TlsLockHeld<'_>,
     ) -> Result<(), ExternalServiceError> {
         info!("Initializing service: {}", service_id);
         self.ensure_no_active_upgrade(service_id).await?;
@@ -48,6 +102,14 @@ impl ExternalServiceManager {
             });
         }
 
+        // ADR 093: the engine installs the server certificate when it
+        // (re)creates the container. Transient: never stored with the
+        // parameters. Empty for services without managed TLS.
+        let mut parameters = parameters;
+        for (key, value) in self.server_tls_parameters(&service, &parameters).await? {
+            parameters.insert(key, value);
+        }
+
         // Local node — use existing Docker-based service logic
         let service_instance = self.create_service_instance_for_parameters(
             service.name.clone(),
@@ -79,21 +141,10 @@ impl ExternalServiceManager {
         }
 
         // Initialize the service
-        let inferred_params = service_instance.init(config).await.map_err(|e| match e {
-            EngineError::RecreateGuard(guard) if guard.is_refusal() => {
-                ExternalServiceError::DataSafetyRefusal {
-                    service_id,
-                    name: service.name.clone(),
-                    reason: guard.to_string(),
-                }
-            }
-            other => ExternalServiceError::from_engine(service_id, other, |reason| {
-                ExternalServiceError::InitializationFailed {
-                    id: service_id,
-                    reason,
-                }
-            }),
-        })?;
+        let inferred_params = service_instance
+            .init(config)
+            .await
+            .map_err(|e| Self::initialization_failure(service_id, &service.name, e, ""))?;
 
         // Store inferred parameters
         self.store_inferred_parameters(service_id, service_instance.as_ref(), inferred_params)
@@ -101,12 +152,12 @@ impl ExternalServiceManager {
 
         // Start the service (create and start container)
         service_instance.start().await.map_err(|error| {
-            ExternalServiceError::from_engine(service_id, error, |e| {
-                ExternalServiceError::InitializationFailed {
-                    id: service_id,
-                    reason: format!("Failed to start service: {}", e),
-                }
-            })
+            Self::initialization_failure(
+                service_id,
+                &service.name,
+                error,
+                "Failed to start service: ",
+            )
         })?;
 
         // `running`, or `starting` until the engine's readiness gate
@@ -154,7 +205,7 @@ impl ExternalServiceManager {
         let client = self.get_remote_client(node_id).await?;
 
         // Flatten serde_json::Value parameters to strings for the builder
-        let string_params: HashMap<String, String> = parameters
+        let mut string_params: HashMap<String, String> = parameters
             .iter()
             .map(|(k, v)| {
                 let s = match v {
@@ -165,8 +216,16 @@ impl ExternalServiceManager {
             })
             .collect();
 
-        let create_params =
-            self.build_remote_create_params(&service.name, service_type, &string_params)?;
+        let generated = remote_generated_secrets(service_type, &string_params);
+        for (key, value) in &generated {
+            string_params.insert((*key).to_string(), value.clone());
+        }
+        let create_params = self.build_remote_create_params(
+            service_id,
+            &service.name,
+            service_type,
+            &string_params,
+        )?;
 
         // Try to stop existing container first (ignore errors — may not exist)
         let container_name = create_params.name.clone();
@@ -222,6 +281,11 @@ impl ExternalServiceManager {
             "container_name".to_string(),
             response.container_name.clone(),
         );
+        // The container now runs with these: store them as the local
+        // engine's `init` would.
+        for (key, value) in generated {
+            inferred.insert(key.to_string(), value);
+        }
 
         // Persist inferred parameters
         let mut current_params = self.get_service_parameters(service_id).await?;
@@ -325,16 +389,27 @@ impl ExternalServiceManager {
         Ok(())
     }
 
+    /// Start a stopped service: through its node's agent when it runs on a
+    /// worker, otherwise through its local engine, falling back to
+    /// re-initializing it when the start fails. A local standalone service
+    /// reports `starting` until its readiness gate confirms it.
     pub async fn start_service(
         &self,
         service_id: i32,
     ) -> Result<ExternalServiceInfo, ExternalServiceError> {
+        // ADR 093: a standalone start reads the TLS mode and certificate it
+        // starts the container with; a mode change waits for it, and it
+        // waits for a mode change, so neither undoes the other.
+        let lock = self.service_tls_locks.for_service(service_id).await;
+        let held = lock.lock().await;
         self.ensure_no_active_upgrade(service_id).await?;
         let service = self.get_service(service_id).await?;
         self.ensure_unambiguous_service_name(&service).await?;
         // Never fall back to `initialize_service` here: that builds a
         // standalone container under the service's own name.
         if service.topology == "cluster" {
+            // A cluster's data nodes take the lock in their own TLS pass.
+            drop(held);
             self.run_cluster_lifecycle(service_id, ClusterLifecycleAction::Start)
                 .await?;
             return self.get_service_info(service_id).await;
@@ -350,13 +425,14 @@ impl ExternalServiceManager {
         // Remote node — delegate to agent
         if let Some(node_id) = service.node_id {
             let client = self.get_remote_client(node_id).await?;
-            let service_instance = self.create_service_instance_for_parameters(
-                service.name.clone(),
-                service_type_enum,
-                &parameters,
-            )?;
             let container_name = self
-                .resolve_remote_container_name(&client, service_instance.as_ref(), &parameters)
+                .resolve_remote_container_name(
+                    &client,
+                    service.id,
+                    &service.name,
+                    service_type_enum,
+                    &parameters,
+                )
                 .await?;
 
             match client.start_service(&container_name).await {
@@ -366,7 +442,7 @@ impl ExternalServiceManager {
                         "Remote start failed for service {} ({}), falling back to initialize: {}",
                         service_id, service.name, e
                     );
-                    self.initialize_service(service_id)
+                    self.initialize_service_holding(service_id, &held)
                         .await
                         .map_err(|init_err| {
                             Self::start_fallback_failure(service_id, &e, init_err)
@@ -463,7 +539,7 @@ impl ExternalServiceManager {
                             "Container {} of service {} ({}) is missing; re-initializing it",
                             container, service_id, service.name
                         );
-                        self.initialize_service(service_id).await?;
+                        self.initialize_service_holding(service_id, &held).await?;
                         return self.get_service_info(service_id).await;
                     }
                     Err(e) => {
@@ -478,6 +554,12 @@ impl ExternalServiceManager {
                 }
             }
             let start_result = if managed_postgres {
+                // ADR 093: start-time drift repair must know the TLS state
+                // (and have the certificate) or it cannot apply it.
+                let mut parameters = parameters.clone();
+                for (key, value) in self.server_tls_parameters(&service, &parameters).await? {
+                    parameters.insert(key, value);
+                }
                 let service_config = ServiceConfig {
                     name: service.name.clone(),
                     service_type: service_type_enum,
@@ -511,7 +593,7 @@ impl ExternalServiceManager {
                         "Direct start failed for service {} ({}), falling back to initialize: {}",
                         service_id, service.name, e
                     );
-                    self.initialize_service(service_id)
+                    self.initialize_service_holding(service_id, &held)
                         .await
                         .map_err(|init_err| {
                             Self::start_fallback_failure(service_id, &e, init_err)
@@ -585,6 +667,52 @@ impl ExternalServiceManager {
         }
     }
 
+    /// An engine failure while (re)initializing a service. The recreate
+    /// guard's verdict stays typed, so a caller can tell it apart and never
+    /// re-initialize over it ([`Self::guard_failure_for_start`]): a refusal
+    /// is [`ExternalServiceError::DataSafetyRefusal`], a failed replacement
+    /// an [`ExternalServiceError::Engine`] holding the guard's error.
+    fn initialization_failure(
+        service_id: i32,
+        name: &str,
+        error: EngineError,
+        prefix: &str,
+    ) -> ExternalServiceError {
+        match error {
+            EngineError::RecreateGuard(guard) if guard.is_refusal() => {
+                ExternalServiceError::DataSafetyRefusal {
+                    service_id,
+                    name: name.to_string(),
+                    reason: guard.to_string(),
+                }
+            }
+            guard @ EngineError::RecreateGuard(_) => ExternalServiceError::Engine {
+                service_id: Some(service_id),
+                source: Box::new(guard),
+            },
+            other => ExternalServiceError::from_engine(service_id, other, |reason| {
+                ExternalServiceError::InitializationFailed {
+                    id: service_id,
+                    reason: format!("{prefix}{reason}"),
+                }
+            }),
+        }
+    }
+
+    /// Whether `error` is the recreate guard's verdict on a replacement:
+    /// re-initializing after it would stop whatever holds the container's
+    /// name and recreate it again, over an original that may still be set
+    /// aside or a replacement that failed verification.
+    pub(super) fn is_recreate_guard_verdict(error: &ExternalServiceError) -> bool {
+        match error {
+            ExternalServiceError::DataSafetyRefusal { .. } => true,
+            ExternalServiceError::Engine { source, .. } => {
+                matches!(source.as_ref(), EngineError::RecreateGuard(_))
+            }
+            _ => false,
+        }
+    }
+
     /// The error to return from a failed start when the failure came from
     /// the recreate guard, or `None` for any other failure (which may fall
     /// back to re-initialising the service). A guard error is never retried
@@ -613,6 +741,8 @@ impl ExternalServiceManager {
         })
     }
 
+    /// Stop a running service: through its node's agent when it runs on a
+    /// worker, otherwise through its local engine.
     pub async fn stop_service(
         &self,
         service_id: i32,
@@ -637,13 +767,14 @@ impl ExternalServiceManager {
         // Remote node — delegate to agent
         if let Some(node_id) = service.node_id {
             let client = self.get_remote_client(node_id).await?;
-            let service_instance = self.create_service_instance_for_parameters(
-                service.name.clone(),
-                service_type_enum,
-                &parameters,
-            )?;
             let container_name = self
-                .resolve_remote_container_name(&client, service_instance.as_ref(), &parameters)
+                .resolve_remote_container_name(
+                    &client,
+                    service.id,
+                    &service.name,
+                    service_type_enum,
+                    &parameters,
+                )
                 .await?;
 
             client.stop_service(&container_name).await.map_err(|e| {
@@ -738,6 +869,93 @@ mod tests {
             original_in_place: restored,
         }
         .into()
+    }
+
+    #[test]
+    fn a_worker_redis_gets_the_password_a_local_one_would_generate() {
+        for service_type in [ServiceType::Redis, ServiceType::Kv] {
+            let generated = remote_generated_secrets(&service_type, &HashMap::new());
+            assert_eq!(generated.len(), 1, "{service_type}");
+            let (key, password) = &generated[0];
+            assert_eq!(*key, "password");
+            assert_eq!(password.len(), 16);
+            assert!(password.chars().all(|c| c.is_ascii_alphanumeric()));
+
+            // The container is created with it.
+            let mut parameters = HashMap::from([(key.to_string(), password.clone())]);
+            parameters.insert(
+                "docker_image".into(),
+                "gotempsh/redis-walg:8-bookworm".into(),
+            );
+            let request = ExternalServiceManager::remote_create_params(
+                7,
+                "cache",
+                &service_type,
+                &parameters,
+                false,
+            )
+            .expect("a create request");
+            let command = request.command.unwrap_or_default();
+            let at = command
+                .iter()
+                .position(|arg| arg == "--requirepass")
+                .expect("the server requires the password");
+            assert_eq!(command.get(at + 1), Some(password));
+        }
+        // A given password is kept, and other engines generate nothing here.
+        let given = HashMap::from([("password".to_string(), "chosen".to_string())]);
+        assert!(remote_generated_secrets(&ServiceType::Redis, &given).is_empty());
+        for service_type in [
+            ServiceType::Postgres,
+            ServiceType::Mongodb,
+            ServiceType::Mariadb,
+        ] {
+            assert!(remote_generated_secrets(&service_type, &HashMap::new()).is_empty());
+        }
+    }
+
+    #[test]
+    fn an_initialization_keeps_the_guard_verdict_typed() {
+        for restored in [true, false] {
+            let error =
+                ExternalServiceManager::initialization_failure(7, "app", guard_error(restored), "");
+            assert!(
+                ExternalServiceManager::is_recreate_guard_verdict(&error),
+                "restored={restored}: {error:?}"
+            );
+            assert!(error.to_string().contains("postgres-app"), "{error}");
+        }
+        let refusal = ExternalServiceManager::initialization_failure(
+            7,
+            "app",
+            crate::externalsvc::recreate_guard::RecreateGuardError::DataInContainerLayer {
+                engine: crate::externalsvc::recreate_guard::ManagedEngine::Postgres,
+                service: "app".into(),
+                container: "postgres-app".into(),
+                operation: "a test".into(),
+                data_dir: "/data".into(),
+            }
+            .into(),
+            "",
+        );
+        assert!(matches!(
+            refusal,
+            ExternalServiceError::DataSafetyRefusal { service_id: 7, .. }
+        ));
+        assert!(ExternalServiceManager::is_recreate_guard_verdict(&refusal));
+
+        let other = ExternalServiceManager::initialization_failure(
+            7,
+            "app",
+            EngineError::failed("app", "container exited"),
+            "Failed to start service: ",
+        );
+        assert!(!ExternalServiceManager::is_recreate_guard_verdict(&other));
+        assert!(matches!(
+            other,
+            ExternalServiceError::InitializationFailed { id: 7, ref reason }
+                if reason.starts_with("Failed to start service: ")
+        ));
     }
 
     #[test]

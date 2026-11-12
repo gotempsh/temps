@@ -637,7 +637,7 @@ impl ExternalServiceManager {
     }
 
     /// Convert HashMap<String, serde_json::Value> to HashMap<String, String>
-    pub(super) fn params_to_strings(
+    pub(in crate::services) fn params_to_strings(
         params: &HashMap<String, serde_json::Value>,
     ) -> HashMap<String, String> {
         params

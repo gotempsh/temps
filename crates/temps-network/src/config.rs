@@ -37,7 +37,65 @@ pub enum Transport {
     Native,
 }
 
+/// The VXLAN network ID every cluster used before ADR 062, and the one a
+/// node uses when its control plane sends none.
+pub const DEFAULT_VXLAN_VNI: u32 = 42;
+
+/// The IANA-assigned VXLAN UDP port.
+pub const DEFAULT_VXLAN_PORT: u16 = 4789;
+
+/// VNIs are 24-bit.
+pub const MAX_VXLAN_VNI: u32 = 0x00FF_FFFF;
+
+/// Lowest VNI handed to a cluster at random (ADR 062): small values are the
+/// ones other tools and hand-made overlays pick.
+pub const MIN_RANDOM_VXLAN_VNI: u32 = 4096;
+
+/// A random VXLAN network ID for a cluster (ADR 062), in
+/// `MIN_RANDOM_VXLAN_VNI..=MAX_VXLAN_VNI` and never `avoid`.
+pub fn random_vxlan_vni(avoid: u32) -> u32 {
+    let span = u128::from(MAX_VXLAN_VNI - MIN_RANDOM_VXLAN_VNI + 1);
+    loop {
+        // A v4 UUID carries 122 random bits from the OS generator.
+        let random = Uuid::new_v4().as_u128();
+        let vni = MIN_RANDOM_VXLAN_VNI + (random % span) as u32;
+        if vni != avoid && vni != DEFAULT_VXLAN_VNI {
+            return vni;
+        }
+    }
+}
+
+/// The lowest VXLAN UDP port accepted from the control plane. The mesh
+/// firewall admits the overlay's port from every mesh peer, so a privileged
+/// port (DNS on 53, say) would expose a host service to them.
+pub const MIN_VXLAN_PORT: u16 = 1024;
+
+/// Check a VXLAN network ID and port received from elsewhere: the VNI is
+/// 24-bit and non-zero, and the port is unprivileged.
+pub fn validate_vxlan(vni: u32, port: u16) -> crate::Result<()> {
+    if vni == 0 || vni > MAX_VXLAN_VNI {
+        return Err(NetworkError::InvalidConfig {
+            reason: format!("VXLAN network ID {vni} is outside 1..={MAX_VXLAN_VNI}"),
+        });
+    }
+    if port < MIN_VXLAN_PORT {
+        return Err(NetworkError::InvalidConfig {
+            reason: format!(
+                "VXLAN UDP port {port} is below {MIN_VXLAN_PORT}: the mesh firewall would admit a \
+                 privileged port from every mesh peer"
+            ),
+        });
+    }
+    Ok(())
+}
+
 impl Transport {
+    /// The default VXLAN transport: network ID 42 on UDP 4789.
+    pub const DEFAULT_VXLAN: Self = Self::Vxlan {
+        vni: DEFAULT_VXLAN_VNI,
+        port: DEFAULT_VXLAN_PORT,
+    };
+
     /// Recommended bridge MTU for this transport, given an underlay MTU.
     pub fn bridge_mtu(&self, underlay_mtu: u32) -> u32 {
         match self {
@@ -107,10 +165,7 @@ impl Default for NetworkConfig {
         Self {
             bridge_name: crate::OverlayNames::default().bridge,
             docker_network_name: crate::OverlayNames::default().docker_network,
-            transport: Transport::Vxlan {
-                vni: 42,
-                port: 4789,
-            },
+            transport: Transport::DEFAULT_VXLAN,
             underlay_mtu: 1500,
             underlay_dev: "eth0".into(),
             vxlan_dev_name: crate::OverlayNames::default().vxlan,
@@ -288,6 +343,29 @@ mod tests {
     use super::*;
     use std::net::Ipv4Addr;
     use std::str::FromStr;
+
+    #[test]
+    fn a_random_network_id_is_large_24_bit_and_avoids_the_given_one() {
+        for _ in 0..1000 {
+            let vni = random_vxlan_vni(5000);
+            assert!((MIN_RANDOM_VXLAN_VNI..=MAX_VXLAN_VNI).contains(&vni));
+            assert_ne!(vni, 5000);
+            assert_ne!(vni, DEFAULT_VXLAN_VNI);
+        }
+    }
+
+    #[test]
+    fn received_network_ids_and_ports_are_checked() {
+        assert!(validate_vxlan(42, 4789).is_ok());
+        assert!(validate_vxlan(MAX_VXLAN_VNI, MIN_VXLAN_PORT).is_ok());
+        assert!(
+            validate_vxlan(42, 53).is_err(),
+            "a privileged port is refused"
+        );
+        assert!(validate_vxlan(0, 4789).is_err());
+        assert!(validate_vxlan(MAX_VXLAN_VNI + 1, 4789).is_err());
+        assert!(validate_vxlan(42, 0).is_err());
+    }
 
     fn alloc(cidr: &str, bridge: &str) -> NodeAlloc {
         NodeAlloc {

@@ -79,7 +79,7 @@
       "ignore_with_reason": 1,
       "anyhow_in_library": 31,
       "files_over_3000_lines": 2,
-      "functions_over_300_lines": 9
+      "functions_over_300_lines": 8
     },
     "temps-blob": {
       "lazy_error_variants": 7
@@ -301,8 +301,7 @@
       "functions_over_300_lines": 1
     },
     "temps-providers-redis": {
-      "files_over_3000_lines": 1,
-      "functions_over_300_lines": 1
+      "files_over_3000_lines": 1
     },
     "temps-providers-s3": {
       "files_over_3000_lines": 2,

@@ -15,6 +15,13 @@ grep -Fq 'useradd --uid 1000 --gid temps --create-home' "$dockerfile"
 grep -Fq 'apt-get update && apt-get upgrade -y --no-install-recommends' "$dockerfile"
 grep -Fq '    libbrotli1 \' "$dockerfile"
 grep -Fq 'dpkg --compare-versions "$(dpkg-query -W -f='"'"'${Version}'"'"' libbrotli1)" ge '"'"'1.0.9-2+deb12u1'"'" "$dockerfile"
+# The no-Docker control-plane backup runs the image's own pg_dump/pg_dumpall,
+# which must be at least the database's major version (ADR-100).
+grep -Fqx 'ARG PG_CLIENT_MAJOR=18' "$dockerfile"
+grep -Fq 'cp /usr/share/postgresql-common/pgdg/apt.postgresql.org.gpg /etc/apt/keyrings/pgdg.gpg' "$dockerfile"
+grep -Fq 'apt-get install -y --no-install-recommends "postgresql-client-${PG_CLIENT_MAJOR}"' "$dockerfile"
+grep -Fq 'pg_dump --version | grep -Eq "^pg_dump \(PostgreSQL\) ${PG_CLIENT_MAJOR}\."' "$dockerfile"
+grep -Fq 'pg_dumpall --version | grep -Eq "^pg_dumpall \(PostgreSQL\) ${PG_CLIENT_MAJOR}\."' "$dockerfile"
 
 if grep -Eq 'FROM alpine|\bapk (add|update|upgrade)' "$dockerfile"; then
     echo 'Dockerfile.release must not use a musl/Alpine runtime for glibc release artifacts' >&2

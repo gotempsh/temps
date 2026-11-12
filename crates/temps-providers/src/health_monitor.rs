@@ -17,7 +17,10 @@ use crate::continuous_archive;
 use crate::externalsvc::mariadb::{BinlogArchiveInterval, MariaDbConfig, MariaDbService};
 use crate::externalsvc::postgres_wal_health::{self, PostgresWalHealth};
 use crate::externalsvc::{HealthProbeStatus, S3Credentials};
-use crate::services::ExternalServiceManager;
+use crate::services::{
+    record_wal_outcome, ContainerStatsBaseline, ExternalServiceManager, PolledContainerStats,
+    WalProbeOutcome,
+};
 use chrono::Utc;
 use futures::{stream, StreamExt};
 use sea_orm::{
@@ -37,11 +40,6 @@ use temps_metrics::{MetricKind, MetricPoint, MetricsStore, SourceKind};
 use thiserror::Error;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
-
-/// Key under `external_services.health_metadata` for Postgres WAL probe output.
-/// Future engines add sibling keys (e.g., `redis_memory`, `mongo_oplog`) so
-/// the column stays generic.
-const POSTGRES_WAL_KEY: &str = "postgres_wal";
 
 /// How many failed probes in a row before we raise an alert.
 pub(crate) const CONSECUTIVE_FAILURES_BEFORE_ALERT: i32 = 3;
@@ -99,6 +97,71 @@ pub enum HealthMonitorError {
     },
 }
 
+/// How long before a scoped credential's own expiry the monitor stops
+/// reusing it, so a run never starts with one about to lapse.
+const BINLOG_CREDENTIAL_EXPIRY_MARGIN: Duration = Duration::from_secs(10 * 60);
+
+/// What a worker MariaDB's binary-log credential was minted for: reused
+/// only while every part still matches, so a change to the source (its
+/// bucket, base path, keys or worker credentials setting all bump
+/// `updated_at`), the service's name or its node mints a new one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BinlogCredentialGrant {
+    s3_source_id: i32,
+    s3_source_updated_at: chrono::DateTime<Utc>,
+    node_id: i32,
+    bucket: String,
+    prefix: String,
+}
+
+impl BinlogCredentialGrant {
+    fn of(service_name: &str, node_id: i32, s3_source: &s3_sources::Model) -> Self {
+        Self {
+            s3_source_id: s3_source.id,
+            s3_source_updated_at: s3_source.updated_at,
+            node_id,
+            bucket: s3_source.bucket_name.clone(),
+            prefix: crate::externalsvc::mariadb_node::binlog_key_prefix(
+                &s3_source.bucket_path,
+                service_name,
+            ),
+        }
+    }
+}
+
+/// A worker MariaDB's binary-log archiving credential, what it was minted
+/// for, and until when it may be reused.
+struct BinlogArchiveCredential {
+    grant: BinlogCredentialGrant,
+    reuse_until: Instant,
+    destination: crate::remote_service_client::WorkerS3Destination,
+}
+
+/// How long a freshly minted binary-log credential may be reused: the
+/// refresh interval, cut short [`BINLOG_CREDENTIAL_EXPIRY_MARGIN`] before
+/// its own expiry (a store may grant less than asked). `None` for one not
+/// worth keeping: the source's full credential (never cached, so a source
+/// switched to scoped stops receiving it on the next run) or one already
+/// about to expire.
+fn binlog_credential_reuse_window(
+    scope: &crate::worker_s3_scope::WorkerCredentialScope,
+    now: chrono::DateTime<Utc>,
+) -> Option<Duration> {
+    use crate::worker_s3_scope::{WorkerCredentialScope, ARCHIVE_CREDENTIAL_REFRESH_INTERVAL};
+    let WorkerCredentialScope::Scoped { expires_at, .. } = scope else {
+        return None;
+    };
+    let window = match expires_at {
+        Some(expires_at) => (*expires_at - now)
+            .to_std()
+            .ok()?
+            .checked_sub(BINLOG_CREDENTIAL_EXPIRY_MARGIN)?
+            .min(ARCHIVE_CREDENTIAL_REFRESH_INTERVAL),
+        None => ARCHIVE_CREDENTIAL_REFRESH_INTERVAL,
+    };
+    (!window.is_zero()).then_some(window)
+}
+
 /// Background loop that keeps `external_services.health_status` in sync with
 /// reality and sends alerts when a service stays down for 3+ consecutive checks.
 pub struct ExternalServiceHealthMonitor {
@@ -116,17 +179,24 @@ pub struct ExternalServiceHealthMonitor {
     /// service id. The health loop ticks every `poll_interval_secs`; we gate
     /// archiving so it only fires once per service's `binlog_archive_interval`.
     last_binlog_archive: Arc<Mutex<HashMap<i32, Instant>>>,
+    /// The scoped credential each worker MariaDB ships its binary logs with
+    /// (ADR-102), keyed by service id: reused across archive runs and minted
+    /// again every [`ARCHIVE_CREDENTIAL_REFRESH_INTERVAL`], when the service
+    /// moves to another node or source, or after a run that failed.
+    ///
+    /// [`ARCHIVE_CREDENTIAL_REFRESH_INTERVAL`]: crate::worker_s3_scope::ARCHIVE_CREDENTIAL_REFRESH_INTERVAL
+    binlog_archive_credentials: Arc<Mutex<HashMap<i32, BinlogArchiveCredential>>>,
     /// Optional metrics store. When set, container CPU/memory samples for
     /// running services with `metrics_enabled` are written to it on every
-    /// health tick (`container.cpu_percent`, `container.memory_used_bytes`,
-    /// `container.memory_percent` with `source_kind = database`).
+    /// health tick (see `container_metric_points`, `source_kind = database`).
     metrics_store: Option<Arc<dyn MetricsStore>>,
-    /// Previous raw docker-stats sample per service (`service_id` →
-    /// `container_name` → sample). The 30s poll interval is the CPU delta
-    /// window; the first tick per container seeds the baseline and emits
-    /// memory only.
-    stats_baselines:
-        Arc<Mutex<HashMap<i32, HashMap<String, bollard::models::ContainerStatsResponse>>>>,
+    /// Previous docker-stats tick per service (`service_id` →
+    /// `container_name` → CPU counters and cached CPU limit). The poll
+    /// interval is the CPU rate window; the first tick per container seeds
+    /// the baseline and emits memory only. Holds entries only for services
+    /// that are sampled (`samples_container_metrics`), and per service only
+    /// for its current containers.
+    stats_baselines: Arc<StatsBaselines>,
 }
 
 impl ExternalServiceHealthMonitor {
@@ -146,8 +216,9 @@ impl ExternalServiceHealthMonitor {
             docker,
             encryption_service,
             last_binlog_archive: Arc::new(Mutex::new(HashMap::new())),
+            binlog_archive_credentials: Arc::new(Mutex::new(HashMap::new())),
             metrics_store: None,
-            stats_baselines: Arc::new(Mutex::new(HashMap::new())),
+            stats_baselines: Arc::new(StatsBaselines::default()),
         }
     }
 
@@ -201,7 +272,16 @@ impl ExternalServiceHealthMonitor {
 
         debug!("Health-checking {} external service(s)", services.len());
 
-        let service_ids: Vec<i32> = services.iter().map(|s| s.id).collect();
+        // Services whose container stats are sampled this cycle. Baselines of
+        // every other service (deleted, stopped, metrics off) are dropped
+        // below, so the map stays bounded by the
+        // sampled containers and a stopped service restarts from a fresh
+        // baseline instead of one from before it stopped.
+        let sampled_ids: std::collections::HashSet<i32> = services
+            .iter()
+            .filter(|s| samples_container_metrics(s))
+            .map(|s| s.id)
+            .collect();
 
         const MAX_CONCURRENT_HEALTH_CHECKS: usize = 8;
         stream::iter(services)
@@ -215,12 +295,7 @@ impl ExternalServiceHealthMonitor {
             })
             .await;
 
-        // Drop stats baselines for services that no longer exist so the map
-        // doesn't grow forever as services are created and deleted.
-        {
-            let mut baselines = self.stats_baselines.lock().await;
-            baselines.retain(|id, _| service_ids.contains(id));
-        }
+        self.stats_baselines.retain(&sampled_ids).await;
 
         Ok(())
     }
@@ -279,17 +354,46 @@ impl ExternalServiceHealthMonitor {
         // The result is persisted under `health_metadata.postgres_wal` so the
         // UI can render warnings. WAL warnings downgrade Operational to
         // Degraded but never escalate Down upward — liveness wins.
-        let wal_snapshot = if service.service_type == "postgres"
+        //
+        // A database on a worker publishes its port on that worker, behind a
+        // host recorded as `localhost`, so this process cannot connect: the
+        // probe runs on the worker through its agent. When it cannot run,
+        // the reason is recorded (`postgres_wal_unchecked`) so the page says
+        // the check is not happening instead of showing nothing.
+        let wal_outcome = if service.service_type == "postgres"
             && service.topology == "standalone"
-            && service.node_id.is_none()
             && !matches!(status, HealthProbeStatus::Down)
         {
-            self.run_postgres_wal_probe(service).await
+            match service.node_id {
+                None => self
+                    .run_postgres_wal_probe(service)
+                    .await
+                    .map(WalProbeOutcome::Snapshot),
+                Some(node_id) => {
+                    let outcome = self
+                        .manager
+                        .probe_worker_postgres_wal(service, node_id)
+                        .await;
+                    if let WalProbeOutcome::Unchecked(reason) = &outcome {
+                        debug!(
+                            service_id = service.id,
+                            service = %service.name,
+                            node_id,
+                            "WAL probe on worker produced no snapshot: {reason}"
+                        );
+                    }
+                    Some(outcome)
+                }
+            }
         } else {
             None
         };
+        let wal_snapshot = match &wal_outcome {
+            Some(WalProbeOutcome::Snapshot(snapshot)) => Some(snapshot),
+            _ => None,
+        };
 
-        if let Some(snapshot) = &wal_snapshot {
+        if let Some(snapshot) = wal_snapshot {
             if snapshot.has_warnings() && matches!(status, HealthProbeStatus::Operational) {
                 status = HealthProbeStatus::Degraded;
                 if error_message.is_none() {
@@ -334,11 +438,16 @@ impl ExternalServiceHealthMonitor {
             0
         };
 
-        let merged_metadata = merge_health_metadata(
-            service.health_metadata.as_ref(),
-            POSTGRES_WAL_KEY,
-            wal_snapshot.as_ref(),
-        );
+        let merged_metadata = wal_outcome.as_ref().and_then(|outcome| {
+            record_wal_outcome(service.health_metadata.as_ref(), outcome, now)
+                .map_err(|e| {
+                    warn!(
+                        "Failed to serialize WAL health for service {}: {}",
+                        service.id, e
+                    )
+                })
+                .ok()
+        });
 
         // Partial update, not `service.clone().into()`: that stamps every
         // column from this cycle's snapshot, including
@@ -380,9 +489,12 @@ impl ExternalServiceHealthMonitor {
         //    service's configured cadence. Only for running standalone
         //    MariaDB services that have a backup schedule (→ S3 destination).
         //    Failures here never affect health monitoring of other services.
+        //
+        //    A MariaDB on a worker node is shipped by the same archiver, run
+        //    by its node's agent (ADR-099); the destination, its pin and the
+        //    cadence are decided here either way.
         if service.service_type == "mariadb"
             && service.topology == "standalone"
-            && service.node_id.is_none()
             && service.status == "running"
             && !matches!(status, HealthProbeStatus::Down)
         {
@@ -392,9 +504,10 @@ impl ExternalServiceHealthMonitor {
         // 5. Container resource metrics: sample docker stats for every
         //    member container and write CPU/memory points to the metrics
         //    store. Gated on the same per-service `metrics_enabled` flag the
-        //    engine-metrics scraper uses. Failures are logged and swallowed —
+        //    engine-metrics scraper uses. A container on a worker is sampled
+        //    through that node's agent. Failures are logged and swallowed —
         //    metrics must never disrupt health monitoring.
-        if service.status == "running" && service.node_id.is_none() && service.metrics_enabled {
+        if samples_container_metrics(service) {
             if let Some(store) = self.metrics_store.clone() {
                 self.record_container_metrics(&store, service).await;
             }
@@ -438,77 +551,49 @@ impl ExternalServiceHealthMonitor {
     }
 
     /// Sample container stats for one service and write the resulting
-    /// CPU/memory points to the metrics store.
+    /// CPU/memory points (`container_metric_points`) to the metrics store.
     ///
-    /// Written points (all `Gauge`, `source_kind = database`,
-    /// `source_id = external_services.id`):
-    /// - `container.cpu_percent` — docker-CLI formula, 100% == one core.
-    ///   Absent on the first tick per container (no delta baseline yet).
-    /// - `container.memory_used_bytes` — RSS excluding page cache.
-    /// - `container.memory_percent` — usage relative to the container's
-    ///   memory limit (host RAM when no limit is set — same semantics as
-    ///   the live stats endpoint).
-    ///
-    /// Cluster members are distinguished by the `role` / `container_name`
-    /// labels. Containers whose sample failed (stopped, remote node) emit
-    /// no points rather than zeros.
+    /// Containers whose sample failed (stopped, agent unreachable) emit no
+    /// points rather than zeros.
     async fn record_container_metrics(
         &self,
         store: &Arc<dyn MetricsStore>,
         service: &external_services::Model,
     ) {
-        let report = {
-            let mut baselines = self.stats_baselines.lock().await;
-            let service_baselines = baselines.entry(service.id).or_default();
-            match self
-                .manager
-                .sample_service_stats(service, service_baselines)
+        // Hold only this service's lock across the Docker and agent calls: a manual
+        // check and the periodic loop sampling the same service take turns,
+        // other services are sampled meanwhile, and the baselines stay in the
+        // map if this future is dropped (a manual check whose client left).
+        let service_baselines = self.stats_baselines.for_service(service.id).await;
+        let sampled = {
+            let mut baselines = service_baselines.lock().await;
+            self.manager
+                .sample_service_stats(service, &mut baselines)
                 .await
-            {
-                Ok(report) => report,
-                Err(e) => {
-                    debug!(
-                        service_id = service.id,
-                        service = %service.name,
-                        "Container stats sampling failed: {}", e
-                    );
-                    return;
-                }
-            }
         };
 
-        let now = Utc::now();
-        let mut points = Vec::with_capacity(report.members.len() * 3);
-
-        for member in &report.members {
-            let mut labels = HashMap::new();
-            labels.insert("role".to_string(), member.role.clone());
-            labels.insert("container_name".to_string(), member.container_name.clone());
-
-            let make_point = |name: &str, value: f64| MetricPoint {
-                time: now,
-                source_kind: SourceKind::Database,
-                source_id: service.id,
-                name: name.to_string(),
-                value,
-                kind: MetricKind::Gauge,
-                engine: Some(service.service_type.clone()),
-                environment: None,
-                node_id: service.node_id,
-                labels: labels.clone(),
-            };
-
-            if let Some(cpu) = member.cpu_percent {
-                points.push(make_point("container.cpu_percent", cpu));
+        let members = match sampled {
+            Ok(members) => members,
+            Err(e) => {
+                debug!(
+                    service_id = service.id,
+                    service = %service.name,
+                    "Container stats sampling failed: {}", e
+                );
+                return;
             }
-            if let Some(mem) = member.memory_usage_bytes {
-                points.push(make_point("container.memory_used_bytes", mem as f64));
-            }
-            if let Some(mem_pct) = member.memory_percent {
-                points.push(make_point("container.memory_percent", mem_pct));
+        };
+        for member in &members {
+            if let Some(reason) = &member.sample.unavailable_reason {
+                debug!(
+                    service_id = service.id,
+                    container = %member.sample.container_name,
+                    "Container stats unavailable: {reason}"
+                );
             }
         }
 
+        let points = container_metric_points(service, &members, Utc::now());
         if points.is_empty() {
             return;
         }
@@ -643,21 +728,30 @@ impl ExternalServiceHealthMonitor {
         };
         let s3_client = creds.build_s3_client().await;
 
-        let docker_client = match self.docker.get() {
-            Some(d) => d,
-            None => {
-                info!(
-                    service_id = service.id,
-                    "Docker unavailable on this process; skipping MariaDB binlog archiving"
-                );
-                return;
-            }
+        let worker_node = match crate::services::service_execution_route(service.node_id) {
+            crate::services::ServiceExecutionRoute::Remote(node_id) => Some(node_id),
+            _ => None,
         };
-        let mariadb = MariaDbService::new(service.name.clone(), docker_client.clone());
-        match mariadb
-            .archive_binlogs(&s3_client, &s3_source, &mariadb_config)
-            .await
-        {
+        let shipped = match worker_node {
+            None => {
+                let Some(docker_client) = self.docker.get() else {
+                    info!(
+                        service_id = service.id,
+                        "Docker unavailable on this process; skipping MariaDB binlog archiving"
+                    );
+                    return;
+                };
+                MariaDbService::new(service.name.clone(), docker_client.clone())
+                    .archive_binlogs(&s3_client, &s3_source, &mariadb_config)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+            Some(node_id) => self
+                .archive_worker_mariadb_binlogs(service, node_id, &s3_source)
+                .await
+                .map_err(|reason| format!("on worker node {node_id}: {reason}")),
+        };
+        match shipped {
             Ok(shipped) => {
                 if shipped > 0 {
                     info!(
@@ -669,8 +763,21 @@ impl ExternalServiceHealthMonitor {
                     // Retention counterpart to the ship. Only after something
                     // new landed — a no-op tick cannot have made an older
                     // segment newly unreachable, so there is nothing to prune.
-                    self.prune_mariadb_binlogs(service, &mariadb, &s3_client, &s3_source)
-                        .await;
+                    // The prune reads and deletes S3 objects only; the engine
+                    // handle it goes through is built on this host's Docker.
+                    match self.docker.get() {
+                        Some(docker_client) => {
+                            let mariadb =
+                                MariaDbService::new(service.name.clone(), docker_client.clone());
+                            self.prune_mariadb_binlogs(service, &mariadb, &s3_client, &s3_source)
+                                .await;
+                        }
+                        None => debug!(
+                            service_id = service.id,
+                            "No Docker handle on this process; archived MariaDB binlogs are \
+                             pruned on a later run of a server that has one"
+                        ),
+                    }
                 }
             }
             Err(e) => {
@@ -922,6 +1029,92 @@ impl ExternalServiceHealthMonitor {
         })
     }
 
+    /// Ship the closed binary logs of `service`, a MariaDB on worker
+    /// `node_id`, to `s3_source` with the control plane's archiver run by the
+    /// node's agent, under a credential scoped to the service's `binlog/`
+    /// prefix (ADR-102), never the source's own. Returns how many segments
+    /// were shipped.
+    async fn archive_worker_mariadb_binlogs(
+        &self,
+        service: &external_services::Model,
+        node_id: i32,
+        s3_source: &s3_sources::Model,
+    ) -> Result<usize, String> {
+        use crate::remote_service_client::MariadbBinlogArchiveResult;
+        let destination = self
+            .binlog_archive_destination(service, node_id, s3_source)
+            .await?;
+        let result = self
+            .manager
+            .mariadb_binlog_archive_worker(service.id, destination, s3_source.bucket_path.clone())
+            .await;
+        let shipped = match result {
+            Ok(MariadbBinlogArchiveResult::Completed { shipped }) => Ok(shipped),
+            Ok(
+                MariadbBinlogArchiveResult::Refused { reason }
+                | MariadbBinlogArchiveResult::Failed { reason },
+            ) => {
+                debug!(service_id = service.id, node_id, %reason, "Worker binlog archive did not complete");
+                Err(reason)
+            }
+            Err(error) => Err(error.to_string()),
+        };
+        if shipped.is_err() {
+            // The credential may be what failed (revoked, expired early):
+            // the next run mints another instead of repeating the failure
+            // for the rest of the refresh interval.
+            self.binlog_archive_credentials
+                .lock()
+                .await
+                .remove(&service.id);
+        }
+        shipped
+    }
+
+    /// The cached binary-log archiving credential of `service` on `node_id`
+    /// for `s3_source`, or a new one from the manager when there is none,
+    /// its reuse window has passed, or it was minted for anything else
+    /// ([`BinlogCredentialGrant`]).
+    async fn binlog_archive_destination(
+        &self,
+        service: &external_services::Model,
+        node_id: i32,
+        s3_source: &s3_sources::Model,
+    ) -> Result<crate::remote_service_client::WorkerS3Destination, String> {
+        let grant = BinlogCredentialGrant::of(&service.name, node_id, s3_source);
+        if let Some(cached) = self
+            .binlog_archive_credentials
+            .lock()
+            .await
+            .get(&service.id)
+            .filter(|cached| cached.grant == grant && Instant::now() < cached.reuse_until)
+        {
+            return Ok(cached.destination.clone());
+        }
+        let scoped = self
+            .manager
+            .mariadb_binlog_archive_destination(service, node_id, s3_source)
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut cache = self.binlog_archive_credentials.lock().await;
+        match binlog_credential_reuse_window(&scoped.scope, Utc::now()) {
+            Some(window) => {
+                cache.insert(
+                    service.id,
+                    BinlogArchiveCredential {
+                        grant,
+                        reuse_until: Instant::now() + window,
+                        destination: scoped.destination.clone(),
+                    },
+                );
+            }
+            None => {
+                cache.remove(&service.id);
+            }
+        }
+        Ok(scoped.destination)
+    }
+
     /// Run the WAL/archive probe for a standalone Postgres service.
     ///
     /// Best-effort: any failure returns `None` and is logged at debug level
@@ -1077,40 +1270,6 @@ impl ExternalServiceHealthMonitor {
     }
 }
 
-/// Merge a single engine snapshot into the existing `health_metadata` JSON
-/// object under `key`. Preserves sibling keys that other engines may have
-/// written, so future engines can plug in without coordinating writes.
-///
-/// Returns:
-/// - `Some(updated)` when the merged object differs from the input or when a
-///   new snapshot is being recorded.
-/// - `None` when `snapshot` is `None` AND nothing in the input needs touching
-///   (avoids gratuitous UPDATEEs on services with no metadata).
-fn merge_health_metadata<T: serde::Serialize>(
-    existing: Option<&sea_orm::JsonValue>,
-    key: &str,
-    snapshot: Option<&T>,
-) -> Option<sea_orm::JsonValue> {
-    let snapshot = snapshot?;
-    let snapshot_value = match serde_json::to_value(snapshot) {
-        Ok(v) => v,
-        Err(e) => {
-            warn!(
-                "Failed to serialize health metadata snapshot for key '{}': {}",
-                key, e
-            );
-            return None;
-        }
-    };
-
-    let mut map = match existing {
-        Some(serde_json::Value::Object(m)) => m.clone(),
-        _ => serde_json::Map::new(),
-    };
-    map.insert(key.to_string(), snapshot_value);
-    Some(serde_json::Value::Object(map))
-}
-
 /// What the health monitor does with a service, given its lifecycle
 /// `external_services.status`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1123,6 +1282,198 @@ enum LifecycleProbe {
     /// Expected to exist but in a terminal bad state (e.g. `failed`, or a
     /// status this build does not know): record it as down.
     Down,
+}
+
+/// One service's stats baselines (`container_name` → previous tick).
+type ServiceStatsBaselines = Arc<Mutex<HashMap<String, ContainerStatsBaseline>>>;
+
+/// The health monitor's stats baselines, one entry per sampled service.
+///
+/// Each service has its own lock, held for the whole of that service's
+/// sampling pass. The outer lock is only held to look the entry up, never
+/// across Docker calls. Entries are never taken out of the map while a
+/// service is sampled, so a sampler whose future is dropped cannot lose them.
+#[derive(Default)]
+struct StatsBaselines {
+    services: Mutex<HashMap<i32, ServiceStatsBaselines>>,
+}
+
+impl StatsBaselines {
+    /// The baselines of `service_id`, created empty on first use.
+    async fn for_service(&self, service_id: i32) -> ServiceStatsBaselines {
+        self.services
+            .lock()
+            .await
+            .entry(service_id)
+            .or_default()
+            .clone()
+    }
+
+    /// Keep only the services in `sampled`.
+    async fn retain(&self, sampled: &std::collections::HashSet<i32>) {
+        self.services
+            .lock()
+            .await
+            .retain(|id, _| sampled.contains(id));
+    }
+}
+
+/// Whether the health loop samples this service's container stats: a
+/// running service with metrics enabled (the same per-service flag the
+/// engine-metrics scraper uses), on this host's Docker or on a worker,
+/// whose agent samples it.
+fn samples_container_metrics(service: &external_services::Model) -> bool {
+    service.status == "running" && service.metrics_enabled
+}
+
+/// The metric points for one tick of a service's containers. All `Gauge`,
+/// `source_kind = database`, `source_id = external_services.id`, one series
+/// per container (`role` / `container_name` labels):
+/// - `container.cpu_percent`: cores used × 100 (Docker's convention, 100 ==
+///   one core), averaged since the previous tick. Absent on the first tick
+///   per container (no rate baseline yet).
+/// - `container.cpu_utilization_percent`: the same usage as a percentage of
+///   the cores the container may use, its CPU limit or else every host core
+///   (100 == saturated). What CPU alert rules threshold. Absent while the
+///   limit is unknown.
+/// - `container.cpu_limit_cores`: the applied CPU limit in cores, `0` when
+///   uncapped, so a tile can read "used / limit cores". Written on every tick
+///   where the limit is known, uncapped included: written only while capped,
+///   the last capped value would stay the "latest" for the store's whole
+///   latest-values window after a cap was removed.
+/// - `container.memory_used_bytes`: RSS excluding page cache.
+/// - `container.memory_percent`: usage relative to the container's memory
+///   limit (host RAM when no limit is set, as on the live stats endpoint).
+///
+/// The names and meanings match what deployment containers record.
+///
+/// A service with more than one container (a cluster) also gets an
+/// unlabelled `cpu_limit_cores` and `cpu_utilization_percent`, and
+/// `container.cluster_cpu_percent` (cores used × 100): its busiest
+/// container's reading, all three from one tick; see `busiest_member`. The
+/// store reads the series with the fewest label keys for latest values and
+/// charts, so that set is what tiles, charts and alerts see. Without it, the
+/// latest usage and limit could each come from a different member and pair
+/// into a reading that belongs to no container.
+///
+/// The busiest member's cores go under their own name rather than an
+/// unlabelled `container.cpu_percent`: that is the one CPU metric with
+/// history from before these were recorded, all of it labelled, and a chart
+/// follows the fewest-label series, so an unlabelled one would hide that
+/// history until it ages out.
+fn container_metric_points(
+    service: &external_services::Model,
+    members: &[PolledContainerStats],
+    now: chrono::DateTime<Utc>,
+) -> Vec<MetricPoint> {
+    let mut points = Vec::with_capacity(members.len() * 5);
+
+    for member in members {
+        let sample = &member.sample;
+        let mut labels = HashMap::new();
+        labels.insert("role".to_string(), sample.role.clone());
+        labels.insert("container_name".to_string(), sample.container_name.clone());
+
+        let make_point = |name: &str, value: f64| MetricPoint {
+            time: now,
+            source_kind: SourceKind::Database,
+            source_id: service.id,
+            name: name.to_string(),
+            value,
+            kind: MetricKind::Gauge,
+            engine: Some(service.service_type.clone()),
+            environment: None,
+            node_id: service.node_id,
+            labels: labels.clone(),
+        };
+
+        if let Some(cpu) = sample.cpu_percent {
+            points.push(make_point("container.cpu_percent", cpu));
+        }
+        if let Some(utilization) = member.cpu_utilization_percent() {
+            points.push(make_point("container.cpu_utilization_percent", utilization));
+        }
+        if let Some(limit) = member.cpu_limit {
+            let cores = limit.cores().unwrap_or(0.0);
+            points.push(make_point("container.cpu_limit_cores", cores));
+        }
+        if let Some(mem) = sample.memory_usage_bytes {
+            points.push(make_point("container.memory_used_bytes", mem as f64));
+        }
+        if let Some(mem_pct) = sample.memory_percent {
+            points.push(make_point("container.memory_percent", mem_pct));
+        }
+    }
+
+    if let Some(busiest) = busiest_member(members) {
+        let make_point = |name: &str, value: f64| MetricPoint {
+            time: now,
+            source_kind: SourceKind::Database,
+            source_id: service.id,
+            name: name.to_string(),
+            value,
+            kind: MetricKind::Gauge,
+            engine: Some(service.service_type.clone()),
+            environment: None,
+            node_id: service.node_id,
+            labels: HashMap::new(),
+        };
+        points.push(make_point(
+            "container.cluster_cpu_percent",
+            busiest.cpu_percent,
+        ));
+        points.push(make_point("container.cpu_limit_cores", busiest.limit_cores));
+        points.push(make_point(
+            "container.cpu_utilization_percent",
+            busiest.utilization_percent,
+        ));
+    }
+
+    points
+}
+
+/// The service-level CPU reading of a cluster: one container's own values,
+/// from one tick.
+#[derive(Debug, PartialEq)]
+struct BusiestMemberCpu {
+    /// Cores used × 100 by that container.
+    cpu_percent: f64,
+    /// Its CPU limit in cores; 0 when uncapped.
+    limit_cores: f64,
+    /// Its share of the cores it may use.
+    utilization_percent: f64,
+}
+
+/// For a service with more than one container, the reading of the container
+/// using the largest share of the cores it may use, among the containers that
+/// reported a rate and a known limit this tick.
+///
+/// - One container's values, never a sum: usage and limit always pair up,
+///   and a threshold keeps its per-container meaning however many members
+///   the service has.
+/// - The busiest, so one saturated member (a primary taking all writes)
+///   still crosses an alert threshold.
+/// - From whichever members reported: a stopped or unreadable member is left
+///   out rather than holding the whole reading back, so the set is written
+///   on every tick any member reports and never goes stale as "latest"
+///   while the service runs degraded.
+///
+/// `None` for a single container (its own series already pair up) and on a
+/// tick where no member reported both a rate and a limit.
+fn busiest_member(members: &[PolledContainerStats]) -> Option<BusiestMemberCpu> {
+    if members.len() < 2 {
+        return None;
+    }
+    members
+        .iter()
+        .filter_map(|member| {
+            Some(BusiestMemberCpu {
+                cpu_percent: member.sample.cpu_percent?,
+                limit_cores: member.cpu_limit?.cores().unwrap_or(0.0),
+                utilization_percent: member.cpu_utilization_percent()?,
+            })
+        })
+        .max_by(|a, b| a.utilization_percent.total_cmp(&b.utilization_percent))
 }
 
 fn lifecycle_probe(status: &str) -> LifecycleProbe {
@@ -1138,87 +1489,4 @@ fn lifecycle_probe(status: &str) -> LifecycleProbe {
 // ── Tests ────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn health_status_strings() {
-        assert_eq!(HealthProbeStatus::Operational.as_str(), "operational");
-        assert_eq!(HealthProbeStatus::Degraded.as_str(), "degraded");
-        assert_eq!(HealthProbeStatus::Down.as_str(), "down");
-    }
-
-    #[test]
-    fn running_services_are_probed() {
-        assert_eq!(lifecycle_probe("running"), LifecycleProbe::Probe);
-    }
-
-    /// A service that is still being created must not produce a failed check:
-    /// that is what made a brand-new Redis read "Down" with "failed 1 check
-    /// ... status is 'pending'" and then sit at 50% uptime.
-    #[test]
-    fn provisioning_and_stopped_services_are_not_checks() {
-        for status in [
-            "pending",
-            "creating",
-            "starting",
-            "restarting",
-            "stopping",
-            "stopped",
-        ] {
-            assert_eq!(
-                lifecycle_probe(status),
-                LifecycleProbe::NotApplicable,
-                "status '{status}' must not count as a failed check"
-            );
-        }
-    }
-
-    #[test]
-    fn failed_and_unknown_services_are_down() {
-        assert_eq!(lifecycle_probe("failed"), LifecycleProbe::Down);
-        assert_eq!(lifecycle_probe("something-new"), LifecycleProbe::Down);
-    }
-
-    #[test]
-    fn merge_writes_new_key_into_empty_metadata() {
-        let merged =
-            merge_health_metadata(None, "postgres_wal", Some(&serde_json::json!({"a": 1})));
-        let merged = merged.expect("expected merged value");
-        assert_eq!(merged["postgres_wal"]["a"], 1);
-    }
-
-    #[test]
-    fn merge_preserves_sibling_keys() {
-        let existing = serde_json::json!({"redis_memory": {"used_bytes": 42}});
-        let merged = merge_health_metadata(
-            Some(&existing),
-            "postgres_wal",
-            Some(&serde_json::json!({"pg_wal_bytes": 100})),
-        )
-        .expect("expected merged value");
-        assert_eq!(merged["redis_memory"]["used_bytes"], 42);
-        assert_eq!(merged["postgres_wal"]["pg_wal_bytes"], 100);
-    }
-
-    #[test]
-    fn merge_overwrites_same_key() {
-        let existing = serde_json::json!({"postgres_wal": {"old": true}});
-        let merged = merge_health_metadata(
-            Some(&existing),
-            "postgres_wal",
-            Some(&serde_json::json!({"new": true})),
-        )
-        .expect("expected merged value");
-        assert!(merged["postgres_wal"].get("old").is_none());
-        assert_eq!(merged["postgres_wal"]["new"], true);
-    }
-
-    #[test]
-    fn merge_returns_none_when_snapshot_missing() {
-        let existing = serde_json::json!({"postgres_wal": {"old": true}});
-        let merged =
-            merge_health_metadata::<serde_json::Value>(Some(&existing), "postgres_wal", None);
-        assert!(merged.is_none());
-    }
-}
+mod tests;

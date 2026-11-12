@@ -833,6 +833,7 @@ mod tests {
             force_path_style: Some(true),
             is_default: None,
             backing_service_id: None,
+            worker_credentials: None,
         };
 
         let s3_source = backup_service

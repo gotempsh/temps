@@ -7,7 +7,10 @@
 //!
 //! - **In place** (and PITR in place): while it is still preparing or
 //!   downloading the backup. The worker's move into its write phase is the
-//!   last safe point.
+//!   last safe point. The one exception is a worker restore whose outcome
+//!   cannot be established ([`OUTCOME_UNKNOWN_PHASE`]): it holds its service
+//!   until the node answers, and cancelling it is the operator's explicit
+//!   release, which accepts that the database may be partially restored.
 //! - **New service** (and PITR to a new service): until the new service is
 //!   registered. Everything the run wrote lives in a container and volume the
 //!   run itself created, and cancelling tears both down.
@@ -39,11 +42,32 @@ use tracing::{info, warn};
 
 use super::restore::{RestoreError, ACTIVE_RESTORE_STATUSES};
 
+/// The phase of a run whose worker node already runs its maximum of backups
+/// and restores: nothing has run on the node, so it can always be stopped.
+pub const WAITING_FOR_NODE_PHASE: &str = "waiting_for_node";
+
+/// The phase of a worker restore whose outcome cannot be established while
+/// it may still be writing (its node unreachable, or with no record of it).
+/// The run holds its service; cancelling it releases the service, which the
+/// run's message says may hold a partially restored database.
+pub const OUTCOME_UNKNOWN_PHASE: &str = "outcome_unknown";
+
 /// Phases in which a restore that overwrites its target can still be stopped.
-const DESTRUCTIVE_CANCELLABLE_PHASES: [&str; 2] = ["prepare", "download"];
+const DESTRUCTIVE_CANCELLABLE_PHASES: [&str; 4] = [
+    "prepare",
+    "download",
+    WAITING_FOR_NODE_PHASE,
+    OUTCOME_UNKNOWN_PHASE,
+];
 
 /// Phases in which a restore into a service it creates can still be stopped.
-const NEW_SERVICE_CANCELLABLE_PHASES: [&str; 4] = ["prepare", "download", "provision", "recover"];
+const NEW_SERVICE_CANCELLABLE_PHASES: [&str; 5] = [
+    "prepare",
+    "download",
+    "provision",
+    "recover",
+    WAITING_FOR_NODE_PHASE,
+];
 
 /// Whether a run writes over an existing service's data. Mirrors
 /// `RestoreRequestMode::is_destructive`, from the stored columns: PITR in
@@ -605,6 +629,7 @@ mod tests {
             updated_at: now,
             cancel_requested_at: None,
             cancel_requested_by: None,
+            restored_login_encrypted: None,
         }
     }
 
@@ -640,15 +665,19 @@ mod tests {
         }
     }
 
+    /// Before writing, or once a worker restore's outcome is unknown: then
+    /// cancelling is the operator's explicit release of the held service.
     #[test]
-    fn destructive_runs_are_cancellable_only_before_writing() {
+    fn destructive_runs_are_cancellable_only_before_writing_or_to_release_them() {
         for (mode, target) in [("in_place", None), ("pitr", None), ("pitr", Some(" "))] {
             assert_eq!(
                 cancellable_phases(mode, target),
-                &["prepare", "download"],
+                &["prepare", "download", "waiting_for_node", "outcome_unknown"],
                 "{mode} {target:?}"
             );
-            assert!(not_cancellable_reason(&run(mode, target, "running", "download")).is_none());
+            for phase in ["download", "waiting_for_node", "outcome_unknown"] {
+                assert!(not_cancellable_reason(&run(mode, target, "running", phase)).is_none());
+            }
             let reason = not_cancellable_reason(&run(mode, target, "running", "restore"))
                 .expect("writing phase is not cancellable");
             assert!(reason.contains("started writing data"), "{reason}");
@@ -658,7 +687,13 @@ mod tests {
     #[test]
     fn new_service_runs_are_cancellable_until_registration() {
         for (mode, target) in [("new_service", Some("copy")), ("pitr", Some("copy"))] {
-            for phase in ["prepare", "download", "provision", "recover"] {
+            for phase in [
+                "prepare",
+                "download",
+                "provision",
+                "recover",
+                "waiting_for_node",
+            ] {
                 assert!(
                     not_cancellable_reason(&run(mode, target, "running", phase)).is_none(),
                     "{mode} {phase}"

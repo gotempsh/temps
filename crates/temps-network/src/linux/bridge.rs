@@ -154,8 +154,16 @@ pub async fn link_name_by_index(handle: &Handle, index: u32) -> crate::Result<Op
     }
 }
 
-/// Ensure an address is assigned to a link. Idempotent — if the address is
-/// already there, this is a no-op.
+/// Ensure an address is assigned to a link, and that it is the link's only
+/// IPv4 address. Idempotent — if the address is already there, this only
+/// removes the others.
+///
+/// The link is an overlay bridge Temps created for this overlay. Any other
+/// IPv4 address on it was left by an earlier allocation (one the control
+/// plane moved, ADR 056): kept, it adds a connected route for a subnet this
+/// node no longer owns, which the node then reports as occupied and the
+/// control plane steers around (ADR 062). A Docker network still on that
+/// old subnet is refused by the overlay preflight before this runs.
 async fn ensure_addr(
     handle: &Handle,
     index: u32,
@@ -165,7 +173,8 @@ async fn ensure_addr(
 ) -> crate::Result<()> {
     use netlink_packet_route::address::AddressAttribute;
 
-    // Walk existing addresses on the link; bail early if ours is present.
+    let mut present = false;
+    let mut stale = Vec::new();
     let mut addrs = handle
         .address()
         .get()
@@ -176,13 +185,40 @@ async fn ensure_addr(
         link: link_name.into(),
         reason: e.to_string(),
     })? {
-        for nla in &msg.attributes {
-            if let AddressAttribute::Address(existing) = nla {
-                if *existing == addr && msg.header.prefix_len == prefix_len {
-                    return Ok(());
-                }
+        let existing = msg.attributes.iter().find_map(|nla| match nla {
+            AddressAttribute::Address(existing) => Some(*existing),
+            _ => None,
+        });
+        match existing {
+            Some(existing) if existing == addr && msg.header.prefix_len == prefix_len => {
+                present = true;
             }
+            Some(existing) if is_stale((existing, msg.header.prefix_len), (addr, prefix_len)) => {
+                stale.push((format!("{existing}/{}", msg.header.prefix_len), msg));
+            }
+            _ => {}
         }
+    }
+
+    for (address, msg) in stale {
+        handle
+            .address()
+            .del(msg)
+            .execute()
+            .await
+            .map_err(|e| NetworkError::Netlink {
+                op: "del_addr",
+                link: link_name.into(),
+                reason: format!("removing stale address {address}: {e}"),
+            })?;
+        info!(
+            bridge = %link_name,
+            %address,
+            "removed an address an earlier overlay allocation left on the bridge"
+        );
+    }
+    if present {
+        return Ok(());
     }
 
     handle
@@ -196,4 +232,25 @@ async fn ensure_addr(
             reason: e.to_string(),
         })?;
     Ok(())
+}
+
+/// Whether `existing` (address, prefix), found on the bridge, is left over:
+/// an IPv4 address other than the wanted one. IPv6 (link-local) addresses
+/// are the kernel's own.
+fn is_stale(existing: (IpAddr, u8), wanted: (IpAddr, u8)) -> bool {
+    matches!((existing.0, wanted.0), (IpAddr::V4(_), IpAddr::V4(_))) && existing != wanted
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_stale;
+
+    #[test]
+    fn only_other_ipv4_addresses_are_stale() {
+        let wanted = ("10.202.4.1".parse().unwrap(), 24);
+        assert!(is_stale(("10.202.3.1".parse().unwrap(), 24), wanted));
+        assert!(is_stale(("10.202.4.1".parse().unwrap(), 16), wanted));
+        assert!(!is_stale(wanted, wanted));
+        assert!(!is_stale(("fe80::1".parse().unwrap(), 64), wanted));
+    }
 }

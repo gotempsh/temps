@@ -565,16 +565,29 @@ impl ExternalService for PostgresService {
             // postmaster as PID 1 with the old healthcheck; both are fixed
             // at creation, so only a recreate applies them.
             let init_drift = self.container_missing_init(container).await;
-            let drift = archive_drift || preload_drift || init_drift;
+            // ADR 093: server TLS is baked into the CMD (and the certificate
+            // into a label), so turning it on or off, or a renewed
+            // certificate, takes a recreate. Only decided with a hydrated
+            // config that says what TLS should be; see `desired_server_tls`.
+            let desired_tls = existing_config
+                .as_ref()
+                .and_then(PostgresConfig::desired_server_tls);
+            let tls_drift = match &desired_tls {
+                Some(desired) => self.container_server_tls_differs(container, desired).await,
+                None => false,
+            };
+            let drift = archive_drift || preload_drift || init_drift || tls_drift;
             if drift {
                 info!(
                     "Container {} has config drift (archive_mode drift={}, \
                      shared_preload_libraries drift={}, init process drift={}, \
-                     desired archive_mode={}). Recreating to apply correct config.",
+                     server TLS drift={}, desired archive_mode={}). Recreating to \
+                     apply correct config.",
                     container_name,
                     archive_drift,
                     preload_drift,
                     init_drift,
+                    tls_drift,
                     desired_enable_archiving
                 );
                 // Without a hydrated config there is nothing to rebuild the

@@ -3,6 +3,7 @@
 
 import { Routes, Route } from 'react-router'
 import { ProjectResponse } from '@/api/client'
+import { useListReturnNavigation } from '@/components/table/list-navigation'
 import RequestLogsList from './RequestLogsList'
 import RequestLogDetail from './RequestLogDetail'
 
@@ -13,13 +14,30 @@ interface RequestLogsProps {
 export default function RequestLogs({
   project: projectResponse,
 }: RequestLogsProps) {
+  const { listState, setListState, containerRef } = useListReturnNavigation(
+    `/projects/${projectResponse.slug}/request-logs`
+  )
+
   return (
-    <Routes>
-      <Route index element={<RequestLogsList project={projectResponse} />} />
-      <Route
-        path=":logId"
-        element={<RequestLogDetail project={projectResponse} />}
-      />
-    </Routes>
+    <div ref={containerRef} className="w-full min-w-0">
+      <Routes>
+        <Route
+          index
+          element={
+            <RequestLogsList
+              project={projectResponse}
+              listState={listState}
+              onRememberList={setListState}
+            />
+          }
+        />
+        <Route
+          path=":logId"
+          element={
+            <RequestLogDetail project={projectResponse} listState={listState} />
+          }
+        />
+      </Routes>
+    </div>
   )
 }

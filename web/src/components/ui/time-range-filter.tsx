@@ -11,12 +11,14 @@ export function TimeRangeFilter({
   disabled = false,
   maxRangeDays = 30,
   allowCustom = true,
+  customLabel,
 }: {
   value: string
   onChange: (value: string) => void
   disabled?: boolean
   maxRangeDays?: number
   allowCustom?: boolean
+  customLabel?: string
 }) {
   return (
     <fieldset disabled={disabled} className="min-w-0 disabled:opacity-50">
@@ -25,6 +27,7 @@ export function TimeRangeFilter({
         onChange={(next) => onChange(serializeTimeRange(next))}
         maxRangeDays={maxRangeDays}
         allowCustom={allowCustom}
+        customLabel={customLabel}
       />
     </fieldset>
   )

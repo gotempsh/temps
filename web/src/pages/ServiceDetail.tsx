@@ -30,7 +30,7 @@ import { ClusterHealthPanel } from '@/components/storage/ClusterHealthPanel'
 import { MonitoringCard } from '@/components/storage/MonitoringCard'
 import { EditServiceDialog } from '@/components/storage/EditServiceDialog'
 import { ServiceResourcesPanel } from '@/components/storage/ServiceResourcesPanel'
-import { ServiceWorkloadModeCard } from '@/components/storage/ServiceWorkloadModeCard'
+import { ServiceTlsCard } from '@/components/storage/ServiceTlsCard'
 import { ResponsivePagination } from '@/components/ui/responsive-pagination'
 import { MajorUpgradeDialog } from '@/components/storage/MajorUpgradeDialog'
 import {
@@ -1062,7 +1062,13 @@ export function ServiceDetail() {
               <WalHealthPanel
                 serviceId={parseInt(id!)}
                 serviceType={service.service.service_type}
-                onUpgrade={() => setIsUpgradeDialogOpen(true)}
+                // A service on a worker node cannot change its image here
+                // (the server refuses it), so it gets no upgrade action.
+                onUpgrade={
+                  service.service.node_id
+                    ? undefined
+                    : () => setIsUpgradeDialogOpen(true)
+                }
                 onBackup={() => setIsBackupDialogOpen(true)}
                 isImported={!!service.current_parameters?.container_name}
               />
@@ -1077,6 +1083,7 @@ export function ServiceDetail() {
                 }
                 metricsEnabled={service.service.metrics_enabled ?? false}
                 onMonitoringChange={() => refetch()}
+                cluster={service.service.topology === 'cluster'}
               />
             )}
 
@@ -1317,15 +1324,14 @@ export function ServiceDetail() {
               serviceName={service.service.name}
             />
 
-            {/*
-              How the database's container is built (ADR-055 workload plane)
-              and the recreate from its workload spec. Instance-admin only;
-              other roles see what it is and who can change it.
-            */}
-            <ServiceWorkloadModeCard
-              serviceId={service.service.id}
-              serviceName={service.service.name}
-            />
+            {/* Server TLS for managed PostgreSQL (ADR-093) */}
+            {service.service.service_type === 'postgres' && (
+              <ServiceTlsCard
+                serviceId={service.service.id}
+                serviceName={service.service.name}
+                serviceStatus={service.service.status}
+              />
+            )}
 
             {/* Backups Section */}
             <Card id={SERVICE_BACKUPS_ANCHOR} className="scroll-mt-20">

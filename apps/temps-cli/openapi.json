@@ -11499,6 +11499,46 @@
         ],
         "type": "object"
       },
+      "ClusterDnsResolversResponse": {
+        "description": "`GET /cluster/dns/resolvers`.",
+        "properties": {
+          "cluster_dns_enabled": {
+            "type": "boolean"
+          },
+          "open_alerts": {
+            "items": {
+              "$ref": "#/components/schemas/DnsAlertEntry"
+            },
+            "type": "array"
+          },
+          "report_interval_secs": {
+            "description": "How often resolvers report, in seconds.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "resolvers": {
+            "description": "Control plane first, then workers by id.",
+            "items": {
+              "$ref": "#/components/schemas/DnsResolverEntry"
+            },
+            "type": "array"
+          },
+          "zone_record_count": {
+            "description": "Records in the zone (`service_endpoints`).",
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "cluster_dns_enabled",
+          "zone_record_count",
+          "report_interval_secs",
+          "resolvers",
+          "open_alerts"
+        ],
+        "type": "object"
+      },
       "ClusterDnsSettings": {
         "description": "Cluster-DNS resolver settings (ADR-024, experimental beta).\n\nWhen `enabled`, the Temps control plane starts a Hickory DNS resolver and\ninjects it as the first nameserver into every deployed container via\n`HostConfig.Dns` — giving containers the ability to resolve `*.temps.local`\nFQDNs for service-to-service communication. Worker nodes pick this flag up\nfrom the `/api/internal/nodes/{id}/network/peers` wire response and gate\ntheir own per-node resolver the same way.\n\n**Default: `false` (disabled).**\n\nWhy disabled by default: a production incident showed that when the injected\nHickory resolver was slow or transiently unresponsive for a non-`*.temps.local`\n(external) hostname, glibc's resolver cycled through all three nameservers\n(`172.20.0.1`, `1.1.1.1`, `8.8.8.8`) at ~5 s timeout × 2 attempts each,\ncausing 22–27 s delays for outbound TCP connections. Disabling the injection\nrestores Docker's embedded DNS as the sole resolver, eliminating that failure\nmode. Operators running single/multi-node installs that depend on\n`*.temps.local` resolution must explicitly opt in by setting `enabled: true`.\n\n`bool` defaults to `false` in Rust and JSON (`#[serde(default)]`), so the\nsafe-off behaviour is automatic for new installs and legacy settings rows.",
         "properties": {
@@ -11787,6 +11827,22 @@
         ],
         "type": "object"
       },
+      "ClusterNetworkIdChangeResponse": {
+        "description": "`POST /settings/cluster-network/network-id` answer.",
+        "properties": {
+          "change": {
+            "$ref": "#/components/schemas/NetworkIdChange"
+          },
+          "status": {
+            "$ref": "#/components/schemas/ClusterNetworkStatus"
+          }
+        },
+        "required": [
+          "change",
+          "status"
+        ],
+        "type": "object"
+      },
       "ClusterNetworkNode": {
         "description": "One worker's view of the overlay.",
         "properties": {
@@ -11845,6 +11901,19 @@
               "string",
               "null"
             ]
+          },
+          "vxlan_id_in_use": {
+            "description": "Whether its overlay is unavailable because another VXLAN device on\nits host holds the cluster's network ID; giving the cluster its own\nnetwork ID fixes that without touching the host.",
+            "type": "boolean"
+          },
+          "vxlan_network_id": {
+            "description": "The VXLAN network ID its agent reports it follows (ADR 062). `None`:\nits agent predates per-cluster network IDs, or never reported.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
           }
         },
         "required": [
@@ -11852,7 +11921,8 @@
           "name",
           "overlay_network_name",
           "in_use",
-          "occupied_ranges"
+          "occupied_ranges",
+          "vxlan_id_in_use"
         ],
         "type": "object"
       },
@@ -11916,6 +11986,10 @@
             "description": "Whether `PUT` can change the pool now.",
             "type": "boolean"
           },
+          "can_change_network_id": {
+            "description": "Whether `POST /settings/cluster-network/network-id` can assign a new\nnetwork ID now, and why not: the nodes that could not follow it.",
+            "type": "boolean"
+          },
           "change_blocked_by": {
             "description": "Why it cannot: the members using the pool, or a control-plane setup\nin progress.",
             "items": {
@@ -11940,6 +12014,12 @@
             "description": "The WireGuard mesh pool; a compute pool may not overlap it.",
             "type": "string"
           },
+          "network_id_change_blocked_by": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "nodes": {
             "items": {
               "$ref": "#/components/schemas/ClusterNetworkNode"
@@ -11958,6 +12038,17 @@
             "format": "int32",
             "minimum": 0,
             "type": "integer"
+          },
+          "vxlan_network_id": {
+            "description": "The cluster's VXLAN network ID and UDP port (ADR 062).",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "vxlan_port": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
           }
         },
         "required": [
@@ -11967,6 +12058,10 @@
           "mesh_pool_cidr",
           "mesh_enabled",
           "overlay_network_name",
+          "vxlan_network_id",
+          "vxlan_port",
+          "can_change_network_id",
+          "network_id_change_blocked_by",
           "pool_confirmed",
           "can_change",
           "change_blocked_by",
@@ -14656,6 +14751,13 @@
               "string",
               "null"
             ]
+          },
+          "unavailable_reason": {
+            "description": "Why the fields above could not be read, when they could not: this\nserver has no Docker daemon for a local container, the agent on the\ncontainer's node could not be reached, or it is too old to report\nthis. `None` with an empty `container_id` means the container does\nnot exist.",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -14742,6 +14844,13 @@
           },
           "role": {
             "type": "string"
+          },
+          "unavailable_reason": {
+            "description": "Why no sample could be taken, when none could: this server has no\nDocker daemon for a local container, the agent on the container's\nnode could not be reached, or it is too old to report usage. `None`\nwith empty fields means the container is missing or stopped.",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -17370,6 +17479,43 @@
         ],
         "type": "object"
       },
+      "CreateInternalAccessGrantRequest": {
+        "properties": {
+          "caller_environment_id": {
+            "description": "Only this environment of the calling project; omit for every\nenvironment, present and future.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "caller_project_id": {
+            "description": "The project whose workloads may call.",
+            "format": "int32",
+            "type": "integer"
+          },
+          "description": {
+            "description": "Why the grant exists, up to 200 characters.",
+            "example": "The checkout worker calls the orders API",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "target_environment_id": {
+            "description": "The environment of this project that may be called; omit for every\nenvironment, present and future.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "caller_project_id"
+        ],
+        "type": "object"
+      },
       "CreateIpAccessControlRequest": {
         "description": "Request to create an IP access control rule",
         "properties": {
@@ -18494,6 +18640,17 @@
           "secret_key": {
             "$ref": "#/components/schemas/SecretString",
             "description": "Secret access key that goes with the access key ID. Shown once by the\nprovider; stored encrypted and never returned."
+          },
+          "worker_credentials": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/WorkerCredentialsPolicy",
+                "description": "What a worker node receives when it backs up or restores one of its\nservices into this source. Default `scoped`."
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
@@ -23016,6 +23173,54 @@
         ],
         "type": "object"
       },
+      "DnsAlertEntry": {
+        "description": "An open DNS alarm.",
+        "properties": {
+          "alarm_type": {
+            "description": "`dns_resolver_down`, `dns_sync_stale`, `dns_query_failures` or\n`dns_internal_proxy_down`.",
+            "type": "string"
+          },
+          "fired_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "message": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "node_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "severity": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "alarm_type",
+          "severity",
+          "status",
+          "title",
+          "fired_at"
+        ],
+        "type": "object"
+      },
       "DnsChallengeRecordResult": {
         "description": "Result of a single DNS TXT record creation for ACME challenge",
         "properties": {
@@ -23103,6 +23308,48 @@
           "provider_hostname"
         ],
         "type": "string"
+      },
+      "DnsInternalAccess": {
+        "description": "Whether the asking project may call an internal route (ADR 101 D7).",
+        "properties": {
+          "reach": {
+            "description": "`same_project`, `granted`, `some_environments` or `not_granted`.",
+            "example": "not_granted",
+            "type": "string"
+          },
+          "setup_path": {
+            "description": "Where the owning project's grants are managed in the console.",
+            "example": "/projects/orders-api/settings/security#internal-access",
+            "type": "string"
+          },
+          "target_environment_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "target_environment_name": {
+            "type": "string"
+          },
+          "target_project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "target_project_name": {
+            "type": "string"
+          },
+          "target_project_slug": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "target_project_id",
+          "target_project_name",
+          "target_project_slug",
+          "target_environment_id",
+          "target_environment_name",
+          "reach",
+          "setup_path"
+        ],
+        "type": "object"
       },
       "DnsLookupError": {
         "description": "Error response for DNS lookup failures",
@@ -23220,6 +23467,44 @@
           "holder_id",
           "first_seen_at",
           "last_seen_at"
+        ],
+        "type": "object"
+      },
+      "DnsOutcomeCounts": {
+        "description": "Queries per outcome in one bucket.",
+        "properties": {
+          "error": {
+            "format": "double",
+            "type": "number"
+          },
+          "nodata": {
+            "format": "double",
+            "type": "number"
+          },
+          "noerror": {
+            "format": "double",
+            "type": "number"
+          },
+          "nxdomain": {
+            "format": "double",
+            "type": "number"
+          },
+          "refused": {
+            "format": "double",
+            "type": "number"
+          },
+          "servfail": {
+            "format": "double",
+            "type": "number"
+          }
+        },
+        "required": [
+          "noerror",
+          "nodata",
+          "nxdomain",
+          "servfail",
+          "refused",
+          "error"
         ],
         "type": "object"
       },
@@ -23554,6 +23839,144 @@
           "pebble"
         ],
         "type": "string"
+      },
+      "DnsQueryLogEntry": {
+        "description": "One logged query.",
+        "properties": {
+          "answer_count": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "environment_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "environment_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "latency_us": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "node_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "node_name": {
+            "type": "string"
+          },
+          "observed_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "outcome": {
+            "type": "string"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "project_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "qname": {
+            "description": "The name asked; `None` for a forwarded (outside-zone) name, which is\nnever stored.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "qtype": {
+            "type": "string"
+          },
+          "service_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "service_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source_ip": {
+            "type": "string"
+          },
+          "zone": {
+            "description": "`internal` or `external`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "node_id",
+          "node_name",
+          "observed_at",
+          "qtype",
+          "zone",
+          "outcome",
+          "latency_us",
+          "answer_count",
+          "source_ip"
+        ],
+        "type": "object"
+      },
+      "DnsQueryLogResponse": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/DnsQueryLogEntry"
+            },
+            "type": "array"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "retention_hours": {
+            "description": "How long entries are kept, in hours.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "total",
+          "page",
+          "page_size",
+          "retention_hours"
+        ],
+        "type": "object"
       },
       "DnsRecord": {
         "description": "A DNS record",
@@ -23997,6 +24420,122 @@
           }
         ]
       },
+      "DnsRecordEntry": {
+        "description": "One record of the internal zone.",
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "environment_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "environment_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "fqdn": {
+            "type": "string"
+          },
+          "generation": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "node_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "node_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "owner_id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "owner_kind": {
+            "description": "What published it: `environment`, `service_member`, `service_role`,\n`node`, `static`.",
+            "type": "string"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "project_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "record_type": {
+            "type": "string"
+          },
+          "service_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "service_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "target_ip": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "target_port": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "ttl": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "fqdn",
+          "record_type",
+          "ttl",
+          "owner_kind",
+          "owner_id",
+          "generation",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
       "DnsRecordInstruction": {
         "description": "A DNS record the operator must create.",
         "properties": {
@@ -24022,6 +24561,38 @@
           "name",
           "value",
           "purpose"
+        ],
+        "type": "object"
+      },
+      "DnsRecordListResponse": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/DnsRecordEntry"
+            },
+            "type": "array"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "total",
+          "page",
+          "page_size"
         ],
         "type": "object"
       },
@@ -24174,6 +24745,268 @@
         ],
         "type": "string"
       },
+      "DnsResolveRequest": {
+        "description": "`POST /cluster/dns/resolve`.",
+        "properties": {
+          "name": {
+            "description": "The name, e.g. `production.shop.temps.local`.",
+            "type": "string"
+          },
+          "node_id": {
+            "description": "The node whose resolver answers; 0 is the control plane.",
+            "format": "int32",
+            "type": "integer"
+          },
+          "project_id": {
+            "description": "Answer as one of this project's containers on that node would be\nanswered, its network policy included.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "record_type": {
+            "description": "`A` (default), `AAAA`, `CNAME`, `SRV` or `TXT`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "node_id",
+          "name"
+        ],
+        "type": "object"
+      },
+      "DnsResolveResponse": {
+        "properties": {
+          "answers": {
+            "items": {
+              "$ref": "#/components/schemas/DnsResolvedRecord"
+            },
+            "type": "array"
+          },
+          "asked_as": {
+            "description": "The container address the query was answered as.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "authoritative": {
+            "description": "Answered from the internal zone.",
+            "type": "boolean"
+          },
+          "internal_access": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/DnsInternalAccess",
+                "description": "Asked as a project, for an internal route: who owns it and whether\nthat project lets the asking one call it. The internal proxy answers\n`403` when `reach` is `not_granted`."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "latency_ms": {
+            "format": "double",
+            "type": "number"
+          },
+          "name": {
+            "type": "string"
+          },
+          "node_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "note": {
+            "description": "A caveat about how the answer was obtained.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "outcome": {
+            "description": "`noerror`, `nodata`, `nxdomain`, `servfail`, `error`.",
+            "type": "string"
+          },
+          "rcode": {
+            "description": "`NOERROR`, `NXDOMAIN`, `SERVFAIL`...",
+            "type": "string"
+          },
+          "record_type": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "node_id",
+          "name",
+          "record_type",
+          "rcode",
+          "outcome",
+          "authoritative",
+          "answers",
+          "latency_ms"
+        ],
+        "type": "object"
+      },
+      "DnsResolvedRecord": {
+        "description": "One answer record.",
+        "properties": {
+          "data": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "record_type": {
+            "type": "string"
+          },
+          "ttl": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "name",
+          "record_type",
+          "ttl",
+          "data"
+        ],
+        "type": "object"
+      },
+      "DnsResolverEntry": {
+        "description": "One node's resolver, as last reported.",
+        "properties": {
+          "build_version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "consecutive_sync_failures": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "dropped_log_entries": {
+            "description": "Query-log entries the resolver dropped under load.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "health": {
+            "$ref": "#/components/schemas/ResolverHealth"
+          },
+          "health_reason": {
+            "description": "Why the resolver is not healthy.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "internal_proxy": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/InternalProxyState",
+                "description": "The worker's internal routing, which serves the HTTP behind every\n`<env>.<project>.temps.local` name on that node (ADR-098). `None`\nfor the control plane, whose main proxy does this."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "is_control_plane": {
+            "type": "boolean"
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_ok_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_sync_age_secs": {
+            "description": "Seconds since the zone last synced; `None` for the control plane,\nwhose zone is fed locally.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "listen_address": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "node_id": {
+            "description": "0 is the control plane.",
+            "format": "int32",
+            "type": "integer"
+          },
+          "node_name": {
+            "type": "string"
+          },
+          "node_status": {
+            "description": "`active`, `draining`, `offline`...; `active` for the control plane.",
+            "type": "string"
+          },
+          "record_count": {
+            "description": "Records the resolver serves.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "report_state": {
+            "description": "`ok`, `agent_too_old`, `unreachable`, `rejected` or `invalid`;\n`None` before the first report.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reported_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "running": {
+            "type": "boolean"
+          },
+          "tasks_alive": {
+            "type": "boolean"
+          },
+          "zone_generation": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "node_id",
+          "node_name",
+          "node_status",
+          "is_control_plane",
+          "health",
+          "running",
+          "tasks_alive",
+          "consecutive_sync_failures",
+          "dropped_log_entries"
+        ],
+        "type": "object"
+      },
       "DnsResolverHeartbeat": {
         "description": "Wire DTO for [`HeartbeatApiRequest::dns_resolver`]. Mirrors\n`temps_node_agent::network_sync::DnsResolverHeartbeat` field-for-field, but\ndeclared separately rather than shared: the agent and control-plane\ncrates don't depend on each other (the agent avoids pulling in\n`temps-deployments`' sea-orm dependency tree), matching the existing\n`WirePeerListResponse` pattern in `temps-node-agent::network_sync`.",
         "properties": {
@@ -24209,6 +25042,74 @@
             "type": "boolean"
           }
         },
+        "type": "object"
+      },
+      "DnsTrafficBucket": {
+        "properties": {
+          "external": {
+            "$ref": "#/components/schemas/DnsOutcomeCounts",
+            "description": "Forwarded queries."
+          },
+          "internal": {
+            "$ref": "#/components/schemas/DnsOutcomeCounts",
+            "description": "`*.temps.local` queries."
+          },
+          "internal_latency_ms": {
+            "description": "Mean latency of internal queries, in milliseconds.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "time": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "time",
+          "internal",
+          "external"
+        ],
+        "type": "object"
+      },
+      "DnsTrafficResponse": {
+        "properties": {
+          "buckets": {
+            "items": {
+              "$ref": "#/components/schemas/DnsTrafficBucket"
+            },
+            "type": "array"
+          },
+          "from": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "node_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "range": {
+            "type": "string"
+          },
+          "step_secs": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "to": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "node_id",
+          "range",
+          "from",
+          "to",
+          "step_secs",
+          "buckets"
+        ],
         "type": "object"
       },
       "DnsZone": {
@@ -36183,6 +37084,15 @@
               "null"
             ]
           },
+          "overlay_vxlan_vni": {
+            "description": "The VXLAN network ID this node's overlay follows (ADR 062): that of\nthe last peer list it acted on. Absent from older agents, which run\nevery overlay on 42.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "public_ingress": {
             "oneOf": [
               {
@@ -39329,6 +40239,204 @@
           }
         ]
       },
+      "InternalAccessGrantListResponse": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/InternalAccessGrantResponse"
+            },
+            "type": "array"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "total",
+          "page",
+          "page_size"
+        ],
+        "type": "object"
+      },
+      "InternalAccessGrantResponse": {
+        "description": "One grant: who (a project, or one environment of it) may call what (this\nproject, or one environment of it).",
+        "properties": {
+          "caller_environment_id": {
+            "description": "`null`: every environment of the caller project.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "caller_environment_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "caller_project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "caller_project_name": {
+            "type": "string"
+          },
+          "caller_project_slug": {
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "created_by": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "target_environment_id": {
+            "description": "`null`: every environment of the target project.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "target_environment_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "target_project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "target_project_name": {
+            "type": "string"
+          },
+          "target_project_slug": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "target_project_id",
+          "target_project_name",
+          "target_project_slug",
+          "caller_project_id",
+          "caller_project_name",
+          "caller_project_slug",
+          "created_at"
+        ],
+        "type": "object"
+      },
+      "InternalProxyState": {
+        "description": "A worker's internal routing, from its heartbeat's\n`capacity.internal_proxy`. Every `<env>.<project>.temps.local` name\npoints at the node's bridge, port 80: the resolver can be healthy while\nnothing serves those calls, and then the names resolve and every call to\nthem fails.",
+        "properties": {
+          "address": {
+            "description": "What containers call, e.g. `10.205.0.1:80`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "error": {
+            "description": "Why the calls are not served; `None` while they are.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "listening": {
+            "description": "Whether containers' calls to port 80 of the bridge address are\nserved. `None` when the agent does not report it (an older agent, or\nno overlay bridge yet): unknown, never \"not listening\".",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "mode": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/InternalRoutingMode",
+                "description": "How they are served. `None` from an agent older than ADR-098, which\nonly ever binds port 80 directly."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "proxy_address": {
+            "description": "The proxy's own listener, e.g. `10.205.0.1:591`, while the agent\nholds it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "redirect": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/InternalRedirectState",
+                "description": "Whether the redirect is in place; `None` from an older agent."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "redirect_error": {
+            "description": "Why the redirect is missing, also while the fallback serves.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "InternalRedirectState": {
+        "description": "Whether a worker's port-80 redirect is in place.",
+        "enum": [
+          "installed",
+          "missing",
+          "unsupported"
+        ],
+        "type": "string"
+      },
+      "InternalRoutingMode": {
+        "description": "How a worker serves port 80 of its bridge address (ADR-098 D5).",
+        "enum": [
+          "redirect",
+          "direct",
+          "down"
+        ],
+        "type": "string"
+      },
       "IpAccessCidrEntry": {
         "description": "One CIDR in a policy, in canonical form (network address, explicit prefix).",
         "properties": {
@@ -41995,6 +43103,61 @@
         ],
         "type": "string"
       },
+      "ManagedCaCertificateResponse": {
+        "description": "The managed-services CA certificate, to add to a client's trust store.",
+        "properties": {
+          "certificate_pem": {
+            "description": "PEM-encoded CA certificate. Public material; the key never leaves\nthe control plane.",
+            "type": "string"
+          },
+          "file_name": {
+            "description": "Suggested file name for the download.",
+            "type": "string"
+          },
+          "fingerprint_sha256": {
+            "type": "string"
+          },
+          "not_after": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "not_before": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "certificate_pem",
+          "file_name",
+          "fingerprint_sha256",
+          "not_before",
+          "not_after"
+        ],
+        "type": "object"
+      },
+      "ManagedCaInfoResponse": {
+        "description": "The managed-services CA. Public facts only.",
+        "properties": {
+          "fingerprint_sha256": {
+            "description": "SHA-256 (lowercase hex) of the CA certificate's DER encoding: compare\nit with the downloaded file before trusting it.",
+            "type": "string"
+          },
+          "not_after": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "not_before": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "fingerprint_sha256",
+          "not_before",
+          "not_after"
+        ],
+        "type": "object"
+      },
       "ManagedContainerNameSettings": {
         "description": "Response of the container-name settings endpoints.",
         "properties": {
@@ -44462,6 +45625,26 @@
         ],
         "type": "object"
       },
+      "NetworkIdChange": {
+        "description": "`POST /settings/cluster-network/network-id` answer.",
+        "properties": {
+          "from": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "to": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "from",
+          "to"
+        ],
+        "type": "object"
+      },
       "NetworkInterface": {
         "description": "Information about a network interface",
         "properties": {
@@ -45108,6 +46291,63 @@
           "dns_resolver_tasks_alive": {
             "type": [
               "boolean",
+              "null"
+            ]
+          },
+          "internal_proxy_address": {
+            "description": "What containers call, e.g. `10.205.0.1:80`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "internal_proxy_error": {
+            "description": "Why the calls are not served, written for the operator; `None` while\nthey are.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "internal_proxy_listen_address": {
+            "description": "The proxy's own listener, e.g. `10.205.0.1:591`, while the agent\nholds it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "internal_proxy_listening": {
+            "description": "Whether containers' calls to port 80 of the node's bridge address,\nwhere every `<env>.<project>.temps.local` name points, are served.\nThe resolver can be healthy while this is `false`: the names resolve\nand every call fails. `None` = not reported (older agent, or no\noverlay bridge yet).",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "internal_proxy_mode": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/InternalRoutingMode",
+                "description": "How the calls are served (ADR-098): `redirect` to the proxy's own\nport, the `direct` fallback on port 80, or `down`. `None` from an\nolder agent."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "internal_proxy_redirect": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/InternalRedirectState",
+                "description": "Whether the port-80 redirect is in place; `None` from an older agent."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "internal_proxy_redirect_error": {
+            "description": "Why the redirect is missing, also while the fallback serves.",
+            "type": [
+              "string",
               "null"
             ]
           },
@@ -49597,6 +50837,17 @@
             },
             "type": "array"
           },
+          "vxlan": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/VxlanEntry",
+                "description": "The cluster's VXLAN network ID and port (ADR 062). Agents treat an\nabsent field (a control plane older than this) as 42/4789."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "wireguard": {
             "oneOf": [
               {
@@ -50909,7 +52160,7 @@
             ]
           },
           "format": {
-            "description": "\"walg\", \"pg_dump\", \"mariadb_physical\", \"mariadb_dump\", \"unknown\".",
+            "description": "\"walg\", \"pg_dump\", \"mariadb_physical\", \"mariadb_dump\", \"mongodump\",\n\"redis_rdb\", \"s3_mirror\", \"unknown\".",
             "type": "string"
           },
           "id": {
@@ -51000,6 +52251,24 @@
             "description": "The control plane's WireGuard mesh public key. `None` while the mesh\nis off or not up yet.",
             "type": [
               "string",
+              "null"
+            ]
+          },
+          "vxlan_port": {
+            "description": "The cluster's VXLAN UDP port, with `vxlan_vni`.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "vxlan_vni": {
+            "description": "The cluster's VXLAN network ID (ADR 062), so a join can warn before\nspending its token when a device on the host already holds it. Not\nsecret: it is in every overlay packet. `None` from an older plane.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
               "null"
             ]
           }
@@ -52864,6 +54133,20 @@
           "project_id": {
             "format": "int32",
             "type": "integer"
+          },
+          "runtime_reason": {
+            "description": "Short, credential-free explanation of the worker observation.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "runtime_status": {
+            "description": "Worker runtime health when external uptime has no address to check.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "status": {
             "description": "Overall status: \"operational\", \"degraded\", \"down\", \"not_deployed\"\n(monitors exist but the environment has no deployment to check yet),\nor \"no_monitors\"",
@@ -58673,6 +59956,20 @@
         ],
         "type": "object"
       },
+      "ResolverHealth": {
+        "description": "What a resolver looks like right now.",
+        "enum": [
+          "healthy",
+          "stale",
+          "down",
+          "off",
+          "node_unavailable",
+          "agent_too_old",
+          "not_reporting",
+          "no_local_resolver"
+        ],
+        "type": "string"
+      },
       "ResourceCounts": {
         "description": "Quick count of resources involved in the migration",
         "properties": {
@@ -59178,7 +60475,7 @@
             "type": "array"
           },
           "strategy": {
-            "description": "How the restore will be performed: \"walg_restore\", \"pg_dump_restore\",\n\"mariadb_physical_restore\", \"mariadb_dump_restore\", or \"unsupported\".",
+            "description": "How the restore will be performed: \"walg_restore\", \"pg_dump_restore\",\n\"mariadb_physical_restore\", \"mariadb_dump_restore\",\n\"mongodump_restore\", \"redis_rdb_restore\", \"s3_mirror_restore\", or\n\"unsupported\".",
             "type": "string"
           },
           "target_service": {
@@ -61150,40 +62447,6 @@
         ],
         "type": "object"
       },
-      "S3CredentialsResponse": {
-        "description": "S3 credentials distributed to agents for backup/restore operations.",
-        "properties": {
-          "access_key_id": {
-            "type": "string"
-          },
-          "bucket_name": {
-            "type": "string"
-          },
-          "endpoint": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "force_path_style": {
-            "type": "boolean"
-          },
-          "region": {
-            "type": "string"
-          },
-          "secret_key": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "access_key_id",
-          "secret_key",
-          "region",
-          "bucket_name",
-          "force_path_style"
-        ],
-        "type": "object"
-      },
       "S3MigrationReport": {
         "description": "Outcome of copying one managed S3 service's buckets into another.",
         "properties": {
@@ -61272,6 +62535,10 @@
           "updated_at": {
             "format": "int64",
             "type": "integer"
+          },
+          "worker_credentials": {
+            "$ref": "#/components/schemas/WorkerCredentialsPolicy",
+            "description": "What a worker node receives from this source (ADR-102)."
           }
         },
         "required": [
@@ -61284,6 +62551,7 @@
           "region",
           "is_default",
           "managed_by_cloud",
+          "worker_credentials",
           "created_at",
           "updated_at"
         ],
@@ -63987,6 +65255,15 @@
         ],
         "type": "object"
       },
+      "ServerTlsMode": {
+        "description": "Server-side TLS mode of one managed service.",
+        "enum": [
+          "off",
+          "available",
+          "required"
+        ],
+        "type": "string"
+      },
       "ServiceAccessInfo": {
         "description": "Response containing information about how the service is being accessed",
         "properties": {
@@ -65155,6 +66432,166 @@
         "required": [
           "field",
           "kind"
+        ],
+        "type": "object"
+      },
+      "ServiceTlsCertificateResponse": {
+        "description": "The certificate currently issued for a service. Public facts only.",
+        "properties": {
+          "fingerprint_sha256": {
+            "description": "SHA-256 (lowercase hex) of the certificate's DER encoding.",
+            "type": "string"
+          },
+          "not_after": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "not_before": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "subject_alt_names": {
+            "description": "Names the certificate is valid for.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "fingerprint_sha256",
+          "subject_alt_names",
+          "not_before",
+          "not_after"
+        ],
+        "type": "object"
+      },
+      "ServiceTlsMemberResponse": {
+        "description": "What one data node of a cluster serves.",
+        "properties": {
+          "active": {
+            "description": "Whether it serves the managed certificate. `null` when it could not\nbe read (see `detail`).",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "container_name": {
+            "type": "string"
+          },
+          "detail": {
+            "description": "Why its state is unknown, when it is.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pending": {
+            "description": "Whether it lags the setting; the next start applies it.",
+            "type": "boolean"
+          },
+          "self_signed": {
+            "description": "Whether it still serves pg_auto_failover's self-signed certificate,\nwhich clients cannot verify.",
+            "type": "boolean"
+          },
+          "status": {
+            "description": "The member's lifecycle status (`running`, `stopped`, ...).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "container_name",
+          "status",
+          "self_signed",
+          "pending"
+        ],
+        "type": "object"
+      },
+      "ServiceTlsStatusResponse": {
+        "description": "A service's effective server TLS status.",
+        "properties": {
+          "accepts_plaintext": {
+            "description": "Whether the server accepts unencrypted connections in this mode.",
+            "type": "boolean"
+          },
+          "active": {
+            "description": "Whether the managed certificate is served: by the container, or by\nevery data node of a cluster. `null` when it cannot be inspected (not\ncreated yet, no Docker daemon here, or cluster members disagree).",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "ca_certificate_path": {
+            "description": "Where to download the CA certificate, once it exists.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "certificate": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ServiceTlsCertificateResponse"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "certificate_authority": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ManagedCaInfoResponse",
+                "description": "Absent until TLS is first enabled on any service."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "change_restarts_database": {
+            "description": "Whether changing the mode restarts the database. False for a\ncluster, whose data nodes switch certificates in place.",
+            "type": "boolean"
+          },
+          "members": {
+            "description": "A cluster's data nodes; empty for a standalone service.",
+            "items": {
+              "$ref": "#/components/schemas/ServiceTlsMemberResponse"
+            },
+            "type": "array"
+          },
+          "mode": {
+            "$ref": "#/components/schemas/ServerTlsMode",
+            "description": "`off`, `available` (TLS offered, plaintext still accepted) or\n`required` (plaintext rejected; not yet supported)."
+          },
+          "pending_restart": {
+            "description": "What runs lags the setting; the next start (or a restart) applies it.",
+            "type": "boolean"
+          },
+          "service_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "supported": {
+            "description": "Whether this service can use managed TLS at all.",
+            "type": "boolean"
+          },
+          "unsupported_reason": {
+            "description": "Why not, when `supported` is false.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "service_id",
+          "mode",
+          "supported",
+          "accepts_plaintext",
+          "pending_restart",
+          "change_restarts_database",
+          "members"
         ],
         "type": "object"
       },
@@ -75072,7 +76509,7 @@
           },
           "worker_install": {
             "$ref": "#/components/schemas/WorkerInstall",
-            "description": "What a new worker installs so it never runs an older Temps than this\nserver: this release, or the newest nightly build for a build made\nbetween releases."
+            "description": "What a new worker installs to match this server: this release, or,\nfor a build made between releases (which no release contains), the\nnewest nightly build. Nightly builds are cut daily from `main`, so a\nserver built from commits newer than the latest nightly, or from a\nbranch that never reached `main`, can get a worker without them."
           }
         },
         "required": [
@@ -77294,6 +78731,17 @@
                 "type": "null"
               }
             ]
+          },
+          "worker_credentials": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/WorkerCredentialsPolicy",
+                "description": "Optional new worker credentials policy."
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "type": "object"
@@ -77409,6 +78857,33 @@
         "required": [
           "imageRef",
           "healthCheckPath"
+        ],
+        "type": "object"
+      },
+      "UpdateServiceTlsRequest": {
+        "properties": {
+          "mode": {
+            "$ref": "#/components/schemas/ServerTlsMode",
+            "description": "The new mode. `required` is rejected until it is supported."
+          }
+        },
+        "required": [
+          "mode"
+        ],
+        "type": "object"
+      },
+      "UpdateServiceTlsResponse": {
+        "properties": {
+          "previous_mode": {
+            "$ref": "#/components/schemas/ServerTlsMode"
+          },
+          "tls": {
+            "$ref": "#/components/schemas/ServiceTlsStatusResponse"
+          }
+        },
+        "required": [
+          "previous_mode",
+          "tls"
         ],
         "type": "object"
       },
@@ -80199,6 +81674,26 @@
         ],
         "type": "object"
       },
+      "VxlanEntry": {
+        "description": "The VXLAN network ID and UDP port every overlay of this cluster uses.",
+        "properties": {
+          "port": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "vni": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "vni",
+          "port"
+        ],
+        "type": "object"
+      },
       "WalWarning": {
         "description": "One actionable warning surfaced to the UI.\n\nEach variant carries the data needed to render a remediation hint without\nthe frontend re-querying anything.",
         "oneOf": [
@@ -81064,8 +82559,16 @@
         ],
         "type": "object"
       },
+      "WorkerCredentialsPolicy": {
+        "description": "What a worker node may receive from an S3 source (ADR-102).",
+        "enum": [
+          "scoped",
+          "allow_full"
+        ],
+        "type": "string"
+      },
       "WorkerInstall": {
-        "description": "What a new worker installs, so it never runs an older Temps than its\ncontrol plane.",
+        "description": "What a new worker installs to match its control plane, as closely as a\npublished build allows.",
         "oneOf": [
           {
             "description": "Exactly the release this control plane runs.",
@@ -81088,7 +82591,7 @@
             "type": "object"
           },
           {
-            "description": "The newest nightly build. This control plane runs a build made after\nrelease `after` and before the next one: no release contains it, and\n`after` is older. Nightly builds are cut every day from `main`, so\nthe newest one contains every change merged before it was cut.",
+            "description": "The newest nightly build. This control plane runs a build made after\nrelease `after` and before the next one: no release contains it, and\n`after` is older. Nightly builds are cut every day from `main`, so\nthe newest one contains every change merged before it was cut, but\nnot commits made since, nor a branch that never reached `main`.",
             "properties": {
               "after": {
                 "example": "v0.1.0-beta.61",
@@ -100899,6 +102402,297 @@
         ]
       }
     },
+    "/cluster/dns/queries": {
+      "get": {
+        "operationId": "list_dns_queries",
+        "parameters": [
+          {
+            "description": "Page number (1-indexed).",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Entries per page, at most 100. Defaults to 20.",
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Queries answered by this node's resolver (0 is the control plane).",
+            "in": "query",
+            "name": "node_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "`noerror`, `nodata`, `nxdomain`, `servfail`, `refused` or `error`.",
+            "in": "query",
+            "name": "outcome",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "`internal` or `external`.",
+            "in": "query",
+            "name": "zone",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Substring of the name asked.",
+            "in": "query",
+            "name": "name",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Queries from this project's containers.",
+            "in": "query",
+            "name": "project_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DnsQueryLogResponse"
+                }
+              }
+            },
+            "description": "Recent DNS queries"
+          },
+          "400": {
+            "description": "Invalid filter"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Recent queries answered by the internal resolvers, newest first. Kept\nfor 24 hours; forwarded names are never stored.",
+        "tags": [
+          "Nodes"
+        ]
+      }
+    },
+    "/cluster/dns/records": {
+      "get": {
+        "operationId": "list_dns_records",
+        "parameters": [
+          {
+            "description": "Page number (1-indexed).",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Records per page, at most 100. Defaults to 20.",
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Substring of the name or target address.",
+            "in": "query",
+            "name": "search",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Records pinned to this node.",
+            "in": "query",
+            "name": "node_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "`environment`, `service_member`, `service_role`, `node` or `static`.",
+            "in": "query",
+            "name": "owner_kind",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DnsRecordListResponse"
+                }
+              }
+            },
+            "description": "Records of the internal zone"
+          },
+          "400": {
+            "description": "Invalid filter"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "The internal zone's records with their owners, newest first.",
+        "tags": [
+          "Nodes"
+        ]
+      }
+    },
+    "/cluster/dns/resolve": {
+      "post": {
+        "operationId": "resolve_dns_name",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DnsResolveRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DnsResolveResponse"
+                }
+              }
+            },
+            "description": "The answer"
+          },
+          "400": {
+            "description": "Invalid name or record type"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Node not found"
+          },
+          "409": {
+            "description": "The resolver is not running, the agent is too old, or the project has no container on that node"
+          },
+          "500": {
+            "description": "Internal server error"
+          },
+          "502": {
+            "description": "The resolver could not be reached"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Resolve a name from one node's resolver and show the answer.",
+        "tags": [
+          "Nodes"
+        ]
+      }
+    },
+    "/cluster/dns/resolvers": {
+      "get": {
+        "operationId": "list_dns_resolvers",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClusterDnsResolversResponse"
+                }
+              }
+            },
+            "description": "Resolver health per node"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Each node's resolver: health, version, records served, last sync, and\nthe open DNS alarms.",
+        "tags": [
+          "Nodes"
+        ]
+      }
+    },
     "/cluster/dns/status": {
       "get": {
         "description": "Same permission as the other node visibility endpoints in this file\n(`admin_list_nodes`, `admin_get_node`) — this is operational/infra\nvisibility, not a new privilege tier.",
@@ -100930,6 +102724,65 @@
           }
         ],
         "summary": "Cluster-wide DNS resolver health (ADR-024): whether cluster DNS is\nenabled, the total record count, and per-node resolver status as last\nreported by each node's heartbeat. Lets an operator answer \"is cluster\nDNS actually healthy right now\" without SSHing into a node to read logs.",
+        "tags": [
+          "Nodes"
+        ]
+      }
+    },
+    "/cluster/dns/traffic": {
+      "get": {
+        "operationId": "dns_traffic",
+        "parameters": [
+          {
+            "description": "The node whose resolver to chart; 0 (the default) is the control\nplane.",
+            "in": "query",
+            "name": "node_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "`1h` (default), `6h`, `24h` or `7d`.",
+            "in": "query",
+            "name": "range",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DnsTrafficResponse"
+                }
+              }
+            },
+            "description": "DNS traffic over time"
+          },
+          "400": {
+            "description": "Invalid range"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Queries per outcome over time for one node's resolver.",
         "tags": [
           "Nodes"
         ]
@@ -109212,6 +111065,16 @@
               }
             },
             "description": "Service not found"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The service's engine cannot be reached to read its restore options"
           }
         },
         "security": [
@@ -109609,6 +111472,265 @@
         ]
       }
     },
+    "/external-services/{id}/tls": {
+      "get": {
+        "operationId": "get_service_tls",
+        "parameters": [
+          {
+            "description": "External service ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceTlsStatusResponse"
+                }
+              }
+            },
+            "description": "Effective server TLS status"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Service not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "External Services"
+        ]
+      },
+      "put": {
+        "operationId": "update_service_tls",
+        "parameters": [
+          {
+            "description": "External service ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateServiceTlsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpdateServiceTlsResponse"
+                }
+              }
+            },
+            "description": "Mode changed and applied (a running database is restarted)"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The service cannot use this mode"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Service not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "A major upgrade is in progress, the service is still being created or starting, or the recreate guard kept its existing container so the mode was not applied"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Applying the mode failed; the previous mode was kept"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "External Services"
+        ]
+      }
+    },
+    "/external-services/{id}/tls/ca-certificate": {
+      "get": {
+        "operationId": "get_managed_ca_certificate",
+        "parameters": [
+          {
+            "description": "External service ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ManagedCaCertificateResponse"
+                }
+              }
+            },
+            "description": "The managed-services CA certificate (public)"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Service not found, or no CA exists yet"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "External Services"
+        ]
+      }
+    },
     "/external-services/{id}/upgrade": {
       "post": {
         "operationId": "upgrade_service",
@@ -109666,7 +111788,7 @@
     },
     "/external-services/{id}/wal-health": {
       "get": {
-        "description": "Returns the latest WAL/archive health snapshot recorded by the background\nhealth monitor for a Postgres external service. Powers the warning banner\non the service detail page when the disk is filling up due to stale\nreplication slots, archive backlog, or misconfigured `archive_command`.\n\nReturns 404 when no snapshot exists yet (probe hasn't run, or the service\nisn't Postgres).",
+        "description": "Returns the latest WAL/archive health snapshot recorded by the background\nhealth monitor for a Postgres external service. Powers the warning banner\non the service detail page when the disk is filling up due to stale\nreplication slots, archive backlog, or misconfigured `archive_command`.\n\nReturns 404 when no snapshot exists yet (probe hasn't run, or the service\nisn't Postgres). When the last check could not run (a database on a\nworker whose agent predates the WAL probe, or cannot be reached), the 404\nhas type `https://temps.sh/probs/wal-health-not-checked` and carries\n`reason` and `checked_at`, so the page can say the check is not happening.",
         "operationId": "getPostgresWalHealth",
         "parameters": [
           {
@@ -109692,7 +111814,7 @@
             "description": "Latest WAL health snapshot"
           },
           "404": {
-            "description": "Service not found, or no WAL snapshot available"
+            "description": "Service not found, or no WAL snapshot available. Type `https://temps.sh/probs/wal-health-not-checked` with `reason` and `checked_at` when the last check could not run"
           },
           "500": {
             "description": "Internal server error"
@@ -109706,6 +111828,7 @@
     },
     "/external-services/{id}/workload-mode": {
       "get": {
+        "description": "An ADR-055 migration control for operators and the CLI; the console does\nnot show it. Databases default to `legacy` and need no change here.",
         "operationId": "get_workload_mode",
         "parameters": [
           {
@@ -109776,11 +111899,13 @@
             "bearer_auth": []
           }
         ],
+        "summary": "Get a database's workload mode (internal, operator-only)",
         "tags": [
           "External Services"
         ]
       },
       "put": {
+        "description": "An ADR-055 migration control for operators and the CLI; the console does\nnot show it. Databases default to `legacy` and need no change here.",
         "operationId": "update_workload_mode",
         "parameters": [
           {
@@ -109871,6 +111996,7 @@
             "bearer_auth": []
           }
         ],
+        "summary": "Change a database's workload mode (internal, operator-only)",
         "tags": [
           "External Services"
         ]
@@ -109878,6 +112004,7 @@
     },
     "/external-services/{id}/workload-mode/pending-changes": {
       "get": {
+        "description": "An ADR-055 migration control for operators and the CLI; the console does\nnot show it. Databases default to `legacy` and need no change here.",
         "operationId": "get_workload_pending_changes",
         "parameters": [
           {
@@ -109958,6 +112085,7 @@
             "bearer_auth": []
           }
         ],
+        "summary": "List what a recreate from the workload spec would change (internal, operator-only)",
         "tags": [
           "External Services"
         ]
@@ -109965,6 +112093,7 @@
     },
     "/external-services/{id}/workload-mode/recreate": {
       "post": {
+        "description": "An ADR-055 migration control for operators and the CLI; the console does\nnot show it. Databases default to `legacy` and need no change here.",
         "operationId": "recreate_from_workload_spec",
         "parameters": [
           {
@@ -110065,6 +112194,7 @@
             "bearer_auth": []
           }
         ],
+        "summary": "Recreate a database's container from its workload spec (internal, operator-only)",
         "tags": [
           "External Services"
         ]
@@ -116134,6 +118264,7 @@
     },
     "/internal/environments/{environment_id}/placement/explain": {
       "get": {
+        "description": "An ADR-055 migration control for operators and the CLI; the console does\nnot show it. Environments default to `legacy` and need no change here.",
         "operationId": "admin_explain_environment_placement",
         "parameters": [
           {
@@ -116213,6 +118344,7 @@
             "bearer_auth": []
           }
         ],
+        "summary": "Explain where the workload plane would place an environment (internal, operator-only)",
         "tags": [
           "Workload Placement"
         ]
@@ -116220,6 +118352,7 @@
     },
     "/internal/environments/{environment_id}/placement/recommendation": {
       "get": {
+        "description": "An ADR-055 migration control for operators and the CLI; the console does\nnot show it. Environments default to `legacy` and need no change here.",
         "operationId": "admin_environment_pinning_recommendation",
         "parameters": [
           {
@@ -116313,6 +118446,7 @@
             "bearer_auth": []
           }
         ],
+        "summary": "Recommend node pinning for an environment (internal, operator-only)",
         "tags": [
           "Workload Placement"
         ]
@@ -116900,6 +119034,7 @@
     },
     "/internal/environments/{environment_id}/workload-isolation": {
       "get": {
+        "description": "An ADR-055 migration control for operators and the CLI; the console does\nnot show it. Environments default to `legacy` and need no change here.",
         "operationId": "admin_get_environment_workload_isolation",
         "parameters": [
           {
@@ -116969,11 +119104,13 @@
             "bearer_auth": []
           }
         ],
+        "summary": "Get an environment's workload isolation (internal, operator-only)",
         "tags": [
           "Workload Placement"
         ]
       },
       "put": {
+        "description": "An ADR-055 migration control for operators and the CLI; the console does\nnot show it. Environments default to `legacy` and need no change here.",
         "operationId": "admin_set_environment_workload_isolation",
         "parameters": [
           {
@@ -117063,6 +119200,7 @@
             "bearer_auth": []
           }
         ],
+        "summary": "Change an environment's workload isolation (internal, operator-only)",
         "tags": [
           "Workload Placement"
         ]
@@ -117070,6 +119208,7 @@
     },
     "/internal/environments/{environment_id}/workload-mode": {
       "get": {
+        "description": "An ADR-055 migration control for operators and the CLI; the console does\nnot show it. Environments default to `legacy` and need no change here.",
         "operationId": "admin_get_environment_workload_mode",
         "parameters": [
           {
@@ -117139,11 +119278,13 @@
             "bearer_auth": []
           }
         ],
+        "summary": "Get an environment's workload mode (internal, operator-only)",
         "tags": [
           "Workload Placement"
         ]
       },
       "put": {
+        "description": "An ADR-055 migration control for operators and the CLI; the console does\nnot show it. Environments default to `legacy` and need no change here.",
         "operationId": "admin_set_environment_workload_mode",
         "parameters": [
           {
@@ -117233,6 +119374,7 @@
             "bearer_auth": []
           }
         ],
+        "summary": "Change an environment's workload mode (internal, operator-only)",
         "tags": [
           "Workload Placement"
         ]
@@ -118456,59 +120598,6 @@
         ],
         "tags": [
           "Workload Placement"
-        ]
-      }
-    },
-    "/internal/nodes/{node_id}/s3-credentials/{s3_source_id}": {
-      "get": {
-        "description": "Agents call this endpoint to receive the S3 credentials they need to upload\nor download backups. The credentials are decrypted from the stored S3 source\nand returned over the authenticated TLS/WireGuard channel.",
-        "operationId": "get_s3_credentials",
-        "parameters": [
-          {
-            "description": "Node ID",
-            "in": "path",
-            "name": "node_id",
-            "required": true,
-            "schema": {
-              "format": "int32",
-              "type": "integer"
-            }
-          },
-          {
-            "description": "S3 source ID",
-            "in": "path",
-            "name": "s3_source_id",
-            "required": true,
-            "schema": {
-              "format": "int32",
-              "type": "integer"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/S3CredentialsResponse"
-                }
-              }
-            },
-            "description": "S3 credentials"
-          },
-          "401": {
-            "description": "Unauthorized"
-          },
-          "404": {
-            "description": "S3 source not found"
-          },
-          "500": {
-            "description": "Internal server error"
-          }
-        },
-        "summary": "Get decrypted S3 credentials for a backup/restore operation.",
-        "tags": [
-          "Nodes"
         ]
       }
     },
@@ -121197,6 +123286,19 @@
             "required": true,
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "description": "Select one environment within the authorized projects; defaults to production.",
+            "in": "query",
+            "name": "environment_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
             }
           }
         ],
@@ -153639,6 +155741,315 @@
         "x-maturity": "experimental"
       }
     },
+    "/projects/{project_id}/internal-access": {
+      "get": {
+        "description": "Newest first. With `environment_id`, only the grants that cover that\nenvironment (its own and the project-wide ones).",
+        "operationId": "list_internal_access_grants",
+        "parameters": [
+          {
+            "description": "The project being called",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Only grants that cover this environment of the project: its own and\nthe project-wide ones.",
+            "in": "query",
+            "name": "environment_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "1-based page, default 1.",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Default 20, at most 100.",
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InternalAccessGrantListResponse"
+                }
+              }
+            },
+            "description": "Grants on the project"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project or environment not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "List the projects allowed to call this project's internal addresses",
+        "tags": [
+          "Internal Access"
+        ]
+      },
+      "post": {
+        "description": "Workloads of the calling project (or of one environment of it) may then\ncall this project's `*.temps.local` addresses (or one environment's)\nthrough the internal proxy. Workers apply it with their next route sync,\nwithin seconds.",
+        "operationId": "create_internal_access_grant",
+        "parameters": [
+          {
+            "description": "The project being called",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateInternalAccessGrantRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InternalAccessGrantResponse"
+                }
+              }
+            },
+            "description": "Grant created"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid grant"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions on either project"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project or environment not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Already granted, or too many grants"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Allow another project to call this project's internal addresses",
+        "tags": [
+          "Internal Access"
+        ]
+      }
+    },
+    "/projects/{project_id}/internal-access/{grant_id}": {
+      "delete": {
+        "description": "Workers refuse the caller again with their next route sync, within\nseconds (ADR 101 D5).",
+        "operationId": "delete_internal_access_grant",
+        "parameters": [
+          {
+            "description": "The project being called",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Grant ID",
+            "in": "path",
+            "name": "grant_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Grant removed"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Grant not found on this project"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Stop another project from calling this project's internal addresses",
+        "tags": [
+          "Internal Access"
+        ]
+      }
+    },
     "/projects/{project_id}/ip-access": {
       "delete": {
         "description": "The project becomes reachable from any address again (environments with\ntheir own policy keep it).",
@@ -164113,6 +166524,48 @@
         ]
       }
     },
+    "/settings/cluster-network/network-id": {
+      "post": {
+        "description": "Assigns a fresh random network ID. Every node's overlay, and the control\nplane's, is rebuilt on it at its next reconcile; cross-node traffic pauses\nuntil each one has. Refused while a node's agent has not reported that it\ncan follow a new network ID.",
+        "operationId": "ClusterNetworkIdChange",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClusterNetworkIdChangeResponse"
+                }
+              }
+            },
+            "description": "Network ID changed"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "409": {
+            "description": "A node cannot follow a new network ID yet; the detail names it and the fix"
+          },
+          "428": {
+            "description": "Re-authentication required"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Give this cluster its own VXLAN network ID (ADR 062)",
+        "tags": [
+          "Nodes"
+        ]
+      }
+    },
     "/settings/disk-status": {
       "get": {
         "description": "Returns live disk usage for the monitored path along with any disks that\nmeet or exceed the configured alert threshold. Read-only — does not send\nnotifications. Used by the dashboard to surface a low-disk-space warning.",
@@ -173347,6 +175800,10 @@
     {
       "description": "What each workload may reach, and whether a node enforces it",
       "name": "Network Policy"
+    },
+    {
+      "description": "Which other projects may call a project's *.temps.local addresses",
+      "name": "Internal Access"
     }
   ]
 }

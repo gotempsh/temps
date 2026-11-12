@@ -70,7 +70,7 @@
           "no-new-privileges:true"
         ]
       },
-      "Image": "mariadb:lts",
+      "Image": "ghcr.io/gotempsh/mariadb-walg@sha256:fa4c9247f82c47ace7c1aa9b77010870f4905bbae57c4f0aa24ae6ba3b6cdbf3",
       "Labels": {
         "temps.service_name": "golden",
         "temps.service_type": "mariadb"

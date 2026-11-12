@@ -469,6 +469,11 @@ const TelemetrySettingsPage = lazy(() =>
     default: m.TelemetrySettingsPage,
   }))
 )
+const DnsPage = lazy(() =>
+  import('./pages/settings/DnsPage').then((m) => ({
+    default: m.DnsPage,
+  }))
+)
 const NetworkPolicyPage = lazy(() =>
   import('./pages/settings/NetworkPolicyPage').then((m) => ({
     default: m.NetworkPolicyPage,
@@ -720,6 +725,7 @@ const FullAppRoutes = () => {
                     the screen. Anything sized to 100% of it — a plugin
                     iframe, say — lost its last rows off-screen. */}
                 <div
+                  data-console-scroll
                   className={
                     focusMode
                       ? 'flex-1 min-h-0 overflow-hidden flex flex-col'
@@ -1034,6 +1040,7 @@ const FullAppRoutes = () => {
                             path="traefik-discovery"
                             element={<TraefikDiscoveryPage />}
                           />
+                          <Route path="dns" element={<DnsPage />} />
                           <Route
                             path="network-policy"
                             element={<NetworkPolicyPage />}

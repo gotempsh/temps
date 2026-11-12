@@ -290,7 +290,7 @@ async fn occupied_ranges_for_registration(
     match temps_network::occupied::collect(
         docker.as_ref(),
         &owned_devices,
-        &config.docker_network_name,
+        &[config.docker_network_name.as_str()],
     )
     .await
     {
@@ -1075,8 +1075,9 @@ impl JoinCommand {
             JoinMode::Paired(_) | JoinMode::Relay(_) => None,
         };
         // Who the target is decides whether this is the saved control plane
-        // (ADR 060); asked before the join token goes anywhere.
-        if let (Some(_), Some(target)) = (&facts.saved, target.as_deref()) {
+        // (ADR 060), and which VXLAN network ID its overlay needs (ADR 062);
+        // asked before the join token goes anywhere.
+        if let Some(target) = target.as_deref() {
             facts.target_identity = Some(super::host_preflight::fetch_plane_identity(target).await);
         }
         // Without `--ingress` a rejoin keeps the saved mode and a new worker

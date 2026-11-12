@@ -19,6 +19,9 @@ temps-entities = { path = "../temps-entities" }
 # ADR-024: the control plane runs the same per-node Hickory resolver as workers,
 # fed directly from the local service_endpoints DB.
 temps-node-dns = { path = "../temps-node-dns" }
+# ADR-095: DNS counters go to the metrics store as node series.
+temps-metrics = { path = "../temps-metrics" }
+futures = { workspace = true }
 hickory-proto = { workspace = true }
 
 # Async runtime

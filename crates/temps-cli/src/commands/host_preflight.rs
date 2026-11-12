@@ -13,6 +13,8 @@
 use std::net::SocketAddr;
 
 use temps_network::overlay_name::{self, DEFAULT_OVERLAY_NETWORK_NAME};
+use temps_network::vxlan_holder::{HolderFacts, VxlanDevice};
+use temps_node_agent::internal_routing::INTERNAL_PROXY_PORT;
 
 /// A Docker network on the host.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,6 +53,9 @@ pub struct SavedJoin {
     /// The control plane's WireGuard mesh key in the agent's last network
     /// snapshot.
     pub control_plane_wg_public_key: Option<String>,
+    /// The VXLAN network ID and port in the agent's last network snapshot
+    /// (ADR 062), when the control plane sent them.
+    pub applied_vxlan: Option<(u32, u16)>,
 }
 
 /// What identifies a control plane (ADR 060): the cluster CA every worker
@@ -60,6 +65,12 @@ pub struct SavedJoin {
 pub struct PlaneIdentity {
     pub ca_fingerprint: Option<String>,
     pub control_plane_wg_public_key: Option<String>,
+    /// The cluster's VXLAN network ID and port (ADR 062). Absent from
+    /// control planes that predate per-cluster network IDs: 42/4789.
+    #[serde(default)]
+    pub vxlan_vni: Option<u32>,
+    #[serde(default)]
+    pub vxlan_port: Option<u16>,
 }
 
 /// Whether the control plane being joined is the one the saved agent config
@@ -156,6 +167,8 @@ pub struct HostFacts {
     /// Network interface names (`/sys/class/net`).
     pub interfaces: Vec<String>,
     pub listeners: Vec<Listener>,
+    /// The host's VXLAN devices, each with what it belongs to (ADR 062).
+    pub vxlan_devices: Vec<(VxlanDevice, HolderFacts)>,
 }
 
 /// One thing a check found.
@@ -186,12 +199,25 @@ pub enum Finding {
     },
     /// A port the worker serves on is already held. `serves_public` is
     /// whether the worker's ingress mode listens for public traffic; with
-    /// `off` only the overlay's internal proxy needs the port.
+    /// `off` only the overlay's internal proxy needs a port, its own
+    /// (ADR-098).
     PortInUse {
         port: u16,
         address: SocketAddr,
         process: Option<String>,
         serves_public: bool,
+    },
+    /// Another VXLAN device on the host holds the network ID and port this
+    /// cluster's overlay needs (ADR 062), so the agent cannot bring it up.
+    VxlanIdInUse {
+        holder: HolderFacts,
+        /// The VXLAN device this node's overlay will use.
+        wanted: String,
+        vni: u32,
+        port: u16,
+        /// The control plane did not say which network ID it uses; the
+        /// default was assumed.
+        assumed: bool,
     },
 }
 
@@ -205,6 +231,9 @@ impl Finding {
             // Only `temps join` decides names, and it always finds one.
             Self::OverlayNameTaken { .. } => false,
             Self::PortInUse { .. } => false,
+            // The fix may be on the control plane (a new network ID), which
+            // the node must have joined for.
+            Self::VxlanIdInUse { .. } => false,
         }
     }
 
@@ -275,29 +304,52 @@ impl Finding {
                     .as_deref()
                     .map(|process| format!(" by {process}"))
                     .unwrap_or_default();
-                if *serves_public {
+                if *port == INTERNAL_PROXY_PORT {
+                    format!(
+                        "port {port} is already in use on {address}{holder}. The overlay's \
+                         internal proxy listens on port {port} of its bridge address, and \
+                         containers' calls to port 80 of that address are redirected to it; \
+                         while the port is held the agent falls back to listening on port 80 \
+                         of the bridge address itself. Stop what holds port {port}, or move it \
+                         to another port."
+                    )
+                } else if *serves_public {
                     format!(
                         "port {port} is already in use on {address}{holder}. The worker serves \
-                         public traffic on 80/443 and the overlay's internal proxy on port 80 \
-                         of its bridge address; while it is held they fail to start. Stop what \
-                         holds it, or use `temps agent ingress` to move public traffic to other \
-                         ports."
-                    )
-                } else if *port == 80 {
-                    format!(
-                        "port {port} is already in use on {address}{holder}. The worker takes \
-                         no public traffic, but the overlay's internal proxy serves port 80 of \
-                         its bridge address and fails to start while it is held. Stop what \
-                         holds it."
+                         public traffic on 80/443, and its public listener fails to start while \
+                         the port is held. Stop what holds it, or use `temps agent ingress` to \
+                         move public traffic to other ports."
                     )
                 } else {
+                    let protocol = if *port == temps_core::worker_ingress::PRIVATE_HTTP_PORT {
+                        "HTTP"
+                    } else {
+                        "HTTPS"
+                    };
                     format!(
-                        "port {port} is already in use on {address}{holder}. The worker's \
-                         private listener (ingress `private`) serves HTTPS on port {port} of \
-                         its private address and fails to start while it is held. Stop what \
-                         holds it."
+                        "port {port} is already in use on {address}{holder}. The worker takes \
+                         no public traffic, but its private listener (ingress `private`) serves \
+                         {protocol} on port {port} of its private address and fails to start \
+                         while it is held. Stop what holds it."
                     )
                 }
+            }
+            Self::VxlanIdInUse {
+                holder,
+                wanted,
+                vni,
+                port,
+                assumed,
+            } => {
+                let mut message =
+                    temps_network::vxlan_holder::describe(holder, wanted, *vni, *port);
+                if *assumed {
+                    message.push_str(
+                        " (The control plane did not say which network ID this cluster uses; \
+                         this assumes the default. A cluster with its own is not affected.)",
+                    );
+                }
+                message
             }
         }
     }
@@ -345,18 +397,30 @@ pub enum Purpose<'a> {
 }
 
 /// The ports a worker with `ingress` serves on, sorted, and whether its
-/// ingress mode listens for public traffic. Port 80 always: the overlay's
-/// internal proxy binds it on the bridge address. `off` binds no public
-/// listener, so 443 and the ingress ports cannot stop it. `private` binds
-/// only its fixed private ports (ADR 064 D5), and takes no public traffic.
+/// ingress mode listens for public traffic. [`INTERNAL_PROXY_PORT`] always:
+/// the overlay's internal proxy binds it on the bridge address, and
+/// containers' port-80 calls are redirected to it (ADR-098), so port 80 is
+/// checked only for a mode that listens on it. `off` binds no public
+/// listener. `private` binds only its fixed private ports (ADR 064 D5), and
+/// takes no public traffic.
 pub fn served_ports(ingress: &temps_core::worker_ingress::LocalIngress) -> (Vec<u16>, bool) {
     use temps_core::worker_ingress::{IngressMode, PRIVATE_HTTPS_PORT, PRIVATE_HTTP_PORT};
     let (mut ports, serves_public) = match ingress.mode {
-        IngressMode::Off => (vec![80], false),
-        IngressMode::Private => (vec![80, PRIVATE_HTTP_PORT, PRIVATE_HTTPS_PORT], false),
-        IngressMode::Fixed | IngressMode::Delegated => {
-            (vec![80, 443, ingress.http_port, ingress.https_port], true)
-        }
+        IngressMode::Off => (vec![INTERNAL_PROXY_PORT], false),
+        IngressMode::Private => (
+            vec![INTERNAL_PROXY_PORT, PRIVATE_HTTP_PORT, PRIVATE_HTTPS_PORT],
+            false,
+        ),
+        IngressMode::Fixed | IngressMode::Delegated => (
+            vec![
+                INTERNAL_PROXY_PORT,
+                80,
+                443,
+                ingress.http_port,
+                ingress.https_port,
+            ],
+            true,
+        ),
     };
     ports.sort_unstable();
     ports.dedup();
@@ -475,7 +539,33 @@ pub fn assess(
         // A re-join keeps the name this node already runs. Registering none
         // would save a config without it, and the next check would take the
         // other cluster's `temps0` beside it for this node's own.
-        assessment.overlay_network_name = own_name;
+        assessment.overlay_network_name = own_name.clone();
+    }
+
+    // ADR 062: a VXLAN device of another overlay on this cluster's network
+    // ID and port keeps this node's overlay down. This node's own device
+    // (under the name it will use, or the one it ran on a re-join) is not
+    // in the way: the agent replaces it.
+    let will_use = assessment
+        .overlay_network_name
+        .clone()
+        .unwrap_or_else(|| preferred.clone());
+    let own_devices: Vec<String> = [Some(will_use.clone()), own_name.clone()]
+        .into_iter()
+        .flatten()
+        .map(|name| format!("vxlan-{name}"))
+        .collect();
+    let (vni, port, assumed) = cluster_vxlan(facts, same_cluster);
+    if let Some((_, holder)) = facts.vxlan_devices.iter().find(|(device, _)| {
+        device.vni == vni && device.port == port && !own_devices.contains(&device.name)
+    }) {
+        assessment.findings.push(Finding::VxlanIdInUse {
+            holder: holder.clone(),
+            wanted: format!("vxlan-{will_use}"),
+            vni,
+            port,
+            assumed,
+        });
     }
 
     for port in ports {
@@ -494,6 +584,30 @@ pub fn assess(
         }
     }
     assessment
+}
+
+/// The network ID and port this cluster's overlay uses (ADR 062), and
+/// whether they are only assumed: what the control plane announced (its
+/// absence from one that answered means it predates per-cluster IDs, so
+/// 42/4789), else what the agent last ran for the same cluster, else the
+/// default.
+fn cluster_vxlan(facts: &HostFacts, same_cluster: bool) -> (u32, u16, bool) {
+    let default_port = temps_network::DEFAULT_VXLAN_PORT;
+    if let Some(Ok(identity)) = &facts.target_identity {
+        return match identity.vxlan_vni {
+            Some(vni) => (vni, identity.vxlan_port.unwrap_or(default_port), false),
+            None => (temps_network::DEFAULT_VXLAN_VNI, default_port, false),
+        };
+    }
+    if let Some((vni, port)) = facts
+        .saved
+        .as_ref()
+        .filter(|_| same_cluster)
+        .and_then(|saved| saved.applied_vxlan)
+    {
+        return (vni, port, false);
+    }
+    (temps_network::DEFAULT_VXLAN_VNI, default_port, true)
 }
 
 fn is_temps_process(listener: &Listener) -> bool {
@@ -574,6 +688,7 @@ pub async fn gather(saved: Option<&temps_node_agent::AgentConfig>) -> HostFacts 
             .as_deref()
             .and_then(saved_ca_fingerprint),
         control_plane_wg_public_key: saved_control_plane_key(&config.mesh_key_dir),
+        applied_vxlan: saved_vxlan(&config.mesh_key_dir),
     });
     HostFacts {
         linux,
@@ -583,7 +698,36 @@ pub async fn gather(saved: Option<&temps_node_agent::AgentConfig>) -> HostFacts 
         networks: docker_networks().await,
         interfaces: interface_names(),
         listeners: if linux { listeners() } else { Vec::new() },
+        vxlan_devices: vxlan_devices().await,
     }
+}
+
+/// The host's VXLAN devices and what each belongs to. Best-effort: a host
+/// whose devices cannot be listed is checked without them.
+async fn vxlan_devices() -> Vec<(VxlanDevice, HolderFacts)> {
+    let Ok(devices) = temps_network::vxlan_holder::list_devices().await else {
+        return Vec::new();
+    };
+    let mut inspected = Vec::with_capacity(devices.len());
+    for device in devices {
+        let facts = temps_network::vxlan_holder::inspect(&device.name).await;
+        inspected.push((device, facts));
+    }
+    inspected
+}
+
+/// The VXLAN network ID and port in the agent's last network snapshot.
+fn saved_vxlan(mesh_key_dir: &std::path::Path) -> Option<(u32, u16)> {
+    let data = std::fs::read(mesh_key_dir.join("network-snapshot.json")).ok()?;
+    let snapshot: serde_json::Value = serde_json::from_slice(&data).ok()?;
+    vxlan_in_snapshot(&snapshot)
+}
+
+fn vxlan_in_snapshot(snapshot: &serde_json::Value) -> Option<(u32, u16)> {
+    let vxlan = snapshot.get("vxlan")?;
+    let vni = u32::try_from(vxlan.get("vni")?.as_u64()?).ok()?;
+    let port = u16::try_from(vxlan.get("port")?.as_u64()?).ok()?;
+    Some((vni, port))
 }
 
 /// The fingerprint of the cluster CA certificate at `path`.
@@ -774,6 +918,7 @@ mod tests {
             applied_overlay_network_name: None,
             ca_fingerprint: None,
             control_plane_wg_public_key: None,
+            applied_vxlan: None,
         }
     }
 
@@ -781,6 +926,7 @@ mod tests {
         Some(Ok(PlaneIdentity {
             ca_fingerprint: ca.map(str::to_string),
             control_plane_wg_public_key: key.map(str::to_string),
+            ..PlaneIdentity::default()
         }))
     }
 
@@ -1127,6 +1273,116 @@ mod tests {
         ));
     }
 
+    fn vxlan(name: &str, vni: u32) -> (VxlanDevice, HolderFacts) {
+        (
+            VxlanDevice {
+                name: name.into(),
+                vni,
+                port: 4789,
+            },
+            HolderFacts::device_only(name),
+        )
+    }
+
+    fn announcing(vni: Option<u32>) -> Option<Result<PlaneIdentity, String>> {
+        Some(Ok(PlaneIdentity {
+            vxlan_vni: vni,
+            vxlan_port: vni.map(|_| 4789),
+            ..PlaneIdentity::default()
+        }))
+    }
+
+    // ADR 062: another overlay's VXLAN device on the network ID this cluster
+    // uses is named before the token is spent, with the same message the
+    // agent would show, and never stops the join.
+    #[test]
+    fn a_vxlan_device_on_this_clusters_network_id_is_warned_about() {
+        let facts = HostFacts {
+            target_identity: announcing(None),
+            // Another overlay, renamed there (ADR 059), on the default ID.
+            vxlan_devices: vec![vxlan("vxlan-shop0", 42)],
+            ..admin()
+        };
+        let assessment = assess(&facts, join("https://cp.example"), &[], true);
+        let [finding] = assessment.findings.as_slice() else {
+            panic!("{:?}", assessment.findings);
+        };
+        assert!(!finding.blocks_join(false));
+        let message = finding.message();
+        assert_eq!(
+            message,
+            temps_network::vxlan_holder::describe(
+                &HolderFacts::device_only("vxlan-shop0"),
+                "vxlan-temps0",
+                42,
+                4789
+            )
+        );
+        assert!(message.contains("own network ID"), "{message}");
+
+        // A cluster with its own network ID is not in its way.
+        let own_id = HostFacts {
+            target_identity: announcing(Some(5_000_123)),
+            ..facts.clone()
+        };
+        assert!(assess(&own_id, join("https://cp.example"), &[], true)
+            .findings
+            .is_empty());
+        // Nor is a device on another port.
+        let mut other_port = facts.clone();
+        other_port.vxlan_devices[0].0.port = 8472;
+        assert!(assess(&other_port, join("https://cp.example"), &[], true)
+            .findings
+            .is_empty());
+    }
+
+    #[test]
+    fn this_nodes_own_vxlan_device_is_not_in_the_way() {
+        // Re-joining the same cluster: the agent replaces its own device.
+        let mut previous = saved("https://cp.example");
+        previous.overlay_network_name = Some("temps1".into());
+        previous.applied_vxlan = Some((5_000_123, 4789));
+        let facts = HostFacts {
+            saved: Some(previous),
+            vxlan_devices: vec![vxlan("vxlan-temps1", 5_000_123)],
+            ..admin()
+        };
+        assert!(assess(&facts, Purpose::ServiceInstall, &[], true)
+            .findings
+            .is_empty());
+
+        // Another cluster's device under the name this node moves off is.
+        let facts = HostFacts {
+            networks: vec![network("temps0", "10.202.0.0/24")],
+            vxlan_devices: vec![vxlan("vxlan-temps0", 42)],
+            ..admin()
+        };
+        let assessment = assess(&facts, join("https://cp.example"), &[], true);
+        assert_eq!(assessment.overlay_network_name.as_deref(), Some("temps1"));
+        let Some(Finding::VxlanIdInUse {
+            wanted, assumed, ..
+        }) = assessment.findings.last()
+        else {
+            panic!("{:?}", assessment.findings);
+        };
+        assert_eq!(wanted, "vxlan-temps1");
+        // Nothing said which ID the cluster uses: the message says so.
+        assert!(*assumed);
+        assert!(assessment
+            .findings
+            .last()
+            .unwrap()
+            .message()
+            .contains("assumes the default"));
+    }
+
+    #[test]
+    fn the_network_id_comes_from_the_snapshot_for_a_service_install() {
+        let snapshot = serde_json::json!({"vxlan": {"vni": 5000123, "port": 4790}});
+        assert_eq!(vxlan_in_snapshot(&snapshot), Some((5_000_123, 4790)));
+        assert_eq!(vxlan_in_snapshot(&serde_json::json!({"peers": []})), None);
+    }
+
     #[test]
     fn held_ports_are_reported_with_their_process() {
         let facts = HostFacts {
@@ -1159,20 +1415,21 @@ mod tests {
             .contains("public traffic on 80/443"));
     }
 
-    /// Ingress `off` binds no public listener: 443 held cannot stop the
-    /// worker, and the message about 80 does not blame public traffic.
+    /// Ingress `off` binds no public listener and the internal proxy has a
+    /// port of its own (ADR-098): a web server on 80 or 443 cannot stop the
+    /// worker, and only the proxy's port is checked.
     #[test]
     fn ingress_off_checks_only_the_overlay_proxy_port() {
         use temps_core::worker_ingress::{IngressMode, LocalIngress};
         let off = LocalIngress::default();
-        assert_eq!(served_ports(&off), (vec![80], false));
+        assert_eq!(served_ports(&off), (vec![591], false));
         let fixed = LocalIngress {
             mode: IngressMode::Fixed,
             http_port: 8080,
             https_port: 8443,
             ..LocalIngress::default()
         };
-        assert_eq!(served_ports(&fixed), (vec![80, 443, 8080, 8443], true));
+        assert_eq!(served_ports(&fixed), (vec![80, 443, 591, 8080, 8443], true));
         // `private` serves its own fixed ports, never the public ingress
         // ports, and takes no public traffic on them.
         let private = LocalIngress {
@@ -1181,7 +1438,7 @@ mod tests {
             https_port: 8443,
             ..LocalIngress::default()
         };
-        assert_eq!(served_ports(&private), (vec![80, 443], false));
+        assert_eq!(served_ports(&private), (vec![80, 443, 591], false));
 
         let facts = HostFacts {
             listeners: vec![
@@ -1198,17 +1455,57 @@ mod tests {
         };
         let (ports, serves_public) = served_ports(&off);
         let assessment = assess(&facts, Purpose::ServiceInstall, &ports, serves_public);
+        assert_eq!(
+            assessment.findings,
+            Vec::new(),
+            "80 and 443 belong to the operator"
+        );
+
+        let held = HostFacts {
+            listeners: vec![Listener {
+                address: "0.0.0.0:591".parse().unwrap(),
+                process: Some("httpd (pid 9)".into()),
+            }],
+            ..admin()
+        };
+        let assessment = assess(&held, Purpose::ServiceInstall, &ports, serves_public);
         assert!(matches!(
             assessment.findings.as_slice(),
             [Finding::PortInUse {
-                port: 80,
+                port: 591,
                 serves_public: false,
                 ..
             }]
         ));
         let message = assessment.findings[0].message();
-        assert!(message.contains("no public traffic"), "{message}");
+        assert!(message.contains("httpd (pid 9)"), "{message}");
+        assert!(
+            message.contains("internal proxy listens on port 591"),
+            "{message}"
+        );
+        assert!(message.contains("redirected"), "{message}");
         assert!(!message.contains("80/443"), "{message}");
+
+        // `private` holds port 80 of its private address: that message is
+        // about the private listener, not the internal proxy.
+        let (ports, serves_public) = served_ports(&private);
+        let assessment = assess(&facts, Purpose::ServiceInstall, &ports, serves_public);
+        let messages: Vec<String> = assessment.findings.iter().map(Finding::message).collect();
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert!(
+            messages[0].contains("serves HTTP on port 80"),
+            "{}",
+            messages[0]
+        );
+        assert!(
+            messages[1].contains("serves HTTPS on port 443"),
+            "{}",
+            messages[1]
+        );
+        assert!(
+            messages.iter().all(|m| !m.contains("internal proxy")),
+            "{messages:?}"
+        );
     }
 
     #[test]

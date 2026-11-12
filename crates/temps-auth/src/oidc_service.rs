@@ -26,12 +26,18 @@ use sea_orm::{
 use tokio::sync::Mutex;
 
 use crate::oidc_errors::OidcError;
+
+mod cloud_sessions;
 use crate::oidc_types::{
     derive_provider_slug, role_mapping_to_response, CreateOidcProviderRequest,
     CreateOidcRoleMappingRequest, OidcProviderSummary, OidcRoleMappingResponse,
     UpdateOidcProviderRequest,
 };
 use crate::user_service::UserService;
+pub use cloud_sessions::{
+    CloudLogoutApplied, CloudLogoutRefusal, CloudSessionCheck, CloudSessionStatus,
+    CLOUD_SESSION_CHECK_INTERVAL, CLOUD_SESSION_STALE_AFTER,
+};
 use temps_core::EncryptionService;
 use temps_entities::oidc_login_states;
 use temps_entities::oidc_providers;
@@ -2451,6 +2457,7 @@ mod tests {
             trust_idp_email: false,
             managed_by_cloud: false,
             admin_only_role_required: false,
+            cloud_sessions_confirmed_at: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -2511,6 +2518,7 @@ mod tests {
             trust_idp_email: false,
             managed_by_cloud: false,
             admin_only_role_required: false,
+            cloud_sessions_confirmed_at: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -2548,6 +2556,7 @@ mod tests {
             trust_idp_email: true,
             managed_by_cloud: true,
             admin_only_role_required: true,
+            cloud_sessions_confirmed_at: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }

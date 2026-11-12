@@ -70,10 +70,16 @@ export function WalHealthPanel({
     backupCapability.isError && !isRoleRefusal(backupCapability.error)
 
   const snapshot = data?.wal_health ?? null
+  const notChecked = data?.not_checked ?? null
   const incompatible = backupCapability.data?.cloud_backup_compatible === false
+  // An image upgrade fixes only what an image can: the capability names the
+  // image when it does. A service on a worker node gets none (its image
+  // cannot be changed from here), so it never gets the upgrade action.
+  const upgradeImage = backupCapability.data?.recommended_image ?? null
   const archivingDisabled = snapshot?.archive_mode === 'off' && !incompatible
   if (
     (!snapshot || snapshot.warnings.length === 0) &&
+    !notChecked &&
     !incompatible &&
     !archivingDisabled &&
     !checkFailed
@@ -86,6 +92,28 @@ export function WalHealthPanel({
 
   return (
     <div className="space-y-3">
+      {notChecked ? (
+        <Alert>
+          <AlertTriangle className="h-4 w-4" />
+          <AlertDescription>
+            <div className="flex items-baseline justify-between gap-3">
+              <p className="font-medium">WAL health is not being checked</p>
+              {notChecked.checked_at ? (
+                <p className="text-xs text-muted-foreground">
+                  Last tried <TimeAgo date={notChecked.checked_at} />
+                </p>
+              ) : null}
+            </div>
+            <p className="mt-1 text-xs text-muted-foreground">
+              {notChecked.reason}
+            </p>
+            <p className="mt-1 text-xs text-muted-foreground">
+              Until it is, this page cannot warn you when WAL fills the disk
+              or archiving stops.
+            </p>
+          </AlertDescription>
+        </Alert>
+      ) : null}
       {checkFailed ? (
         <Alert variant="destructive">
           <AlertTriangle className="h-4 w-4" />
@@ -115,7 +143,11 @@ export function WalHealthPanel({
           <AlertTriangle className="h-4 w-4" />
           <AlertDescription className="space-y-3">
             <div>
-              <p className="font-medium">Cloud backups need WAL-G</p>
+              <p className="font-medium">
+                {upgradeImage
+                  ? 'Cloud backups need WAL-G'
+                  : 'Cloud backups are not available for this service'}
+              </p>
               <p className="mt-1 text-xs text-muted-foreground">
                 {backupCapability.data?.reason}
               </p>
@@ -125,7 +157,7 @@ export function WalHealthPanel({
                 </p>
               ) : null}
             </div>
-            {onUpgrade ? (
+            {onUpgrade && upgradeImage ? (
               <Button size="sm" onClick={onUpgrade}>
                 Upgrade backup engine
               </Button>
