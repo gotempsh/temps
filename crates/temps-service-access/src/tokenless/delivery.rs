@@ -21,6 +21,35 @@ const FIELD: &str = "secret";
 const USERNAME: &str = "username";
 const PASSWORD: &str = "password";
 
+/// Name parts that mark a header as carrying a credential: `dd-application-key`,
+/// `x-app-secret`, `x-auth-token`, `x-session-id`. A fixed header is stored in
+/// the policy in plaintext, shown to everyone who can read the service
+/// (owners of linked sandboxes included), and not redacted from responses, so
+/// it must never hold a secret. A part matches when it is, starts with or ends
+/// with one of these (`apikey`, `authorization`, `accesstoken`). The common
+/// credential headers (`x-api-key`, `x-auth-token`) are refused earlier, as
+/// [`ALWAYS_STRIPPED`].
+const CREDENTIAL_NAME_PARTS: &[&str] = &[
+    "key",
+    "secret",
+    "token",
+    "password",
+    "passwd",
+    "auth",
+    "credential",
+    "signature",
+    "session",
+];
+
+/// True when `name` (lower case) reads like a header that carries a credential.
+fn names_a_credential(name: &str) -> bool {
+    name.split(['-', '_']).any(|part| {
+        CREDENTIAL_NAME_PARTS
+            .iter()
+            .any(|word| part.starts_with(word) || part.ends_with(word))
+    })
+}
+
 fn invalid(field: &'static str, reason: &'static str) -> AccessError {
     AccessError::Validation { field, reason }
 }
@@ -94,6 +123,12 @@ pub fn validate_delivery(delivery: &mut Option<CredentialDelivery>) -> Result<()
             return Err(invalid(
                 "delivery",
                 "credential headers belong in the credential format, not in fixed request headers",
+            ));
+        }
+        if names_a_credential(&header.name) {
+            return Err(invalid(
+                "delivery",
+                "a request header whose name marks it as a key, secret, token or password cannot be a fixed header: fixed headers are stored and shown as plain text to everyone who can read the service. A service sends one credential, in its credential format",
             ));
         }
     }
@@ -300,6 +335,46 @@ mod tests {
                 reason(delivery(header_format(bad), &[])).contains("delivery"),
                 "{bad}"
             );
+        }
+    }
+
+    /// A second credential typed into a fixed header would be stored and shown
+    /// in plain text, so names that mark one are refused; ordinary fixed
+    /// headers, including the account identifiers catalog templates send, are
+    /// not.
+    #[test]
+    fn fixed_headers_named_like_credentials_are_refused() {
+        for name in [
+            "DD-APPLICATION-KEY",
+            "x-app-key",
+            "x-apikey",
+            "x-client-secret",
+            "x-refresh-token",
+            "x-access-token",
+            "x-authority-proof",
+            "x-session-id",
+            "x-api-signature",
+            "x-db-password",
+            "x_partner_credential",
+        ] {
+            let error = reason(delivery(
+                header_format("dd-api-key"),
+                &[(name, "fixture-value")],
+            ));
+            assert!(error.contains("plain text"), "{name}: {error}");
+        }
+        for name in [
+            "notion-version",
+            "anthropic-version",
+            "openai-organization",
+            "x-algolia-application-id",
+            "plaid-client-id",
+            "harvest-account-id",
+            "accept",
+            "keep-alive-hint",
+        ] {
+            let mut value = delivery(CredentialFormat::Bearer, &[(name, "fixture-value")]);
+            validate_delivery(&mut value).unwrap_or_else(|error| panic!("{name}: {error}"));
         }
     }
 

@@ -109,6 +109,7 @@ fn catalog(query: ServiceCatalogQuery) -> Result<ServiceCatalog, AccessError> {
         } else {
             None
         };
+        let description = description_for(&template.id, template.description.clone());
         let (delivery, credential_labels) = delivery_for(&template);
         let credential_help = help_for(&template);
         let origin = template
@@ -133,7 +134,7 @@ fn catalog(query: ServiceCatalogQuery) -> Result<ServiceCatalog, AccessError> {
             popular: template.popular,
             id: template.id,
             name: template.name,
-            description: template.description,
+            description,
             category: category.into(),
             origin,
             supported: reason.is_none(),
@@ -164,6 +165,20 @@ fn catalog(query: ServiceCatalogQuery) -> Result<ServiceCatalog, AccessError> {
         page_size,
     })
 }
+/// A template's description, except where it advises a setup Temps refuses.
+/// Datadog's says to add `DD-APPLICATION-KEY` as a custom header: a second
+/// secret in a fixed header would be stored and shown in plain text, so
+/// [`crate::tokenless::delivery::validate_delivery`] rejects it, and the
+/// catalog says what the service does reach instead.
+fn description_for(id: &str, description: String) -> String {
+    match id {
+        "datadog" => "Metrics, logs and monitors. Temps sends the API key only, so endpoints \
+                      that also need an application key are not available."
+            .into(),
+        _ => description,
+    }
+}
+
 /// The delivery a template needs, or `None` for a plain bearer token, with the
 /// labels for its credential inputs. Header values that are `{{VARIABLE}}`
 /// placeholders ship empty: the operator supplies them for their own account.
@@ -376,6 +391,40 @@ mod tests {
         assert!(reference_for_origin("https://internal.example.invalid").is_none());
         assert!(reference_for_origin("http://slack.com").is_none());
     }
+    /// No entry tells the operator to put a credential in a request header:
+    /// fixed headers are plain text that linked sandbox owners can read, so
+    /// validation refuses one, and the catalog must not advise it.
+    #[test]
+    fn no_entry_advises_a_second_credential_in_a_request_header() {
+        let mut checked = 0;
+        for page in 1..=3 {
+            let all = catalog(ServiceCatalogQuery {
+                page: Some(page),
+                page_size: Some(100),
+                ..Default::default()
+            })
+            .unwrap();
+            for entry in all.items {
+                let description = entry.description.to_lowercase();
+                assert!(
+                    !description.contains("custom header"),
+                    "{}: {}",
+                    entry.id,
+                    entry.description
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 60, "only {checked} entries were checked");
+        let datadog = catalog(ServiceCatalogQuery {
+            id: Some("datadog".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(datadog.items[0].supported);
+        assert!(datadog.items[0].description.contains("API key only"));
+    }
+
     #[test]
     fn every_listed_http_service_is_supported_with_a_deliverable_credential_format() {
         let mut checked = 0;
