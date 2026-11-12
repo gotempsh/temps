@@ -253,16 +253,16 @@ pub const MAX_ENRICHMENT_BYTES: usize = 64 * 1024;
 pub const MAX_ENRICHMENT_KEYS: usize = 128;
 
 /// How far before the requested window `get_page_path_visitors` reads a
-/// session's earlier page views to number them (`session_page_number`,
-/// `is_entry`, `is_bounce`).
+/// session's earlier page views to number them (`session_page_number`).
 ///
 /// A session is a sliding 30-minute inactivity window, so one continuously
 /// active client can keep a single session for days. Reading every event such
 /// a session ever had made the request cost grow with the session's whole
 /// history; this bound caps it. A session that already had page views more
 /// than this long before the window is numbered from the first page view
-/// inside the bound, so its page number is lower than the true one and its
-/// first in-bound view can report `is_entry`.
+/// inside the bound, so its page number is lower than the true one.
+/// `is_entry` and `is_bounce` stay exact: an existence check covers the
+/// earlier page views.
 const PAGE_VISITORS_SESSION_LOOKBACK_HOURS: i64 = 24;
 
 /// How far past the requested window `get_page_path_visitors` reads a
@@ -271,14 +271,18 @@ const PAGE_VISITORS_SESSION_LOOKBACK_HOURS: i64 = 24;
 /// an existence check, since it puts time on page at the 1800s clamp.
 const PAGE_VISITORS_SESSION_LOOKAHEAD_MINUTES: i64 = 30;
 
-/// How far before a visitor's `first_seen` (or a session's `started_at`) its
-/// rows may be timestamped. Events are stamped with the server clock at ingest
-/// after the visitor row exists, and a request log only carries a session id
-/// once the proxy has upserted that session, so the only gap is batch-writer
-/// delay and clock skew between proxy nodes and the control plane; a day is
-/// far beyond both. Used as a lower time bound so TimescaleDB skips chunks
-/// (including compressed ones, which cannot use the visitor or session index)
-/// that cannot hold the rows.
+/// How far outside a visitor's `first_seen` or a session's
+/// `[started_at, last_accessed_at]` its rows may be timestamped. Events are
+/// stamped with the server clock at ingest after the visitor row exists, and a
+/// request log only carries a session id once the proxy has upserted that
+/// session. The proxy re-issues the session cookie (`Max-Age` = the session
+/// timeout, 30 minutes by default) only on the tracked document responses that
+/// also move `last_accessed_at`, so a browser stops sending a session id within
+/// that timeout of the session's last recorded access. The gaps are therefore
+/// the session timeout, batch-writer delay and clock skew between proxy nodes
+/// and the control plane; a day is far beyond them. Used as a time bound so
+/// TimescaleDB skips chunks (including compressed ones, which cannot use the
+/// visitor or session index) that cannot hold the rows.
 const ANALYTICS_ROW_CLOCK_SLACK_HOURS: i32 = 24;
 
 /// `ts` minus [`ANALYTICS_ROW_CLOCK_SLACK_HOURS`], saturated at the minimum
@@ -313,13 +317,16 @@ fn earliest_row_time(ts: UtcDateTime) -> UtcDateTime {
 ///     the 1800s clamp: only its existence is checked.
 ///   Priority 3: the session's own last_accessed_at, which covers the
 ///     exit page (no next event), then a 1s floor.
-/// is_exit / is_bounce also account for page views past $9, so they
-/// are exact; session_page_number / is_entry count page views from $8
-/// (see [`PAGE_VISITORS_SESSION_LOOKBACK_HOURS`]).
+/// is_entry / is_exit / is_bounce also account for the session's page
+/// views before $8 and after $9 (existence checks bounded by the session's
+/// own lifetime, see [`ANALYTICS_ROW_CLOCK_SLACK_HOURS`]), so they are
+/// exact; session_page_number counts page views from $8 (see
+/// [`PAGE_VISITORS_SESSION_LOOKBACK_HOURS`]).
 ///
 /// Parameters: `$1` project_id, `$2` page_path, `$3`/`$4` window start/end,
 /// `$5` environment_id (NULL for all), `$6`/`$7` LIMIT/OFFSET, `$8`/`$9` the
-/// session-event bounds from [`page_path_visitors_context_bounds`].
+/// session-event bounds from [`page_path_visitors_context_bounds`], `$10`
+/// [`ANALYTICS_ROW_CLOCK_SLACK_HOURS`].
 const PAGE_PATH_VISITORS_SQL: &str = r#"
             WITH target_views AS MATERIALIZED (
                 SELECT
@@ -384,27 +391,52 @@ const PAGE_PATH_VISITORS_SQL: &str = r#"
                 ) w
                 WHERE w.event_id = ANY(ts.target_event_ids)
             ),
-            session_meta AS MATERIALIZED (
+            session_lifetimes AS MATERIALIZED (
                 SELECT
                     ts.session_id,
                     -- Tolerate both bare-UUID and legacy v2|uuid|ts formats in
-                    -- events.session_id (see get_visitor_sessions_by_id
-                    -- comment): two unique-index lookups per session.
+                    -- events.session_id (see VISITOR_SESSIONS_SQL): two
+                    -- unique-index lookups per session.
+                    COALESCE(rs_exact.started_at, rs_v2.started_at) AS session_started_at,
                     COALESCE(rs_exact.last_accessed_at, rs_v2.last_accessed_at)
-                        AS session_last_accessed_at,
-                    EXISTS (
-                        SELECT 1
-                        FROM events later
-                        WHERE later.session_id = ts.session_id
-                          AND later.project_id = $1
-                          AND later.event_type = 'page_view'
-                          AND later.timestamp > $9
-                    ) AS has_page_view_after_bound
+                        AS session_last_accessed_at
                 FROM target_sessions ts
                 LEFT JOIN request_sessions rs_exact ON rs_exact.session_id = ts.session_id
                 LEFT JOIN request_sessions rs_v2
                     ON ts.session_id LIKE 'v2|%'
                     AND rs_v2.session_id = split_part(ts.session_id, '|', 2)
+            ),
+            -- Whether the session has page views outside [$8, $9]. Each
+            -- probe is bounded by the session's own lifetime (widened by the
+            -- clock slack), so only the chunks the session spans are read,
+            -- never everything up to now or back to the project's start. A
+            -- session without a request_sessions row (yet) falls back to
+            -- the slack around the bounds.
+            session_meta AS MATERIALIZED (
+                SELECT
+                    sl.session_id,
+                    sl.session_last_accessed_at,
+                    EXISTS (
+                        SELECT 1
+                        FROM events earlier
+                        WHERE earlier.session_id = sl.session_id
+                          AND earlier.project_id = $1
+                          AND earlier.event_type = 'page_view'
+                          AND earlier.timestamp < $8
+                          AND earlier.timestamp >= COALESCE(sl.session_started_at, $8)
+                              - make_interval(hours => $10)
+                    ) AS has_page_view_before_bound,
+                    EXISTS (
+                        SELECT 1
+                        FROM events later
+                        WHERE later.session_id = sl.session_id
+                          AND later.project_id = $1
+                          AND later.event_type = 'page_view'
+                          AND later.timestamp > $9
+                          AND later.timestamp <= COALESCE(sl.session_last_accessed_at, $9)
+                              + make_interval(hours => $10)
+                    ) AS has_page_view_after_bound
+                FROM session_lifetimes sl
             )
             SELECT
                 tv.visitor_id,
@@ -433,9 +465,13 @@ const PAGE_PATH_VISITORS_SQL: &str = r#"
                         ) - tv.viewed_at
                     ))::int))
                 END AS time_on_page,
-                (spv.pv_number = 1) AS is_entry,
+                (spv.pv_number = 1 AND NOT sm.has_page_view_before_bound) AS is_entry,
                 (spv.pv_number = spv.pv_total AND NOT sm.has_page_view_after_bound) AS is_exit,
-                (spv.pv_total <= 1 AND NOT sm.has_page_view_after_bound) AS is_bounce,
+                (
+                    spv.pv_total <= 1
+                    AND NOT sm.has_page_view_before_bound
+                    AND NOT sm.has_page_view_after_bound
+                ) AS is_bounce,
                 spv.pv_number::int AS session_page_number,
                 tv.referrer,
                 tv.browser,
@@ -3781,6 +3817,7 @@ WHERE project_id = $1
                 offset_value.into(),
                 context_start.into(),
                 context_end.into(),
+                ANALYTICS_ROW_CLOCK_SLACK_HOURS.into(),
             ],
         );
 
@@ -7137,7 +7174,8 @@ mod tests {
         seed.event(busy, "page_leave", TARGET, at(1001)).await?;
         // Page views before the lookback: outside the bound, so the session
         // is numbered from its first page view inside it (documented on
-        // PAGE_VISITORS_SESSION_LOOKBACK_HOURS).
+        // PAGE_VISITORS_SESSION_LOOKBACK_HOURS), but none of its views is the
+        // entry.
         for minute in 0..5 {
             let ts = w0 - chrono::Duration::hours(30) + chrono::Duration::minutes(minute);
             seed.event(busy, "page_view", "/bulk/early", ts).await?;
@@ -7216,6 +7254,7 @@ mod tests {
                     0i64.into(),
                     context_start.into(),
                     context_end.into(),
+                    ANALYTICS_ROW_CLOCK_SLACK_HOURS.into(),
                 ],
             ))
             .await?
@@ -7234,7 +7273,7 @@ mod tests {
                 at(2 * k),
                 busy.to_string(),
                 Some(time),
-                k == 0,
+                false,
                 false,
                 false,
                 Some(k as i32 + 1),
@@ -8065,6 +8104,117 @@ mod tests {
         assert!(
             !reads_any(&read, &old_chunks),
             "the count read a chunk from before the session: {read:?}"
+        );
+
+        cleanup_test_analytics!(db);
+        Ok(())
+    }
+
+    /// A session's page views outside the `[$8, $9]` bounds of
+    /// `get_page_path_visitors` still decide `is_entry` / `is_exit` /
+    /// `is_bounce`, and the existence checks that see them read only the
+    /// chunks of the session's own lifetime, never the project's history up
+    /// to now or back to its start.
+    #[tokio::test]
+    async fn test_get_page_path_visitors_flags_see_the_whole_session_within_its_lifetime(
+    ) -> anyhow::Result<()> {
+        let Some((service, db, _container)) =
+            analytics_service_or_skip("test_page_path_visitors_session_lifetime").await
+        else {
+            return Ok(());
+        };
+        let db = db.as_ref();
+        let scope = seeded_scope(db).await?;
+        let (project_id, env_id) = (scope.project_id, scope.environment_id);
+        let seed = FlowSeeder {
+            db,
+            project_id,
+            environment_id: Some(env_id),
+            visitor_id: None,
+        };
+        const TARGET: &str = "/pricing";
+        let w0 = chrono::DateTime::parse_from_rfc3339("2026-04-10T12:00:00Z")?
+            .with_timezone(&chrono::Utc);
+        let window_end = w0 + chrono::Duration::hours(1);
+        let min = |m: i64| w0 + chrono::Duration::minutes(m);
+
+        // Kept alive for more than a day: one page view 30h before the
+        // window (outside the lookback), one target view inside it.
+        insert_request_session(db, "long-lived", min(-30 * 60), min(20), None).await?;
+        seed.event("long-lived", "page_view", "/a", min(-30 * 60))
+            .await?;
+        seed.event("long-lived", "page_view", TARGET, min(10))
+            .await?;
+        // A real bounce next to it.
+        insert_request_session(db, "single-view", min(5), min(6), None).await?;
+        seed.event("single-view", "page_view", TARGET, min(5))
+            .await?;
+        // Other sessions' page views two months before and after: the
+        // existence checks must not read their chunks.
+        let before = w0 - chrono::Duration::days(60);
+        let after = w0 + chrono::Duration::days(60);
+        seed.event("earlier-session", "page_view", "/x", before)
+            .await?;
+        seed.event("later-session", "page_view", "/x", after)
+            .await?;
+
+        let response = service
+            .get_page_path_visitors(project_id, TARGET, w0, window_end, Some(env_id), 1, 50)
+            .await?;
+        let listed: Vec<_> = response
+            .sessions
+            .iter()
+            .map(|s| {
+                (
+                    s.session_id.clone().unwrap_or_default(),
+                    s.is_entry,
+                    s.is_exit,
+                    s.is_bounce,
+                    s.session_page_number,
+                )
+            })
+            .collect();
+        assert_eq!(
+            listed,
+            vec![
+                ("long-lived".to_string(), false, true, false, Some(1)),
+                ("single-view".to_string(), true, true, true, Some(1)),
+            ],
+            "a page view before the lookback rules out entry and bounce"
+        );
+
+        let (context_start, context_end) = page_path_visitors_context_bounds(w0, window_end);
+        let (_, read) = explain_analyze(
+            db,
+            PAGE_PATH_VISITORS_SQL,
+            vec![
+                project_id.into(),
+                TARGET.into(),
+                w0.into(),
+                window_end.into(),
+                Some(env_id).into(),
+                50i64.into(),
+                0i64.into(),
+                context_start.into(),
+                context_end.into(),
+                ANALYTICS_ROW_CLOCK_SLACK_HOURS.into(),
+            ],
+        )
+        .await?;
+        let window_chunks = chunks_holding(db, "events", min(10)).await?;
+        let long_ago_chunks = chunks_holding(db, "events", min(-30 * 60)).await?;
+        assert!(reads_any(&read, &window_chunks), "{read:?}");
+        assert!(
+            reads_any(&read, &long_ago_chunks),
+            "the earlier-page-view check must reach the session's start: {read:?}"
+        );
+        assert!(
+            !reads_any(&read, &chunks_holding(db, "events", before).await?),
+            "a check read a chunk from before any listed session started: {read:?}"
+        );
+        assert!(
+            !reads_any(&read, &chunks_holding(db, "events", after).await?),
+            "a check read a chunk from after every listed session ended: {read:?}"
         );
 
         cleanup_test_analytics!(db);
