@@ -22,6 +22,8 @@ Static deployments follow a different path than server deployments:
 
 This means your static site uses zero memory and zero CPU after the build completes. The proxy handles compression, caching, and routing.
 
+No Git repository? A folder or HTML file of plain static files, with no build step, can be dropped into the console and is served the same way. See [Deploy from local files](/docs/deploy-from-local-files).
+
 ### What counts as static
 
 A deployment is static when Temps can determine that the build output is a set of HTML, CSS, and JavaScript files with no server component. The following frameworks produce static output by default:
