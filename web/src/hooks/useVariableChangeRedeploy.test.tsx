@@ -16,7 +16,9 @@ afterEach(cleanup)
 
 async function confirmChange(
   sourceType: SourceType,
-  deployment: Record<string, unknown> = {}
+  deployment: Record<string, unknown> = {},
+  // On: a project that took an uploaded archive can take it again.
+  allowAlternateSources = true
 ) {
   const api = mockApi({
     'GET /projects/7/environments': () =>
@@ -40,7 +42,12 @@ async function confirmChange(
     <QueryClientProvider client={client}>{children}</QueryClientProvider>
   )
   const { result } = renderHook(
-    () => useVariableChangeRedeploy({ id: 7, source_type: sourceType }),
+    () =>
+      useVariableChangeRedeploy({
+        id: 7,
+        source_type: sourceType,
+        allow_alternate_sources: allowAlternateSources,
+      }),
     { wrapper }
   )
   await result.current('API_KEY updated', 'all')
@@ -81,4 +88,26 @@ test('a Git project whose live deployment is an uploaded archive is told to uplo
   })
   expect(options.action).toBeUndefined()
   expect(options.description).toContain('Upload the source again')
+})
+
+// The server takes an archive into a Git project only while Other sources is
+// on, so "upload again" would end in a refusal.
+test('a Git project with Other sources off is told to turn it on before uploading again', async () => {
+  const [, options] = await confirmChange(
+    'git',
+    { metadata: { deploymentSourceType: 'uploaded_source' } },
+    false
+  )
+  expect(options.action).toBeUndefined()
+  expect(options.description).toContain(
+    'accepts only while Other sources is on'
+  )
+  expect(options.description).toContain('ask an administrator')
+})
+
+test('an uploaded-source project is told to upload again whatever Other sources says', async () => {
+  const [, options] = await confirmChange('uploaded_source', {}, false)
+  expect(options.description).toBe(
+    'Applies on next deploy. Upload the source again to apply it now.'
+  )
 })

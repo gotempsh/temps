@@ -89,4 +89,15 @@ describe('variableChangeRedeployMessage', () => {
       'Applies on next deploy. Upload the source again to apply it now.'
     )
   })
+
+  test('says to turn on Other sources first when the project would refuse the upload', () => {
+    const message = variableChangeRedeployMessage(
+      [{ name: 'production' }],
+      false,
+      false
+    )
+    expect(message).toContain('Other sources')
+    expect(message).toContain('then upload the source again')
+    expect(message).not.toContain('Redeploy production')
+  })
 })

@@ -36,14 +36,23 @@ export function combinedScope(
   return [...new Set((scopes as readonly (readonly number[])[]).flat())]
 }
 
-/** Toast body after a change, e.g. "Applies on next deploy. Redeploy production to apply it now." */
+/**
+ * Toast body after a change, e.g. "Applies on next deploy. Redeploy production
+ * to apply it now." When nothing can be redeployed in place it says to upload
+ * the source again, and when the project would refuse that upload too
+ * (`uploadAccepted`, see `acceptsSourceArchive`), that Other sources must be
+ * turned on first.
+ */
 export function variableChangeRedeployMessage(
   targets: Pick<EnvironmentResponse, 'name'>[],
-  redeployable = true
+  redeployable = true,
+  uploadAccepted = true
 ): string {
   const names = targets.map((environment) => environment.name)
   if (!redeployable && names.length > 0) {
-    return 'Applies on next deploy. Upload the source again to apply it now.'
+    return uploadAccepted
+      ? 'Applies on next deploy. Upload the source again to apply it now.'
+      : 'Applies on next deploy. It runs an uploaded archive, which this service accepts only while Other sources is on in its settings. Turn it on (or ask an administrator to), then upload the source again to apply it now.'
   }
   const where =
     names.length === 1
