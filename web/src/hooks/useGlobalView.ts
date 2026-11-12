@@ -54,6 +54,11 @@ export function useGlobalView() {
     search: params.get('q') ?? '',
     setRange,
     setTimeRange,
+    /**
+     * Moves a relative window to now and leaves everything else, page
+     * included, as it is (a Refresh). A custom window does not move.
+     */
+    advance: () => setNow(Date.now()),
     setPage: (page: number) =>
       updateParams(
         (next) => {

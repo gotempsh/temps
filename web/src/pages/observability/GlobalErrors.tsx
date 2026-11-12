@@ -4,8 +4,12 @@
 import { number } from '@/lib/global-observability'
 import { useGlobalView } from '@/hooks/useGlobalView'
 import { Link } from 'react-router'
-import { useQuery } from '@tanstack/react-query'
-import { listGlobalErrorGroupsOptions } from '@/api/client/@tanstack/react-query.gen'
+import { keepPreviousData, useQuery } from '@tanstack/react-query'
+import {
+  listGlobalErrorGroupsOptions,
+  listGlobalErrorGroupsQueryKey,
+} from '@/api/client/@tanstack/react-query.gen'
+import { queryKeyPrefix } from '@/lib/refresh'
 import {
   GlobalPage,
   GlobalPagination,
@@ -34,6 +38,7 @@ export default function GlobalErrors() {
     ? view.params.get('status')!
     : 'all'
   const query = useQuery({
+    placeholderData: keepPreviousData,
     ...listGlobalErrorGroupsOptions({
       query: {
         project_id: view.projectId,
@@ -52,8 +57,7 @@ export default function GlobalErrors() {
       title="Errors"
       description="Review application issues across your services. Event and user counts cover the selected time range."
       view={view}
-      fetching={query.isFetching}
-      refresh={() => void query.refetch()}
+      refreshQueryKeys={[queryKeyPrefix(listGlobalErrorGroupsQueryKey)]}
       searchLabel="Search errors"
       filters={
         <FilterSelect

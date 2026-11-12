@@ -23,8 +23,12 @@ import {
 } from '@/lib/attribute-facets'
 import { RecordLink, RecordRow } from '@temps-sdk/ds'
 import { Link } from 'react-router'
-import { useQuery } from '@tanstack/react-query'
-import { queryGlobalTraceSummariesOptions } from '@/api/client/@tanstack/react-query.gen'
+import { keepPreviousData, useQuery } from '@tanstack/react-query'
+import {
+  queryGlobalTraceSummariesOptions,
+  queryGlobalTraceSummariesQueryKey,
+} from '@/api/client/@tanstack/react-query.gen'
+import { queryKeyPrefix } from '@/lib/refresh'
 import {
   GlobalPage,
   GlobalPagination,
@@ -105,6 +109,7 @@ export default function GlobalTraces() {
     patchView,
   ])
   const query = useQuery({
+    placeholderData: keepPreviousData,
     ...queryGlobalTraceSummariesOptions({
       query: {
         project_id: view.projectId,
@@ -132,8 +137,7 @@ export default function GlobalTraces() {
       title="Traces"
       description="Follow requests across services."
       view={view}
-      fetching={query.isFetching}
-      refresh={() => void query.refetch()}
+      refreshQueryKeys={[queryKeyPrefix(queryGlobalTraceSummariesQueryKey)]}
       searchLabel="Search span names"
       filterNotice={attribute.notice}
       filters={

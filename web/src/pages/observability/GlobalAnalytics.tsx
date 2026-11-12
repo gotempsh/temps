@@ -4,8 +4,12 @@
 import { useState, type ReactNode } from 'react'
 import { Button } from '@/components/ui/button'
 import { OBSERVABILITY_PAGE_SIZE } from '@/lib/global-observability'
-import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { getGlobalAnalyticsOptions } from '@/api/client/@tanstack/react-query.gen'
+import { keepPreviousData, useQuery } from '@tanstack/react-query'
+import {
+  getGlobalAnalyticsOptions,
+  getGlobalAnalyticsQueryKey,
+} from '@/api/client/@tanstack/react-query.gen'
+import { queryKeyPrefix } from '@/lib/refresh'
 import {
   AnalyticsTrafficChart,
   type AnalyticsMetric,
@@ -45,8 +49,8 @@ function Breakdown({
   totalVisitors: number
   expanded?: boolean
 }) {
-  const query = useQuery(
-    getGlobalAnalyticsOptions({
+  const query = useQuery({
+    ...getGlobalAnalyticsOptions({
       query: {
         project_id: view.projectId,
         start_date: view.from,
@@ -59,8 +63,10 @@ function Breakdown({
         search: view.search || undefined,
         page: expanded ? view.page : 1,
       },
-    })
-  )
+    }),
+    // Refresh moves the window: keep the numbers on screen meanwhile.
+    placeholderData: keepPreviousData,
+  })
   return (
     <DataSection
       title={title}
@@ -123,24 +129,29 @@ function Breakdown({
 }
 export default function GlobalAnalytics() {
   const view = useGlobalView()
-  const queryClient = useQueryClient()
   const [metric, setMetric] = useState<AnalyticsMetric>('visitors')
   const common = {
     project_id: view.projectId,
     start_date: view.from,
     end_date: view.to,
   }
-  const summary = useQuery(
-    getGlobalAnalyticsOptions({ query: { ...common, facet: 'summary' } })
-  )
-  const traffic = useQuery(
-    getGlobalAnalyticsOptions({ query: { ...common, facet: 'traffic' } })
-  )
-  const pages = useQuery(
-    getGlobalAnalyticsOptions({
+  const summary = useQuery({
+    ...getGlobalAnalyticsOptions({ query: { ...common, facet: 'summary' } }),
+    // Refresh moves the window: keep the numbers on screen meanwhile.
+    placeholderData: keepPreviousData,
+  })
+  const traffic = useQuery({
+    ...getGlobalAnalyticsOptions({ query: { ...common, facet: 'traffic' } }),
+    // Refresh moves the window: keep the numbers on screen meanwhile.
+    placeholderData: keepPreviousData,
+  })
+  const pages = useQuery({
+    ...getGlobalAnalyticsOptions({
       query: { ...common, facet: 'pages', per_page: 1 },
-    })
-  )
+    }),
+    // Refresh moves the window: keep the numbers on screen meanwhile.
+    placeholderData: keepPreviousData,
+  })
   const totals = summary.data?.rows[0]
   const grid = (children: ReactNode) => (
     <div className="grid min-w-0 grid-cols-1 gap-4 md:grid-cols-2">
@@ -184,14 +195,7 @@ export default function GlobalAnalytics() {
       title="Analytics"
       description="Traffic, audience, and engagement across your services."
       view={view}
-      fetching={summary.isFetching || traffic.isFetching || pages.isFetching}
-      refresh={() => {
-        void queryClient.invalidateQueries({
-          predicate: (query) =>
-            (query.queryKey[0] as { _id?: string })?._id ===
-            'getGlobalAnalytics',
-        })
-      }}
+      refreshQueryKeys={[queryKeyPrefix(getGlobalAnalyticsQueryKey)]}
       searchLabel="Search analytics breakdowns"
     >
       {expandedTitle && selectedBreakdown ? (
