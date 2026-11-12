@@ -46,7 +46,10 @@ export function markReadFailureHandled(error: unknown): void {
   handledListeners.forEach((listener) => listener())
 }
 
-/** Be told when a component starts explaining an error itself. */
+/**
+ * Be told when a component starts explaining an error itself, or keeps
+ * showing earlier data in its place.
+ */
 export function subscribeToHandledReadFailures(
   listener: () => void
 ): () => void {
@@ -54,6 +57,27 @@ export function subscribeToHandledReadFailures(
   return () => {
     handledListeners.delete(listener)
   }
+}
+
+/** Errors of reads whose component still shows earlier data in their place. */
+const retainedErrors = new WeakSet<object>()
+
+/**
+ * Record that `error` failed a read whose component keeps showing earlier
+ * data (a moved window that did not load): the route-level report still says
+ * the latest data is unavailable, since the page itself does not.
+ */
+export function markReadFailureRetained(error: unknown): void {
+  if (error === null || typeof error !== 'object') return
+  if (retainedErrors.has(error)) return
+  retainedErrors.add(error)
+  handledListeners.forEach((listener) => listener())
+}
+
+function isRetained(error: unknown): boolean {
+  return (
+    error !== null && typeof error === 'object' && retainedErrors.has(error)
+  )
 }
 
 function isHandled(error: unknown): boolean {
@@ -92,6 +116,8 @@ export function isExpectedQueryFailure(query: Query): boolean {
 export interface RouteQueryFailure {
   queryHash: string
   error: unknown
+  /** The page still shows earlier data in its place. */
+  retained: boolean
 }
 
 /**
@@ -117,7 +143,11 @@ export function collectRouteQueryFailures(
         isReportableReadFailure(query.state.error) &&
         !isHandled(query.state.error),
     })
-    .map((query) => ({ queryHash: query.queryHash, error: query.state.error }))
+    .map((query) => ({
+      queryHash: query.queryHash,
+      error: query.state.error,
+      retained: isRetained(query.state.error),
+    }))
 }
 
 /**

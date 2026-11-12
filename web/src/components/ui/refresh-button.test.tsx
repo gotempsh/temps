@@ -20,6 +20,7 @@ import { useState, type ReactNode } from 'react'
 import { toast } from 'sonner'
 import { installBrowserWindow } from '@/test/dom'
 import { ROUTE_FAILURE_IGNORE_REFUSAL } from '@/lib/route-query-failures'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 import { RefreshButton } from './refresh-button'
 
 installBrowserWindow()
@@ -263,6 +264,41 @@ describe('RefreshButton', () => {
     await act(async () => answers.get(2)!.resolve('window 2'))
     await screen.findByText('window 2')
     await screen.findByText('Updated just now')
+  })
+
+  test('moves a window query as a move, so its rows stay while it loads', async () => {
+    const answers = new Map<number, ReturnType<typeof deferred<string>>>()
+    function Page() {
+      const [end, setEnd] = useState(10)
+      const rows = useWindowQuery({
+        queryKey: ['visits', { start_date: end - 10, end_date: end }],
+        queryFn: () => {
+          const answer = deferred<string>()
+          answers.set(end, answer)
+          return answer.promise
+        },
+      })
+      return (
+        <>
+          <RefreshButton
+            queryKeys={[['visits']]}
+            onRefresh={() => setEnd((n) => n + 1)}
+          />
+          <p>{rows.data ?? 'loading'}</p>
+        </>
+      )
+    }
+    renderWithClient(<Page />)
+    await waitFor(() => expect(answers.has(10)).toBe(true))
+    await act(async () => answers.get(10)!.resolve('visits 10'))
+    await screen.findByText('visits 10')
+
+    fireEvent.click(refreshButton())
+
+    await waitFor(() => expect(answers.has(11)).toBe(true))
+    expect(screen.getByText('visits 10')).toBeTruthy()
+    await act(async () => answers.get(11)!.resolve('visits 11'))
+    await screen.findByText('visits 11')
   })
 
   test('never reloads the document', async () => {

@@ -2,7 +2,21 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { describe, expect, test } from 'bun:test'
-import { formatUpdatedAgo, keepPreviousWindow, queryKeyPrefix } from './refresh'
+import {
+  QueryClient,
+  type QueryCache,
+  type QueryKey,
+} from '@tanstack/react-query'
+import {
+  forgetWindowMove,
+  formatUpdatedAgo,
+  isMovingWindows,
+  keepPreviousWindow,
+  moveWindows,
+  previousWindowQuery,
+  queryKeyPrefix,
+  recordWindowMove,
+} from './refresh'
 
 describe('formatUpdatedAgo', () => {
   const at = Date.UTC(2026, 0, 1)
@@ -49,85 +63,114 @@ describe('keepPreviousWindow', () => {
   }
   const rows = ['France', 'Germany']
 
+  /** The cache after `from` loaded `rows`. */
+  function loaded(from: QueryKey): QueryCache {
+    const client = new QueryClient()
+    client.setQueryData(from, rows)
+    return client.getQueryCache()
+  }
+
+  /** What `to` shows while it loads, after `from`'s window moved to it. */
+  function afterMove(from: QueryKey, to: QueryKey, cache = loaded(from)) {
+    recordWindowMove(cache, from, to)
+    return keepPreviousWindow(to)(rows, { queryKey: from })
+  }
+
   test('keeps the previous data when only the window moved', () => {
-    const placeholder = keepPreviousWindow(
-      key({ ...moved, group_by: 'country' })
-    )
     expect(
-      placeholder(rows, { queryKey: key({ ...window, group_by: 'country' }) })
+      afterMove(
+        key({ ...window, group_by: 'country' }),
+        key({ ...moved, group_by: 'country' })
+      )
     ).toBe(rows)
   })
 
-  test('drops it when anything else changed: a drill-down, a service, a page', () => {
-    const drilled = keepPreviousWindow(
-      key({ ...window, group_by: 'region', filter_country: 'France' })
-    )
+  test('keeps it for a move of any shape: an end-only move, a short window long idle', () => {
     expect(
-      drilled(rows, { queryKey: key({ ...window, group_by: 'country' }) })
+      afterMove(
+        key(window),
+        key({ start_date: window.start_date, end_date: moved.end_date })
+      )
+    ).toBe(rows)
+    expect(
+      afterMove(
+        key({
+          start_date: '2026-01-02T00:00:00Z',
+          end_date: '2026-01-02T01:00:00Z',
+        }),
+        key({
+          start_date: '2026-01-02T05:00:00Z',
+          end_date: '2026-01-02T06:00:00Z',
+        })
+      )
+    ).toBe(rows)
+  })
+
+  test('drops it when a move changed anything else: a drill-down, a service', () => {
+    expect(
+      afterMove(
+        key({ ...window, group_by: 'country' }),
+        key({ ...moved, group_by: 'region', filter_country: 'France' })
+      )
     ).toBeUndefined()
-    const otherService = keepPreviousWindow([
-      {
-        _id: 'getBreakdown',
-        baseUrl: '',
-        path: { project_id: 8 },
-        query: window,
-      },
-    ])
-    expect(otherService(rows, { queryKey: key(window) })).toBeUndefined()
+    expect(
+      afterMove(key(window), [
+        {
+          _id: 'getBreakdown',
+          baseUrl: '',
+          path: { project_id: 8 },
+          query: moved,
+        },
+      ])
+    ).toBeUndefined()
   })
 
-  test('keeps it when a range anchored to a day only moves its end ("today")', () => {
-    const today = keepPreviousWindow(
-      key({ start_date: window.start_date, end_date: moved.end_date })
-    )
-    expect(today(rows, { queryKey: key(window) })).toBe(rows)
-  })
-
-  test('drops it when another range is picked, wider, narrower or elsewhere', () => {
-    const lastWeek = keepPreviousWindow(
-      key({ start_date: '2025-12-26T00:05:00Z', end_date: moved.end_date })
-    )
-    expect(lastWeek(rows, { queryKey: key(window) })).toBeUndefined()
-    const lastHour = keepPreviousWindow(
-      key({ start_date: '2026-01-01T23:05:00Z', end_date: moved.end_date })
-    )
-    expect(lastHour(rows, { queryKey: key(window) })).toBeUndefined()
-    const nextDay = keepPreviousWindow(
-      key({ start_date: window.end_date, end_date: '2026-01-03T00:00:00Z' })
-    )
-    expect(nextDay(rows, { queryKey: key(window) })).toBeUndefined()
-    const earlier = keepPreviousWindow(
-      key({
-        start_date: '2025-12-31T00:00:00Z',
-        end_date: '2026-01-01T00:00:00Z',
-      })
-    )
-    expect(earlier(rows, { queryKey: key(window) })).toBeUndefined()
-  })
-
-  test('keeps it when an idle Refresh moves a short window past its own length', () => {
-    const lastHour = (end: string) => ({
-      start_date: new Date(Date.parse(end) - 3_600_000).toISOString(),
-      end_date: end,
+  test('drops it for a range picked rather than moved, however close to now it ends', () => {
+    // An hour picked as a custom range ending now looks exactly like "last
+    // hour" moved by Refresh; only a recorded move keeps the earlier data.
+    const earlierHour = key({
+      start_date: '2026-01-02T10:00:00Z',
+      end_date: '2026-01-02T11:00:00Z',
     })
-    const twoHoursLater = '2026-01-02T02:00:00.000Z'
-    const refreshed = keepPreviousWindow(
-      key(lastHour(twoHoursLater)),
-      Date.parse(twoHoursLater)
-    )
+    const pickedHour = key({
+      start_date: '2026-01-02T12:00:00Z',
+      end_date: '2026-01-02T13:00:00Z',
+    })
     expect(
-      refreshed(rows, { queryKey: key(lastHour('2026-01-02T00:00:00.000Z')) })
-    ).toBe(rows)
-    // The same hour picked as a custom range long afterwards is another range.
-    const pickedLater = keepPreviousWindow(
-      key(lastHour(twoHoursLater)),
-      Date.parse('2026-01-09T00:00:00.000Z')
-    )
-    expect(
-      pickedLater(rows, {
-        queryKey: key(lastHour('2026-01-02T00:00:00.000Z')),
-      })
+      keepPreviousWindow(pickedHour)(rows, { queryKey: earlierHour })
     ).toBeUndefined()
+  })
+
+  test('a key picked again after a move is a new selection', () => {
+    const from = key({ ...window, group_by: 'browser' })
+    const to = key({ ...moved, group_by: 'browser' })
+    expect(afterMove(from, to)).toBe(rows)
+    forgetWindowMove(to)
+    expect(keepPreviousWindow(to)(rows, { queryKey: from })).toBeUndefined()
+  })
+
+  test('a window moved again before it loaded keeps the data it was keeping', () => {
+    const first = key({ ...window, group_by: 'device' })
+    const second = key({ ...moved, group_by: 'device' })
+    const third = key({
+      start_date: '2026-01-01T00:10:00Z',
+      end_date: '2026-01-02T00:10:00Z',
+      group_by: 'device',
+    })
+    const cache = loaded(first)
+    recordWindowMove(cache, first, second)
+    recordWindowMove(cache, second, third)
+    expect(keepPreviousWindow(third)(rows, { queryKey: first })).toBe(rows)
+    expect(previousWindowQuery(cache, third)?.queryKey).toEqual(first)
+  })
+
+  test('a window moved from one that never loaded keeps nothing', () => {
+    const from = key({ ...window, group_by: 'os' })
+    const to = key({ ...moved, group_by: 'os' })
+    const cache = new QueryClient().getQueryCache()
+    recordWindowMove(cache, from, to)
+    expect(previousWindowQuery(cache, to)).toBeUndefined()
+    expect(keepPreviousWindow(to)(rows, { queryKey: from })).toBeUndefined()
   })
 
   test('reads a window named in a hand-written key', () => {
@@ -136,23 +179,36 @@ describe('keepPreviousWindow', () => {
       'summary',
       { from, to },
     ]
-    const refreshed = keepPreviousWindow(
-      usageKey(moved.start_date, moved.end_date)
-    )
     expect(
-      refreshed(rows, {
-        queryKey: usageKey(window.start_date, window.end_date),
-      })
+      afterMove(
+        usageKey(window.start_date, window.end_date),
+        usageKey(moved.start_date, moved.end_date)
+      )
     ).toBe(rows)
-    const wider = keepPreviousWindow(
-      usageKey('2025-12-02T00:05:00Z', moved.end_date)
-    )
-    expect(
-      wider(rows, { queryKey: usageKey(window.start_date, window.end_date) })
-    ).toBeUndefined()
   })
 
   test('has nothing to keep without a previous query', () => {
     expect(keepPreviousWindow(key(window))(rows, undefined)).toBeUndefined()
+  })
+})
+
+describe('moveWindows', () => {
+  test('marks the key changes it renders as moves, and only those', () => {
+    expect(isMovingWindows()).toBe(false)
+    let during = false
+    moveWindows(() => {
+      during = isMovingWindows()
+    })
+    expect(during).toBe(true)
+    expect(isMovingWindows()).toBe(false)
+  })
+
+  test('ends the move even when the update throws', () => {
+    expect(() =>
+      moveWindows(() => {
+        throw new Error('update failed')
+      })
+    ).toThrow('update failed')
+    expect(isMovingWindows()).toBe(false)
   })
 })

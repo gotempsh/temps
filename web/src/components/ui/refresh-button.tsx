@@ -13,7 +13,6 @@ import {
 import { notify } from '@temps-sdk/ds'
 import { RefreshCw } from 'lucide-react'
 import { useEffect, useState } from 'react'
-import { flushSync } from 'react-dom'
 import { Button } from '@/components/ui/button'
 import {
   Tooltip,
@@ -22,7 +21,7 @@ import {
   TooltipTrigger,
 } from '@/components/ui/tooltip'
 import { problemDetail } from '@/lib/api-problem'
-import { formatUpdatedAgo } from '@/lib/refresh'
+import { formatUpdatedAgo, moveWindows } from '@/lib/refresh'
 import { isExpectedQueryFailure } from '@/lib/route-query-failures'
 import { cn } from '@/lib/utils'
 
@@ -115,7 +114,7 @@ export function RefreshButton({
 
   const handleClick = () => {
     if (busy) return
-    if (onRefresh) flushSync(onRefresh)
+    if (onRefresh) moveWindows(onRefresh)
     refresh.mutate()
   }
 

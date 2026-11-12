@@ -1,7 +1,13 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { hashKey, type Query, type QueryKey } from '@tanstack/react-query'
+import {
+  hashKey,
+  type Query,
+  type QueryCache,
+  type QueryKey,
+} from '@tanstack/react-query'
+import { flushSync } from 'react-dom'
 
 type KeyScope<Options> = {
   [Key in keyof Options]?: Options[Key] extends object
@@ -41,9 +47,14 @@ export function formatUpdatedAgo(updatedAt: number, now: number): string {
  * Query parameters that only place a query in time. Refresh on a relative
  * window ("last 24 hours") changes these and nothing else.
  */
-const WINDOW_START_PARAMS = new Set(['start_date', 'start_time', 'from'])
-const WINDOW_END_PARAMS = new Set(['end_date', 'end_time', 'to'])
-const WINDOW_PARAMS = new Set([...WINDOW_START_PARAMS, ...WINDOW_END_PARAMS])
+const WINDOW_PARAMS = new Set([
+  'start_date',
+  'start_time',
+  'from',
+  'end_date',
+  'end_time',
+  'to',
+])
 
 function withoutWindow(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(withoutWindow)
@@ -57,94 +68,105 @@ function withoutWindow(value: unknown): unknown {
   return value
 }
 
-function instant(value: unknown): number | undefined {
-  if (typeof value === 'number') return value
-  if (typeof value !== 'string' || value === '') return undefined
-  const parsed = Date.parse(value)
-  return Number.isNaN(parsed) ? undefined : parsed
+/**
+ * Window moves in progress: Refresh, or a relative range advancing on its own.
+ * Only a key change made inside `moveWindows` is a move; any other (another
+ * range picked, however close to now it ends) is a new selection.
+ */
+let moving = 0
+
+/**
+ * Move windows: run `update`, the state change that moves one or more
+ * relative windows to now, and render it synchronously, so each window query
+ * sees its key change while the move is in progress (`isMovingWindows`).
+ */
+export function moveWindows(update: () => void): void {
+  moving += 1
+  try {
+    flushSync(update)
+  } finally {
+    moving -= 1
+  }
 }
 
-/** The first start and end a key names, wherever in the key they sit. */
-function windowOf(value: unknown): { start?: number; end?: number } {
-  const found: { start?: number; end?: number } = {}
-  const visit = (node: unknown) => {
-    if (Array.isArray(node)) return node.forEach(visit)
-    if (node === null || typeof node !== 'object') return
-    for (const [key, entry] of Object.entries(node)) {
-      if (WINDOW_START_PARAMS.has(key)) found.start ??= instant(entry)
-      else if (WINDOW_END_PARAMS.has(key)) found.end ??= instant(entry)
-      else visit(entry)
-    }
-  }
-  visit(value)
-  return found
+/** Whether the key changes rendered now are window moves. */
+export function isMovingWindows(): boolean {
+  return moving > 0
 }
 
 /**
- * Whether `next` is `previous` moved forward the way Refresh moves a relative
- * window: the end later, the start no earlier and moved no more than the end
- * ("last 24 hours" moves both, "today" only its end), and either still
- * overlapping it or ending about `now`, as a window Refresh moved does even
- * after an idle hour on "last hour". Picking another range (7 days after 24
- * hours, 24 hours after 7 days, or a custom range elsewhere in the past) is
- * not. Bounds a key does not name are not judged.
+ * For each moved key (its hash), the window whose data it shows until it
+ * loads, and falls back to if it fails. Bounded: the oldest moves are
+ * forgotten first.
  */
-function movedForward(
-  previous: { start?: number; end?: number },
-  next: { start?: number; end?: number },
-  now: number
-): boolean {
-  const { start: s0, end: e0 } = previous
-  const { start: s1, end: e1 } = next
-  if (e0 !== undefined && e1 !== undefined && e1 < e0) return false
-  if (s0 !== undefined && s1 !== undefined && s1 < s0) return false
-  if (s0 === undefined || s1 === undefined) return true
-  if (e0 === undefined || e1 === undefined) return true
-  if (s1 - s0 > e1 - e0) return false
-  return s1 < e0 || Math.abs(now - e1) <= e1 - s1
+const movedFrom = new Map<string, string>()
+const MOVES_REMEMBERED = 500
+
+/**
+ * Record that a query's key moved from `from` to `to`. The data `to` keeps on
+ * screen is `from`'s, or, if `from` had not loaded either, what `from` was
+ * keeping. A change to anything but the window is not a move.
+ */
+export function recordWindowMove(
+  queryCache: QueryCache,
+  from: QueryKey,
+  to: QueryKey
+): void {
+  const toHash = hashKey(to)
+  movedFrom.delete(toHash)
+  if (
+    hashKey(withoutWindow(from) as QueryKey) !==
+    hashKey(withoutWindow(to) as QueryKey)
+  )
+    return
+  const fromHash = hashKey(from)
+  const origin =
+    queryCache.get(fromHash)?.state.data !== undefined
+      ? fromHash
+      : movedFrom.get(fromHash)
+  if (origin === undefined || origin === toHash) return
+  movedFrom.set(toHash, origin)
+  if (movedFrom.size > MOVES_REMEMBERED) {
+    const [oldest] = movedFrom.keys()
+    movedFrom.delete(oldest)
+  }
+}
+
+/** Record that `to` is a new selection, not a moved window. */
+export function forgetWindowMove(to: QueryKey): void {
+  movedFrom.delete(hashKey(to))
 }
 
 /**
  * `placeholderData` for a query whose window moves: while the moved window
  * loads, the previous window's data stays on screen. Any other change to the
- * key (a drill-down, another service, filter or page, or another range picked)
- * gets no placeholder, so data of one selection never shows, clickable, under
- * another.
+ * key (a drill-down, another service, filter or page, or another range
+ * picked) gets no placeholder, so data of one selection never shows,
+ * clickable, under another. Moves are recorded by `useWindowMoves`.
  */
-export function keepPreviousWindow(queryKey: QueryKey, now = Date.now()) {
-  const current = hashKey(withoutWindow(queryKey) as QueryKey)
-  const currentWindow = windowOf(queryKey)
+export function keepPreviousWindow(queryKey: QueryKey) {
+  const current = hashKey(queryKey)
   return <T>(
     previous: T | undefined,
     previousQuery?: { queryKey: QueryKey }
   ): T | undefined =>
     previousQuery !== undefined &&
-    hashKey(withoutWindow(previousQuery.queryKey) as QueryKey) === current &&
-    movedForward(windowOf(previousQuery.queryKey), currentWindow, now)
+    movedFrom.get(current) === hashKey(previousQuery.queryKey)
       ? previous
       : undefined
 }
 
 /**
- * The query for the last window that loaded before `queryKey`'s window: the
- * same selection, a window `queryKey` moved forward from (as of `now`, when
- * it was asked for), with data. When a moved window fails before it loads,
- * the page keeps showing this one.
+ * The query whose data `queryKey`'s moved window keeps on screen, if it still
+ * has data: when a moved window fails before it loads, the page keeps showing
+ * that one.
  */
 export function previousWindowQuery(
-  queries: readonly Query[],
-  queryKey: QueryKey,
-  now: number
+  queryCache: QueryCache,
+  queryKey: QueryKey
 ): Query | undefined {
-  const current = hashKey(withoutWindow(queryKey) as QueryKey)
-  const currentWindow = windowOf(queryKey)
-  let latest: Query | undefined
-  for (const query of queries) {
-    if (query.state.data === undefined) continue
-    if (hashKey(withoutWindow(query.queryKey) as QueryKey) !== current) continue
-    if (!movedForward(windowOf(query.queryKey), currentWindow, now)) continue
-    if (!latest || query.state.dataUpdatedAt > latest.state.dataUpdatedAt)
-      latest = query
-  }
-  return latest
+  const from = movedFrom.get(hashKey(queryKey))
+  if (from === undefined) return undefined
+  const query = queryCache.get(from)
+  return query?.state.data === undefined ? undefined : query
 }

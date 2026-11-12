@@ -6,6 +6,7 @@ import {
   getDateRangeFromFilter,
   type AnalyticsDateFilter,
 } from './useAnalyticsDateRange'
+import { moveWindows } from '@/lib/refresh'
 
 /** How often a relative range ("last 24 hours") moves forward to now. */
 export const RANGE_ADVANCE_MS = 5 * 60_000
@@ -35,7 +36,8 @@ export function useAdvancingDateRange(
   useEffect(() => {
     if (!relative || intervalMs === null) return
     const advance = () => {
-      if (document.visibilityState === 'visible') setTick((t) => t + 1)
+      if (document.visibilityState !== 'visible') return
+      moveWindows(() => setTick((t) => t + 1))
     }
     const timer = window.setInterval(advance, intervalMs)
     document.addEventListener('visibilitychange', advance)

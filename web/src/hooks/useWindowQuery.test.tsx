@@ -6,6 +6,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { useState } from 'react'
 import { installBrowserWindow } from '@/test/dom'
+import { moveWindows } from '@/lib/refresh'
 import { collectRouteQueryFailures } from '@/lib/route-query-failures'
 import { useWindowQuery } from './useWindowQuery'
 
@@ -45,12 +46,23 @@ function renderBreakdown(
       <>
         <button
           type="button"
+          onClick={() =>
+            moveWindows(() => {
+              setStart((n) => n + 1)
+              setEnd((n) => n + 1)
+            })
+          }
+        >
+          Move window
+        </button>
+        <button
+          type="button"
           onClick={() => {
             setStart((n) => n + 1)
             setEnd((n) => n + 1)
           }}
         >
-          Move window
+          Pick the next range
         </button>
         <button type="button" onClick={() => setStart(-20)}>
           Pick a wider range
@@ -98,7 +110,7 @@ test('a drill-down shows loading, never the previous level under the new one', a
   await screen.findByText('regions')
 })
 
-test('a moved window that fails keeps the last loaded rows, with nothing for the shell to report', async () => {
+test('a moved window that fails keeps the last loaded rows, and the shell says the latest did not load', async () => {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   })
@@ -107,14 +119,48 @@ test('a moved window that fails keeps the last loaded rows, with nothing for the
   await screen.findByText('countries')
 
   fireEvent.click(screen.getByRole('button', { name: 'Move window' }))
-  await act(async () =>
-    answers[1].reject({ status: 500, title: 'Internal Server Error' })
-  )
+  const error = { status: 500, title: 'Internal Server Error' }
+  await act(async () => answers[1].reject(error))
 
   await act(async () => new Promise((resolve) => setTimeout(resolve, 5)))
   expect(screen.getByText('countries')).toBeTruthy()
   expect(screen.queryByText('failed')).toBeNull()
-  expect(collectRouteQueryFailures(client)).toEqual([])
+  expect(collectRouteQueryFailures(client)).toEqual([
+    {
+      queryHash: expect.any(String),
+      error,
+      retained: true,
+    },
+  ])
+})
+
+test('a range picked next to the one on screen loads from scratch, never under the old rows', async () => {
+  const answers = renderBreakdown()
+  await act(async () => answers[0].resolve('countries'))
+  await screen.findByText('countries')
+
+  fireEvent.click(screen.getByRole('button', { name: 'Pick the next range' }))
+
+  await screen.findByText('loading')
+  expect(screen.queryByText('countries')).toBeNull()
+  await act(async () =>
+    answers[1].reject({ status: 500, title: 'Internal Server Error' })
+  )
+  await screen.findByText('failed')
+  expect(screen.queryByText('countries')).toBeNull()
+})
+
+test('a window moved while another range loads keeps nothing from before it', async () => {
+  const answers = renderBreakdown()
+  await act(async () => answers[0].resolve('countries'))
+  await screen.findByText('countries')
+
+  fireEvent.click(screen.getByRole('button', { name: 'Pick a wider range' }))
+  await screen.findByText('loading')
+  fireEvent.click(screen.getByRole('button', { name: 'Move window' }))
+
+  expect(screen.getByText('loading')).toBeTruthy()
+  expect(screen.queryByText('countries')).toBeNull()
 })
 
 test('another range that fails shows the error, not the previous range', async () => {

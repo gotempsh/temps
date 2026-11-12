@@ -12,6 +12,7 @@ import {
 import { installBrowserWindow } from '@/test/dom'
 import { jsonResponse, mockApi } from '@/test/fetch-mock'
 import { OverviewInsights } from './OverviewInsights'
+import { moveWindows } from '@/lib/refresh'
 
 installBrowserWindow()
 afterEach(cleanup)
@@ -58,7 +59,8 @@ test('Ask AI waits while a moved window still shows the previous stats', async (
   const askAi = () => screen.getByRole('button', { name: 'Ask AI' })
   await waitFor(() => expect(askAi().hasAttribute('disabled')).toBe(false))
 
-  rerender(view(moved(dayStart), moved(dayEnd)))
+  // Refresh moves the window.
+  moveWindows(() => rerender(view(moved(dayStart), moved(dayEnd))))
 
   await waitFor(() => expect(releaseSessions).toBeDefined())
   expect(askAi().hasAttribute('disabled')).toBe(true)

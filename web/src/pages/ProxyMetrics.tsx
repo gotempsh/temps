@@ -95,7 +95,7 @@ import {
   XAxis,
   YAxis,
 } from 'recharts'
-import { useWindowQuery } from '@/hooks/useWindowQuery'
+import { useWindowMoves, useWindowQuery } from '@/hooks/useWindowQuery'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -615,9 +615,11 @@ function NodeMetricPanel({
   scope: NodeScope
   emptyText?: string
 }) {
-  const results = useQueries({
-    queries: panel.series.map((s) => proxySeriesQuery(s.metric, window, scope)),
-  })
+  const queries = panel.series.map((s) =>
+    proxySeriesQuery(s.metric, window, scope)
+  )
+  useWindowMoves(queries.map((q) => q.queryKey))
+  const results = useQueries({ queries })
 
   const isPending = results.some((r) => r.isPending)
   const errors = results.filter((r) => r.isError).map((r) => r.error)
@@ -835,19 +837,19 @@ function NodeSummaryStats({
   scope: NodeScope
 }) {
   // Same query keys the chart panels use — React Query dedupes the fetches.
+  const queries = [
+    proxySeriesQuery('proxy.requests', window, scope),
+    proxySeriesQuery('proxy.requests_5xx', window, scope),
+    proxySeriesQuery('proxy.request_duration_p95_ms', window, scope),
+    // Destination split — same options the "Requests by destination"
+    // panel uses, so React Query dedupes the fetches.
+    proxySeriesQuery('proxy.requests_project', window, scope),
+    proxySeriesQuery('proxy.requests_console', window, scope),
+    proxySeriesQuery('proxy.requests_other', window, scope),
+  ]
+  useWindowMoves(queries.map((q) => q.queryKey))
   const [requests, errors5xx, p95, destProject, destConsole, destOther] =
-    useQueries({
-      queries: [
-        proxySeriesQuery('proxy.requests', window, scope),
-        proxySeriesQuery('proxy.requests_5xx', window, scope),
-        proxySeriesQuery('proxy.request_duration_p95_ms', window, scope),
-        // Destination split — same options the "Requests by destination"
-        // panel uses, so React Query dedupes the fetches.
-        proxySeriesQuery('proxy.requests_project', window, scope),
-        proxySeriesQuery('proxy.requests_console', window, scope),
-        proxySeriesQuery('proxy.requests_other', window, scope),
-      ],
-    })
+    useQueries({ queries })
 
   const totalRequests = (requests.data ?? []).reduce(
     (acc, p) => acc + (p.value ?? 0),

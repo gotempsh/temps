@@ -7,6 +7,7 @@ import { cleanup, render, waitFor } from '@testing-library/react'
 import { installBrowserWindow } from '@/test/dom'
 import { jsonResponse, mockApi } from '@/test/fetch-mock'
 import { SpeedWorldMap } from './SpeedWorldMap'
+import { moveWindows } from '@/lib/refresh'
 
 installBrowserWindow()
 afterEach(cleanup)
@@ -42,7 +43,10 @@ test('a moved window keeps the map on screen while it loads', async () => {
     expect(view.container.querySelector('svg')).not.toBeNull()
   )
 
-  view.rerender(map('2026-01-01T00:05:00Z', '2026-01-02T00:05:00Z'))
+  // Refresh moves the window.
+  moveWindows(() =>
+    view.rerender(map('2026-01-01T00:05:00Z', '2026-01-02T00:05:00Z'))
+  )
 
   await waitFor(() => expect(release).toBeDefined())
   expect(view.container.querySelector('svg')).not.toBeNull()

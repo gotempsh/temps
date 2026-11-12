@@ -4,6 +4,7 @@
 import { afterEach, expect, test } from 'bun:test'
 import { act, cleanup, renderHook, waitFor } from '@testing-library/react'
 import { installBrowserWindow } from '@/test/dom'
+import { isMovingWindows } from '@/lib/refresh'
 import { useAdvancingDateRange } from './useAdvancingDateRange'
 
 installBrowserWindow()
@@ -17,6 +18,25 @@ test('a relative range moves forward to now while the page stays open', async ()
   await waitFor(() =>
     expect(result.current.endDate!.getTime()).toBeGreaterThan(first)
   )
+})
+
+test('moving forward on its own is a window move, not a new selection', async () => {
+  const moves: boolean[] = []
+  const { result } = renderHook(() => {
+    const range = useAdvancingDateRange(
+      { quickFilter: '24hours', dateRange: undefined },
+      20
+    )
+    moves.push(isMovingWindows())
+    return range
+  })
+  const first = result.current.endDate!.getTime()
+  await waitFor(() =>
+    expect(result.current.endDate!.getTime()).toBeGreaterThan(first)
+  )
+  // The first render is the range picked; the render that moved it is a move.
+  expect(moves[0]).toBe(false)
+  expect(moves[moves.length - 1]).toBe(true)
 })
 
 test('a custom range never moves', async () => {

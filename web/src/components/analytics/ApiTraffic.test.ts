@@ -16,7 +16,8 @@ import {
   trafficQueryNeedsCompatibilityRetry,
   trafficTableQueryKey,
 } from '@/lib/api-traffic-sort'
-import { keepPreviousWindow } from '@/lib/refresh'
+import { QueryClient } from '@tanstack/react-query'
+import { keepPreviousWindow, recordWindowMove } from '@/lib/refresh'
 
 describe('API traffic server-side sorting', () => {
   test('toggles an active metric from descending to ascending', () => {
@@ -200,6 +201,8 @@ describe('API traffic tables on Refresh', () => {
     sort: { metric: 'requests', direction: 'desc' as const },
   }
   const rows = { rows: ['GET /orders'] }
+  const shown = new QueryClient()
+  shown.setQueryData(trafficTableQueryKey(table), rows)
 
   test('a moved window keeps the current routes on screen', () => {
     const moved = trafficTableQueryKey({
@@ -207,6 +210,7 @@ describe('API traffic tables on Refresh', () => {
       startIso: '2026-01-01T00:05:00.000Z',
       endIso: '2026-01-02T00:05:00.000Z',
     })
+    recordWindowMove(shown.getQueryCache(), trafficTableQueryKey(table), moved)
     expect(
       keepPreviousWindow(moved)(rows, {
         queryKey: trafficTableQueryKey(table),
@@ -221,11 +225,12 @@ describe('API traffic tables on Refresh', () => {
       { environmentId: 4 },
       { kind: 'callers' as const },
     ]) {
+      const next = trafficTableQueryKey({ ...table, ...change })
+      recordWindowMove(shown.getQueryCache(), trafficTableQueryKey(table), next)
       expect(
-        keepPreviousWindow(trafficTableQueryKey({ ...table, ...change }))(
-          rows,
-          { queryKey: trafficTableQueryKey(table) }
-        )
+        keepPreviousWindow(next)(rows, {
+          queryKey: trafficTableQueryKey(table),
+        })
       ).toBeUndefined()
     }
   })
