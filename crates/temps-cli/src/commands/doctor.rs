@@ -414,7 +414,17 @@ impl DoctorCommand {
             ),
             SecretsEnvironment::Empty => {}
         }
-        if !matches!(secrets_env, SecretsEnvironment::Unknown { .. }) {
+        // serve refuses to start with it; read as unset, the checks below
+        // would pass on what it never uses.
+        if let Some(variable) = secrets_env.not_unicode() {
+            report.add(
+                "Secrets",
+                CheckResult::Fail(format!(
+                    "This shell sets {variable} to a value that is not valid Unicode, which \
+                     `temps serve` refuses to start with. Fix or unset it in this shell"
+                )),
+            );
+        } else if !matches!(secrets_env, SecretsEnvironment::Unknown { .. }) {
             self.check_secrets(data_dir, &secrets_env, report);
         }
 

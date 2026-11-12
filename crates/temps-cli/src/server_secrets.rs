@@ -90,6 +90,20 @@ impl<'a> SecretsEnvironment<'a> {
         }
     }
 
+    /// The first variable this shell sets to a value that is not valid
+    /// Unicode. `temps serve` refuses to start with one; [`Self::get`] would
+    /// read it as unset, and the data directory's key would be used instead.
+    pub(crate) fn not_unicode(&self) -> Option<&'static str> {
+        match self {
+            SecretsEnvironment::Shell(variables) => {
+                first_not_unicode(variables, |name| std::env::var(name))
+            }
+            SecretsEnvironment::Service(_)
+            | SecretsEnvironment::Unknown { .. }
+            | SecretsEnvironment::Empty => None,
+        }
+    }
+
     pub(crate) fn get(&self, name: &str) -> Option<String> {
         match self {
             SecretsEnvironment::Shell(_) => std::env::var(name).ok(),
@@ -118,6 +132,16 @@ impl<'a> SecretsEnvironment<'a> {
             }
         }
     }
+}
+
+fn first_not_unicode(
+    variables: &[&'static str],
+    read: impl Fn(&str) -> Result<String, std::env::VarError>,
+) -> Option<&'static str> {
+    variables
+        .iter()
+        .copied()
+        .find(|name| matches!(read(name), Err(std::env::VarError::NotUnicode(_))))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -176,6 +200,12 @@ pub(crate) enum ServerSecretsError {
         #[source]
         source: Box<temps_config::ConfigServiceError>,
     },
+    #[error(
+        "This shell sets {variable} to a value that is not valid Unicode, which `temps serve` \
+         refuses to start with, so which encryption key to use cannot be told. Nothing was \
+         changed. Fix or unset {variable} in this shell"
+    )]
+    ShellVariableNotUnicode { variable: &'static str },
     #[error(
         "The encryption key {origin} is not a valid Temps encryption key: {source}. Nothing \
          was changed. Set it to the server's key, 64 hex characters"
@@ -382,6 +412,9 @@ fn service_encryption_key(
             reason: reason.clone(),
         });
     }
+    if let Some(variable) = environment.not_unicode() {
+        return Err(ServerSecretsError::ShellVariableNotUnicode { variable });
+    }
     let inspection =
         temps_config::inspect_installation_secrets_with(data_dir, |name| environment.get(name));
     match inspection.encryption_key {
@@ -546,6 +579,52 @@ mod tests {
             .value,
             KEY
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_shell_variable_that_is_not_unicode_is_never_read_as_unset() {
+        use std::os::unix::ffi::OsStrExt;
+        // A name no other test reads, so setting it races with nothing.
+        const VARIABLE: &str = "TEMPS_TEST_NOT_UNICODE_SECRET";
+        std::env::set_var(VARIABLE, std::ffi::OsStr::from_bytes(b"\xff\xfe-secret"));
+
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("data");
+        // The data directory holds a valid key, which must not be used.
+        write(&data.join(temps_config::ENCRYPTION_KEY_FILE), KEY);
+        let unit = root.path().join("temps.service");
+        write(
+            &unit,
+            &format!(
+                "[Service]\nExecStart=/usr/bin/temps serve --database-url={URL} --data-dir={}\n",
+                data.display()
+            ),
+        );
+        let database = resolve(&unit, None);
+        let service = database.serving_service().unwrap();
+        let error =
+            service_encryption_key(&data, service, SecretsEnvironment::Shell(vec![VARIABLE]))
+                .unwrap_err();
+        std::env::remove_var(VARIABLE);
+        assert!(
+            matches!(error, ServerSecretsError::ShellVariableNotUnicode { variable } if variable == VARIABLE),
+            "{error}"
+        );
+        let message = error.to_string();
+        assert!(message.contains("Nothing was changed"), "{message}");
+        assert!(!message.contains("-secret"), "{message}");
+
+        // Only a value that is set and not Unicode is refused.
+        let read = |name: &str| match name {
+            "UNSET" => Err(std::env::VarError::NotPresent),
+            "PLAIN" => Ok("value".to_string()),
+            _ => Err(std::env::VarError::NotUnicode(std::ffi::OsString::from(
+                "x",
+            ))),
+        };
+        assert_eq!(first_not_unicode(&["UNSET", "PLAIN"], read), None);
+        assert_eq!(first_not_unicode(&["PLAIN", "BAD"], read), Some("BAD"));
     }
 
     #[test]

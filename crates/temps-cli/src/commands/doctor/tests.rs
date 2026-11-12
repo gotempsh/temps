@@ -739,6 +739,52 @@ fn doctor_says_when_this_shells_secrets_replace_the_services() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn doctor_fails_a_shell_secret_that_is_not_unicode_instead_of_passing_the_data_dir() {
+    use std::os::unix::ffi::OsStrExt;
+    // A name no other test reads, so setting it races with nothing.
+    const VARIABLE: &str = "TEMPS_TEST_DOCTOR_NOT_UNICODE_SECRET";
+    std::env::set_var(VARIABLE, std::ffi::OsStr::from_bytes(b"\xff\xfe"));
+    let home = tempfile::tempdir().unwrap();
+    let (service, data_dir) = installer_layout(home.path());
+    let doctor = DoctorCommand {
+        database_url: None,
+        data_dir: None,
+        scope: None,
+    };
+    let mut report = DiagnosticReport::new();
+    doctor.check_data_dir(
+        &data_dir,
+        "test",
+        false,
+        Some(&service),
+        SecretsEnvironment::Shell(vec![VARIABLE]),
+        &mut report,
+    );
+    std::env::remove_var(VARIABLE);
+    assert!(
+        report
+            .checks
+            .iter()
+            .any(|(label, result)| label == "Secrets"
+                && matches!(result, CheckResult::Fail(message)
+                if message.contains(VARIABLE) && message.contains("not valid Unicode"))),
+        "{:?}",
+        report.checks
+    );
+    // The data directory's valid key is not passed in its place.
+    assert!(
+        !report
+            .checks
+            .iter()
+            .any(|(label, result)| label == "Encryption key"
+                && matches!(result, CheckResult::Pass(_))),
+        "{:?}",
+        report.checks
+    );
+}
+
 #[test]
 fn the_auth_secret_passes_on_the_layout_serve_uses() {
     let home = tempfile::tempdir().unwrap();
