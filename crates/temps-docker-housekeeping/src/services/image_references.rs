@@ -232,9 +232,11 @@ mod tests {
         }
         .insert(db.as_ref())
         .await?;
-        // The other project deploys a promoted tag, and its multi-platform
-        // build produced the same image ID and a per-platform tag.
-        let other = deploy(ids[1], "other-1", "promoted:latest")
+        // The other project deploys a promoted image by its bare name (an
+        // image deployment stores the reference as written, without the
+        // implicit `:latest`), and its multi-platform build produced the same
+        // image ID and a per-platform tag.
+        let other = deploy(ids[1], "other-1", "Promoted-App")
             .insert(db.as_ref())
             .await?;
         deployment_jobs::ActiveModel {
@@ -255,20 +257,20 @@ mod tests {
         .insert(db.as_ref())
         .await?;
 
-        let candidates: Vec<String> = [
+        // Candidates as the callers build them: every spelling of each tag.
+        let mut candidates: Vec<String> = Vec::new();
+        for tag in [
             "owner-1:latest",
-            "sha256:aa",
-            "promoted:latest",
-            "sha256:bb",
+            "Promoted-App:latest",
             "other-1:latest-arm64",
-            "sha256:cc",
             "nobody:latest",
-        ]
-        .map(str::to_string)
-        .to_vec();
+        ] {
+            candidates.extend(tag_spellings(tag));
+        }
+        candidates.extend(["sha256:aa", "sha256:bb", "sha256:cc"].map(str::to_string));
         let found = referenced_images(db.as_ref(), &candidates, Some(ids[0].0)).await?;
         let expected: HashSet<String> = [
-            "promoted:latest",
+            "Promoted-App",
             "sha256:bb",
             "other-1:latest-arm64",
             "sha256:cc",
@@ -276,6 +278,10 @@ mod tests {
         .map(str::to_string)
         .into();
         assert_eq!(found, expected);
+        // The bare name protects the image under its explicit spelling, and
+        // the tag's case is kept as written.
+        assert!(names_tag(&found, "Promoted-App:latest"));
+        assert!(!names_tag(&found, "promoted-app:latest"));
 
         let everyone = referenced_images(db.as_ref(), &candidates, None).await?;
         assert!(everyone.contains("owner-1:latest") && everyone.contains("sha256:aa"));
