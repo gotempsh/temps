@@ -108,6 +108,21 @@ impl S3Endpoint {
         let (has_userinfo, shown) = redact_userinfo(trimmed);
         let (candidate, scheme_was_explicit) = match trimmed.split_once("://") {
             Some((scheme, _)) => {
+                // `split_once` stops at the first `://` anywhere, so the text
+                // before it is only a scheme when it is shaped like one
+                // (`https:\\k:s@host/a://b` would otherwise report
+                // `https:\\k:s@host/a`, credential included, as the scheme).
+                if !is_scheme_token(scheme) {
+                    let endpoint = mask_through_last_at(&shown);
+                    return Err(if has_userinfo || scheme.contains('@') {
+                        S3EndpointError::EmbeddedCredentials { endpoint }
+                    } else {
+                        S3EndpointError::Malformed {
+                            endpoint,
+                            reason: "the text before '://' is not a URL scheme".to_string(),
+                        }
+                    });
+                }
                 let scheme = scheme.to_ascii_lowercase();
                 if scheme != "http" && scheme != "https" {
                     return Err(S3EndpointError::UnsupportedScheme {
@@ -328,11 +343,7 @@ fn redact_userinfo(raw: &str) -> (bool, String) {
     let after_scheme = raw
         .find(':')
         .filter(|&colon| {
-            let scheme = &raw[..colon];
-            scheme.starts_with(|c: char| c.is_ascii_alphabetic())
-                && scheme
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+            is_scheme_token(&raw[..colon])
                 && matches!(raw.as_bytes().get(colon + 1), Some(b'/' | b'\\'))
         })
         .map_or(0, |colon| colon + 1);
@@ -349,6 +360,16 @@ fn redact_userinfo(raw: &str) -> (bool, String) {
         ),
         None => (false, raw.to_string()),
     }
+}
+
+/// Whether `text` is shaped like a URL scheme: a letter, then letters,
+/// digits, `+`, `-` or `.` (RFC 3986). Nothing else is ever reported back
+/// as a scheme, so a credential can never travel in that field.
+fn is_scheme_token(text: &str) -> bool {
+    text.starts_with(|c: char| c.is_ascii_alphabetic())
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
 }
 
 /// `raw` with everything up to its last `@` replaced by `***`: the
@@ -388,6 +409,10 @@ mod tests {
             // Tabs and newlines, which the parser drops.
             "https://acc\tess:hun\nter2@objects.example",
             "https:/\t/access:hunter2@objects.example",
+            // A later `://` that would otherwise make the credential part
+            // of the reported scheme.
+            "https:\\access:hunter2@objects.example/path://x",
+            "access:hunter2@objects.example/a://b",
         ] {
             for use_tls in [None, Some(false), Some(true)] {
                 let error = S3Endpoint::parse(raw, use_tls).unwrap_err();
@@ -426,6 +451,24 @@ mod tests {
             mask_through_last_at("https:/x/k:s@objects.example"),
             "***@objects.example"
         );
+    }
+
+    #[test]
+    fn only_a_scheme_shaped_prefix_is_reported_as_a_scheme() {
+        assert!(matches!(
+            S3Endpoint::parse("s3+tls://objects.example", None),
+            Err(S3EndpointError::UnsupportedScheme { scheme, .. }) if scheme == "s3+tls"
+        ));
+        let error = S3Endpoint::parse("objects.example/a://b", None).unwrap_err();
+        assert!(
+            matches!(error, S3EndpointError::Malformed { .. }),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("is not a URL scheme"), "{error}");
+        assert!(matches!(
+            S3Endpoint::parse("https:\\access:hunter2@objects.example/path://x", None),
+            Err(S3EndpointError::EmbeddedCredentials { .. })
+        ));
     }
 
     #[test]
