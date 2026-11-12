@@ -9,6 +9,7 @@ import {
   getErrorDashboardStatsOptions,
   getErrorDashboardStatsQueryKey,
   getErrorTimeSeriesQueryKey,
+  getProjectDeploymentsQueryKey,
   getOrCreateDsnMutation,
   hasErrorGroupsOptions,
   hasErrorGroupsQueryKey,
@@ -705,6 +706,10 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
               path: projectPath,
             }),
             queryKeyPrefix(getErrorTimeSeriesQueryKey, { path: projectPath }),
+            // The chart's deployment markers.
+            queryKeyPrefix(getProjectDeploymentsQueryKey, {
+              path: { id: project.id },
+            }),
           ]}
           onRefresh={advance}
           leftActions={

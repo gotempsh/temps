@@ -87,6 +87,8 @@ import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerifi
 import {
   adminListNodesOptions,
   adminListNodesQueryKey,
+  clusterNetworkGetQueryKey,
+  wireguardMeshStatusGetQueryKey,
   adminDrainStatusOptions,
   adminGetNodeOptions,
   adminListNodeContainersOptions,
@@ -1883,6 +1885,9 @@ export function NodesPage() {
               queryKeys={[
                 queryKeyPrefix(adminListNodesQueryKey),
                 allTunnelsOptions().queryKey,
+                // The mesh and overlay badges and network warnings in the table.
+                wireguardMeshStatusGetQueryKey(),
+                clusterNetworkGetQueryKey(),
               ]}
             />
           }

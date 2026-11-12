@@ -143,6 +143,8 @@ export function DomainsSettings({ project }: DomainsSettingsProps) {
                 queryKeyPrefix(listIngressHostnamesQueryKey),
                 queryKeyPrefix(getEnvironmentReachabilityQueryKey),
                 queryKeyPrefix(listReachabilityRunsQueryKey),
+                // The managed-delivery rows under DNS and CDN, not its form.
+                ['delivery-bindings', project.id],
               ]}
             />
             <Button onClick={() => setIsAddDialogOpen(true)}>

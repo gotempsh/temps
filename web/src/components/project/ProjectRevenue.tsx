@@ -175,6 +175,8 @@ export function ProjectRevenue({ project }: ProjectRevenueProps) {
                   revenueMetricsMrrQueryKey({ path: projectPath }),
                   revenueMetricsCustomersQueryKey({ path: projectPath }),
                   revenueRecentEventsQueryKey({ path: projectPath }),
+                  // The providers' last event and status, shown below.
+                  revenueListIntegrationsQueryKey({ path: projectPath }),
                 ]}
               />
               <DropdownMenu>

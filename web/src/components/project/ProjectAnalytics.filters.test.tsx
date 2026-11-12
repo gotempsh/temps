@@ -112,3 +112,41 @@ test('Refresh on the journey tab moves the window to now and refetches it', asyn
     ).toBe('false')
   )
 })
+
+test('Refresh on the AI agents tab also reloads its timeline for a custom range', async () => {
+  let timelineReads = 0
+  mockApi({
+    'GET /projects/17/has-events': () => jsonResponse({ has_events: true }),
+    'GET /proxy-logs/stats/ai-agents/timeline': () => {
+      timelineReads++
+      return jsonResponse({ bucket: '1 hour', items: [] })
+    },
+    'GET /proxy-logs/stats/ai-agents': () => jsonResponse({ items: [] }),
+    'GET /proxy-logs/stats/ai-pages': () => jsonResponse({ items: [] }),
+    'GET /proxy-logs/stats/ai-status': () => jsonResponse({ items: [] }),
+  })
+  render(
+    <QueryClientProvider
+      client={
+        new QueryClient({
+          defaultOptions: { queries: { retry: false, staleTime: Infinity } },
+        })
+      }
+    >
+      <MemoryRouter
+        initialEntries={[
+          '/ai-agents?filter=custom&from=2026-01-01T00:00:00.000Z&to=2026-01-02T00:00:00.000Z',
+        ]}
+      >
+        <ProjectAnalytics
+          project={{ id: 17, slug: 'demo' } as ProjectResponse}
+        />
+      </MemoryRouter>
+    </QueryClientProvider>
+  )
+  await waitFor(() => expect(timelineReads).toBe(1))
+
+  fireEvent.click(await screen.findByRole('button', { name: 'Refresh' }))
+
+  await waitFor(() => expect(timelineReads).toBe(2))
+})

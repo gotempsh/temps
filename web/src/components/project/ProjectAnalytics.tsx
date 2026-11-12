@@ -22,6 +22,7 @@ import {
   getAiAgentBreakdownQueryKey,
   getAiPageBreakdownQueryKey,
   getAiStatusBreakdownQueryKey,
+  getAiAgentTimelineQueryKey,
   getEventDetailQueryKey,
   getEventEntriesQueryKey,
   getEventVisitorsQueryKey,
@@ -837,6 +838,7 @@ function AiAgentsTab({ project, view = 'overview' }: AiAgentsTabProps) {
           queryKeyPrefix(getAiAgentBreakdownQueryKey),
           queryKeyPrefix(getAiPageBreakdownQueryKey),
           queryKeyPrefix(getAiStatusBreakdownQueryKey),
+          queryKeyPrefix(getAiAgentTimelineQueryKey),
         ]}
         onRefresh={advance}
       />
