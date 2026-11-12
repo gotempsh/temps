@@ -140,6 +140,17 @@ from `$CREDENTIALS_DIRECTORY`. Prefer any of these over `--database-url`: the
 flag puts the password in `ps` output and in the service definition, and Temps
 logs a warning when it is used.
 
+Admin commands run from a shell on the server's host (`temps doctor`,
+`temps migrate`, `temps reset-admin-password`, `temps api-key`,
+`temps domain import`, `temps backfill`, `temps network setup-multi-node`)
+fall back to the installed service when none of the above is set: they read
+`--database-url` and `--data-dir` from `/etc/systemd/system/temps.service`
+(with its drop-ins, `Environment=`, `EnvironmentFile=` and `LoadCredential=`)
+or from the launchd agent `~/Library/LaunchAgents/dev.temps.temps.plist`, and
+say which file they used. `temps serve`, `temps proxy`, `temps setup` and
+`temps backup restore` never do: they use only their own configuration. When
+no source supplies a URL, the error lists every place that was checked.
+
 ### Database URL Format
 
 ```
