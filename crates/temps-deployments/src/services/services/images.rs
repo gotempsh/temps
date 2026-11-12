@@ -94,6 +94,39 @@ pub(super) fn removal_requests(
         .collect()
 }
 
+/// This install's owner ID from `read`, bounded by `deadline`. A read that
+/// fails or runs out of time yields `None`, which keeps every labelled image:
+/// the safe direction when ownership cannot be proved.
+async fn owner_within_deadline<F, E>(
+    project_id: i32,
+    deadline: tokio::time::Instant,
+    read: F,
+) -> Option<String>
+where
+    F: std::future::Future<Output = Result<Option<String>, E>>,
+    E: std::fmt::Display,
+{
+    match tokio::time::timeout_at(deadline, read).await {
+        Ok(Ok(owner)) => owner,
+        Ok(Err(error)) => {
+            warn!(
+                project_id,
+                %error,
+                "Could not read this install's image owner ID; keeping every labelled image of the deleted project"
+            );
+            None
+        }
+        Err(_) => {
+            warn!(
+                project_id,
+                deadline_secs = TOTAL_REMOVAL_DEADLINE.as_secs(),
+                "Out of time reading this install's image owner ID; keeping every labelled image of the deleted project"
+            );
+            None
+        }
+    }
+}
+
 impl DeploymentService {
     async fn read_project_image_plan(&self, project_id: i32) -> Result<ProjectImagePlan, DbErr> {
         use sea_orm::ActiveEnum;
@@ -380,28 +413,21 @@ impl temps_core::ProjectImageCleaner for DeploymentService {
         if plan.images.is_empty() {
             return report;
         }
+        // The deadline covers everything after the row delete, reading the
+        // owner ID included, so a stalled database or data directory cannot
+        // hold the delete response and its audit entry open.
+        let deadline = tokio::time::Instant::now() + TOTAL_REMOVAL_DEADLINE;
         // This install's owner ID: an image another install sharing the host
         // labelled is theirs, even when a copied database records it as
         // ours. Without the ID, every labelled image counts as someone
         // else's, so only images that predate the labels are removed.
-        let owner = match image_ownership::load_image_owner_id(
-            self.db.as_ref(),
-            &self.config_service.data_dir(),
+        let owner = owner_within_deadline(
+            plan.project_id,
+            deadline,
+            image_ownership::load_image_owner_id(self.db.as_ref(), &self.config_service.data_dir()),
         )
-        .await
-        {
-            Ok(owner) => owner,
-            Err(error) => {
-                warn!(
-                    project_id = plan.project_id,
-                    %error,
-                    "Could not read this install's image owner ID; keeping every labelled image of the deleted project"
-                );
-                None
-            }
-        };
+        .await;
         let requests = removal_requests(plan, owner);
-        let deadline = tokio::time::Instant::now() + TOTAL_REMOVAL_DEADLINE;
         for node_id in &plan.nodes {
             if tokio::time::Instant::now() >= deadline {
                 warn!(
@@ -567,6 +593,34 @@ mod tests {
         let (keep, kept_shared) = partition_shared(images, &shared);
         assert_eq!(keep, vec![image("app-3:latest", Some("sha256:cd"))]);
         assert_eq!(kept_shared, vec!["app-1:latest", "app-2:latest"]);
+    }
+
+    /// A read of the owner ID that never answers is cut off at the deadline,
+    /// and the cleanup goes on keeping every labelled image.
+    #[tokio::test]
+    async fn a_stalled_owner_read_is_bounded_by_the_deadline() {
+        let short = std::time::Duration::from_millis(50);
+        let stalled = std::future::pending::<Result<Option<String>, std::io::Error>>();
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            owner_within_deadline(7, started + short, stalled).await,
+            None
+        );
+        let waited = started.elapsed();
+        assert!(
+            waited >= short && waited < std::time::Duration::from_secs(5),
+            "cut off at the deadline, not left waiting: {waited:?}"
+        );
+
+        let far = tokio::time::Instant::now() + TOTAL_REMOVAL_DEADLINE;
+        let failed =
+            async { Err::<Option<String>, _>(std::io::Error::other("database unavailable")) };
+        assert_eq!(owner_within_deadline(7, far, failed).await, None);
+        let answered = async { Ok::<_, std::io::Error>(Some("install-a.marker".to_string())) };
+        assert_eq!(
+            owner_within_deadline(7, far, answered).await.as_deref(),
+            Some("install-a.marker")
+        );
     }
 
     /// Every request carries this install's owner check, so a copied
