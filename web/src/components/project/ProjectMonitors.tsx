@@ -17,6 +17,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { RefreshButton } from '@/components/ui/refresh-button'
 import { queryKeyPrefix } from '@/lib/refresh'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 import {
   ProjectResponse,
   MonitorResponse,
@@ -39,7 +40,7 @@ import {
   Globe,
   MoreVertical,
 } from 'lucide-react'
-import { useMemo, useState } from 'react'
+import { useMemo, useReducer, useState } from 'react'
 import { Link } from 'react-router'
 import { useForm } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
@@ -111,6 +112,8 @@ interface MonitorCardProps {
   projectSlug: string
   onDelete: () => void
   environment?: EnvironmentResponse
+  /** End of the card's last-24-hours window; Refresh moves it to now. */
+  windowEnd: number
 }
 
 function MonitorCard({
@@ -118,17 +121,18 @@ function MonitorCard({
   projectSlug,
   onDelete,
   environment,
+  windowEnd,
 }: MonitorCardProps) {
   const isOnDemand = environment?.deployment_config?.onDemand === true
   const { startDate, endDate } = useMemo(() => {
-    const now = new Date()
+    const end = new Date(windowEnd)
     return {
-      startDate: subDays(now, 1),
-      endDate: now,
+      startDate: subDays(end, 1),
+      endDate: end,
     }
-  }, [])
+  }, [windowEnd])
   // Fetch status timeline for the monitor
-  const { data: statusData } = useQuery({
+  const { data: statusData } = useWindowQuery({
     ...getBucketedStatusOptions({
       path: {
         monitor_id: monitor.id,
@@ -142,7 +146,7 @@ function MonitorCard({
     refetchInterval: 30000, // Refresh every 30 seconds
   })
 
-  const { data: currentMonitorStatus } = useQuery({
+  const { data: currentMonitorStatus } = useWindowQuery({
     ...getCurrentMonitorStatusOptions({
       path: {
         monitor_id: monitor.id,
@@ -340,6 +344,13 @@ export function ProjectMonitors({ project }: ProjectMonitorsProps) {
   const [isCreateDialogOpen, setIsCreateDialogOpen] = useState(false)
   const [monitorToDelete, setMonitorToDelete] =
     useState<MonitorResponse | null>(null)
+  // The cards' last-24-hours window ends here; Refresh moves it to now so
+  // new samples come into view.
+  const [windowEnd, moveWindowToNow] = useReducer(
+    () => Date.now(),
+    undefined,
+    () => Date.now()
+  )
 
   // Form with validation
   const form = useForm<CreateMonitorFormData>({
@@ -474,6 +485,7 @@ export function ProjectMonitors({ project }: ProjectMonitorsProps) {
                 queryKeyPrefix(getBucketedStatusQueryKey),
                 queryKeyPrefix(getCurrentMonitorStatusQueryKey),
               ]}
+              onRefresh={moveWindowToNow}
             />
             <Button variant="outline" asChild>
               <Link to="/status-pages">
@@ -686,6 +698,7 @@ export function ProjectMonitors({ project }: ProjectMonitorsProps) {
               monitor={monitor}
               projectSlug={project.slug}
               onDelete={() => setMonitorToDelete(monitor)}
+              windowEnd={windowEnd}
               environment={environments?.find(
                 (env) => env.id === monitor.environment_id
               )}
