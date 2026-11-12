@@ -1161,6 +1161,92 @@ impl IngressConnectorService {
         Ok(plan.view(&host, publications.get(&host)))
     }
 
+    /// Whether `host` may be published through tunnel `id`: the tunnel
+    /// exists, its zone holds the hostname, and moving it there is allowed.
+    async fn check_tunnel_choice(&self, host: &str, id: i32) -> Result<(), IngressError> {
+        let connector = self.find(id).await?;
+        let zone = self.zone_of(&connector).await?;
+        record_label(host, &connector.domain, &zone)?;
+        if let Some(guard) = self.move_guard.get() {
+            guard
+                .check_move(host, &connector.name)
+                .await
+                .map_err(IngressError::Validation)?;
+        }
+        Ok(())
+    }
+
+    /// Choose tunnel `connector_id` for `hostname`, only while its choice is
+    /// still `expected` (what the caller read, as `hostname_choice` returns
+    /// it): a choice someone made in between is never replaced unseen. A
+    /// reachability run decides from what it read, so it writes this way.
+    /// Already choosing this tunnel counts as done, so a resumed run whose
+    /// write landed before it stopped does not fail.
+    pub async fn choose_tunnel_if_unchanged(
+        &self,
+        hostname: &str,
+        connector_id: i32,
+        expected: Option<Option<i32>>,
+    ) -> Result<(), IngressError> {
+        let host = normalize_host(hostname)?;
+        self.check_tunnel_choice(&host, connector_id).await?;
+        let now = Utc::now();
+        let written = match expected {
+            None => {
+                let inserted = ingress_hostname_choices::ActiveModel {
+                    hostname: Set(host.clone()),
+                    connector_id: Set(Some(connector_id)),
+                    created_at: Set(now),
+                    updated_at: Set(now),
+                    ..Default::default()
+                }
+                .insert(self.db.as_ref())
+                .await;
+                match inserted {
+                    Ok(_) => true,
+                    // `hostname` is unique: a row someone inserted meanwhile
+                    // refuses this. Any other failure is reported as it is.
+                    Err(error) => {
+                        if self.hostname_choice(&host).await?.is_none() {
+                            return Err(error.into());
+                        }
+                        false
+                    }
+                }
+            }
+            Some(previous) => {
+                let column = ingress_hostname_choices::Column::ConnectorId;
+                ingress_hostname_choices::Entity::update_many()
+                    .col_expr(column, Expr::value(Some(connector_id)))
+                    .col_expr(
+                        ingress_hostname_choices::Column::UpdatedAt,
+                        Expr::value(now),
+                    )
+                    .filter(ingress_hostname_choices::Column::Hostname.eq(&host))
+                    .filter(match previous {
+                        Some(id) => column.eq(id),
+                        None => column.is_null(),
+                    })
+                    .exec(self.db.as_ref())
+                    .await?
+                    .rows_affected
+                    == 1
+            }
+        };
+        if !written {
+            let current = self.hostname_choice(&host).await?;
+            if current != Some(Some(connector_id)) {
+                return Err(IngressError::Validation(format!(
+                    "{host}'s tunnel choice changed while this setup ran, so it was left as \
+                     the other change set it. Plan again to see it, or change it under \
+                     Expose your apps."
+                )));
+            }
+        }
+        self.reconcile_all().await;
+        Ok(())
+    }
+
     /// Record the operator's choice for one hostname and apply it now.
     pub async fn set_hostname_choice(
         &self,
@@ -1195,15 +1281,7 @@ impl IngressConnectorService {
                 let id = request.connector_id.ok_or_else(|| {
                     IngressError::Validation("Pick the tunnel to publish it through.".into())
                 })?;
-                let connector = self.find(id).await?;
-                let zone = self.zone_of(&connector).await?;
-                record_label(&host, &connector.domain, &zone)?;
-                if let Some(guard) = self.move_guard.get() {
-                    guard
-                        .check_move(&host, &connector.name)
-                        .await
-                        .map_err(IngressError::Validation)?;
-                }
+                self.check_tunnel_choice(&host, id).await?;
                 Some(id)
             }
         };

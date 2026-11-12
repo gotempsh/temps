@@ -3732,18 +3732,16 @@ impl RunOps for LiveOps {
             .map_err(text)
     }
 
-    async fn route_hostname(&self, host: &str, connector_id: i32) -> Result<(), String> {
+    async fn route_hostname(
+        &self,
+        host: &str,
+        connector_id: i32,
+        expected: Option<Option<i32>>,
+    ) -> Result<(), String> {
         self.deps
             .connectors
-            .set_hostname_choice(
-                host,
-                SetHostnameChoiceRequest {
-                    mode: HostnameMode::Tunnel,
-                    connector_id: Some(connector_id),
-                },
-            )
+            .choose_tunnel_if_unchanged(host, connector_id, expected)
             .await
-            .map(|_| ())
             .map_err(text)
     }
 

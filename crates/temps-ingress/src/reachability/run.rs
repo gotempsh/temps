@@ -304,7 +304,14 @@ pub trait RunOps: Send + Sync {
     async fn detach_domain(&self, id: i32) -> Result<(), String>;
     /// See `IngressConnectorService::hostname_choice`.
     async fn hostname_choice(&self, host: &str) -> Result<Option<Option<i32>>, String>;
-    async fn route_hostname(&self, host: &str, connector_id: i32) -> Result<(), String>;
+    /// Chooses the tunnel for `host` only while its choice is still
+    /// `expected`, the one the run read: a choice made meanwhile is kept.
+    async fn route_hostname(
+        &self,
+        host: &str,
+        connector_id: i32,
+        expected: Option<Option<i32>>,
+    ) -> Result<(), String>;
     /// Puts a hostname's choice back as it was before the run.
     async fn restore_hostname_choice(
         &self,
@@ -2906,7 +2913,11 @@ impl Runner<'_> {
                 match self.begin(&intent).await {
                     Err(hold) => hold.into(),
                     Ok(Begin::Have(_)) => Outcome::Done(None),
-                    Ok(Begin::Go) => match self.ops.route_hostname(&address, connector_id).await {
+                    Ok(Begin::Go) => match self
+                        .ops
+                        .route_hostname(&address, connector_id, previous.as_choice())
+                        .await
+                    {
                         Ok(()) => {
                             self.finish(
                                 &intent.key(input.run_id),
@@ -4369,6 +4380,8 @@ mod tests {
         zone: Option<ZoneState>,
         existing_domain: Option<(i32, i32)>,
         choice: Option<Option<i32>>,
+        /// The choice `route_hostname` was told to expect, once called.
+        route_expected: Mutex<Option<Option<Option<i32>>>>,
         published_after: usize,
         reachable: bool,
         resolves: bool,
@@ -4590,8 +4603,14 @@ mod tests {
             self.log("hostname_choice");
             Ok(self.choice)
         }
-        async fn route_hostname(&self, _host: &str, connector_id: i32) -> Result<(), String> {
+        async fn route_hostname(
+            &self,
+            _host: &str,
+            connector_id: i32,
+            expected: Option<Option<i32>>,
+        ) -> Result<(), String> {
             self.log(format!("route_hostname {connector_id}"));
+            *self.route_expected.lock().unwrap() = Some(expected);
             Ok(())
         }
         async fn restore_hostname_choice(
@@ -6663,6 +6682,9 @@ mod tests {
             connector_id: 41,
             previous: PreviousChoice::Off,
         }));
+        // The write is conditional on the choice the run read, so one made
+        // meanwhile is never replaced unseen.
+        assert_eq!(*ops.route_expected.lock().unwrap(), Some(Some(None)));
         let results = undo(&mut record.journal, &ops, 0, &Journaled::default())
             .await
             .results;
