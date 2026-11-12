@@ -502,6 +502,7 @@ impl ExternalService for PostgresService {
             }
             self.wait_for_container_health(&self.docker, &container_name)
                 .await?;
+            self.repair_walg_env_on_start(&container_name).await;
             let _ = config;
             return Ok(());
         }
@@ -608,6 +609,7 @@ impl ExternalService for PostgresService {
                         Ok(_) => {
                             self.wait_for_container_health(&self.docker, &container_name)
                                 .await?;
+                            self.repair_walg_env_on_start(&container_name).await;
                             return Ok(());
                         }
                         Err(e) if matches!(&e, EngineError::RecreateGuard(g) if g.original_in_place()) =>
@@ -695,6 +697,7 @@ impl ExternalService for PostgresService {
         // Wait for container to be healthy
         self.wait_for_container_health(&self.docker, &container_name)
             .await?;
+        self.repair_walg_env_on_start(&container_name).await;
 
         Ok(())
     }

@@ -35,6 +35,7 @@ pub use cluster_state::*;
 pub(crate) use cluster_topology::*;
 use engine_selection::{EngineKind, EngineSelection};
 pub(crate) use manager::record_wal_outcome;
+pub use manager::{ArchiveTargetTestError, ArchiveTargetTestOutcome};
 pub use manager::{WalHealthReading, WalHealthUnchecked, WalProbeOutcome};
 pub use schema::*;
 pub use temps_providers_core::service_errors::*;
