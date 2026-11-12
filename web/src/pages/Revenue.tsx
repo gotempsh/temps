@@ -33,12 +33,13 @@ import {
 } from '@/components/ui/table'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
-import { keepPreviousData, useQuery } from '@tanstack/react-query'
+import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import { DollarSign, X } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { DateRange } from 'react-day-picker'
 import { Link } from 'react-router'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 const ALL_PROJECTS = '__all_projects__'
 const ALL_TYPES = '__all_types__'
@@ -81,7 +82,7 @@ export function Revenue() {
     ...revenueMetricsGlobalSummaryOptions(),
   })
 
-  const eventsQuery = useQuery({
+  const eventsQuery = useWindowQuery({
     ...revenueGlobalEventsOptions({
       query: {
         project_id:
@@ -97,7 +98,6 @@ export function Revenue() {
         limit: 200,
       },
     }),
-    placeholderData: keepPreviousData,
   })
 
   const projectOptions = useMemo<SearchableSelectOption[]>(() => {

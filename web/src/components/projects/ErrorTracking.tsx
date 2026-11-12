@@ -64,12 +64,7 @@ import {
 } from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
 import { cn } from '@/lib/utils'
-import {
-  keepPreviousData,
-  useMutation,
-  useQuery,
-  useQueryClient,
-} from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import {
   AlertTriangle,
@@ -90,6 +85,7 @@ import { toast } from 'sonner'
 import { TimeAgo } from '../utils/TimeAgo'
 import { errorGroupSortQuery, EVENT_COUNT_SORT } from './error-group-sort'
 import { errorRowText } from './error-row-text'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 interface ErrorTrackingProps {
   project: ProjectResponse
@@ -244,27 +240,27 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
   }
 
   // Fetch error groups for the project (only if we have errors)
-  const { data: errorGroupsResponse, isLoading: isLoadingGroups } = useQuery({
-    ...listErrorGroupsOptions({
-      path: { project_id: project.id },
-      query: {
-        page,
-        page_size: pageSize,
-        status: statusFilter === 'all' ? null : statusFilter,
-        start_date: timeRange.startTime,
-        end_date: timeRange.endTime,
-        environment_id: environmentFilter,
-        ...errorGroupSortQuery(groupSort),
-      },
-    }),
-    enabled: hasErrors,
-    // Refresh moves the window: keep the issues on screen meanwhile.
-    placeholderData: keepPreviousData,
-  })
+  const { data: errorGroupsResponse, isLoading: isLoadingGroups } =
+    useWindowQuery({
+      ...listErrorGroupsOptions({
+        path: { project_id: project.id },
+        query: {
+          page,
+          page_size: pageSize,
+          status: statusFilter === 'all' ? null : statusFilter,
+          start_date: timeRange.startTime,
+          end_date: timeRange.endTime,
+          environment_id: environmentFilter,
+          ...errorGroupSortQuery(groupSort),
+        },
+      }),
+      enabled: hasErrors,
+      // Refresh moves the window: keep the issues on screen meanwhile.
+    })
 
   // Fetch error dashboard statistics (only if we have errors)
-  const { data: dashboardStats, isLoading: isLoadingDashboardStats } = useQuery(
-    {
+  const { data: dashboardStats, isLoading: isLoadingDashboardStats } =
+    useWindowQuery({
       ...getErrorDashboardStatsOptions({
         path: { project_id: project.id },
         query: {
@@ -275,9 +271,7 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
         },
       }),
       enabled: hasErrors,
-      placeholderData: keepPreviousData,
-    }
-  )
+    })
 
   // Shared mutation for the assignee quick-actions on each row ("Assign to
   // me" / "Unassign"). `assigned_to: ''` is the backend's clear-assignment

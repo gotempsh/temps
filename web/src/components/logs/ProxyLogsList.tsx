@@ -38,7 +38,7 @@ import {
   type DataTableColumn,
   type StatusTone,
 } from '@temps-sdk/ds'
-import { keepPreviousData, useQuery } from '@tanstack/react-query'
+import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import {
   AlertCircle,
@@ -64,6 +64,7 @@ import {
   useListScrollRestoration,
   type ListReturnState,
 } from '@/components/table/list-navigation'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 interface ProxyLogsListProps {
   project: ProjectResponse
@@ -174,7 +175,7 @@ export default function ProxyLogsList({
   const { data: environmentsData, isLoading: environmentsLoading } = useQuery(
     getEnvironmentsOptions({ path: { project_id: project.id } })
   )
-  const query = useQuery({
+  const query = useWindowQuery({
     ...getProxyLogsOptions({
       query: {
         page,
@@ -202,7 +203,6 @@ export default function ProxyLogsList({
     }),
     // A refresh moves the window, so the key changes: keep the current rows
     // and count on screen until the next ones arrive.
-    placeholderData: keepPreviousData,
   })
   const { data: logs, isLoading, error } = query
   const totalPages = Math.max(1, Math.ceil((logs?.total ?? 0) / limit))

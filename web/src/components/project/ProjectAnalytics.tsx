@@ -132,6 +132,7 @@ import {
   TabsTrigger,
 } from '@/components/ui/tabs'
 import { RefreshButton } from '@/components/ui/refresh-button'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 import { queryKeyPrefix } from '@/lib/refresh'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
@@ -144,7 +145,6 @@ import type { ChartDateRange } from '@/lib/chart-range-selection'
 import { CreateFunnel } from '@/pages/CreateFunnel'
 import { EditFunnel } from '@/pages/EditFunnel'
 import {
-  keepPreviousData,
   useMutation,
   useQuery,
   useQueryClient,
@@ -221,8 +221,7 @@ export function VisitorChart({
     'events' | 'sessions' | 'visitors'
   >('visitors')
 
-  const { data, isLoading, error } = useQuery({
-    placeholderData: keepPreviousData,
+  const { data, isLoading, error } = useWindowQuery({
     ...getHourlyVisitsOptions({
       path: {
         project_id: project.id,
@@ -1474,8 +1473,7 @@ interface ChartProps {
 function EventsChart({ project, startDate, endDate, environment }: ChartProps) {
   const navigate = useNavigate()
   const [searchParams] = useSearchParams()
-  const { data, isLoading, error } = useQuery({
-    placeholderData: keepPreviousData,
+  const { data, isLoading, error } = useWindowQuery({
     ...getEventsCountOptions({
       path: {
         project_id: project.id,

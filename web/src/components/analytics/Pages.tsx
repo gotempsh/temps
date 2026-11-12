@@ -16,7 +16,6 @@ import {
   CardTitle,
 } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
-import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import { FileText } from 'lucide-react'
 import { useMemo } from 'react'
@@ -29,6 +28,7 @@ import {
 } from './insights'
 import type { AiInsightContext } from './insights'
 import { PageListItem } from './PageListItem'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 interface PagesProps {
   project: ProjectResponse
@@ -46,8 +46,7 @@ export function Pages({
   const [insightsOpen, setInsightsOpen] = useInsightsOpen()
 
   // Fetch page paths
-  const { data, isLoading, error, refetch } = useQuery({
-    placeholderData: keepPreviousData,
+  const { data, isLoading, error, refetch } = useWindowQuery({
     ...getPagePathsOptions({
       query: {
         project_id: project.id,
@@ -69,8 +68,7 @@ export function Pages({
   }, [pagePaths])
 
   // Fetch all sparklines in a single batch request
-  const { data: sparklineData } = useQuery({
-    placeholderData: keepPreviousData,
+  const { data: sparklineData } = useWindowQuery({
     ...getPagePathsSparklinesOptions({
       query: {
         project_id: project.id,

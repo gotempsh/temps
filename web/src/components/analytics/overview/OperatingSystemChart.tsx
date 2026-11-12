@@ -13,13 +13,13 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
-import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import { ChevronLeft } from 'lucide-react'
 import * as React from 'react'
 import { useNavigate, useSearchParams } from 'react-router'
 import { OsIcon } from './TechnologyIcon'
 import { buildAnalyticsDimensionUrl } from './viewAllUrl'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 interface OperatingSystemChartProps {
   project: ProjectResponse
@@ -40,8 +40,7 @@ export function OperatingSystemChart({
 
   const groupBy = selectedOs ? 'operating_system_version' : 'operating_system'
 
-  const { data, isLoading, error } = useQuery({
-    placeholderData: keepPreviousData,
+  const { data, isLoading, error } = useWindowQuery({
     ...getPropertyBreakdownOptions({
       path: {
         project_id: project.id,

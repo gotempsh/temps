@@ -14,11 +14,11 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
-import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import { ArrowRight } from 'lucide-react'
 import * as React from 'react'
 import { useNavigate, useSearchParams } from 'react-router'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 /** How many rows the overview card shows before "View all". */
 const TOP_N = 5
@@ -56,8 +56,7 @@ export function AiAgentsChart({
     )
   }, [navigate, project.slug, searchParams])
 
-  const { data, isLoading, error } = useQuery({
-    placeholderData: keepPreviousData,
+  const { data, isLoading, error } = useWindowQuery({
     ...getAiAgentBreakdownOptions({
       query: {
         project_id: project.id,

@@ -40,7 +40,6 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import {
   AlertCircle,
@@ -58,6 +57,7 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useSearchParams } from 'react-router'
 import { IpLink } from '@/components/data-display/IpLink'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 interface ProxyLogsDataTableProps {
   projectId?: number
@@ -450,7 +450,7 @@ export function ProxyLogsDataTable({
     return { start: timeRangeToStartDate(timeRange), end: null }
   }, [timeRange, filters.start_date, filters.end_date, refreshedAt])
 
-  const { data, isLoading, error } = useQuery({
+  const { data, isLoading, error } = useWindowQuery({
     ...getProxyLogsOptions({
       query: {
         project_id: scopedProjectId ?? null,
@@ -511,7 +511,6 @@ export function ProxyLogsDataTable({
     // A refresh moves the window, so the key changes: keep the current rows
     // (and their count) on screen until the next ones arrive instead of
     // collapsing the table into a spinner.
-    placeholderData: keepPreviousData,
   })
 
   const handleSort = (column: string) => {

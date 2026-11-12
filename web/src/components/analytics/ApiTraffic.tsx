@@ -62,12 +62,7 @@ import {
   type AnalyticsDateFilter,
   type QuickFilter,
 } from '@/hooks/useAnalyticsDateRange'
-import {
-  keepPreviousData,
-  useMutation,
-  useQuery,
-  useQueryClient,
-} from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   AlertTriangle,
   ChevronLeft,
@@ -93,6 +88,7 @@ import {
 import { apiTrafficProxyLogsUrl } from '@/lib/api-traffic-navigation'
 import { useAiAssistant } from '@/components/ai/AiAssistantContext'
 import type { ChartDateRange } from '@/lib/chart-range-selection'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 interface ApiTrafficTabProps {
   project: ProjectResponse
@@ -373,7 +369,7 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
     staleTime: 5 * 60 * 1000,
   })
 
-  const timeseriesQuery = useQuery({
+  const timeseriesQuery = useWindowQuery({
     ...getApiTimeseriesOptions({
       path: { project_id: project.id },
       query: {
@@ -384,10 +380,9 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
     }),
     enabled,
     // Refresh moves the window: keep the charts and tables on screen.
-    placeholderData: keepPreviousData,
   })
 
-  const routesQuery = useQuery({
+  const routesQuery = useWindowQuery({
     queryKey: [
       'api-traffic-query',
       project.id,
@@ -434,10 +429,9 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
       }),
     enabled,
     retry: retryUnlessClientError,
-    placeholderData: keepPreviousData,
   })
 
-  const callersQuery = useQuery({
+  const callersQuery = useWindowQuery({
     queryKey: [
       'api-traffic-query',
       project.id,
@@ -481,7 +475,6 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
       }),
     enabled,
     retry: retryUnlessClientError,
-    placeholderData: keepPreviousData,
   })
 
   const detailQuery = useQuery({

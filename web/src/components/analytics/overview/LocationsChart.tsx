@@ -15,12 +15,12 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
-import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import { ChevronLeft, ChevronRight } from 'lucide-react'
 import * as React from 'react'
 import { useNavigate, useSearchParams } from 'react-router'
 import { buildAnalyticsDimensionUrl } from './viewAllUrl'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 type LocationType = 'country' | 'region' | 'city'
 
@@ -47,8 +47,7 @@ export function LocationsChart({
   const [searchParams] = useSearchParams()
   const [drill, setDrill] = React.useState<DrillState>({ level: 'country' })
 
-  const { data, isLoading, error } = useQuery({
-    placeholderData: keepPreviousData,
+  const { data, isLoading, error } = useWindowQuery({
     ...getPropertyBreakdownOptions({
       path: {
         project_id: project.id,

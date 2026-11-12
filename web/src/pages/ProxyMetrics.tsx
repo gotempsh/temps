@@ -33,7 +33,7 @@ import {
   nodeMetricsGetRangeQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
 import { RefreshButton } from '@/components/ui/refresh-button'
-import { queryKeyPrefix } from '@/lib/refresh'
+import { keepPreviousWindow, queryKeyPrefix } from '@/lib/refresh'
 import {
   NodeReportingNotice,
   NodeScopeSelect,
@@ -82,7 +82,7 @@ import {
   type ProxyRangeValue,
   type ResolvedProxyWindow,
 } from '@/lib/proxy-metrics-window'
-import { keepPreviousData, useQueries, useQuery } from '@tanstack/react-query'
+import { useQueries, useQuery } from '@tanstack/react-query'
 import { useEffect, useMemo, useReducer, useRef, useState } from 'react'
 import type { DateRange } from 'react-day-picker'
 import { PageContainer, PageHeader } from '@/components/layout/PageContainer'
@@ -95,6 +95,7 @@ import {
   XAxis,
   YAxis,
 } from 'recharts'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -420,20 +421,22 @@ function proxySeriesQuery(
   window: ResolvedProxyWindow,
   scope: NodeScope
 ) {
+  const options = nodeRangeQuery(
+    scope,
+    window.rangeParam
+      ? { metric, range: window.rangeParam }
+      : {
+          metric,
+          start_time: window.startIso,
+          end_time: window.endIso,
+        }
+  )
   return {
-    ...nodeRangeQuery(
-      scope,
-      window.rangeParam
-        ? { metric, range: window.rangeParam }
-        : {
-            metric,
-            start_time: window.startIso,
-            end_time: window.endIso,
-          }
-    ),
+    ...options,
     staleTime: 15_000,
-    // Refresh moves a preset window: keep the chart on screen meanwhile.
-    placeholderData: keepPreviousData,
+    // Refresh moves a preset window: keep the chart on screen meanwhile, but
+    // not across another node scope.
+    placeholderData: keepPreviousWindow(options.queryKey),
     // A refused read (a role without settings:read) is neither retried nor
     // polled again: the answer cannot change until the role does.
     refetchInterval: refetchUnlessRefused(30_000),
@@ -462,7 +465,7 @@ function useResolvedWindow(
  * stat cards and every chart panel, so React Query dedupes to one request.
  */
 function useBucketStats(window: ResolvedProxyWindow, filter: ProxyFilter) {
-  return useQuery({
+  return useWindowQuery({
     ...getTimeBucketStatsOptions({
       query: {
         start_time: window.startIso,
@@ -475,7 +478,6 @@ function useBucketStats(window: ResolvedProxyWindow, filter: ProxyFilter) {
     enabled: filter.projectId != null,
     staleTime: 15_000,
     refetchInterval: 30_000,
-    placeholderData: keepPreviousData,
   })
 }
 
@@ -1157,7 +1159,7 @@ function TrafficByProject({
   const totalPages = Math.max(1, Math.ceil(total / TRAFFIC_PAGE_SIZE))
 
   const idsParam = projects.map((p) => p.id).join(',')
-  const healthQ = useQuery({
+  const healthQ = useWindowQuery({
     ...getProjectsHealthOptions({
       query: {
         project_ids: idsParam,
@@ -1168,7 +1170,6 @@ function TrafficByProject({
     enabled: visible && projects.length > 0,
     staleTime: 30_000,
     refetchInterval: 60_000,
-    placeholderData: keepPreviousData,
   })
 
   const health = healthQ.data?.projects ?? {}

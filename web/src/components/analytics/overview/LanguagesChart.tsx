@@ -14,12 +14,12 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
-import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import { Languages } from 'lucide-react'
 import * as React from 'react'
 import { useNavigate, useSearchParams } from 'react-router'
 import { buildAnalyticsDimensionUrl } from './viewAllUrl'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 interface LanguagesChartProps {
   project: ProjectResponse
@@ -36,8 +36,7 @@ export function LanguagesChart({
 }: LanguagesChartProps) {
   const navigate = useNavigate()
   const [searchParams] = useSearchParams()
-  const { data, isLoading, error } = useQuery({
-    placeholderData: keepPreviousData,
+  const { data, isLoading, error } = useWindowQuery({
     ...getPropertyBreakdownOptions({
       path: {
         project_id: project.id,

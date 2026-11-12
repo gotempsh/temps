@@ -23,7 +23,6 @@ import {
 } from '@/lib/attribute-facets'
 import { RecordLink, RecordRow } from '@temps-sdk/ds'
 import { Link } from 'react-router'
-import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import {
   queryGlobalTraceSummariesOptions,
   queryGlobalTraceSummariesQueryKey,
@@ -47,6 +46,7 @@ import { Badge } from '@/components/ui/badge'
 import { SortableTableHead } from '@/components/ui/sortable-table-head'
 import { TimeAgo } from '@/components/utils/TimeAgo'
 import { OBSERVABILITY_PAGE_SIZE } from '@/lib/global-observability'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 export default function GlobalTraces() {
   const view = useGlobalView()
@@ -108,8 +108,7 @@ export default function GlobalTraces() {
     urlValue,
     patchView,
   ])
-  const query = useQuery({
-    placeholderData: keepPreviousData,
+  const query = useWindowQuery({
     ...queryGlobalTraceSummariesOptions({
       query: {
         project_id: view.projectId,

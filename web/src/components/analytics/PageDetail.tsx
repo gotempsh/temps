@@ -30,7 +30,6 @@ import {
   TooltipTrigger,
 } from '@/components/ui/tooltip'
 import { Skeleton } from '@/components/ui/skeleton'
-import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import {
   ArrowLeft,
@@ -50,6 +49,7 @@ import {
 import { useState } from 'react'
 import { useNavigate } from 'react-router'
 import { TimeAgo } from '../utils/TimeAgo'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 interface PageDetailProps {
   project: ProjectResponse
@@ -97,8 +97,7 @@ export function PageDetail({
   const perPage = 50
 
   // Fetch page detail analytics
-  const { data: detailData, isLoading: detailLoading } = useQuery({
-    placeholderData: keepPreviousData,
+  const { data: detailData, isLoading: detailLoading } = useWindowQuery({
     ...getPagePathDetailOptions({
       query: {
         page_path: pagePath,
@@ -112,8 +111,7 @@ export function PageDetail({
   })
 
   // Fetch visitor sessions for this page
-  const { data: visitorsData, isLoading: visitorsLoading } = useQuery({
-    placeholderData: keepPreviousData,
+  const { data: visitorsData, isLoading: visitorsLoading } = useWindowQuery({
     ...getPagePathVisitorsOptions({
       query: {
         page_path: pagePath,
@@ -130,8 +128,7 @@ export function PageDetail({
 
   // AI crawler activity for this exact path (from proxy logs, not the visitor
   // JS SDK — bots don't run the SDK). `path`-scoped so the count is precise.
-  const { data: aiPageData, isLoading: aiLoading } = useQuery({
-    placeholderData: keepPreviousData,
+  const { data: aiPageData, isLoading: aiLoading } = useWindowQuery({
     ...getAiPageBreakdownOptions({
       query: {
         project_id: project.id,

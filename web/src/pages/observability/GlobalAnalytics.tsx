@@ -4,7 +4,6 @@
 import { useState, type ReactNode } from 'react'
 import { Button } from '@/components/ui/button'
 import { OBSERVABILITY_PAGE_SIZE } from '@/lib/global-observability'
-import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import {
   getGlobalAnalyticsOptions,
   getGlobalAnalyticsQueryKey,
@@ -33,6 +32,7 @@ import type { AnalyticsFacet } from '@/api/client/types.gen'
 import { EmptyState } from '@/components/ui/empty-state'
 import { BarChart3 } from 'lucide-react'
 import { Link } from 'react-router'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 function Breakdown({
   title,
@@ -49,7 +49,7 @@ function Breakdown({
   totalVisitors: number
   expanded?: boolean
 }) {
-  const query = useQuery({
+  const query = useWindowQuery({
     ...getGlobalAnalyticsOptions({
       query: {
         project_id: view.projectId,
@@ -65,7 +65,6 @@ function Breakdown({
       },
     }),
     // Refresh moves the window: keep the numbers on screen meanwhile.
-    placeholderData: keepPreviousData,
   })
   return (
     <DataSection
@@ -135,22 +134,19 @@ export default function GlobalAnalytics() {
     start_date: view.from,
     end_date: view.to,
   }
-  const summary = useQuery({
+  const summary = useWindowQuery({
     ...getGlobalAnalyticsOptions({ query: { ...common, facet: 'summary' } }),
     // Refresh moves the window: keep the numbers on screen meanwhile.
-    placeholderData: keepPreviousData,
   })
-  const traffic = useQuery({
+  const traffic = useWindowQuery({
     ...getGlobalAnalyticsOptions({ query: { ...common, facet: 'traffic' } }),
     // Refresh moves the window: keep the numbers on screen meanwhile.
-    placeholderData: keepPreviousData,
   })
-  const pages = useQuery({
+  const pages = useWindowQuery({
     ...getGlobalAnalyticsOptions({
       query: { ...common, facet: 'pages', per_page: 1 },
     }),
     // Refresh moves the window: keep the numbers on screen meanwhile.
-    placeholderData: keepPreviousData,
   })
   const totals = summary.data?.rows[0]
   const grid = (children: ReactNode) => (

@@ -31,7 +31,6 @@ import {
   type TableSort,
 } from '@/lib/client-table-sort'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
-import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import {
   ArrowLeft,
@@ -43,6 +42,7 @@ import {
 } from 'lucide-react'
 import * as React from 'react'
 import { useNavigate } from 'react-router'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 interface AiAgentsDetailProps {
   project: ProjectResponse
@@ -104,8 +104,7 @@ export function AiAgentsDetail({
   // Which page row is expanded to show its per-agent breakdown.
   const [expandedPath, setExpandedPath] = React.useState<string | null>(null)
 
-  const agentsQuery = useQuery({
-    placeholderData: keepPreviousData,
+  const agentsQuery = useWindowQuery({
     ...getAiAgentBreakdownOptions({
       query: {
         project_id: project.id,
@@ -118,8 +117,7 @@ export function AiAgentsDetail({
     enabled: !!startDate && !!endDate,
   })
 
-  const pagesQuery = useQuery({
-    placeholderData: keepPreviousData,
+  const pagesQuery = useWindowQuery({
     ...getAiPageBreakdownOptions({
       query: {
         project_id: project.id,
@@ -132,8 +130,7 @@ export function AiAgentsDetail({
     enabled: !!startDate && !!endDate,
   })
 
-  const statusQuery = useQuery({
-    placeholderData: keepPreviousData,
+  const statusQuery = useWindowQuery({
     ...getAiStatusBreakdownOptions({
       query: {
         project_id: project.id,
@@ -921,8 +918,7 @@ function PageAgentBreakdown({
   onAgentClick,
   onViewAll,
 }: PageAgentBreakdownProps) {
-  const { data, isLoading, error } = useQuery({
-    placeholderData: keepPreviousData,
+  const { data, isLoading, error } = useWindowQuery({
     ...getAiAgentBreakdownOptions({
       query: {
         project_id: project.id,

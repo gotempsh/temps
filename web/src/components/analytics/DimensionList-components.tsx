@@ -27,7 +27,6 @@ import {
   SortableTableHead,
   type SortDirection,
 } from '@/components/ui/sortable-table-head'
-import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import { ArrowLeft, ChevronRight, Search } from 'lucide-react'
 import * as React from 'react'
@@ -47,6 +46,7 @@ import {
   type DimensionSortKey,
   dimensionRowHref,
 } from './DimensionList-shared'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 /**
  * Maximum rows fetched from the backend. The property-breakdown and
@@ -95,8 +95,7 @@ export function DimensionList({
   const getRowHref = (value: string): string | undefined =>
     dimensionRowHref(project.slug, dimension, value, searchParams)
 
-  const breakdownQuery = useQuery({
-    placeholderData: keepPreviousData,
+  const breakdownQuery = useWindowQuery({
     ...getPropertyBreakdownOptions({
       path: { project_id: project.id },
       query: {
@@ -112,8 +111,7 @@ export function DimensionList({
       !!startDate && !!endDate && !!config.groupBy && !config.useEventsCount,
   })
 
-  const eventsQuery = useQuery({
-    placeholderData: keepPreviousData,
+  const eventsQuery = useWindowQuery({
     ...getEventsCountOptions({
       path: { project_id: project.id },
       query: {

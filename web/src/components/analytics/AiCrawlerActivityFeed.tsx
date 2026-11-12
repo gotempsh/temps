@@ -24,11 +24,11 @@ import {
 } from '@/components/ui/select'
 import { AGENT_TO_PROVIDER, AI_PROVIDERS } from '@/lib/ai-agents'
 import { proxyLogDetailUrl } from '@/lib/proxy-log-navigation'
-import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import { format, formatDistanceToNow } from 'date-fns'
 import { Bot, ExternalLink } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { Link, useSearchParams } from 'react-router'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 const ALL = '__all__'
 const PAGE_SIZE_OPTIONS = [25, 50, 100] as const
@@ -116,7 +116,7 @@ export function AiCrawlerActivityFeed({
     setSearchParams(next, { replace: true })
   }
 
-  const { data, isLoading, error } = useQuery({
+  const { data, isLoading, error } = useWindowQuery({
     ...getProxyLogsOptions({
       query: {
         project_id: projectId || null,
@@ -134,7 +134,6 @@ export function AiCrawlerActivityFeed({
       },
     }),
     staleTime: 1000 * 15,
-    placeholderData: keepPreviousData,
   })
 
   // A preset ("last 24 hours") ends now again; a custom range only refetches.

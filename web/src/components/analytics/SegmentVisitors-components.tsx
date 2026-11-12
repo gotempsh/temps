@@ -21,7 +21,6 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import { format, formatDistanceToNow } from 'date-fns'
 import {
   ArrowLeft,
@@ -38,6 +37,7 @@ import {
   segmentParamFor,
   type SegmentVisitorsProps,
 } from './SegmentVisitors-shared'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 const PAGE_SIZE = 25
 
@@ -105,8 +105,7 @@ export function SegmentVisitors({
     segmentQuery[filterParam] = value
   }
 
-  const { data, isLoading, error } = useQuery({
-    placeholderData: keepPreviousData,
+  const { data, isLoading, error } = useWindowQuery({
     ...getVisitorsOptions({
       query: {
         project_id: project.id,

@@ -4,7 +4,6 @@
 import { number } from '@/lib/global-observability'
 import { useGlobalView } from '@/hooks/useGlobalView'
 import { Link } from 'react-router'
-import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import {
   listGlobalErrorGroupsOptions,
   listGlobalErrorGroupsQueryKey,
@@ -29,6 +28,7 @@ import { TimeAgo } from '@/components/utils/TimeAgo'
 import { OBSERVABILITY_PAGE_SIZE } from '@/lib/global-observability'
 import { FixErrorWithAgentButton } from '@/components/ai/FixErrorWithAgentButton'
 import { offersFixInList } from '@/components/ai/fix-error-with-agent'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 export default function GlobalErrors() {
   const view = useGlobalView()
@@ -37,8 +37,7 @@ export default function GlobalErrors() {
   )
     ? view.params.get('status')!
     : 'all'
-  const query = useQuery({
-    placeholderData: keepPreviousData,
+  const query = useWindowQuery({
     ...listGlobalErrorGroupsOptions({
       query: {
         project_id: view.projectId,

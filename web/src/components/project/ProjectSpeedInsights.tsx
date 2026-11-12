@@ -57,7 +57,7 @@ import {
 import { SegmentedControl } from '@/components/ui/segmented-control'
 import { SpeedWorldMap } from '@/components/project/SpeedWorldMap'
 import { cn } from '@/lib/utils'
-import { keepPreviousData, useQuery } from '@tanstack/react-query'
+import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import {
   AlertTriangle,
@@ -71,6 +71,7 @@ import {
 } from 'lucide-react'
 import { useMemo, useReducer, useState } from 'react'
 import { Link } from 'react-router'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 type MetricKey = 'lcp' | 'inp' | 'cls' | 'ttfb' | 'fcp'
 
@@ -365,7 +366,7 @@ function SpeedBreakdownCard({
   const [sortKey, setSortKey] = useState<BreakdownSortKey>('events')
   const [sortDirection, setSortDirection] = useState<SortDirection>('desc')
 
-  const { data, isLoading, isError } = useQuery({
+  const { data, isLoading, isError } = useWindowQuery({
     ...getGroupedPageMetricsOptions({
       query: {
         start_date: startDate,
@@ -379,7 +380,6 @@ function SpeedBreakdownCard({
       },
     }),
     enabled: environmentId !== null,
-    placeholderData: keepPreviousData,
   })
 
   const groups = useMemo(() => data?.groups ?? [], [data?.groups])
@@ -603,7 +603,7 @@ export function ProjectSpeedInsights({ project }: ProjectSpeedInsightsProps) {
     data: metrics,
     isLoading,
     error,
-  } = useQuery({
+  } = useWindowQuery({
     ...getMetricsOverTimeOptions({
       query: {
         start_date: startDate,
@@ -617,7 +617,6 @@ export function ProjectSpeedInsights({ project }: ProjectSpeedInsightsProps) {
     }),
     enabled: effectiveEnvironment !== null,
     refetchInterval: 300000,
-    placeholderData: keepPreviousData,
   })
 
   const chartData = useMemo(() => {

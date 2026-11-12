@@ -32,7 +32,7 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from '@/components/ui/popover'
-import { keepPreviousData, useQuery } from '@tanstack/react-query'
+import { useQuery } from '@tanstack/react-query'
 import {
   Activity,
   AlertCircle,
@@ -52,6 +52,7 @@ import {
   formatUptime,
   unknownTimeNote,
 } from '@/lib/monitor-uptime'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 interface MonitorDetailProps {
   project: ProjectResponse
@@ -272,7 +273,7 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
     isLoading: isLoadingCurrentMonitorStatus,
     error: currentMonitorStatusError,
     refetch: refetchCurrentMonitorStatus,
-  } = useQuery({
+  } = useWindowQuery({
     ...getCurrentMonitorStatusOptions({
       path: {
         monitor_id: parseInt(monitorId || '0'),
@@ -282,7 +283,6 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
         end_time: endDate ? endDate.toISOString() : undefined,
       },
     }),
-    placeholderData: keepPreviousData,
   })
 
   const {
@@ -290,7 +290,7 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
     isLoading: isLoadingStatus,
     error: statusError,
     refetch: refetchStatus,
-  } = useQuery({
+  } = useWindowQuery({
     ...getBucketedStatusOptions({
       path: {
         monitor_id: parseInt(monitorId || '0'),
@@ -304,7 +304,6 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
     enabled: !!monitorId && !!startDate && !!endDate,
     refetchInterval: 30000, // Refresh every 30 seconds
     // Refresh moves the window: keep the timeline on screen meanwhile.
-    placeholderData: keepPreviousData,
   })
   // Calculate uptime stats from status data (filtered by date range)
   const uptimePercentage = currentMonitorStatus?.uptime_percentage ?? null

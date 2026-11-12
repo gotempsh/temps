@@ -32,10 +32,11 @@ import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { useCanViewAuditLogs } from '@/hooks/useAuditAccess'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { ALL_FILTER, buildOperationOptions } from './AuditLogs-shared'
-import { keepPreviousData, useQuery } from '@tanstack/react-query'
+import { useQuery } from '@tanstack/react-query'
 import { ScrollText, X } from 'lucide-react'
 import { useEffect, useMemo, useReducer } from 'react'
 import { Navigate } from 'react-router'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 const ITEMS_PER_PAGE = 20
 
@@ -80,7 +81,7 @@ export function AuditLogs() {
     enabled: canViewAuditLogs,
   })
 
-  const { data, isLoading, isError, refetch, isFetching } = useQuery({
+  const { data, isLoading, isError, refetch, isFetching } = useWindowQuery({
     ...listAuditLogsOptions({
       query: {
         limit: ITEMS_PER_PAGE,
@@ -94,7 +95,6 @@ export function AuditLogs() {
     }),
     enabled: canViewAuditLogs,
     // Refresh moves the window: keep the entries on screen meanwhile.
-    placeholderData: keepPreviousData,
   })
 
   const hasMore = data?.length === ITEMS_PER_PAGE

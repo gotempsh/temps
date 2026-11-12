@@ -218,6 +218,7 @@ import {
   compareAiModelIdsByRelevance,
   sortAiModelIdsByRelevance,
 } from '@/lib/ai-model-ranking'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 // Mutation errors here are thrown ProblemDetails response bodies, not Error
 // instances -- String(error) on an object stringifies to "[object Object]"
@@ -3422,7 +3423,7 @@ export function AgentActivity() {
     data: tracesResponse,
     isLoading: tracesLoading,
     error: tracesError,
-  } = useQuery({
+  } = useWindowQuery({
     ...queryGenaiTracesOptions({
       query: {
         project_id: projectId,
@@ -3433,12 +3434,6 @@ export function AgentActivity() {
       },
     }),
     enabled: !!projectId,
-    // Keep the list on screen while a moved window loads, but never show
-    // another service's traces under the newly picked one.
-    placeholderData: (previous, previousQuery) =>
-      previousQuery?.queryKey[0].query?.project_id === projectId
-        ? previous
-        : undefined,
   })
 
   const {
@@ -3788,7 +3783,7 @@ export function ProjectAgentActivity({
     data: tracesResponse,
     isLoading: tracesLoading,
     error: tracesError,
-  } = useQuery({
+  } = useWindowQuery({
     ...queryGenaiTracesOptions({
       query: {
         project_id: projectId,
@@ -3799,7 +3794,6 @@ export function ProjectAgentActivity({
       },
     }),
     enabled: !!projectId,
-    placeholderData: keepPreviousData,
   })
 
   const {

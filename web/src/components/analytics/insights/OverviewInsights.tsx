@@ -7,7 +7,6 @@ import {
   getUniqueCountsOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import type { ProjectResponse } from '@/api/client/types.gen'
-import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import { useMemo } from 'react'
 import {
   deriveBreakdownInsights,
@@ -16,6 +15,7 @@ import {
 } from './derive'
 import { InsightsPanel } from './InsightsPanel'
 import type { AiInsightContext, Insight } from './types'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 interface OverviewInsightsProps {
   project: ProjectResponse
@@ -46,32 +46,28 @@ export function OverviewInsights({
     environment_id: environment,
   }
 
-  const visitorsQuery = useQuery({
-    placeholderData: keepPreviousData,
+  const visitorsQuery = useWindowQuery({
     ...getUniqueCountsOptions({
       path: { project_id: project.id },
       query: { ...baseQuery, metric: 'visitors' },
     }),
     enabled,
   })
-  const sessionsQuery = useQuery({
-    placeholderData: keepPreviousData,
+  const sessionsQuery = useWindowQuery({
     ...getUniqueCountsOptions({
       path: { project_id: project.id },
       query: { ...baseQuery, metric: 'sessions' },
     }),
     enabled,
   })
-  const hourlyQuery = useQuery({
-    placeholderData: keepPreviousData,
+  const hourlyQuery = useWindowQuery({
     ...getHourlyVisitsOptions({
       path: { project_id: project.id },
       query: { ...baseQuery, aggregation_level: 'visitors' },
     }),
     enabled,
   })
-  const channelsQuery = useQuery({
-    placeholderData: keepPreviousData,
+  const channelsQuery = useWindowQuery({
     ...getPropertyBreakdownOptions({
       path: { project_id: project.id },
       query: {
@@ -83,8 +79,7 @@ export function OverviewInsights({
     }),
     enabled,
   })
-  const countriesQuery = useQuery({
-    placeholderData: keepPreviousData,
+  const countriesQuery = useWindowQuery({
     ...getPropertyBreakdownOptions({
       path: { project_id: project.id },
       query: {

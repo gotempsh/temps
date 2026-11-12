@@ -34,7 +34,6 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from '@/components/ui/tooltip'
-import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import { useMemo, useState } from 'react'
 import {
   ArrowRight,
@@ -45,6 +44,7 @@ import {
   AlertCircle,
 } from 'lucide-react'
 import { type PageFlowProps, durationSortValue } from './PageFlow-shared'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 function formatDuration(seconds: number | null | undefined): string {
   if (seconds == null || seconds <= 0) return '-'
@@ -493,8 +493,7 @@ export function PageFlow({
   endDate,
   environment,
 }: PageFlowProps) {
-  const { data, isLoading, isError } = useQuery({
-    placeholderData: keepPreviousData,
+  const { data, isLoading, isError } = useWindowQuery({
     ...getPageFlowOptions({
       query: {
         project_id: project.id,

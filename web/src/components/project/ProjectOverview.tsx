@@ -48,7 +48,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { TimeAgo } from '@/components/utils/TimeAgo'
 import { cn } from '@/lib/utils'
 import { buildProjectAnalyticsCountRequest } from '@/lib/project-analytics-summary'
-import { keepPreviousData, useQueries, useQuery } from '@tanstack/react-query'
+import { useQueries, useQuery } from '@tanstack/react-query'
 import { format, subDays } from 'date-fns'
 import { ArrowRight, Sparkles } from 'lucide-react'
 import { useMemo, useReducer } from 'react'
@@ -56,6 +56,7 @@ import { Link } from 'react-router'
 import { formatAxisNumber } from '@/lib/chart-axis-ticks'
 import { PROJECT_TOUR_EVENT } from './ProjectTour'
 import { errorRatePoints, errorRateTone } from './error-rate-chart'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 interface ProjectOverviewProps {
   project: ProjectResponse
@@ -89,8 +90,7 @@ export function ProjectOverview({
     end_date: endDate.toISOString(),
   }
 
-  const visitorsQuery = useQuery({
-    placeholderData: keepPreviousData,
+  const visitorsQuery = useWindowQuery({
     ...getUniqueCountsOptions({
       ...buildProjectAnalyticsCountRequest(
         project.id,
@@ -101,8 +101,7 @@ export function ProjectOverview({
     enabled: analyticsEnabled,
   })
 
-  const pageViewsQuery = useQuery({
-    placeholderData: keepPreviousData,
+  const pageViewsQuery = useWindowQuery({
     ...getUniqueCountsOptions({
       ...buildProjectAnalyticsCountRequest(
         project.id,
@@ -113,8 +112,7 @@ export function ProjectOverview({
     enabled: analyticsEnabled,
   })
 
-  const returningVisitorsQuery = useQuery({
-    placeholderData: keepPreviousData,
+  const returningVisitorsQuery = useWindowQuery({
     ...getUniqueCountsOptions({
       ...buildProjectAnalyticsCountRequest(
         project.id,
@@ -125,8 +123,7 @@ export function ProjectOverview({
     enabled: analyticsEnabled,
   })
 
-  const hourlyVisitorsQuery = useQuery({
-    placeholderData: keepPreviousData,
+  const hourlyVisitorsQuery = useWindowQuery({
     ...getHourlyVisitsOptions({
       path: { project_id: project.id },
       query: { ...analyticsWindow, aggregation_level: 'visitors' },
@@ -138,8 +135,7 @@ export function ProjectOverview({
     data: errorStats,
     isPending: isLoadingErrors,
     isError: hasErrorStatsError,
-  } = useQuery({
-    placeholderData: keepPreviousData,
+  } = useWindowQuery({
     ...getErrorDashboardStatsOptions({
       query: {
         start_time: startDate.toISOString(),
@@ -151,8 +147,7 @@ export function ProjectOverview({
     enabled: !!project.id,
   })
 
-  const apiTrafficQuery = useQuery({
-    placeholderData: keepPreviousData,
+  const apiTrafficQuery = useWindowQuery({
     ...getApiTimeseriesOptions({
       path: { project_id: project.id },
       query: {
@@ -163,8 +158,7 @@ export function ProjectOverview({
     enabled: !!project.id,
   })
 
-  const apiRoutesQuery = useQuery({
-    placeholderData: keepPreviousData,
+  const apiRoutesQuery = useWindowQuery({
     ...getApiRoutesOptions({
       path: { project_id: project.id },
       query: {
@@ -177,8 +171,7 @@ export function ProjectOverview({
     enabled: !!project.id,
   })
 
-  const recentErrorsQuery = useQuery({
-    placeholderData: keepPreviousData,
+  const recentErrorsQuery = useWindowQuery({
     ...listErrorGroupsOptions({
       path: { project_id: project.id },
       query: {
@@ -193,8 +186,7 @@ export function ProjectOverview({
     enabled: !!project.id,
   })
 
-  const tracesQuery = useQuery({
-    placeholderData: keepPreviousData,
+  const tracesQuery = useWindowQuery({
     ...queryTraceSummariesOptions({
       query: {
         project_id: project.id,
