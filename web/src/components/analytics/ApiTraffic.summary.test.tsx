@@ -38,6 +38,7 @@ function mockTraffic() {
   const timeseriesEnds: string[] = []
   const summaryRouteEnds: string[] = []
   const prompts: string[] = []
+  const refreshes: boolean[] = []
   mockApi({
     [`GET ${base}/proxy-log-access`]: () =>
       jsonResponse({ can_read_proxy_logs: false }),
@@ -74,7 +75,9 @@ function mockTraffic() {
   globalThis.fetch = (async (input: Request | string | URL, init) => {
     const url = String(input instanceof Request ? input.url : input)
     if (url.endsWith('/projects/17/ai/structured-output/stream')) {
-      prompts.push(JSON.parse(String(init?.body)).prompt)
+      const body = JSON.parse(String(init?.body))
+      prompts.push(body.prompt)
+      refreshes.push(body.refresh)
       const value = {
         headline: 'Traffic is steady',
         findings: [],
@@ -88,7 +91,7 @@ function mockTraffic() {
     }
     return sdkFetch(input, init)
   }) as typeof fetch
-  return { timeseriesEnds, summaryRouteEnds, prompts }
+  return { timeseriesEnds, summaryRouteEnds, prompts, refreshes }
 }
 
 function renderTab(open: AiAssistantValue['open'] = () => {}) {
@@ -166,5 +169,31 @@ test('Investigate with AI after a Refresh inspects the window the summary was ma
   const [summarized, moved] = traffic.timeseriesEnds
   expect(prompts).toHaveLength(1)
   expect(prompts[0]).toContain(`to ${summarized}`)
+  expect(prompts[0]).toContain(`The summary below covers `)
   expect(prompts[0]).not.toContain(moved)
+})
+
+test('after a Refresh, Generate keeps the open summary; Refresh summary makes a new one for now', async () => {
+  const traffic = mockTraffic()
+  renderTab()
+  const generate = await screen.findByRole('button', {
+    name: 'Generate AI traffic summary',
+  })
+  await waitFor(() => expect(generate.hasAttribute('disabled')).toBe(false))
+  fireEvent.click(generate)
+  await screen.findByText('Traffic is steady')
+  await new Promise((resolve) => setTimeout(resolve, 5))
+  fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
+  await waitFor(() => expect(traffic.timeseriesEnds).toHaveLength(2))
+
+  // A cached entry for a rolling preset does not name its window, so asking
+  // again here could return the earlier window's summary as the current one.
+  fireEvent.click(generate)
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  expect(traffic.prompts).toHaveLength(1)
+
+  fireEvent.click(screen.getByRole('button', { name: 'Refresh summary' }))
+  await waitFor(() => expect(traffic.prompts).toHaveLength(2))
+  expect(traffic.refreshes).toEqual([false, true])
+  expect(traffic.prompts[1]).toContain(traffic.timeseriesEnds[1])
 })
