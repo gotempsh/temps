@@ -31,6 +31,7 @@ function renderBreakdown(
     const [start, setStart] = useState(0)
     const [end, setEnd] = useState(10)
     const [level, setLevel] = useState('country')
+    const [, setRenders] = useState(0)
     const query = useWindowQuery({
       queryKey: [
         'breakdown',
@@ -69,6 +70,9 @@ function renderBreakdown(
         </button>
         <button type="button" onClick={() => setLevel('region')}>
           Drill down
+        </button>
+        <button type="button" onClick={() => setRenders((n) => n + 1)}>
+          Render again
         </button>
         <p>
           {query.isPending ? 'loading' : query.isError ? 'failed' : query.data}
@@ -175,4 +179,30 @@ test('another range that fails shows the error, not the previous range', async (
 
   await screen.findByText('failed')
   expect(screen.queryByText('countries')).toBeNull()
+})
+
+test('the kept rows stay after the cache drops the window they came from', async () => {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  const answers = renderBreakdown(client)
+  await act(async () => answers[0].resolve('countries'))
+  await screen.findByText('countries')
+
+  fireEvent.click(screen.getByRole('button', { name: 'Move window' }))
+  await act(async () =>
+    answers[1].reject({ status: 500, title: 'Internal Server Error' })
+  )
+  await act(async () => new Promise((resolve) => setTimeout(resolve, 5)))
+  expect(screen.getByText('countries')).toBeTruthy()
+
+  // What `gcTime` does to the inactive earlier window after five minutes.
+  const [earlier] = client
+    .getQueryCache()
+    .findAll({ predicate: (query) => query.state.data !== undefined })
+  act(() => client.getQueryCache().remove(earlier))
+  fireEvent.click(screen.getByRole('button', { name: 'Render again' }))
+
+  expect(screen.getByText('countries')).toBeTruthy()
+  expect(screen.queryByText('failed')).toBeNull()
 })
