@@ -48,7 +48,8 @@ pub use disk_status::{
 };
 pub use enrollment_tokens::{EnrollmentError, EnrollmentTokenService, MintParams};
 pub use installation_secrets::{
-    bootstrap_stateless_requested, resolve_installation_secrets, InstallationSecrets,
+    bootstrap_stateless_requested, inspect_installation_secrets_with, resolve_installation_secrets,
+    InspectedSecret, InstallationSecrets, InstallationSecretsInspection, SecretSource,
     AUTH_SECRET_ENV, AUTH_SECRET_FILE_ENV, ENCRYPTION_KEY_ENV, ENCRYPTION_KEY_FILE_ENV,
     STATELESS_ENV,
 };
@@ -58,7 +59,7 @@ pub use service::{
     stateless_telemetry_anonymous_id, stored_clickhouse_compression, ClusterCaRotationResult,
     ClusterNetworkState, ConfigService, ConfigServiceError, EffectiveTelemetryPolicies,
     InstallationMode, RetentionPolicy, ServerConfig, SettingsUpdateResult,
-    TrustedPrivateNetworksIntent,
+    TrustedPrivateNetworksIntent, AUTH_SECRET_FILE, ENCRYPTION_KEY_FILE, PIPELINE_LOGS_DIR_NAME,
 };
 // Used by the settings handlers in `temps-config-handlers`.
 pub use service::preserve_provider_credential_proof;

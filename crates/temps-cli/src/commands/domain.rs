@@ -15,8 +15,7 @@ use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::{Path, PathBuf};
-use temps_core::EncryptionService;
+use std::path::PathBuf;
 use temps_entities::domains;
 use temps_schema::establish_connection;
 use x509_parser::prelude::*;
@@ -333,8 +332,9 @@ pub struct ImportCertificateCommand {
     pub private_key: PathBuf,
 
     /// Database URL. Prefer TEMPS_DATABASE_URL (or TEMPS_DATABASE_URL_FILE / the systemd credential temps_database_url): the flag form puts the password in the process command line
+    /// When unset, the installed `temps serve` service's URL is used.
     #[arg(long, env = "TEMPS_DATABASE_URL", hide_env_values = true)]
-    pub database_url: String,
+    pub database_url: Option<String>,
 
     /// Data directory containing the encryption key
     #[arg(long, env = "TEMPS_DATA_DIR")]
@@ -1863,13 +1863,24 @@ async fn execute_import(cmd: ImportCertificateCommand) -> anyhow::Result<()> {
     );
     println!();
 
-    // Get data directory
-    let data_dir = get_data_dir(&cmd.data_dir)?;
+    let database = crate::database_url_source::resolve_database_url(
+        cmd.database_url.as_deref(),
+        crate::database_url_source::UrlDiscovery::InstalledService,
+    )?;
+    database.announce_discovery();
 
-    // Load encryption key
-    let encryption_key = load_encryption_key(&data_dir)?;
-    let encryption_service = EncryptionService::new(&encryption_key)
-        .map_err(|e| anyhow::anyhow!("Failed to create encryption service: {}", e))?;
+    // The server's data directory and key with the server's database: the
+    // stored private key must be encrypted with the key the server reads.
+    let data_dir = match cmd.data_dir.clone() {
+        Some(dir) => dir,
+        None => match crate::server_secrets::service_data_dir(&database)? {
+            Some(dir) => dir,
+            None => get_data_dir(&None)?,
+        },
+    };
+    let key = crate::server_secrets::encryption_key(&data_dir, &database)?;
+    key.announce();
+    let encryption_service = key.into_encryption()?;
 
     // Read certificate and private key files
     println!(
@@ -1910,7 +1921,7 @@ async fn execute_import(cmd: ImportCertificateCommand) -> anyhow::Result<()> {
 
     // Connect to database
     println!("{} Connecting to database...", "→".bright_blue());
-    let db = establish_connection(&cmd.database_url).await?;
+    let db = establish_connection(database.url()).await?;
 
     // Check if domain already exists
     let existing = domains::Entity::find()
@@ -2022,12 +2033,6 @@ fn get_data_dir(data_dir: &Option<PathBuf>) -> anyhow::Result<PathBuf> {
             .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
         Ok(home.join(".temps"))
     }
-}
-
-fn load_encryption_key(data_dir: &Path) -> anyhow::Result<String> {
-    temps_config::resolve_installation_secrets(data_dir)
-        .map(|secrets| secrets.encryption_key)
-        .map_err(|error| anyhow::anyhow!("Failed to resolve installation secrets: {error}"))
 }
 
 fn validate_and_parse_certificate(

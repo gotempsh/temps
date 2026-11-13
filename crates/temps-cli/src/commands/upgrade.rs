@@ -780,11 +780,18 @@ pub(crate) fn lock_capacity_warning_for(capacity: &temps_schema::LockCapacity) -
 /// is downloaded or replaced. Without a database URL there is nothing to
 /// check; a failed check is noted and does not stop the upgrade.
 async fn print_lock_capacity_warning(database_url: Option<&str>) {
-    let Some(database_url) = database_url else {
-        debug!("No database URL; skipping the pre-update lock capacity check");
-        return;
+    let database = match crate::database_url_source::resolve_database_url(
+        database_url,
+        crate::database_url_source::UrlDiscovery::InstalledService,
+    ) {
+        Ok(database) => database,
+        Err(not_found) => {
+            debug!("Skipping the pre-update lock capacity check: {not_found}");
+            return;
+        }
     };
-    match lock_capacity_warning(database_url).await {
+    database.announce_discovery();
+    match lock_capacity_warning(database.url()).await {
         Ok(None) => debug!("PostgreSQL lock table fits this instance's chunk count"),
         Ok(Some(warning)) => {
             println!("  Warning: {warning}");
