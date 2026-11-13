@@ -62,6 +62,13 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "decides which sandbox may call a project's internal addresses (ADR 105), a network boundary around the project; the project's owner sets it in the console, and an assistant working in a sandbox must not grant that sandbox access itself",
+        &[
+            "create_internal_access_sandbox_grant",
+            "delete_internal_access_sandbox_grant",
+        ],
+    ),
+    (
         "revokes every visitor's gate session for an address; a security action the user takes themselves, behind step-up",
         &["sign_everyone_out_of_address"],
     ),

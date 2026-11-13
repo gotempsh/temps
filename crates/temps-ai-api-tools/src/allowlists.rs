@@ -853,6 +853,13 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     // project and environment ids, names and a description, no credential.
     // ProjectsRead on the project, narrowed to it.
     "list_internal_access_grants",
+    // Which sandboxes may call a project's internal addresses (ADR 105):
+    // sandbox ids, labels and a description, no credential. ProjectsRead on
+    // the project, narrowed to it.
+    "list_internal_access_sandbox_grants",
+    // The internal hostnames and `curl` lines one of the caller's own
+    // sandboxes may use (ADR 105), no credential; scoped to that user.
+    "list_sandbox_internal_addresses",
     "get_ingress_settings",
     "get_rule",
     "get_workload_mode",
