@@ -131,6 +131,21 @@ pub fn validate_instance_default(
 /// before connecting again after it lost (or could not open) its connection.
 const LISTENER_RETRY: Duration = Duration::from_secs(10);
 
+/// Publish the instance default `defaults` holds. Read under
+/// [`HEALTHCHECK_WRITES`], not before it: a save in this process holds it
+/// through its publish and has updated the watch before that (its settings
+/// write reloads the cache), so the value read here is never older than one
+/// that save published.
+async fn publish_watched_default(
+    defaults: &mut tokio::sync::watch::Receiver<Option<ManagedServiceHealthcheckSettings>>,
+) {
+    let _writes = HEALTHCHECK_WRITES.lock().await;
+    let current = *defaults.borrow_and_update();
+    if let Some(settings) = current {
+        registry::set_instance_default(overrides_from_settings(settings));
+    }
+}
+
 /// Reads and writes the instance default.
 pub struct HealthcheckDefaultsService {
     config: Arc<ConfigService>,
@@ -257,13 +272,7 @@ impl HealthcheckDefaultsService {
         let mut defaults = self.config.subscribe_managed_service_healthchecks();
         tokio::spawn(async move {
             while defaults.changed().await.is_ok() {
-                let current = *defaults.borrow_and_update();
-                if let Some(settings) = current {
-                    // After a save in this process, which holds it through
-                    // its own publish: the registry ends with the latest.
-                    let _writes = HEALTHCHECK_WRITES.lock().await;
-                    registry::set_instance_default(overrides_from_settings(settings));
-                }
+                publish_watched_default(&mut defaults).await;
             }
         });
 
@@ -303,12 +312,16 @@ impl HealthcheckDefaultsService {
             );
             return;
         }
+        // A failed read is a database error (a service that cannot be
+        // classified is logged and skipped): reconnect and read again.
         if let Err(error) = self.reload_registry().await {
             warn!(
                 %error,
+                retry_secs,
                 "Could not reload the managed service healthcheck overrides after \
-                 subscribing; keeping the last loaded ones"
+                 subscribing; reconnecting to read them again"
             );
+            return;
         }
         debug!("Listening for managed service healthcheck changes");
         loop {
@@ -320,12 +333,17 @@ impl HealthcheckDefaultsService {
                         .handle_registry_notification(notification.payload())
                         .await
                     {
+                        // A database error, likely transient. The
+                        // notification is consumed, so reconnect: the reload
+                        // on resubscribing reads this service again.
                         warn!(
                             %error,
                             payload = notification.payload(),
+                            retry_secs,
                             "Could not reload the healthcheck overrides of a changed service; \
-                             it keeps the last loaded ones until the next change or reconnect"
+                             reconnecting to read them again"
                         );
+                        return;
                     }
                 }
                 Ok(None) => {
@@ -369,6 +387,91 @@ mod tests {
             assert_eq!(property["minimum"], min, "{}: {property}", field.name());
             assert_eq!(property["maximum"], max, "{}: {property}", field.name());
         }
+    }
+
+    /// A default saved here while an older one waited for the lock is not
+    /// overwritten by it.
+    #[tokio::test]
+    async fn a_watched_default_never_overwrites_a_newer_save() {
+        let _registry = crate::services::HEALTHCHECK_REGISTRY_TEST_LOCK.lock().await;
+        let interval = |secs| ManagedServiceHealthcheckSettings {
+            interval_secs: Some(secs),
+            ..Default::default()
+        };
+        let (watch, mut defaults) = tokio::sync::watch::channel(None);
+        watch.send_replace(Some(interval(60)));
+
+        // A save in this process holds the lock; the older value waits.
+        let save = HEALTHCHECK_WRITES.lock().await;
+        let waiting = tokio::spawn(async move {
+            publish_watched_default(&mut defaults).await;
+        });
+        tokio::task::yield_now().await;
+        watch.send_replace(Some(interval(90)));
+        registry::set_instance_default(overrides_from_settings(interval(90)));
+        drop(save);
+        waiting.await.expect("publish task");
+
+        let published = registry::instance_default();
+        registry::set_instance_default(HealthcheckOverrides::default());
+        assert_eq!(published.interval_secs, Some(90));
+    }
+
+    /// The listener reconnects (and reloads) on an error, so a failed read
+    /// must be reported, while a service that cannot be classified must not
+    /// be, or it would reconnect forever.
+    #[tokio::test]
+    async fn only_a_database_error_fails_a_notification() {
+        use sea_orm::{DatabaseBackend, DbErr, MockDatabase};
+        let _registry = crate::services::HEALTHCHECK_REGISTRY_TEST_LOCK.lock().await;
+        let unclassifiable = temps_entities::external_services::Model {
+            service_type: "not-an-engine".to_string(),
+            healthcheck_interval_secs: Some(60),
+            ..crate::services::test_support::encrypted_service_model(990_301, serde_json::json!({}))
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![unclassifiable]])
+                .append_query_errors([DbErr::Custom("connection reset".into())])
+                .into_connection(),
+        );
+        let manager = Arc::new(ExternalServiceManager::new_with_handle(
+            db.clone(),
+            Arc::new(temps_core::EncryptionService::new_from_password(
+                "healthcheck notification test",
+            )),
+            Arc::new(temps_core::DockerHandle::disabled(
+                "control-plane",
+                "healthcheck notification test",
+            )),
+            true,
+            Arc::new(temps_dns::DnsRegistry::new(db.clone())),
+        ));
+        let config = Arc::new(ConfigService::new(
+            Arc::new(
+                temps_config::ServerConfig::new(
+                    "127.0.0.1:3000".to_string(),
+                    "postgresql://test".to_string(),
+                    None,
+                    Some("127.0.0.1:8000".to_string()),
+                )
+                .expect("ServerConfig::new"),
+            ),
+            db,
+        ));
+        let defaults = HealthcheckDefaultsService::new(config, manager);
+
+        let classified = defaults.handle_registry_notification("990301").await;
+        let published = registry::for_service(990_301);
+        registry::clear_service(990_301);
+        assert!(classified.is_ok(), "{classified:?}");
+        assert_eq!(published.interval_secs, Some(60), "kept by id");
+
+        let failed = defaults.handle_registry_notification("990302").await;
+        assert!(
+            matches!(failed, Err(ExternalServiceError::DatabaseError { .. })),
+            "{failed:?}"
+        );
     }
 
     #[test]

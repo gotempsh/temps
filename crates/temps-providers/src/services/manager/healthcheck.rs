@@ -704,7 +704,9 @@ impl ExternalServiceManager {
 
     /// Read one service's overrides into the registry again, or forget them
     /// when the service has none or no longer exists. Call it holding
-    /// [`HEALTHCHECK_WRITES`].
+    /// [`HEALTHCHECK_WRITES`]. Fails only on a database error: a service
+    /// whose container cannot be resolved is logged and kept by id, as at
+    /// startup ([`Self::load_healthcheck_registry`]).
     pub(crate) async fn reload_service_healthcheck(
         &self,
         service_id: i32,
@@ -716,10 +718,22 @@ impl ExternalServiceManager {
             registry::clear_service(service_id);
             return Ok(());
         };
-        let target = self.healthcheck_target(&row)?;
+        let container_name = match self.healthcheck_target(&row) {
+            Ok(target) => target.container_name,
+            Err(error) => {
+                warn!(
+                    service_id,
+                    %error,
+                    "Could not resolve the container of a changed service with healthcheck \
+                     overrides; its control-plane container keeps the defaults until it next \
+                     changes"
+                );
+                None
+            }
+        };
         registry::set_service(registry::ServiceHealthcheckEntry {
             service_id,
-            container_name: target.container_name,
+            container_name,
             overrides: service_overrides(&row),
         });
         Ok(())
