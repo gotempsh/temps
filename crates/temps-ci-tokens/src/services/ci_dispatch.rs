@@ -1792,6 +1792,7 @@ mod tests {
             platform: Some("linux/amd64".into()),
             cache_namespace: None,
             build_args: Default::default(),
+            labels: Default::default(),
         };
         let spec = service
             .encryption
@@ -1981,6 +1982,7 @@ mod tests {
         let build_service = service.clone();
         let build_target = target.clone();
         let request = BuildRequest {
+            labels: Default::default(),
             build_secrets: Default::default(),
             context_path: context.path().into(),
             dockerfile_path: None,

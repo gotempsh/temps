@@ -110,7 +110,26 @@ pub struct BuildSpec {
     /// neither side writes them to disk or to a log.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub build_args: BTreeMap<String, String>,
+    /// Labels for the built image, `sh.temps.image.*` keys only: which install,
+    /// project and deployment built it, so housekeeping can recognise the
+    /// image once the database rows naming it are gone. Not values a build
+    /// reads. Optional on the wire: an agent that predates it ignores the
+    /// field and builds an unlabelled image, as before.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
 }
+
+/// Prefix every image label a worker build accepts must start with. Its own
+/// namespace, not `sh.temps.*` at large: containers inherit their image's
+/// labels, and a container's `sh.temps.*` labels are Temps' container config
+/// (`sh.temps.project_id`, `sh.temps.managed`), which an image must never set.
+pub const IMAGE_LABEL_PREFIX: &str = "sh.temps.image.";
+
+/// Most labels one worker build accepts.
+pub const MAX_IMAGE_LABELS: usize = 16;
+
+/// Longest label key or value a worker build accepts.
+pub const MAX_IMAGE_LABEL_LEN: usize = 256;
 
 /// BuildKit's predefined build argument that prefixes every cache mount ID.
 pub const CACHE_MOUNT_NAMESPACE_ARG: &str = "BUILDKIT_CACHE_MOUNT_NS";
@@ -189,6 +208,7 @@ impl BuildSpec {
         {
             return Err("Image name must be 1–256 characters without whitespace".to_string());
         }
+        self.validate_labels()?;
         validate_archive_path(Path::new(&self.dockerfile))?;
         if self
             .platform
@@ -206,6 +226,37 @@ impl BuildSpec {
                 "Worker build cache namespace must be 1-{MAX_CACHE_NAMESPACE_LEN} ASCII letters, \
                  digits, '-', '_' or '.'"
             ));
+        }
+        Ok(())
+    }
+
+    fn validate_labels(&self) -> Result<(), String> {
+        if self.labels.len() > MAX_IMAGE_LABELS {
+            return Err(format!(
+                "Worker builds accept at most {MAX_IMAGE_LABELS} image labels, got {}",
+                self.labels.len()
+            ));
+        }
+        for (key, value) in &self.labels {
+            let key_ok = key.starts_with(IMAGE_LABEL_PREFIX)
+                && key.len() <= MAX_IMAGE_LABEL_LEN
+                && key
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
+            if !key_ok {
+                return Err(format!(
+                    "Worker build image label '{}' must start with '{IMAGE_LABEL_PREFIX}' and use \
+                     only ASCII letters, digits, '.', '_' or '-' (at most {MAX_IMAGE_LABEL_LEN} \
+                     characters)",
+                    key.escape_debug()
+                ));
+            }
+            if value.len() > MAX_IMAGE_LABEL_LEN || value.chars().any(char::is_control) {
+                return Err(format!(
+                    "Worker build image label '{key}' has a value longer than \
+                     {MAX_IMAGE_LABEL_LEN} bytes or containing control characters"
+                ));
+            }
         }
         Ok(())
     }
@@ -888,6 +939,7 @@ mod tests {
             platform: Some("linux/amd64".to_string()),
             cache_namespace: None,
             build_args: BTreeMap::new(),
+            labels: BTreeMap::new(),
         };
         assert!(spec.validate().is_ok());
         for path in ["../Dockerfile", "/etc/passwd", "a\\..\\b", "C:foo"] {
@@ -904,6 +956,47 @@ mod tests {
     }
 
     #[test]
+    fn build_spec_labels_are_temps_scoped_and_bounded() {
+        let mut spec = BuildSpec {
+            version: BUILD_PROTOCOL_VERSION,
+            image_name: "app:latest".to_string(),
+            dockerfile: "Dockerfile".to_string(),
+            platform: None,
+            cache_namespace: None,
+            build_args: BTreeMap::new(),
+            labels: BTreeMap::from([("sh.temps.image.project_id".to_string(), "7".to_string())]),
+        };
+        // Labels need no newer protocol: an older agent just ignores them.
+        assert!(spec.validate().is_ok());
+        let json = serde_json::to_value(&spec).expect("serialize");
+        assert_eq!(json["labels"]["sh.temps.image.project_id"], "7");
+
+        spec.labels = BTreeMap::from([("maintainer".to_string(), "x".to_string())]);
+        assert!(spec.validate().is_err(), "a non-Temps label key is refused");
+        spec.labels = BTreeMap::from([("sh.temps.managed".to_string(), "true".to_string())]);
+        assert!(
+            spec.validate().is_err(),
+            "a container-config label is refused on an image"
+        );
+        spec.labels = BTreeMap::from([("sh.temps.image.x".to_string(), "a\nb".to_string())]);
+        assert!(spec.validate().is_err(), "a control character is refused");
+        spec.labels = (0..=MAX_IMAGE_LABELS)
+            .map(|index| (format!("sh.temps.image.l{index}"), "v".to_string()))
+            .collect();
+        assert!(spec.validate().is_err(), "too many labels are refused");
+
+        // A spec from an older control plane carries no labels at all.
+        let legacy: BuildSpec = serde_json::from_value(serde_json::json!({
+            "version": BUILD_PROTOCOL_VERSION,
+            "image_name": "app:latest",
+            "dockerfile": "Dockerfile",
+            "platform": null,
+        }))
+        .expect("deserialize a spec without labels");
+        assert!(legacy.labels.is_empty());
+    }
+
+    #[test]
     fn build_spec_build_args_need_v2_and_are_bounded() {
         let mut spec = BuildSpec {
             version: BUILD_PROTOCOL_VERSION,
@@ -915,6 +1008,7 @@ mod tests {
                 "VITE_API_URL".to_string(),
                 "https://api.example.test".to_string(),
             )]),
+            labels: BTreeMap::new(),
         };
         // v1 has no field for values: a v1 spec carrying them is malformed.
         assert!(spec.validate().is_err());

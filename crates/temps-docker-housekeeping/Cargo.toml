@@ -5,7 +5,7 @@
 name = "temps-docker-housekeeping"
 version.workspace = true
 edition.workspace = true
-description = "Docker housekeeping on hosts Temps manages: scheduled image, build cache and asset cleanup, and the Docker disk usage report"
+description = "Docker housekeeping on hosts Temps manages: scheduled image, build cache, orphaned project image and asset cleanup, and the Docker disk usage report"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -18,6 +18,7 @@ temps-core = { path = "../temps-core" }
 temps-database = { path = "../temps-database" }
 temps-entities = { path = "../temps-entities" }
 temps-file-store = { path = "../temps-file-store" }
+temps-docker-util = { path = "../temps-docker-util" }
 serde = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }
@@ -29,6 +30,7 @@ axum = { workspace = true }
 chrono = { workspace = true }
 utoipa = { workspace = true, features = ["chrono"] }
 async-trait = { workspace = true }
+uuid = { workspace = true }
 futures-util = { workspace = true }
 bollard = { workspace = true }
 tar = { workspace = true }
@@ -39,6 +41,7 @@ hyper = { workspace = true }
 hyper-util = { workspace = true, features = ["default"] }
 
 [dev-dependencies]
+tempfile = { workspace = true }
 temps-test-utils = { path = "../temps-test-utils" }
 tower = { workspace = true }
 

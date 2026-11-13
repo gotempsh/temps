@@ -1866,6 +1866,26 @@ async fn run_project_teardown(
                 ))
         })?;
 
+    // Read which images the project's builds produced, and where they live,
+    // while those records still exist: they cascade away with the project
+    // row. Best-effort: without the plan the images are left labelled for
+    // the nightly sweep of images whose project no longer exists.
+    let image_plan = match state
+        .project_image_cleaner
+        .plan_project_image_cleanup(id)
+        .await
+    {
+        Ok(plan) => Ok(plan),
+        Err(error) => {
+            warn!(
+                project_id = id,
+                %error,
+                "Could not read the project's built images; they are left for the nightly sweep"
+            );
+            Err(error.to_string())
+        }
+    };
+
     state
         .project_service
         .delete_project(id, &project.name)
@@ -1880,13 +1900,43 @@ async fn run_project_teardown(
             Problem::from(error)
         })?;
 
-    info!(project_id = id, project_name = %project.name, "Project deleted");
+    // Only once the rows are gone, so nothing can deploy these images again.
+    // Cannot fail the deletion: every image kept or not removed is logged
+    // with its reason, and stays labelled for the nightly sweep.
+    // `None` with the reason when the images could not even be read, so the
+    // audit tells "nothing to remove" from "cleanup never ran".
+    let (images, image_plan_error) = match &image_plan {
+        Ok(plan) => (
+            Some(
+                state
+                    .project_image_cleaner
+                    .remove_project_images(plan)
+                    .await,
+            ),
+            None,
+        ),
+        Err(reason) => (None, Some(reason.clone())),
+    };
+    let counts = images.unwrap_or_default();
+
+    info!(
+        project_id = id,
+        project_name = %project.name,
+        image_cleanup_planned = image_plan_error.is_none(),
+        images_removed = counts.removed,
+        images_skipped = counts.skipped,
+        images_failed = counts.failed,
+        image_runtimes_unreachable = counts.unreachable_runtimes,
+        "Project deleted"
+    );
 
     let audit_event = ProjectDeletedAudit {
         context: audit_context,
         project_id: project.id,
         project_name: project.name,
         project_slug: project.slug,
+        images,
+        image_plan_error,
     };
 
     if let Err(e) = state.audit_service.create_audit_log(&audit_event).await {
@@ -5378,6 +5428,62 @@ mod tests {
         assert!(
             hook_call[..propagated].contains(".run(id)"),
             "the hook result is what is propagated"
+        );
+    }
+
+    /// The project's built images are read while their build records exist
+    /// (before the row delete cascades them away) and removed only after
+    /// the rows are deleted, and their removal cannot fail the deletion.
+    #[test]
+    fn teardown_plans_images_before_deleting_rows_and_removes_them_after() {
+        let source = include_str!("handlers.rs");
+        let start = source
+            .find("async fn run_project_teardown(")
+            .expect("run_project_teardown exists");
+        let tail = &source[start..];
+        let end = tail
+            .find("pub async fn delete_project(")
+            .expect("end of run_project_teardown");
+        let teardown = &tail[..end];
+
+        let containers = teardown
+            .find("cleanup_project_containers")
+            .expect("the teardown removes containers");
+        let plan = teardown
+            .find(".plan_project_image_cleanup(id)")
+            .expect("the teardown reads the project's images");
+        let rows = teardown
+            .find(".delete_project(")
+            .expect("the teardown deletes the project rows");
+        let removal = teardown
+            .find(".remove_project_images(plan)")
+            .expect("the teardown removes the project's images");
+        let audit = teardown
+            .find("ProjectDeletedAudit {")
+            .expect("the teardown audits the deletion");
+        assert!(
+            containers < plan,
+            "images are planned after containers are removed"
+        );
+        assert!(plan < rows, "images are read before the rows cascade away");
+        assert!(
+            rows < removal,
+            "images are removed only after the rows are deleted"
+        );
+        assert!(removal < audit, "the audit records what the removal did");
+
+        let plan_call = &teardown[plan..rows];
+        assert!(
+            !plan_call[..plan_call.find(";").expect("end of the plan statement")].contains('?'),
+            "a failure to read the images must not fail the deletion"
+        );
+        assert!(
+            teardown[removal..audit].contains("images_removed = counts.removed"),
+            "the deletion log carries the image counts"
+        );
+        assert!(
+            teardown[audit..].contains("image_plan_error,"),
+            "the audit records when the images could not be read"
         );
     }
 

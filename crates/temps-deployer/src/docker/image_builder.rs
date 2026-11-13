@@ -127,6 +127,17 @@ pub(super) fn docker_build_args(
     args
 }
 
+/// Label every image Temps builds carries, whoever asked for the build.
+pub const BUILT_BY_LABEL: (&str, &str) = ("built-by", "temps");
+
+/// The labels for `request`'s image: the caller's, then `built-by=temps`,
+/// which a caller cannot override.
+pub(super) fn image_labels(request: &BuildRequest) -> HashMap<String, String> {
+    let mut labels = request.labels.clone();
+    labels.insert(BUILT_BY_LABEL.0.to_string(), BUILT_BY_LABEL.1.to_string());
+    labels
+}
+
 fn split_repository_and_tag(image: &str) -> (&str, &str) {
     match image.rsplit_once(':') {
         Some((repository, image_tag)) if !image_tag.contains('/') => (repository, image_tag),
@@ -493,8 +504,7 @@ impl ImageBuilder for DockerRuntime {
             describe_build_memory_request(&request.image_name, memory_i32, self.use_buildkit)
         );
 
-        let mut labels = HashMap::new();
-        labels.insert("built-by".to_string(), "temps".to_string());
+        let labels = image_labels(&request);
         let build_options = bollard::query_parameters::BuildImageOptions {
             dockerfile: request
                 .dockerfile_path
@@ -720,8 +730,7 @@ impl ImageBuilder for DockerRuntime {
             describe_build_memory_request(&request.image_name, memory_i32, self.use_buildkit)
         );
 
-        let mut labels = HashMap::new();
-        labels.insert("built-by".to_string(), "temps".to_string());
+        let labels = image_labels(&request);
 
         let build_options = bollard::query_parameters::BuildImageOptions {
             dockerfile: request

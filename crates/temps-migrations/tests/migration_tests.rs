@@ -8760,3 +8760,210 @@ async fn test_restore_runs_restored_login_migration_up_and_down() -> anyhow::Res
     assert!(!has_column(&db).await?, "dropped by down");
     Ok(())
 }
+
+/// The image ownership identity table is single-row and refuses an empty ID;
+/// no row exists until the first build creates one; down drops it.
+#[tokio::test]
+async fn test_image_ownership_identity_migration_up_and_down() -> anyhow::Result<()> {
+    if external_db_configured() {
+        println!("Skipping image ownership identity migration test: external database configured");
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_exposed_port(ContainerPort::Tcp(5432))
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!(
+                "Skipping image ownership identity migration test: Docker unavailable: {error}"
+            );
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    let name = "m20261112_000001_create_image_ownership_identity";
+    let before = Migrator::migrations().len() as u32 - steps_back_to(name);
+    Migrator::up(&db, Some(before)).await?;
+    async fn table_exists(db: &DatabaseConnection) -> anyhow::Result<bool> {
+        Ok(db
+            .query_one(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT to_regclass('public.image_ownership_identity') IS NOT NULL AS present"
+                    .to_string(),
+            ))
+            .await?
+            .expect("one row")
+            .try_get::<bool>("", "present")?)
+    }
+    assert!(!table_exists(&db).await?, "absent before the migration");
+
+    Migrator::up(&db, Some(1)).await?;
+    assert!(table_exists(&db).await?, "created by the migration");
+    let rows = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*)::bigint AS n FROM image_ownership_identity".to_string(),
+        ))
+        .await?
+        .expect("one row")
+        .try_get::<i64>("", "n")?;
+    assert_eq!(rows, 0, "the migration generates no per-install state");
+    db.execute_unprepared(
+        "INSERT INTO image_ownership_identity (id, instance_id) VALUES (1, 'install-a')",
+    )
+    .await?;
+    assert!(
+        db.execute_unprepared(
+            "INSERT INTO image_ownership_identity (id, instance_id) VALUES (2, 'install-b')",
+        )
+        .await
+        .is_err(),
+        "a second row is refused"
+    );
+    db.execute_unprepared("DELETE FROM image_ownership_identity")
+        .await?;
+    assert!(
+        db.execute_unprepared(
+            "INSERT INTO image_ownership_identity (id, instance_id) VALUES (1, '')",
+        )
+        .await
+        .is_err(),
+        "an empty install ID is refused"
+    );
+
+    Migrator::down(&db, Some(steps_back_to(name))).await?;
+    assert!(!table_exists(&db).await?, "dropped by down");
+    Ok(())
+}
+
+/// Deleting a project row records its ID for the sweep of its leftover
+/// images, in the same statement, whatever deleted it; deleting a project
+/// with a reused ID again starts its record over; down removes the trigger
+/// and the table and leaves project deletion working.
+#[tokio::test]
+async fn test_deleted_project_images_migration_up_and_down() -> anyhow::Result<()> {
+    if external_db_configured() {
+        println!("Skipping deleted project images migration test: external database configured");
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_exposed_port(ContainerPort::Tcp(5432))
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!(
+                "Skipping deleted project images migration test: Docker unavailable: {error}"
+            );
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    let name = "m20261113_000001_record_deleted_project_images";
+    let before = Migrator::migrations().len() as u32 - steps_back_to(name);
+    Migrator::up(&db, Some(before)).await?;
+    let insert_project = |id: i32| {
+        format!(
+            "INSERT INTO projects(id,name,repo_name,repo_owner,directory,main_branch,preset,slug,created_at,updated_at) \
+             VALUES({id},'Doomed {id}','repo','owner','/','main','nodejs','doomed-{id}',now(),now())"
+        )
+    };
+    async fn recorded(db: &DatabaseConnection) -> anyhow::Result<Vec<(i32, bool)>> {
+        let rows = db
+            .query_all(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT project_id, checked_at IS NOT NULL AS checked \
+                 FROM deleted_project_images ORDER BY project_id"
+                    .to_string(),
+            ))
+            .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok((
+                    row.try_get::<i32>("", "project_id")?,
+                    row.try_get::<bool>("", "checked")?,
+                ))
+            })
+            .collect()
+    }
+    async fn table_exists(db: &DatabaseConnection) -> anyhow::Result<bool> {
+        Ok(db
+            .query_one(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT to_regclass('public.deleted_project_images') IS NOT NULL AS present"
+                    .to_string(),
+            ))
+            .await?
+            .expect("one row")
+            .try_get::<bool>("", "present")?)
+    }
+    // A project deleted before the migration leaves no record: its images
+    // were never labelled with an owner.
+    db.execute_unprepared(&insert_project(9801)).await?;
+    db.execute_unprepared("DELETE FROM projects WHERE id = 9801")
+        .await?;
+    assert!(!table_exists(&db).await?, "absent before the migration");
+
+    Migrator::up(&db, Some(1)).await?;
+    assert!(table_exists(&db).await?, "created by the migration");
+    assert!(recorded(&db).await?.is_empty(), "no backfill");
+    db.execute_unprepared(&insert_project(9802)).await?;
+    db.execute_unprepared(&insert_project(9803)).await?;
+    db.execute_unprepared("DELETE FROM projects WHERE id IN (9802, 9803)")
+        .await?;
+    assert_eq!(recorded(&db).await?, [(9802, false), (9803, false)]);
+    // A deletion rolled back records nothing.
+    db.execute_unprepared(&insert_project(9804)).await?;
+    db.execute_unprepared("BEGIN; DELETE FROM projects WHERE id = 9804; ROLLBACK;")
+        .await?;
+    assert_eq!(recorded(&db).await?, [(9802, false), (9803, false)]);
+    // The sweep checked 9802; the ID is reused (a restored backup) and
+    // deleted again: its record starts over.
+    db.execute_unprepared(
+        "UPDATE deleted_project_images SET checked_at = now() WHERE project_id = 9802",
+    )
+    .await?;
+    db.execute_unprepared(&insert_project(9802)).await?;
+    db.execute_unprepared("DELETE FROM projects WHERE id = 9802")
+        .await?;
+    assert_eq!(recorded(&db).await?, [(9802, false), (9803, false)]);
+
+    Migrator::down(&db, Some(steps_back_to(name))).await?;
+    assert!(!table_exists(&db).await?, "dropped by down");
+    db.execute_unprepared("DELETE FROM projects WHERE id = 9804")
+        .await?;
+    Ok(())
+}

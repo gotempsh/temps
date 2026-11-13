@@ -274,7 +274,17 @@ impl DeploymentService {
             .one(self.db.as_ref())
             .await?
             .ok_or_else(|| DeploymentError::NotFound(format!("Node {} not found", node_id)))?;
+        self.remote_container_operations(node).await
+    }
 
+    /// [`Self::container_operations_for_node`] for a worker whose row the
+    /// caller already holds, so a caller going over many nodes reads them in
+    /// one query rather than one per node.
+    pub(crate) async fn remote_container_operations(
+        &self,
+        node: nodes::Model,
+    ) -> Result<Arc<dyn ContainerOperations>, DeploymentError> {
+        let node_id = node.id;
         let encrypted_token = node.token_encrypted.as_ref().ok_or_else(|| {
             DeploymentError::Other(format!(
                 "Node {} has no agent token; cannot reach remote agent",

@@ -48,6 +48,7 @@ impl SecretBuildFixture {
         cache_from: Vec<String>,
     ) -> BuildRequest {
         BuildRequest {
+            labels: Default::default(),
             build_secrets: crate::BuildSecrets::new(
                 secrets
                     .iter()
@@ -414,6 +415,7 @@ fn oversized_build_secret_is_refused_by_name_without_its_value() {
 #[test]
 fn frontend_options_keep_the_dockerfile_path_arguments_and_platform() {
     let request = BuildRequest {
+        labels: Default::default(),
         build_secrets: Default::default(),
         cache_from: vec!["seed:latest".to_string()],
         image_name: "test".into(),
@@ -449,6 +451,37 @@ fn frontend_options_keep_the_dockerfile_path_arguments_and_platform() {
         rendered.into_iter().collect::<String>()
     };
     assert_eq!(canonical(&actual), canonical(&options));
+}
+
+/// A build with secret mounts goes through BuildKit's solve, not `/build`;
+/// its image must carry the same ownership labels.
+#[test]
+fn secret_mount_builds_carry_the_ownership_labels() {
+    let request = BuildRequest {
+        labels: HashMap::from([
+            ("sh.temps.image.project_id".to_string(), "7".to_string()),
+            ("built-by".to_string(), "someone-else".to_string()),
+        ]),
+        build_secrets: Default::default(),
+        cache_from: Vec::new(),
+        image_name: "app:latest".into(),
+        context_path: PathBuf::from("/tmp/context"),
+        dockerfile_path: None,
+        build_args: HashMap::new(),
+        build_args_buildkit: HashMap::new(),
+        platform: Some("linux/amd64".into()),
+        log_path: PathBuf::new(),
+    };
+    let rendered = format!(
+        "{:?}",
+        secret_mount_frontend_options(&request, "linux/amd64", &[])
+    );
+    assert!(
+        rendered.contains(r#""sh.temps.image.project_id": "7""#),
+        "{rendered}"
+    );
+    assert!(rendered.contains(r#""built-by": "temps""#), "{rendered}");
+    assert!(!rendered.contains("someone-else"), "{rendered}");
 }
 
 #[test]

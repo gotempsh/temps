@@ -1255,6 +1255,22 @@ impl ContainerDeployer for PlaneContainerDeployer {
     async fn image_exists(&self, image_name: &str) -> Result<bool, DeployerError> {
         self.local.image_exists(image_name).await
     }
+
+    async fn remove_unused_images(
+        &self,
+        requests: &[temps_deployer::ImageRemovalRequest],
+    ) -> Result<Vec<temps_deployer::ImageRemovalOutcome>, DeployerError> {
+        self.local.remove_unused_images(requests).await
+    }
+
+    async fn list_owned_images(
+        &self,
+        owner: &str,
+        project_id: i32,
+        after: Option<&temps_deployer::ListCursor>,
+    ) -> Result<temps_deployer::LabelledImages, DeployerError> {
+        self.local.list_owned_images(owner, project_id, after).await
+    }
 }
 
 /// How often a handoff rereads a worker's replica while it waits for the

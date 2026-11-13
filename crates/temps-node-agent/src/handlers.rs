@@ -400,6 +400,8 @@ fn container_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
         | temps_deployer::DeployerError::NetworkError(_)
         | temps_deployer::DeployerError::ResourceAllocationFailed(_)
         | temps_deployer::DeployerError::SecretMountFailed { .. }
+        | temps_deployer::DeployerError::ImageRemoval { .. }
+        | temps_deployer::DeployerError::ImageInventory { .. }
         | temps_deployer::DeployerError::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
         // DockerUnavailable is returned when the control-plane node has no
         // Docker daemon; the caller should direct traffic to a worker node.
@@ -421,6 +423,8 @@ fn container_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
         get_container_info,
         list_containers,
         image_exists,
+        remove_images,
+        list_owned_images,
         import_image,
         pull_image,
         crate::build_handler::build_image,
@@ -509,6 +513,8 @@ fn container_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
         AgentExecRequest,
         AgentExecResponse,
         PullImageRequest,
+        temps_deployer::remote::RemoveImagesRequest,
+        temps_deployer::remote::ListOwnedImagesRequest,
         PullImageResponse,
         RegistryCredentials,
         NodeHealthReport,
@@ -2092,6 +2098,145 @@ pub async fn image_exists(
                 format!("Failed to check image {}: {}", image_name, e),
             )
             .into_response()
+        }
+    }
+}
+
+/// Remove images from this node's daemon, each only if no container here,
+/// running or stopped, was created from it.
+///
+/// The control plane calls this when a project is deleted, for the images
+/// its builds recorded. Judged by image ID against every container on this
+/// daemon, and never forced, so an image something still uses stays. One
+/// outcome per image, in request order; at most
+/// [`temps_deployer::MAX_IMAGE_REMOVAL_BATCH`] images per call.
+#[utoipa::path(
+    tag = "Images",
+    post,
+    path = "/agent/images/remove",
+    request_body = temps_deployer::remote::RemoveImagesRequest,
+    responses(
+        (status = 200, description = "One outcome per image, in request order: removed, absent, in_use, replaced, refused or failed"),
+        (status = 400, description = "More images than one call accepts"),
+        (status = 401, description = "Unauthorized — invalid or missing bearer token"),
+        (status = 503, description = "Docker unavailable on this node"),
+        (status = 500, description = "The node's runtime could not remove images; nothing was removed")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn remove_images(
+    State(state): State<Arc<AgentState>>,
+    Json(request): Json<temps_deployer::remote::RemoveImagesRequest>,
+) -> impl IntoResponse {
+    if request.images.len() > temps_deployer::MAX_IMAGE_REMOVAL_BATCH {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Refusing to remove {} images in one call; at most {} are accepted",
+                request.images.len(),
+                temps_deployer::MAX_IMAGE_REMOVAL_BATCH
+            ),
+        )
+        .into_response();
+    }
+    match state
+        .container_deployer
+        .remove_unused_images(&request.images)
+        .await
+    {
+        Ok(outcomes) => {
+            let removed = outcomes.iter().filter(|o| o.status.is_removed()).count();
+            let kept = outcomes.iter().filter(|o| o.status.is_kept()).count();
+            let failed = outcomes.iter().filter(|o| o.status.is_failed()).count();
+            tracing::info!(
+                requested = request.images.len(),
+                removed,
+                kept,
+                failed,
+                "Removed unused images on request of the control plane"
+            );
+            AgentResponse::ok(outcomes).into_response()
+        }
+        Err(error) => {
+            tracing::error!(
+                requested = request.images.len(),
+                %error,
+                "Could not remove images on request of the control plane"
+            );
+            error_response(container_error_status(&error), error.to_string()).into_response()
+        }
+    }
+}
+
+/// Whether `owner` is a plausible image ownership label value: the
+/// control plane sends `<uuid>.<uuid>`.
+fn is_valid_image_owner(owner: &str) -> bool {
+    !owner.is_empty()
+        && owner.len() <= 128
+        && owner
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_'))
+}
+
+/// The images on this node's daemon that one Temps install built for one
+/// of its projects, so its control plane can sweep a project it deleted.
+///
+/// Lists only images labelled with that install's ownership ID and that
+/// project's ID, oldest first
+/// and bounded by [`temps_deployer::MAX_LABELLED_IMAGES`], keeping only
+/// their `sh.temps.image.*` labels, each with a container created from it if
+/// any. Removal goes through `POST /agent/images/remove`, which checks again.
+#[utoipa::path(
+    tag = "Images",
+    post,
+    path = "/agent/images/owned",
+    request_body = temps_deployer::remote::ListOwnedImagesRequest,
+    responses(
+        (status = 200, description = "This install's images on the node, oldest first, with any container using each"),
+        (status = 400, description = "The owner is not a valid image ownership ID, or the project ID is not positive"),
+        (status = 401, description = "Unauthorized — invalid or missing bearer token"),
+        (status = 503, description = "Docker unavailable on this node"),
+        (status = 500, description = "The node's images could not be listed")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_owned_images(
+    State(state): State<Arc<AgentState>>,
+    Json(request): Json<temps_deployer::remote::ListOwnedImagesRequest>,
+) -> impl IntoResponse {
+    if !is_valid_image_owner(&request.owner) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "The image owner must be 1-128 ASCII letters, digits, '-', '.' or '_'".to_string(),
+        )
+        .into_response();
+    }
+    if request.project_id <= 0 {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "The project ID must be positive, got {}",
+                request.project_id
+            ),
+        )
+        .into_response();
+    }
+    match state
+        .container_deployer
+        .list_owned_images(&request.owner, request.project_id, request.after.as_ref())
+        .await
+    {
+        Ok(listing) => {
+            tracing::debug!(
+                listed = listing.images.len(),
+                unlisted = listing.unlisted,
+                "Listed this install's images on request of the control plane"
+            );
+            AgentResponse::ok(listing).into_response()
+        }
+        Err(error) => {
+            tracing::error!(%error, "Could not list images on request of the control plane");
+            error_response(container_error_status(&error), error.to_string()).into_response()
         }
     }
 }

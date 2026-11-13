@@ -5,7 +5,7 @@
 name = "temps-docker-util"
 version.workspace = true
 edition.workspace = true
-description = "Docker helpers shared across crates: capped exec capture, image pull with progress, ensure-network and streamed tar upload"
+description = "Docker helpers shared across crates: capped exec capture, image pull with progress, ensure-network, streamed tar upload and in-use-safe image removal"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -14,7 +14,11 @@ homepage.workspace = true
 [dependencies]
 bollard = { workspace = true }
 bytes = { workspace = true }
+serde = { workspace = true }
 futures = { workspace = true }
+http = { workspace = true }
+percent-encoding = { workspace = true }
+serde_json = { workspace = true }
 tar = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
