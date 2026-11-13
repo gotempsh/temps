@@ -90,6 +90,26 @@ pub fn credential_is_encoded(delivery: Option<&CredentialDelivery>) -> bool {
     )
 }
 
+/// The longest credential any format stores; the SDK's header renderer stops
+/// at 8192 for every format but bearer ([`validate_credential_shape`]).
+pub const MAX_CREDENTIAL_BYTES: usize = 16384;
+
+/// Whether a credential's characters can be sent in this delivery's format.
+/// Saving a service, planning a worker and issuing its policy all apply this
+/// one rule, so a credential that was accepted is never refused later: an
+/// encoded (Basic) credential may hold any text but control characters, while
+/// a token placed in a header verbatim must be header-safe printable ASCII.
+pub fn credential_text_is_sendable(delivery: Option<&CredentialDelivery>, secret: &str) -> bool {
+    if secret.is_empty() || secret.len() > MAX_CREDENTIAL_BYTES {
+        return false;
+    }
+    if credential_is_encoded(delivery) {
+        !secret.chars().any(char::is_control)
+    } else {
+        secret.bytes().all(|b| (33..=126).contains(&b))
+    }
+}
+
 /// Normalizes header names to lower case and rejects anything the SDK would
 /// not inject. A delivery equal to the default (bearer, no headers) is dropped
 /// so such policies keep their original stored shape.
@@ -497,5 +517,44 @@ mod tests {
             &[],
         );
         assert!(validate_delivery(&mut value).is_err());
+    }
+
+    #[test]
+    fn a_basic_password_may_hold_any_text_but_a_token_must_be_header_safe() {
+        let basic = delivery(CredentialFormat::Basic, &[]);
+        let basic_token = delivery(
+            CredentialFormat::BasicToken {
+                username: "api".into(),
+            },
+            &[],
+        );
+        for encoded in [basic.as_ref(), basic_token.as_ref()] {
+            for value in [
+                "account:correct horse battery staple",
+                "account:contraseña-ñandú",
+            ] {
+                assert!(credential_text_is_sendable(encoded, value), "{value}");
+            }
+            for value in ["", "account:line\nbreak", "account:tab\there"] {
+                assert!(!credential_text_is_sendable(encoded, value), "{value:?}");
+            }
+        }
+        let header = delivery(header_format("x-api-key"), &[]);
+        for verbatim in [None, header.as_ref()] {
+            assert!(credential_text_is_sendable(verbatim, "tok_ABC-123.~!"));
+            assert!(credential_text_is_sendable(
+                verbatim,
+                &"a".repeat(MAX_CREDENTIAL_BYTES)
+            ));
+            for value in [
+                "",
+                "white space",
+                "señal",
+                "line\nbreak",
+                &"a".repeat(MAX_CREDENTIAL_BYTES + 1),
+            ] {
+                assert!(!credential_text_is_sendable(verbatim, value), "{value:?}");
+            }
+        }
     }
 }

@@ -476,6 +476,56 @@ async fn postgres_registration_races_restart_versions_and_real_worker_binding() 
     test.cleanup().await;
 }
 
+/// Issuance applies the rule the service was saved under: a Basic password
+/// may hold spaces or non-ASCII letters, a verbatim token may not.
+#[test]
+fn issuance_accepts_basic_passwords_that_a_bearer_token_may_not_hold() {
+    let (identity, _) = identity();
+    let basic = |secret: &str| {
+        let mut binding = input(Uuid::new_v4(), Uuid::new_v4(), &["https://api.example.com"]);
+        let request = PrepareSession {
+            target: binding.plan.target().clone(),
+            grant_id: format!("grant_{}", Uuid::new_v4().simple()),
+            service_id: format!("svc_{}", Uuid::new_v4().simple()),
+            service_version: 1,
+            policy: SandboxAccessPolicy {
+                provider: None,
+                github_repository: None,
+                origin: "https://registry.example.com".into(),
+                path_prefixes: vec!["/v2".into()],
+                methods: vec![AccessMethod::Get],
+                delivery: Some(crate::types::CredentialDelivery {
+                    format: crate::types::CredentialFormat::Basic,
+                    headers: vec![],
+                }),
+            },
+            expires_at: Utc::now() + chrono::Duration::seconds(30),
+            max_ttl_seconds: 60,
+        };
+        binding.credentials =
+            BTreeMap::from([(request.grant_id.clone(), SecretString::new(secret))]);
+        binding.plan = PreparedBinding::prepare(vec![request], 1, Utc::now()).unwrap();
+        binding
+    };
+    for secret in [
+        "account:correct horse battery staple",
+        "account:contraseña-ñandú",
+    ] {
+        issue::validate_bindings(identity.boot_id, &[basic(secret)], Utc::now()).unwrap();
+        let mut bearer = input(Uuid::new_v4(), Uuid::new_v4(), &["https://api.example.com"]);
+        *bearer.credentials.values_mut().next().unwrap() = SecretString::new(secret);
+        assert!(issue::validate_bindings(identity.boot_id, &[bearer], Utc::now()).is_err());
+    }
+    assert!(issue::validate_bindings(
+        identity.boot_id,
+        &[basic("account:line\nbreak")],
+        Utc::now()
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("control characters"));
+}
+
 #[tokio::test]
 async fn issuance_rejects_wrong_node_expiry_duplicates_and_limits() {
     let (identity, _) = identity();

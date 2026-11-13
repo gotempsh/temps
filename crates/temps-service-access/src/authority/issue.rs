@@ -353,15 +353,14 @@ pub(super) fn validate_bindings(
             let credential = binding.credentials.get(grant.grant_id()).ok_or_else(|| {
                 invalid(boot_id, "validate policy", "grant credential is missing")
             })?;
-            let value = credential.expose();
-            if value.is_empty()
-                || value.len() > 16384
-                || !value.bytes().all(|b| (33..=126).contains(&b))
-            {
+            if !crate::tokenless::delivery::credential_text_is_sendable(
+                grant.delivery(),
+                credential.expose(),
+            ) {
                 return Err(invalid(
                     boot_id,
                     "validate credential",
-                    "bearer credential must be 1 to 16384 printable non-space ASCII bytes",
+                    "credential must be 1 to 16384 bytes: printable non-space ASCII for a token, or text without control characters for a Basic password",
                 ));
             }
         }

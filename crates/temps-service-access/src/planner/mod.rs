@@ -281,10 +281,12 @@ impl PolicyPlanner {
                             "stored credential is not UTF-8",
                         )
                     })?;
-                    if value.is_empty()
-                        || value.len() > 16384
-                        || !value.bytes().all(|b| (33..=126).contains(&b))
-                    {
+                    // The rule the service was saved under: a Basic password
+                    // may contain spaces or non-ASCII letters.
+                    if !crate::tokenless::delivery::credential_text_is_sendable(
+                        policy.delivery.as_ref(),
+                        value,
+                    ) {
                         return Err(invalid(
                             boot_id,
                             "validate service credential",
