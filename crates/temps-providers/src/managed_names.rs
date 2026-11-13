@@ -694,6 +694,7 @@ pub fn enable_failure_problem(kind: ManagedServiceKind, error: &ExternalServiceE
         | ExternalServiceError::ClusterNotSettled { .. }
         | ExternalServiceError::ClusterBusy { .. }
         | ExternalServiceError::LockTimeout { .. }
+        | ExternalServiceError::HealthcheckSettingsBusy { .. }
         | ExternalServiceError::DeletionFailed { .. }
         | ExternalServiceError::ServiceHasLinkedProjects { .. }
         | ExternalServiceError::EnvironmentVariableNotFound { .. }
@@ -711,6 +712,9 @@ pub fn enable_failure_problem(kind: ManagedServiceKind, error: &ExternalServiceE
         | ExternalServiceError::ControlPlaneMemberUnreachable { .. }
         | ExternalServiceError::ClusterPortsUnavailable { .. }
         | ExternalServiceError::ClusterMemberLimitExceeded { .. }
+        | ExternalServiceError::InvalidHealthcheck { .. }
+        | ExternalServiceError::HealthcheckUnsupported { .. }
+        | ExternalServiceError::HealthcheckDefaultConflictsWithService { .. }
         | ExternalServiceError::NoSandboxAccessEngine { .. }
         | ExternalServiceError::SandboxAccessUnsupported { .. } => error_builder::internal_server_error()
             .title(title)

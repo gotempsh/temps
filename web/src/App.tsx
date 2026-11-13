@@ -409,6 +409,11 @@ const RequestTimeoutsPage = lazy(() =>
     default: m.RequestTimeoutsPage,
   }))
 )
+const ServiceHealthchecksPage = lazy(() =>
+  import('./pages/settings/ServiceHealthchecksPage').then((m) => ({
+    default: m.ServiceHealthchecksPage,
+  }))
+)
 const OnDemandTlsPage = lazy(() =>
   import('./pages/settings/OnDemandTlsPage').then((m) => ({
     default: m.OnDemandTlsPage,
@@ -1032,6 +1037,10 @@ const FullAppRoutes = () => {
                           <Route
                             path="request-timeouts"
                             element={<RequestTimeoutsPage />}
+                          />
+                          <Route
+                            path="service-healthchecks"
+                            element={<ServiceHealthchecksPage />}
                           />
                           <Route
                             path="on-demand-tls"

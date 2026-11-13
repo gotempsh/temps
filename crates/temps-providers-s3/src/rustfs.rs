@@ -1027,17 +1027,15 @@ impl RustfsService {
                 ..host_config
             }),
             // RustFS healthcheck - check if the health endpoint is responding
-            healthcheck: Some(bollard::models::HealthConfig {
-                test: Some(vec![
-                    "CMD-SHELL".to_string(),
-                    "curl -sf http://localhost:9000/health > /dev/null || exit 1".to_string(),
-                ]),
-                interval: Some(2000000000), // 2 seconds
-                timeout: Some(5000000000),  // 5 seconds
-                retries: Some(3),
-                start_period: Some(10000000000),  // 10 seconds
-                start_interval: Some(2000000000), // 2 seconds
-            }),
+            healthcheck: Some(
+                temps_providers_core::healthcheck::managed_health_config(
+                    docker,
+                    temps_providers_core::externalsvc::recreate_guard::ManagedEngine::Rustfs,
+                    &container_name,
+                    "curl -sf http://localhost:9000/health > /dev/null || exit 1",
+                )
+                .await,
+            ),
             ..Default::default()
         };
 

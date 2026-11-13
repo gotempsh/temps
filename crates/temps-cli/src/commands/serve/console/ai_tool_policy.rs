@@ -75,6 +75,10 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "decide_reachability_conflict",
             "resume_reachability_run",
             "undo_reachability_run",
+            // Recreates a managed database's container to apply new
+            // healthcheck timings; it restarts briefly, and the console
+            // confirms first.
+            "apply_service_healthcheck",
             "blob_disable",
             "cancel_data_import",
             "cancel_pg_upgrade",

@@ -703,14 +703,15 @@ impl RedisService {
                 ..host_config
             }),
             networking_config,
-            healthcheck: Some(bollard::models::HealthConfig {
-                test: Some(vec!["CMD-SHELL".to_string(), "redis-cli ping".to_string()]),
-                interval: Some(1000000000), // 1 second
-                timeout: Some(3000000000),  // 3 seconds
-                retries: Some(3),
-                start_period: Some(5000000000),   // 5 seconds
-                start_interval: Some(1000000000), // 1 second
-            }),
+            healthcheck: Some(
+                temps_providers_core::healthcheck::managed_health_config(
+                    docker,
+                    temps_providers_core::externalsvc::recreate_guard::ManagedEngine::Redis,
+                    &container_name,
+                    "redis-cli ping",
+                )
+                .await,
+            ),
             ..Default::default()
         };
 

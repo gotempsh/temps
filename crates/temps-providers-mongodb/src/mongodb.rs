@@ -645,21 +645,19 @@ impl MongodbService {
                 ..host_config
             }),
             networking_config,
-            healthcheck: Some(bollard::models::HealthConfig {
-                // Credential-free command line: the probe reads the root
-                // credentials from the container's own environment (set above)
-                // rather than taking them as `mongosh` arguments. See
-                // [`HEALTHCHECK_COMMAND`] for why argv is not usable here.
-                test: Some(vec![
-                    "CMD-SHELL".to_string(),
-                    HEALTHCHECK_COMMAND.to_string(),
-                ]),
-                interval: Some(2000000000), // 2 seconds
-                timeout: Some(10000000000), // 10 seconds
-                retries: Some(5),
-                start_period: Some(45000000000), // 45 seconds - gives MongoDB time to initialize credentials
-                start_interval: Some(2000000000), // 2 seconds
-            }),
+            // Credential-free command line: the probe reads the root
+            // credentials from the container's own environment (set above)
+            // rather than taking them as `mongosh` arguments. See
+            // [`HEALTHCHECK_COMMAND`] for why argv is not usable here.
+            healthcheck: Some(
+                temps_providers_core::healthcheck::managed_health_config(
+                    docker,
+                    temps_providers_core::externalsvc::recreate_guard::ManagedEngine::MongoDb,
+                    &container_name,
+                    HEALTHCHECK_COMMAND,
+                )
+                .await,
+            ),
             ..Default::default()
         };
 

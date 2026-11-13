@@ -193,6 +193,9 @@ impl PostgresService {
         // The agent created it `unless-stopped`; the spec's default would
         // turn that into `always`.
         plan.keep_restart_policy(&existing);
+        // This process has none of the control plane's healthcheck overrides;
+        // the container was created with them.
+        plan.keep_healthcheck(&existing);
         Ok(NodeContainerPlan {
             plan,
             secrets: process.secret_values(),
