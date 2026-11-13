@@ -359,6 +359,9 @@ export function ServiceHealthcheckCard({
               </Callout>
             ) : null}
             <ServiceHealthcheckView
+              // Another service's page reuses this card: an open Apply now
+              // confirmation must close rather than restart that service.
+              key={query.data.service_id}
               healthcheck={query.data}
               saving={save.isPending}
               applying={apply.isPending}

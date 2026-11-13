@@ -363,6 +363,65 @@ test('a failed save is shown beside Save and cleared by the next edit', async ()
   await waitFor(() => expect(onEdit).toHaveBeenCalled())
 })
 
+test("an open Apply now confirmation closes when another service's page opens", async () => {
+  const other: ServiceHealthcheck = {
+    ...STANDALONE,
+    service_id: 8,
+    service_name: 'sessions-cache',
+  }
+  const api = mockApi({
+    'GET /external-services/7/healthcheck': () => jsonResponse(STANDALONE),
+    'GET /external-services/8/healthcheck': () => jsonResponse(other),
+    'POST /external-services/7/healthcheck/apply': () => jsonResponse({}),
+    'POST /external-services/8/healthcheck/apply': () => jsonResponse({}),
+  })
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  const card = (serviceId: number, serviceName: string) => (
+    <QueryClientProvider client={queryClient}>
+      <MemoryRouter>
+        <ServiceHealthcheckCard
+          serviceId={serviceId}
+          serviceName={serviceName}
+        />
+      </MemoryRouter>
+    </QueryClientProvider>
+  )
+  try {
+    // Service 8's settings are cached, as after browsing back to it.
+    const rendered = render(card(8, 'sessions-cache'))
+    await rendered.findByRole('button', { name: 'Apply now' })
+    rendered.rerender(card(7, 'orders-cache'))
+    await waitFor(() =>
+      expect(api.called('GET', '/external-services/7/healthcheck')).toBe(true)
+    )
+    await act(async () => {
+      fireEvent.click(
+        await rendered.findByRole('button', { name: 'Apply now' })
+      )
+    })
+    expect((await rendered.findByRole('alertdialog')).textContent).toContain(
+      'Recreate orders-cache now?'
+    )
+
+    rendered.rerender(card(8, 'sessions-cache'))
+    await waitFor(() =>
+      expect(rendered.queryByText('Recreate sessions-cache now?')).toBeNull()
+    )
+    await waitFor(() => expect(rendered.queryByRole('alertdialog')).toBeNull())
+    expect(api.called('POST', '/external-services/8/healthcheck/apply')).toBe(
+      false
+    )
+    expect(api.called('POST', '/external-services/7/healthcheck/apply')).toBe(
+      false
+    )
+  } finally {
+    api.restore()
+    queryClient.clear()
+  }
+})
+
 test("a save that finishes after another service's page opened stays with its own service", async () => {
   const other: ServiceHealthcheck = {
     ...STANDALONE,
