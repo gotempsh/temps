@@ -9,7 +9,7 @@
 //! | What the cluster has | Option | Actions |
 //! |---|---|---|
 //! | A tunnel that would publish the hostname | `existing_tunnel` | 1 |
-//! | A tunnel that covers it but would not publish it | `existing_tunnel`, confirmed | 2 |
+//! | A tunnel that covers it but would not publish it | `existing_tunnel` (confirmed when it changes a choice) | 2 |
 //! | A direct ingress on port 80 and a zone Temps manages | `direct_managed_dns` | 1 |
 //! | A Cloudflare account, no covering tunnel | `new_tunnel` | 2 |
 //! | Nothing | `new_tunnel_with_token` | 3 |
@@ -595,11 +595,16 @@ pub fn tunnel_route<'a>(facts: &'a PlanFacts, host: &str) -> Option<TunnelRoute<
             ),
             None => "the tunnel that would publish it is gone".to_string(),
         },
+        // Nothing is chosen for the hostname yet: recording the choice is
+        // what asking for this address under the tunnel means, and it
+        // changes nobody's choice, so it needs no confirmation. The run
+        // still refuses to override a choice that appears before it routes.
         Some(PublicationIntent::OnlyChosen { .. }) | Some(PublicationIntent::NoTunnel) | None => {
-            format!(
-                "tunnel `{}` publishes only hostnames chosen for it",
-                tunnel.name
-            )
+            return Some(TunnelRoute {
+                tunnel,
+                route: true,
+                confirmation: None,
+            });
         }
     };
     Some(TunnelRoute {
@@ -3986,6 +3991,10 @@ mod tests {
             .fields
             .iter()
             .all(|f| f.key == FIELD_HTTP_POLICY));
+        // No choice exists for it yet, so recording one changes nobody's:
+        // one click applies it, without a confirmation.
+        assert_eq!(plan.options[0].confirmation, None);
+        assert!(plan.options[0].recommended);
     }
 
     #[test]

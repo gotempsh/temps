@@ -1,11 +1,12 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { afterEach, expect, test } from 'bun:test'
+import { afterEach, beforeEach, expect, test } from 'bun:test'
 import { cleanup, fireEvent, render, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router'
 import { client } from '@/api/client/client.gen'
+import { restoreApiClient } from '@/test/api-client'
 import { installBrowserWindow } from '@/test/dom'
 import { DockBody } from './AiAssistantDock'
 import {
@@ -47,9 +48,11 @@ const chat = (publicId: string, contextType: string, title: string | null) => ({
 })
 
 const originalConfig = client.getConfig()
+// A chat another test opened is remembered and would open instead of the list.
+beforeEach(() => window.localStorage.clear())
 afterEach(() => {
   cleanup()
-  client.setConfig(originalConfig)
+  restoreApiClient(originalConfig)
 })
 
 /** Answers the chat list and the one chat; everything else stays pending. */

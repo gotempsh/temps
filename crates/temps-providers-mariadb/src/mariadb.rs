@@ -325,6 +325,35 @@ pub fn mariadb_server_command(
     args
 }
 
+/// Why a MariaDB in `container_name` has no binary logs to archive: it was
+/// created without `--log-bin`, which only a container's creation sets.
+/// Services created since binary logging became part of the server command
+/// have it; an older container gets it when it is created again.
+pub fn binary_logging_off_reason(container_name: &str) -> String {
+    format!(
+        "binary logging is off in container '{container_name}' (the server was started without \
+         --log-bin), so there are no binary logs to archive and point-in-time recovery is \
+         unavailable; base backups still work. The flag is set when the container is created: \
+         a container created again from the service's configuration (an image upgrade does \
+         this) starts with binary logging on"
+    )
+}
+
+/// `SELECT @@global.log_bin`: `1`/`ON` or `0`/`OFF` on the last line of the
+/// client's output (anything before it is a client warning). `None` for
+/// any other answer.
+fn parse_log_bin(output: &str) -> Option<bool> {
+    let answer = output
+        .lines()
+        .map(str::trim)
+        .rfind(|line| !line.is_empty())?;
+    match answer.to_ascii_uppercase().as_str() {
+        "1" | "ON" => Some(true),
+        "0" | "OFF" => Some(false),
+        _ => None,
+    }
+}
+
 /// Manifest describing which binary-log segments have been shipped to S3 for
 /// a MariaDB service. Stored at the `binlog/manifest.json` key. The restore
 /// path reads this to know the contiguous set of segments available to replay.
@@ -1849,7 +1878,9 @@ impl MariaDbService {
 
     /// Ship every closed (rotated) binary-log segment that has not yet been
     /// archived to S3, advancing the manifest only past segments that actually
-    /// uploaded successfully. Returns the number of segments shipped this run.
+    /// uploaded successfully. Returns the number of segments shipped this run;
+    /// a segment that does not upload fails the run (after the manifest
+    /// records the ones before it), so a failure never reads as up to date.
     ///
     /// Steps:
     /// 1. `FLUSH BINARY LOGS` rotates the active segment closed.
@@ -1869,6 +1900,16 @@ impl MariaDbService {
         let container_name = self.get_live_container_name(config);
         let bucket = &s3_source.bucket_name;
         let prefix = s3_source.bucket_path.trim_matches('/');
+
+        // 0. A server without binary logging has nothing to ship, and every
+        //    statement below would fail on it with a bare SQL error. Said
+        //    once, with why and what turns it on, before anything runs.
+        if !self.binary_logging_enabled(config).await? {
+            return Err(EngineError::Conflict {
+                service: self.name.clone(),
+                reason: binary_logging_off_reason(&container_name),
+            });
+        }
 
         // 1. Rotate so the currently-active segment closes and becomes
         //    shippable on this (or a subsequent) run.
@@ -1907,6 +1948,9 @@ impl MariaDbService {
         );
 
         let mut shipped = 0usize;
+        // The segment that did not upload, and why: the run then fails
+        // instead of reporting the segments it never shipped as up to date.
+        let mut ship_failure: Option<(String, EngineError)> = None;
         for file in &to_ship {
             let key = Self::binlog_object_key(prefix, &self.name, file)?;
             match self
@@ -1934,6 +1978,7 @@ impl MariaDbService {
                         "Failed to ship MariaDB binlog segment, stopping run: {}",
                         e
                     );
+                    ship_failure = Some((file.clone(), e));
                     break;
                 }
             }
@@ -1959,7 +2004,57 @@ impl MariaDbService {
             }
         }
 
+        if let Some((file, error)) = ship_failure {
+            return Err(EngineError::failed(
+                &self.name,
+                format!(
+                    "binary-log segment {file} did not upload to s3://{bucket}: {error}. \
+                     {shipped} of {} segment(s) to ship were shipped before it (recorded in \
+                     the manifest); the next run resumes from {file}",
+                    to_ship.len()
+                ),
+            ));
+        }
+
         Ok(shipped)
+    }
+
+    /// Whether the server writes binary logs (`@@global.log_bin`). It is
+    /// a startup flag (`--log-bin`, from [`mariadb_server_command`]), so a
+    /// container created without it has none until a container is created
+    /// with it. Read-only.
+    pub async fn binary_logging_enabled(&self, config: &MariaDbConfig) -> Result<bool> {
+        let container_name = self.get_live_container_name(config);
+        let output = self
+            .run_container_command(
+                &container_name,
+                vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "if command -v mariadb >/dev/null 2>&1; then \
+                         mariadb -N -B -uroot -e 'SELECT @@global.log_bin'; \
+                     else \
+                         mysql -N -B -uroot -e 'SELECT @@global.log_bin'; \
+                     fi"
+                    .to_string(),
+                ],
+                Some(vec![
+                    format!("MYSQL_PWD={}", config.root_password),
+                    format!("MARIADB_PWD={}", config.root_password),
+                ]),
+                Duration::from_secs(15),
+            )
+            .await?;
+        parse_log_bin(&output).ok_or_else(|| {
+            EngineError::failed(
+                &self.name,
+                format!(
+                    "could not read whether binary logging is on in container \
+                     '{container_name}': SELECT @@global.log_bin answered {:?}",
+                    output.trim()
+                ),
+            )
+        })
     }
 
     /// `FLUSH BINARY LOGS` — rotates the active binlog so it closes.
@@ -4981,6 +5076,31 @@ mod tests {
         ));
         assert_eq!(command, expected);
         assert!(command.contains(&"--log-bin=mysql-bin".to_string()));
+    }
+
+    #[test]
+    fn log_bin_is_read_from_the_last_line_of_the_answer() {
+        assert_eq!(parse_log_bin("1\n"), Some(true));
+        assert_eq!(parse_log_bin("0"), Some(false));
+        assert_eq!(parse_log_bin("ON"), Some(true));
+        assert_eq!(parse_log_bin("off\n\n"), Some(false));
+        assert_eq!(
+            parse_log_bin("mariadb: [Warning] Using a password on the command line\n0\n"),
+            Some(false)
+        );
+        assert_eq!(parse_log_bin(""), None);
+        assert_eq!(
+            parse_log_bin("ERROR 1045 (28000): Access denied for user 'root'@'localhost'"),
+            None
+        );
+    }
+
+    #[test]
+    fn binary_logging_off_names_the_container_and_what_turns_it_on() {
+        let reason = binary_logging_off_reason("mariadb-shop");
+        assert!(reason.contains("'mariadb-shop'"), "{reason}");
+        assert!(reason.contains("--log-bin"), "{reason}");
+        assert!(reason.contains("created again"), "{reason}");
     }
 
     #[test]
