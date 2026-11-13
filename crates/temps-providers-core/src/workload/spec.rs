@@ -789,9 +789,11 @@ impl DatabaseWorkloadPlan {
     /// Keep the healthcheck timings the running container was created with,
     /// rather than the ones this process would resolve: a worker's agent
     /// rebuilds a database from its inspected container and has no copy of
-    /// the control plane's healthcheck overrides (#1877). A value the daemon
-    /// did not store (`StartInterval` below API 1.44) leaves the spec's, and
-    /// a container without a healthcheck leaves them all.
+    /// the control plane's healthcheck overrides (#1877). A daemon below API
+    /// 1.44 stores no `StartInterval` and checks at `Interval` from the
+    /// start, so that is the start interval kept: the spec's would lower the
+    /// interval to it on such a daemon (`healthcheck::probes_for_daemon`). A
+    /// container without a healthcheck leaves them all.
     pub fn keep_healthcheck(&mut self, existing: &ContainerInspectResponse) {
         let Some(health) = existing
             .config
@@ -812,16 +814,17 @@ impl DatabaseWorkloadPlan {
                 .and_then(|nanos| u32::try_from(nanos / 1_000_000_000).ok())
                 .filter(|secs| *secs > 0)
         };
+        let interval = secs(health.interval);
         let probes = &mut self.spec.probes;
         if let Some(startup) = probes.startup.as_mut() {
             // Docker leaves a start period of 0 out.
             startup.initial_delay_secs = secs(health.start_period).unwrap_or(0);
-            if let Some(start_interval) = secs(health.start_interval) {
+            if let Some(start_interval) = secs(health.start_interval).or(interval) {
                 startup.period_secs = start_interval;
             }
         }
         if let Some(readiness) = probes.readiness.as_mut() {
-            if let Some(interval) = secs(health.interval) {
+            if let Some(interval) = interval {
                 readiness.period_secs = interval;
             }
             if let Some(timeout) = secs(health.timeout) {
@@ -1259,7 +1262,9 @@ mod tests {
         assert_eq!(kept.test, health_of(&admitted).test);
 
         // A daemon below API 1.44 stored no start interval and no zero start
-        // period: the spec's start interval stays, the start period is 0.
+        // period. It checked at the interval from the start, and the rebuilt
+        // container keeps that cadence there rather than the spec's 2s start
+        // interval; the start period is 0.
         let mut plan = admitted.clone();
         plan.keep_healthcheck(&existing(Some(HealthConfig {
             start_interval: None,
@@ -1268,8 +1273,13 @@ mod tests {
         })));
         let kept = health_of(&plan);
         assert_eq!(kept.interval, Some(60 * S));
-        assert_eq!(kept.start_interval, health_of(&admitted).start_interval);
+        assert_eq!(kept.start_interval, Some(60 * S));
         assert_eq!(kept.start_period.unwrap_or(0), 0);
+        let on_old_daemon = crate::healthcheck::probes_for_daemon(
+            &plan.spec.probes,
+            crate::healthcheck::StartIntervalSupport::Unsupported,
+        );
+        assert_eq!(on_old_daemon.readiness.map(|p| p.period_secs), Some(60));
 
         // Nothing to keep: the spec's healthcheck.
         for none in [
