@@ -11,6 +11,10 @@
 //! metrics leave through [`temps_core::ProjectMetricsSink`] and large payloads
 //! through [`temps_core::PayloadBlobStore`].
 
+#[cfg(test)]
+mod conformance_tests;
+#[cfg(test)]
+mod e2e_docker_tests;
 pub mod engine;
 pub mod error;
 pub mod executor;

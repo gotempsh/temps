@@ -800,6 +800,39 @@ jobs:
           path: web/dist
           key: ${{ steps.console-key.outputs.key }}
 
+  workflows-sdk:
+    name: Workflows SDK
+    needs: changes
+    # sdks/ is in the Rust area: the SDK and the engine share the executor
+    # protocol, so a change to either runs this.
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7.0.1
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+          no-cache: ${{ github.ref != 'refs/heads/main' }}
+
+      - name: Install dependencies
+        working-directory: sdks/node
+        run: bun install --frozen-lockfile
+
+      # Unit tests and the executor protocol conformance suite against the
+      # in-memory orchestrator. The same suite runs against the real engine
+      # in the docker-deployments integration group
+      # (temps-workflows' conformance_tests).
+      - name: Typecheck, test and build @temps-sdk/workflows
+        working-directory: sdks/node/packages/workflows
+        run: |
+          bun run typecheck
+          bun run test:run
+          bun run build
+
   openapi-canonical:
     name: OpenAPI Spec Format
     runs-on: ubuntu-latest
@@ -1634,6 +1667,15 @@ jobs:
       - name: Make the default Redis image available
         if: env.GROUP_RUNS == 'true' && matrix.redis_image
         run: .github/scripts/ensure-default-redis-image.sh
+
+      # temps-workflows' real-engine conformance and end-to-end tests drive
+      # the TypeScript SDK with Bun; without it they skip.
+      - name: Install Bun
+        if: env.GROUP_RUNS == 'true' && matrix.group == 'docker-deployments'
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+          no-cache: ${{ github.ref != 'refs/heads/main' }}
 
       - name: Run integration tests
         if: env.GROUP_RUNS == 'true'
