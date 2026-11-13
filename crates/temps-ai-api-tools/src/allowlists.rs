@@ -846,6 +846,16 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     "list_node_modes",
     "list_rules",
     "node_state_status",
+    // Durable workflows (ADR-103): status, runs and journals with every
+    // payload masked, settings, and whether a credential exists (its prefix,
+    // never the token). Decrypting a payload is `reveal_workflow_payload`,
+    // which is withheld.
+    "get_workflows_overview",
+    "list_workflow_runs",
+    "get_workflow_run",
+    "list_workflow_steps",
+    "get_workflow_settings",
+    "get_workflow_credential",
 ];
 
 /// [`AI_READ_ALLOWLIST`] as owned strings, the shape [`crate::InternalApiCaller`] takes.
@@ -1245,6 +1255,13 @@ pub const AI_WRITE_ALLOWLIST: &[&str] = &[
     // Revenue configuration
     "revenue_update_config",
     "revenue_delete_integration",
+    // Durable workflow run lifecycle (ADR-103): stopping a run, or re-running
+    // it from a step or out of `stuck`, through the console's guards and
+    // audit. Starting a run or sending an event (which runs the app's code
+    // with a caller-chosen payload) and deleting one stay console-only.
+    "cancel_workflow_run",
+    "retry_workflow_run",
+    "resume_workflow_run",
 ];
 
 /// [`AI_WRITE_ALLOWLIST`] as owned strings, the shape [`crate::InternalApiCaller`] takes.

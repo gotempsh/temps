@@ -34,6 +34,7 @@ pub struct WorkflowsAppState {
 /// Whether the environment can run workflows. When `configured` is false,
 /// `reason` says what is missing and `setup_path` where to fix it.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[schema(as = WorkflowExecutorCapabilityResponse)]
 pub struct ExecutorCapabilityResponse {
     pub configured: bool,
     pub reason: Option<String>,
@@ -61,6 +62,7 @@ impl From<ExecutorStatus> for ExecutorCapabilityResponse {
 
 /// The environment's workflow credential, never its token.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[schema(as = WorkflowCredentialStatusResponse)]
 pub struct CredentialStatusResponse {
     pub configured: bool,
     /// First characters of the token, to recognise it.
@@ -138,6 +140,7 @@ impl From<Overview> for WorkflowsOverviewResponse {
 
 /// The event a waiting run is suspended on.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[schema(as = WorkflowAwaitedEventResponse)]
 pub struct AwaitedEventResponse {
     pub name: String,
     pub key: Option<String>,
@@ -335,6 +338,7 @@ pub struct RetryWorkflowRunRequest {
 /// Which payload to reveal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
+#[schema(as = WorkflowRevealTarget)]
 pub enum RevealTarget {
     Input,
     Output,
@@ -344,6 +348,7 @@ pub enum RevealTarget {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[schema(as = WorkflowRevealPayloadRequest)]
 pub struct RevealPayloadRequest {
     pub target: RevealTarget,
     /// Required for `step_result` and `step_error`.
@@ -352,6 +357,7 @@ pub struct RevealPayloadRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[schema(as = WorkflowRevealPayloadResponse)]
 pub struct RevealPayloadResponse {
     pub target: RevealTarget,
     pub sequence: Option<i32>,

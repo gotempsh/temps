@@ -5361,6 +5361,72 @@
         ],
         "type": "object"
       },
+      "AppStartWorkflowRunResponse": {
+        "properties": {
+          "created": {
+            "type": "boolean"
+          },
+          "run": {
+            "$ref": "#/components/schemas/AppWorkflowRunResponse"
+          }
+        },
+        "required": [
+          "run",
+          "created"
+        ],
+        "type": "object"
+      },
+      "AppWorkflowRunResponse": {
+        "description": "A run as the app that started it sees it: its result once finished.",
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "error": {
+            "description": "Set once the run failed.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "error_kind": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "finished_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "output": {
+            "description": "Set once the run completed.",
+            "type": "object"
+          },
+          "status": {
+            "$ref": "#/components/schemas/WorkflowRunStatus"
+          },
+          "workflow": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "workflow",
+          "status",
+          "output",
+          "created_at"
+        ],
+        "type": "object"
+      },
       "ApplicationGitConnectionsResponse": {
         "properties": {
           "bindings": {
@@ -40596,6 +40662,32 @@
         ],
         "type": "string"
       },
+      "IssuedWorkflowCredentialResponse": {
+        "description": "A new workflow credential. `token` is shown this once.",
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "prefix": {
+            "type": "string"
+          },
+          "token": {
+            "type": "string"
+          },
+          "usage": {
+            "description": "How the app uses it.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "token",
+          "prefix",
+          "created_at",
+          "usage"
+        ],
+        "type": "object"
+      },
       "JobStatusResponse": {
         "description": "Snapshot of a background job. `status` is one of \"running\" | \"exited\"\n| \"failed\"; `exit_code` is populated only when `status == \"exited\"`.",
         "properties": {
@@ -60967,6 +61059,19 @@
         },
         "type": "object"
       },
+      "RetryWorkflowRunRequest": {
+        "properties": {
+          "from_sequence": {
+            "description": "Journal entry to run again from; entries from it on are dropped.\nDefaults to the entry that failed, or the end of the journal.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "RevenueRow": {
         "properties": {
           "amount_minor": {
@@ -65131,6 +65236,46 @@
         },
         "required": [
           "content"
+        ],
+        "type": "object"
+      },
+      "SendWorkflowEventRequest": {
+        "properties": {
+          "key": {
+            "description": "Narrows delivery to runs waiting on this key.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "payload": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
+      "SendWorkflowEventResponse": {
+        "properties": {
+          "delivered": {
+            "description": "Runs woken by this event.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "event_id": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "event_id",
+          "delivered"
         ],
         "type": "object"
       },
@@ -70987,6 +71132,43 @@
           "estimated_restart_secs",
           "restart_mode",
           "message"
+        ],
+        "type": "object"
+      },
+      "StartWorkflowRunRequest": {
+        "properties": {
+          "idempotency_key": {
+            "description": "A second start with the same key returns the first run.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "input": {
+            "type": "object"
+          },
+          "workflow": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "workflow"
+        ],
+        "type": "object"
+      },
+      "StartWorkflowRunResponse": {
+        "properties": {
+          "created": {
+            "description": "False when the idempotency key matched an earlier run.",
+            "type": "boolean"
+          },
+          "run": {
+            "$ref": "#/components/schemas/WorkflowRunResponse"
+          }
+        },
+        "required": [
+          "run",
+          "created"
         ],
         "type": "object"
       },
@@ -82833,6 +83015,57 @@
           }
         ]
       },
+      "WorkflowAwaitedEventResponse": {
+        "description": "The event a waiting run is suspended on.",
+        "properties": {
+          "key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
+      "WorkflowCredentialStatusResponse": {
+        "description": "The environment's workflow credential, never its token.",
+        "properties": {
+          "configured": {
+            "type": "boolean"
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_used_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "prefix": {
+            "description": "First characters of the token, to recognise it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "configured"
+        ],
+        "type": "object"
+      },
       "WorkflowDryRunRequest": {
         "properties": {
           "cpu_limit": {
@@ -82874,6 +83107,1034 @@
         },
         "required": [
           "yaml"
+        ],
+        "type": "object"
+      },
+      "WorkflowEmittedEvent": {
+        "properties": {
+          "key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "payload": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
+      "WorkflowExecutorCapabilityResponse": {
+        "description": "Whether the environment can run workflows. When `configured` is false,\n`reason` says what is missing and `setup_path` where to fix it.",
+        "properties": {
+          "configured": {
+            "type": "boolean"
+          },
+          "deployment_id": {
+            "description": "The deployment whose replicas would be invoked.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "replicas": {
+            "description": "Healthy replicas found.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "sdk": {
+            "description": "SDK name and version reported by the manifest.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "setup_path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "configured",
+          "replicas"
+        ],
+        "type": "object"
+      },
+      "WorkflowHeartbeatResponse": {
+        "properties": {
+          "cancelled": {
+            "description": "True once an operator cancelled the run: stop at the next step.",
+            "type": "boolean"
+          },
+          "lease_expires_at": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "lease_expires_at",
+          "cancelled"
+        ],
+        "type": "object"
+      },
+      "WorkflowInvocationKeyResponse": {
+        "description": "`GET /workflows/v1/invocation-key` response.",
+        "properties": {
+          "algorithm": {
+            "description": "`ed25519`.",
+            "type": "string"
+          },
+          "key_id": {
+            "type": "string"
+          },
+          "public_key": {
+            "description": "Base64url (no padding) of the 32-byte public key.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "algorithm",
+          "public_key",
+          "key_id"
+        ],
+        "type": "object"
+      },
+      "WorkflowJournalEntry": {
+        "description": "One recorded journal entry as the executor replays it.",
+        "properties": {
+          "attempts": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "error": {
+            "description": "The recorded error message (`failed`, or the last failed attempt).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "$ref": "#/components/schemas/WorkflowStepKind"
+          },
+          "name": {
+            "type": "string"
+          },
+          "result": {
+            "description": "The recorded result (`completed`), decrypted for the executor.",
+            "type": "object"
+          },
+          "sequence": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "status": {
+            "$ref": "#/components/schemas/WorkflowStepStatus"
+          },
+          "wake_at": {
+            "description": "A `sleep`'s wake time or a `wait`'s timeout.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "sequence",
+          "name",
+          "kind",
+          "status",
+          "attempts",
+          "result"
+        ],
+        "type": "object"
+      },
+      "WorkflowJournalPage": {
+        "description": "`GET /workflow-runs/{run_id}/journal` response page.",
+        "properties": {
+          "entries": {
+            "items": {
+              "$ref": "#/components/schemas/WorkflowJournalEntry"
+            },
+            "type": "array"
+          },
+          "next_sequence": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "entries"
+        ],
+        "type": "object"
+      },
+      "WorkflowOutcome": {
+        "description": "How an invocation ended.",
+        "oneOf": [
+          {
+            "properties": {
+              "output": {
+                "type": "object"
+              },
+              "type": {
+                "enum": [
+                  "completed"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "error": {
+                "type": "string"
+              },
+              "sequence": {
+                "description": "The journal entry that failed, when a step did.",
+                "format": "int32",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "type": {
+                "enum": [
+                  "failed"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "error",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Suspended in `sleep`/`sleepUntil` until `until`.",
+            "properties": {
+              "sequence": {
+                "format": "int32",
+                "type": "integer"
+              },
+              "type": {
+                "enum": [
+                  "sleep"
+                ],
+                "type": "string"
+              },
+              "until": {
+                "format": "date-time",
+                "type": "string"
+              }
+            },
+            "required": [
+              "sequence",
+              "until",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Suspended in `waitForEvent`.",
+            "properties": {
+              "event": {
+                "type": "string"
+              },
+              "key": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "sequence": {
+                "format": "int32",
+                "type": "integer"
+              },
+              "timeout_at": {
+                "format": "date-time",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "type": {
+                "enum": [
+                  "wait"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "sequence",
+              "event",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "A step attempt failed and is retried at `at`.",
+            "properties": {
+              "at": {
+                "format": "date-time",
+                "type": "string"
+              },
+              "sequence": {
+                "format": "int32",
+                "type": "integer"
+              },
+              "type": {
+                "enum": [
+                  "retry"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "sequence",
+              "at",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Replay found a different step than the journal recorded.",
+            "properties": {
+              "expected": {
+                "type": "string"
+              },
+              "found": {
+                "type": "string"
+              },
+              "sequence": {
+                "format": "int32",
+                "type": "integer"
+              },
+              "type": {
+                "enum": [
+                  "incompatible"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "sequence",
+              "expected",
+              "found",
+              "type"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "WorkflowOutcomeRequest": {
+        "description": "`POST /workflow-runs/{run_id}/outcome` body.",
+        "properties": {
+          "outcome": {
+            "$ref": "#/components/schemas/WorkflowOutcome"
+          }
+        },
+        "required": [
+          "outcome"
+        ],
+        "type": "object"
+      },
+      "WorkflowOutcomeResponse": {
+        "properties": {
+          "status": {
+            "$ref": "#/components/schemas/WorkflowRunStatus"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "type": "object"
+      },
+      "WorkflowRevealPayloadRequest": {
+        "properties": {
+          "sequence": {
+            "description": "Required for `step_result` and `step_error`.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "target": {
+            "$ref": "#/components/schemas/WorkflowRevealTarget"
+          }
+        },
+        "required": [
+          "target"
+        ],
+        "type": "object"
+      },
+      "WorkflowRevealPayloadResponse": {
+        "properties": {
+          "sequence": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "target": {
+            "$ref": "#/components/schemas/WorkflowRevealTarget"
+          },
+          "value": {
+            "description": "The decrypted payload; `null` when none was stored.",
+            "type": "object"
+          }
+        },
+        "required": [
+          "target",
+          "value"
+        ],
+        "type": "object"
+      },
+      "WorkflowRevealTarget": {
+        "description": "Which payload to reveal.",
+        "enum": [
+          "input",
+          "output",
+          "error",
+          "step_result",
+          "step_error"
+        ],
+        "type": "string"
+      },
+      "WorkflowRunListResponse": {
+        "properties": {
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "runs": {
+            "items": {
+              "$ref": "#/components/schemas/WorkflowRunResponse"
+            },
+            "type": "array"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total_pages": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "runs",
+          "total",
+          "page",
+          "page_size",
+          "total_pages"
+        ],
+        "type": "object"
+      },
+      "WorkflowRunResponse": {
+        "description": "A run, payloads masked.",
+        "properties": {
+          "attempt": {
+            "description": "Invocations so far.",
+            "format": "int32",
+            "type": "integer"
+          },
+          "awaited_event": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/WorkflowAwaitedEventResponse"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "blocked_reason": {
+            "description": "Why the run is not progressing (no replica, invocation failures).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "consecutive_failures": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "due_at": {
+            "description": "When the run is next runnable.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "environment_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "error_kind": {
+            "description": "Category of the failure: `step_failed`, `workflow_failed`,\n`incompatible`, `payload_too_large`, `cancelled`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "finished_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "has_error": {
+            "type": "boolean"
+          },
+          "has_input": {
+            "type": "boolean"
+          },
+          "has_output": {
+            "type": "boolean"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "idempotency_key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "input_bytes": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "journal_bytes": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "lease_expires_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "output_bytes": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "parent_run_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "started_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "started_by_credential_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "started_by_user_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/WorkflowRunStatus"
+          },
+          "step_count": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "workflow": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "project_id",
+          "environment_id",
+          "workflow",
+          "status",
+          "attempt",
+          "consecutive_failures",
+          "has_input",
+          "input_bytes",
+          "has_output",
+          "output_bytes",
+          "has_error",
+          "step_count",
+          "journal_bytes",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
+      "WorkflowRunStatus": {
+        "description": "Where a run is in its lifecycle (ADR-103 §3).",
+        "enum": [
+          "queued",
+          "running",
+          "sleeping",
+          "waiting",
+          "retrying",
+          "completed",
+          "failed",
+          "cancelled",
+          "stuck"
+        ],
+        "type": "string"
+      },
+      "WorkflowSettings": {
+        "description": "The settings in effect for an environment: its row, or the defaults.",
+        "properties": {
+          "host_service": {
+            "description": "Compose service hosting the workflow handler; `None`: the main service.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "inline_payload_limit_bytes": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "invocation_deadline_secs": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "lease_secs": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "max_active_runs": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "max_concurrent_runs": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "max_journal_bytes_per_run": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "max_payload_bytes": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "max_steps_per_run": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "retention_days": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "stuck_after_failures": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "invocation_deadline_secs",
+          "lease_secs",
+          "max_concurrent_runs",
+          "max_active_runs",
+          "max_steps_per_run",
+          "max_journal_bytes_per_run",
+          "inline_payload_limit_bytes",
+          "max_payload_bytes",
+          "retention_days",
+          "stuck_after_failures"
+        ],
+        "type": "object"
+      },
+      "WorkflowStepKind": {
+        "description": "What a journal entry records.",
+        "enum": [
+          "step",
+          "sleep",
+          "wait",
+          "now",
+          "random",
+          "send_event"
+        ],
+        "type": "string"
+      },
+      "WorkflowStepListResponse": {
+        "properties": {
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "steps": {
+            "items": {
+              "$ref": "#/components/schemas/WorkflowStepResponse"
+            },
+            "type": "array"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total_pages": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "steps",
+          "total",
+          "page",
+          "page_size",
+          "total_pages"
+        ],
+        "type": "object"
+      },
+      "WorkflowStepResponse": {
+        "description": "A journal entry, payloads masked.",
+        "properties": {
+          "attempts": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "completed_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "duration_ms": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "error_ref": {
+            "description": "Error-tracking event of the attempt's exception.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "event_id": {
+            "description": "The event that completed a wait.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "has_error": {
+            "type": "boolean"
+          },
+          "has_result": {
+            "type": "boolean"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/WorkflowStepKind"
+          },
+          "name": {
+            "type": "string"
+          },
+          "result_bytes": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "sequence": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "status": {
+            "$ref": "#/components/schemas/WorkflowStepStatus"
+          },
+          "trace_id": {
+            "description": "OTEL trace of the attempt, to open in traces.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "wake_at": {
+            "description": "A sleep's wake time or a wait's timeout.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "sequence",
+          "name",
+          "kind",
+          "status",
+          "attempts",
+          "has_result",
+          "result_bytes",
+          "has_error",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
+      "WorkflowStepStatus": {
+        "description": "A journal entry's state. `pending` is a sleep or wait not yet over, or a\nstep whose failed attempt is waiting for its retry.",
+        "enum": [
+          "pending",
+          "completed",
+          "failed"
+        ],
+        "type": "string"
+      },
+      "WorkflowStepWriteRequest": {
+        "description": "`POST /workflow-runs/{run_id}/steps` body: record one journal entry.",
+        "properties": {
+          "attempts": {
+            "description": "Attempts made so far, this one included.",
+            "format": "int32",
+            "type": "integer"
+          },
+          "duration_ms": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "error_ref": {
+            "description": "Error-tracking event id of the attempt's exception.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "event": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/WorkflowEmittedEvent",
+                "description": "For `send_event`: the event to deliver, recorded exactly once."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "kind": {
+            "$ref": "#/components/schemas/WorkflowStepKind"
+          },
+          "name": {
+            "type": "string"
+          },
+          "result": {
+            "type": "object"
+          },
+          "sequence": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "status": {
+            "$ref": "#/components/schemas/WorkflowStepStatus"
+          },
+          "trace_id": {
+            "description": "OTEL trace id of the attempt's span (metadata only).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "wake_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "sequence",
+          "name",
+          "kind",
+          "status",
+          "attempts"
+        ],
+        "type": "object"
+      },
+      "WorkflowStepWriteResponse": {
+        "description": "The entry as Temps holds it after the write. When `already_recorded` is\ntrue, the executor must continue with this recorded value, not its own.",
+        "properties": {
+          "already_recorded": {
+            "type": "boolean"
+          },
+          "entry": {
+            "$ref": "#/components/schemas/WorkflowJournalEntry"
+          },
+          "lease_expires_at": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "entry",
+          "already_recorded",
+          "lease_expires_at"
+        ],
+        "type": "object"
+      },
+      "WorkflowSummaryResponse": {
+        "properties": {
+          "active_runs": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "completed_runs": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "concurrency": {
+            "description": "Runs allowed to execute at once, from the manifest.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "defined": {
+            "description": "False when runs exist for a workflow the deployment no longer defines.",
+            "type": "boolean"
+          },
+          "failed_runs": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "last_run_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "name",
+          "defined",
+          "active_runs",
+          "completed_runs",
+          "failed_runs"
+        ],
+        "type": "object"
+      },
+      "WorkflowsOverviewResponse": {
+        "properties": {
+          "credential": {
+            "$ref": "#/components/schemas/WorkflowCredentialStatusResponse"
+          },
+          "executor": {
+            "$ref": "#/components/schemas/WorkflowExecutorCapabilityResponse"
+          },
+          "workflows": {
+            "items": {
+              "$ref": "#/components/schemas/WorkflowSummaryResponse"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "executor",
+          "credential",
+          "workflows"
         ],
         "type": "object"
       },
@@ -151800,6 +153061,1178 @@
         ]
       }
     },
+    "/projects/{project_id}/environments/{environment_id}/workflows": {
+      "get": {
+        "operationId": "get_workflows_overview",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowsOverviewResponse"
+                }
+              }
+            },
+            "description": "Workflows of the environment, whether it can run them, and its credential status"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Environment not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Workflows"
+        ]
+      }
+    },
+    "/projects/{project_id}/environments/{environment_id}/workflows/credential": {
+      "delete": {
+        "operationId": "revoke_workflow_credential",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Credential revoked"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Environment or credential not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Workflows"
+        ]
+      },
+      "get": {
+        "operationId": "get_workflow_credential",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowCredentialStatusResponse"
+                }
+              }
+            },
+            "description": "Whether the environment has a workflow credential, never its token"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Environment not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Workflows"
+        ]
+      },
+      "post": {
+        "operationId": "issue_workflow_credential",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IssuedWorkflowCredentialResponse"
+                }
+              }
+            },
+            "description": "New credential; the token is shown only in this response. The previous credential stops working."
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Environment not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Workflows"
+        ]
+      }
+    },
+    "/projects/{project_id}/environments/{environment_id}/workflows/events": {
+      "post": {
+        "operationId": "send_workflow_event",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SendWorkflowEventRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SendWorkflowEventResponse"
+                }
+              }
+            },
+            "description": "Event stored and delivered to the runs waiting on it"
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Environment not found"
+          },
+          "413": {
+            "description": "Payload too large"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Workflows"
+        ]
+      }
+    },
+    "/projects/{project_id}/environments/{environment_id}/workflows/runs": {
+      "get": {
+        "operationId": "list_workflow_runs",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/WorkflowRunStatus"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          {
+            "description": "Only runs of this workflow.",
+            "in": "query",
+            "name": "workflow",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "1-indexed page number. Defaults to 1.",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Items per page. Defaults to 20, capped at 100.",
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowRunListResponse"
+                }
+              }
+            },
+            "description": "Runs, newest first"
+          },
+          "400": {
+            "description": "Invalid filter"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Environment not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Workflows"
+        ]
+      },
+      "post": {
+        "operationId": "start_workflow_run",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StartWorkflowRunRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StartWorkflowRunResponse"
+                }
+              }
+            },
+            "description": "The idempotency key matched an earlier run"
+          },
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StartWorkflowRunResponse"
+                }
+              }
+            },
+            "description": "Run started"
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Environment not found"
+          },
+          "413": {
+            "description": "Input too large"
+          },
+          "429": {
+            "description": "Active run quota reached"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Workflows"
+        ]
+      }
+    },
+    "/projects/{project_id}/environments/{environment_id}/workflows/runs/{run_id}": {
+      "delete": {
+        "operationId": "delete_workflow_run",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Run ID",
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Run and its journal deleted"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Run not found"
+          },
+          "409": {
+            "description": "The run is running; cancel it first"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Workflows"
+        ]
+      },
+      "get": {
+        "operationId": "get_workflow_run",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Run ID",
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowRunResponse"
+                }
+              }
+            },
+            "description": "The run, payloads masked"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Run not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Workflows"
+        ]
+      }
+    },
+    "/projects/{project_id}/environments/{environment_id}/workflows/runs/{run_id}/cancel": {
+      "post": {
+        "operationId": "cancel_workflow_run",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Run ID",
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowRunResponse"
+                }
+              }
+            },
+            "description": "Run cancelled; an in-flight invocation stops at its next step"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Run not found"
+          },
+          "409": {
+            "description": "The run already finished"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Workflows"
+        ]
+      }
+    },
+    "/projects/{project_id}/environments/{environment_id}/workflows/runs/{run_id}/resume": {
+      "post": {
+        "operationId": "resume_workflow_run",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Run ID",
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowRunResponse"
+                }
+              }
+            },
+            "description": "Run due now; a pending sleep wakes now"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Run not found"
+          },
+          "409": {
+            "description": "The run cannot be resumed in its state"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Workflows"
+        ]
+      }
+    },
+    "/projects/{project_id}/environments/{environment_id}/workflows/runs/{run_id}/retry": {
+      "post": {
+        "operationId": "retry_workflow_run",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Run ID",
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RetryWorkflowRunRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowRunResponse"
+                }
+              }
+            },
+            "description": "Run queued again from the given journal entry"
+          },
+          "400": {
+            "description": "Sequence outside the journal"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Run not found"
+          },
+          "409": {
+            "description": "The run is still active"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Workflows"
+        ]
+      }
+    },
+    "/projects/{project_id}/environments/{environment_id}/workflows/runs/{run_id}/reveal": {
+      "post": {
+        "operationId": "reveal_workflow_payload",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Run ID",
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkflowRevealPayloadRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowRevealPayloadResponse"
+                }
+              }
+            },
+            "description": "The decrypted payload; the read is audit-logged"
+          },
+          "400": {
+            "description": "A step payload needs its sequence"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Run or step not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Workflows"
+        ]
+      }
+    },
+    "/projects/{project_id}/environments/{environment_id}/workflows/runs/{run_id}/steps": {
+      "get": {
+        "operationId": "list_workflow_steps",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Run ID",
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "1-indexed page number. Defaults to 1.",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Items per page. Defaults to 20, capped at 100.",
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowStepListResponse"
+                }
+              }
+            },
+            "description": "The run's journal in sequence order, payloads masked"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Run not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Workflows"
+        ]
+      }
+    },
+    "/projects/{project_id}/environments/{environment_id}/workflows/settings": {
+      "get": {
+        "operationId": "get_workflow_settings",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowSettings"
+                }
+              }
+            },
+            "description": "Settings in effect (the defaults until changed)"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Environment not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Workflows"
+        ]
+      },
+      "put": {
+        "operationId": "update_workflow_settings",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkflowSettings"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowSettings"
+                }
+              }
+            },
+            "description": "Settings saved"
+          },
+          "400": {
+            "description": "A value is out of range"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Environment not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Workflows"
+        ]
+      }
+    },
     "/projects/{project_id}/error-alert-rules": {
       "get": {
         "operationId": "list_alert_rules",
@@ -175442,6 +177875,399 @@
         ]
       }
     },
+    "/workflow-runs/{run_id}/heartbeat": {
+      "post": {
+        "operationId": "heartbeat_run",
+        "parameters": [
+          {
+            "description": "Run ID",
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowHeartbeatResponse"
+                }
+              }
+            },
+            "description": "Lease extended, or `cancelled: true` to stop"
+          },
+          "401": {
+            "description": "Missing or invalid invocation token"
+          },
+          "404": {
+            "description": "Run not found"
+          },
+          "409": {
+            "description": "The token's lease is no longer current"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Workflow Executor"
+        ]
+      }
+    },
+    "/workflow-runs/{run_id}/journal": {
+      "get": {
+        "operationId": "get_run_journal",
+        "parameters": [
+          {
+            "description": "Run ID",
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "First sequence to return. Defaults to 0.",
+            "in": "query",
+            "name": "from",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowJournalPage"
+                }
+              }
+            },
+            "description": "A page of the journal, decrypted for the executor"
+          },
+          "401": {
+            "description": "Missing or invalid invocation token"
+          },
+          "404": {
+            "description": "Run not found"
+          },
+          "409": {
+            "description": "The token's lease is no longer current"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Workflow Executor"
+        ]
+      }
+    },
+    "/workflow-runs/{run_id}/outcome": {
+      "post": {
+        "operationId": "report_run_outcome",
+        "parameters": [
+          {
+            "description": "Run ID",
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkflowOutcomeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowOutcomeResponse"
+                }
+              }
+            },
+            "description": "Outcome applied (for executors that answered the invoke with 202)"
+          },
+          "400": {
+            "description": "Invalid outcome"
+          },
+          "401": {
+            "description": "Missing or invalid invocation token"
+          },
+          "404": {
+            "description": "Run not found"
+          },
+          "409": {
+            "description": "The token's lease is no longer current"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Workflow Executor"
+        ]
+      }
+    },
+    "/workflow-runs/{run_id}/steps": {
+      "post": {
+        "operationId": "record_run_step",
+        "parameters": [
+          {
+            "description": "Run ID",
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkflowStepWriteRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowStepWriteResponse"
+                }
+              }
+            },
+            "description": "The entry as recorded; when already_recorded, continue with it"
+          },
+          "400": {
+            "description": "Invalid entry"
+          },
+          "401": {
+            "description": "Missing or invalid invocation token"
+          },
+          "404": {
+            "description": "Run not found"
+          },
+          "409": {
+            "description": "Stale lease, or the replay does not match the journal (WorkflowIncompatible)"
+          },
+          "413": {
+            "description": "Result too large"
+          },
+          "429": {
+            "description": "The run reached its step or journal-size quota"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Workflow Executor"
+        ]
+      }
+    },
+    "/workflows/v1/events": {
+      "post": {
+        "operationId": "app_send_workflow_event",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SendWorkflowEventRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SendWorkflowEventResponse"
+                }
+              }
+            },
+            "description": "Event stored and delivered to the runs waiting on it"
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "401": {
+            "description": "Missing, unknown or revoked workflow credential"
+          },
+          "413": {
+            "description": "Payload too large"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Workflow App API"
+        ]
+      }
+    },
+    "/workflows/v1/invocation-key": {
+      "get": {
+        "operationId": "get_invocation_key",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowInvocationKeyResponse"
+                }
+              }
+            },
+            "description": "The public key SDKs verify invocation tokens with"
+          }
+        },
+        "tags": [
+          "Workflow Executor"
+        ]
+      }
+    },
+    "/workflows/v1/runs": {
+      "post": {
+        "operationId": "app_start_workflow_run",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StartWorkflowRunRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AppStartWorkflowRunResponse"
+                }
+              }
+            },
+            "description": "The idempotency key matched an earlier run"
+          },
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AppStartWorkflowRunResponse"
+                }
+              }
+            },
+            "description": "Run started"
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "401": {
+            "description": "Missing, unknown or revoked workflow credential"
+          },
+          "413": {
+            "description": "Input too large"
+          },
+          "429": {
+            "description": "Active run quota reached"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Workflow App API"
+        ]
+      }
+    },
+    "/workflows/v1/runs/{run_id}": {
+      "get": {
+        "operationId": "app_get_workflow_run",
+        "parameters": [
+          {
+            "description": "Run ID",
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AppWorkflowRunResponse"
+                }
+              }
+            },
+            "description": "The run, with its output once completed or its error once failed"
+          },
+          "401": {
+            "description": "Missing, unknown or revoked workflow credential"
+          },
+          "404": {
+            "description": "No such run in the credential's environment"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Workflow App API"
+        ]
+      }
+    },
     "/x/plugins/{name}/ai-tools": {
       "get": {
         "operationId": "get_plugin_ai_tools",
@@ -176039,6 +178865,18 @@
     {
       "description": "Credential checks for environment variables and secrets: provider HTTP verification and local expiry of certificates, SSH certificates, OpenPGP keys, kubeconfigs and JWTs",
       "name": "HTTP Checks"
+    },
+    {
+      "description": "Durable workflows: runs, steps, events and settings of an environment",
+      "name": "Workflows"
+    },
+    {
+      "description": "Callbacks of the workflow SDK running in the app, authorized by the invocation token",
+      "name": "Workflow Executor"
+    },
+    {
+      "description": "Start runs, read them and send events from the app, with the environment's workflow credential",
+      "name": "Workflow App API"
     },
     {
       "description": "Authentication and authorization endpoints",

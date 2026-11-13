@@ -1829,7 +1829,11 @@ mod tests {
                 "user / {name}"
             );
             let read_only = *permission == Permission::WorkflowsRead;
-            assert_eq!(Role::Reader.has_permission(permission), read_only, "reader / {name}");
+            assert_eq!(
+                Role::Reader.has_permission(permission),
+                read_only,
+                "reader / {name}"
+            );
             assert_eq!(
                 Role::PlatformAdmin.has_permission(permission),
                 read_only,

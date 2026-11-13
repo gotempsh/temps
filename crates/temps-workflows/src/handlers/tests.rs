@@ -679,3 +679,39 @@ async fn the_overview_shows_an_onboarding_state_when_nothing_can_run() {
     );
     assert_eq!(overview["credential"]["configured"], false);
 }
+
+/// Every plugin's schemas land in one OpenAPI document keyed by name, so a
+/// generic name (`JournalEntry`, `StepKind`) silently replaces another
+/// crate's schema of the same name. Workflow schemas carry the domain in
+/// their name, and every reference resolves inside this document.
+#[test]
+fn schema_names_are_workflow_qualified_and_every_reference_resolves() {
+    use utoipa::OpenApi as _;
+    let doc = WorkflowsApiDoc::openapi();
+    let schemas = doc
+        .components
+        .as_ref()
+        .map(|c| c.schemas.clone())
+        .unwrap_or_default();
+    let unqualified: Vec<&String> = schemas
+        .keys()
+        .filter(|name| !name.contains("Workflow"))
+        .collect();
+    assert!(
+        unqualified.is_empty(),
+        "schemas without a workflow-qualified name: {unqualified:?}"
+    );
+
+    let json = serde_json::to_string(&doc).unwrap();
+    let dangling: Vec<String> = json
+        .split("\"#/components/schemas/")
+        .skip(1)
+        .filter_map(|rest| rest.split('"').next())
+        .filter(|name| !schemas.contains_key(*name))
+        .map(str::to_string)
+        .collect();
+    assert!(
+        dangling.is_empty(),
+        "references to schemas the document lacks: {dangling:?}"
+    );
+}

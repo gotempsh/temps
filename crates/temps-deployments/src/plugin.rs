@@ -398,6 +398,18 @@ impl TempsPlugin for DeploymentsPlugin {
                 deployment_service.clone() as Arc<dyn temps_core::DeploymentContainerCleaner>;
             context.register_service(deployment_container_cleaner);
 
+            // Where the durable workflows engine invokes an environment's code
+            // (ADR-103): the current deployment's healthy replicas. Absent in
+            // embeddings that never register a runtime context, which keeps
+            // the historical host behaviour, as for `LocalWorkloadPolicy`.
+            let runtime_context = context
+                .get_service::<temps_core::RuntimeContext>()
+                .unwrap_or_else(|| Arc::new(temps_core::RuntimeContext::host()));
+            let executor_endpoints: Arc<dyn temps_core::ExecutorEndpoints> = Arc::new(
+                crate::services::DeploymentExecutorEndpoints::new(db.clone(), runtime_context),
+            );
+            context.register_service(executor_endpoints);
+
             // Remote container log source — lets the log-aggregator collect logs
             // from containers on remote worker nodes into searchable history. The
             // aggregator picks this up via get_service and runs its reconcile

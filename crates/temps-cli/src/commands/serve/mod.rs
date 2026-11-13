@@ -1368,6 +1368,7 @@ impl ServeCommand {
             cookie_crypto: cookie_crypto.clone(),
             encryption_service: encryption_service.clone(),
             route_table: route_table.clone(),
+            runtime_context: runtime_context.clone(),
             queue: queue.clone(),
             ready_signal: Some(ready_tx),
             additional_templates: self.additional_templates.clone(),
