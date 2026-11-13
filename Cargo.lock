@@ -13375,6 +13375,7 @@ dependencies = [
  "axum",
  "base64 0.23.1",
  "bollard",
+ "bytes",
  "chrono",
  "cookie",
  "ed25519-dalek 3.0.0",
@@ -16085,6 +16086,38 @@ dependencies = [
  "tokio",
  "tracing",
  "x25519-dalek 3.0.0",
+]
+
+[[package]]
+name = "temps-workflows"
+version = "0.1.0-beta.61"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64 0.23.1",
+ "bytes",
+ "chrono",
+ "ed25519-dalek 3.0.0",
+ "hex",
+ "http-body-util",
+ "reqwest 0.12.28",
+ "sea-orm 1.1.20",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "sqlx 0.8.6",
+ "temps-authz",
+ "temps-core",
+ "temps-entities",
+ "temps-migrations",
+ "temps-test-utils",
+ "testcontainers",
+ "thiserror 2.0.21",
+ "tokio",
+ "tower",
+ "tracing",
+ "utoipa",
+ "uuid",
 ]
 
 [[package]]

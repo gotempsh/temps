@@ -391,6 +391,77 @@ impl EncryptionService {
         Ok(plaintext)
     }
 
+    /// AES-256-GCM encrypt `data` with `associated_data` authenticated but not
+    /// encrypted; returns base64 of `nonce || ciphertext+tag`, the same layout
+    /// as [`EncryptionService::encrypt`].
+    ///
+    /// The associated data binds the ciphertext to where it is stored (for
+    /// example a run, a step and a field). Decrypting it under any other
+    /// associated data fails, so a ciphertext copied into another row, project
+    /// or field cannot be read there. The associated data itself is not secret
+    /// and is not stored in the output: the caller rebuilds it from the row.
+    pub fn encrypt_with_aad(
+        &self,
+        data: &[u8],
+        associated_data: &[u8],
+    ) -> Result<String, EncryptionError> {
+        use aes_gcm::aead::Payload;
+
+        let key = Key::<Aes256Gcm>::from(*self.master_key.as_ref());
+        let cipher = Aes256Gcm::new(&key);
+        let mut nonce_bytes = [0u8; NONCE_LENGTH];
+        crate::ecies::fill_secure_random_bytes("generating an encryption nonce", &mut nonce_bytes)?;
+        let nonce = Nonce::from(nonce_bytes);
+        let ciphertext = cipher
+            .encrypt(
+                &nonce,
+                Payload {
+                    msg: data,
+                    aad: associated_data,
+                },
+            )
+            .map_err(|_| EncryptionError::Encrypt)?;
+        let mut combined = nonce.to_vec();
+        combined.extend(ciphertext);
+        Ok(BASE64.encode(combined))
+    }
+
+    /// Inverse of [`EncryptionService::encrypt_with_aad`]. Fails with
+    /// [`EncryptionError::Decrypt`] when the associated data differs from the
+    /// one the value was encrypted under, or the ciphertext was altered.
+    pub fn decrypt_with_aad(
+        &self,
+        encoded_data: &str,
+        associated_data: &[u8],
+    ) -> Result<Vec<u8>, EncryptionError> {
+        use aes_gcm::aead::Payload;
+
+        let data = BASE64
+            .decode(encoded_data)
+            .map_err(|error| EncryptionError::InvalidBase64 {
+                reason: describe_base64_error(&error),
+            })?;
+        if data.len() < NONCE_LENGTH {
+            return Err(EncryptionError::Truncated { length: data.len() });
+        }
+        let (nonce_bytes, ciphertext) = data.split_at(NONCE_LENGTH);
+        let key = Key::<Aes256Gcm>::from(*self.master_key.as_ref());
+        let cipher = Aes256Gcm::new(&key);
+        let nonce =
+            Nonce::try_from(nonce_bytes).map_err(|error| EncryptionError::InvalidNonce {
+                reason: error.to_string(),
+            })?;
+        cipher
+            .decrypt(
+                &nonce,
+                Payload {
+                    msg: ciphertext,
+                    aad: associated_data,
+                },
+            )
+            .map_err(|_| EncryptionError::Decrypt)
+    }
+
     /// Encrypts a string and returns base64 encoded encrypted data
     pub fn encrypt_string(&self, data: &str) -> Result<String, EncryptionError> {
         self.encrypt(data.as_bytes())
@@ -458,6 +529,39 @@ mod tests {
     use super::*;
 
     const TEST_KEY: &str = "12345678901234567890123456789012";
+
+    #[test]
+    fn aad_round_trips_and_binds_the_ciphertext_to_its_associated_data() {
+        let service = EncryptionService::new(TEST_KEY).unwrap();
+        let sealed = service
+            .encrypt_with_aad(b"payload", b"run:1/step:2/result")
+            .unwrap();
+        assert_eq!(
+            service
+                .decrypt_with_aad(&sealed, b"run:1/step:2/result")
+                .unwrap(),
+            b"payload"
+        );
+        // Moved to another step, the value no longer opens.
+        assert!(matches!(
+            service.decrypt_with_aad(&sealed, b"run:1/step:3/result"),
+            Err(EncryptionError::Decrypt)
+        ));
+        // Nor does the AAD-free decrypt path read it.
+        assert!(matches!(
+            service.decrypt(&sealed),
+            Err(EncryptionError::Decrypt)
+        ));
+    }
+
+    #[test]
+    fn aad_decrypt_reports_truncated_input() {
+        let service = EncryptionService::new(TEST_KEY).unwrap();
+        assert!(matches!(
+            service.decrypt_with_aad("AAAA", b"x"),
+            Err(EncryptionError::Truncated { length: 3 })
+        ));
+    }
 
     fn service() -> EncryptionService {
         EncryptionService::new(TEST_KEY).unwrap()
