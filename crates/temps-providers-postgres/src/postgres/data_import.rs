@@ -673,10 +673,7 @@ mod tests {
     }
 
     async fn postgres_scenario(docker: &mut TestDocker) {
-        if !docker
-            .ensure_images(&[SOURCE_IMAGE, TARGET_IMAGE])
-            .await
-        {
+        if !docker.ensure_images(&[SOURCE_IMAGE, TARGET_IMAGE]).await {
             return;
         }
         let source = docker
