@@ -27,6 +27,7 @@ export { FakeOrchestrator, FAKE_API_URL, FAKE_CREDENTIAL } from './fake-orchestr
 export type { FakeRun, FakeOrchestratorOptions } from './fake-orchestrator.js';
 
 export interface TestRunnerOptions extends FakeOrchestratorOptions {
+  codec?: WorkflowHandlerOptions['codec'];
   workflows: WorkflowHandlerOptions['workflows'];
   telemetry?: Pick<WorkflowHandlerOptions, 'tracer' | 'errorTracker'>;
 }
@@ -60,6 +61,7 @@ export function createTestRunner(options: TestRunnerOptions): TestRunner {
   const orchestrator = new FakeOrchestrator(options);
   const handler = createWorkflowHandler({
     workflows: options.workflows,
+    codec: options.codec,
     apiUrl: FAKE_API_URL,
     fetch: orchestrator.fetch,
     invocationKey: orchestrator.invocationKey,
@@ -67,7 +69,7 @@ export function createTestRunner(options: TestRunnerOptions): TestRunner {
     errorTracker: options.telemetry?.errorTracker,
   });
   orchestrator.attach(handler);
-  const client = new WorkflowsClient({ apiUrl: FAKE_API_URL, token: FAKE_CREDENTIAL, fetch: orchestrator.fetch });
+  const client = new WorkflowsClient({ apiUrl: FAKE_API_URL, token: FAKE_CREDENTIAL, fetch: orchestrator.fetch, codec: options.codec });
   const view = (run: FakeRun): TestRun => ({
     id: run.id,
     status: run.status,

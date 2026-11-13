@@ -137,3 +137,31 @@ impl_audit_operation!(
     WorkflowCredentialRevokedAudit,
     "WORKFLOW_CREDENTIAL_REVOKED"
 );
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkflowKeyShreddedAudit {
+    pub context: WorkflowAuditContext,
+    pub project_id: i32,
+    pub key_id: Uuid,
+}
+impl_audit_operation!(WorkflowKeyShreddedAudit, "WORKFLOW_PROJECT_KEY_SHREDDED");
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkflowGrantChangedAudit {
+    pub context: WorkflowAuditContext,
+    pub project_id: i32,
+    pub environment_id: i32,
+    pub grant_id: Uuid,
+    pub revoked: bool,
+}
+impl_audit_operation!(WorkflowGrantChangedAudit, "WORKFLOW_GRANT_CHANGED");
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkflowDevAudit {
+    pub context: WorkflowAuditContext,
+    pub project_id: i32,
+    pub environment_id: i32,
+    pub session_id: Uuid,
+    pub operation: String,
+}
+impl_audit_operation!(WorkflowDevAudit, "WORKFLOW_DEVELOPMENT_TUNNEL");

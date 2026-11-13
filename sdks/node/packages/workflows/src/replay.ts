@@ -15,6 +15,7 @@
  * invocations.
  */
 
+import { decode, decodeEntry, encodeOutcome, encodeWrite, PayloadCodecError, type PayloadCodec } from './codec.js';
 import { randomBytes } from 'node:crypto';
 
 import {
@@ -70,6 +71,7 @@ export type InvocationResult =
   | { type: 'unavailable'; reason: string };
 
 export interface InvocationDeps {
+  codec?: PayloadCodec;
   transport: ExecutorTransport;
   telemetry: Telemetry;
   token: string;
@@ -85,6 +87,7 @@ class Suspension {
 /** A user-level `catch` must not swallow a suspension or a lease loss. */
 function isControl(error: unknown): boolean {
   return (
+    error instanceof PayloadCodecError ||
     error instanceof Suspension ||
     error instanceof StaleLeaseError ||
     error instanceof WorkflowIncompatibleError ||
@@ -193,6 +196,7 @@ class Invocation<Input> {
 
   private ended(thrown: unknown): InvocationResult {
     const error = this.control ?? thrown;
+    if (error instanceof PayloadCodecError) return { type: 'unavailable', reason: error.message };
     if (error instanceof Suspension) return { type: 'outcome', outcome: error.outcome };
     if (error instanceof StaleLeaseError) return { type: 'stale' };
     if (error instanceof TempsUnavailableError) return { type: 'unavailable', reason: error.message };
@@ -222,7 +226,7 @@ class Invocation<Input> {
         if (isOutage(error)) this.raise(new TempsUnavailableError(this.request.run_id, error));
         throw error;
       }
-      for (const entry of page.entries) this.journal.set(entry.sequence, entry);
+      for (const entry of page.entries) this.journal.set(entry.sequence, this.deps.codec ? await decodeEntry(this.deps.codec, entry) : entry);
       next = page.next_sequence ?? null;
     }
   }
@@ -292,9 +296,10 @@ class Invocation<Input> {
   private async record(write: StepWriteRequest): Promise<JournalEntry> {
     let reply;
     try {
-      reply = await this.deps.transport.recordStep(this.deps.token, this.request.run_id, write);
+      reply = await this.deps.transport.recordStep(this.deps.token, this.request.run_id, this.deps.codec ? await encodeWrite(this.deps.codec, write) : write);
+      if (this.deps.codec) reply = { ...reply, entry: await decodeEntry(this.deps.codec, reply.entry) };
     } catch (error) {
-      if (error instanceof StaleLeaseError || error instanceof WorkflowIncompatibleError) this.raise(error);
+      if (error instanceof PayloadCodecError || error instanceof StaleLeaseError || error instanceof WorkflowIncompatibleError) this.raise(error);
       if (isOutage(error)) this.raise(new TempsUnavailableError(this.request.run_id, error));
       throw error;
     }
@@ -519,7 +524,17 @@ export async function runInvocation<Input>(
   request: InvokeRequest,
   deps: InvocationDeps,
 ): Promise<InvocationResult> {
-  return new Invocation(definition, request, deps).run();
+  try {
+    const decoded = deps.codec ? { ...request,
+      input: await decode(deps.codec, request.input ?? null),
+      journal: await Promise.all(request.journal.map((entry) => decodeEntry(deps.codec!, entry))),
+    } : request;
+    const result = await new Invocation(definition, decoded, deps).run();
+    return deps.codec && result.type === 'outcome'
+      ? { ...result, outcome: await encodeOutcome(deps.codec, result.outcome) } : result;
+  } catch {
+    return { type: 'unavailable', reason: new PayloadCodecError().message };
+  }
 }
 
 export type { Duration };

@@ -2173,6 +2173,35 @@ templates:
         );
     }
 
+    #[test]
+    fn workflow_engine_templates_expose_only_authenticated_gateways() {
+        for engine in ["restate", "temporal"] {
+            let template = bundled_template_by_slug(&format!("{engine}-workflow-engine")).unwrap();
+            assert!(TemplateService::validate_template(&template).is_empty());
+            assert_eq!(template.git.r#ref.len(), 40);
+            assert!(template.git.r#ref.bytes().all(|c| c.is_ascii_hexdigit()));
+            let service = template.primary();
+            assert_eq!(service.preset, "docker-compose");
+            let config = service.preset_config.as_ref().unwrap();
+            assert_eq!(config["composePath"], format!("{engine}.compose.yaml"));
+            for port in config["publicPorts"].as_array().unwrap() {
+                assert_eq!(port["service"], "gateway");
+                assert_eq!(port["healthCheckPath"], "/healthz");
+            }
+            assert!(!config
+                .as_object()
+                .unwrap()
+                .contains_key("relaxedCapabilityServices"));
+            let password = service
+                .env_vars
+                .iter()
+                .find(|v| v.name == "ENGINE_PASSWORD")
+                .unwrap();
+            assert!(password.secret && password.required);
+            assert_eq!(password.default_generator.as_deref(), Some("random_secret"));
+        }
+    }
+
     /// Template deployments reject mutable image tags, so a curated template
     /// with one could never be deployed (it failed the first-run demo with
     /// "use an immutable image reference ending in @sha256:…").

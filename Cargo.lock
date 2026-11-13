@@ -13407,6 +13407,7 @@ dependencies = [
  "x25519-dalek 3.0.0",
  "x509-parser",
  "yaml_serde",
+ "zeroize",
 ]
 
 [[package]]
@@ -16104,15 +16105,18 @@ dependencies = [
  "http-body-util",
  "reqwest 0.12.28",
  "sea-orm 1.1.20",
+ "sea-orm-migration 1.1.20",
  "serde",
  "serde_json",
  "sha2 0.11.1",
  "sqlx 0.8.6",
+ "tempfile",
  "temps-authz",
  "temps-core",
  "temps-entities",
  "temps-migrations",
  "temps-test-utils",
+ "temps-workflows-sdk",
  "testcontainers",
  "thiserror 2.0.21",
  "tokio",
@@ -16121,6 +16125,27 @@ dependencies = [
  "tracing-subscriber",
  "utoipa",
  "uuid",
+]
+
+[[package]]
+name = "temps-workflows-sdk"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64 0.23.1",
+ "chrono",
+ "ed25519-dalek 3.0.0",
+ "futures",
+ "hex",
+ "rand 0.10.3",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "thiserror 2.0.21",
+ "tokio",
+ "tower",
 ]
 
 [[package]]

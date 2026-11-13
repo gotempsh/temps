@@ -2,7 +2,7 @@
 
 > Auto-generated documentation for the Temps CLI.
 >
-> Generated on: 2026-11-08
+> Generated on: 2026-11-13
 
 ## Installation
 
@@ -32,6 +32,26 @@ bunx @temps-sdk/cli configure
 | `-h, --help` | Display help for command |
 
 ## Commands
+
+## `workflows`
+
+Durable application workflows
+
+**Subcommands:**
+
+- `dev` - Forward preview-environment invocations to a local SDK server
+
+### `workflows dev`
+
+Forward preview-environment invocations to a local SDK server
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Undeployed, unprotected preview environment ID | - | Yes |
+| `--port <port>` | Local SDK server port | `3000` | No |
 
 ## `projects` (alias: `project`, `p`)
 

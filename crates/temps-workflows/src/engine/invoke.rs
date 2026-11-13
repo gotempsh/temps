@@ -294,22 +294,29 @@ impl WorkflowEngine {
             .await?;
         let full_page = rows.len() as u64 == JOURNAL_PAGE_ENTRIES;
         let scope = Self::scope(run);
-        let mut entries = Vec::with_capacity(rows.len());
+        let mut selected = Vec::with_capacity(rows.len());
         let mut bytes = 0usize;
+        let mut next_sequence = None;
         for row in rows {
             let size = usize::try_from(i64::from(row.result_bytes) + i64::from(row.error_bytes))
                 .unwrap_or(0);
-            if !entries.is_empty() && bytes + size > JOURNAL_PAGE_BYTES {
-                return Ok((entries, Some(row.sequence)));
+            if !selected.is_empty() && bytes + size > JOURNAL_PAGE_BYTES {
+                next_sequence = Some(row.sequence);
+                break;
             }
             bytes += size;
             let next = row.sequence + 1;
-            entries.push(self.journal_entry(&scope, &row, settings).await?);
-            if full_page && entries.len() as u64 == JOURNAL_PAGE_ENTRIES {
-                return Ok((entries, Some(next)));
+            selected.push(row);
+            if full_page && selected.len() as u64 == JOURNAL_PAGE_ENTRIES {
+                next_sequence = Some(next);
             }
         }
-        Ok((entries, None))
+        let rows = self.store.hydrate_journal(run.id, selected).await?;
+        let mut entries = Vec::with_capacity(rows.len());
+        for row in rows {
+            entries.push(self.journal_entry(&scope, &row, settings).await?);
+        }
+        Ok((entries, next_sequence))
     }
 
     pub(crate) async fn journal_entry(

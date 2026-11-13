@@ -14,6 +14,7 @@
  * credential (`TEMPS_WORKFLOWS_TOKEN`).
  */
 
+import type { PayloadCodec } from './codec.js';
 import type { KeyObject } from 'node:crypto';
 
 import {
@@ -45,6 +46,7 @@ export const MAX_INVOKE_BODY = 64 * 1024 * 1024;
 const KEY_REFRESH_MS = 60_000;
 
 export interface WorkflowHandlerOptions extends TelemetryOptions {
+  codec?: PayloadCodec;
   workflows: WorkflowDefinition[];
   /** Temps' API root; default `process.env.TEMPS_API_URL`. */
   apiUrl?: string;
@@ -180,7 +182,7 @@ export function createWorkflowHandler(options: WorkflowHandlerOptions): FetchHan
   }
   const transport = new ExecutorTransport({ apiUrl, fetch: options.fetch });
   const keys = new KeyCache(transport, options.token ?? process.env.TEMPS_WORKFLOWS_TOKEN, options.invocationKey);
-  const telemetry = new Telemetry(options);
+  const telemetry = new Telemetry({ ...options, redactErrors: options.codec !== undefined || options.redactErrors });
   const manifest: Manifest = {
     protocol_version: PROTOCOL_VERSION,
     sdk: SDK_NAME,
@@ -256,6 +258,7 @@ export function createWorkflowHandler(options: WorkflowHandlerOptions): FetchHan
       telemetry,
       token,
       heartbeatMs: options.heartbeatMs,
+      codec: options.codec,
     });
     if (result.type === 'stale') return new Response(null, { status: 202 });
     if (result.type === 'unavailable') return problem(503, 'Temps Unavailable', result.reason);

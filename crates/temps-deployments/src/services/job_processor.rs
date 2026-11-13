@@ -5181,14 +5181,14 @@ mod tests {
             )
             .await?;
 
-        // Verify jobs were created (nextjs project should create 10 jobs including
+        // Verify jobs were created (nextjs project should create 11 jobs including
         // persist_static_assets, configure_crons, configure_metric_alerts,
-        // configure_agents, scan_vulnerabilities, and capture_source_maps)
+        // configure_agents, deployment_workflows, scan_vulnerabilities, and capture_source_maps)
         let job_ids: Vec<String> = jobs.iter().map(|j| j.job_id.clone()).collect();
         assert_eq!(
             jobs.len(),
-            10,
-            "Expected 10 jobs but got {}: {:?}",
+            11,
+            "Expected 11 jobs but got {}: {:?}",
             jobs.len(),
             job_ids
         );
@@ -5199,6 +5199,7 @@ mod tests {
         assert!(job_ids.contains(&"deploy_container".to_string()));
         assert!(job_ids.contains(&"persist_static_assets".to_string()));
         assert!(job_ids.contains(&"mark_deployment_complete".to_string()));
+        assert!(job_ids.contains(&"deployment_workflows".to_string()));
         assert!(job_ids.contains(&"configure_crons".to_string()));
         assert!(job_ids.contains(&"configure_metric_alerts".to_string()));
         assert!(job_ids.contains(&"scan_vulnerabilities".to_string()));

@@ -25,7 +25,7 @@ use crate::types::RunStatus;
 
 type AppState = State<Arc<WorkflowsAppState>>;
 
-async fn credential(
+pub(super) async fn credential(
     state: &WorkflowsAppState,
     headers: &HeaderMap,
 ) -> Result<CredentialRow, Problem> {
@@ -33,7 +33,7 @@ async fn credential(
     Ok(state.service.authenticate_credential(token).await?)
 }
 
-fn app_run(
+pub(super) fn app_run(
     run: RunRow,
     output: Option<serde_json::Value>,
     error: Option<String>,

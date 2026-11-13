@@ -1054,6 +1054,29 @@ impl TempsPlugin for DeploymentsPlugin {
                 ),
             }
 
+            // `workflow` crons start durable workflow runs (ADR-103 §9).
+            // The workflows plugin may register after this one, so its
+            // control is only resolvable here.
+            match (
+                context.get_service::<dyn temps_core::WorkflowControl>(),
+                context.get_service::<crate::services::DatabaseCronConfigService>(),
+            ) {
+                (Some(control), Some(cron_service)) => {
+                    cron_service.set_workflow_control(control.clone());
+                    context
+                        .require_service::<WorkflowExecutionService>()
+                        .set_workflow_control(control);
+                    tracing::debug!("workflow control wired into cron scheduler");
+                }
+                (None, _) => tracing::info!(
+                    "durable workflows are not loaded: workflow crons are recorded as failed \
+                     with that reason"
+                ),
+                (Some(_), None) => tracing::warn!(
+                    "Cron scheduler service is not registered; workflow crons cannot run"
+                ),
+            }
+
             // The workload plane runs `job` crons (ADR-055 §14). Built here,
             // not at registration, because it audit-logs its admission
             // refusals and the audit logger is only resolvable now. Started

@@ -306,3 +306,200 @@ An executor conforms to version 1 when it passes the conformance suite in
 `sdks/node/packages/workflows` (replay, retries, suspend and resume,
 incompatibility, stale-lease rejection, idempotent start), which runs against
 both a fake orchestrator and the real engine.
+
+## Optional application payload encryption
+
+The TypeScript SDK accepts the same `codec` on `WorkflowsClient` and
+`createWorkflowHandler`. `aesGcmCodec({ activeKeyId, keys })` uses 32-byte
+application-held keys and AES-256-GCM; keys never go to Temps. Its versioned
+JSON envelope carries `codec`, `key_id`, `nonce`, `data`, and `tag`. Keep old keys
+in the key ring while retained runs or events can still reference them. A
+missing key or failed authentication rejects the invocation before user code
+runs; it is retryable, never silently treated as plaintext.
+
+Inputs, outputs, ordinary step results, deterministic clock/random results,
+event payloads and child inputs are encoded on write. The executor decodes
+journal pages, event payloads inside wait results, and child output/error
+fields while preserving their orchestration metadata. Error strings use the
+`temps-codec-v1:` prefix followed by an encoded JSON envelope; messages are
+bounded before encryption so server limits cannot truncate ciphertext. Server
+errors remain readable metadata. The app-held codec also redacts application
+error messages and stacks from the SDK's tracing and error-tracking hooks.
+Application code remains responsible for what it logs independently.
+
+Every participant sending payloads to a codec-enabled workflow must use the
+same codec, including event publishers and parent/child workflows. Management
+API inputs and cron inputs are not automatically encoded by Temps: those
+callers must supply an encoded envelope. Layer-1 encryption and quota checks
+still apply to the encoded values; envelope overhead counts toward limits.
+
+## Cross-environment grants
+
+Grants belong to the destination environment. Its operator creates an exact
+(source environment, operation, resource name) grant under
+`/projects/{project_id}/environments/{environment_id}/workflows/grants`.
+Operations are `start` and `event`; there are no wildcard or payload-read grants.
+The destination project must own the destination environment.
+
+A source app uses its existing workflow credential with
+`POST /workflows/v1/projects/{project_id}/environments/{environment_id}/runs`
+or `.../events`. Authorization is checked for every request. Revocation rejects
+new calls; requests already authorized and runs already started may finish.
+Reading a destination run still requires a credential or management permission
+for the destination.
+
+The TypeScript client's start/send options accept
+`target: { projectId, environmentId }`; Python accepts
+`target=(project_id, environment_id)`; Go has `StartIn` and `SendEventTo`.
+Rust uses an optional `Target`. The ordinary read methods remain scoped to the
+credential's own environment.
+
+## Project encryption keys
+
+New payloads use a random project key, wrapped by the instance master key.
+The stored ciphertext prefix `pk1:<key UUID>:` selects that key; associated
+data still binds project, environment, run and field. The wrapped key is read
+on use, without a process cache. Older unprefixed ciphertext remains readable
+with the instance key.
+
+The project key list returns only key IDs and creation/shredding timestamps.
+Shredding requires both workflow-write and run-delete permission, the exact
+key ID in `confirm_key_id`, and creates an audit record. It replaces the wrapped
+key with a tombstone. Subsequent decryption returns 410; operations that already
+loaded the key may finish. New writes create a new project key. Shredding does
+not erase legacy instance-key payloads, and a backup containing the wrapped key
+can restore access. Include key-bearing backups in an erasure policy.
+
+## Deployment drain
+
+`drain_timeout_secs` is an environment setting: zero (the default) disables
+drain, and 1–3600 enables it. Before promotion, Temps pauses new claims for the
+environment and waits for currently running invocations to finish. Sleeping,
+waiting and queued runs are retained and replay on the new deployment.
+
+The pause is a fenced, renewable 90-second database lease. A cancelled or
+crashed deployment cannot leave claims paused indefinitely; an old deployment
+cannot release a newer deployment's pause. A timeout or lost lease fails
+promotion and leaves the previous deployment active. The console exposes this
+under the environment's Durable workflows settings.
+
+## Local development
+
+`temps workflows dev --project-id <id> --environment-id <id> --port 3000`
+connects an already-running local SDK server to an **undeployed, unprotected
+preview environment**. Configure that SDK with the instance's API URL and the
+preview environment's workflow credential. The CLI itself uses the normal
+management login and requires workflow-write plus payload-read permission.
+
+This is an outbound polling tunnel: no public local port, inbound firewall rule,
+or forwarding URL is needed. The CLI forwards only the manifest and invocation
+protocol paths to `127.0.0.1`. It sends the signed invocation token, never its
+management credential, to the local server. Executor callbacks use the ordinary
+workflow API. Start runs and send events from the console or an SDK as usual.
+Restart the CLI after changing the workflow manifest.
+
+Requests and responses are encrypted with instance-key associated data while
+queued centrally, so different control-plane processes can serve polling and
+invocation. A session expires after 60 seconds without a successful poll.
+Disconnect removes its pending messages; crashed sessions are removed by the
+lease reaper. There are at most 16 sessions, four requests per session, and
+8 MiB per tunnel message. Larger development payloads must be reduced or run
+on a deployed executor. Local execution retains the normal at-least-once step
+contract: disconnection may cause the engine to retry an invocation.
+
+## SDK integration points
+
+| Language | Source package | HTTP integration |
+|---|---|---|
+| TypeScript | `sdks/node/packages/workflows` | Fetch handler and Node adapters |
+| Python | `sdks/python/workflows` | `WorkflowApp` ASGI application |
+| Go | `sdks/go/workflows` | `NewHandler` / `Handler` implementing `http.Handler` |
+| Rust | `crates/temps-workflows-sdk` | `Executor::router()` mounted in Axum |
+
+Python workflows are async functions; synchronous blocking work must be moved
+off the event loop. Go step functions must honor their context cancellation.
+Rust step futures are cancelled on timeout. All step bodies must be idempotent.
+The Go and Rust executors pin the environment-bound invocation key at startup;
+recreate the handler after instance signing-key rotation.
+
+## Deployment-triggered runs
+
+A source deployment can declare up to 16 distinct workflow names:
+
+```yaml
+deploymentWorkflows:
+  - after-deploy
+  - warm-cache
+```
+
+Temps adds a persisted **Start Deployment Workflows** job after successful
+promotion. It starts each named workflow with
+`{ "deployment_id": ..., "project_id": ..., "environment_id": ... }` as input.
+The idempotency key includes the deployment ID and workflow name, so retrying
+the job after a lost response returns the earlier run. A new deployment gets
+new runs. Invalid names and duplicates are rejected before any start.
+
+The deployment remains successful if this optional job fails; its job log
+identifies the failure and can be retried. Workflows run independently and
+appear in All workflows. A job that begins after its deployment has already
+been superseded skips its starts. Once started, runs follow the ordinary
+replay-on-current-deployment contract; they are not pinned to an old image.
+Image-only deployments without a source tree do not read this configuration.
+
+## Managed PostgreSQL journal
+
+Workflow settings can select `managed_store_service_id`, a PostgreSQL service
+linked to the project. The default is the control-plane database. This selection
+applies to new runs; each run pins its journal service until deletion. Keep that
+service linked, available and backed up alongside the control-plane database.
+The settings screen lists linked PostgreSQL services and checks connectivity
+before saving the choice.
+
+Scheduling, leases, quotas and a metadata index remain central. Encrypted
+results and errors are stored in the managed database's plain
+`temps_workflow_journal_v1` table. Under the central run lock, Temps commits an
+immutable revision remotely before committing the central index and run state.
+Repeating the same step attempt recovers the first remote result, including when
+the central transaction never committed. Payload pages are bounded before remote
+reads. Managed operations share four connection slots and a 15-second deadline;
+an unavailable journal returns a retryable 503 instead of re-executing a recorded
+step without its result.
+
+A revision retains the currently indexed predecessor while reclaiming older
+attempts of that step. Run deletion queues durable remote cleanup, retried by
+retention even after the project is removed. A service cannot be deleted while
+runs or cleanup records still reference it. After an uncertain write, uploaded
+blobs are retained until run cleanup because the remote entry may reference them.
+Project-key shredding also makes encrypted payloads in managed journals
+unreadable; restore and backup limitations are the same as for the default store.
+
+## Separate Temporal and Restate engines
+
+The project template catalog includes **Temporal Workflow Engine** and
+**Restate Workflow Engine**. These deploy the upstream engines as Compose
+applications; they do not share Temps workflow credentials, journals, grants,
+or SDKs. Their images are pinned by digest and the source template includes
+schema initialization, health checks and explicit CPU/memory limits. Running
+services have aggregate limits of about 1.2 GiB for Temporal or 832 MiB for
+Restate, in addition to Temps and application workers. Allocate capacity for
+that extra engine before deploying it.
+
+The template generates `ENGINE_PASSWORD` and, for Temporal,
+`DATABASE_PASSWORD` as secret project variables. The console username defaults
+to `admin`. Retrieve the password through the normal authorized project-secret
+flow, use the Temps HTTPS URL, and rotate it in project variables. Only the
+Nginx gateway is publicly routed. Its health probe is unauthenticated; other
+requests require Basic Auth. Restate's second gateway route (`gateway-8081`)
+is its authenticated ingress endpoint. Temporal's gRPC endpoint stays private
+at `temporal:7233`; add workers to the same Compose application/network.
+Do not expose its unauthenticated gRPC listener as a public port.
+
+Named volumes hold Restate's data and Temporal's PostgreSQL data. Keep the
+same project/environment and preserve the database password on redeploy.
+Back up these volumes using the upstream engine's supported backup procedure;
+Temps control-plane backups alone do not contain their history. Deleting a
+volume destroys that history. The integration tests verify authentication,
+restart persistence and repeatable Temporal schema initialization, and the
+Compose translator test verifies compatibility with the default capability
+profile. Neither template requests host networking, host bind mounts or extra
+container capabilities.

@@ -49,3 +49,21 @@ describe('WorkflowsClient', () => {
     }
   });
 });
+
+it('sends granted starts and events to the explicit destination without changing read scope', async () => {
+  const urls: string[] = [];
+  const client = new WorkflowsClient({ apiUrl: 'https://control.example.test/api', token: 'synthetic', fetch: async (url) => {
+    urls.push(String(url));
+    return Response.json(String(url).endsWith('/events') ? { event_id: 1, delivered: 0 } : { run: { id: 'r', status: 'queued' }, created: true });
+  } });
+  const target = { projectId: 4, environmentId: 8 };
+  await client.start('orders', {}, { target });
+  await client.sendEvent('paid', { target, payload: 1 });
+  await client.getRun('r');
+  expect(urls).toEqual([
+    'https://control.example.test/api/workflows/v1/projects/4/environments/8/runs',
+    'https://control.example.test/api/workflows/v1/projects/4/environments/8/events',
+    'https://control.example.test/api/workflows/v1/runs/r',
+  ]);
+  await expect(client.start('orders', null, { target: { projectId: -1, environmentId: 8 } })).rejects.toThrow('positive integers');
+});

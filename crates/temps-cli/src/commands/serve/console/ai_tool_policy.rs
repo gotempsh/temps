@@ -76,6 +76,12 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "update_workflow_settings",
             "issue_workflow_credential",
             "revoke_workflow_credential",
+            "shred_workflow_project_key",
+            "open_workflow_dev","configure_workflow_dev","close_workflow_dev","poll_workflow_dev","respond_workflow_dev",
+            "create_workflow_grant",
+            "revoke_workflow_grant",
+            "app_start_granted_workflow",
+            "app_send_granted_event",
         ],
     ),
     (

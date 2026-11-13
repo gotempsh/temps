@@ -1284,3 +1284,78 @@ async fn settings_round_trip_and_default_when_absent() {
     assert_eq!(saved, custom);
     assert_eq!(f.store.settings(f.environment_id).await.unwrap(), custom);
 }
+
+#[tokio::test]
+async fn deploy_drain_pauses_claims_until_release_and_recovers_after_a_crash() {
+    use sea_orm::{DbBackend, Statement};
+    let Some(f) = fixture("deployment drain").await else {
+        return;
+    };
+    let row=f.conn.query_one(Statement::from_sql_and_values(DbBackend::Postgres,"INSERT INTO deployments(project_id,environment_id,slug,state,created_at,updated_at,metadata) VALUES($1,$2,'drain-test','running',now(),now(),'{}') RETURNING id",vec![f.project_id.into(),f.environment_id.into()])).await.unwrap().unwrap();
+    let deployment: i32 = row.try_get("", "id").unwrap();
+    f.start("orders").await;
+    let running = f.claim_one().await;
+    let token = f
+        .store
+        .begin_drain(f.environment_id, deployment)
+        .await
+        .unwrap();
+    assert!(f
+        .store
+        .begin_drain(f.environment_id, deployment)
+        .await
+        .is_err());
+    f.start("queued").await;
+    assert!(f.store.claim_due(10, &[]).await.unwrap().is_empty());
+    assert_eq!(
+        f.store.renew_drain(f.environment_id, token).await.unwrap(),
+        1
+    );
+    f.store.cancel_run(running.run.id).await.unwrap();
+    assert_eq!(
+        f.store.renew_drain(f.environment_id, token).await.unwrap(),
+        0
+    );
+    f.store
+        .end_drain(f.environment_id, Uuid::new_v4())
+        .await
+        .unwrap();
+    assert!(f.store.claim_due(10, &[]).await.unwrap().is_empty());
+    f.store.end_drain(f.environment_id, token).await.unwrap();
+    assert_eq!(f.store.claim_due(10, &[]).await.unwrap().len(), 1);
+    let expired = f
+        .store
+        .begin_drain(f.environment_id, deployment)
+        .await
+        .unwrap();
+    f.conn
+        .execute_unprepared(
+            "UPDATE workflow_deployment_drains SET expires_at=now()-interval '1 second'",
+        )
+        .await
+        .unwrap();
+    assert!(f
+        .store
+        .renew_drain(f.environment_id, expired)
+        .await
+        .is_err());
+    f.start("after-crash").await;
+    assert_eq!(f.store.claim_due(10, &[]).await.unwrap().len(), 1);
+    let replacement = f
+        .store
+        .begin_drain(f.environment_id, deployment)
+        .await
+        .unwrap();
+    f.store.end_drain(f.environment_id, expired).await.unwrap();
+    assert!(f
+        .store
+        .renew_drain(f.environment_id, replacement)
+        .await
+        .is_ok());
+    f.store
+        .end_drain(f.environment_id, replacement)
+        .await
+        .unwrap();
+}
+
+mod managed;

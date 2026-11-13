@@ -198,6 +198,29 @@ const RUN: &str = "00000000-0000-0000-0000-000000000001";
 
 fn management_routes() -> Vec<(&'static str, String, Option<Value>)> {
     vec![
+        ("POST", format!("{BASE}/dev"), None),
+        ("PUT", format!("{BASE}/dev/{RUN}"), Some(json!({}))),
+        ("DELETE", format!("{BASE}/dev/{RUN}"), None),
+        ("POST", format!("{BASE}/dev/{RUN}/poll"), None),
+        (
+            "POST",
+            format!("{BASE}/dev/{RUN}/requests/{RUN}"),
+            Some(json!({})),
+        ),
+        ("GET", "/workflows/runs".to_string(), None),
+        ("GET", format!("{BASE}/grants"), None),
+        (
+            "POST",
+            format!("{BASE}/grants"),
+            Some(json!({"source_environment_id":3,"action":"start","resource":"orders"})),
+        ),
+        ("DELETE", format!("{BASE}/grants/{RUN}"), None),
+        ("GET", "/projects/1/workflow-keys".into(), None),
+        (
+            "POST",
+            format!("/projects/1/workflow-keys/{RUN}/shred"),
+            Some(json!({"confirm_key_id": RUN})),
+        ),
         ("GET", BASE.to_string(), None),
         ("GET", format!("{BASE}/runs"), None),
         (
@@ -854,4 +877,553 @@ fn schema_names_are_workflow_qualified_and_every_reference_resolves() {
         dangling.is_empty(),
         "references to schemas the document lacks: {dangling:?}"
     );
+}
+
+#[tokio::test]
+async fn global_runs_are_masked_paginated_and_reject_invalid_cursors() {
+    let Some((h, _, app)) = live("global run pagination").await else {
+        return;
+    };
+    let first = h
+        .start("orders", json!({"private": "synthetic-secret"}))
+        .await;
+    let second = h.start("orders", json!(null)).await;
+    let reader = || Some(AuthContext::new_session(user(h.env.user_id), Role::Reader));
+    let (status, _, body) = send(
+        app.clone(),
+        "GET",
+        "/workflows/runs?page_size=1",
+        None,
+        reader(),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["runs"].as_array().unwrap().len(), 1);
+    assert!(!body.to_string().contains("synthetic-secret"));
+    let cursor = body["next_cursor"].as_str().unwrap().replace('+', "%2B");
+    let (_, _, next) = send(
+        app.clone(),
+        "GET",
+        &format!("/workflows/runs?page_size=1&cursor={cursor}"),
+        None,
+        reader(),
+        None,
+    )
+    .await;
+    let ids = [
+        body["runs"][0]["id"].as_str().unwrap(),
+        next["runs"][0]["id"].as_str().unwrap(),
+    ];
+    assert!(ids.contains(&first.to_string().as_str()));
+    assert!(ids.contains(&second.to_string().as_str()));
+    let (status, _, problem) = send(
+        app.clone(),
+        "GET",
+        "/workflows/runs?cursor=invalid",
+        None,
+        reader(),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(problem["title"], "Validation Error");
+    let (status, _, _) = send(
+        app,
+        "GET",
+        "/workflows/runs",
+        None,
+        Some(AuthContext::new_session(user(1), Role::ApiReader)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+struct ListingChecker {
+    fail: bool,
+    permission: Option<Vec<String>>,
+}
+#[async_trait]
+impl temps_core::ProjectAccessChecker for ListingChecker {
+    async fn user_can_access_project(
+        &self,
+        _: i32,
+        _: i32,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(false)
+    }
+    async fn effective_project_permissions(
+        &self,
+        _: i32,
+        _: i32,
+    ) -> Result<Option<Vec<String>>, Box<dyn std::error::Error + Send + Sync>> {
+        if self.fail {
+            return Err(std::io::Error::other("synthetic access failure").into());
+        }
+        Ok(self.permission.clone())
+    }
+}
+
+#[tokio::test]
+async fn global_listing_enforces_project_permissions_and_fails_closed() {
+    let Some(h) = harness("global listing access", &["orders"], completing(), true).await else {
+        return;
+    };
+    h.start("orders", json!(null)).await;
+    let service = Arc::new(WorkflowService::new(
+        h.store.clone(),
+        h.engine.clone(),
+        h.codec.clone(),
+        Arc::new(WorkflowMetrics::new(Arc::new(NoopProjectMetricsSink))),
+    ));
+    for permission in [None, Some(vec![]), Some(vec!["workflows:read".into()])] {
+        let allowed = permission.as_ref().is_some_and(|p| !p.is_empty());
+        let mut state = state_from(
+            service.clone(),
+            h.engine.clone(),
+            Arc::new(RecordingAudit::default()),
+        );
+        Arc::get_mut(&mut state).unwrap().project_access_checker = Some(Arc::new(ListingChecker {
+            fail: false,
+            permission,
+        }));
+        let (status, _, body) = send(
+            router(state),
+            "GET",
+            "/workflows/runs",
+            None,
+            Some(AuthContext::new_session(user(h.env.user_id), Role::Reader)),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["runs"].as_array().unwrap().len(), usize::from(allowed));
+    }
+    let mut state = state_from(
+        service,
+        h.engine.clone(),
+        Arc::new(RecordingAudit::default()),
+    );
+    Arc::get_mut(&mut state).unwrap().project_access_checker = Some(Arc::new(ListingChecker {
+        fail: true,
+        permission: None,
+    }));
+    let (status, _, problem) = send(
+        router(state),
+        "GET",
+        "/workflows/runs",
+        None,
+        Some(AuthContext::new_session(user(h.env.user_id), Role::Reader)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(problem["title"], "Project Access Check Failed");
+}
+
+#[tokio::test]
+async fn project_key_shredding_is_confirmed_scoped_and_audited() {
+    let Some((h, audit, app)) = live("project key shred handler").await else {
+        return;
+    };
+    let admin = AuthContext::new_session(user(h.env.user_id), Role::Admin);
+    let scope = crate::payload::PayloadScope {
+        project_id: h.env.project_id,
+        environment_id: h.env.environment_id,
+        run_id: uuid::Uuid::new_v4(),
+    };
+    let settings = crate::types::WorkflowSettings::default();
+    let stored = h
+        .codec
+        .seal(
+            &scope,
+            &crate::payload::PayloadField::RunInput,
+            &json!({"private":"synthetic"}),
+            1,
+            &settings,
+        )
+        .await
+        .unwrap();
+    let base = format!("/projects/{}/workflow-keys", h.env.project_id);
+    let (status, _, list) = send(app.clone(), "GET", &base, None, Some(admin.clone()), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(list["total"], 1);
+    assert!(list["keys"][0].get("wrapped_key").is_none());
+    let id = list["keys"][0]["id"].as_str().unwrap();
+    let url = format!("{base}/{id}/shred");
+    let (status, _, problem) = send(
+        app.clone(),
+        "POST",
+        &url,
+        Some(json!({"confirm_key_id":uuid::Uuid::new_v4()})),
+        Some(admin.clone()),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(problem["detail"]
+        .as_str()
+        .unwrap()
+        .contains("confirm_key_id"));
+    assert!(h
+        .codec
+        .open(
+            &scope,
+            &crate::payload::PayloadField::RunInput,
+            &stored,
+            &settings
+        )
+        .await
+        .is_ok());
+    let reader = AuthContext::new_session(user(h.env.user_id), Role::Reader);
+    assert_eq!(
+        send(
+            app.clone(),
+            "POST",
+            &url,
+            Some(json!({"confirm_key_id":id})),
+            Some(reader),
+            None
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    let other = format!(
+        "/projects/{}/workflow-keys/{id}/shred",
+        h.env.project_id + 1
+    );
+    assert_eq!(
+        send(
+            app.clone(),
+            "POST",
+            &other,
+            Some(json!({"confirm_key_id":id})),
+            Some(admin.clone()),
+            None
+        )
+        .await
+        .0,
+        StatusCode::GONE
+    );
+    assert_eq!(
+        send(
+            app.clone(),
+            "POST",
+            &url,
+            Some(json!({"confirm_key_id":id})),
+            Some(admin.clone()),
+            None
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    assert!(matches!(
+        h.codec
+            .open(
+                &scope,
+                &crate::payload::PayloadField::RunInput,
+                &stored,
+                &settings
+            )
+            .await,
+        Err(crate::error::WorkflowError::ProjectKeyUnavailable { .. })
+    ));
+    assert!(audit
+        .operations()
+        .contains(&"WORKFLOW_PROJECT_KEY_SHREDDED".into()));
+    assert_eq!(
+        send(
+            app,
+            "POST",
+            &url,
+            Some(json!({"confirm_key_id":id})),
+            Some(admin),
+            None
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+}
+
+#[tokio::test]
+async fn grants_allow_only_named_operations_and_revocation_cuts_off_new_calls() {
+    use sea_orm::ConnectionTrait;
+    let Some((h, audit, app)) = live("workflow grant authorization").await else {
+        return;
+    };
+    let (p, e) = (h.env.project_id, h.env.environment_id);
+    let row=h.env.conn.query_one(sea_orm::Statement::from_sql_and_values(sea_orm::DbBackend::Postgres,
+        "INSERT INTO environments(name,slug,subdomain,host,upstreams,created_at,updated_at,project_id) VALUES('source','source','source-grants','source.example.test','[]',now(),now(),$1) RETURNING id",vec![p.into()])).await.unwrap().unwrap();
+    let source: i32 = row.try_get("", "id").unwrap();
+    let admin = AuthContext::new_session(user(h.env.user_id), Role::Admin);
+    let credential_url = format!("/projects/{p}/environments/{source}/workflows/credential");
+    let (status, _, issued) = send(
+        app.clone(),
+        "POST",
+        &credential_url,
+        None,
+        Some(admin.clone()),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let token = issued["token"].as_str().unwrap();
+    let target = format!("/workflows/v1/projects/{p}/environments/{e}");
+    let run_body = json!({"workflow":"orders","idempotency_key":"grant-test"});
+    let denied = send(
+        app.clone(),
+        "POST",
+        &format!("{target}/runs"),
+        Some(run_body.clone()),
+        None,
+        Some(token),
+    )
+    .await;
+    assert_eq!(denied.0, StatusCode::FORBIDDEN);
+    assert!(denied.2["detail"].as_str().unwrap().contains("grant"));
+    let base = format!("/projects/{p}/environments/{e}/workflows/grants");
+    let grant_body = json!({"source_environment_id":source,"action":"start","resource":"orders"});
+    let reader = AuthContext::new_session(user(h.env.user_id), Role::Reader);
+    assert_eq!(
+        send(
+            app.clone(),
+            "POST",
+            &base,
+            Some(grant_body.clone()),
+            Some(reader),
+            None
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    let (status, _, grant) = send(
+        app.clone(),
+        "POST",
+        &base,
+        Some(grant_body.clone()),
+        Some(admin.clone()),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        send(
+            app.clone(),
+            "POST",
+            &base,
+            Some(grant_body),
+            Some(admin.clone()),
+            None
+        )
+        .await
+        .2["id"],
+        grant["id"]
+    );
+    let started = send(
+        app.clone(),
+        "POST",
+        &format!("{target}/runs"),
+        Some(run_body.clone()),
+        None,
+        Some(token),
+    )
+    .await;
+    assert_eq!(started.0, StatusCode::CREATED);
+    let run_id = started.2["run"]["id"].as_str().unwrap();
+    assert_eq!(
+        send(
+            app.clone(),
+            "GET",
+            &format!("/workflows/v1/runs/{run_id}"),
+            None,
+            None,
+            Some(token)
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        send(
+            app.clone(),
+            "POST",
+            &format!("{target}/runs"),
+            Some(json!({"workflow":"another"})),
+            None,
+            Some(token)
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        send(
+            app.clone(),
+            "POST",
+            &format!("{target}/events"),
+            Some(json!({"name":"orders"})),
+            None,
+            Some(token)
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    let event_grant = json!({"source_environment_id":source,"action":"event","resource":"paid"});
+    assert_eq!(
+        send(
+            app.clone(),
+            "POST",
+            &base,
+            Some(event_grant),
+            Some(admin.clone()),
+            None
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        send(
+            app.clone(),
+            "POST",
+            &format!("{target}/events"),
+            Some(json!({"name":"paid","payload":1})),
+            None,
+            Some(token)
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let id = grant["id"].as_str().unwrap();
+    assert_eq!(
+        send(
+            app.clone(),
+            "DELETE",
+            &format!("{base}/{id}"),
+            None,
+            Some(admin.clone()),
+            None
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        send(
+            app.clone(),
+            "POST",
+            &format!("{target}/runs"),
+            Some(run_body),
+            None,
+            Some(token)
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    let list = send(
+        app,
+        "GET",
+        &format!("{base}?page_size=1"),
+        None,
+        Some(admin),
+        None,
+    )
+    .await
+    .2;
+    assert_eq!(list["total"], 1);
+    assert_eq!(list["grants"][0]["action"], "event");
+    assert!(audit
+        .operations()
+        .contains(&"WORKFLOW_GRANT_CHANGED".into()));
+}
+
+#[tokio::test]
+async fn development_sessions_require_payload_access_and_audit_without_tokens() {
+    use sea_orm::ConnectionTrait;
+    let Some(h) = harness("development handlers", &["orders"], completing(), false).await else {
+        return;
+    };
+    h.env
+        .conn
+        .execute_unprepared("UPDATE environments SET is_preview=true")
+        .await
+        .unwrap();
+    let encryption = Arc::new(EncryptionService::new("12345678901234567890123456789012").unwrap());
+    let dev = Arc::new(crate::dev::DevTunnel::new(
+        h.env.conn.clone(),
+        encryption.clone(),
+        Arc::new(InvocationSigner::new(&encryption)),
+    ));
+    let service = Arc::new(
+        WorkflowService::new(
+            h.store.clone(),
+            h.engine.clone(),
+            h.codec.clone(),
+            Arc::new(WorkflowMetrics::new(Arc::new(NoopProjectMetricsSink))),
+        )
+        .with_dev(dev),
+    );
+    let audit = Arc::new(RecordingAudit::default());
+    let app = router(state_from(service, h.engine.clone(), audit.clone()));
+    let base = format!(
+        "/projects/{}/environments/{}/workflows/dev",
+        h.env.project_id, h.env.environment_id
+    );
+    let admin = || Some(AuthContext::new_session(user(h.env.user_id), Role::Admin));
+    let (status, _, _) = send(
+        app.clone(),
+        "POST",
+        &base,
+        None,
+        Some(AuthContext::new_session(user(h.env.user_id), Role::User)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, headers, opened) = send(app.clone(), "POST", &base, None, admin(), None).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(headers["cache-control"], "no-store");
+    let token = opened["manifest_token"].as_str().unwrap();
+    let session = opened["session_id"].as_str().unwrap();
+    let path = format!("{base}/{session}");
+    let (status, _, _) = send(
+        app.clone(),
+        "PUT",
+        &path,
+        Some(json!({"protocol_version":1,"workflows":[]})),
+        admin(),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, headers, poll) = send(
+        app.clone(),
+        "POST",
+        &format!("{path}/poll"),
+        None,
+        admin(),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["cache-control"], "no-store");
+    assert!(poll["request"].is_null());
+    let (status, _, _) = send(app, "DELETE", &path, None, admin(), None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let rows = audit.0.lock().unwrap();
+    assert_eq!(
+        rows.iter()
+            .filter(|(operation, _)| operation == "WORKFLOW_DEVELOPMENT_TUNNEL")
+            .count(),
+        4
+    );
+    assert!(rows.iter().all(|(_, body)| !body.contains(token)));
 }

@@ -19,6 +19,7 @@ pub struct Model {
     pub run_id: Uuid,
     #[sea_orm(primary_key, auto_increment = false)]
     pub sequence: i32,
+    pub managed_revision: Option<String>,
     pub name: String,
     /// `step | sleep | wait | now | random | send_event`.
     pub kind: String,

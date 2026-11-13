@@ -9076,7 +9076,8 @@ async fn test_workflow_tables_up_down_and_refusal_with_live_runs() -> anyhow::Re
         .is_err());
 
     // A live run blocks the rollback, and the tables survive the attempt.
-    let refused = Migrator::down(&db, Some(steps_back_to(name))).await;
+    // Only the target was applied (`up(Some(1))`), so one step reverts it.
+    let refused = Migrator::down(&db, Some(1)).await;
     assert!(refused.is_err(), "down must refuse while runs exist");
     assert_eq!(table_count(&db).await?, 5);
 
@@ -9094,7 +9095,141 @@ async fn test_workflow_tables_up_down_and_refusal_with_live_runs() -> anyhow::Re
         .expect("count returns a row");
     assert_eq!(remaining.try_get::<i64>("", "n")?, 0);
 
-    Migrator::down(&db, Some(steps_back_to(name))).await?;
+    Migrator::down(&db, Some(1)).await?;
     assert_eq!(table_count(&db).await?, 0, "dropped by down");
+    Ok(())
+}
+
+/// ADR-103 §9: workflow crons apply to an existing database with its `http`
+/// crons untouched, the mode CHECK admits `workflow`, and the rollback
+/// refuses while a live workflow cron exists.
+#[tokio::test]
+async fn test_workflow_crons_up_down_and_refusal_with_live_workflow_crons() -> anyhow::Result<()> {
+    if external_db_configured() {
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!("Skipping workflow crons migration test: Docker unavailable: {error}");
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    let name = "m20261113_000002_add_workflow_crons";
+    let before = Migrator::migrations().len() as u32 - steps_back_to(name);
+    Migrator::up(&db, Some(before)).await?;
+
+    db.execute_unprepared(
+        "INSERT INTO projects \
+         (name, repo_name, repo_owner, directory, main_branch, preset, created_at, updated_at, slug) \
+         VALUES ('Crons', '', '', '.', 'main', 'dockerfile', now(), now(), 'crons-test')",
+    )
+    .await?;
+    db.execute_unprepared(
+        "INSERT INTO environments (name, slug, subdomain, host, upstreams, created_at, updated_at, project_id) \
+         SELECT 'production', 'production', 'crons-test-production', 'crons.test', '[]', now(), now(), id \
+         FROM projects WHERE slug = 'crons-test'",
+    )
+    .await?;
+    let insert_cron = |path: &str, mode: &str, workflow: &str| {
+        format!(
+            "INSERT INTO crons (project_id, environment_id, path, schedule, created_at, updated_at, mode, workflow_name) \
+             SELECT e.project_id, e.id, '{path}', '0 8 * * 1', now(), now(), '{mode}', {workflow} \
+             FROM environments e JOIN projects p ON p.id = e.project_id WHERE p.slug = 'crons-test'"
+        )
+    };
+    // An http cron from before: no workflow columns yet.
+    db.execute_unprepared(
+        "INSERT INTO crons (project_id, environment_id, path, schedule, created_at, updated_at) \
+         SELECT e.project_id, e.id, '/api/cron', '* * * * *', now(), now() \
+         FROM environments e JOIN projects p ON p.id = e.project_id WHERE p.slug = 'crons-test'",
+    )
+    .await?;
+    assert!(
+        db.execute_unprepared(
+            &insert_cron("workflow:early", "workflow", "NULL")
+                .replace(", workflow_name", "")
+                .replace(", NULL", "")
+        )
+        .await
+        .is_err(),
+        "the mode is refused before the migration"
+    );
+
+    Migrator::up(&db, Some(1)).await?;
+    let http = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT mode, workflow_name FROM crons WHERE path = '/api/cron'".to_string(),
+        ))
+        .await?
+        .expect("the http cron survives");
+    assert_eq!(http.try_get::<String>("", "mode")?, "http");
+    assert_eq!(http.try_get::<Option<String>>("", "workflow_name")?, None);
+    db.execute_unprepared(&insert_cron("workflow:digest", "workflow", "'send-digest'"))
+        .await?;
+    assert!(
+        db.execute_unprepared(&insert_cron("x", "bogus", "NULL"))
+            .await
+            .is_err(),
+        "an unknown mode is still refused"
+    );
+    db.execute_unprepared(
+        "INSERT INTO cron_executions (cron_id, executed_at, url, status_code, headers, response_time_ms, state, workflow_run_id) \
+         SELECT id, now(), path, 0, '{}', 0, 'running', '00000000-0000-4000-8000-000000000001' \
+         FROM crons WHERE path = 'workflow:digest'",
+    )
+    .await?;
+
+    let refused = Migrator::down(&db, Some(1)).await;
+    let message = refused
+        .expect_err("down must refuse while a workflow cron is live")
+        .to_string();
+    assert!(message.contains("1 live cron"), "{message}");
+
+    db.execute_unprepared("UPDATE crons SET deleted_at = now() WHERE path = 'workflow:digest'")
+        .await?;
+    Migrator::down(&db, Some(1)).await?;
+    let columns = db
+        .query_all(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT column_name FROM information_schema.columns \
+             WHERE (table_name = 'crons' AND column_name IN ('workflow_name', 'workflow_input')) \
+             OR (table_name = 'cron_executions' AND column_name = 'workflow_run_id')"
+                .to_string(),
+        ))
+        .await?;
+    assert!(columns.is_empty(), "dropped by down");
+    assert!(
+        db.execute_unprepared(
+            &insert_cron("workflow:late", "workflow", "NULL")
+                .replace(", workflow_name", "")
+                .replace(", NULL", "")
+        )
+        .await
+        .is_err(),
+        "the mode is refused again after down"
+    );
+
+    Migrator::up(&db, None).await?;
     Ok(())
 }

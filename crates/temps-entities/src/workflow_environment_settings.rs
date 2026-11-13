@@ -23,6 +23,7 @@ pub struct Model {
     /// Compose service that hosts the workflow handler. `NULL`: the
     /// environment's main (single-container) service.
     pub host_service: Option<String>,
+    pub drain_timeout_secs: i32,
     /// Longest one invocation may run before it is abandoned. Default 900.
     pub invocation_deadline_secs: i32,
     /// Lease length; heartbeats and journal writes extend it. Default 120.

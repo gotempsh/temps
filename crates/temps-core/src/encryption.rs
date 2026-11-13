@@ -9,6 +9,8 @@ use base64::{engine::general_purpose::STANDARD as BASE64, DecodeError, Engine};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
+mod project_keys;
+
 const NONCE_LENGTH: usize = 12;
 
 /// Version prefix for password-derived ciphertexts (Argon2id KDF, random salt).

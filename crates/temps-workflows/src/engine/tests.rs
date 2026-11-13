@@ -140,7 +140,11 @@ pub(crate) async fn harness_with(
     let base_url = format!("http://{}", listener.local_addr().unwrap());
     let encryption = Arc::new(EncryptionService::new("12345678901234567890123456789012").unwrap());
     let store = Arc::new(PgWorkflowStore::new(env.conn.clone()));
-    let codec = Arc::new(PayloadCodec::new(encryption.clone(), blobs));
+    let codec = Arc::new(
+        PayloadCodec::new(encryption.clone(), blobs).with_project_keys(Arc::new(
+            crate::project_keys::ProjectKeys::new(env.conn.clone(), encryption.clone()),
+        )),
+    );
     let engine = Arc::new(WorkflowEngine::new(
         store.clone(),
         codec.clone(),

@@ -127,6 +127,7 @@ impl StoredPayload {
 /// blob storage; payloads over the inline cap are then rejected.
 pub struct PayloadCodec {
     encryption: Arc<EncryptionService>,
+    project_keys: Option<Arc<crate::project_keys::ProjectKeys>>,
     blobs: Option<Arc<dyn PayloadBlobStore>>,
 }
 
@@ -135,7 +136,41 @@ impl PayloadCodec {
         encryption: Arc<EncryptionService>,
         blobs: Option<Arc<dyn PayloadBlobStore>>,
     ) -> Self {
-        Self { encryption, blobs }
+        Self {
+            encryption,
+            blobs,
+            project_keys: None,
+        }
+    }
+
+    /// Production mode: new project payloads use independently shreddable keys.
+    pub(crate) fn with_project_keys(mut self, keys: Arc<crate::project_keys::ProjectKeys>) -> Self {
+        self.project_keys = Some(keys);
+        self
+    }
+
+    pub(crate) async fn project_key_history(
+        &self,
+        project_id: i32,
+        page: u64,
+        page_size: u64,
+    ) -> WorkflowResult<(Vec<temps_entities::workflow_project_keys::Model>, u64)> {
+        match &self.project_keys {
+            Some(keys) => keys.list(project_id, page, page_size).await,
+            None => Ok((Vec::new(), 0)),
+        }
+    }
+
+    pub(crate) async fn shred_project_key(
+        &self,
+        project_id: i32,
+        key_id: Uuid,
+    ) -> WorkflowResult<()> {
+        let keys = self
+            .project_keys
+            .as_ref()
+            .ok_or(WorkflowError::ProjectKeyUnavailable { project_id, key_id })?;
+        keys.shred(project_id, key_id).await
     }
 
     pub fn has_blob_storage(&self) -> bool {
@@ -168,15 +203,42 @@ impl PayloadCodec {
                 blob_unavailable: false,
             });
         }
-        let ciphertext = self
-            .encryption
-            .encrypt_with_aad(&plaintext, &scope.associated_data(field))
-            .map_err(|source| WorkflowError::Encryption {
-                run_id: scope.run_id,
-                field: field.label(),
-                operation: "encrypt",
-                source,
-            })?;
+        let ciphertext =
+            if let Some(keys) = self.project_keys.as_ref().filter(|_| scope.project_id > 0) {
+                let key = keys.active(scope.project_id).await?;
+                let wrapped =
+                    key.wrapped_key
+                        .as_deref()
+                        .ok_or(WorkflowError::ProjectKeyUnavailable {
+                            project_id: scope.project_id,
+                            key_id: key.id,
+                        })?;
+                let encrypted = self
+                    .encryption
+                    .encrypt_with_project_key(
+                        scope.project_id,
+                        &key.id.to_string(),
+                        wrapped,
+                        &plaintext,
+                        &scope.associated_data(field),
+                    )
+                    .map_err(|source| WorkflowError::Encryption {
+                        run_id: scope.run_id,
+                        field: field.label(),
+                        operation: "encrypt project payload",
+                        source,
+                    })?;
+                format!("pk1:{}:{encrypted}", key.id)
+            } else {
+                self.encryption
+                    .encrypt_with_aad(&plaintext, &scope.associated_data(field))
+                    .map_err(|source| WorkflowError::Encryption {
+                        run_id: scope.run_id,
+                        field: field.label(),
+                        operation: "encrypt",
+                        source,
+                    })?
+            };
         let bytes = i32::try_from(plaintext.len()).unwrap_or(i32::MAX);
         if plaintext.len() <= inline {
             return Ok(StoredPayload {
@@ -239,15 +301,59 @@ impl PayloadCodec {
             }
             (None, None) => return Ok(None),
         };
-        let plaintext = self
-            .encryption
-            .decrypt_with_aad(&ciphertext, &scope.associated_data(field))
-            .map_err(|source| WorkflowError::Encryption {
+        let plaintext = if let Some(envelope) = ciphertext.strip_prefix("pk1:") {
+            let (id, encrypted) =
+                envelope
+                    .split_once(':')
+                    .ok_or_else(|| WorkflowError::Encoding {
+                        run_id: scope.run_id,
+                        field: field.label(),
+                        reason: "invalid project-key envelope".into(),
+                    })?;
+            let id = Uuid::parse_str(id).map_err(|_| WorkflowError::Encoding {
                 run_id: scope.run_id,
                 field: field.label(),
-                operation: "decrypt",
-                source,
+                reason: "invalid project-key identifier".into(),
             })?;
+            let keys = self
+                .project_keys
+                .as_ref()
+                .ok_or(WorkflowError::ProjectKeyUnavailable {
+                    project_id: scope.project_id,
+                    key_id: id,
+                })?;
+            let key = keys.get(scope.project_id, id).await?;
+            let wrapped =
+                key.wrapped_key
+                    .as_deref()
+                    .ok_or(WorkflowError::ProjectKeyUnavailable {
+                        project_id: scope.project_id,
+                        key_id: id,
+                    })?;
+            self.encryption
+                .decrypt_with_project_key(
+                    scope.project_id,
+                    &id.to_string(),
+                    wrapped,
+                    encrypted,
+                    &scope.associated_data(field),
+                )
+                .map_err(|source| WorkflowError::Encryption {
+                    run_id: scope.run_id,
+                    field: field.label(),
+                    operation: "decrypt project payload",
+                    source,
+                })?
+        } else {
+            self.encryption
+                .decrypt_with_aad(&ciphertext, &scope.associated_data(field))
+                .map_err(|source| WorkflowError::Encryption {
+                    run_id: scope.run_id,
+                    field: field.label(),
+                    operation: "decrypt",
+                    source,
+                })?
+        };
         serde_json::from_slice(&plaintext)
             .map(Some)
             .map_err(|_| WorkflowError::Encoding {

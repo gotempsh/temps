@@ -833,6 +833,41 @@ jobs:
           bun run test:run
           bun run build
 
+  workflows-other-sdks:
+    name: Workflow Python and Go SDKs
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.1.0
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-go@v7.0.0
+        with:
+          go-version: '1.23.x'
+          cache: false
+      - name: Test Python executor
+        working-directory: sdks/python/workflows
+        run: |
+          python -m pip install .
+          python -m unittest temps_workflows.test_runtime -v
+      - name: Test Go executor and races
+        working-directory: sdks/go/workflows
+        run: go test -race ./...
+
+  workflow-engine-templates:
+    name: Workflow engine templates
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Test authenticated routes and persistent storage
+        run: python3 -m unittest discover -s examples/workflow-engines -p test_templates.py -v
+
   openapi-canonical:
     name: OpenAPI Spec Format
     runs-on: ubuntu-latest
@@ -1154,7 +1189,7 @@ jobs:
             # that crate.
             filter: >-
               ((package(temps-providers*) and not test(/^query::/)) or package(temps-presets) or
-              package(temps-auth) or package(temps-core) or package(libsqlite3-sys) or
+              package(temps-auth) or package(temps-core) or package(temps-workflows-sdk) or package(libsqlite3-sys) or
               package(temps-monitoring) or package(temps-kv) or
               package(temps-analytics-funnels) or package(temps-webhooks) or
               package(temps-infra) or package(temps-captcha-wasm) or
@@ -1676,6 +1711,21 @@ jobs:
         with:
           bun-version: latest
           no-cache: ${{ github.ref != 'refs/heads/main' }}
+
+      - name: Install Python for workflow conformance
+        if: env.GROUP_RUNS == 'true' && matrix.group == 'docker-deployments'
+        uses: actions/setup-python@v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Install Go for workflow conformance
+        if: env.GROUP_RUNS == 'true' && matrix.group == 'docker-deployments'
+        uses: actions/setup-go@v7.0.0
+        with:
+          go-version: '1.23.x'
+          cache: false
+      - name: Install Python workflow SDK dependencies
+        if: env.GROUP_RUNS == 'true' && matrix.group == 'docker-deployments'
+        run: python -m pip install ./sdks/python/workflows
 
       - name: Run integration tests
         if: env.GROUP_RUNS == 'true'

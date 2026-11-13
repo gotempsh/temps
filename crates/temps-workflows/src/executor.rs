@@ -89,6 +89,7 @@ pub struct Invocation<'a> {
 
 pub struct ExecutorClient {
     http: reqwest::Client,
+    dev: Option<std::sync::Arc<crate::dev::DevTunnel>>,
 }
 
 impl ExecutorClient {
@@ -101,9 +102,33 @@ impl ExecutorClient {
             .map_err(|error| ExecutorCallError::Signing {
                 reason: format!("HTTP client could not be built: {error}"),
             })?;
-        Ok(Self { http })
+        Ok(Self { http, dev: None })
     }
 
+    pub fn with_dev(mut self, dev: std::sync::Arc<crate::dev::DevTunnel>) -> Self {
+        self.dev = Some(dev);
+        self
+    }
+    fn dev_session(
+        &self,
+        endpoint: &ExecutorEndpoint,
+    ) -> Result<Option<(&crate::dev::DevTunnel, Uuid)>, ExecutorCallError> {
+        let Some(id) = endpoint.base_url.strip_prefix("dev://") else {
+            return Ok(None);
+        };
+        let tunnel = self
+            .dev
+            .as_deref()
+            .ok_or_else(|| ExecutorCallError::Connect {
+                url: endpoint.base_url.clone(),
+                reason: "development transport is not installed".into(),
+            })?;
+        let id = Uuid::parse_str(id).map_err(|_| ExecutorCallError::Protocol {
+            url: endpoint.base_url.clone(),
+            reason: "invalid development session".into(),
+        })?;
+        Ok(Some((tunnel, id)))
+    }
     pub async fn manifest(
         &self,
         signer: &InvocationSigner,
@@ -111,6 +136,15 @@ impl ExecutorClient {
         environment_id: i32,
         endpoint: &ExecutorEndpoint,
     ) -> Result<Manifest, ExecutorCallError> {
+        if let Some((tunnel, session)) = self.dev_session(endpoint)? {
+            return tunnel
+                .manifest(project_id, environment_id, session)
+                .await
+                .map_err(|error| ExecutorCallError::Connect {
+                    url: endpoint.base_url.clone(),
+                    reason: error.to_string(),
+                });
+        }
         let url = format!("{}{MANIFEST_PATH}", endpoint.base_url.trim_end_matches('/'));
         let token = signer
             .sign(&InvocationClaims {
@@ -196,6 +230,31 @@ impl ExecutorClient {
             .map_err(|error| ExecutorCallError::Signing {
                 reason: error.to_string(),
             })?;
+        if let Some((tunnel, session)) = self.dev_session(invocation.endpoint)? {
+            let reply = tunnel
+                .invoke(
+                    invocation.project_id,
+                    invocation.environment_id,
+                    session,
+                    token,
+                    invocation.body,
+                    invocation.deadline_at,
+                )
+                .await
+                .map_err(|error| ExecutorCallError::Connect {
+                    url: url.clone(),
+                    reason: error.to_string(),
+                })?;
+            return match (reply.status, reply.outcome) {
+                (200, Some(outcome)) => Ok(InvokeReply::Outcome(outcome)),
+                (202, _) => Ok(InvokeReply::Accepted),
+                (status, _) => Err(ExecutorCallError::Status {
+                    url,
+                    status,
+                    hint: " from local development executor",
+                }),
+            };
+        }
         let timeout = (invocation.deadline_at - Utc::now())
             .to_std()
             .unwrap_or(Duration::from_secs(1))

@@ -257,6 +257,19 @@ const TunnelDomainDetail = lazy(() =>
 const Certificates = lazy(() =>
   import('./pages/Certificates').then((m) => ({ default: m.Certificates }))
 )
+const ProjectWorkflowKeys = lazy(() => import('./pages/workflows/ProjectWorkflowKeys').then((m) => ({ default: m.ProjectWorkflowKeys })))
+const WorkflowSettings = lazy(() => import('./pages/workflows/WorkflowSettings').then((m) => ({ default: m.WorkflowSettings })))
+const WorkflowGrants = lazy(() => import('./pages/workflows/WorkflowGrants').then((m) => ({ default: m.WorkflowGrants })))
+const AllWorkflows = lazy(() =>
+  import('./pages/workflows/AllWorkflows').then((m) => ({
+    default: m.AllWorkflows,
+  }))
+)
+const WorkflowRunDetail = lazy(() =>
+  import('./pages/workflows/WorkflowRunDetail').then((m) => ({
+    default: m.WorkflowRunDetail,
+  }))
+)
 const Backups = lazy(() =>
   import('./pages/Backups').then((m) => ({ default: m.Backups }))
 )
@@ -1231,6 +1244,14 @@ const FullAppRoutes = () => {
                         <Route
                           path="/dns-providers/:id"
                           element={<DnsProviderDetail />}
+                        />
+                        <Route path="/workflows" element={<AllWorkflows />} />
+                        <Route path="/workflows/:projectId/keys" element={<ProjectWorkflowKeys />} />
+                        <Route path="/workflows/:projectId/:environmentId/settings" element={<WorkflowSettings />} />
+                        <Route path="/workflows/:projectId/:environmentId/grants" element={<WorkflowGrants />} />
+                        <Route
+                          path="/workflows/:projectId/:environmentId/runs/:runId"
+                          element={<WorkflowRunDetail />}
                         />
                         <Route path="/backups" element={<Backups />} />
                         <Route

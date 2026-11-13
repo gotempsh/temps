@@ -45,16 +45,17 @@ const RUNNABLE: &str = "('queued', 'sleeping', 'waiting', 'retrying')";
 const TERMINAL: &str = "('completed', 'failed', 'cancelled')";
 
 pub struct PgWorkflowStore {
-    db: Arc<DatabaseConnection>,
+    pub(super) db: Arc<DatabaseConnection>,
+    pub(super) managed: Option<Arc<dyn temps_core::workflow_journal::ManagedWorkflowJournal>>,
 }
 
 impl PgWorkflowStore {
     pub fn new(db: Arc<DatabaseConnection>) -> Self {
-        Self { db }
+        Self { db, managed: None }
     }
 }
 
-fn stmt(sql: &str, values: Vec<Value>) -> Statement {
+pub(super) fn stmt(sql: &str, values: Vec<Value>) -> Statement {
     Statement::from_sql_and_values(DbBackend::Postgres, sql, values)
 }
 
@@ -113,6 +114,124 @@ impl WaitingRow {
 
 #[async_trait]
 impl WorkflowStore for PgWorkflowStore {
+    async fn begin_drain(&self, environment_id: i32, deployment_id: i32) -> WorkflowResult<Uuid> {
+        let txn = self
+            .db
+            .begin()
+            .await
+            .map_err(WorkflowError::db("beginning workflow drain"))?;
+        txn.execute(stmt(
+            "SELECT pg_advisory_xact_lock($1)",
+            vec![CLAIM_LOCK_KEY.into()],
+        ))
+        .await
+        .map_err(WorkflowError::db("locking workflow drain against claims"))?;
+        let token = Uuid::new_v4();
+        let result=txn.execute(stmt("INSERT INTO workflow_deployment_drains(environment_id,deployment_id,token,expires_at) VALUES($1,$2,$3,now()+interval '90 seconds') ON CONFLICT(environment_id) DO UPDATE SET deployment_id=EXCLUDED.deployment_id,token=EXCLUDED.token,expires_at=EXCLUDED.expires_at WHERE workflow_deployment_drains.expires_at<=now()",vec![environment_id.into(),deployment_id.into(),token.into()])).await.map_err(WorkflowError::db("acquiring workflow drain"))?;
+        if result.rows_affected() == 0 {
+            return Err(WorkflowError::DrainLost { environment_id });
+        }
+        txn.commit()
+            .await
+            .map_err(WorkflowError::db("committing workflow drain"))?;
+        Ok(token)
+    }
+    async fn renew_drain(&self, environment_id: i32, token: Uuid) -> WorkflowResult<u64> {
+        let txn = self
+            .db
+            .begin()
+            .await
+            .map_err(WorkflowError::db("renewing workflow drain"))?;
+        let result=txn.execute(stmt("UPDATE workflow_deployment_drains SET expires_at=now()+interval '90 seconds' WHERE environment_id=$1 AND token=$2 AND expires_at>now()",vec![environment_id.into(),token.into()])).await.map_err(WorkflowError::db("renewing workflow drain lease"))?;
+        if result.rows_affected() == 0 {
+            return Err(WorkflowError::DrainLost { environment_id });
+        }
+        let row=txn.query_one(stmt("SELECT count(*)::BIGINT AS n FROM workflow_runs WHERE environment_id=$1 AND status='running'",vec![environment_id.into()])).await.map_err(WorkflowError::db("counting draining workflow invocations"))?.ok_or(WorkflowError::DrainLost {environment_id})?;
+        let count: i64 = row
+            .try_get("", "n")
+            .map_err(WorkflowError::db("reading draining invocation count"))?;
+        txn.commit()
+            .await
+            .map_err(WorkflowError::db("committing drain heartbeat"))?;
+        Ok(count.max(0) as u64)
+    }
+    async fn end_drain(&self, environment_id: i32, token: Uuid) -> WorkflowResult<()> {
+        self.db
+            .execute(stmt(
+                "DELETE FROM workflow_deployment_drains WHERE environment_id=$1 AND token=$2",
+                vec![environment_id.into(), token.into()],
+            ))
+            .await
+            .map_err(WorkflowError::db("releasing workflow drain"))?;
+        Ok(())
+    }
+
+    async fn grant(
+        &self,
+        source: i32,
+        target: i32,
+        action: &str,
+        resource: &str,
+    ) -> WorkflowResult<temps_entities::workflow_grants::Model> {
+        temps_entities::workflow_grants::Model::find_by_statement(stmt(
+            "INSERT INTO workflow_grants(id,source_environment_id,target_environment_id,action,resource) VALUES($1,$2,$3,$4,$5) ON CONFLICT(source_environment_id,target_environment_id,action,resource) DO UPDATE SET resource=EXCLUDED.resource RETURNING *",
+            vec![Uuid::new_v4().into(),source.into(),target.into(),action.into(),resource.into()])).one(self.db.as_ref()).await.map_err(WorkflowError::db("creating workflow grant"))?
+            .ok_or_else(|| WorkflowError::Validation { field:"grant",reason:format!("grant from environment {source} to {target} was not returned") })
+    }
+    async fn grants(
+        &self,
+        target: i32,
+        page: u64,
+        page_size: u64,
+    ) -> WorkflowResult<(Vec<temps_entities::workflow_grants::Model>, u64)> {
+        use temps_entities::workflow_grants::{Column, Entity};
+        let pages = Entity::find()
+            .filter(Column::TargetEnvironmentId.eq(target))
+            .order_by_desc(Column::CreatedAt)
+            .order_by_desc(Column::Id)
+            .paginate(self.db.as_ref(), page_size.clamp(1, 100));
+        let total = pages
+            .num_items()
+            .await
+            .map_err(WorkflowError::db("counting workflow grants"))?;
+        Ok((
+            pages
+                .fetch_page(page.saturating_sub(1))
+                .await
+                .map_err(WorkflowError::db("listing workflow grants"))?,
+            total,
+        ))
+    }
+    async fn revoke_grant(&self, target: i32, grant_id: Uuid) -> WorkflowResult<bool> {
+        use temps_entities::workflow_grants::{Column, Entity};
+        Ok(Entity::delete_many()
+            .filter(Column::TargetEnvironmentId.eq(target))
+            .filter(Column::Id.eq(grant_id))
+            .exec(self.db.as_ref())
+            .await
+            .map_err(WorkflowError::db("revoking workflow grant"))?
+            .rows_affected
+            > 0)
+    }
+    async fn has_grant(
+        &self,
+        source: i32,
+        target: i32,
+        action: &str,
+        resource: &str,
+    ) -> WorkflowResult<bool> {
+        use temps_entities::workflow_grants::{Column, Entity};
+        Ok(Entity::find()
+            .filter(Column::SourceEnvironmentId.eq(source))
+            .filter(Column::TargetEnvironmentId.eq(target))
+            .filter(Column::Action.eq(action))
+            .filter(Column::Resource.eq(resource))
+            .one(self.db.as_ref())
+            .await
+            .map_err(WorkflowError::db("authorizing workflow grant"))?
+            .is_some())
+    }
+
     async fn environment_project(&self, environment_id: i32) -> WorkflowResult<Option<i32>> {
         Ok(environments::Entity::find_by_id(environment_id)
             .one(self.db.as_ref())
@@ -139,13 +258,21 @@ impl WorkflowStore for PgWorkflowStore {
         environment_id: i32,
         settings: &WorkflowSettings,
     ) -> WorkflowResult<WorkflowSettings> {
+        if let Some(service_id) = settings.managed_store_service_id {
+            let scope = temps_core::workflow_journal::WorkflowJournalScope {
+                service_id,
+                project_id,
+                run_id: Uuid::nil(),
+            };
+            self.check_managed(scope).await?;
+        }
         let row = workflow_environment_settings::Entity::find()
             .from_raw_sql(stmt(
                 "INSERT INTO workflow_environment_settings (environment_id, project_id, host_service, \
                  invocation_deadline_secs, lease_secs, max_concurrent_runs, max_active_runs, \
                  max_steps_per_run, max_journal_bytes_per_run, inline_payload_limit_bytes, \
-                 max_payload_bytes, retention_days, stuck_after_failures) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
+                 max_payload_bytes, retention_days, stuck_after_failures, drain_timeout_secs, managed_store_service_id) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) \
                  ON CONFLICT (environment_id) DO UPDATE SET host_service = EXCLUDED.host_service, \
                  invocation_deadline_secs = EXCLUDED.invocation_deadline_secs, \
                  lease_secs = EXCLUDED.lease_secs, max_concurrent_runs = EXCLUDED.max_concurrent_runs, \
@@ -153,7 +280,7 @@ impl WorkflowStore for PgWorkflowStore {
                  max_journal_bytes_per_run = EXCLUDED.max_journal_bytes_per_run, \
                  inline_payload_limit_bytes = EXCLUDED.inline_payload_limit_bytes, \
                  max_payload_bytes = EXCLUDED.max_payload_bytes, retention_days = EXCLUDED.retention_days, \
-                 stuck_after_failures = EXCLUDED.stuck_after_failures, updated_at = now() \
+                 stuck_after_failures = EXCLUDED.stuck_after_failures, drain_timeout_secs = EXCLUDED.drain_timeout_secs, managed_store_service_id = EXCLUDED.managed_store_service_id, updated_at = now() \
                  RETURNING *",
                 vec![
                     environment_id.into(),
@@ -169,6 +296,8 @@ impl WorkflowStore for PgWorkflowStore {
                     settings.max_payload_bytes.into(),
                     settings.retention_days.into(),
                     settings.stuck_after_failures.into(),
+                    settings.drain_timeout_secs.into(),
+                    settings.managed_store_service_id.into(),
                 ],
             ))
             .one(self.db.as_ref())
@@ -348,7 +477,10 @@ impl WorkflowStore for PgWorkflowStore {
             .await
             .map_err(WorkflowError::db("inserting a workflow run"))?;
         let outcome = match inserted {
-            Some(row) => {
+            Some(mut row) => {
+                txn.execute(stmt("INSERT INTO workflow_managed_runs(run_id,service_id,project_id) SELECT $1,managed_store_service_id,project_id FROM workflow_environment_settings WHERE environment_id=$2 AND managed_store_service_id IS NOT NULL",vec![row.id.into(),row.environment_id.into()])).await.map_err(WorkflowError::db("pinning managed workflow journal"))?;
+                let updated = txn.execute(stmt("UPDATE workflow_runs SET has_blob_payloads=true WHERE id=$1 AND EXISTS(SELECT 1 FROM workflow_managed_runs WHERE run_id=$1)",vec![row.id.into()])).await.map_err(WorkflowError::db("tracking managed journal blob cleanup"))?;
+                row.has_blob_payloads |= updated.rows_affected() > 0;
                 notify(&txn).await?;
                 StartOutcome::Created(row)
             }
@@ -417,6 +549,7 @@ impl WorkflowStore for PgWorkflowStore {
              ), due AS ( \
                 SELECT id, environment_id, workflow_name, due_at FROM workflow_runs \
                 WHERE status IN {RUNNABLE} AND due_at <= now() \
+                AND NOT EXISTS(SELECT 1 FROM workflow_deployment_drains drain WHERE drain.environment_id=workflow_runs.environment_id AND drain.expires_at>now()) \
                 ORDER BY due_at, id LIMIT {CLAIM_WINDOW} \
              ), ranked_wf AS ( \
                 SELECT d.id, d.environment_id, d.due_at, \
@@ -671,6 +804,14 @@ impl WorkflowStore for PgWorkflowStore {
     }
 
     async fn reap_expired(&self, batch: u64) -> WorkflowResult<Vec<ReapedRun>> {
+        self.db
+            .execute(stmt(
+                "DELETE FROM workflow_dev_sessions WHERE expires_at<=now()",
+                vec![],
+            ))
+            .await
+            .map_err(WorkflowError::db("removing expired development tunnels"))?;
+
         #[derive(FromQueryResult)]
         struct Reaped {
             id: Uuid,
@@ -1076,6 +1217,25 @@ impl WorkflowStore for PgWorkflowStore {
         ))
         .await
         .map_err(WorkflowError::db("delivering a workflow event"))?;
+        let updated = workflow_steps::Entity::find_by_id((waiting.run_id, waiting.sequence))
+            .one(&txn)
+            .await
+            .map_err(WorkflowError::db("loading completed managed wait"))?
+            .ok_or(WorkflowError::StepNotFound {
+                run_id: waiting.run_id,
+                sequence: waiting.sequence,
+            })?;
+        let canonical = self.persist_revision(&txn, updated, &mut None).await?;
+        let delta = i64::from(canonical.result_bytes) + i64::from(canonical.error_bytes)
+            - i64::from(step.result_bytes)
+            - i64::from(step.error_bytes);
+        if run.journal_bytes + delta > max_journal_bytes {
+            return Ok(WaitCompletion::OverQuota {
+                journal_bytes: run.journal_bytes,
+                result_bytes: canonical.result_bytes,
+            });
+        }
+        let blob = blob || canonical.result_blob_key.is_some();
         txn.execute(stmt(
             "UPDATE workflow_runs SET journal_bytes = journal_bytes + $2, \
              has_blob_payloads = has_blob_payloads OR $3, \
@@ -1125,7 +1285,7 @@ impl WorkflowStore for PgWorkflowStore {
 
     async fn record_step(
         &self,
-        record: StepRecord,
+        mut record: StepRecord,
         limits: StepLimits,
     ) -> WorkflowResult<StepRecordOutcome> {
         let txn = self
@@ -1153,7 +1313,7 @@ impl WorkflowStore for PgWorkflowStore {
             .map_err(WorkflowError::db("recording a journal entry"))?;
         let new_bytes = i64::from(record.result.bytes) + i64::from(record.error.bytes);
         let blob = record.result.blob_key.is_some() || record.error.blob_key.is_some();
-        let (entry, inserted, bytes_delta, already) = match existing {
+        let (mut entry, inserted, mut bytes_delta, already) = match existing {
             Some(existing) => {
                 if existing.name != record.name || existing.kind != record.kind.as_str() {
                     return Err(WorkflowError::Incompatible {
@@ -1252,6 +1412,24 @@ impl WorkflowStore for PgWorkflowStore {
                 (inserted, true, new_bytes, false)
             }
         };
+        if already {
+            entry = self.hydrate(record.run_id, vec![entry]).await?.remove(0);
+        } else {
+            let proposed_bytes = i64::from(entry.result_bytes) + i64::from(entry.error_bytes);
+            entry = self
+                .persist_revision(&txn, entry, &mut record.event)
+                .await?;
+            bytes_delta +=
+                i64::from(entry.result_bytes) + i64::from(entry.error_bytes) - proposed_bytes;
+            if run.journal_bytes + bytes_delta > limits.max_journal_bytes {
+                return Err(WorkflowError::QuotaExceeded {
+                    environment_id: run.environment_id,
+                    quota: "max_journal_bytes_per_run",
+                    limit: limits.max_journal_bytes,
+                });
+            }
+        }
+        let blob = blob || entry.result_blob_key.is_some();
         let mut event_id = None;
         if inserted {
             if let Some(event) = record.event {
@@ -1317,21 +1495,33 @@ impl WorkflowStore for PgWorkflowStore {
         from_sequence: i32,
         limit: u64,
     ) -> WorkflowResult<Vec<StepRow>> {
-        workflow_steps::Entity::find()
+        let rows = workflow_steps::Entity::find()
             .filter(workflow_steps::Column::RunId.eq(run_id))
             .filter(workflow_steps::Column::Sequence.gte(from_sequence))
             .order_by_asc(workflow_steps::Column::Sequence)
-            .limit(limit)
+            .limit(limit.min(1000))
             .all(self.db.as_ref())
             .await
-            .map_err(WorkflowError::db("reading a workflow journal"))
+            .map_err(WorkflowError::db("reading a workflow journal"))?;
+        Ok(rows)
+    }
+    async fn uses_managed_journal(&self, run_id: Uuid) -> WorkflowResult<bool> {
+        Ok(self.placement(self.db.as_ref(), run_id).await?.is_some())
     }
 
+    async fn hydrate_journal(
+        &self,
+        run_id: Uuid,
+        rows: Vec<StepRow>,
+    ) -> WorkflowResult<Vec<StepRow>> {
+        self.hydrate(run_id, rows).await
+    }
     async fn step(&self, run_id: Uuid, sequence: i32) -> WorkflowResult<Option<StepRow>> {
-        workflow_steps::Entity::find_by_id((run_id, sequence))
+        let row = workflow_steps::Entity::find_by_id((run_id, sequence))
             .one(self.db.as_ref())
             .await
-            .map_err(WorkflowError::db("reading a journal entry"))
+            .map_err(WorkflowError::db("reading a journal entry"))?;
+        Ok(self.hydrate(run_id, row.into_iter().collect()).await?.pop())
     }
 
     async fn get_run(&self, run_id: Uuid) -> WorkflowResult<Option<RunRow>> {
@@ -1339,6 +1529,40 @@ impl WorkflowStore for PgWorkflowStore {
             .one(self.db.as_ref())
             .await
             .map_err(WorkflowError::db("loading a workflow run"))
+    }
+
+    async fn scan_runs(
+        &self,
+        filter: &RunFilter,
+        before: Option<(DateTime<Utc>, Uuid)>,
+        limit: u64,
+    ) -> WorkflowResult<Vec<RunRow>> {
+        use sea_orm::Condition;
+        let mut query = workflow_runs::Entity::find();
+        if let Some((time, id)) = before {
+            query = query.filter(
+                Condition::any()
+                    .add(workflow_runs::Column::CreatedAt.lt(time))
+                    .add(
+                        Condition::all()
+                            .add(workflow_runs::Column::CreatedAt.eq(time))
+                            .add(workflow_runs::Column::Id.lt(id)),
+                    ),
+            );
+        }
+        if let Some(status) = filter.status {
+            query = query.filter(workflow_runs::Column::Status.eq(status.as_str()));
+        }
+        if let Some(name) = &filter.workflow_name {
+            query = query.filter(workflow_runs::Column::WorkflowName.eq(name.clone()));
+        }
+        query
+            .order_by_desc(workflow_runs::Column::CreatedAt)
+            .order_by_desc(workflow_runs::Column::Id)
+            .limit(limit.clamp(1, 100))
+            .all(self.db.as_ref())
+            .await
+            .map_err(WorkflowError::db("scanning global workflow runs"))
     }
 
     async fn list_runs(
@@ -1369,6 +1593,83 @@ impl WorkflowStore for PgWorkflowStore {
             .await
             .map_err(WorkflowError::db("listing workflow runs"))?;
         Ok((rows, total))
+    }
+
+    async fn find_started(
+        &self,
+        environment_id: i32,
+        workflow: &str,
+        idempotency_key: &str,
+    ) -> WorkflowResult<Option<Uuid>> {
+        workflow_runs::Entity::find()
+            .select_only()
+            .column(workflow_runs::Column::Id)
+            .filter(workflow_runs::Column::EnvironmentId.eq(environment_id))
+            .filter(workflow_runs::Column::WorkflowName.eq(workflow))
+            .filter(workflow_runs::Column::IdempotencyKey.eq(idempotency_key))
+            .into_tuple::<Uuid>()
+            .one(self.db.as_ref())
+            .await
+            .map_err(WorkflowError::db(
+                "finding an already started workflow occurrence",
+            ))
+    }
+
+    async fn run_briefs(
+        &self,
+        environment_id: i32,
+        run_ids: &[Uuid],
+    ) -> WorkflowResult<Vec<RunBrief>> {
+        #[derive(FromQueryResult)]
+        struct Row {
+            id: Uuid,
+            workflow_name: String,
+            status: String,
+            error_kind: Option<String>,
+        }
+        if run_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = Row::find_by_statement(stmt(
+            "SELECT id, workflow_name, status, error_kind FROM workflow_runs \
+             WHERE environment_id = $1 AND id = ANY($2)",
+            vec![environment_id.into(), run_ids.to_vec().into()],
+        ))
+        .all(self.db.as_ref())
+        .await
+        .map_err(WorkflowError::db("reading the states of workflow runs"))?;
+        Ok(rows
+            .into_iter()
+            .map(|row| RunBrief {
+                id: row.id,
+                workflow_name: row.workflow_name,
+                status: row.status,
+                error_kind: row.error_kind,
+            })
+            .collect())
+    }
+
+    async fn active_by_workflow(&self, environment_id: i32) -> WorkflowResult<Vec<(String, i64)>> {
+        #[derive(FromQueryResult)]
+        struct Row {
+            workflow_name: String,
+            active: i64,
+        }
+        let rows = Row::find_by_statement(stmt(
+            &format!(
+                "SELECT workflow_name, count(*)::BIGINT AS active FROM workflow_runs \
+                 WHERE environment_id = $1 AND status NOT IN {TERMINAL} \
+                 GROUP BY workflow_name ORDER BY workflow_name LIMIT 1000"
+            ),
+            vec![environment_id.into()],
+        ))
+        .all(self.db.as_ref())
+        .await
+        .map_err(WorkflowError::db("counting active workflow runs"))?;
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.workflow_name, row.active))
+            .collect())
     }
 
     async fn workflow_summaries(
@@ -1480,6 +1781,7 @@ impl WorkflowStore for PgWorkflowStore {
     }
 
     async fn delete_expired_runs(&self, batch: u64) -> WorkflowResult<Vec<ExpiredRun>> {
+        self.clean_managed_journals().await?;
         #[derive(FromQueryResult)]
         struct Row {
             id: Uuid,

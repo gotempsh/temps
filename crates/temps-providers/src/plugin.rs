@@ -90,6 +90,12 @@ impl TempsPlugin for ProvidersPlugin {
             let external_service_manager =
                 Arc::new(external_service_manager.with_worker_credentials(worker_credentials));
             context.register_service(external_service_manager.clone());
+            let workflow_journal: Arc<dyn temps_core::workflow_journal::ManagedWorkflowJournal> =
+                Arc::new(crate::workflow_journal::PostgresWorkflowJournal::new(
+                    db.clone(),
+                    external_service_manager.clone(),
+                ));
+            context.register_service(workflow_journal);
 
             // Imports of external databases into managed services. Registered
             // on every process so the console can always explain whether an

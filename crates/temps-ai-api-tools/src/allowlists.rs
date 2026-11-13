@@ -852,6 +852,9 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     // which is withheld.
     "get_workflows_overview",
     "list_workflow_runs",
+    "list_all_workflow_runs",
+    "list_workflow_project_keys",
+    "list_workflow_grants",
     "get_workflow_run",
     "list_workflow_steps",
     "get_workflow_settings",

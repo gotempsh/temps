@@ -161,8 +161,15 @@ impl StepStatus {
 /// The settings in effect for an environment: its row, or the defaults.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct WorkflowSettings {
+    /// Managed PostgreSQL journal for new runs; existing runs keep their store.
+    #[serde(default)]
+    pub managed_store_service_id: Option<i32>,
     /// Compose service hosting the workflow handler; `None`: the main service.
     pub host_service: Option<String>,
+    /// Opt-in deploy drain: pause new invocations and wait for running attempts.
+    /// Zero disables it. Suspended runs resume on the new deployment.
+    #[serde(default)]
+    pub drain_timeout_secs: i32,
     pub invocation_deadline_secs: i32,
     pub lease_secs: i32,
     pub max_concurrent_runs: i32,
@@ -179,7 +186,9 @@ impl Default for WorkflowSettings {
     /// Mirrors the column defaults of `workflow_environment_settings`.
     fn default() -> Self {
         Self {
+            managed_store_service_id: None,
             host_service: None,
+            drain_timeout_secs: 0,
             invocation_deadline_secs: 900,
             lease_secs: 120,
             max_concurrent_runs: 50,
@@ -197,7 +206,9 @@ impl Default for WorkflowSettings {
 impl From<&workflow_environment_settings::Model> for WorkflowSettings {
     fn from(row: &workflow_environment_settings::Model) -> Self {
         Self {
+            managed_store_service_id: row.managed_store_service_id,
             host_service: row.host_service.clone(),
+            drain_timeout_secs: row.drain_timeout_secs,
             invocation_deadline_secs: row.invocation_deadline_secs,
             lease_secs: row.lease_secs,
             max_concurrent_runs: row.max_concurrent_runs,
@@ -224,6 +235,12 @@ impl WorkflowSettings {
             }
             Ok(())
         }
+        range(
+            "drain_timeout_secs",
+            self.drain_timeout_secs.into(),
+            0,
+            3600,
+        )?;
         if let Some(service) = &self.host_service {
             validate_name("host_service", service, 128)?;
         }

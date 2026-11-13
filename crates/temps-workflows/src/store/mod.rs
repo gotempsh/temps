@@ -13,6 +13,7 @@
 //! write carrying an older token than the run's is rejected, so a replica that
 //! lost its lease (network split, a slow container) cannot change the run.
 
+mod managed;
 mod postgres;
 #[cfg(test)]
 mod tests;
@@ -234,6 +235,15 @@ pub struct WorkflowSummary {
     pub last_run_at: Option<DateTime<Utc>>,
 }
 
+/// The few columns of a run another subsystem follows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunBrief {
+    pub id: Uuid,
+    pub workflow_name: String,
+    pub status: String,
+    pub error_kind: Option<String>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RunFilter {
     pub status: Option<RunStatus>,
@@ -242,6 +252,32 @@ pub struct RunFilter {
 
 #[async_trait]
 pub trait WorkflowStore: Send + Sync {
+    async fn begin_drain(&self, environment_id: i32, deployment_id: i32) -> WorkflowResult<Uuid>;
+    async fn renew_drain(&self, environment_id: i32, token: Uuid) -> WorkflowResult<u64>;
+    async fn end_drain(&self, environment_id: i32, token: Uuid) -> WorkflowResult<()>;
+
+    async fn grant(
+        &self,
+        source: i32,
+        target: i32,
+        action: &str,
+        resource: &str,
+    ) -> WorkflowResult<temps_entities::workflow_grants::Model>;
+    async fn grants(
+        &self,
+        target: i32,
+        page: u64,
+        page_size: u64,
+    ) -> WorkflowResult<(Vec<temps_entities::workflow_grants::Model>, u64)>;
+    async fn revoke_grant(&self, target: i32, grant_id: Uuid) -> WorkflowResult<bool>;
+    async fn has_grant(
+        &self,
+        source: i32,
+        target: i32,
+        action: &str,
+        resource: &str,
+    ) -> WorkflowResult<bool>;
+
     // ── Environments, settings, credentials ──────────────────────────
 
     /// The project an environment belongs to, if it exists.
@@ -388,6 +424,19 @@ pub trait WorkflowStore: Send + Sync {
         record: StepRecord,
         limits: StepLimits,
     ) -> WorkflowResult<StepRecordOutcome>;
+    /// Hydrate only the byte-bounded replay page, not every metadata row scanned.
+    async fn uses_managed_journal(&self, _run_id: Uuid) -> WorkflowResult<bool> {
+        Ok(false)
+    }
+
+    async fn hydrate_journal(
+        &self,
+        _run_id: Uuid,
+        rows: Vec<StepRow>,
+    ) -> WorkflowResult<Vec<StepRow>> {
+        Ok(rows)
+    }
+
     async fn journal(
         &self,
         run_id: Uuid,
@@ -398,7 +447,20 @@ pub trait WorkflowStore: Send + Sync {
 
     // ── Reads, metrics, retention ────────────────────────────────────
 
+    /// Bounded global scan ordered newest first. Authorization is applied before exposing rows.
+    async fn scan_runs(
+        &self,
+        filter: &RunFilter,
+        before: Option<(DateTime<Utc>, Uuid)>,
+        limit: u64,
+    ) -> WorkflowResult<Vec<RunRow>>;
     async fn get_run(&self, run_id: Uuid) -> WorkflowResult<Option<RunRow>>;
+    async fn find_started(
+        &self,
+        environment_id: i32,
+        workflow: &str,
+        idempotency_key: &str,
+    ) -> WorkflowResult<Option<Uuid>>;
     async fn list_runs(
         &self,
         environment_id: i32,
@@ -406,6 +468,15 @@ pub trait WorkflowStore: Send + Sync {
         page: u64,
         page_size: u64,
     ) -> WorkflowResult<(Vec<RunRow>, u64)>;
+    /// The runs of `run_ids` that exist in the environment.
+    async fn run_briefs(
+        &self,
+        environment_id: i32,
+        run_ids: &[Uuid],
+    ) -> WorkflowResult<Vec<RunBrief>>;
+    /// Unfinished runs per workflow in the environment, read from the
+    /// active-run index.
+    async fn active_by_workflow(&self, environment_id: i32) -> WorkflowResult<Vec<(String, i64)>>;
     async fn workflow_summaries(
         &self,
         environment_id: i32,

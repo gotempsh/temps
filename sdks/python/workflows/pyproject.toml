@@ -1,0 +1,16 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "temps-workflows"
+version = "0.1.0"
+description = "Durable workflow executor and client for Temps"
+requires-python = ">=3.11"
+dependencies = ["cryptography>=43"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["temps_workflows"]

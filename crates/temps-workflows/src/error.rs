@@ -16,6 +16,30 @@ use uuid::Uuid;
 
 #[derive(Debug, Error)]
 pub enum WorkflowError {
+    #[error(transparent)]
+    ManagedJournal(#[from] temps_core::workflow_journal::WorkflowJournalError),
+    #[error("Development tunnel of environment {environment_id}: {reason}")]
+    DevTunnel {
+        environment_id: i32,
+        reason: &'static str,
+    },
+    #[error("Workflow drain of environment {environment_id} is owned by another deployment or its lease expired")]
+    DrainLost { environment_id: i32 },
+
+    #[error("Environment {source_environment} has no grant to {action} '{resource}' in environment {target_environment}")]
+    GrantDenied {
+        source_environment: i32,
+        target_environment: i32,
+        action: &'static str,
+        resource: String,
+    },
+
+    #[error("Project {project_id} encryption key {key_id} is missing or shredded; its payloads cannot be decrypted")]
+    ProjectKeyUnavailable { project_id: i32, key_id: Uuid },
+
+    #[error("Could not authorize workflow listing for user {user_id:?}")]
+    ListingAccess { user_id: Option<i32> },
+
     #[error("Environment {environment_id} was not found in project {project_id}")]
     EnvironmentNotFound {
         project_id: i32,

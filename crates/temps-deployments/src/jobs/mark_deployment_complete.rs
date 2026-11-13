@@ -36,6 +36,8 @@ const WORKER_APPLY_TIMEOUT_SECS: u64 = temps_core::worker_sync::WORKER_SYNC_RECO
 
 mod paused_sweep;
 mod stop_grace;
+mod workflow_drain;
+mod workflow_warning;
 pub(crate) use paused_sweep::{
     deployment_still_swept, environment_lifecycle_lock, MAX_CONCURRENT_REPLICA_STOPS,
 };
@@ -141,6 +143,7 @@ pub struct MarkDeploymentCompleteJob {
     /// ADR 068 D5: whether anyone can open what was deployed. Empty in a
     /// binary without the ingress plugin.
     environment_addresses: Option<Arc<temps_core::environment_address::EnvironmentAddressSlot>>,
+    workflow_control: Option<Arc<dyn temps_core::WorkflowControl>>,
 }
 
 /// Longest the D5 reachability check may hold a finished deploy.
@@ -176,6 +179,7 @@ impl MarkDeploymentCompleteJob {
             encryption_service,
             workload_plane: None,
             environment_addresses: None,
+            workflow_control: None,
         }
     }
 
@@ -461,9 +465,15 @@ impl MarkDeploymentCompleteJob {
             environment_id, "Acquired environment lock"
         );
 
+        let drain = self
+            .drain_workflow_invocations(deployment.project_id, environment_id)
+            .await?;
         let result = self
-            .mark_complete_inner(context, &deployment, environment_id)
+            .mark_complete_inner(context, &deployment, environment_id, drain.as_ref())
             .await;
+        if let Some(drain) = drain {
+            drain.finish().await;
+        }
 
         // Lock is released when `_guard` is dropped (on all exit paths)
         drop(_guard);
@@ -491,7 +501,11 @@ impl MarkDeploymentCompleteJob {
         context: &WorkflowContext,
         deployment: &deployments::Model,
         environment_id: i32,
+        drain: Option<&workflow_drain::DrainGuard>,
     ) -> Result<MarkCompleteOutput, WorkflowError> {
+        self.warn_about_active_workflows(deployment.project_id, environment_id)
+            .await;
+
         // Update deployment with workflow outputs
         let mut active_deployment: deployments::ActiveModel = deployment.clone().into();
 
@@ -890,6 +904,9 @@ impl MarkDeploymentCompleteJob {
             "Rollback target resolved for route-table timeout"
         );
 
+        if let Some(drain) = drain {
+            drain.check().await?;
+        }
         if !self.promote_if_latest(self.deployment_id).await? {
             return Err(WorkflowError::JobExecutionFailed(format!(
                 "Deployment {} was cancelled or superseded before route promotion",
@@ -2949,6 +2966,7 @@ pub struct MarkDeploymentCompleteJobBuilder {
     encryption_service: Option<Arc<temps_core::EncryptionService>>,
     workload_plane: Option<Arc<temps_workload_plane::WorkloadPlane>>,
     environment_addresses: Option<Arc<temps_core::environment_address::EnvironmentAddressSlot>>,
+    workflow_control: Option<Arc<dyn temps_core::WorkflowControl>>,
 }
 
 impl MarkDeploymentCompleteJobBuilder {
@@ -2965,6 +2983,7 @@ impl MarkDeploymentCompleteJobBuilder {
             encryption_service: None,
             workload_plane: None,
             environment_addresses: None,
+            workflow_control: None,
         }
     }
 
@@ -3034,6 +3053,14 @@ impl MarkDeploymentCompleteJobBuilder {
         self
     }
 
+    pub fn workflow_control(
+        mut self,
+        control: Option<Arc<dyn temps_core::WorkflowControl>>,
+    ) -> Self {
+        self.workflow_control = control;
+        self
+    }
+
     pub fn build(self) -> Result<MarkDeploymentCompleteJob, WorkflowError> {
         let job_id = self
             .job_id
@@ -3073,6 +3100,7 @@ impl MarkDeploymentCompleteJobBuilder {
             job = job.with_log_service(log_service);
         }
         job = job.with_config_service(config_service);
+        job.workflow_control = self.workflow_control;
         if let Some(plane) = self.workload_plane {
             job = job.with_workload_plane(plane);
         }

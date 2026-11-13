@@ -69,6 +69,7 @@ pub struct InvokeRequest {
 
 /// One workflow the executor serves.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[schema(as=WorkflowManifestEntry)]
 pub struct ManifestWorkflow {
     pub name: String,
     /// Optional label of the workflow's code version.
@@ -81,6 +82,7 @@ pub struct ManifestWorkflow {
 
 /// `GET /.well-known/temps/workflows/manifest` response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[schema(as=WorkflowManifest)]
 pub struct Manifest {
     pub protocol_version: u32,
     #[serde(default)]

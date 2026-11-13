@@ -97,6 +97,8 @@ pub mod worker_ingress;
 pub mod worker_install;
 pub mod worker_shield;
 pub mod worker_sync;
+pub mod workflow_control;
+pub mod workflow_journal;
 pub use docker_handle::{
     worker_node_required_problem, DockerHandle, DockerUnavailable, CONTROL_PLANE_DOCKER_REASON,
     WORKER_NODE_REQUIRED_ERROR_CODE, WORKER_NODE_REQUIRED_REMEDY, WORKER_NODE_REQUIRED_TITLE,
@@ -212,6 +214,10 @@ pub use traces::{
     TraceSummaryDto,
 };
 pub use utils::*;
+pub use workflow_control::{
+    ActiveWorkflowRuns, StartedWorkflowRun, WorkflowControl, WorkflowControlError, WorkflowDrain,
+    WorkflowRunPhase, WorkflowRunState, WorkflowStart,
+};
 
 // Re-export external dependencies
 pub use anyhow;

@@ -19344,6 +19344,26 @@
         ],
         "type": "object"
       },
+      "CreateWorkflowGrantRequest": {
+        "properties": {
+          "action": {
+            "$ref": "#/components/schemas/WorkflowGrantAction"
+          },
+          "resource": {
+            "type": "string"
+          },
+          "source_environment_id": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "source_environment_id",
+          "action",
+          "resource"
+        ],
+        "type": "object"
+      },
       "CreatedRepositoryResponse": {
         "description": "The repository that was created. Carries no credentials.",
         "properties": {
@@ -19487,7 +19507,7 @@
             "type": "integer"
           },
           "state": {
-            "description": "`running | succeeded | failed | skipped` for a `job` run; absent\nfor an `http` call, whose outcome is `status_code`.",
+            "description": "`running | succeeded | failed | skipped` for a `job` or `workflow`\nrun; absent for an `http` call, whose outcome is `status_code`.",
             "type": [
               "string",
               "null"
@@ -19499,6 +19519,14 @@
           },
           "url": {
             "type": "string"
+          },
+          "workflow_run_id": {
+            "description": "The durable workflow run a `workflow` cron started.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "workload_id": {
             "description": "The workload the `job` run executed as.",
@@ -19550,12 +19578,16 @@
             "format": "int32",
             "type": "integer"
           },
+          "has_workflow_input": {
+            "description": "Whether a `workflow` cron gives its runs an input (set in\n`.temps.yaml`).",
+            "type": "boolean"
+          },
           "id": {
             "format": "int32",
             "type": "integer"
           },
           "mode": {
-            "description": "`http` (a GET to `path` on the running deployment) or `job`\n(`command` run in the environment's image until it exits). For a\n`job`, `path` is the cron's key, `job:<name>`.",
+            "description": "`http` (a GET to `path` on the running deployment), `job`\n(`command` run in the environment's image until it exits) or\n`workflow` (a run of the durable workflow `workflow` started). For a\n`job`, `path` is the cron's key, `job:<name>`; for a `workflow`,\n`workflow:<name>`.",
             "example": "http",
             "type": "string"
           },
@@ -19606,6 +19638,13 @@
           },
           "updated_at": {
             "type": "string"
+          },
+          "workflow": {
+            "description": "The durable workflow a `workflow` cron starts. Absent otherwise.",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -19618,7 +19657,8 @@
           "updated_at",
           "mode",
           "concurrency_policy",
-          "retry_limit"
+          "retry_limit",
+          "has_workflow_input"
         ],
         "type": "object"
       },
@@ -36008,6 +36048,26 @@
           "data",
           "total",
           "windows"
+        ],
+        "type": "object"
+      },
+      "GlobalWorkflowRunsResponse": {
+        "properties": {
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "runs": {
+            "items": {
+              "$ref": "#/components/schemas/WorkflowRunResponse"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "runs"
         ],
         "type": "object"
       },
@@ -69242,6 +69302,19 @@
         ],
         "type": "object"
       },
+      "ShredWorkflowKeyRequest": {
+        "properties": {
+          "confirm_key_id": {
+            "description": "Exact key UUID, confirming that its retained payloads become unreadable.",
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "confirm_key_id"
+        ],
+        "type": "object"
+      },
       "SiblingRef": {
         "description": "A sibling project that shares the same `trace_id` and has opted in to\ncross-project trace sharing (`cross_project_trace_sharing = TRUE`).\n\nReturned by `CrossProjectTraceService::find_sibling_projects` and exposed\nby the Phase 1 `GET /otel/traces/cross-project/{trace_id}` endpoint.",
         "properties": {
@@ -83092,6 +83165,85 @@
         ],
         "type": "object"
       },
+      "WorkflowDevPollResponse": {
+        "properties": {
+          "request": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/WorkflowDevRequest"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "WorkflowDevReply": {
+        "properties": {
+          "outcome": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/WorkflowOutcomeRequest"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "status": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "type": "object"
+      },
+      "WorkflowDevRequest": {
+        "properties": {
+          "body": {
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "token": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "token",
+          "body"
+        ],
+        "type": "object"
+      },
+      "WorkflowDevSessionResponse": {
+        "properties": {
+          "expires_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "manifest_token": {
+            "type": "string"
+          },
+          "session_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "manifest_token",
+          "expires_at"
+        ],
+        "type": "object"
+      },
       "WorkflowDryRunRequest": {
         "properties": {
           "cpu_limit": {
@@ -83198,6 +83350,86 @@
         "required": [
           "configured",
           "replicas"
+        ],
+        "type": "object"
+      },
+      "WorkflowGrantAction": {
+        "enum": [
+          "start",
+          "event"
+        ],
+        "type": "string"
+      },
+      "WorkflowGrantListResponse": {
+        "properties": {
+          "grants": {
+            "items": {
+              "$ref": "#/components/schemas/WorkflowGrantResponse"
+            },
+            "type": "array"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total_pages": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "grants",
+          "page",
+          "page_size",
+          "total",
+          "total_pages"
+        ],
+        "type": "object"
+      },
+      "WorkflowGrantResponse": {
+        "properties": {
+          "action": {
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "resource": {
+            "type": "string"
+          },
+          "source_environment_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "target_environment_id": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "source_environment_id",
+          "target_environment_id",
+          "action",
+          "resource",
+          "created_at"
         ],
         "type": "object"
       },
@@ -83321,6 +83553,61 @@
         },
         "required": [
           "entries"
+        ],
+        "type": "object"
+      },
+      "WorkflowManifest": {
+        "description": "`GET /.well-known/temps/workflows/manifest` response.",
+        "properties": {
+          "protocol_version": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "sdk": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "workflows": {
+            "items": {
+              "$ref": "#/components/schemas/WorkflowManifestEntry"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "protocol_version",
+          "workflows"
+        ],
+        "type": "object"
+      },
+      "WorkflowManifestEntry": {
+        "description": "One workflow the executor serves.",
+        "properties": {
+          "concurrency": {
+            "description": "Runs of this workflow allowed to execute at once in the environment.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "version": {
+            "description": "Optional label of the workflow's code version.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "name"
         ],
         "type": "object"
       },
@@ -83507,6 +83794,68 @@
         },
         "required": [
           "status"
+        ],
+        "type": "object"
+      },
+      "WorkflowProjectKeyResponse": {
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "shredded_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "created_at"
+        ],
+        "type": "object"
+      },
+      "WorkflowProjectKeysResponse": {
+        "properties": {
+          "keys": {
+            "items": {
+              "$ref": "#/components/schemas/WorkflowProjectKeyResponse"
+            },
+            "type": "array"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total_pages": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "keys",
+          "page",
+          "page_size",
+          "total",
+          "total_pages"
         ],
         "type": "object"
       },
@@ -83783,6 +84132,11 @@
       "WorkflowSettings": {
         "description": "The settings in effect for an environment: its row, or the defaults.",
         "properties": {
+          "drain_timeout_secs": {
+            "description": "Opt-in deploy drain: pause new invocations and wait for running attempts.\nZero disables it. Suspended runs resume on the new deployment.",
+            "format": "int32",
+            "type": "integer"
+          },
           "host_service": {
             "description": "Compose service hosting the workflow handler; `None`: the main service.",
             "type": [
@@ -83801,6 +84155,14 @@
           "lease_secs": {
             "format": "int32",
             "type": "integer"
+          },
+          "managed_store_service_id": {
+            "description": "Managed PostgreSQL journal for new runs; existing runs keep their store.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "max_active_runs": {
             "format": "int32",
@@ -153336,6 +153698,363 @@
         ]
       }
     },
+    "/projects/{project_id}/environments/{environment_id}/workflows/dev": {
+      "post": {
+        "operationId": "open_workflow_dev",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowDevSessionResponse"
+                }
+              }
+            },
+            "description": "Development tunnel operation completed"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Requires workflow write and payload access"
+          },
+          "409": {
+            "description": "Session unavailable"
+          },
+          "413": {
+            "description": "Message too large"
+          },
+          "500": {
+            "description": "Database failure"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Workflows"
+        ]
+      }
+    },
+    "/projects/{project_id}/environments/{environment_id}/workflows/dev/{session_id}": {
+      "delete": {
+        "operationId": "close_workflow_dev",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Development tunnel operation completed"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Requires workflow write and payload access"
+          },
+          "409": {
+            "description": "Session unavailable"
+          },
+          "413": {
+            "description": "Message too large"
+          },
+          "500": {
+            "description": "Database failure"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Workflows"
+        ]
+      },
+      "put": {
+        "operationId": "configure_workflow_dev",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkflowManifest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Development tunnel operation completed"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Requires workflow write and payload access"
+          },
+          "409": {
+            "description": "Session unavailable"
+          },
+          "413": {
+            "description": "Message too large"
+          },
+          "500": {
+            "description": "Database failure"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Workflows"
+        ]
+      }
+    },
+    "/projects/{project_id}/environments/{environment_id}/workflows/dev/{session_id}/poll": {
+      "post": {
+        "operationId": "poll_workflow_dev",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowDevPollResponse"
+                }
+              }
+            },
+            "description": "Development tunnel operation completed"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Requires workflow write and payload access"
+          },
+          "409": {
+            "description": "Session unavailable"
+          },
+          "413": {
+            "description": "Message too large"
+          },
+          "500": {
+            "description": "Database failure"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Workflows"
+        ]
+      }
+    },
+    "/projects/{project_id}/environments/{environment_id}/workflows/dev/{session_id}/requests/{request_id}": {
+      "post": {
+        "operationId": "respond_workflow_dev",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkflowDevReply"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Development tunnel operation completed"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Requires workflow write and payload access"
+          },
+          "409": {
+            "description": "Session unavailable"
+          },
+          "413": {
+            "description": "Message too large"
+          },
+          "500": {
+            "description": "Database failure"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Workflows"
+        ]
+      }
+    },
     "/projects/{project_id}/environments/{environment_id}/workflows/events": {
       "post": {
         "operationId": "send_workflow_event",
@@ -153399,6 +154118,218 @@
           },
           "500": {
             "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Workflows"
+        ]
+      }
+    },
+    "/projects/{project_id}/environments/{environment_id}/workflows/grants": {
+      "get": {
+        "operationId": "list_workflow_grants",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "1-indexed page number. Defaults to 1.",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Items per page. Defaults to 20, capped at 100.",
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowGrantListResponse"
+                }
+              }
+            },
+            "description": "Incoming grants"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Environment not found"
+          },
+          "500": {
+            "description": "Database failure"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Workflows"
+        ]
+      },
+      "post": {
+        "operationId": "create_workflow_grant",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateWorkflowGrantRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowGrantResponse"
+                }
+              }
+            },
+            "description": "Grant created or already exists"
+          },
+          "400": {
+            "description": "Invalid grant"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Environment not found"
+          },
+          "500": {
+            "description": "Database failure"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Workflows"
+        ]
+      }
+    },
+    "/projects/{project_id}/environments/{environment_id}/workflows/grants/{grant_id}": {
+      "delete": {
+        "operationId": "revoke_workflow_grant",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "path",
+            "name": "grant_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Grant revoked; in-flight authorized operations may finish"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Environment not found"
+          },
+          "500": {
+            "description": "Database failure"
           }
         },
         "security": [
@@ -164417,6 +165348,142 @@
           "Webhook Deliveries"
         ],
         "x-maturity": "beta"
+      }
+    },
+    "/projects/{project_id}/workflow-keys": {
+      "get": {
+        "operationId": "list_workflow_project_keys",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "1-indexed page number. Defaults to 1.",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Items per page. Defaults to 20, capped at 100.",
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowProjectKeysResponse"
+                }
+              }
+            },
+            "description": "Key metadata only; never wrapped key material"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Database failure"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Workflows"
+        ]
+      }
+    },
+    "/projects/{project_id}/workflow-keys/{key_id}/shred": {
+      "post": {
+        "operationId": "shred_workflow_project_key",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "path",
+            "name": "key_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ShredWorkflowKeyRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Wrapped key erased; new payloads get a new key. Backups may retain the old key."
+          },
+          "400": {
+            "description": "Confirmation mismatch"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "410": {
+            "description": "Key unavailable"
+          },
+          "500": {
+            "description": "Database failure"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Workflows"
+        ]
       }
     },
     "/projects/{project_id}/workflows/dry-run": {
@@ -178154,6 +179221,95 @@
         ]
       }
     },
+    "/workflows/runs": {
+      "get": {
+        "operationId": "list_all_workflow_runs",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/WorkflowRunStatus"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "workflow",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GlobalWorkflowRunsResponse"
+                }
+              }
+            },
+            "description": "Authorized runs across projects, newest first"
+          },
+          "400": {
+            "description": "Invalid cursor"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Access or database failure"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Workflows"
+        ]
+      }
+    },
     "/workflows/v1/events": {
       "post": {
         "operationId": "app_send_workflow_event",
@@ -178223,6 +179379,153 @@
         ],
         "tags": [
           "Workflow Executor"
+        ]
+      }
+    },
+    "/workflows/v1/projects/{project_id}/environments/{environment_id}/events": {
+      "post": {
+        "operationId": "app_send_granted_event",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SendWorkflowEventRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SendWorkflowEventResponse"
+                }
+              }
+            },
+            "description": "Event delivered through grant"
+          },
+          "400": {
+            "description": "Invalid event"
+          },
+          "401": {
+            "description": "Invalid credential"
+          },
+          "403": {
+            "description": "Grant required"
+          },
+          "413": {
+            "description": "Payload too large"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Workflow App API"
+        ]
+      }
+    },
+    "/workflows/v1/projects/{project_id}/environments/{environment_id}/runs": {
+      "post": {
+        "operationId": "app_start_granted_workflow",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StartWorkflowRunRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AppStartWorkflowRunResponse"
+                }
+              }
+            },
+            "description": "Idempotent replay"
+          },
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AppStartWorkflowRunResponse"
+                }
+              }
+            },
+            "description": "Started through grant"
+          },
+          "400": {
+            "description": "Invalid input"
+          },
+          "401": {
+            "description": "Invalid credential"
+          },
+          "403": {
+            "description": "Grant required"
+          },
+          "413": {
+            "description": "Payload too large"
+          },
+          "429": {
+            "description": "Quota exceeded"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Workflow App API"
         ]
       }
     },

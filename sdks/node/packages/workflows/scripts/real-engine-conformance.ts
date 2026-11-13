@@ -15,6 +15,7 @@
  */
 
 import { createServer } from 'node:http';
+import { remoteFixtures } from './remote-fixtures.js';
 
 import { toNodeListener } from '../src/adapters.js';
 import { WorkflowsClient } from '../src/client.js';
@@ -32,11 +33,15 @@ function required(name: string): string {
 const control = required('TEMPS_TEST_CONTROL_URL');
 const port = Number(required('EXECUTOR_PORT'));
 const client = new WorkflowsClient();
+const remote = process.env.TEMPS_FIXTURE_URL ? await remoteFixtures(process.env.TEMPS_FIXTURE_URL) : undefined;
 
 async function controlCall<T>(path: string, method: 'GET' | 'POST' = 'POST'): Promise<T> {
+  await remote?.flush();
   const response = await fetch(`${control}${path}`, { method });
   if (!response.ok) throw new Error(`control ${path} failed with ${response.status}: ${await response.text()}`);
-  return (await response.json()) as T;
+  const value = (await response.json()) as T;
+  await remote?.refresh();
+  return value;
 }
 
 const target: ConformanceTarget = {
@@ -67,15 +72,15 @@ const target: ConformanceTarget = {
   },
 };
 
-const fixtures = createConformanceFixtures();
-const handler = createWorkflowHandler({ workflows: fixtures.workflows, tracer: false, heartbeatMs: 1000 });
+const fixtures = remote?.fixtures ?? createConformanceFixtures();
+const handler = remote?.handler ?? createWorkflowHandler({ workflows: fixtures.workflows, tracer: false, heartbeatMs: 1000 });
 const server = createServer((request, response) => void toNodeListener(handler)(request, response));
-await new Promise<void>((resolve) => server.listen(port, '127.0.0.1', resolve));
+if (!remote) await new Promise<void>((resolve) => server.listen(port, '127.0.0.1', resolve));
 
 let passed = 0;
 let failed = 0;
 for (const testCase of conformanceCases) {
-  fixtures.reset();
+  await fixtures.reset();
   const started = Date.now();
   try {
     await testCase.run(target, fixtures, handler);
@@ -87,5 +92,6 @@ for (const testCase of conformanceCases) {
   }
 }
 console.log(`conformance: passed=${passed} failed=${failed}`);
-server.close();
+if (!remote) server.close();
+remote?.close();
 process.exit(failed === 0 ? 0 : 1);

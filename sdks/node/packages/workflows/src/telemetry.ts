@@ -34,6 +34,8 @@ export interface ErrorTracker {
 }
 
 export interface TelemetryOptions {
+  /** Omit application error messages/stacks from telemetry (enabled by app-held codecs). */
+  redactErrors?: boolean;
   /** A tracer; `false` disables tracing. Default: `@opentelemetry/api`'s, if installed. */
   tracer?: TracerLike | false;
   errorTracker?: ErrorTracker;
@@ -79,8 +81,8 @@ export class Telemetry {
         const value = await fn();
         return { value, traceId: recorded };
       } catch (error) {
-        if (error instanceof Error) span.recordException(error);
-        span.setStatus({ code: SPAN_STATUS_ERROR, message: error instanceof Error ? error.name : 'error' });
+        if (error instanceof Error) span.recordException(this.options.redactErrors ? new Error('Workflow step failed') : error);
+        span.setStatus({ code: SPAN_STATUS_ERROR, message: this.options.redactErrors ? 'Error' : error instanceof Error ? error.name : 'error' });
         throw Object.assign(new StepAttemptError(error), { traceId: recorded });
       } finally {
         span.end();
@@ -93,7 +95,7 @@ export class Telemetry {
     const tracker = this.options.errorTracker;
     if (!tracker) return undefined;
     try {
-      const id = await tracker.captureException(error, {
+      const id = await tracker.captureException(this.options.redactErrors ? new Error('Workflow step failed') : error, {
         tags: {
           'workflow.name': context.workflow,
           'workflow.step': context.step,

@@ -14,7 +14,11 @@
 
 mod app;
 pub mod audit;
+mod dev;
 mod executor;
+mod global;
+mod grants;
+mod keys;
 mod management;
 #[cfg(test)]
 mod tests;
@@ -39,12 +43,21 @@ pub use types::WorkflowsAppState;
 use types::*;
 
 use app::*;
+use dev::*;
 use executor::*;
+use global::*;
+use grants::*;
+use keys::*;
 use management::*;
 
 #[derive(OpenApi)]
 #[openapi(
     paths(
+        open_workflow_dev,configure_workflow_dev,close_workflow_dev,poll_workflow_dev,respond_workflow_dev,
+        list_workflow_grants,create_workflow_grant,revoke_workflow_grant,app_start_granted_workflow,app_send_granted_event,
+        list_workflow_project_keys,
+        shred_workflow_project_key,
+        list_all_workflow_runs,
         get_workflows_overview,
         list_workflow_runs,
         start_workflow_run,
@@ -71,6 +84,12 @@ use management::*;
         app_send_workflow_event,
     ),
     components(schemas(
+        crate::dev::DevSessionResponse,crate::dev::DevPollResponse,crate::dev::DevRequest,crate::dev::DevReply,crate::protocol::Manifest,crate::protocol::ManifestWorkflow,
+        grants::CreateWorkflowGrantRequest,grants::WorkflowGrantResponse,grants::WorkflowGrantListResponse,crate::service::WorkflowGrantAction,
+        keys::WorkflowProjectKeyResponse,
+        keys::WorkflowProjectKeysResponse,
+        keys::ShredWorkflowKeyRequest,
+        global::GlobalWorkflowRunsResponse,
         WorkflowsOverviewResponse,
         ExecutorCapabilityResponse,
         CredentialStatusResponse,
@@ -119,6 +138,36 @@ const RUNS: &str = "/projects/{project_id}/environments/{environment_id}/workflo
 /// Authenticated management routes.
 pub fn configure_routes() -> Router<Arc<WorkflowsAppState>> {
     Router::new()
+        .route(
+            &format!("{RUNS}/grants"),
+            get(list_workflow_grants).post(create_workflow_grant),
+        )
+        .route(
+            &format!("{RUNS}/grants/{{grant_id}}"),
+            axum::routing::delete(revoke_workflow_grant),
+        )
+        .route(
+            "/projects/{project_id}/workflow-keys",
+            get(list_workflow_project_keys),
+        )
+        .route(
+            "/projects/{project_id}/workflow-keys/{key_id}/shred",
+            post(shred_workflow_project_key),
+        )
+        .route(&format!("{RUNS}/dev"), post(open_workflow_dev))
+        .route(
+            &format!("{RUNS}/dev/{{session_id}}"),
+            axum::routing::put(configure_workflow_dev).delete(close_workflow_dev),
+        )
+        .route(
+            &format!("{RUNS}/dev/{{session_id}}/poll"),
+            post(poll_workflow_dev),
+        )
+        .route(
+            &format!("{RUNS}/dev/{{session_id}}/requests/{{request_id}}"),
+            post(respond_workflow_dev),
+        )
+        .route("/workflows/runs", get(list_all_workflow_runs))
         .route(RUNS, get(get_workflows_overview))
         .route(
             &format!("{RUNS}/runs"),
@@ -165,6 +214,14 @@ pub fn configure_routes() -> Router<Arc<WorkflowsAppState>> {
 /// credential inside each handler, not by the session middleware.
 pub fn configure_public_routes() -> Router<Arc<WorkflowsAppState>> {
     Router::new()
+        .route(
+            "/workflows/v1/projects/{project_id}/environments/{environment_id}/runs",
+            post(app_start_granted_workflow),
+        )
+        .route(
+            "/workflows/v1/projects/{project_id}/environments/{environment_id}/events",
+            post(app_send_granted_event),
+        )
         .route("/workflows/v1/invocation-key", get(get_invocation_key))
         .route("/workflow-runs/{run_id}/journal", get(get_run_journal))
         .route("/workflow-runs/{run_id}/steps", post(record_run_step))
@@ -178,6 +235,23 @@ pub fn configure_public_routes() -> Router<Arc<WorkflowsAppState>> {
 impl From<WorkflowError> for Problem {
     fn from(error: WorkflowError) -> Self {
         let (status, title) = match &error {
+            WorkflowError::ManagedJournal(_) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Managed Journal Unavailable",
+            ),
+            WorkflowError::DevTunnel { .. } => (
+                StatusCode::CONFLICT,
+                "Workflow Development Tunnel Unavailable",
+            ),
+            WorkflowError::DrainLost { .. } => (StatusCode::CONFLICT, "Workflow Drain Lease Lost"),
+            WorkflowError::GrantDenied { .. } => (StatusCode::FORBIDDEN, "Workflow Grant Required"),
+            WorkflowError::ProjectKeyUnavailable { .. } => {
+                (StatusCode::GONE, "Project Encryption Key Unavailable")
+            }
+            WorkflowError::ListingAccess { .. } => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Project Access Check Failed",
+            ),
             WorkflowError::EnvironmentNotFound { .. } => {
                 (StatusCode::NOT_FOUND, "Environment Not Found")
             }

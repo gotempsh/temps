@@ -285,9 +285,11 @@ impl From<StepRow> for WorkflowStepResponse {
             kind: StepKind::parse(&step.kind).unwrap_or(StepKind::Step),
             status: StepStatus::parse(&step.status).unwrap_or(StepStatus::Pending),
             attempts: step.attempts,
-            has_result: step.result_encrypted.is_some() || step.result_blob_key.is_some(),
+            has_result: step.result_bytes > 0
+                || step.result_encrypted.is_some()
+                || step.result_blob_key.is_some(),
             result_bytes: step.result_bytes,
-            has_error: step.error_encrypted.is_some(),
+            has_error: step.error_bytes > 0 || step.error_encrypted.is_some(),
             wake_at: step.wake_at,
             duration_ms: step.duration_ms,
             trace_id: step.trace_id,

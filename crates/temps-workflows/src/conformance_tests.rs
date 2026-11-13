@@ -41,6 +41,8 @@ use crate::store::{PgWorkflowStore, WorkflowStore};
 use crate::test_support::test_environment;
 use crate::token::InvocationSigner;
 
+mod rust_fixture;
+
 const SDK_DIR: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../sdks/node/packages/workflows"
@@ -201,6 +203,38 @@ fn free_port() -> u16 {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_sdk_conforms_against_the_real_engine() {
+    run_conformance("typescript").await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn python_sdk_conforms_against_the_real_engine() {
+    run_conformance("python").await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn go_sdk_conforms_against_the_real_engine() {
+    run_conformance("go").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rust_sdk_conforms_against_the_real_engine() {
+    run_conformance("rust").await;
+}
+
+async fn run_conformance(language: &str) {
+    let available = match language {
+        "python" => std::process::Command::new("python3")
+            .args(["-c", "import cryptography"])
+            .status()
+            .is_ok_and(|s| s.success()),
+        "go" => std::process::Command::new("go")
+            .arg("version")
+            .status()
+            .is_ok_and(|s| s.success()),
+        _ => true,
+    };
+    if !available {
+        println!("{language} SDK test dependencies unavailable; skipping conformance");
+        return;
+    }
     if !bun_available() {
         println!("bun is not installed, skipping the real-engine conformance suite");
         return;
@@ -271,7 +305,57 @@ async fn the_sdk_conforms_against_the_real_engine() {
     let api = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
 
-    let child = tokio::process::Command::new("bun")
+    let rust_fixture = if language == "rust" {
+        Some(rust_fixture::start(&format!("{api}/api"), &credential.token, executor_port).await)
+    } else {
+        None
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut fixture = if language == "python" {
+        let mut command = tokio::process::Command::new("python3");
+        command
+            .arg("tests/conformance_server.py")
+            .current_dir(root.join("sdks/python/workflows"))
+            .env("PYTHONPATH", root.join("sdks/python/workflows"));
+        Some(command)
+    } else if language == "go" {
+        let binary = temp.path().join("go-workflow-fixtures");
+        let built = tokio::time::timeout(
+            Duration::from_secs(90),
+            tokio::process::Command::new("go")
+                .args(["build", "-o"])
+                .arg(&binary)
+                .arg("./internal/conformance")
+                .current_dir(root.join("sdks/go/workflows"))
+                .kill_on_drop(true)
+                .status(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(built.success(), "Go conformance fixture must build");
+        Some(tokio::process::Command::new(binary))
+    } else {
+        None
+    };
+    let _fixture = fixture.as_mut().map(|command| {
+        command
+            .env("TEMPS_API_URL", format!("{api}/api"))
+            .env("TEMPS_WORKFLOWS_TOKEN", &credential.token)
+            .env("EXECUTOR_PORT", executor_port.to_string())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap()
+    });
+    let mut driver = tokio::process::Command::new("bun");
+    if fixture.is_some() || rust_fixture.is_some() {
+        driver.env(
+            "TEMPS_FIXTURE_URL",
+            format!("http://127.0.0.1:{executor_port}"),
+        );
+    }
+    let child = driver
         .args(["run", "scripts/real-engine-conformance.ts"])
         .current_dir(SDK_DIR)
         .env("TEMPS_API_URL", format!("{api}/api"))
@@ -288,6 +372,9 @@ async fn the_sdk_conforms_against_the_real_engine() {
         .expect("the conformance suite finishes within 4 minutes")
         .unwrap();
     server.abort();
+    if let Some(fixture) = rust_fixture {
+        fixture.abort();
+    }
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     println!("{stdout}");

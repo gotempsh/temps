@@ -99,6 +99,7 @@ members = [
     "crates/temps-kv",
     "crates/temps-flags",
     "crates/temps-workflows",
+    "crates/temps-workflows-sdk",
     "crates/temps-service-access",
     "crates/temps-service-access-runtime",
     "crates/temps-ingress",

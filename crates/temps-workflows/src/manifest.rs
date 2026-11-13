@@ -78,8 +78,15 @@ impl ManifestCache {
         set: &ExecutorEndpointSet,
     ) -> Result<Arc<Manifest>, String> {
         let now = Instant::now();
+        // A local developer can hot-reload without a deployment ID changing.
+        // Read its bounded persisted manifest on each invocation, including on
+        // control planes other than the one that accepted the update.
+        let development = set
+            .endpoints
+            .iter()
+            .any(|endpoint| endpoint.base_url.starts_with("dev://"));
         if let Some(entry) = self.read().get(&environment_id) {
-            if entry.fresh(set.deployment_id, now) {
+            if !development && entry.fresh(set.deployment_id, now) {
                 return entry.result.clone();
             }
         }

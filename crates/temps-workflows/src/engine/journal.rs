@@ -298,7 +298,16 @@ impl WorkflowEngine {
         let outcome = match self.store.record_step(record, limits).await {
             Ok(outcome) => outcome,
             Err(error) => {
-                self.codec.discard(run.project_id, &result).await;
+                // An uncertain remote commit may already reference this blob.
+                // Keep it until run retention rather than break crash recovery.
+                if !self
+                    .store
+                    .uses_managed_journal(run.id)
+                    .await
+                    .unwrap_or(true)
+                {
+                    self.codec.discard(run.project_id, &result).await;
+                }
                 return Err(error);
             }
         };

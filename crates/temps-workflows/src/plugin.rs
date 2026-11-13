@@ -65,6 +65,7 @@ impl TempsPlugin for WorkflowsPlugin {
     fn required_services(&self) -> Vec<RequiredService> {
         vec![
             RequiredService::of::<DatabaseConnection>(),
+            RequiredService::of::<dyn temps_core::workflow_journal::ManagedWorkflowJournal>(),
             RequiredService::of::<EncryptionService>(),
             RequiredService::of::<dyn ExecutorEndpoints>(),
             RequiredService::of::<dyn ProjectMetricsSink>(),
@@ -88,10 +89,23 @@ impl TempsPlugin for WorkflowsPlugin {
                 tracing::info!("blob storage is not available: workflow payloads are limited to the inline size");
             }
 
-            let store: Arc<dyn WorkflowStore> = Arc::new(PgWorkflowStore::new(db.clone()));
-            let codec = Arc::new(PayloadCodec::new(encryption.clone(), blobs));
+            let store: Arc<dyn WorkflowStore> = Arc::new(PgWorkflowStore::new(db.clone()).with_managed_journal(context.require_service::<dyn temps_core::workflow_journal::ManagedWorkflowJournal>()));
+            let codec = Arc::new(
+                PayloadCodec::new(encryption.clone(), blobs).with_project_keys(Arc::new(
+                    crate::project_keys::ProjectKeys::new(db.clone(), encryption.clone()),
+                )),
+            );
             let signer = Arc::new(InvocationSigner::new(&encryption));
             let metrics = Arc::new(WorkflowMetrics::new(sink));
+            let dev = Arc::new(crate::dev::DevTunnel::new(
+                db.clone(),
+                encryption.clone(),
+                signer.clone(),
+            ));
+            let endpoints = Arc::new(crate::dev::DevEndpoints {
+                tunnel: dev.clone(),
+                deployed: endpoints,
+            });
             let client =
                 ExecutorClient::new().map_err(|error| PluginError::PluginRegistrationFailed {
                     plugin_name: "workflows".into(),
@@ -102,15 +116,18 @@ impl TempsPlugin for WorkflowsPlugin {
                 codec.clone(),
                 signer.clone(),
                 endpoints,
-                client,
+                client.with_dev(dev.clone()),
                 metrics.clone(),
             ));
-            let service = Arc::new(WorkflowService::new(
-                store.clone(),
-                engine.clone(),
-                codec.clone(),
-                metrics.clone(),
-            ));
+            let service = Arc::new(
+                WorkflowService::new(
+                    store.clone(),
+                    engine.clone(),
+                    codec.clone(),
+                    metrics.clone(),
+                )
+                .with_dev(dev),
+            );
             let listen_pool = match db.as_ref() {
                 DatabaseConnection::SqlxPostgresPoolConnection(_) => {
                     Some(db.get_postgres_connection_pool().clone())
@@ -118,6 +135,9 @@ impl TempsPlugin for WorkflowsPlugin {
                 // Not Postgres (tests on a mock): poll only.
                 _ => None,
             };
+            let control: Arc<dyn temps_core::WorkflowControl> = Arc::new(
+                crate::control::WorkflowControlService::new(service.clone(), store.clone()),
+            );
             let scheduler = Arc::new(WorkflowScheduler::new(
                 engine.clone(),
                 store,
@@ -131,6 +151,7 @@ impl TempsPlugin for WorkflowsPlugin {
             context.register_service(engine);
             context.register_service(service);
             context.register_service(scheduler);
+            context.register_service(control);
             tracing::debug!("workflows plugin services registered");
             Ok(())
         })

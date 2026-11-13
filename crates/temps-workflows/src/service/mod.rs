@@ -6,6 +6,11 @@
 //! environment and checks that the environment belongs to the project, and
 //! that a run belongs to the environment, before anything else.
 
+mod dev;
+mod global;
+mod grants;
+pub use global::GlobalRuns;
+pub use grants::WorkflowGrantAction;
 #[cfg(test)]
 mod tests;
 
@@ -121,6 +126,7 @@ impl std::fmt::Debug for IssuedCredential {
 }
 
 pub struct WorkflowService {
+    dev: Option<Arc<crate::dev::DevTunnel>>,
     store: Arc<dyn WorkflowStore>,
     engine: Arc<WorkflowEngine>,
     codec: Arc<PayloadCodec>,
@@ -135,6 +141,7 @@ impl WorkflowService {
         metrics: Arc<WorkflowMetrics>,
     ) -> Self {
         Self {
+            dev: None,
             store,
             engine,
             codec,
@@ -251,6 +258,21 @@ impl WorkflowService {
                 sdk: None,
             },
         }
+    }
+
+    pub async fn project_key_history(
+        &self,
+        project_id: i32,
+        page: u64,
+        page_size: u64,
+    ) -> WorkflowResult<(Vec<temps_entities::workflow_project_keys::Model>, u64)> {
+        self.codec
+            .project_key_history(project_id, page, page_size)
+            .await
+    }
+
+    pub async fn shred_project_key(&self, project_id: i32, key_id: Uuid) -> WorkflowResult<()> {
+        self.codec.shred_project_key(project_id, key_id).await
     }
 
     // ── Runs ─────────────────────────────────────────────────────────

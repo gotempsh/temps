@@ -2279,6 +2279,17 @@ impl WorkflowPlanner {
         // NOT required for deployment completion - if they fail, deployment still succeeds
         if has_git_info || is_uploaded_source {
             jobs.push(JobDefinition {
+                job_id: "deployment_workflows".into(),
+                job_type: "DeploymentWorkflowsJob".into(),
+                name: "Start Deployment Workflows".into(),
+                description: Some(
+                    "Start deploymentWorkflows from .temps.yaml; retries reuse run IDs".into(),
+                ),
+                dependencies: vec!["mark_deployment_complete".into()],
+                job_config: Some(serde_json::json!({"download_job_id":source_job_id})),
+                required_for_completion: false,
+            });
+            jobs.push(JobDefinition {
                 job_id: "configure_crons".to_string(),
                 job_type: "ConfigureCronsJob".to_string(),
                 name: "Configure Cron Jobs".to_string(),
@@ -4066,6 +4077,13 @@ mod tests {
             assert_eq!(alerts.job_type, "ConfigureMetricAlertsJob");
             assert_reads_temps_yaml_from(alerts, "prepare_source_bundle");
 
+            let workflows = planned_job(&jobs, "deployment_workflows")
+                .expect("deployment workflows must be planned");
+            assert_reads_temps_yaml_from(workflows, "prepare_source_bundle");
+            assert_eq!(
+                workflows.job_config.as_ref().unwrap()["_required_for_completion"],
+                false
+            );
             // Agent definitions are synced from a git repository only.
             assert!(planned_job(&jobs, "configure_agents").is_none());
         }
@@ -4102,7 +4120,11 @@ mod tests {
             .await?;
 
         assert!(planned_job(&jobs, "prepare_source_bundle").is_none());
-        for id in ["configure_crons", "configure_metric_alerts"] {
+        for id in [
+            "configure_crons",
+            "configure_metric_alerts",
+            "deployment_workflows",
+        ] {
             let job = planned_job(&jobs, id).unwrap_or_else(|| panic!("{id} must be planned"));
             assert_reads_temps_yaml_from(job, "download_repo");
         }

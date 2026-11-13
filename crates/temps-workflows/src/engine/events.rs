@@ -281,7 +281,14 @@ impl WorkflowEngine {
                 Ok(false)
             }
             Err(error) => {
-                self.codec.discard(waiting.project_id, &sealed).await;
+                if !self
+                    .store
+                    .uses_managed_journal(waiting.run_id)
+                    .await
+                    .unwrap_or(true)
+                {
+                    self.codec.discard(waiting.project_id, &sealed).await;
+                }
                 Err(error)
             }
         }

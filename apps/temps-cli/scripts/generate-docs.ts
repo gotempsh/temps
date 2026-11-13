@@ -16,6 +16,7 @@
  */
 
 import { Command } from 'commander'
+import { registerDurableWorkflowCommands } from '../src/commands/workflows/index.js'
 import { registerProjectsCommands } from '../src/commands/projects/index.js'
 import { registerDeployCommands } from '../src/commands/deploy/index.js'
 import { registerDomainsCommands } from '../src/commands/domains/index.js'
@@ -359,7 +360,8 @@ async function main() {
     .version('0.0.0')
 
   // Register all commands
-  registerProjectsCommands(program)
+  registerDurableWorkflowCommands(program)
+registerProjectsCommands(program)
   registerDeployCommands(program)
   registerDomainsCommands(program)
   registerEnvironmentsCommands(program)

@@ -13,6 +13,8 @@
 
 #[cfg(test)]
 mod conformance_tests;
+pub mod control;
+pub mod dev;
 #[cfg(test)]
 mod e2e_docker_tests;
 pub mod engine;
@@ -23,6 +25,7 @@ pub mod manifest;
 pub mod metrics;
 pub mod payload;
 pub mod plugin;
+mod project_keys;
 pub mod protocol;
 pub mod scheduler;
 pub mod service;

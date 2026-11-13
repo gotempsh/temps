@@ -60,6 +60,7 @@ import { serviceTemplateDeployOverrides } from '@/lib/template-runtime-defaults'
 import { ProjectSpeedInsights } from '@/components/project/ProjectSpeedInsights'
 import { ProjectStorage } from '@/components/project/ProjectStorage'
 import CronMonitors from './CronMonitors'
+import { EnvironmentWorkflows } from './workflows/EnvironmentWorkflows'
 import { CronJobs, MovedToCheckIns } from './CronJobs'
 import ProjectFeedback from './ProjectFeedback'
 import TelemetryReleases from './TelemetryReleases'
@@ -950,6 +951,10 @@ export function ProjectDetail() {
                 <Route
                   path="errors/feedback/*"
                   element={<ProjectFeedback project={project} />}
+                />
+                <Route
+                  path="durable-workflows"
+                  element={<EnvironmentWorkflows project={project} />}
                 />
                 <Route
                   path="cron-jobs"

@@ -54,6 +54,9 @@ hex.workspace = true
 base64.workspace = true
 
 [dev-dependencies]
+temps-workflows-sdk = { path = "../temps-workflows-sdk" }
+tempfile.workspace = true
+sea-orm-migration.workspace = true
 tokio = { workspace = true, features = ["test-util", "macros"] }
 tower.workspace = true
 temps-test-utils = { path = "../temps-test-utils" }
