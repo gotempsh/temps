@@ -366,9 +366,9 @@ pub async fn container_using_image(
         .map(|container| container.id.unwrap_or_else(|| "<unknown>".to_string())))
 }
 
-/// Most labelled images one listing keeps, oldest first. Docker cannot page
-/// an image listing, so this bounds what a caller holds, not what the daemon
-/// sends; the rest are counted in [`LabelledImages::unlisted`].
+/// Most labelled images one listing keeps, oldest first; the rest are
+/// counted in [`LabelledImages::unlisted`]. The listing is read as a stream,
+/// so this bounds what is held while it is read, not only what is returned.
 pub const MAX_LABELLED_IMAGES: usize = 1000;
 
 /// An image carrying the label a listing asked for.
@@ -418,48 +418,11 @@ pub fn page_labelled_images(
     after: Option<&ListCursor>,
     max: usize,
 ) -> LabelledImages {
-    let (images, unlisted) = select_page(images, after, max, |image| {
-        (image.created, image.image_id.as_str())
-    });
-    LabelledImages {
-        next: next_cursor(&images, unlisted),
-        images,
-        unlisted,
+    let mut page = listing::PageCollector::new(after, max);
+    for image in images {
+        page.offer(image);
     }
-}
-
-/// The page of `items` after `after`, oldest first by `position`, at most
-/// `max` long, and how many further items were left out. Works in place:
-/// the items before the cursor and past the page are dropped before the
-/// caller converts anything, so what it builds is bounded by `max`.
-fn select_page<T>(
-    mut items: Vec<T>,
-    after: Option<&ListCursor>,
-    max: usize,
-    position: impl Fn(&T) -> (i64, &str),
-) -> (Vec<T>, usize) {
-    if let Some(after) = after {
-        let start = (after.created, after.image_id.as_str());
-        items.retain(|item| position(item) > start);
-    }
-    let unlisted = items.len().saturating_sub(max);
-    if unlisted > 0 && max > 0 {
-        items.select_nth_unstable_by(max - 1, |a, b| position(a).cmp(&position(b)));
-    }
-    items.truncate(max);
-    items.sort_unstable_by(|a, b| position(a).cmp(&position(b)));
-    (items, unlisted)
-}
-
-/// Where the page after `images` starts, when `unlisted` images remain.
-fn next_cursor(images: &[LabelledImage], unlisted: usize) -> Option<ListCursor> {
-    (unlisted > 0)
-        .then(|| images.last())
-        .flatten()
-        .map(|last| ListCursor {
-            created: last.created,
-            image_id: last.image_id.clone(),
-        })
+    page.finish()
 }
 
 /// Images carrying every `key=value` of `labels` after `after`, oldest
@@ -468,10 +431,10 @@ fn next_cursor(images: &[LabelledImage], unlisted: usize) -> Option<ListCursor> 
 /// With `check_usage`, each kept image is also checked for a container
 /// created from it (one query per image).
 ///
-/// Docker cannot page or limit an image listing, so its whole answer is
-/// read: callers narrow it with the labels (the orphan sweep asks for one
-/// deleted project's images of one install), and the page bounds what is
-/// built and returned from it.
+/// Docker cannot page or limit an image listing, so its answer is read as
+/// a stream and only the page is held: at most [`MAX_LABELLED_IMAGES`]
+/// images and one entry being read, however many images match on the
+/// daemon (see the `listing` module).
 pub async fn list_labelled_images(
     docker: &Docker,
     labels: &[(&str, &str)],
@@ -479,51 +442,9 @@ pub async fn list_labelled_images(
     check_usage: bool,
     after: Option<&ListCursor>,
 ) -> Result<LabelledImages, DockerUtilError> {
-    let images = docker
-        .list_images(Some(bollard::query_parameters::ListImagesOptions {
-            all: false,
-            filters: Some(HashMap::from([(
-                "label".to_string(),
-                labels
-                    .iter()
-                    .map(|(key, value)| format!("{key}={value}"))
-                    .collect(),
-            )])),
-            ..Default::default()
-        }))
-        .await
-        .map_err(|source| DockerUtilError::ImageInventory {
-            operation: "list labelled images",
-            source,
-        })?;
-    // Narrow the answer to the page before converting anything, so what is
-    // built and handed on is bounded by MAX_LABELLED_IMAGES.
-    let (images, unlisted) = select_page(images, after, MAX_LABELLED_IMAGES, |image| {
-        (image.created, image.id.as_str())
-    });
-    let images: Vec<LabelledImage> = images
-        .into_iter()
-        .map(|image| LabelledImage {
-            image_id: image.id,
-            tags: image
-                .repo_tags
-                .into_iter()
-                .filter(|tag| tag != "<none>:<none>")
-                .collect(),
-            labels: image
-                .labels
-                .into_iter()
-                .filter(|(label, _)| label.starts_with(keep_prefix))
-                .collect(),
-            created: image.created,
-            in_use_by: None,
-        })
-        .collect();
-    let mut page = LabelledImages {
-        next: next_cursor(&images, unlisted),
-        images,
-        unlisted,
-    };
+    let mut page =
+        listing::stream_labelled_images(docker, labels, keep_prefix, after, MAX_LABELLED_IMAGES)
+            .await?;
     if check_usage {
         for image in &mut page.images {
             image.in_use_by = match container_using_image(docker, &image.image_id).await {
@@ -740,6 +661,8 @@ async fn remove_by_id(docker: &Docker, reference: &str, image_id: String) -> Ima
         },
     }
 }
+
+mod listing;
 
 #[cfg(test)]
 mod tests;

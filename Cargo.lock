@@ -13705,6 +13705,8 @@ dependencies = [
  "bollard",
  "bytes",
  "futures",
+ "http 1.5.0",
+ "percent-encoding",
  "serde",
  "serde_json",
  "tar",

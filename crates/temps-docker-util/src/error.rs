@@ -125,6 +125,27 @@ pub enum DockerUtilError {
         source: DockerError,
     },
 
+    /// Docker's answer to an image listing is not the JSON array of images
+    /// its API documents (`reason` says how), so nothing is listed from it.
+    #[error("Docker's image listing is not a JSON array of images (at byte {offset}): {reason}")]
+    ImageListingMalformed { offset: u64, reason: &'static str },
+
+    /// One entry of Docker's image listing could not be read as an image.
+    #[error("Docker's image listing has an entry at byte {offset} that is not an image: {source}")]
+    ImageListingEntry {
+        offset: u64,
+        #[source]
+        source: serde_json::Error,
+    },
+
+    /// One entry of Docker's image listing is larger than the reader holds,
+    /// so the listing is refused rather than read into memory.
+    #[error(
+        "Docker's image listing has an entry at byte {offset} larger than {max_bytes} bytes; \
+         refusing to hold it"
+    )]
+    ImageListingEntryTooLarge { offset: u64, max_bytes: usize },
+
     /// More images were passed to one removal call than it accepts.
     #[error("Refusing to remove {requested} images in one call; at most {max} are accepted")]
     ImageBatchTooLarge { requested: usize, max: usize },
@@ -157,6 +178,9 @@ impl DockerUtilError {
             | Self::ImageInventory { source, .. } => Ok(source),
             other @ (Self::ExecTimedOut { .. }
             | Self::ImageBatchTooLarge { .. }
+            | Self::ImageListingMalformed { .. }
+            | Self::ImageListingEntry { .. }
+            | Self::ImageListingEntryTooLarge { .. }
             | Self::ExecCancelled { .. }
             | Self::PullStalled { .. }
             | Self::PullTimedOut { .. }
@@ -188,6 +212,9 @@ impl DockerUtilError {
             Self::ExecTimedOut { .. }
             | Self::ExecCancelled { .. }
             | Self::ImageBatchTooLarge { .. }
+            | Self::ImageListingMalformed { .. }
+            | Self::ImageListingEntry { .. }
+            | Self::ImageListingEntryTooLarge { .. }
             | Self::UploadSource { .. }
             | Self::UploadInvalidName { .. }
             | Self::UploadStalled { .. }
