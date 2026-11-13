@@ -998,35 +998,7 @@ impl ExternalServiceHealthMonitor {
         &self,
         s3_source: &s3_sources::Model,
     ) -> Result<S3Credentials, HealthMonitorError> {
-        let decrypt_failed =
-            |credential: &'static str, error: String| HealthMonitorError::S3CredentialDecryption {
-                s3_source_id: s3_source.id,
-                credential,
-                reason: error,
-            };
-        let access_key_id = self
-            .encryption_service
-            .decrypt_string(&s3_source.access_key_id)
-            .map_err(|e| decrypt_failed("access key", e.to_string()))?;
-        let secret_key = self
-            .encryption_service
-            .decrypt_string(&s3_source.secret_key)
-            .map_err(|e| decrypt_failed("secret key", e.to_string()))?;
-
-        let session_token =
-            temps_entities::s3_sources::decrypt_session_token(&self.encryption_service, s3_source)
-                .map_err(|e| decrypt_failed("session token", e.to_string()))?;
-
-        Ok(S3Credentials {
-            access_key_id,
-            secret_key,
-            session_token,
-            region: s3_source.region.clone(),
-            endpoint: s3_source.endpoint.clone(),
-            bucket_name: s3_source.bucket_name.clone(),
-            bucket_path: s3_source.bucket_path.clone(),
-            force_path_style: s3_source.effective_path_style(false).force_path_style,
-        })
+        s3_credentials_from_source(&self.encryption_service, s3_source)
     }
 
     /// Ship the closed binary logs of `service`, a MariaDB on worker
@@ -1487,6 +1459,46 @@ fn lifecycle_probe(status: &str) -> LifecycleProbe {
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
+
+/// Decrypt an `s3_sources` row into the `S3Credentials` the binary-log
+/// archiver uploads with.
+///
+/// An unset `force_path_style` means path style, as it does for every other
+/// client built from a source (the backup engines, WAL-G, the S3 source
+/// response), so binary logs reach the same store the same way its backups
+/// do.
+fn s3_credentials_from_source(
+    encryption_service: &EncryptionService,
+    s3_source: &s3_sources::Model,
+) -> Result<S3Credentials, HealthMonitorError> {
+    let decrypt_failed =
+        |credential: &'static str, error: String| HealthMonitorError::S3CredentialDecryption {
+            s3_source_id: s3_source.id,
+            credential,
+            reason: error,
+        };
+    let access_key_id = encryption_service
+        .decrypt_string(&s3_source.access_key_id)
+        .map_err(|e| decrypt_failed("access key", e.to_string()))?;
+    let secret_key = encryption_service
+        .decrypt_string(&s3_source.secret_key)
+        .map_err(|e| decrypt_failed("secret key", e.to_string()))?;
+
+    let session_token =
+        temps_entities::s3_sources::decrypt_session_token(encryption_service, s3_source)
+            .map_err(|e| decrypt_failed("session token", e.to_string()))?;
+
+    Ok(S3Credentials {
+        access_key_id,
+        secret_key,
+        session_token,
+        region: s3_source.region.clone(),
+        endpoint: s3_source.endpoint.clone(),
+        bucket_name: s3_source.bucket_name.clone(),
+        bucket_path: s3_source.bucket_path.clone(),
+        force_path_style: s3_source.effective_path_style(true).force_path_style,
+    })
+}
 
 #[cfg(test)]
 mod tests;
