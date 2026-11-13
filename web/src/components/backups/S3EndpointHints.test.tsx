@@ -41,6 +41,25 @@ describe('S3PathStyleField', () => {
     expect(html).toContain('Forced: the endpoint is an IP address')
   })
 
+  test('a forced box stays locked when it is already ticked', () => {
+    for (const props of [
+      { endpoint: '10.0.0.5:9000', managedObjectStore: false },
+      { endpoint: 'https://objects.example.com', managedObjectStore: true },
+    ]) {
+      const html = renderToStaticMarkup(
+        <S3PathStyleField
+          id="ps"
+          checked={true}
+          onCheckedChange={() => {}}
+          {...props}
+        />
+      )
+      expect(html).toContain('data-state="checked"')
+      expect(html).toContain('disabled')
+      expect(html).toContain('Forced:')
+    }
+  })
+
   test('a hostname leaves the box to the operator', () => {
     const html = renderToStaticMarkup(
       <S3PathStyleField

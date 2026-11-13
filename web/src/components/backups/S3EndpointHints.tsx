@@ -57,8 +57,14 @@ export function S3PathStyleField({
   onCheckedChange: (checked: boolean) => void
   managedObjectStore?: boolean
 }) {
-  const effective = previewPathStyle(endpoint, checked, managedObjectStore)
-  const forced = effective.reason !== 'configured'
+  // Whether the endpoint forces path style is decided without the
+  // operator's value: a box already ticked on an IP endpoint is still
+  // locked, so it can never be unticked into a value that cannot apply.
+  const constraint = previewPathStyle(endpoint, false, managedObjectStore)
+  const forced = constraint.reason !== 'configured'
+  const effective = forced
+    ? constraint
+    : previewPathStyle(endpoint, checked, managedObjectStore)
   return (
     <Label htmlFor={id} className="flex items-center space-x-2">
       <Checkbox
