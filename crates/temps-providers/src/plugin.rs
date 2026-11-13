@@ -126,6 +126,30 @@ impl TempsPlugin for ProvidersPlugin {
             // left to retry against an absent daemon. The HTTP surface stays
             // registered so the console can still list what exists and explain
             // why provisioning is unavailable here.
+            // The healthcheck overrides every managed container is created
+            // with, loaded before routes serve so no create races them. Also
+            // on a process without local workloads: the workload specs of
+            // worker databases are computed here. Reads only rows with an
+            // override, so a default install reads none. Kept current after
+            // that, so what another process sharing the database saves
+            // reaches the containers this one creates.
+            let healthcheck_defaults = Arc::new(crate::services::HealthcheckDefaultsService::new(
+                context.require_service::<temps_config::ConfigService>(),
+                external_service_manager.clone(),
+            ));
+            match healthcheck_defaults.reload_registry().await {
+                Ok(services) => {
+                    tracing::info!(services, "Loaded managed service healthcheck overrides")
+                }
+                Err(error) => tracing::error!(
+                    error = %error,
+                    "Could not load the managed service healthcheck overrides; new containers \
+                     use the instance default until the healthcheck listener reads them"
+                ),
+            }
+            healthcheck_defaults.spawn_registry_sync();
+            context.register_service(healthcheck_defaults);
+
             if !local_workloads.local_workloads_enabled() {
                 tracing::info!(
                     profile = local_workloads.profile(),
@@ -351,15 +375,25 @@ impl TempsPlugin for ProvidersPlugin {
             crate::handlers::workload_handlers::configure_routes().with_state(app_state.clone());
         let server_tls_routes =
             crate::handlers::server_tls_handlers::configure_routes().with_state(app_state.clone());
-        let archive_target_routes =
-            crate::handlers::archive_target_handlers::configure_routes().with_state(app_state);
+        let archive_target_routes = crate::handlers::archive_target_handlers::configure_routes()
+            .with_state(app_state.clone());
+        let healthcheck_defaults =
+            context.require_service::<crate::services::HealthcheckDefaultsService>();
+        let healthcheck_routes = crate::handlers::healthcheck_handlers::configure_routes()
+            .with_state(Arc::new(
+                crate::handlers::healthcheck_handlers::HealthcheckState {
+                    app: app_state,
+                    defaults: healthcheck_defaults,
+                },
+            ));
 
         let router = providers_routes
             .merge(pg_stat_routes)
             .merge(data_import_routes)
             .merge(workload_routes)
             .merge(server_tls_routes)
-            .merge(archive_target_routes);
+            .merge(archive_target_routes)
+            .merge(healthcheck_routes);
         Some(PluginRoutes::new(router))
     }
 
@@ -376,9 +410,18 @@ impl TempsPlugin for ProvidersPlugin {
         let server_tls = <ServerTlsApiDoc as OpenApiTrait>::openapi();
         use crate::handlers::archive_target_handlers::ArchiveTargetApiDoc;
         let archive_target = <ArchiveTargetApiDoc as OpenApiTrait>::openapi();
+        use crate::handlers::healthcheck_handlers::HealthcheckApiDoc;
+        let healthcheck = <HealthcheckApiDoc as OpenApiTrait>::openapi();
         Some(merge_openapi_schemas(
             base,
-            vec![pg_stat, data_import, workload, server_tls, archive_target],
+            vec![
+                pg_stat,
+                data_import,
+                workload,
+                server_tls,
+                archive_target,
+                healthcheck,
+            ],
         ))
     }
 }

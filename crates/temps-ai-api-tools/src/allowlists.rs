@@ -148,6 +148,11 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     // private key is ever returned.
     "get_service_tls",
     "get_managed_ca_certificate",
+    // Docker healthcheck timings of a managed service's container and the
+    // instance default: whole seconds and counts, nothing sensitive. Lets
+    // the assistant explain why a container is checked as often as it is.
+    "get_service_healthcheck",
+    "get_healthcheck_defaults",
     // ── Agentic follow-up reads: what a change did, and what to do next ──
     "list_container_history",
     "tail_deployment_job_logs",
@@ -1143,6 +1148,11 @@ pub const AI_WRITE_ALLOWLIST: &[&str] = &[
     "NodeMetricsCreateAlertRule",
     "NodeMetricsUpdateAlertRule",
     "update_service_log_ingestion",
+    // Healthcheck timings: validated integers, nothing running changes until
+    // the container is recreated. Recreating it now (`apply_service_healthcheck`)
+    // restarts the database and stays out.
+    "update_service_healthcheck",
+    "update_healthcheck_defaults",
     "kv_enable",
     "kv_update",
     "blob_update",

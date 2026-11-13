@@ -85,7 +85,10 @@ const FINGERPRINT_LINE_PREFIX: &str = "TEMPSFP:";
 const FINGERPRINT_DONE: &str = "TEMPSFP_DONE";
 
 /// Engines whose containers Temps manages and may need to replace.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
+#[serde(rename_all = "lowercase")]
 pub enum ManagedEngine {
     Postgres,
     Redis,

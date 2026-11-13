@@ -39,8 +39,8 @@ use serde::{Deserialize, Serialize};
 use temps_workload::{
     labels as workload_labels, Artifact, Attachments, EnvSpec, InstanceLimits, InstanceSpec,
     Isolation, Lifetime, LogRotation, NetworkAttachment, PlacementSpec, PortBinding, PortProtocol,
-    PortSpec, Probe, ProbeKind, Probes, Process, ResourceAmounts, Resources, RestartPolicy,
-    SecretRef, SecurityProfile, VolumeMount, WorkloadKind, WorkloadRef, WorkloadSpec,
+    PortSpec, Probes, Process, ResourceAmounts, Resources, RestartPolicy, SecretRef,
+    SecurityProfile, VolumeMount, WorkloadKind, WorkloadRef, WorkloadSpec,
 };
 use temps_workload_docker::{data_container_create_body, ContainerShape, DataExtras};
 use temps_workload_plane::{admit_data_service, AdmissionInput, AdmissionPolicy, Owner};
@@ -141,10 +141,9 @@ impl DatabaseEngine {
         }
     }
 
-    /// The engine's healthcheck, as §13 probes: readiness is the check,
-    /// startup the grace period. The values are the control-plane engines'.
-    pub fn probes(self, env: &BTreeMap<String, String>) -> Probes {
-        let (script, period, timeout, failures, grace, grace_period) = match self {
+    /// The engine's healthcheck command for a container with `env`.
+    pub fn healthcheck_script(self, env: &BTreeMap<String, String>) -> String {
+        match self {
             Self::Postgres => {
                 let user = env
                     .get("POSTGRES_USER")
@@ -152,51 +151,26 @@ impl DatabaseEngine {
                     .unwrap_or("postgres");
                 // The image creates POSTGRES_DB, defaulting to the user.
                 let database = env.get("POSTGRES_DB").map(String::as_str).unwrap_or(user);
-                (
-                    crate::externalsvc::naming::postgres_healthcheck_cmd(user, database),
-                    1,
-                    3,
-                    3,
-                    30,
-                    1,
-                )
+                crate::externalsvc::naming::postgres_healthcheck_cmd(user, database)
             }
-            Self::Redis => ("redis-cli ping".to_string(), 1, 3, 3, 5, 1),
-            Self::Mongodb => (
-                crate::externalsvc::naming::HEALTHCHECK_COMMAND.to_string(),
-                2,
-                10,
-                5,
-                45,
-                2,
-            ),
-            Self::Mariadb => (
+            Self::Redis => "redis-cli ping".to_string(),
+            Self::Mongodb => crate::externalsvc::naming::HEALTHCHECK_COMMAND.to_string(),
+            Self::Mariadb => {
                 "mariadb-admin ping -h 127.0.0.1 -uroot -p\"$MARIADB_ROOT_PASSWORD\" --silent"
-                    .to_string(),
-                1,
-                3,
-                5,
-                30,
-                1,
-            ),
-        };
-        let exec = ProbeKind::Exec {
-            command: vec!["/bin/sh".to_string(), "-c".to_string(), script],
-        };
-        Probes {
-            startup: Some(Probe {
-                initial_delay_secs: grace,
-                period_secs: grace_period,
-                ..Probe::new(exec.clone())
-            }),
-            readiness: Some(Probe {
-                period_secs: period,
-                timeout_secs: timeout,
-                failure_threshold: failures,
-                ..Probe::new(exec)
-            }),
-            liveness: None,
+                    .to_string()
+            }
         }
+    }
+
+    /// The engine's healthcheck, as §13 probes: readiness is the check,
+    /// startup the grace period. The timings are the ones every managed
+    /// container of this engine gets (`crate::healthcheck`).
+    pub fn probes(self, env: &BTreeMap<String, String>, service_id: i32) -> Probes {
+        crate::healthcheck::managed_probes(
+            self.managed_engine(),
+            service_id,
+            self.healthcheck_script(env),
+        )
     }
 }
 
@@ -719,7 +693,7 @@ pub fn database_workload_spec(
             app_protocol: Default::default(),
         }],
         network: Default::default(),
-        probes: identity.engine.probes(&probe_env),
+        probes: identity.engine.probes(&probe_env, identity.service_id),
         placement: PlacementSpec {
             // Node 0 is the control plane, as in the node list.
             nodes: Some(vec![identity.node_id.unwrap_or(0)]),
@@ -809,6 +783,60 @@ impl DatabaseWorkloadPlan {
         };
         if let Lifetime::LongRunning { restart } = &mut self.spec.lifetime {
             *restart = kept;
+        }
+    }
+
+    /// Keep the healthcheck timings the running container was created with,
+    /// rather than the ones this process would resolve: a worker's agent
+    /// rebuilds a database from its inspected container and has no copy of
+    /// the control plane's healthcheck overrides (#1877). A daemon below API
+    /// 1.44 stores no `StartInterval` and checks at `Interval` from the
+    /// start, so that is the start interval kept: the spec's would lower the
+    /// interval to it on such a daemon (`healthcheck::probes_for_daemon`). A
+    /// container without a healthcheck leaves them all.
+    pub fn keep_healthcheck(&mut self, existing: &ContainerInspectResponse) {
+        let Some(health) = existing
+            .config
+            .as_ref()
+            .and_then(|config| config.healthcheck.as_ref())
+            .filter(|health| {
+                health
+                    .test
+                    .as_ref()
+                    .and_then(|test| test.first())
+                    .is_some_and(|first| first != "NONE")
+            })
+        else {
+            return;
+        };
+        let secs = |nanos: Option<i64>| {
+            nanos
+                .and_then(|nanos| u32::try_from(nanos / 1_000_000_000).ok())
+                .filter(|secs| *secs > 0)
+        };
+        let interval = secs(health.interval);
+        let probes = &mut self.spec.probes;
+        if let Some(startup) = probes.startup.as_mut() {
+            // Docker leaves a start period of 0 out.
+            startup.initial_delay_secs = secs(health.start_period).unwrap_or(0);
+            if let Some(start_interval) = secs(health.start_interval).or(interval) {
+                startup.period_secs = start_interval;
+            }
+        }
+        if let Some(readiness) = probes.readiness.as_mut() {
+            if let Some(interval) = interval {
+                readiness.period_secs = interval;
+            }
+            if let Some(timeout) = secs(health.timeout) {
+                readiness.timeout_secs = timeout;
+            }
+            if let Some(retries) = health
+                .retries
+                .and_then(|retries| u32::try_from(retries).ok())
+                .filter(|retries| *retries > 0)
+            {
+                readiness.failure_threshold = retries;
+            }
         }
     }
 
@@ -1189,6 +1217,84 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_rebuilt_container_keeps_its_own_healthcheck() {
+        use bollard::models::{ContainerConfig, HealthConfig};
+        let process = DatabaseProcess::from_remote_params(DatabaseEngine::Redis, &redis_params());
+        let admitted = DatabaseWorkloadPlan::admit(
+            &identity(DatabaseEngine::Redis, "redis-orders", Some(3)),
+            &process,
+        )
+        .unwrap();
+        let health_of = |plan: &DatabaseWorkloadPlan| {
+            let values = process.secret_values();
+            database_create_body(plan, SecretValues::Resolved(&values), &Default::default())
+                .unwrap()
+                .healthcheck
+                .unwrap()
+        };
+        let existing = |health: Option<HealthConfig>| ContainerInspectResponse {
+            config: Some(ContainerConfig {
+                healthcheck: health,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        const S: i64 = 1_000_000_000;
+        // Created by the control plane with this service's overrides.
+        let overridden = HealthConfig {
+            test: Some(vec!["CMD-SHELL".into(), "redis-cli ping".into()]),
+            interval: Some(60 * S),
+            timeout: Some(7 * S),
+            retries: Some(4),
+            start_period: Some(40 * S),
+            start_interval: Some(3 * S),
+        };
+        let mut plan = admitted.clone();
+        plan.keep_healthcheck(&existing(Some(overridden.clone())));
+        let kept = health_of(&plan);
+        assert_eq!(kept.interval, Some(60 * S));
+        assert_eq!(kept.timeout, Some(7 * S));
+        assert_eq!(kept.retries, Some(4));
+        assert_eq!(kept.start_period, Some(40 * S));
+        assert_eq!(kept.start_interval, Some(3 * S));
+        // The command is the spec's, not copied from the container.
+        assert_eq!(kept.test, health_of(&admitted).test);
+
+        // A daemon below API 1.44 stored no start interval and no zero start
+        // period. It checked at the interval from the start, and the rebuilt
+        // container keeps that cadence there rather than the spec's 2s start
+        // interval; the start period is 0.
+        let mut plan = admitted.clone();
+        plan.keep_healthcheck(&existing(Some(HealthConfig {
+            start_interval: None,
+            start_period: None,
+            ..overridden
+        })));
+        let kept = health_of(&plan);
+        assert_eq!(kept.interval, Some(60 * S));
+        assert_eq!(kept.start_interval, Some(60 * S));
+        assert_eq!(kept.start_period.unwrap_or(0), 0);
+        let on_old_daemon = crate::healthcheck::probes_for_daemon(
+            &plan.spec.probes,
+            crate::healthcheck::StartIntervalSupport::Unsupported,
+        );
+        assert_eq!(on_old_daemon.readiness.map(|p| p.period_secs), Some(60));
+
+        // Nothing to keep: the spec's healthcheck.
+        for none in [
+            None,
+            Some(HealthConfig {
+                test: Some(vec!["NONE".into()]),
+                ..Default::default()
+            }),
+        ] {
+            let mut plan = admitted.clone();
+            plan.keep_healthcheck(&existing(none));
+            assert_eq!(health_of(&plan), health_of(&admitted));
+        }
+    }
+
     /// ADR 093: an enforced create rebuilds the container from its spec, so
     /// the spec must carry the TLS fingerprint the engine labels it with, or
     /// every start sees certificate drift and recreates the database.
@@ -1303,15 +1409,22 @@ mod tests {
             health.test,
             Some(vec!["CMD-SHELL".into(), "redis-cli ping".into()])
         );
-        assert_eq!(health.start_period, Some(5_000_000_000));
+        // The shared managed-service cadence (`crate::healthcheck`).
+        assert_eq!(health.interval, Some(30_000_000_000));
+        assert_eq!(health.start_interval, Some(2_000_000_000));
+        assert_eq!(health.start_period, Some(90_000_000_000));
     }
 
     #[test]
     fn a_postgres_healthcheck_uses_the_configured_user_and_database() {
-        let probes = DatabaseEngine::Postgres.probes(&BTreeMap::from([
-            ("POSTGRES_USER".to_string(), "app".to_string()),
-            ("POSTGRES_DB".to_string(), "shop".to_string()),
-        ]));
+        let probes = DatabaseEngine::Postgres.probes(
+            &BTreeMap::from([
+                ("POSTGRES_USER".to_string(), "app".to_string()),
+                ("POSTGRES_DB".to_string(), "shop".to_string()),
+            ]),
+            // No override is registered for this id.
+            -1,
+        );
         let health = temps_workload_docker::data::healthcheck(&probes).unwrap();
         assert_eq!(
             health.test,
@@ -1321,12 +1434,14 @@ mod tests {
             ])
         );
         assert_eq!(health.retries, Some(3));
-        assert_eq!(health.start_period, Some(30_000_000_000));
+        assert_eq!(health.interval, Some(30_000_000_000));
+        assert_eq!(health.start_interval, Some(2_000_000_000));
+        assert_eq!(health.start_period, Some(120_000_000_000));
         // Without POSTGRES_DB the image's database is the user's.
-        let probes = DatabaseEngine::Postgres.probes(&BTreeMap::from([(
-            "POSTGRES_USER".to_string(),
-            "app".to_string(),
-        )]));
+        let probes = DatabaseEngine::Postgres.probes(
+            &BTreeMap::from([("POSTGRES_USER".to_string(), "app".to_string())]),
+            -1,
+        );
         let health = temps_workload_docker::data::healthcheck(&probes).unwrap();
         assert_eq!(
             health.test.unwrap()[1],

@@ -4855,6 +4855,17 @@
               "null"
             ]
           },
+          "managed_service_healthchecks": {
+            "$ref": "#/components/schemas/ManagedServiceHealthcheckSettings",
+            "default": {
+              "interval_secs": null,
+              "retries": null,
+              "start_interval_secs": null,
+              "start_period_secs": null,
+              "timeout_secs": null
+            },
+            "description": "Instance-wide defaults for the Docker healthcheck of managed service\ncontainers. Owned by `PUT /external-services/healthcheck-defaults`,\nwhich validates and audits them; the generic settings update\npreserves the stored value. Unset values use Temps' built-in timings."
+          },
           "mcp_server": {
             "$ref": "#/components/schemas/McpServerSettings",
             "default": {
@@ -6000,6 +6011,35 @@
         "required": [
           "plan_id",
           "option"
+        ],
+        "type": "object"
+      },
+      "ApplyServiceHealthcheckResponse": {
+        "description": "After `apply`: the container was recreated with these timings.",
+        "properties": {
+          "applied": {
+            "$ref": "#/components/schemas/HealthcheckTimings",
+            "description": "As this host's Docker got them: below API 1.44 the interval is the\nstart interval."
+          },
+          "healthcheck": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ServiceHealthcheck",
+                "description": "The service's healthcheck as it is now. `null` when it could not be\nread back; the recreate still succeeded, so read it again rather than\napplying again."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "service_id": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "service_id",
+          "applied"
         ],
         "type": "object"
       },
@@ -27939,6 +27979,35 @@
         ],
         "type": "object"
       },
+      "EngineHealthcheckDefault": {
+        "description": "What a service of one engine inherits.",
+        "properties": {
+          "builtin": {
+            "$ref": "#/components/schemas/HealthcheckTimings",
+            "description": "Temps' own timings for the engine."
+          },
+          "effective": {
+            "$ref": "#/components/schemas/ResolvedHealthcheck",
+            "description": "What a service without overrides gets, and where each value comes from."
+          },
+          "engine": {
+            "$ref": "#/components/schemas/ManagedEngine"
+          },
+          "readiness_wait_secs": {
+            "description": "How long Temps waits for a new container of this engine to become\nhealthy; a check has to land inside it.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "engine",
+          "builtin",
+          "effective",
+          "readiness_wait_secs"
+        ],
+        "type": "object"
+      },
       "EnqueuedJob": {
         "description": "A single job that was successfully enqueued during a fan-out run.",
         "properties": {
@@ -37050,6 +37119,209 @@
         ],
         "type": "object"
       },
+      "HealthcheckCapability": {
+        "description": "Whether Temps can give this service's container a healthcheck, and\nwhether it can recreate it from here to apply one now.",
+        "properties": {
+          "apply_now_reason": {
+            "description": "Why not, when `can_apply_now` is false.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "can_apply_now": {
+            "description": "Temps can recreate the container from here to apply the settings.",
+            "type": "boolean"
+          },
+          "configurable": {
+            "description": "The container has a Docker healthcheck Temps builds, so overrides\napply to it.",
+            "type": "boolean"
+          },
+          "reason": {
+            "description": "Why not, when `configurable` is false.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "configurable",
+          "can_apply_now"
+        ],
+        "type": "object"
+      },
+      "HealthcheckDefaults": {
+        "description": "The instance default and what it gives each engine.",
+        "properties": {
+          "engines": {
+            "items": {
+              "$ref": "#/components/schemas/EngineHealthcheckDefault"
+            },
+            "type": "array"
+          },
+          "overrides": {
+            "$ref": "#/components/schemas/HealthcheckOverrides",
+            "description": "The instance default (null = the engine's built-in value)."
+          }
+        },
+        "required": [
+          "overrides",
+          "engines"
+        ],
+        "type": "object"
+      },
+      "HealthcheckOverrides": {
+        "description": "Overrides of some or all of the five healthcheck values. `None` inherits.",
+        "properties": {
+          "interval_secs": {
+            "default": null,
+            "description": "Seconds between checks once healthy (5–3600).",
+            "example": 60,
+            "format": "int32",
+            "maximum": 3600,
+            "minimum": 5,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "retries": {
+            "default": null,
+            "description": "Consecutive failures that make the container unhealthy (1–10).",
+            "example": 3,
+            "format": "int32",
+            "maximum": 10,
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "start_interval_secs": {
+            "default": null,
+            "description": "Seconds between checks while starting (1–60).",
+            "example": 2,
+            "format": "int32",
+            "maximum": 60,
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "start_period_secs": {
+            "default": null,
+            "description": "Seconds after start during which failures do not count (0–600).",
+            "example": 90,
+            "format": "int32",
+            "maximum": 600,
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "timeout_secs": {
+            "default": null,
+            "description": "Seconds one check may run (1–60, and shorter than the interval).",
+            "example": 5,
+            "format": "int32",
+            "maximum": 60,
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "HealthcheckSource": {
+        "description": "Where an effective healthcheck value comes from.",
+        "enum": [
+          "builtin",
+          "instance_default",
+          "service"
+        ],
+        "type": "string"
+      },
+      "HealthcheckSources": {
+        "description": "The source of each of the five values.",
+        "properties": {
+          "interval_secs": {
+            "$ref": "#/components/schemas/HealthcheckSource"
+          },
+          "retries": {
+            "$ref": "#/components/schemas/HealthcheckSource"
+          },
+          "start_interval_secs": {
+            "$ref": "#/components/schemas/HealthcheckSource"
+          },
+          "start_period_secs": {
+            "$ref": "#/components/schemas/HealthcheckSource"
+          },
+          "timeout_secs": {
+            "$ref": "#/components/schemas/HealthcheckSource"
+          }
+        },
+        "required": [
+          "interval_secs",
+          "start_interval_secs",
+          "start_period_secs",
+          "timeout_secs",
+          "retries"
+        ],
+        "type": "object"
+      },
+      "HealthcheckTimings": {
+        "description": "The five numbers of a Docker healthcheck, in whole seconds (retries is a\ncount).",
+        "properties": {
+          "interval_secs": {
+            "description": "Seconds between checks once the container is healthy.",
+            "example": 30,
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "retries": {
+            "description": "Consecutive failed checks that make the container unhealthy.",
+            "example": 3,
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "start_interval_secs": {
+            "description": "Seconds between checks while the container is starting, within\n`start_period_secs`.",
+            "example": 2,
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "start_period_secs": {
+            "description": "Seconds after start during which failed checks do not count and\nchecks run every `start_interval_secs`.",
+            "example": 90,
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "timeout_secs": {
+            "description": "Seconds one check may run before it counts as failed.",
+            "example": 5,
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "interval_secs",
+          "start_interval_secs",
+          "start_period_secs",
+          "timeout_secs",
+          "retries"
+        ],
+        "type": "object"
+      },
       "HeartbeatApiRequest": {
         "properties": {
           "architecture": {
@@ -43349,6 +43621,18 @@
         ],
         "type": "object"
       },
+      "ManagedEngine": {
+        "description": "Engines whose containers Temps manages and may need to replace.",
+        "enum": [
+          "postgres",
+          "redis",
+          "mariadb",
+          "mongodb",
+          "rustfs",
+          "minio"
+        ],
+        "type": "string"
+      },
       "ManagedEnvironmentVariable": {
         "properties": {
           "description": {
@@ -43384,6 +43668,69 @@
           "temps"
         ],
         "type": "string"
+      },
+      "ManagedServiceHealthcheckSettings": {
+        "description": "Instance-wide defaults for the Docker healthcheck every managed database\nand storage container is created with. `None` inherits Temps' built-in\nvalue for the engine; a service can override each value again. Bounds and\nvalidation live with the healthcheck builder\n(`temps_providers_core::healthcheck`).",
+        "properties": {
+          "interval_secs": {
+            "default": null,
+            "description": "Seconds between checks once a container is healthy (5–3600).",
+            "example": 60,
+            "format": "int32",
+            "maximum": 3600,
+            "minimum": 5,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "retries": {
+            "default": null,
+            "description": "Consecutive failed checks that make a container unhealthy (1–10).",
+            "format": "int32",
+            "maximum": 10,
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "start_interval_secs": {
+            "default": null,
+            "description": "Seconds between checks while a container is starting (1–60).",
+            "example": 2,
+            "format": "int32",
+            "maximum": 60,
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "start_period_secs": {
+            "default": null,
+            "description": "Seconds after start during which failed checks do not count (0–600).",
+            "format": "int32",
+            "maximum": 600,
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "timeout_secs": {
+            "default": null,
+            "description": "Seconds one check may run before it counts as failed (1–60).",
+            "format": "int32",
+            "maximum": 60,
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
       },
       "ManualAction": {
         "description": "A manual action the user must perform outside of the automated migration",
@@ -60058,6 +60405,22 @@
           }
         ]
       },
+      "ResolvedHealthcheck": {
+        "description": "The values a container would be created with, and where each comes from.",
+        "properties": {
+          "sources": {
+            "$ref": "#/components/schemas/HealthcheckSources"
+          },
+          "timings": {
+            "$ref": "#/components/schemas/HealthcheckTimings"
+          }
+        },
+        "required": [
+          "timings",
+          "sources"
+        ],
+        "type": "object"
+      },
       "ResolverCoverageHost": {
         "description": "Where a stale deployment runs: the control plane or a worker.",
         "properties": {
@@ -66027,6 +66390,108 @@
         "required": [
           "service_id",
           "consecutive_failures"
+        ],
+        "type": "object"
+      },
+      "ServiceHealthcheck": {
+        "description": "A service's healthcheck as the console shows it.",
+        "properties": {
+          "capability": {
+            "$ref": "#/components/schemas/HealthcheckCapability"
+          },
+          "effective": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ResolvedHealthcheck",
+                "description": "What a new or recreated container gets, and where each value comes\nfrom."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "engine": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ManagedEngine",
+                "description": "The engine whose built-in timings apply. Absent for a service whose\ncontainer has no healthcheck Temps builds."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "inherited": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ResolvedHealthcheck",
+                "description": "What the container would get without this service's overrides: what\na cleared field falls back to."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "overrides": {
+            "$ref": "#/components/schemas/HealthcheckOverrides",
+            "description": "This service's own overrides (null = inherit)."
+          },
+          "overrides_ignored_reason": {
+            "description": "Why this service's overrides are set aside: they no longer combine\nwith the instance default, so `effective` is what the container gets\nwithout them. Change or clear them to use them again.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pending_recreate": {
+            "description": "The running container differs from `effective` (as this host's\nDocker would store it) until it is recreated. `false` when either is\nunknown.",
+            "type": "boolean"
+          },
+          "readiness_wait_secs": {
+            "description": "How long Temps waits for a new container of this engine to become\nhealthy; a check has to land inside it.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "running": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/HealthcheckTimings",
+                "description": "The running container's healthcheck, when it could be read."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "service_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "service_name": {
+            "type": "string"
+          },
+          "service_type": {
+            "type": "string"
+          },
+          "start_interval_supported": {
+            "description": "`false`: this host's Docker ignores the start interval, so the\nsteady-state interval stays at the start interval. Absent when not\nknown yet.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "service_id",
+          "service_name",
+          "service_type",
+          "capability",
+          "overrides",
+          "pending_recreate"
         ],
         "type": "object"
       },
@@ -108372,6 +108837,148 @@
         ]
       }
     },
+    "/external-services/healthcheck-defaults": {
+      "get": {
+        "description": "Null values use each engine's built-in timing. `engines` lists what a\nservice of each engine inherits.",
+        "operationId": "get_healthcheck_defaults",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthcheckDefaults"
+                }
+              }
+            },
+            "description": "The instance default"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Get the instance-wide default healthcheck of managed service containers",
+        "tags": [
+          "External Services"
+        ]
+      },
+      "put": {
+        "description": "Applies to containers created or recreated afterwards; nothing running\nchanges. Send null for a value to use each engine's built-in timing.",
+        "operationId": "update_healthcheck_defaults",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HealthcheckOverrides"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthcheckDefaults"
+                }
+              }
+            },
+            "description": "Saved"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "A value is out of range, the timeout is not shorter than the interval, or no check would land inside an engine's readiness wait"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The default would make a service's existing overrides invalid"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Replace the instance-wide default healthcheck of managed service containers",
+        "tags": [
+          "External Services"
+        ]
+      }
+    },
     "/external-services/import": {
       "post": {
         "operationId": "import_external_service",
@@ -109567,6 +110174,281 @@
           }
         },
         "summary": "Persisted health status for an external service",
+        "tags": [
+          "External Services"
+        ]
+      }
+    },
+    "/external-services/{id}/healthcheck": {
+      "get": {
+        "description": "Its own overrides, what a new or recreated container gets (with where\neach value comes from), and what the running container has.",
+        "operationId": "get_service_healthcheck",
+        "parameters": [
+          {
+            "description": "External service ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceHealthcheck"
+                }
+              }
+            },
+            "description": "The service's healthcheck"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Service not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Get a managed service's healthcheck",
+        "tags": [
+          "External Services"
+        ]
+      },
+      "put": {
+        "description": "Send null for a value to inherit the instance default. Applies when the\ncontainer is next recreated; nothing running changes.",
+        "operationId": "update_service_healthcheck",
+        "parameters": [
+          {
+            "description": "External service ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HealthcheckOverrides"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceHealthcheck"
+                }
+              }
+            },
+            "description": "Saved; applies when the container is recreated"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "A value is out of range, the timeout is not shorter than the interval, or no check would land inside the engine's readiness wait"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Service not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The service's container has no healthcheck Temps builds"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Replace a managed service's healthcheck overrides",
+        "tags": [
+          "External Services"
+        ]
+      }
+    },
+    "/external-services/{id}/healthcheck/apply": {
+      "post": {
+        "description": "The service restarts briefly. Its volumes and configuration are kept: the\noriginal container is kept until the replacement holds the same data,\nand put back otherwise. Only for a running standalone service on a\nprocess that runs local containers: recreating starts the container, so\na stopped service is left alone. Not available for clusters, worker\ndatabases or imported containers.",
+        "operationId": "apply_service_healthcheck",
+        "parameters": [
+          {
+            "description": "External service ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplyServiceHealthcheckResponse"
+                }
+              }
+            },
+            "description": "The container was recreated"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Service not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Temps will not recreate this container from here (not running, local workloads disabled, a cluster, worker or imported container), or the recreate was refused to protect its data"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The recreate failed; the original container was kept"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Recreate a managed service's container to apply its healthcheck now",
         "tags": [
           "External Services"
         ]

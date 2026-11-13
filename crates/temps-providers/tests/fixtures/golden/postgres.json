@@ -41,15 +41,15 @@
         "5432/tcp": {}
       },
       "Healthcheck": {
-        "Interval": 1000000000,
+        "Interval": 30000000000,
         "Retries": 3,
-        "StartInterval": 1000000000,
-        "StartPeriod": 30000000000,
+        "StartInterval": 2000000000,
+        "StartPeriod": 120000000000,
         "Test": [
           "CMD-SHELL",
           "exec pg_isready -h 127.0.0.1 -p 5432 -U 'postgres' -d 'postgres'"
         ],
-        "Timeout": 3000000000
+        "Timeout": 5000000000
       },
       "HostConfig": {
         "Init": true,

@@ -361,6 +361,8 @@ impl ExternalServiceManager {
             let init_result = async {
                 self.ensure_new_local_service_resources_unused(&service)
                     .await?;
+                // Before its first container, which looks the name up.
+                self.claim_healthcheck_container(service.id).await;
                 self.initialize_service(service.id).await
             }
             .await;
@@ -1002,6 +1004,7 @@ impl ExternalServiceManager {
         // before the original container is stopped.
         self.persist_service_config(service_id, service_update)
             .await?;
+        let renamed = pre_rename_instance.is_some();
 
         if let Some(old_instance) = pre_rename_instance {
             if let Err(e) = old_instance.stop().await {
@@ -1010,6 +1013,12 @@ impl ExternalServiceManager {
                     service_id, e
                 );
             }
+        }
+
+        // Before the container is created under the new name, which is
+        // where the engines look its healthcheck overrides up.
+        if renamed {
+            self.republish_healthcheck_overrides(service_id).await?;
         }
 
         // Reinitialize the service (this will stop, remove, and recreate the container with new image)
@@ -1164,6 +1173,10 @@ impl ExternalServiceManager {
             })
             .await
             .map_err(ExternalServiceError::from)?;
+        // A later service that reuses the name must not inherit these, here
+        // or in another process.
+        Self::forget_healthcheck_overrides(service_id).await;
+        self.notify_healthcheck_change(service_id).await;
 
         // Stop the per-cluster role reconciler before dropping its records,
         // otherwise a tick mid-deletion could re-write what we just removed.

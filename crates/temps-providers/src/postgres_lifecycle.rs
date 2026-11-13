@@ -516,25 +516,22 @@ impl PostgresContainerLifecycle for PostgresLifecycleAdapter {
             )),
             host_config: Some(host_config),
             networking_config,
-            healthcheck: Some(bollard::models::HealthConfig {
-                test: Some(vec![
-                    "CMD-SHELL".to_string(),
-                    // Without -d, pg_isready (via libpq) defaults the target
-                    // database to the username. For any service where
-                    // database != username, that's a nonexistent database,
-                    // so every healthcheck tick (interval=1s) logs a FATAL
-                    // "database does not exist" forever — pg_isready still
-                    // reports healthy (the server did respond), but the
-                    // container's logs fill up with noise for its entire
-                    // lifetime. Pin -d explicitly to the configured database.
+            // Without -d, pg_isready (via libpq) defaults the target
+            // database to the username. For any service where database !=
+            // username, that's a nonexistent database, so every healthcheck
+            // tick logs a FATAL "database does not exist" forever —
+            // pg_isready still reports healthy (the server did respond), but
+            // the container's logs fill up with noise for its entire
+            // lifetime. Pin -d explicitly to the configured database.
+            healthcheck: Some(
+                temps_providers_core::healthcheck::managed_health_config(
+                    &docker,
+                    temps_providers_core::externalsvc::recreate_guard::ManagedEngine::Postgres,
+                    &container_name,
                     postgres_healthcheck_cmd(&cfg.username, &cfg.database),
-                ]),
-                interval: Some(1_000_000_000),
-                timeout: Some(3_000_000_000),
-                retries: Some(3),
-                start_period: Some(30_000_000_000),
-                start_interval: Some(1_000_000_000),
-            }),
+                )
+                .await,
+            ),
             ..Default::default()
         };
 

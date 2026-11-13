@@ -268,6 +268,19 @@ pub enum ExternalServiceError {
         timeout_secs: u64,
     },
 
+    /// Healthcheck settings (the instance default and every service's
+    /// overrides) are saved one at a time across all Temps processes, so
+    /// each is checked against the other as saved. This one waited too long
+    /// for another save to finish.
+    #[error(
+        "Timed out after {timeout_secs}s waiting for another healthcheck settings save while \
+         {operation}. Nothing was saved; retry once the other save finishes"
+    )]
+    HealthcheckSettingsBusy {
+        operation: &'static str,
+        timeout_secs: u64,
+    },
+
     #[error("Failed to delete service {id}: {reason}")]
     DeletionFailed { id: i32, reason: String },
 
@@ -387,6 +400,55 @@ pub enum ExternalServiceError {
         requested: usize,
         max: u16,
     },
+    /// A healthcheck override (of a service, or the instance default when
+    /// `service_id` is `None`) is out of bounds or does not combine.
+    #[error("Invalid healthcheck for {target}: {source}", target = healthcheck_target(*service_id))]
+    InvalidHealthcheck {
+        service_id: Option<i32>,
+        #[source]
+        source: crate::healthcheck::HealthcheckValidationError,
+    },
+    /// The service's container has no healthcheck Temps builds (a cluster,
+    /// an imported container, an engine without one), or Temps cannot
+    /// recreate it from here to apply one (a worker database).
+    #[error("Cannot {operation} of service {service_id} ('{name}'): {reason}")]
+    HealthcheckUnsupported {
+        service_id: i32,
+        name: String,
+        operation: &'static str,
+        reason: String,
+    },
+    /// The new instance default would no longer combine with the overrides
+    /// a service already has, so its next container would silently drop
+    /// them.
+    #[error(
+        "The healthcheck instance default would make the overrides of service {service_id} \
+         ('{name}') invalid: {source}{others}. Change or clear those overrides first.",
+        others = more_services(*others)
+    )]
+    HealthcheckDefaultConflictsWithService {
+        service_id: i32,
+        name: String,
+        #[source]
+        source: crate::healthcheck::HealthcheckValidationError,
+        /// How many other services would be affected too.
+        others: usize,
+    },
+}
+
+fn more_services(others: usize) -> String {
+    match others {
+        0 => String::new(),
+        1 => " (and 1 other service)".to_string(),
+        n => format!(" (and {n} other services)"),
+    }
+}
+
+fn healthcheck_target(service_id: Option<i32>) -> String {
+    match service_id {
+        Some(id) => format!("service {id}"),
+        None => "the instance default".to_string(),
+    }
 }
 
 impl From<ServiceIdentityReservationError> for ExternalServiceError {
@@ -539,10 +601,14 @@ pub fn worker_node_required(error: &ExternalServiceError) -> Option<Problem> {
         | E::ControlPlaneMemberUnreachable { .. }
         | E::ClusterPortsUnavailable { .. }
         | E::ClusterMemberLimitExceeded { .. }
+        | E::InvalidHealthcheck { .. }
+        | E::HealthcheckUnsupported { .. }
+        | E::HealthcheckDefaultConflictsWithService { .. }
         | E::ClusterMemberProvisioning { .. }
         | E::ClusterNotSettled { .. }
         | E::ClusterBusy { .. }
         | E::LockTimeout { .. }
+        | E::HealthcheckSettingsBusy { .. }
         | E::Engine { .. } => None,
     }
 }
