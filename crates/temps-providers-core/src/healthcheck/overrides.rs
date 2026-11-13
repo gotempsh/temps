@@ -168,16 +168,20 @@ pub enum HealthcheckValidationError {
     #[error(
         "healthcheck start_period_secs ({start_period_secs}s, from {start_period_source}) plus \
          interval_secs ({interval_secs}s, from {interval_source}) plus timeout_secs \
-         ({timeout_secs}s, from {timeout_source}), twice with a start period (a check still \
-         running when it ends, then the next one), and the up to {READINESS_POLL_SECS}s Temps \
-         takes to read the result must not exceed {readiness_wait_secs}s, how long Temps waits for this \
-         engine's container to become healthy, unless the start period lasts that long: after \
-         the start period Docker checks only once per interval, so a container still starting \
-         would be seen too late and every create, upgrade and restore would time out"
+         ({timeout_secs}s, from {timeout_source}), with a start period also start_interval_secs \
+         ({start_interval_secs}s, from {start_interval_source}) and the timeout again (the last \
+         check Docker schedules inside it may start one start interval before it ends and still \
+         be running after it), and the up to {READINESS_POLL_SECS}s Temps takes to read the \
+         result must not exceed {readiness_wait_secs}s, how long Temps waits for this engine's \
+         container to become healthy, unless the start period lasts that long: after the start \
+         period Docker checks only once per interval, so a container still starting would be \
+         seen too late and every create, upgrade and restore would time out"
     )]
     StartPeriodTooShortForInterval {
         start_period_secs: u32,
         start_period_source: HealthcheckSource,
+        start_interval_secs: u32,
+        start_interval_source: HealthcheckSource,
         interval_secs: u32,
         interval_source: HealthcheckSource,
         timeout_secs: u32,
@@ -246,9 +250,12 @@ impl ResolvedHealthcheck {
     ///     interval inside the start period and once per interval after it,
     ///     each wait counted from when the previous check finished, so the
     ///     start period lasts until then, or the first check after it fits
-    ///     before it (the start period, plus the timeout of a check still
-    ///     running when it ends, plus one interval), or the interval is no
-    ///     longer than the start interval (checks never slow down). Otherwise
+    ///     before it, or the interval is no longer than the start interval
+    ///     (checks never slow down). Docker picks the next wait as a check
+    ///     finishes, so the last check at the start interval is scheduled
+    ///     just before the start period ends, starts up to one start interval
+    ///     after it and may run its timeout; the next one comes an interval
+    ///     after that. Otherwise
     ///     a container that takes longer to start than the start period is
     ///     checked next only after the wait gave up.
     pub fn validate(&self, readiness_wait_secs: u32) -> Result<(), HealthcheckValidationError> {
@@ -283,10 +290,11 @@ impl ResolvedHealthcheck {
                 readiness_wait_secs,
             });
         }
-        // A start-period check that starts just before the period ends may
-        // run its full timeout; Docker waits one interval after it finishes.
+        // The last check scheduled inside the start period starts up to one
+        // start interval after it ends and may run its full timeout; Docker
+        // waits one interval after it finishes.
         let boundary_check = if t.start_period_secs > 0 {
-            t.timeout_secs
+            t.start_interval_secs.saturating_add(t.timeout_secs)
         } else {
             0
         };
@@ -301,6 +309,8 @@ impl ResolvedHealthcheck {
             return Err(HealthcheckValidationError::StartPeriodTooShortForInterval {
                 start_period_secs: t.start_period_secs,
                 start_period_source: self.sources.start_period_secs,
+                start_interval_secs: t.start_interval_secs,
+                start_interval_source: self.sources.start_interval_secs,
                 interval_secs: t.interval_secs,
                 interval_source: self.sources.interval_secs,
                 timeout_secs: t.timeout_secs,
@@ -599,10 +609,11 @@ mod tests {
         assert_eq!(check(53, 3600), Ok(()));
         assert_eq!(check(55, 10), Ok(()));
         // A shorter start period plus one interval still leaves the check
-        // time to finish and be read: 20 s, a 5 s check running as it ends,
-        // then 28 s, so the next check starts at 53 s.
+        // time to finish and be read: 20 s, the 2 s start interval of the
+        // last check scheduled inside it, that check's 5 s, then 26 s, so the
+        // next check starts at 53 s.
         assert_eq!(check(0, 53), Ok(()));
-        assert_eq!(check(20, 28), Ok(()));
+        assert_eq!(check(20, 26), Ok(()));
         // Checking as often as while starting needs no start period.
         let never_slower = HealthcheckOverrides {
             start_period_secs: Some(0),
@@ -617,14 +628,17 @@ mod tests {
 
         // The next check after the start period starts too late to be seen.
         // (20, 33) would start it at 53 s if the check running when the start
-        // period ends took no time; it may take 5 s.
-        for (start_period, interval) in [(10, 120), (30, 30), (20, 33), (20, 29)] {
+        // period ends took no time; it may take 5 s. (20, 27) would if that
+        // check started as the start period ended; it may start 2 s after.
+        for (start_period, interval) in [(10, 120), (30, 30), (20, 33), (20, 29), (20, 27)] {
             let error = check(start_period, interval).unwrap_err();
             assert_eq!(
                 error,
                 HealthcheckValidationError::StartPeriodTooShortForInterval {
                     start_period_secs: start_period,
                     start_period_source: InstanceDefault,
+                    start_interval_secs: 2,
+                    start_interval_source: Builtin,
                     interval_secs: interval,
                     interval_source: InstanceDefault,
                     timeout_secs: 5,
@@ -679,6 +693,41 @@ mod tests {
             "{error:?}"
         );
         assert!(error.to_string().contains("start_interval_secs"), "{error}");
+    }
+
+    #[test]
+    fn a_start_interval_longer_than_the_start_period_delays_the_next_check() {
+        // PostgreSQL: a 90 s wait and a 5 s timeout, so a check has to start
+        // by 83 s. The first check comes 30 s in, after the 10 s start period
+        // ended, so Docker waits 60 s after it: the next one starts at 95 s.
+        let postgres = HealthcheckTimings::builtin(ManagedEngine::Postgres);
+        let wait = crate::healthcheck::readiness_wait_secs(ManagedEngine::Postgres);
+        let check = |start_interval: u32| {
+            let service = HealthcheckOverrides {
+                start_period_secs: Some(10),
+                start_interval_secs: Some(start_interval),
+                interval_secs: Some(60),
+                ..Default::default()
+            };
+            resolve(&service, &Default::default(), &postgres).validate(wait)
+        };
+        assert_eq!(
+            check(30),
+            Err(HealthcheckValidationError::StartPeriodTooShortForInterval {
+                start_period_secs: 10,
+                start_period_source: Service,
+                start_interval_secs: 30,
+                start_interval_source: Service,
+                interval_secs: 60,
+                interval_source: Service,
+                timeout_secs: 5,
+                timeout_source: Builtin,
+                readiness_wait_secs: wait,
+            })
+        );
+        // 10 + 8 + 5 + 60 = 83: the next check starts just in time.
+        assert_eq!(check(8), Ok(()));
+        assert!(check(9).is_err());
     }
 
     #[test]

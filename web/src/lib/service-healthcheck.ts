@@ -184,9 +184,10 @@ export function healthcheckFormSchema(inherited: InheritedHealthcheck[]) {
         })
         return
       }
-      // Docker waits each interval from when the previous check finished,
-      // and a check running as the start period ends may take its timeout.
-      const boundaryCheck = startPeriod > 0 ? timeout : 0
+      // Docker picks each wait as a check finishes, so the last check
+      // scheduled inside the start period may start one start interval after
+      // it ends and take its timeout; the next comes one interval later.
+      const boundaryCheck = startPeriod > 0 ? startInterval + timeout : 0
       const covered =
         startPeriod >= lastStart ||
         startPeriod + boundaryCheck + interval <= lastStart ||
@@ -198,7 +199,7 @@ export function healthcheckFormSchema(inherited: InheritedHealthcheck[]) {
             overrides.start_period_secs !== null
               ? ['start_period_secs']
               : ['interval_secs'],
-          message: `Start period (${startPeriod}s), a check running as it ends (up to ${boundaryCheck}s) and one interval (${interval}s) must leave the next ${timeout}s check time to finish inside the ${wait}s Temps waits for a new container to become healthy (by ${lastStart}s), or the start period must last that long`,
+          message: `Start period (${startPeriod}s), the last check scheduled inside it (starting up to ${startInterval}s after it ends and taking up to ${timeout}s) and one interval (${interval}s) must leave the next ${timeout}s check time to finish inside the ${wait}s Temps waits for a new container to become healthy (by ${lastStart}s), or the start period must last that long`,
         })
         return
       }

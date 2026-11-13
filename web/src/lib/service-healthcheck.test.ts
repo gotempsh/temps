@@ -157,13 +157,14 @@ describe('a check must be seen inside the readiness wait', () => {
     expect(
       issues({ start_period_secs: '55', interval_secs: '10' }, [rustfs])
     ).toEqual([])
-    // 20s, a 5s check running as it ends, then 28s: the next starts at 53s.
+    // 20s, the last check inside it starting 2s after it ends and taking 5s,
+    // then 26s: the next starts at 53s.
     expect(
-      issues({ start_period_secs: '20', interval_secs: '28' }, [rustfs])
+      issues({ start_period_secs: '20', interval_secs: '26' }, [rustfs])
     ).toEqual([])
     expect(
-      issues({ start_period_secs: '20', interval_secs: '33' }, [rustfs])[0]
-    ).toStartWith('start_period_secs: Start period (20s), a check running')
+      issues({ start_period_secs: '20', interval_secs: '27' }, [rustfs])[0]
+    ).toStartWith('start_period_secs: Start period (20s), the last check')
     // Checking as often as while starting needs no start period.
     expect(
       issues(
@@ -185,8 +186,27 @@ describe('a check must be seen inside the readiness wait', () => {
     expect(
       issues({ start_period_secs: '30', interval_secs: '30' }, [redis, rustfs])
     ).toEqual([
-      'start_period_secs: Start period (30s), a check running as it ends (up to 5s) and one interval (30s) must leave the next 5s check time to finish inside the 60s Temps waits for a new container to become healthy (by 53s), or the start period must last that long',
+      'start_period_secs: Start period (30s), the last check scheduled inside it (starting up to 2s after it ends and taking up to 5s) and one interval (30s) must leave the next 5s check time to finish inside the 60s Temps waits for a new container to become healthy (by 53s), or the start period must last that long',
     ])
+  })
+
+  test('a start interval longer than the start period delays the next check', () => {
+    // PostgreSQL waits 90s: the first check comes 30s in, after the 10s start
+    // period, and the next one 5s + 60s later, at 95s.
+    const postgres: InheritedHealthcheck = {
+      timings: { ...REDIS, start_period_secs: 120 },
+      readinessWaitSecs: 90,
+    }
+    const values = (startInterval: string) => ({
+      start_period_secs: '10',
+      start_interval_secs: startInterval,
+      interval_secs: '60',
+    })
+    expect(issues(values('30'), [postgres])).toEqual([
+      'start_period_secs: Start period (10s), the last check scheduled inside it (starting up to 30s after it ends and taking up to 5s) and one interval (60s) must leave the next 5s check time to finish inside the 90s Temps waits for a new container to become healthy (by 83s), or the start period must last that long',
+    ])
+    // 10s + 8s + 5s + 60s: the next check starts at 83s, just in time.
+    expect(issues(values('8'), [postgres])).toEqual([])
   })
 
   test('an inherited start period is blamed on the interval', () => {
@@ -195,7 +215,7 @@ describe('a check must be seen inside the readiness wait', () => {
       readinessWaitSecs: 90,
     }
     expect(issues({ interval_secs: '120' }, [shortStart])).toEqual([
-      'interval_secs: Start period (10s), a check running as it ends (up to 5s) and one interval (120s) must leave the next 5s check time to finish inside the 90s Temps waits for a new container to become healthy (by 83s), or the start period must last that long',
+      'interval_secs: Start period (10s), the last check scheduled inside it (starting up to 2s after it ends and taking up to 5s) and one interval (120s) must leave the next 5s check time to finish inside the 90s Temps waits for a new container to become healthy (by 83s), or the start period must last that long',
     ])
   })
 })
