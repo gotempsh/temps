@@ -87,6 +87,7 @@ temps-deployment-logs = { path = "../temps-deployment-logs" }
 temps-mcp-server = { path = "../temps-mcp-server" }
 temps-metrics = { path = "../temps-metrics" }
 temps-monitoring = { path = "../temps-monitoring" }
+temps-workflows = { path = "../temps-workflows" }
 temps-notifications = { path = "../temps-notifications" }
 temps-otel = { path = "../temps-otel" }
 temps-product-telemetry = { path = "../temps-product-telemetry" }

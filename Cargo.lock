@@ -13191,6 +13191,7 @@ dependencies = [
  "temps-vulnerability-scanner",
  "temps-webhooks",
  "temps-wireguard",
+ "temps-workflows",
  "temps-workload",
  "temps-workload-activator",
  "temps-workload-plane",

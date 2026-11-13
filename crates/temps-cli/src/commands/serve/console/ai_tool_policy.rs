@@ -67,6 +67,31 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "durable workflow operations that run the app's code with a caller-chosen payload, decrypt a stored payload, delete a run's history, or issue or revoke the app's workflow credential; the operator does these in the console",
+        &[
+            "start_workflow_run",
+            "send_workflow_event",
+            "reveal_workflow_payload",
+            "delete_workflow_run",
+            "update_workflow_settings",
+            "issue_workflow_credential",
+            "revoke_workflow_credential",
+        ],
+    ),
+    (
+        "the workflow executor and app protocol (ADR-103): called by the SDK inside a deployment with an invocation token or the environment's workflow credential, never by a user or the assistant",
+        &[
+            "get_invocation_key",
+            "get_run_journal",
+            "record_run_step",
+            "heartbeat_run",
+            "report_run_outcome",
+            "app_start_workflow_run",
+            "app_get_workflow_run",
+            "app_send_workflow_event",
+        ],
+    ),
+    (
         "revokes every visitor's gate session for an address; a security action the user takes themselves, behind step-up",
         &["sign_everyone_out_of_address"],
     ),

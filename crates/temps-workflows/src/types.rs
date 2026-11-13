@@ -13,6 +13,7 @@ use crate::error::{WorkflowError, WorkflowResult};
 /// Where a run is in its lifecycle (ADR-103 §3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
+#[schema(as = WorkflowRunStatus)]
 pub enum RunStatus {
     /// Due now, waiting for a free invoker or under a concurrency limit.
     Queued,
@@ -81,6 +82,7 @@ impl RunStatus {
 /// What a journal entry records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
+#[schema(as = WorkflowStepKind)]
 pub enum StepKind {
     Step,
     Sleep,
@@ -120,6 +122,7 @@ impl StepKind {
 /// step whose failed attempt is waiting for its retry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
+#[schema(as = WorkflowStepStatus)]
 pub enum StepStatus {
     Pending,
     Completed,

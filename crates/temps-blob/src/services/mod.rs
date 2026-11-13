@@ -5,8 +5,10 @@
 
 mod blob_service;
 mod config;
+mod payload_store;
 
 pub use blob_service::{
     BlobInfo, BlobService, ListOptions, ListResult, PutOptions, DEFAULT_BUCKET,
 };
 pub use config::{BlobConfig, BlobInputConfig};
+pub use payload_store::BlobPayloadStore;

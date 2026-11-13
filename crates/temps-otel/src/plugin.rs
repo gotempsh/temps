@@ -1473,6 +1473,11 @@ impl TempsPlugin for OtelPlugin {
                 None => storage,
             };
             context.register_service(storage.clone());
+            // Control-plane metrics of a project (durable workflows, ADR-103)
+            // go to the same store, so ordinary alert rules read them.
+            context.register_service(Arc::new(
+                crate::project_metrics_sink::OtelProjectMetricsSink::new(storage.clone()),
+            ) as Arc<dyn temps_core::ProjectMetricsSink>);
 
             // Create auth service. Also registered in the context so
             // `configure_routes` can inject the ADR-028 ProjectAccessChecker

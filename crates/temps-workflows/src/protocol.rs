@@ -28,6 +28,7 @@ pub const MANIFEST_PATH: &str = "/.well-known/temps/workflows/manifest";
 
 /// One recorded journal entry as the executor replays it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[schema(as = WorkflowJournalEntry)]
 pub struct JournalEntry {
     pub sequence: i32,
     pub name: String,
@@ -62,7 +63,7 @@ pub struct InvokeRequest {
     /// The journal, in sequence order, from 0.
     pub journal: Vec<JournalEntry>,
     /// Set when the journal did not fit: fetch the rest with
-    /// `GET /workflow-runs/{run_id}/journal?after=<this - 1>`.
+    /// `GET /workflow-runs/{run_id}/journal?from=<this>`.
     pub journal_next_sequence: Option<i32>,
 }
 
@@ -89,6 +90,7 @@ pub struct Manifest {
 
 /// `POST /workflow-runs/{run_id}/steps` body: record one journal entry.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[schema(as = WorkflowStepWriteRequest)]
 pub struct StepWriteRequest {
     pub sequence: i32,
     pub name: String,
@@ -117,6 +119,7 @@ pub struct StepWriteRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[schema(as = WorkflowEmittedEvent)]
 pub struct EmittedEvent {
     pub name: String,
     #[serde(default)]
@@ -129,6 +132,7 @@ pub struct EmittedEvent {
 /// The entry as Temps holds it after the write. When `already_recorded` is
 /// true, the executor must continue with this recorded value, not its own.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[schema(as = WorkflowStepWriteResponse)]
 pub struct StepWriteResponse {
     pub entry: JournalEntry,
     pub already_recorded: bool,
@@ -137,15 +141,18 @@ pub struct StepWriteResponse {
 
 /// `GET /workflow-runs/{run_id}/journal` response page.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[schema(as = WorkflowJournalPage)]
 pub struct JournalPage {
     pub entries: Vec<JournalEntry>,
     pub next_sequence: Option<i32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[schema(as = WorkflowHeartbeatRequest)]
 pub struct HeartbeatRequest {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[schema(as = WorkflowHeartbeatResponse)]
 pub struct HeartbeatResponse {
     pub lease_expires_at: DateTime<Utc>,
     /// True once an operator cancelled the run: stop at the next step.
@@ -155,6 +162,7 @@ pub struct HeartbeatResponse {
 /// How an invocation ended.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[schema(as = WorkflowOutcome)]
 pub enum Outcome {
     Completed {
         #[serde(default)]
@@ -190,11 +198,13 @@ pub enum Outcome {
 
 /// `POST /workflow-runs/{run_id}/outcome` body.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[schema(as = WorkflowOutcomeRequest)]
 pub struct OutcomeRequest {
     pub outcome: Outcome,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[schema(as = WorkflowOutcomeResponse)]
 pub struct OutcomeResponse {
     pub status: crate::types::RunStatus,
 }
@@ -209,6 +219,7 @@ pub fn wait_result(payload: Option<Value>) -> Value {
 
 /// `GET /workflows/v1/invocation-key` response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[schema(as = WorkflowInvocationKeyResponse)]
 pub struct InvocationKeyResponse {
     /// `ed25519`.
     pub algorithm: String,
