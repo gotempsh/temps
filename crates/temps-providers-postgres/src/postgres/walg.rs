@@ -101,6 +101,9 @@ const SNAPSHOT_NO_FILE: &str = "__TEMPS_NO_WALG_ENV__";
 const SNAPSHOT_CKSUM: &str = "__TEMPS_WALG_ENV_CKSUM__";
 const SNAPSHOT_RAW: &str = "__TEMPS_WALG_ENV_RAW__";
 const SNAPSHOT_EVAL: &str = "__TEMPS_WALG_ENV_EVAL__";
+/// Printed only once the evaluated assignments are complete: output cut
+/// short anywhere before it is an incomplete snapshot, never an empty one.
+const SNAPSHOT_END: &str = "__TEMPS_WALG_ENV_END__";
 
 /// Copies `walg.env` once and reports everything from that copy, so the
 /// checksum, text and assignments always describe the same file.
@@ -117,7 +120,7 @@ const WALG_ENV_SNAPSHOT_SCRIPT: &str = "f=/var/lib/postgresql/walg.env; \
      echo __TEMPS_WALG_ENV_RAW__; cat \"$snap\"; echo; \
      echo __TEMPS_WALG_ENV_EVAL__; \
      env -i sh -c '. \"$1\" && env' sh \"$snap\" | grep -E '^(WALG_|AWS_)'; \
-     exit 0";
+     echo __TEMPS_WALG_ENV_END__; exit 0";
 
 /// Parse what [`WALG_ENV_SNAPSHOT_SCRIPT`] printed: `Ok(None)` when there is
 /// no file.
@@ -135,13 +138,14 @@ pub(crate) fn parse_walg_env_snapshot(
     let (checksum, after_raw) = after_cksum
         .split_once(&format!("\n{SNAPSHOT_RAW}\n"))
         .ok_or_else(missing)?;
-    let (raw, evaluated) = after_raw
+    let (raw, after_eval) = after_raw
         .rsplit_once(&format!("\n{SNAPSHOT_EVAL}\n"))
-        .or_else(|| {
-            after_raw
-                .strip_suffix(&format!("\n{SNAPSHOT_EVAL}"))
-                .map(|raw| (raw, ""))
-        })
+        .ok_or_else(missing)?;
+    // Without the end marker the assignments may be cut short; an empty
+    // list would read as "no AWS_ENDPOINT" and skip the repair silently.
+    let evaluated = after_eval
+        .trim_end_matches('\n')
+        .strip_suffix(SNAPSHOT_END)
         .ok_or_else(missing)?;
     Ok(Some(WalgEnvSnapshot {
         checksum: checksum.trim().to_string(),

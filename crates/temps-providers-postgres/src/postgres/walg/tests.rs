@@ -1410,21 +1410,50 @@ mod atomic_write_tests {
         let scratch = Scratch::new("lock");
         std::fs::write(scratch.file(), OLD).unwrap();
         let path = scratch.file().to_str().unwrap().to_string();
+        let ready = format!("{path}.ready");
+        let release = format!("{path}.release");
+        // The holder says when it owns the lock and keeps it until told to
+        // let go: no timing guess either way. It gives up after 30 seconds,
+        // so a failed assertion never leaves it running.
         let mut holder = Command::new("sh")
             .arg("-c")
-            .arg(format!("exec 9>>'{path}.lock'; flock 9; sleep 2"))
+            .arg(format!(
+                "exec 9>>'{path}.lock'; flock 9; : > '{ready}'; i=0; \
+                 while [ ! -e '{release}' ] && [ $i -lt 600 ]; do sleep 0.05; i=$((i+1)); done"
+            ))
             .spawn()
             .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        let started = std::time::Instant::now();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !std::path::Path::new(&ready).exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the holder never took the lock"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
         let lines = vec!["export AWS_ENDPOINT='http://10.0.0.5:9000'".to_string()];
-        assert!(run("", &atomic_write_command(&lines, &path, None)).success());
+        let mut writer = Command::new("sh")
+            .arg("-c")
+            .arg(atomic_write_command(&lines, &path, None))
+            .spawn()
+            .unwrap();
+        // However long the writer takes to start, it cannot finish (or touch
+        // the file) while the lock is held.
+        std::thread::sleep(std::time::Duration::from_millis(300));
         assert!(
-            started.elapsed() >= std::time::Duration::from_millis(1200),
-            "the write did not wait for the lock: {:?}",
-            started.elapsed()
+            writer.try_wait().unwrap().is_none(),
+            "the write finished while another writer held the lock"
         );
-        holder.wait().unwrap();
+        assert_eq!(std::fs::read_to_string(scratch.file()).unwrap(), OLD);
+
+        std::fs::write(&release, "").unwrap();
+        assert!(holder.wait().unwrap().success());
+        assert!(writer.wait().unwrap().success());
+        assert_eq!(
+            std::fs::read_to_string(scratch.file()).unwrap(),
+            "export AWS_ENDPOINT='http://10.0.0.5:9000'\n"
+        );
     }
 
     #[test]
@@ -1436,7 +1465,8 @@ mod atomic_write_tests {
                       export AWS_ENDPOINT='10.0.0.5:9000'\n\
                       \n\
                       __TEMPS_WALG_ENV_EVAL__\n\
-                      AWS_ENDPOINT=10.0.0.5:9000\n";
+                      AWS_ENDPOINT=10.0.0.5:9000\n\
+                      __TEMPS_WALG_ENV_END__\n";
         assert_eq!(
             parse_walg_env_snapshot(output),
             Ok(Some(WalgEnvSnapshot {
@@ -1447,6 +1477,24 @@ mod atomic_write_tests {
         );
         assert_eq!(parse_walg_env_snapshot("__TEMPS_NO_WALG_ENV__\n"), Ok(None));
         assert!(parse_walg_env_snapshot("AWS_ENDPOINT=10.0.0.5:9000\n").is_err());
+        // A file with no WALG_/AWS_ assignments is a complete, empty list.
+        let empty = "__TEMPS_WALG_ENV_CKSUM__\n1 2\n__TEMPS_WALG_ENV_RAW__\n# note\n\n\
+                     __TEMPS_WALG_ENV_EVAL__\n__TEMPS_WALG_ENV_END__\n";
+        assert_eq!(
+            parse_walg_env_snapshot(empty).map(|s| s.map(|s| s.evaluated)),
+            Ok(Some(Vec::new()))
+        );
+    }
+
+    /// Output that stops before the end marker (a stream cut short) is an
+    /// incomplete snapshot, never an empty list of assignments that would
+    /// make the repair skip a legacy endpoint.
+    #[test]
+    fn a_snapshot_cut_short_is_incomplete() {
+        let head = "__TEMPS_WALG_ENV_CKSUM__\n1 2\n__TEMPS_WALG_ENV_RAW__\n\
+                    export AWS_ENDPOINT='10.0.0.5:9000'\n\n__TEMPS_WALG_ENV_EVAL__\n";
+        assert!(parse_walg_env_snapshot(head).is_err());
+        assert!(parse_walg_env_snapshot(&format!("{head}AWS_ENDPOINT=10.0.0.5:9000\n")).is_err());
     }
 
     /// The snapshot script itself, against a real file: the reported
