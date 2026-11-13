@@ -197,6 +197,17 @@ impl S3Endpoint {
         self.port
     }
 
+    /// The port a connection actually uses: the explicit one, or the
+    /// scheme's default (80 for HTTP, 443 for HTTPS). [`Self::url`] omits a
+    /// default port, so `http://localhost:80` and `http://localhost` name the
+    /// same destination.
+    pub fn effective_port(&self) -> u16 {
+        self.port.unwrap_or(match self.scheme {
+            S3Scheme::Http => 80,
+            S3Scheme::Https => 443,
+        })
+    }
+
     /// Whether the input spelled out `http://` or `https://`.
     pub fn scheme_was_explicit(&self) -> bool {
         self.scheme_was_explicit

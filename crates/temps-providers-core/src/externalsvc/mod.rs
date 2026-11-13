@@ -439,14 +439,7 @@ impl S3Credentials {
             return Some(url);
         }
 
-        // Extract port from the endpoint URL
-        let port: Option<u16> = url.split("://").nth(1).and_then(|host_port| {
-            host_port
-                .split('/')
-                .next()
-                .and_then(|hp| hp.rsplit(':').next())
-                .and_then(|p| p.parse().ok())
-        });
+        let port = endpoint_port(&url);
 
         // Determine which Docker network the target container is on
         let target_network = match docker
@@ -544,6 +537,17 @@ impl S3Credentials {
     }
 }
 
+/// The port a client connects to for `url`, including the scheme's default.
+///
+/// Normalisation drops a default port (`http://localhost:80` becomes
+/// `http://localhost`), and an object store published on the host's port 80
+/// or 443 must still be matched to the container that publishes it.
+fn endpoint_port(url: &str) -> Option<u16> {
+    temps_core::s3_endpoint::S3Endpoint::parse(url, None)
+        .ok()
+        .map(|endpoint| endpoint.effective_port())
+}
+
 /// Select the canonical Docker container name from `ContainerSummary::names`.
 ///
 /// Docker's legacy `--link` support prepends aliases such as
@@ -559,7 +563,26 @@ fn canonical_container_name(names: &[String]) -> Option<&str> {
 
 #[cfg(test)]
 mod s3_endpoint_tests {
-    use super::canonical_container_name;
+    use super::{canonical_container_name, endpoint_port};
+
+    /// An explicit default port is dropped by normalisation; the container
+    /// lookup still needs it to find the store published on that port.
+    #[test]
+    fn endpoint_port_includes_the_scheme_default() {
+        let normalised = temps_core::s3_endpoint::endpoint_url("http://localhost:80");
+        assert_eq!(normalised, "http://localhost");
+        assert_eq!(endpoint_port(&normalised), Some(80));
+        assert_eq!(
+            endpoint_port(&temps_core::s3_endpoint::endpoint_url(
+                "https://127.0.0.1:443"
+            )),
+            Some(443)
+        );
+        assert_eq!(
+            endpoint_port(&temps_core::s3_endpoint::endpoint_url("localhost:9000")),
+            Some(9000)
+        );
+    }
 
     #[test]
     fn canonical_container_name_ignores_link_aliases() {
