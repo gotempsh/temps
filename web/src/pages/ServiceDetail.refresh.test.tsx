@@ -68,3 +68,56 @@ test('a failed Refresh keeps the loaded service page', async () => {
   expect(screen.getByRole('heading', { name: 'orders-db' })).toBeTruthy()
   expect(screen.queryByText("Couldn't load service")).toBeNull()
 })
+
+test('Refresh also reads the service health shown in the header again', async () => {
+  let healthReads = 0
+  mockApi({
+    'GET /external-services/3': () =>
+      jsonResponse({
+        sensitive_parameters: [],
+        current_parameters: {},
+        service: {
+          id: 3,
+          name: 'orders-db',
+          service_type: 'postgres',
+          status: 'running',
+          created_at: '2026-01-01T00:00:00Z',
+          updated_at: '2026-01-01T00:00:00Z',
+        },
+      }),
+    'GET /external-services/3/health-status': () => {
+      healthReads++
+      // The monitor saw the service go down since the page loaded.
+      return jsonResponse({
+        service_id: 3,
+        status: healthReads === 1 ? 'operational' : 'down',
+        consecutive_failures: healthReads === 1 ? 0 : 3,
+        recent_checks: [],
+      })
+    },
+  })
+  render(
+    <QueryClientProvider
+      client={
+        new QueryClient({ defaultOptions: { queries: { retry: false } } })
+      }
+    >
+      <MemoryRouter initialEntries={['/storage/3']}>
+        <BreadcrumbProvider>
+          <Routes>
+            <Route path="/storage/:id" element={<ServiceDetail />} />
+          </Routes>
+        </BreadcrumbProvider>
+      </MemoryRouter>
+    </QueryClientProvider>
+  )
+  await screen.findByRole('heading', { name: 'orders-db' })
+  await waitFor(() => expect(healthReads).toBe(1))
+
+  fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
+
+  await waitFor(() => expect(healthReads).toBe(2))
+  await waitFor(() =>
+    expect(screen.getAllByText('Down').length).toBeGreaterThan(0)
+  )
+})

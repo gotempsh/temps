@@ -792,6 +792,8 @@ export function ServiceDetail() {
                 }),
                 ['pg-upgrades', id],
                 externalServiceBackupsQueryKey(service.service.id),
+                // The header badge and the health strip.
+                ['service-health', service.service.id],
               ]}
             />
             {/*
