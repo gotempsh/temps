@@ -73,6 +73,11 @@ pub struct RouteEntry {
     /// predates grants, admits the route's own project only.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_callers: Vec<temps_core::internal_access::InternalAccessCaller>,
+    /// Sandboxes on this node this internal route admits (ADR 105). Empty,
+    /// the default from a control plane or a `routes.json` that predates
+    /// sandbox grants, admits no sandbox.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_sandboxes: Vec<temps_core::internal_access::InternalAccessSandboxCaller>,
 }
 
 /// What a container serves, by the control plane's route snapshot: the
@@ -939,6 +944,7 @@ mod tests {
             gate: None,
             shield: None,
             allowed_callers: Vec::new(),
+            allowed_sandboxes: Vec::new(),
         }
     }
 

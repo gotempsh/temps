@@ -8402,6 +8402,22 @@ export type CreateInternalAccessGrantRequest = {
     target_environment_id?: number | null;
 };
 
+export type CreateInternalAccessSandboxGrantRequest = {
+    /**
+     * Why the grant exists, up to 200 characters.
+     */
+    description?: string | null;
+    /**
+     * Public id of one of your sandboxes.
+     */
+    sandbox_id: string;
+    /**
+     * The environment of this project that may be called; omit for every
+     * environment, present and future.
+     */
+    target_environment_id?: number | null;
+};
+
 /**
  * Request to create an IP access control rule
  */
@@ -11892,6 +11908,11 @@ export type DnsResolveRequest = {
      * `A` (default), `AAAA`, `CNAME`, `SRV` or `TXT`.
      */
     record_type?: string | null;
+    /**
+     * Ask as one of your sandboxes (its public id): whether an internal
+     * access grant lets it call the name. Not with `project_id`.
+     */
+    sandbox_id?: string | null;
 };
 
 export type DnsResolveResponse = {
@@ -18738,6 +18759,43 @@ export type InternalAccessGrantResponse = {
     created_by?: number | null;
     description?: string | null;
     id: number;
+    /**
+     * `null`: every environment of the target project.
+     */
+    target_environment_id?: number | null;
+    target_environment_name?: string | null;
+    target_project_id: number;
+    target_project_name: string;
+    target_project_slug: string;
+};
+
+export type InternalAccessSandboxGrantListResponse = {
+    items: Array<InternalAccessSandboxGrantResponse>;
+    page: number;
+    page_size: number;
+    total: number;
+};
+
+/**
+ * One sandbox allowed to call this project (or one environment of it).
+ */
+export type InternalAccessSandboxGrantResponse = {
+    created_at: string;
+    created_by?: number | null;
+    description?: string | null;
+    id: number;
+    /**
+     * The sandbox's public id.
+     */
+    sandbox_id: string;
+    /**
+     * The name the user gave the sandbox.
+     */
+    sandbox_name: string;
+    /**
+     * `running` or `stopped`; a destroyed sandbox's grants are removed.
+     */
+    sandbox_status: string;
     /**
      * `null`: every environment of the target project.
      */
@@ -29283,6 +29341,39 @@ export type SandboxInner = {
     timeout: number;
     updatedAt: number;
     vcpus: number;
+};
+
+export type SandboxInternalAddressListResponse = {
+    items: Array<SandboxInternalAddressResponse>;
+    page: number;
+    page_size: number;
+    total: number;
+};
+
+/**
+ * One internal address the sandbox may call, with the command that calls it.
+ */
+export type SandboxInternalAddressResponse = {
+    alias_curl_command?: string | null;
+    /**
+     * The same environment by its subdomain, `<subdomain>.temps.local`
+     * (ADR-105 D7). Absent when the subdomain is not one DNS label, or a
+     * managed service or another owner holds that name.
+     */
+    alias_hostname?: string | null;
+    /**
+     * Run inside the sandbox: its egress proxy sends it to this host's
+     * internal proxy.
+     */
+    curl_command: string;
+    environment_id: number;
+    environment_name: string;
+    grant_id: number;
+    hostname: string;
+    project_id: number;
+    project_name: string;
+    project_slug: string;
+    url: string;
 };
 
 /**
@@ -83402,6 +83493,158 @@ export type CreateInternalAccessGrantResponses = {
 
 export type CreateInternalAccessGrantResponse = CreateInternalAccessGrantResponses[keyof CreateInternalAccessGrantResponses];
 
+export type ListInternalAccessSandboxGrantsData = {
+    body?: never;
+    path: {
+        /**
+         * The project being called
+         */
+        project_id: number;
+    };
+    query?: {
+        /**
+         * Only grants that cover this environment of the project: its own and
+         * the project-wide ones.
+         */
+        environment_id?: number | null;
+        /**
+         * 1-based page, default 1.
+         */
+        page?: number | null;
+        /**
+         * Default 20, at most 100.
+         */
+        page_size?: number | null;
+    };
+    url: '/projects/{project_id}/internal-access/sandboxes';
+};
+
+export type ListInternalAccessSandboxGrantsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project or environment not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type ListInternalAccessSandboxGrantsError = ListInternalAccessSandboxGrantsErrors[keyof ListInternalAccessSandboxGrantsErrors];
+
+export type ListInternalAccessSandboxGrantsResponses = {
+    /**
+     * Sandbox grants on the project
+     */
+    200: InternalAccessSandboxGrantListResponse;
+};
+
+export type ListInternalAccessSandboxGrantsResponse = ListInternalAccessSandboxGrantsResponses[keyof ListInternalAccessSandboxGrantsResponses];
+
+export type CreateInternalAccessSandboxGrantData = {
+    body: CreateInternalAccessSandboxGrantRequest;
+    path: {
+        /**
+         * The project being called
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/internal-access/sandboxes';
+};
+
+export type CreateInternalAccessSandboxGrantErrors = {
+    /**
+     * Invalid grant
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions on the project
+     */
+    403: ProblemDetails;
+    /**
+     * Project, environment or sandbox not found
+     */
+    404: ProblemDetails;
+    /**
+     * Already granted, or too many grants
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type CreateInternalAccessSandboxGrantError = CreateInternalAccessSandboxGrantErrors[keyof CreateInternalAccessSandboxGrantErrors];
+
+export type CreateInternalAccessSandboxGrantResponses = {
+    /**
+     * Grant created
+     */
+    201: InternalAccessSandboxGrantResponse;
+};
+
+export type CreateInternalAccessSandboxGrantResponse = CreateInternalAccessSandboxGrantResponses[keyof CreateInternalAccessSandboxGrantResponses];
+
+export type DeleteInternalAccessSandboxGrantData = {
+    body?: never;
+    path: {
+        /**
+         * The project being called
+         */
+        project_id: number;
+        /**
+         * Sandbox grant ID
+         */
+        grant_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/internal-access/sandboxes/{grant_id}';
+};
+
+export type DeleteInternalAccessSandboxGrantErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Grant not found on this project
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type DeleteInternalAccessSandboxGrantError = DeleteInternalAccessSandboxGrantErrors[keyof DeleteInternalAccessSandboxGrantErrors];
+
+export type DeleteInternalAccessSandboxGrantResponses = {
+    /**
+     * Grant removed
+     */
+    204: void;
+};
+
+export type DeleteInternalAccessSandboxGrantResponse = DeleteInternalAccessSandboxGrantResponses[keyof DeleteInternalAccessSandboxGrantResponses];
+
 export type DeleteInternalAccessGrantData = {
     body?: never;
     path: {
@@ -88742,6 +88985,57 @@ export type SandboxAccessVaultsResponses = {
 };
 
 export type SandboxAccessVaultsResponse = SandboxAccessVaultsResponses[keyof SandboxAccessVaultsResponses];
+
+export type ListSandboxInternalAddressesData = {
+    body?: never;
+    path: {
+        /**
+         * Public id of one of your sandboxes
+         */
+        sandbox_id: string;
+    };
+    query?: {
+        /**
+         * 1-based page, default 1.
+         */
+        page?: number | null;
+        /**
+         * Default 20, at most 100.
+         */
+        page_size?: number | null;
+    };
+    url: '/sandboxes/{sandbox_id}/internal-addresses';
+};
+
+export type ListSandboxInternalAddressesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Sandbox not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type ListSandboxInternalAddressesError = ListSandboxInternalAddressesErrors[keyof ListSandboxInternalAddressesErrors];
+
+export type ListSandboxInternalAddressesResponses = {
+    /**
+     * Addresses the sandbox may call
+     */
+    200: SandboxInternalAddressListResponse;
+};
+
+export type ListSandboxInternalAddressesResponse = ListSandboxInternalAddressesResponses[keyof ListSandboxInternalAddressesResponses];
 
 export type GeneralAccessCapabilityData = {
     body?: never;

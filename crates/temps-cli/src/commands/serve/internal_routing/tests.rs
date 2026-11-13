@@ -33,6 +33,7 @@ fn dto(host: &str, project_id: i32, environment_id: i32, container_id: &str) -> 
         gate: None,
         shield: None,
         allowed_callers: Vec::new(),
+        allowed_sandboxes: Vec::new(),
     }
 }
 

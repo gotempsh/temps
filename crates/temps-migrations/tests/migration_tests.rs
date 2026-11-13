@@ -8752,3 +8752,113 @@ async fn test_restore_runs_restored_login_migration_up_and_down() -> anyhow::Res
     assert!(!has_column(&db).await?, "dropped by down");
     Ok(())
 }
+
+/// ADR-105 D7: the alias owner kind is accepted by both constraints after the
+/// migration, refused before it, and `down` removes the aliases' rows and
+/// restores the constraints; an environment's own name is untouched.
+#[tokio::test]
+async fn test_dns_environment_subdomain_alias_migration_up_and_down() -> anyhow::Result<()> {
+    if external_db_configured() {
+        println!("Skipping subdomain alias migration test: external database configured");
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_exposed_port(ContainerPort::Tcp(5432))
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!("Skipping subdomain alias migration test: Docker unavailable: {error}");
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    let name = "m20261113_000001_dns_environment_subdomain_alias";
+    let before = Migrator::migrations().len() as u32 - steps_back_to(name);
+    Migrator::up(&db, Some(before)).await?;
+    let claim = |fqdn: &str, kind: &str| {
+        format!(
+            "INSERT INTO dns_name_claims (fqdn, owner_kind, owner_id) VALUES ('{fqdn}', '{kind}', 7)"
+        )
+    };
+    let record = |fqdn: &str, kind: &str| {
+        format!(
+            "INSERT INTO service_endpoints (fqdn, record_type, target_ip, target_port, ttl, \
+             owner_kind, owner_id, generation, created_at, updated_at) \
+             VALUES ('{fqdn}', 'A', '172.20.0.1', 80, 10, '{kind}', 7, 1, now(), now())"
+        )
+    };
+    assert!(db
+        .execute_unprepared(&claim(
+            "shop-production.temps.local",
+            "environment_subdomain"
+        ))
+        .await
+        .is_err());
+    assert!(db
+        .execute_unprepared(&record(
+            "shop-production.temps.local",
+            "environment_subdomain"
+        ))
+        .await
+        .is_err());
+
+    Migrator::up(&db, Some(1)).await?;
+    for statement in [
+        claim("production.shop.temps.local", "environment"),
+        record("production.shop.temps.local", "environment"),
+        claim("shop-production.temps.local", "environment_subdomain"),
+        record("shop-production.temps.local", "environment_subdomain"),
+    ] {
+        db.execute_unprepared(&statement).await?;
+    }
+    assert!(
+        db.execute_unprepared(&claim("x.temps.local", "bogus"))
+            .await
+            .is_err(),
+        "the owner kinds stay a closed set"
+    );
+
+    Migrator::down(&db, Some(steps_back_to(name))).await?;
+    let count = |table: &'static str, kind: &'static str| {
+        let db = &db;
+        async move {
+            db.query_one(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                format!("SELECT count(*) AS n FROM {table} WHERE owner_kind = '{kind}'"),
+            ))
+            .await?
+            .expect("count row")
+            .try_get::<i64>("", "n")
+            .map_err(anyhow::Error::from)
+        }
+    };
+    assert_eq!(count("dns_name_claims", "environment_subdomain").await?, 0);
+    assert_eq!(
+        count("service_endpoints", "environment_subdomain").await?,
+        0
+    );
+    assert_eq!(count("dns_name_claims", "environment").await?, 1);
+    assert_eq!(count("service_endpoints", "environment").await?, 1);
+    assert!(db
+        .execute_unprepared(&claim("shop-staging.temps.local", "environment_subdomain"))
+        .await
+        .is_err());
+    Ok(())
+}

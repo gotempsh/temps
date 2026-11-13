@@ -578,6 +578,11 @@ pub enum ClusterDnsError {
     NoProjectContainer { project_id: i32, node_id: i32 },
     #[error("Invalid test resolution: {reason}")]
     Invalid { reason: String },
+    #[error(
+        "Sandbox {sandbox_id} not found among your sandboxes, or it has been destroyed; a test \
+         resolution can only be asked as a sandbox you own"
+    )]
+    SandboxNotFound { sandbox_id: String },
     #[error("The resolver on node {node_id} is not running: {reason}")]
     ResolverNotRunning { node_id: i32, reason: String },
     #[error("The agent on node {node_id} predates test resolution (HTTP {status}); upgrade it")]
@@ -609,6 +614,49 @@ pub struct TestResolution {
     /// For an internal route asked as a project: who owns it, and whether
     /// that project lets the asking one call it (ADR 101 D7).
     pub internal_access: Option<super::internal_access_check::InternalAccessVerdict>,
+}
+
+/// Whom a test resolution is asked as.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TestResolutionCaller {
+    /// The node's resolver itself.
+    Node,
+    /// One of the project's containers on that node.
+    Project(i32),
+    /// One of the asking user's sandboxes (ADR 105).
+    Sandbox { sandbox_id: String, user_id: i32 },
+}
+
+/// How a sandbox reaches `name`, said next to a test resolution asked as it.
+pub(crate) fn sandbox_resolution_note(
+    sandbox: &super::internal_access_check::AskingSandbox,
+    node_id: i32,
+    name: &str,
+    internal_route: bool,
+) -> String {
+    let runs_on = sandbox.node_id.unwrap_or(CONTROL_PLANE_NODE_ID);
+    let mut note = if internal_route {
+        format!(
+            "Sandbox {} does not look this name up: its egress proxy sends http://{name}/ to the \
+             internal proxy of the node it runs on, which admits it only with an internal access \
+             grant naming the sandbox.",
+            sandbox.public_id
+        )
+    } else {
+        format!(
+            "Sandbox {} reaches only public addresses and the internal addresses \
+             <environment>.<project>.temps.local and <environment subdomain>.temps.local; any \
+             other private name is refused by its egress proxy.",
+            sandbox.public_id
+        )
+    };
+    if runs_on != node_id {
+        note.push_str(&format!(
+            " The sandbox runs on node {runs_on}, not node {node_id}: that node's internal proxy \
+             decides its calls."
+        ));
+    }
+    note
 }
 
 #[derive(Debug, FromQueryResult)]
@@ -825,8 +873,21 @@ impl ClusterDnsService {
         node_id: i32,
         name: &str,
         record_type: &str,
-        project_id: Option<i32>,
+        asked_as: TestResolutionCaller,
     ) -> Result<TestResolution, ClusterDnsError> {
+        let project_id = match &asked_as {
+            TestResolutionCaller::Project(project_id) => Some(*project_id),
+            TestResolutionCaller::Sandbox { .. } | TestResolutionCaller::Node => None,
+        };
+        if let TestResolutionCaller::Sandbox {
+            sandbox_id,
+            user_id,
+        } = &asked_as
+        {
+            return self
+                .resolve_as_sandbox(node_id, name, record_type, sandbox_id, *user_id)
+                .await;
+        }
         let mut resolution = self
             .resolve_answer(node_id, name, record_type, project_id)
             .await?;
@@ -842,6 +903,51 @@ impl ClusterDnsService {
                 source,
             })?;
         }
+        Ok(resolution)
+    }
+
+    /// A test resolution asked as sandbox `sandbox_id` (ADR 105). The
+    /// sandbox never looks internal names up: its egress proxy sends the
+    /// request by name to the internal proxy of the sandbox's node. So the
+    /// answer is the node's own, and the verdict says whether a sandbox grant
+    /// admits it.
+    async fn resolve_as_sandbox(
+        &self,
+        node_id: i32,
+        name: &str,
+        record_type: &str,
+        sandbox_id: &str,
+        user_id: i32,
+    ) -> Result<TestResolution, ClusterDnsError> {
+        let sandbox =
+            super::internal_access_check::owned_sandbox(self.db.as_ref(), sandbox_id, user_id)
+                .await
+                .map_err(|source| ClusterDnsError::Database {
+                    operation: "reading the sandbox a test resolution is asked as",
+                    source,
+                })?
+                .ok_or_else(|| ClusterDnsError::SandboxNotFound {
+                    sandbox_id: sandbox_id.to_string(),
+                })?;
+        let mut resolution = self
+            .resolve_answer(node_id, name, record_type, None)
+            .await?;
+        resolution.internal_access = super::internal_access_check::sandbox_internal_access_verdict(
+            self.db.as_ref(),
+            &resolution.name,
+            &sandbox,
+        )
+        .await
+        .map_err(|source| ClusterDnsError::Database {
+            operation: "checking a sandbox's internal access for a test resolution",
+            source,
+        })?;
+        resolution.note = Some(sandbox_resolution_note(
+            &sandbox,
+            node_id,
+            &resolution.name,
+            resolution.internal_access.is_some(),
+        ));
         Ok(resolution)
     }
 
@@ -1374,6 +1480,33 @@ impl ClusterDnsCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_resolution_asked_as_a_sandbox_says_how_the_sandbox_reaches_the_name() {
+        let sandbox = |node_id| super::super::internal_access_check::AskingSandbox {
+            id: 5,
+            public_id: "sbx_alpha".to_string(),
+            node_id,
+        };
+        let note =
+            sandbox_resolution_note(&sandbox(None), 0, "production.orders.temps.local", true);
+        assert!(
+            note.contains("http://production.orders.temps.local/"),
+            "{note}"
+        );
+        assert!(
+            note.contains("internal access grant naming the sandbox"),
+            "{note}"
+        );
+        assert!(!note.contains("runs on node"), "{note}");
+
+        let note =
+            sandbox_resolution_note(&sandbox(Some(3)), 0, "production.orders.temps.local", true);
+        assert!(note.contains("runs on node 3, not node 0"), "{note}");
+
+        let note = sandbox_resolution_note(&sandbox(None), 0, "db.internal.example", false);
+        assert!(note.contains("any other private name is refused"), "{note}");
+    }
 
     /// What an agent from before ADR-098 reports when port 80 is held.
     fn held_proxy() -> InternalProxyState {

@@ -71,6 +71,7 @@ pub(crate) fn route_entry(dto: RouteEntryDto) -> RouteEntry {
         gate: None,
         shield: None,
         allowed_callers: dto.allowed_callers,
+        allowed_sandboxes: dto.allowed_sandboxes,
     }
 }
 
@@ -82,11 +83,17 @@ async fn refresh(
     db: &sea_orm::DatabaseConnection,
     generation: u64,
 ) -> Result<usize, sea_orm::DbErr> {
-    let routes: Vec<RouteEntry> = temps_routes::route_sync::internal_route_entries(peer_table, db)
-        .await?
-        .into_iter()
-        .map(route_entry)
-        .collect();
+    // The sandboxes this process runs itself are the control plane's
+    // (`sandboxes.node_id IS NULL`, ADR 105).
+    let routes: Vec<RouteEntry> = temps_routes::route_sync::internal_route_entries(
+        peer_table,
+        db,
+        temps_routes::internal_access_grants::SnapshotNode::ControlPlane,
+    )
+    .await?
+    .into_iter()
+    .map(route_entry)
+    .collect();
     let count = routes.len();
     store.apply_snapshot(generation, routes);
     Ok(count)

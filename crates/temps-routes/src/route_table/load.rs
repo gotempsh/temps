@@ -45,6 +45,11 @@ struct RouteLoadState {
     tls_wildcards_matcher: WildcardMatcher,
     /// Status-page hostnames (phase 7).
     status_page_hosts: HashMap<String, StatusPageHostRoute>,
+    /// One-label `*.temps.local` names another owner holds in the DNS
+    /// registry (a managed service, a node, a static record): an
+    /// environment's subdomain alias yields to them and is not routed
+    /// (ADR-105 D7).
+    taken_aliases: HashSet<String>,
 }
 
 /// What `assemble_snapshot` hands back for publication.
@@ -146,6 +151,7 @@ impl CachedPeerTable {
             http_wildcards_matcher: WildcardMatcher::new(),
             tls_wildcards_matcher: WildcardMatcher::new(),
             status_page_hosts: HashMap::new(),
+            taken_aliases: self.taken_alias_names().await?,
         };
 
         self.load_environment_domain_routes(&mut state).await?;
@@ -904,6 +910,26 @@ impl CachedPeerTable {
     }
 
     /// Phase 4: every environment with a subdomain and a current deployment (preview domain routing).
+    /// The one-label internal names owners other than an environment's
+    /// subdomain alias hold (ADR-105 D7), read once per rebuild. Bounded by
+    /// the number of managed services, nodes and static records.
+    async fn taken_alias_names(&self) -> Result<HashSet<String>, RouteLoadError> {
+        #[derive(sea_orm::FromQueryResult)]
+        struct Claimed {
+            fqdn: String,
+        }
+        use sea_orm::FromQueryResult;
+        let rows = Claimed::find_by_statement(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT fqdn FROM dns_name_claims \
+             WHERE owner_kind <> $1 AND fqdn ~ '^[^.]+\\.temps\\.local$'",
+            [temps_core::internal_access::ENVIRONMENT_ALIAS_OWNER_KIND.into()],
+        ))
+        .all(self.db.as_ref())
+        .await?;
+        Ok(rows.into_iter().map(|row| row.fqdn).collect())
+    }
+
     async fn load_environment_routes(
         &self,
         state: &mut RouteLoadState,
@@ -920,8 +946,15 @@ impl CachedPeerTable {
             deployments_cache,
             nodes_cache,
             tunnel_environment_hosts,
+            taken_aliases,
             ..
         } = state;
+        // ADR-105 D7: `<environment subdomain>.temps.local`, unless another
+        // owner holds that name.
+        let alias_for = |subdomain: &str| {
+            temps_core::internal_access::environment_alias_name(subdomain)
+                .filter(|alias| !taken_aliases.contains(alias))
+        };
 
         // 4. Load all environments with main_url (for preview domain routing)
         // This handles environments that don't have explicit environment_domains entries
@@ -1147,6 +1180,7 @@ impl CachedPeerTable {
                             if !env_slug.is_empty() && !proj_slug.is_empty() {
                                 hosts.push(format!("{}.{}.temps.local", env_slug, proj_slug));
                             }
+                            hosts.extend(alias_for(&env.subdomain));
                             hosts.extend(compose_public_service_hostnames(
                                 route.project.preset_config.as_ref(),
                                 preview_domain,
@@ -1277,6 +1311,30 @@ impl CachedPeerTable {
                                     internal_fqdn, env.project_id, env.id, deployment_id
                                 );
                             }
+                        }
+                    }
+                    // The environment's subdomain alias (ADR-105 D7): the same
+                    // route under a second name, so it carries the same
+                    // project and environment and the same grant decision.
+                    if let Some(alias) = alias_for(&env.subdomain) {
+                        if !routes.contains_key(&alias) {
+                            routes.insert(
+                                alias.clone(),
+                                RouteInfo {
+                                    backend: backend.clone(),
+                                    redirect_to: None,
+                                    status_code: None,
+                                    project: project.cloned(),
+                                    environment: environment.cloned(),
+                                    deployment: Some(Arc::clone(deployment)),
+                                    cert_eligible: false,
+                                },
+                            );
+                            primary_route_hosts.insert(alias.clone());
+                            debug!(
+                                "Loaded internal temps.local alias: {} (project={}, env={}, deploy={})",
+                                alias, env.project_id, env.id, deployment_id
+                            );
                         }
                     }
 
@@ -2234,6 +2292,8 @@ mod tests {
             "shop-production",
             preview_host.as_str(),
             internal_host.as_str(),
+            // ADR-105 D7: the subdomain alias.
+            "shop-production.temps.local",
         ] {
             let route = table
                 .get_route(host)
@@ -2255,6 +2315,20 @@ mod tests {
                 .is_some_and(|r| !r.cert_eligible),
             "an internal temps.local name is never on-demand certable"
         );
+
+        // A managed service holding the alias's name takes it: the alias is
+        // no longer routed, the environment's two-label name still is.
+        test_db
+            .db
+            .execute(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                "INSERT INTO dns_name_claims (fqdn, owner_kind, owner_id) \
+                 VALUES ('shop-production.temps.local', 'service_role', 3)",
+            ))
+            .await?;
+        table.load_routes().await?;
+        assert!(table.get_route("shop-production.temps.local").is_none());
+        assert!(table.get_route(&internal_host).is_some());
 
         test_db.cleanup().await?;
         Ok(())

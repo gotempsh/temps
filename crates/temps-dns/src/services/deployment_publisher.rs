@@ -152,21 +152,27 @@ impl DeploymentDnsPublisher {
     /// DNS was turned off, or its resolver stopped. Workers' records are left
     /// as they are.
     async fn withdraw_control_plane_names(&self) -> Result<usize, DnsRegistryError> {
-        let owners: Vec<i64> = temps_entities::service_endpoints::Entity::find()
+        let owners: Vec<(String, i64)> = temps_entities::service_endpoints::Entity::find()
             .select_only()
+            .column(temps_entities::service_endpoints::Column::OwnerKind)
             .column(temps_entities::service_endpoints::Column::OwnerId)
-            .filter(
-                temps_entities::service_endpoints::Column::OwnerKind
-                    .eq(OwnerKind::Environment.as_str()),
-            )
+            .filter(temps_entities::service_endpoints::Column::OwnerKind.is_in([
+                OwnerKind::Environment.as_str(),
+                OwnerKind::EnvironmentSubdomain.as_str(),
+            ]))
             .filter(temps_entities::service_endpoints::Column::NodeId.is_null())
             .distinct()
-            .into_tuple::<i64>()
+            .into_tuple::<(String, i64)>()
             .all(self.db.as_ref())
             .await?;
-        for owner_id in &owners {
+        for (kind, owner_id) in &owners {
+            let kind = if kind == OwnerKind::EnvironmentSubdomain.as_str() {
+                OwnerKind::EnvironmentSubdomain
+            } else {
+                OwnerKind::Environment
+            };
             self.registry
-                .replace_endpoints_for_owner(OwnerKind::Environment, *owner_id, &[])
+                .replace_endpoints_for_owner(kind, *owner_id, &[])
                 .await?;
         }
         if !owners.is_empty() {
@@ -279,8 +285,13 @@ impl DeploymentDnsPublisher {
                 continue;
             }
 
+            // ADR-105 D7: the environment's subdomain under the zone, owned
+            // separately so a name another owner holds refuses only the alias.
+            self.publish_alias(env.id, &env.subdomain, &bridge_ips)
+                .await;
+
             let fqdn = format!("{}.{}.temps.local", env_slug, proj_slug);
-            let drafts = environment_drafts(env.id, &fqdn, &bridge_ips);
+            let drafts = environment_drafts(OwnerKind::Environment, env.id, &fqdn, &bridge_ips);
 
             match self
                 .registry
@@ -329,16 +340,62 @@ impl DeploymentDnsPublisher {
         Ok(reconciled)
     }
 
-    /// Drop all DNS records of an environment's stable name, and release the
-    /// name. Called when the environment is torn down, so its hostname stops
-    /// resolving and another owner may claim it.
+    /// Publish `<subdomain>.temps.local` for one environment (ADR-105 D7), or
+    /// withdraw it when the subdomain is not one DNS label. Its own owner, so
+    /// a managed service or any other owner holding the name refuses only
+    /// the alias: the registry records the conflict, and the environment's
+    /// `<env>.<project>.temps.local` name is published as before.
+    async fn publish_alias(&self, environment_id: i32, subdomain: &str, targets: &[NameTarget]) {
+        let drafts = temps_core::internal_access::environment_alias_name(subdomain)
+            .map(|alias| {
+                environment_drafts(
+                    OwnerKind::EnvironmentSubdomain,
+                    environment_id,
+                    &alias,
+                    targets,
+                )
+            })
+            .unwrap_or_default();
+        match self
+            .registry
+            .replace_endpoints_for_owner(
+                OwnerKind::EnvironmentSubdomain,
+                environment_id as i64,
+                &drafts,
+            )
+            .await
+        {
+            Ok(_) => {}
+            // Recorded as a conflict and logged once by the registry.
+            Err(DnsRegistryError::NameClaimed { .. }) => {
+                debug!(
+                    environment_id,
+                    subdomain, "environment alias is held by another owner; not published"
+                );
+            }
+            Err(error) => {
+                warn!(
+                    environment_id,
+                    subdomain,
+                    %error,
+                    "failed to publish the environment's subdomain alias; will retry on next reconcile"
+                );
+            }
+        }
+    }
+
+    /// Drop all DNS records of an environment's stable name and its subdomain
+    /// alias, and release both names. Called when the environment is torn
+    /// down, so its hostnames stop resolving and another owner may claim them.
     pub async fn delete_for_environment(
         &self,
         environment_id: i32,
     ) -> Result<(), DnsRegistryError> {
-        self.registry
-            .delete_by_owner(OwnerKind::Environment, environment_id as i64)
-            .await?;
+        for kind in [OwnerKind::Environment, OwnerKind::EnvironmentSubdomain] {
+            self.registry
+                .delete_by_owner(kind, environment_id as i64)
+                .await?;
+        }
         Ok(())
     }
 
@@ -380,6 +437,7 @@ pub async fn worker_bridge_gateways<C: sea_orm::ConnectionTrait>(
 /// The multi-A record set for one environment's stable name: one record
 /// per node bridge gateway, owned by the environment.
 fn environment_drafts(
+    owner_kind: OwnerKind,
     environment_id: i32,
     fqdn: &str,
     targets: &[NameTarget],
@@ -392,7 +450,7 @@ fn environment_drafts(
             target_ip: Some(target.ip.clone()),
             target_port: Some(INTERNAL_PROXY_PORT),
             ttl: DEPLOYMENT_TTL_SECS,
-            owner_kind: OwnerKind::Environment,
+            owner_kind,
             owner_id: environment_id as i64,
             node_id: target.node_id,
         })
@@ -498,6 +556,7 @@ mod tests {
     #[test]
     fn a_control_plane_record_has_no_node() {
         let drafts = environment_drafts(
+            OwnerKind::Environment,
             12,
             "production.api.temps.local",
             &name_targets(Vec::new(), gateway()),
@@ -522,5 +581,145 @@ mod tests {
         assert_eq!(publisher.current_control_plane_gateway(), None);
         *slot.write().unwrap() = gateway();
         assert_eq!(publisher.current_control_plane_gateway(), gateway());
+    }
+
+    /// ADR-105 D7, end to end through the publisher: an environment gets its
+    /// subdomain alias next to its two-label name; a managed service holding
+    /// the alias's name takes only the alias away; tearing the environment
+    /// down releases both.
+    #[tokio::test]
+    async fn an_environment_publishes_its_subdomain_alias_beside_its_name() {
+        use sea_orm::{ActiveModelTrait, Set};
+        use temps_entities::{preset::Preset, service_endpoints, upstream_config::UpstreamList};
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(_) => {
+                println!("Docker/DB not available, skipping test");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let now = chrono::Utc::now();
+        let project = projects::ActiveModel {
+            name: Set("Orders".into()),
+            slug: Set("orders".into()),
+            repo_owner: Set("owner".into()),
+            repo_name: Set("repo".into()),
+            main_branch: Set("main".into()),
+            preset: Set(Preset::NextJs),
+            directory: Set("/".into()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            is_deleted: Set(false),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+        let env = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("production".into()),
+            slug: Set("production".into()),
+            host: Set("orders-production.example.test".into()),
+            subdomain: Set("orders-production".into()),
+            upstreams: Set(UpstreamList::default()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+        let deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(env.id),
+            slug: Set("orders-production-1".into()),
+            state: Set("completed".into()),
+            metadata: Set(Some(deployments::DeploymentMetadata::default())),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+        let mut current: environments::ActiveModel = env.clone().into();
+        current.current_deployment_id = Set(Some(deployment.id));
+        current.update(db.as_ref()).await.unwrap();
+
+        let registry = Arc::new(DnsRegistry::new(db.clone()));
+        let slot: temps_node_dns::OverlayDnsSlot = Arc::new(std::sync::RwLock::new(gateway()));
+        let publisher = DeploymentDnsPublisher::new(db.clone(), registry.clone())
+            .with_control_plane_gateway(slot);
+        let owners = |fqdn: &'static str| {
+            let db = db.clone();
+            async move {
+                service_endpoints::Entity::find()
+                    .filter(service_endpoints::Column::Fqdn.eq(fqdn))
+                    .all(db.as_ref())
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|r| (r.owner_kind, r.owner_id, r.target_ip))
+                    .collect::<Vec<_>>()
+            }
+        };
+        let env_id = i64::from(env.id);
+        let at_gateway = Some("172.20.0.1".to_string());
+
+        assert_eq!(publisher.reconcile_all().await.unwrap(), 1);
+        assert_eq!(
+            owners("production.orders.temps.local").await,
+            [("environment".to_string(), env_id, at_gateway.clone())]
+        );
+        assert_eq!(
+            owners("orders-production.temps.local").await,
+            [(
+                "environment_subdomain".to_string(),
+                env_id,
+                at_gateway.clone()
+            )]
+        );
+
+        // A managed service named `orders-production` takes the alias's name.
+        let service = EndpointDraft {
+            fqdn: "orders-production.temps.local".into(),
+            record_type: RecordType::A,
+            target_ip: Some("10.0.0.9".into()),
+            target_port: Some(5432),
+            ttl: 10,
+            owner_kind: OwnerKind::ServiceRole,
+            owner_id: 3,
+            node_id: None,
+        };
+        registry
+            .replace_endpoints_for_owner(OwnerKind::ServiceRole, 3, &[service])
+            .await
+            .unwrap();
+        assert_eq!(
+            publisher.reconcile_all().await.unwrap(),
+            1,
+            "the environment's own name still publishes"
+        );
+        assert_eq!(
+            owners("orders-production.temps.local").await,
+            [("service_role".to_string(), 3, Some("10.0.0.9".to_string()))]
+        );
+        assert_eq!(
+            owners("production.orders.temps.local").await,
+            [("environment".to_string(), env_id, at_gateway)]
+        );
+        assert!(registry
+            .list_name_conflicts()
+            .await
+            .unwrap()
+            .iter()
+            .any(|c| c.fqdn == "orders-production.temps.local"
+                && c.owner_kind == "environment_subdomain"
+                && c.owner_id == env_id));
+
+        publisher.delete_for_environment(env.id).await.unwrap();
+        assert!(owners("production.orders.temps.local").await.is_empty());
+        assert_eq!(owners("orders-production.temps.local").await.len(), 1);
     }
 }

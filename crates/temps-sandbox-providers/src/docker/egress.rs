@@ -32,6 +32,91 @@ pub(super) fn sandbox_egress_proxy_name(container_name: &str) -> String {
     format!("{SANDBOX_EGRESS_PROXY_PREFIX}{container_name}")
 }
 
+/// The sandbox `container` is the egress proxy of, judged only from what the
+/// Docker daemon records about it, or `None` (ADR 105).
+///
+/// The internal proxy uses it to tell which sandbox a request comes from:
+/// the request's source address is the egress proxy's, on
+/// [`SANDBOX_EGRESS_NETWORK`], and that proxy serves exactly one sandbox.
+/// Everything checked here is set by the provider when it creates the
+/// proxy, and none of it is writable from inside a sandbox:
+///
+/// - the name is `temps-sandbox-egress-proxy-v2-<sandbox>` (Docker names are
+///   unique per daemon, and a Compose deployment may not set
+///   `container_name`);
+/// - it carries the egress policy label, and the network-owner label names
+///   the same sandbox;
+/// - it is attached to [`SANDBOX_EGRESS_NETWORK`] and to that sandbox's own
+///   network, which Compose deployments may not join (external and named
+///   networks are refused).
+///
+/// `container_name` may carry Docker's leading `/`.
+pub fn egress_proxy_sandbox(
+    container_name: &str,
+    labels: Option<&HashMap<String, String>>,
+    networks: &[&str],
+) -> Option<String> {
+    let name = container_name.strip_prefix('/').unwrap_or(container_name);
+    let sandbox = name.strip_prefix(SANDBOX_EGRESS_PROXY_PREFIX)?;
+    if !sandbox.starts_with(SANDBOX_NAME_PREFIX) || sandbox.len() == SANDBOX_NAME_PREFIX.len() {
+        return None;
+    }
+    let labels = labels?;
+    if labels.get(SANDBOX_NETWORK_OWNER_LABEL).map(String::as_str) != Some(sandbox)
+        || labels.get(SANDBOX_EGRESS_POLICY_LABEL).is_none()
+    {
+        return None;
+    }
+    let own_network = sandbox_network_name(sandbox);
+    (networks.contains(&SANDBOX_EGRESS_NETWORK) && networks.contains(&own_network.as_str()))
+        .then(|| sandbox.to_string())
+}
+
+/// Where this host's internal proxy listens, as the internal routing
+/// supervisor last reported it; `None` while it is not serving (ADR 105).
+///
+/// One supervisor per process, so one value per process, like the
+/// supervisor's own status. Read when an egress proxy is created or checked
+/// for drift, never per request.
+static INTERNAL_PROXY_ADDRESS: std::sync::RwLock<Option<std::net::SocketAddr>> =
+    std::sync::RwLock::new(None);
+
+/// Record where this host's internal proxy listens, or that it does not
+/// (`None`). Egress proxies created or replaced from now on send requests
+/// for `<environment>.<project>.temps.local` there; the ones already
+/// running keep the address they were created with until their sandbox is
+/// next started.
+pub fn publish_internal_proxy_address(address: Option<std::net::SocketAddr>) {
+    let mut slot = match INTERNAL_PROXY_ADDRESS.write() {
+        Ok(slot) => slot,
+        // The slot holds a plain value; a writer that panicked left a
+        // whole one behind.
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *slot = address;
+}
+
+/// The value the egress proxy receives in [`SANDBOX_INTERNAL_PROXY_ENV`]:
+/// the internal proxy's address, or empty while none is serving.
+pub(super) fn internal_proxy_environment_value() -> String {
+    let address = match INTERNAL_PROXY_ADDRESS.read() {
+        Ok(slot) => *slot,
+        Err(poisoned) => *poisoned.into_inner(),
+    };
+    address
+        .map(|address| address.to_string())
+        .unwrap_or_default()
+}
+
+/// Whether `container` was created with `expected` as its internal proxy
+/// address; a container without the variable carries the empty value.
+pub(super) fn container_has_internal_proxy(
+    container: &bollard::models::ContainerInspectResponse,
+    expected: &str,
+) -> bool {
+    container_environment_value(container, SANDBOX_INTERNAL_PROXY_ENV).unwrap_or("") == expected
+}
+
 pub(super) fn sandbox_egress_proxy_extra_hosts() -> Vec<String> {
     vec![SANDBOX_HOST_GATEWAY.to_string()]
 }
@@ -218,7 +303,7 @@ pub(super) fn sandbox_mcp_relay_url(
 
 /// The egress proxy is the only container with a NIC on both the internal
 /// sandbox network and this ordinary outbound bridge.
-pub(super) const SANDBOX_EGRESS_NETWORK: &str = "temps-sandbox-egress-v1";
+pub const SANDBOX_EGRESS_NETWORK: &str = "temps-sandbox-egress-v1";
 const SANDBOX_EGRESS_PROXY_PREFIX: &str = "temps-sandbox-egress-proxy-v2-";
 pub(super) const SANDBOX_EGRESS_PROXY_ALIAS: &str = "temps-sandbox-egress-proxy";
 pub(super) const SANDBOX_EGRESS_PROXY_PORT: u16 = 3128;
@@ -240,6 +325,10 @@ pub(super) const SANDBOX_EGRESS_RULES_ENV: &str = "TEMPS_SANDBOX_EGRESS_POLICY";
 pub(super) const SANDBOX_EGRESS_RULES_LABEL: &str = "sh.temps.sandbox-egress-rules";
 /// The sandbox a sidecar serves, so its refusals name it.
 pub(super) const SANDBOX_NAME_ENV: &str = "TEMPS_SANDBOX_NAME";
+/// The proxy's environment variable for where this host's internal proxy
+/// listens (ADR 105). Set by Temps from the internal routing supervisor's
+/// status; the Temps binary itself reads no such variable.
+pub(super) const SANDBOX_INTERNAL_PROXY_ENV: &str = "TEMPS_INTERNAL_PROXY_ADDRESS";
 
 pub(super) const SANDBOX_MCP_RELAY_BASE_URL: &str =
     "http://temps-sandbox-egress-proxy:3128/.temps/mcp";
@@ -272,6 +361,19 @@ if (!['http:', 'https:'].includes(controlPlane.protocol) ||
   throw new Error("TEMPS_CONTROL_PLANE_URL must be an HTTP(S) origin without credentials");
 }
 const sandboxName = process.env.TEMPS_SANDBOX_NAME || "unknown";
+// Where this host's internal proxy listens (ADR 105), set by Temps when it
+// creates this sidecar; empty while internal routing is not serving here.
+const internalProxy = parseInternalProxy(process.env.TEMPS_INTERNAL_PROXY_ADDRESS || "");
+
+function parseInternalProxy(value) {
+  if (value === "") return null;
+  const match = /^(?:\[([0-9A-Fa-f:.]+)\]|([0-9.]+)):([0-9]{1,5})$/.exec(value);
+  const host = match && (match[1] || match[2]);
+  if (!match || net.isIP(host) === 0 || Number(match[3]) < 1 || Number(match[3]) > 65535) {
+    throw new Error("TEMPS_INTERNAL_PROXY_ADDRESS must be an IP address and port");
+  }
+  return { host, port: Number(match[3]), display: value };
+}
 
 function isPrivateAddress(address) {
   if (address.startsWith("::ffff:")) address = address.slice(7);
@@ -399,12 +501,48 @@ function egressDecision(policy, hostname, port, answers) {
 const egressPolicy = loadEgressPolicy(process.env.TEMPS_SANDBOX_EGRESS_POLICY);
 
 class Denied extends Error {
-  constructor(reason, destination) {
+  constructor(reason, destination, status = 403) {
     super(`egress to ${destination} denied (${reason})`);
     this.reason = reason;
     this.destination = destination;
+    this.status = status;
   }
 }
+
+// ---- internal names (begin) ----
+// A project's internal address (ADR 105) is `<environment>.<project>.temps.local`
+// or `<environment subdomain>.temps.local`: one or two DNS labels, then
+// `temps.local`. It is never looked up here: it is sent to this host's
+// internal proxy, which decides from the project's internal access grants
+// whether this sandbox may call it, and answers at once for a name it does
+// not route. Every other name under `.local`, and `localhost`, only means
+// something on this host or link and is refused without a lookup: a `.local`
+// lookup goes to multicast DNS and waits out its timeout, holding one of the
+// few threads every lookup shares.
+const INTERNAL_NAME = /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)?[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.temps\.local$/;
+const LOOKUP_DEADLINE_MS = 3000;
+const INTERNAL_CONNECT_DEADLINE_MS = 3000;
+
+function isInternalName(host) {
+  return INTERNAL_NAME.test(host);
+}
+
+function isLocalName(host) {
+  return host === "localhost" || host.endsWith(".localhost") ||
+    host === "local" || host.endsWith(".local");
+}
+
+// dns.lookup with a deadline: a resolver that never answers costs the
+// caller LOOKUP_DEADLINE_MS, not however long the system resolver retries.
+function lookupWithin(host) {
+  let timer;
+  const deadline = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Denied("lookup_timeout", host)), LOOKUP_DEADLINE_MS);
+  });
+  return Promise.race([dns.lookup(host, { all: true, verbatim: true }), deadline])
+    .finally(() => clearTimeout(timer));
+}
+// ---- internal names (end) ----
 
 function formatDestination(hostname, port) {
   const host = normalizeHost(hostname);
@@ -421,6 +559,18 @@ function denialExplanation(reason) {
       return "private, loopback, link-local and metadata addresses are never reachable from a sandbox";
     case "unresolvable":
       return "the name did not resolve";
+    case "lookup_timeout":
+      return `the name did not resolve within ${LOOKUP_DEADLINE_MS / 1000} seconds`;
+    case "local_name":
+      return "names under .local and localhost only mean something on this host and are never reachable from a sandbox; a project's internal address has the form http://<environment>.<project>.temps.local/ or http://<environment subdomain>.temps.local/";
+    case "internal_port":
+      return "a project's internal address is served over plain http on port 80 only: drop the port";
+    case "internal_connect":
+      return "a project's internal address is plain http on port 80, reached with an http:// request through this proxy, never https or a CONNECT tunnel: call http://<the same name>/";
+    case "internal_unrouted":
+      return "internal routing was not serving on this host when this sandbox's egress proxy started (cluster DNS is off, or this host's internal proxy is down). Turn cluster DNS on in Settings > DNS and check its internal proxy status there, then stop and start the sandbox";
+    case "internal_unreachable":
+      return `this host's internal proxy at ${internalProxy ? internalProxy.display : "(none)"} did not answer within ${INTERNAL_CONNECT_DEADLINE_MS / 1000} seconds. Check the internal proxy status in Settings > DNS; if cluster DNS was turned off, restarted or moved since this sandbox started, stop and start the sandbox`;
     default:
       return "only plain http:// requests and CONNECT tunnels can leave the sandbox";
   }
@@ -461,7 +611,7 @@ function denial(error, fallbackDestination, method) {
 function refuseRequest(request, response, error) {
   const body = denial(error, String(request.url).slice(0, 256), request.method);
   if (!response.headersSent) {
-    response.writeHead(403, {
+    response.writeHead(error instanceof Denied ? error.status : 403, {
       "content-type": "text/plain; charset=utf-8",
       "content-length": Buffer.byteLength(body),
     });
@@ -475,12 +625,15 @@ function refuseRequest(request, response, error) {
 async function admit(hostname, port) {
   const host = normalizeHost(hostname);
   const destination = formatDestination(host, port);
+  if (isInternalName(host)) throw new Denied("internal_connect", destination);
+  if (isLocalName(host)) throw new Denied("local_name", destination);
   if (!mayResolve(egressPolicy, host, port)) throw new Denied("policy", destination);
   let answers;
   try {
-    answers = await dns.lookup(host, { all: true, verbatim: true });
-  } catch (_) {
-    throw new Denied("unresolvable", destination);
+    answers = await lookupWithin(host);
+  } catch (error) {
+    const reason = error instanceof Denied ? error.reason : "unresolvable";
+    throw new Denied(reason, destination);
   }
   const decision = egressDecision(egressPolicy, host, port, answers);
   if (decision.denied) throw new Denied(decision.denied, destination);
@@ -589,7 +742,7 @@ async function forward(request, response, target, allowPrivate) {
   let address;
   if (allowPrivate) {
     // A Temps relay: the control plane, whatever the sandbox's policy.
-    const answer = (await dns.lookup(target.hostname, { all: true, verbatim: true }))[0];
+    const answer = (await lookupWithin(target.hostname))[0];
     if (!answer) throw new Error("destination did not resolve");
     address = answer.address;
   } else {
@@ -620,6 +773,54 @@ async function forward(request, response, target, allowPrivate) {
   request.pipe(upstream);
 }
 
+// Send a plain-http request for a project's internal address to this host's
+// internal proxy. The proxy tells which sandbox is calling from this
+// sidecar's own address, which only Docker assigns (ADR 105): nothing in
+// the request is trusted for it. Every failure answers at once or within
+// INTERNAL_CONNECT_DEADLINE_MS.
+function forwardInternal(request, response, target) {
+  const host = normalizeHost(target.hostname);
+  const port = Number(target.port || 80);
+  const destination = formatDestination(host, port);
+  if (port !== 80) throw new Denied("internal_port", destination);
+  if (!internalProxy) throw new Denied("internal_unrouted", destination, 503);
+  const headers = { ...request.headers, host };
+  delete headers["proxy-authorization"];
+  delete headers["proxy-connection"];
+  let connected = false;
+  const upstream = http.request({
+    host: internalProxy.host,
+    port: internalProxy.port,
+    method: request.method,
+    path: `${target.pathname}${target.search}`,
+    headers,
+  }, (upstreamResponse) => {
+    upstreamResponse.on("error", () => response.destroy());
+    response.writeHead(upstreamResponse.statusCode || 502, upstreamResponse.headers);
+    upstreamResponse.pipe(response);
+  });
+  const deadline = setTimeout(() => upstream.destroy(new Error("connect timeout")),
+    INTERNAL_CONNECT_DEADLINE_MS);
+  upstream.on("socket", (socket) => socket.once("connect", () => {
+    connected = true;
+    clearTimeout(deadline);
+  }));
+  upstream.on("close", () => clearTimeout(deadline));
+  upstream.on("error", () => {
+    clearTimeout(deadline);
+    if (response.headersSent) {
+      response.destroy();
+    } else if (connected) {
+      response.writeHead(502);
+      response.end();
+    } else {
+      refuseRequest(request, response, new Denied("internal_unreachable", destination, 503));
+    }
+  });
+  request.on("error", () => upstream.destroy());
+  request.pipe(upstream);
+}
+
 async function handleRequest(request, response) {
   try {
     const incoming = new URL(request.url, `http://${request.headers.host || proxyAuthority}`);
@@ -643,6 +844,10 @@ async function handleRequest(request, response) {
     const target = new URL(request.url);
     if (target.protocol !== "http:" || target.username || target.password) {
       throw new Error("request target is not allowed");
+    }
+    if (isInternalName(normalizeHost(target.hostname))) {
+      forwardInternal(request, response, target);
+      return;
     }
     await forward(request, response, target, false);
   } catch (error) {
@@ -739,6 +944,7 @@ impl DockerSandboxProvider {
             (None, None) => SandboxEgressPolicy::internet(),
         };
         let egress = SidecarEgressPolicy::new(sandbox_container_name, &policy)?;
+        let internal_proxy = internal_proxy_environment_value();
 
         if let Some(info) = &existing {
             let image_matches = info
@@ -774,6 +980,7 @@ impl DockerSandboxProvider {
                 control_plane_url,
             );
             let host_gateway_matches = container_has_extra_host(info, SANDBOX_HOST_GATEWAY);
+            let internal_proxy_matches = container_has_internal_proxy(info, &internal_proxy);
             let rules_match = egress.is_carried_by(info, sandbox_container_name);
             // A stopped proxy is always recreated rather than started: it
             // was parked with its sandbox, and its endpoint still names the
@@ -785,6 +992,7 @@ impl DockerSandboxProvider {
                 && command_matches
                 && control_plane_matches
                 && host_gateway_matches
+                && internal_proxy_matches
                 && rules_match
                 && running
             {
@@ -811,6 +1019,7 @@ impl DockerSandboxProvider {
             sandbox_container_name,
             control_plane_url,
             &egress,
+            &internal_proxy,
         )
         .await?;
 
@@ -852,6 +1061,7 @@ impl DockerSandboxProvider {
         sandbox_container_name: &str,
         control_plane_url: &str,
         egress: &SidecarEgressPolicy,
+        internal_proxy: &str,
     ) -> Result<(), AgentError> {
         let mut tmpfs = HashMap::new();
         tmpfs.insert("/tmp".to_string(), "size=16m,mode=1777".to_string());
@@ -867,6 +1077,7 @@ impl DockerSandboxProvider {
                 format!("{SANDBOX_CONTROL_PLANE_URL_ENV}={control_plane_url}"),
                 format!("{SANDBOX_EGRESS_RULES_ENV}={}", egress.json),
                 format!("{SANDBOX_NAME_ENV}={sandbox_container_name}"),
+                format!("{SANDBOX_INTERNAL_PROXY_ENV}={internal_proxy}"),
             ]),
             labels: Some(HashMap::from([
                 (
@@ -964,7 +1175,95 @@ impl DockerSandboxProvider {
             sandbox_container_name,
             &self.config.control_plane_url,
             &egress,
+            // Never started: the proxy that runs is recreated on start,
+            // with the address current then.
+            &internal_proxy_environment_value(),
         )
         .await
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    const SANDBOX: &str = "temps-sandbox-alpha";
+
+    fn proxy_labels(owner: &str) -> HashMap<String, String> {
+        HashMap::from([
+            (
+                SANDBOX_EGRESS_POLICY_LABEL.to_string(),
+                SANDBOX_EGRESS_POLICY_VERSION.to_string(),
+            ),
+            (SANDBOX_NETWORK_OWNER_LABEL.to_string(), owner.to_string()),
+        ])
+    }
+
+    fn check(name: &str, labels: &HashMap<String, String>, networks: &[&str]) -> Option<String> {
+        egress_proxy_sandbox(name, Some(labels), networks)
+    }
+
+    #[test]
+    fn the_egress_proxy_names_the_sandbox_it_serves() {
+        let own = sandbox_network_name(SANDBOX);
+        let networks = [SANDBOX_EGRESS_NETWORK, own.as_str()];
+        let name = format!("/{}", sandbox_egress_proxy_name(SANDBOX));
+        assert_eq!(
+            check(&name, &proxy_labels(SANDBOX), &networks).as_deref(),
+            Some(SANDBOX)
+        );
+        // Without Docker's leading slash too.
+        assert_eq!(
+            check(&name[1..], &proxy_labels(SANDBOX), &networks).as_deref(),
+            Some(SANDBOX)
+        );
+    }
+
+    /// Each attribute is required: a container that copies some of them is
+    /// not a sandbox caller.
+    #[test]
+    fn a_container_that_copies_only_part_of_the_proxy_is_nobody() {
+        let own = sandbox_network_name(SANDBOX);
+        let networks = [SANDBOX_EGRESS_NETWORK, own.as_str()];
+        let name = sandbox_egress_proxy_name(SANDBOX);
+
+        // The sandbox's own container, or any other name.
+        assert_eq!(check(SANDBOX, &proxy_labels(SANDBOX), &networks), None);
+        assert_eq!(
+            check("api-production-1", &proxy_labels(SANDBOX), &networks),
+            None
+        );
+        // A proxy name for something that is not a sandbox container.
+        let odd = format!("{SANDBOX_EGRESS_PROXY_PREFIX}api");
+        assert_eq!(check(&odd, &proxy_labels("api"), &networks), None);
+        let bare = format!("{SANDBOX_EGRESS_PROXY_PREFIX}{SANDBOX_NAME_PREFIX}");
+        assert_eq!(
+            check(&bare, &proxy_labels(SANDBOX_NAME_PREFIX), &networks),
+            None
+        );
+        // Labels missing, or naming another sandbox.
+        assert_eq!(egress_proxy_sandbox(&name, None, &networks), None);
+        let mut no_policy = proxy_labels(SANDBOX);
+        no_policy.remove(SANDBOX_EGRESS_POLICY_LABEL);
+        assert_eq!(check(&name, &no_policy, &networks), None);
+        assert_eq!(
+            check(&name, &proxy_labels("temps-sandbox-beta"), &networks),
+            None
+        );
+        // Not on both of its networks.
+        assert_eq!(
+            check(&name, &proxy_labels(SANDBOX), &[SANDBOX_EGRESS_NETWORK]),
+            None
+        );
+        assert_eq!(check(&name, &proxy_labels(SANDBOX), &[own.as_str()]), None);
+        let other = sandbox_network_name("temps-sandbox-beta");
+        assert_eq!(
+            check(
+                &name,
+                &proxy_labels(SANDBOX),
+                &[SANDBOX_EGRESS_NETWORK, other.as_str()]
+            ),
+            None
+        );
     }
 }

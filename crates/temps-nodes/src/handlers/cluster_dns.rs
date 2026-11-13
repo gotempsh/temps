@@ -31,6 +31,7 @@ use crate::handlers::types::NodeAdminState;
 use crate::services::cluster_dns::{
     control_plane_proxy_state, dns_nodes, resolver_health, ClusterDnsError, DnsNode, HealthInput,
     InternalProxyState, InternalRedirectState, InternalRoutingMode, ResolverHealth, TestResolution,
+    TestResolutionCaller,
 };
 
 const CONTROL_PLANE_NAME: &str = "control plane";
@@ -53,6 +54,7 @@ impl From<ClusterDnsError> for Problem {
             ),
             ClusterDnsError::NodeUnavailable { .. } => (StatusCode::CONFLICT, "Node unavailable"),
             ClusterDnsError::Invalid { .. } => (StatusCode::BAD_REQUEST, "Invalid test resolution"),
+            ClusterDnsError::SandboxNotFound { .. } => (StatusCode::NOT_FOUND, "Sandbox not found"),
             ClusterDnsError::ResolverNotRunning { .. } => {
                 (StatusCode::CONFLICT, "DNS resolver not running")
             }
@@ -665,6 +667,10 @@ pub struct DnsResolveRequest {
     /// Answer as one of this project's containers on that node would be
     /// answered, its network policy included.
     pub project_id: Option<i32>,
+    /// Ask as one of your sandboxes (its public id): whether an internal
+    /// access grant lets it call the name. Not with `project_id`.
+    #[schema(example = "sbx_a1b2c3d4e5f6")]
+    pub sandbox_id: Option<String>,
 }
 
 /// One answer record.
@@ -704,9 +710,9 @@ pub struct DnsResolveResponse {
     pub asked_as: Option<String>,
     /// A caveat about how the answer was obtained.
     pub note: Option<String>,
-    /// Asked as a project, for an internal route: who owns it and whether
-    /// that project lets the asking one call it. The internal proxy answers
-    /// `403` when `reach` is `not_granted`.
+    /// Asked as a project or a sandbox, for an internal route: who owns it
+    /// and whether that project lets the asker call it. The internal proxy
+    /// answers `403` when `reach` is `not_granted`.
     pub internal_access: Option<DnsInternalAccess>,
 }
 
@@ -789,17 +795,34 @@ pub async fn resolve_dns_name(
     info!(
         node_id = request.node_id,
         project_id = ?request.project_id,
+        sandbox_id = ?request.sandbox_id,
         record_type = %record_type,
         "Test DNS resolution requested from the console"
     );
+    let asked_as = match (request.project_id, request.sandbox_id) {
+        (Some(_), Some(_)) => {
+            return Err(Problem::from(ClusterDnsError::Invalid {
+                reason: "ask as a project or as a sandbox, not both".to_string(),
+            }))
+        }
+        (Some(project_id), None) => TestResolutionCaller::Project(project_id),
+        (None, Some(sandbox_id)) => {
+            // A sandbox is asked as by its owner only.
+            let Some(user_id) = auth.user_id_opt() else {
+                return Err(Problem::from(ClusterDnsError::SandboxNotFound {
+                    sandbox_id,
+                }));
+            };
+            TestResolutionCaller::Sandbox {
+                sandbox_id,
+                user_id,
+            }
+        }
+        (None, None) => TestResolutionCaller::Node,
+    };
     let resolution = state
         .cluster_dns
-        .resolve(
-            request.node_id,
-            &request.name,
-            &record_type,
-            request.project_id,
-        )
+        .resolve(request.node_id, &request.name, &record_type, asked_as)
         .await?;
     Ok(Json(DnsResolveResponse::from(resolution)))
 }

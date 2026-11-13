@@ -105,6 +105,20 @@ impl InternalRoutingStatus {
     pub fn heartbeat_value(&self) -> Option<serde_json::Value> {
         serde_json::to_value(self).ok()
     }
+
+    /// The listener that is the internal proxy, while one serves: its own
+    /// port whenever it holds it, otherwise the bridge's port 80 of the
+    /// fallback. A sandbox's egress proxy connects here directly (ADR 105),
+    /// so it needs no redirect, and never reaches port 80 while that may be
+    /// another program's.
+    pub fn serving_address(&self) -> Option<SocketAddr> {
+        match self.mode {
+            _ if !self.listening => None,
+            RoutingMode::Down => None,
+            RoutingMode::Redirect => self.proxy_address,
+            RoutingMode::Direct => Some(self.proxy_address.unwrap_or(self.address)),
+        }
+    }
 }
 
 /// One routing supervisor per agent process, so its state is too.
@@ -131,9 +145,11 @@ pub fn current_status() -> Option<InternalRoutingStatus> {
 /// no longer exists.
 pub fn clear_status() {
     *STATUS.write() = None;
+    temps_sandbox_providers::docker::publish_internal_proxy_address(None);
 }
 
 fn record_status(status: InternalRoutingStatus) {
+    temps_sandbox_providers::docker::publish_internal_proxy_address(status.serving_address());
     *STATUS.write() = Some(status);
 }
 
@@ -1042,6 +1058,44 @@ mod tests {
             nft.calls.load(Ordering::SeqCst),
             scripts,
             "no removal on stop"
+        );
+    }
+
+    #[test]
+    fn a_sandbox_egress_proxy_is_sent_to_the_proxy_listener_itself() {
+        let status = |mode, listening, proxy: Option<&str>| InternalRoutingStatus {
+            address: "10.205.0.1:80".parse().unwrap(),
+            listening,
+            error: None,
+            attempts: 1,
+            mode,
+            proxy_address: proxy.map(|proxy| proxy.parse().unwrap()),
+            redirect: RedirectState::Installed,
+            redirect_error: None,
+        };
+        let own: SocketAddr = "10.205.0.1:591".parse().unwrap();
+        let port80: SocketAddr = "10.205.0.1:80".parse().unwrap();
+        assert_eq!(
+            status(RoutingMode::Redirect, true, Some("10.205.0.1:591")).serving_address(),
+            Some(own)
+        );
+        // The fallback serves port 80; its own port, when held, is still
+        // preferred.
+        assert_eq!(
+            status(RoutingMode::Direct, true, Some("10.205.0.1:591")).serving_address(),
+            Some(own)
+        );
+        assert_eq!(
+            status(RoutingMode::Direct, true, None).serving_address(),
+            Some(port80)
+        );
+        assert_eq!(
+            status(RoutingMode::Down, false, None).serving_address(),
+            None
+        );
+        assert_eq!(
+            status(RoutingMode::Redirect, false, Some("10.205.0.1:591")).serving_address(),
+            None
         );
     }
 

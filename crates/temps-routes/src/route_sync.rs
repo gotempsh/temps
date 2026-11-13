@@ -117,6 +117,12 @@ pub struct RouteEntryDto {
     /// the default; an empty list means the same, so it is not sent.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_callers: Vec<temps_core::internal_access::InternalAccessCaller>,
+    /// Sandboxes on this snapshot's node this internal route admits (ADR
+    /// 105). A separate list so an agent that predates sandbox grants, which
+    /// reads `allowed_callers` as project callers, parses the snapshot and
+    /// ignores this one: it then admits no sandbox, which fails closed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_sandboxes: Vec<temps_core::internal_access::InternalAccessSandboxCaller>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1078,13 +1084,17 @@ pub(crate) async fn build_snapshot(
         tailnet_identity,
         runs_shield,
     } = capabilities;
-    let routes = internal_route_entries(&state.peer_table, state.db.as_ref())
-        .await
-        .map_err(|source| SnapshotBuildError::Database {
-            node_id: node.id,
-            operation: "load internal access grants",
-            source,
-        })?;
+    let routes = internal_route_entries(
+        &state.peer_table,
+        state.db.as_ref(),
+        crate::internal_access_grants::SnapshotNode::Worker(node.id),
+    )
+    .await
+    .map_err(|source| SnapshotBuildError::Database {
+        node_id: node.id,
+        operation: "load internal access grants",
+        source,
+    })?;
     // A node running an ingress connector (ADR 058) serves public routes on
     // its loopback tunnel origin even without a public listener.
     let runs_connector = {
@@ -1542,6 +1552,7 @@ fn certificate_has_single_exact_dns_identity(certificate_pem: &str, expected: &s
 pub async fn internal_route_entries<C: sea_orm::ConnectionTrait>(
     peer_table: &CachedPeerTable,
     db: &C,
+    node: crate::internal_access_grants::SnapshotNode,
 ) -> Result<Vec<RouteEntryDto>, sea_orm::DbErr> {
     let raw = peer_table.snapshot_internal_routes();
     let mut routes = Vec::with_capacity(raw.len());
@@ -1552,6 +1563,8 @@ pub async fn internal_route_entries<C: sea_orm::ConnectionTrait>(
     }
     let grants = crate::internal_access_grants::load_live_grants(db).await?;
     crate::internal_access_grants::attach_allowed_callers(&mut routes, &grants);
+    let sandbox_grants = crate::internal_access_grants::load_live_sandbox_grants(db, node).await?;
+    crate::internal_access_grants::attach_allowed_sandboxes(&mut routes, &sandbox_grants);
     Ok(routes)
 }
 
@@ -1578,6 +1591,7 @@ fn entry_from_route(host: String, info: &RouteInfo) -> Option<RouteEntryDto> {
         gate: None,
         shield: None,
         allowed_callers: Vec::new(),
+        allowed_sandboxes: Vec::new(),
     })
 }
 
@@ -1709,6 +1723,7 @@ pub(crate) mod tests {
             gate: None,
             shield: None,
             allowed_callers: Vec::new(),
+            allowed_sandboxes: Vec::new(),
         }
     }
 
@@ -2469,6 +2484,7 @@ mod gate_hold_back_tests {
             }),
             shield: None,
             allowed_callers: Vec::new(),
+            allowed_sandboxes: Vec::new(),
         }
     }
 

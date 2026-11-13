@@ -19,8 +19,9 @@ use temps_entities::internal_access_grants;
 
 use super::error::InternalAccessError;
 
-/// The most grants one target project may hold. Every grant ends up in the
-/// caller list of the target's routes in every route snapshot (ADR 101 D5).
+/// The most grants one target project may hold, project and sandbox callers
+/// together. Every grant ends up in the caller list of the target's routes in
+/// every route snapshot (ADR 101 D5, ADR 105).
 pub const MAX_GRANTS_PER_PROJECT: u64 = 100;
 pub const MAX_DESCRIPTION_LENGTH: usize = 200;
 pub const DEFAULT_PAGE_SIZE: u64 = 20;
@@ -78,8 +79,8 @@ LEFT JOIN environments te ON te.id = g.target_environment_id \
 LEFT JOIN environments ce ON ce.id = g.caller_environment_id";
 
 #[derive(Debug, FromQueryResult)]
-struct CountRow {
-    n: i64,
+pub(super) struct CountRow {
+    pub(super) n: i64,
 }
 
 #[derive(Debug, FromQueryResult)]
@@ -89,7 +90,7 @@ struct IdRow {
 }
 
 pub struct InternalAccessService {
-    db: Arc<DatabaseConnection>,
+    pub(super) db: Arc<DatabaseConnection>,
 }
 
 impl InternalAccessService {
@@ -200,23 +201,7 @@ impl InternalAccessService {
         if let Some(environment_id) = grant.caller_environment_id {
             ensure_live_environment(&txn, grant.caller_project_id, environment_id).await?;
         }
-        let existing = CountRow::find_by_statement(Statement::from_sql_and_values(
-            DatabaseBackend::Postgres,
-            "SELECT count(*)::BIGINT AS n FROM internal_access_grants WHERE target_project_id = $1",
-            [target_project_id.into()],
-        ))
-        .one(&txn)
-        .await
-        .map_err(InternalAccessError::db(
-            "count a project's internal access grants",
-        ))?
-        .map_or(0, |row| u64::try_from(row.n).unwrap_or(0));
-        if existing >= MAX_GRANTS_PER_PROJECT {
-            return Err(InternalAccessError::TooManyGrants {
-                project_id: target_project_id,
-                limit: MAX_GRANTS_PER_PROJECT,
-            });
-        }
+        ensure_below_grant_limit(&txn, target_project_id).await?;
 
         let inserted = internal_access_grants::ActiveModel {
             target_project_id: Set(target_project_id),
@@ -281,6 +266,35 @@ impl InternalAccessService {
     }
 }
 
+/// Refuse a new grant on a project that already holds
+/// [`MAX_GRANTS_PER_PROJECT`], counting project and sandbox callers. Run
+/// with the target project's row locked.
+pub(super) async fn ensure_below_grant_limit<C: ConnectionTrait>(
+    db: &C,
+    target_project_id: i32,
+) -> Result<(), InternalAccessError> {
+    let existing = CountRow::find_by_statement(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "SELECT ((SELECT count(*) FROM internal_access_grants WHERE target_project_id = $1) + \
+                 (SELECT count(*) FROM internal_access_sandbox_grants WHERE target_project_id = $1) \
+                )::BIGINT AS n",
+        [target_project_id.into()],
+    ))
+    .one(db)
+    .await
+    .map_err(InternalAccessError::db(
+        "count a project's internal access grants",
+    ))?
+    .map_or(0, |row| u64::try_from(row.n).unwrap_or(0));
+    if existing >= MAX_GRANTS_PER_PROJECT {
+        return Err(InternalAccessError::TooManyGrants {
+            project_id: target_project_id,
+            limit: MAX_GRANTS_PER_PROJECT,
+        });
+    }
+    Ok(())
+}
+
 async fn find_view<C: ConnectionTrait>(
     db: &C,
     target_project_id: i32,
@@ -300,7 +314,7 @@ async fn find_view<C: ConnectionTrait>(
     })
 }
 
-async fn ensure_live_project<C: ConnectionTrait>(
+pub(super) async fn ensure_live_project<C: ConnectionTrait>(
     db: &C,
     project_id: i32,
     lock: bool,
@@ -324,7 +338,7 @@ async fn ensure_live_project<C: ConnectionTrait>(
     .ok_or(InternalAccessError::ProjectNotFound { project_id })
 }
 
-async fn ensure_live_environment<C: ConnectionTrait>(
+pub(super) async fn ensure_live_environment<C: ConnectionTrait>(
     db: &C,
     project_id: i32,
     environment_id: i32,

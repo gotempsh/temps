@@ -66,7 +66,9 @@ use tokio::net::TcpListener;
 use tokio::sync::{watch, Notify, Semaphore};
 use tracing::{debug, error, info, warn};
 
-use crate::internal_access::{AccessDecision, DenyReason, CROSS_PROJECT_DENIED};
+use crate::internal_access::{
+    sandbox_denied, AccessDecision, DenyReason, Recheck, CROSS_PROJECT_DENIED,
+};
 use crate::route_store::{RouteEntry, SharedRouteStore};
 use crate::worker_metrics::RequestRecorder;
 
@@ -167,20 +169,48 @@ const IDENTITY_INSPECTION_TIMEOUT: Duration = Duration::from_millis(500);
 
 struct CallerIdentitySnapshot {
     identities: HashMap<IpAddr, String>,
+    /// The sandbox each egress proxy's address on the egress network serves
+    /// (ADR 105). Only that address: a sandbox's requests leave its egress
+    /// proxy from there.
+    sandboxes: HashMap<IpAddr, Arc<str>>,
     refreshed_at: Instant,
 }
 
 impl CallerIdentitySnapshot {
     fn new(identities: HashMap<IpAddr, String>) -> Self {
+        Self::from_sources(SourceIdentities {
+            containers: identities,
+            sandboxes: HashMap::new(),
+        })
+    }
+
+    fn from_sources(sources: SourceIdentities) -> Self {
         Self {
-            identities,
+            identities: sources.containers,
+            sandboxes: sources.sandboxes,
             refreshed_at: Instant::now(),
         }
     }
 
     fn clear(&mut self) {
         self.identities.clear();
+        self.sandboxes.clear();
     }
+}
+
+/// What the local Docker daemon says owns each source address.
+#[derive(Debug, Default)]
+struct SourceIdentities {
+    containers: HashMap<IpAddr, String>,
+    sandboxes: HashMap<IpAddr, Arc<str>>,
+}
+
+/// The container that owns a request's source address, and the sandbox it is
+/// the egress proxy of, when it is one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CallerCandidate {
+    container_id: String,
+    sandbox: Option<Arc<str>>,
 }
 
 struct InspectionQuota {
@@ -202,7 +232,7 @@ struct ProxyState {
     client: reqwest::Client,
     store: SharedRouteStore,
     docker: Option<bollard::Docker>,
-    inspection_quotas: Arc<RwLock<HashMap<i32, Arc<InspectionQuota>>>>,
+    inspection_quotas: Arc<RwLock<HashMap<Recheck, Arc<InspectionQuota>>>>,
     inspection_concurrency: Arc<Semaphore>,
     caller_identities: Arc<RwLock<CallerIdentitySnapshot>>,
     public_mode: bool,
@@ -335,7 +365,9 @@ pub(crate) async fn spawn(
     let initial_identities = load_source_identities(&docker)
         .await
         .map_err(|error| std::io::Error::other(error.to_string()))?;
-    let caller_identities = Arc::new(RwLock::new(CallerIdentitySnapshot::new(initial_identities)));
+    let caller_identities = Arc::new(RwLock::new(CallerIdentitySnapshot::from_sources(
+        initial_identities,
+    )));
     let inspection_quotas = Arc::new(RwLock::new(HashMap::new()));
     let state = Arc::new(ProxyState {
         client,
@@ -840,15 +872,31 @@ async fn handle(State(state): State<Arc<ProxyState>>, mut req: Request) -> Respo
                 "internal proxy request allowed by an internal access grant"
             );
         }
+        AccessDecision::SandboxGranted => {
+            debug!(
+                %host,
+                route_project_id = ?entry.project_id,
+                route_environment_id = ?entry.environment_id,
+                "internal proxy request from a sandbox allowed by a sandbox grant"
+            );
+        }
         AccessDecision::Denied(reason) => {
+            let sandbox = calling_sandbox(&state, req.extensions());
             warn!(
                 %host,
                 route_project_id = ?entry.project_id,
                 route_has_grants = !entry.allowed_callers.is_empty(),
+                route_has_sandbox_grants = !entry.allowed_sandboxes.is_empty(),
+                sandbox = sandbox.as_deref(),
                 reason = reason.as_str(),
                 "blocked cross-project internal proxy request"
             );
-            return error_body(StatusCode::FORBIDDEN, CROSS_PROJECT_DENIED);
+            return match (reason, sandbox) {
+                (DenyReason::SandboxNotGranted, Some(sandbox)) => {
+                    error_body(StatusCode::FORBIDDEN, &sandbox_denied(&sandbox))
+                }
+                _ => error_body(StatusCode::FORBIDDEN, CROSS_PROJECT_DENIED),
+            };
         }
     }
 
@@ -1296,23 +1344,30 @@ async fn caller_access(
     let Some(peer) = extensions.get::<ConnectInfo<SocketAddr>>().map(|c| c.0) else {
         return AccessDecision::Denied(DenyReason::UnknownCaller);
     };
-    let container_id = candidate_container_id(&state.caller_identities, peer.ip());
-    let container = container_id.as_deref();
+    let candidate = candidate_caller(&state.caller_identities, peer.ip());
+    let container = candidate.as_ref().map(|c| c.container_id.as_str());
+    let sandbox = candidate.as_ref().and_then(|c| c.sandbox.as_ref());
     crate::internal_access::authorize(
         &state.store,
         container,
+        sandbox,
         entry,
-        |caller_project_id| async move {
+        |recheck| async move {
             match container {
                 Some(container_id) => {
-                    source_container_is_current(state, peer.ip(), container_id, caller_project_id)
-                        .await
+                    source_container_is_current(state, peer.ip(), container_id, recheck).await
                 }
                 None => false,
             }
         },
     )
     .await
+}
+
+/// The sandbox whose egress proxy owns `source_ip`, for a refusal's text.
+fn calling_sandbox(state: &ProxyState, extensions: &axum::http::Extensions) -> Option<Arc<str>> {
+    let peer = extensions.get::<ConnectInfo<SocketAddr>>().map(|c| c.0)?;
+    candidate_caller(&state.caller_identities, peer.ip()).and_then(|candidate| candidate.sandbox)
 }
 
 /// Verify the cached candidate against Docker's current running-container and
@@ -1323,11 +1378,11 @@ async fn source_container_is_current(
     state: &ProxyState,
     source_ip: IpAddr,
     container_id: &str,
-    project_id: i32,
+    recheck: Recheck,
 ) -> bool {
     use bollard::query_parameters::InspectContainerOptions;
 
-    let quota = inspection_quota(state, project_id);
+    let quota = inspection_quota(state, &recheck);
     let project_slot = Arc::clone(&quota.concurrency).try_acquire_owned().ok();
     let Some(_project_slot) = project_slot else {
         return false;
@@ -1363,10 +1418,28 @@ async fn source_container_is_current(
     }
     let Some(networks) = inspected
         .network_settings
-        .and_then(|settings| settings.networks)
+        .as_ref()
+        .and_then(|settings| settings.networks.as_ref())
     else {
         return false;
     };
+    if let Recheck::Sandbox(sandbox) = &recheck {
+        // Docker must still say this is that sandbox's egress proxy, and that
+        // the source address is its endpoint on the egress network.
+        let names: Vec<&str> = networks.keys().map(String::as_str).collect();
+        let labels = inspected
+            .config
+            .as_ref()
+            .and_then(|config| config.labels.as_ref());
+        let name = inspected.name.as_deref().unwrap_or_default();
+        let is_that_sandbox =
+            temps_sandbox_providers::docker::egress_proxy_sandbox(name, labels, &names)
+                .is_some_and(|found| *found == **sandbox);
+        let on_egress_network = networks
+            .get(temps_sandbox_providers::docker::SANDBOX_EGRESS_NETWORK)
+            .is_some_and(|endpoint| endpoint_owns(endpoint, source_ip));
+        return is_that_sandbox && on_egress_network;
+    }
     let owns_source_ip = networks.values().any(|endpoint| {
         [
             endpoint.ip_address.as_deref(),
@@ -1380,14 +1453,26 @@ async fn source_container_is_current(
     owns_source_ip
 }
 
-fn inspection_quota(state: &ProxyState, project_id: i32) -> Arc<InspectionQuota> {
-    if let Some(quota) = state.inspection_quotas.read().get(&project_id).cloned() {
+/// Whether `endpoint` holds `source_ip`.
+fn endpoint_owns(endpoint: &bollard::models::EndpointSettings, source_ip: IpAddr) -> bool {
+    [
+        endpoint.ip_address.as_deref(),
+        endpoint.global_ipv6_address.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|address| address.parse::<IpAddr>().ok())
+    .any(|address| address == source_ip)
+}
+
+fn inspection_quota(state: &ProxyState, recheck: &Recheck) -> Arc<InspectionQuota> {
+    if let Some(quota) = state.inspection_quotas.read().get(recheck).cloned() {
         return quota;
     }
     state
         .inspection_quotas
         .write()
-        .entry(project_id)
+        .entry(recheck.clone())
         .or_insert_with(|| Arc::new(InspectionQuota::new()))
         .clone()
 }
@@ -1396,15 +1481,21 @@ fn inspection_quota(state: &ProxyState, project_id: i32) -> Arc<InspectionQuota>
 /// network attachment state is the authority for which container owns an IP;
 /// route destination addresses are not caller identity and may be hostnames or
 /// shared node addresses.
-fn candidate_container_id(
+/// The container that owns `source_ip`, and the sandbox it is the egress
+/// proxy of, from the last Docker snapshot. A stale snapshot knows nobody.
+fn candidate_caller(
     caller_identities: &RwLock<CallerIdentitySnapshot>,
     source_ip: IpAddr,
-) -> Option<String> {
+) -> Option<CallerCandidate> {
     let snapshot = caller_identities.read();
     if snapshot.refreshed_at.elapsed() > IDENTITY_MAX_AGE {
         return None;
     }
-    snapshot.identities.get(&source_ip).cloned()
+    let container_id = snapshot.identities.get(&source_ip)?.clone();
+    Some(CallerCandidate {
+        container_id,
+        sandbox: snapshot.sandboxes.get(&source_ip).cloned(),
+    })
 }
 
 fn identity_event_requires_refresh(event: &bollard::models::EventMessage) -> bool {
@@ -1427,7 +1518,7 @@ async fn refresh_source_identities(
 ) {
     match load_source_identities(docker).await {
         Ok(snapshot) => {
-            *caller_identities.write() = CallerIdentitySnapshot::new(snapshot);
+            *caller_identities.write() = CallerIdentitySnapshot::from_sources(snapshot);
         }
         Err(error) => {
             caller_identities.write().clear();
@@ -1438,7 +1529,7 @@ async fn refresh_source_identities(
 
 async fn load_source_identities(
     docker: &bollard::Docker,
-) -> Result<HashMap<IpAddr, String>, bollard::errors::Error> {
+) -> Result<SourceIdentities, bollard::errors::Error> {
     use bollard::query_parameters::ListContainersOptions;
 
     let containers = docker
@@ -1447,8 +1538,13 @@ async fn load_source_identities(
             ..Default::default()
         }))
         .await?;
+    Ok(source_identities(containers))
+}
 
-    let mut identities = HashMap::new();
+/// Every running container's addresses, and, for a sandbox's egress proxy,
+/// the sandbox its address on the egress network speaks for (ADR 105).
+fn source_identities(containers: Vec<bollard::models::ContainerSummary>) -> SourceIdentities {
+    let mut identities = SourceIdentities::default();
     for container in containers {
         let Some(container_id) = container.id else {
             continue;
@@ -1460,7 +1556,20 @@ async fn load_source_identities(
         else {
             continue;
         };
-        for endpoint in networks.values() {
+        let network_names: Vec<&str> = networks.keys().map(String::as_str).collect();
+        let sandbox: Option<Arc<str>> = container
+            .names
+            .as_ref()
+            .and_then(|names| names.first())
+            .and_then(|name| {
+                temps_sandbox_providers::docker::egress_proxy_sandbox(
+                    name,
+                    container.labels.as_ref(),
+                    &network_names,
+                )
+            })
+            .map(Arc::from);
+        for (network, endpoint) in networks {
             for address in [
                 endpoint.ip_address.as_deref(),
                 endpoint.global_ipv6_address.as_deref(),
@@ -1468,13 +1577,19 @@ async fn load_source_identities(
             .into_iter()
             .flatten()
             {
-                if let Ok(ip) = address.parse::<IpAddr>() {
-                    identities.insert(ip, container_id.clone());
+                let Ok(ip) = address.parse::<IpAddr>() else {
+                    continue;
+                };
+                identities.containers.insert(ip, container_id.clone());
+                if let Some(sandbox) = &sandbox {
+                    if network == temps_sandbox_providers::docker::SANDBOX_EGRESS_NETWORK {
+                        identities.sandboxes.insert(ip, Arc::clone(sandbox));
+                    }
                 }
             }
         }
     }
-    Ok(identities)
+    identities
 }
 
 /// True if the client requested a protocol upgrade. We check both the
@@ -2280,7 +2395,188 @@ mod tests {
             gate: None,
             shield: None,
             allowed_callers: Vec::new(),
+            allowed_sandboxes: Vec::new(),
         }
+    }
+
+    const EGRESS_IP: &str = "172.29.0.5";
+    const SANDBOX: &str = "temps-sandbox-alpha";
+
+    /// A sandbox's egress proxy as `docker ps` lists it: on the egress
+    /// network and on its sandbox's own network.
+    fn egress_proxy_summary(sandbox: &str, egress_ip: &str) -> bollard::models::ContainerSummary {
+        use bollard::models::{ContainerSummaryNetworkSettings, EndpointSettings};
+        let endpoint = |ip: &str| EndpointSettings {
+            ip_address: Some(ip.to_string()),
+            ..Default::default()
+        };
+        bollard::models::ContainerSummary {
+            id: Some(format!("container-proxy-{sandbox}")),
+            names: Some(vec![format!("/temps-sandbox-egress-proxy-v2-{sandbox}")]),
+            labels: Some(HashMap::from([
+                (
+                    "sh.temps.sandbox-egress-policy".to_string(),
+                    "1".to_string(),
+                ),
+                (
+                    "sh.temps.sandbox-network-for".to_string(),
+                    sandbox.to_string(),
+                ),
+            ])),
+            network_settings: Some(ContainerSummaryNetworkSettings {
+                networks: Some(HashMap::from([
+                    (
+                        temps_sandbox_providers::docker::SANDBOX_EGRESS_NETWORK.to_string(),
+                        endpoint(egress_ip),
+                    ),
+                    (
+                        temps_sandbox_providers::docker::sandbox_network_name(sandbox),
+                        endpoint("10.250.0.2"),
+                    ),
+                ])),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn only_the_egress_address_of_a_sandbox_proxy_speaks_for_the_sandbox() {
+        let identities = source_identities(vec![egress_proxy_summary(SANDBOX, EGRESS_IP)]);
+        let egress: IpAddr = EGRESS_IP.parse().unwrap();
+        let inner: IpAddr = "10.250.0.2".parse().unwrap();
+        assert_eq!(
+            identities.sandboxes.get(&egress).map(|s| &**s),
+            Some(SANDBOX)
+        );
+        assert!(
+            !identities.sandboxes.contains_key(&inner),
+            "the address on the sandbox's own network is where the sandbox reaches the proxy"
+        );
+        assert_eq!(identities.containers.len(), 2);
+
+        // A container that only looks like one (no labels) speaks for nobody.
+        let mut lookalike = egress_proxy_summary(SANDBOX, EGRESS_IP);
+        lookalike.labels = None;
+        assert!(source_identities(vec![lookalike]).sandboxes.is_empty());
+    }
+
+    /// A proxy for internal calls only, with these identities and routes.
+    fn internal_state(
+        identities: SourceIdentities,
+        routes: Vec<RouteEntry>,
+    ) -> (tempfile::TempDir, Arc<ProxyState>) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(RouteStore::new(dir.path().join("routes.json")));
+        store.apply_snapshot(1, routes);
+        let state = Arc::new(ProxyState {
+            client: reqwest::Client::new(),
+            store,
+            docker: None,
+            inspection_quotas: Arc::new(RwLock::new(HashMap::new())),
+            inspection_concurrency: Arc::new(Semaphore::new(1)),
+            caller_identities: Arc::new(RwLock::new(CallerIdentitySnapshot::from_sources(
+                identities,
+            ))),
+            public_mode: false,
+            private_mode: false,
+            forwarded_proto: "http",
+            require_sni: false,
+            tunnel_origin: false,
+            acme: None,
+            acme_relay: Arc::new(AcmeRelayState::new()),
+            serve: None,
+            tailnet: None,
+        });
+        (dir, state)
+    }
+
+    async fn call(
+        state: &Arc<ProxyState>,
+        peer: &str,
+        host: &str,
+        headers: &[(&str, &str)],
+    ) -> (StatusCode, String) {
+        let mut request = Request::builder().uri("/").header("host", host);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let mut request = request.body(Body::empty()).unwrap();
+        let peer: SocketAddr = format!("{peer}:40000").parse().unwrap();
+        request.extensions_mut().insert(ConnectInfo(peer));
+        let response = handle(State(Arc::clone(state)), request).await;
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    /// The sandbox is whoever Docker says owns the source address. Headers
+    /// naming a sandbox, an address or a project change nothing.
+    #[tokio::test]
+    async fn a_sandbox_identity_cannot_be_claimed_with_headers() {
+        let mut granted = route("production.api.temps.local", 42, "container-api");
+        granted.allowed_sandboxes =
+            vec![temps_core::internal_access::InternalAccessSandboxCaller {
+                name: SANDBOX.to_string(),
+                public_id: "sbx_alpha0000001".to_string(),
+            }];
+        let identities = source_identities(vec![
+            egress_proxy_summary(SANDBOX, EGRESS_IP),
+            egress_proxy_summary("temps-sandbox-beta", "172.29.0.6"),
+        ]);
+        let (_dir, state) = internal_state(identities, vec![granted]);
+        let forged = [
+            ("x-temps-sandbox", SANDBOX),
+            ("x-temps-caller-sandbox", SANDBOX),
+            ("x-forwarded-for", EGRESS_IP),
+            ("x-real-ip", EGRESS_IP),
+            ("forwarded", "for=172.29.0.5"),
+            ("x-temps-project-id", "42"),
+        ];
+
+        // Sandbox beta claims to be alpha: refused, as beta.
+        let (status, body) =
+            call(&state, "172.29.0.6", "production.api.temps.local", &forged).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body.contains("sandbox temps-sandbox-beta"), "{body}");
+        assert!(!body.contains(SANDBOX), "{body}");
+
+        // An address nobody owns: refused, whatever it claims.
+        let (status, body) =
+            call(&state, "172.29.0.99", "production.api.temps.local", &forged).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body.contains("not accessible from this workload"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_sandbox_without_a_grant_is_told_what_to_add_and_where() {
+        let route = route("production.api.temps.local", 42, "container-api");
+        let identities = source_identities(vec![egress_proxy_summary(SANDBOX, EGRESS_IP)]);
+        let (_dir, state) = internal_state(identities, vec![route]);
+        let (status, body) = call(&state, EGRESS_IP, "production.api.temps.local", &[]).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body.contains(&format!("sandbox {SANDBOX}")), "{body}");
+        assert!(
+            body.contains("Settings > Protection > Internal access"),
+            "{body}"
+        );
+    }
+
+    /// Admitted by the snapshot, the sandbox is still refused when Docker
+    /// cannot confirm its egress proxy (here: no Docker at all).
+    #[tokio::test]
+    async fn a_granted_sandbox_needs_docker_to_confirm_its_proxy() {
+        let mut granted = route("production.api.temps.local", 42, "container-api");
+        granted.allowed_sandboxes =
+            vec![temps_core::internal_access::InternalAccessSandboxCaller {
+                name: SANDBOX.to_string(),
+                public_id: "sbx_alpha0000001".to_string(),
+            }];
+        let identities = source_identities(vec![egress_proxy_summary(SANDBOX, EGRESS_IP)]);
+        let (_dir, state) = internal_state(identities, vec![granted]);
+        let (status, _) = call(&state, EGRESS_IP, "production.api.temps.local", &[]).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
     }
 
     /// A held port fails the spawn with the bind error, before Docker is
@@ -2391,10 +2687,12 @@ mod tests {
         )])));
 
         assert_eq!(
-            candidate_container_id(&identities, "172.20.1.10".parse().unwrap()).as_deref(),
+            candidate_caller(&identities, "172.20.1.10".parse().unwrap())
+                .map(|candidate| candidate.container_id)
+                .as_deref(),
             Some("container-alpha")
         );
-        assert!(candidate_container_id(&identities, "172.20.1.99".parse().unwrap()).is_none());
+        assert!(candidate_caller(&identities, "172.20.1.99".parse().unwrap()).is_none());
     }
 
     #[test]
@@ -2402,16 +2700,17 @@ mod tests {
         let source_ip = "172.20.1.10".parse().unwrap();
         let identities = RwLock::new(CallerIdentitySnapshot {
             identities: HashMap::from([(source_ip, "departed-container".to_string())]),
+            sandboxes: HashMap::new(),
             refreshed_at: Instant::now() - IDENTITY_MAX_AGE - Duration::from_millis(1),
         });
 
-        assert!(candidate_container_id(&identities, source_ip).is_none());
+        assert!(candidate_caller(&identities, source_ip).is_none());
 
         let mut snapshot = identities.write();
         snapshot.refreshed_at = Instant::now();
         snapshot.clear();
         drop(snapshot);
-        assert!(candidate_container_id(&identities, source_ip).is_none());
+        assert!(candidate_caller(&identities, source_ip).is_none());
     }
 
     #[test]
@@ -2547,6 +2846,7 @@ mod tests {
                 gate: None,
                 shield: None,
                 allowed_callers: Vec::new(),
+                allowed_sandboxes: Vec::new(),
             };
             let service = hyper::service::service_fn(move |mut request| {
                 request

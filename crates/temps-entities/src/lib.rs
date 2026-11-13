@@ -121,6 +121,7 @@ pub mod ingress_connectors;
 pub mod ingress_hostname_choices;
 pub mod ingress_publications;
 pub mod internal_access_grants;
+pub mod internal_access_sandbox_grants;
 pub mod ip_access_control;
 pub mod ip_geolocations;
 pub mod managed_service_certificate_authorities;

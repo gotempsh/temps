@@ -39,6 +39,19 @@ pub struct InternalAccessAppState {
 pub fn router(state: Arc<InternalAccessAppState>) -> Router {
     Router::new()
         .route(
+            "/projects/{project_id}/internal-access/sandboxes",
+            get(super::sandbox_handlers::list_internal_access_sandbox_grants)
+                .post(super::sandbox_handlers::create_internal_access_sandbox_grant),
+        )
+        .route(
+            "/projects/{project_id}/internal-access/sandboxes/{grant_id}",
+            delete(super::sandbox_handlers::delete_internal_access_sandbox_grant),
+        )
+        .route(
+            "/sandboxes/{sandbox_id}/internal-addresses",
+            get(super::sandbox_handlers::list_sandbox_internal_addresses),
+        )
+        .route(
             "/projects/{project_id}/internal-access",
             get(list_internal_access_grants).post(create_internal_access_grant),
         )
@@ -54,12 +67,21 @@ pub fn router(state: Arc<InternalAccessAppState>) -> Router {
     paths(
         list_internal_access_grants,
         create_internal_access_grant,
-        delete_internal_access_grant
+        delete_internal_access_grant,
+        super::sandbox_handlers::list_internal_access_sandbox_grants,
+        super::sandbox_handlers::create_internal_access_sandbox_grant,
+        super::sandbox_handlers::delete_internal_access_sandbox_grant,
+        super::sandbox_handlers::list_sandbox_internal_addresses
     ),
     components(schemas(
         InternalAccessGrantResponse,
         InternalAccessGrantListResponse,
-        CreateInternalAccessGrantRequest
+        CreateInternalAccessGrantRequest,
+        super::sandbox_handlers::InternalAccessSandboxGrantResponse,
+        super::sandbox_handlers::InternalAccessSandboxGrantListResponse,
+        super::sandbox_handlers::CreateInternalAccessSandboxGrantRequest,
+        super::sandbox_handlers::SandboxInternalAddressResponse,
+        super::sandbox_handlers::SandboxInternalAddressListResponse
     )),
     tags((name = "Internal Access", description = "Which other projects may call a project's *.temps.local addresses"))
 )]
@@ -78,18 +100,29 @@ impl From<InternalAccessError> for Problem {
                     .with_title("Environment Not Found")
                     .with_detail(error.to_string())
             }
-            InternalAccessError::GrantNotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
-                .with_title("Internal Access Grant Not Found")
-                .with_detail(error.to_string()),
+            InternalAccessError::GrantNotFound { .. }
+            | InternalAccessError::SandboxGrantNotFound { .. } => {
+                problemdetails::new(StatusCode::NOT_FOUND)
+                    .with_title("Internal Access Grant Not Found")
+                    .with_detail(error.to_string())
+            }
+            InternalAccessError::SandboxNotFound { .. } => {
+                problemdetails::new(StatusCode::NOT_FOUND)
+                    .with_title("Sandbox Not Found")
+                    .with_detail(error.to_string())
+            }
             InternalAccessError::SelfGrant { .. }
             | InternalAccessError::DescriptionTooLong { .. } => {
                 problemdetails::new(StatusCode::BAD_REQUEST)
                     .with_title("Invalid Internal Access Grant")
                     .with_detail(error.to_string())
             }
-            InternalAccessError::DuplicateGrant { .. } => problemdetails::new(StatusCode::CONFLICT)
-                .with_title("Internal Access Already Granted")
-                .with_detail(error.to_string()),
+            InternalAccessError::DuplicateGrant { .. }
+            | InternalAccessError::DuplicateSandboxGrant { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Internal Access Already Granted")
+                    .with_detail(error.to_string())
+            }
             InternalAccessError::TooManyGrants { .. } => problemdetails::new(StatusCode::CONFLICT)
                 .with_title("Too Many Internal Access Grants")
                 .with_detail(error.to_string()),
@@ -196,10 +229,10 @@ pub struct ListInternalAccessQuery {
 // ----------------------------------------------------------------- audit
 
 #[derive(Debug, Clone, Serialize)]
-struct AuditContext {
-    user_id: Option<i32>,
-    ip_address: Option<String>,
-    user_agent: String,
+pub(super) struct AuditContext {
+    pub(super) user_id: Option<i32>,
+    pub(super) ip_address: Option<String>,
+    pub(super) user_agent: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
