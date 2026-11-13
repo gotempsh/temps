@@ -219,7 +219,8 @@ Records one journal entry **before** the workflow continues past it.
 | `wait` | `pending` with `wake_at` = the timeout (optional), then `completed` | Temps completes it with `{"received": true, "payload": ...}` when the event arrives, while the run is still suspended on it. One event completes at most one wait of a run, and only an event sent after the run started. A result that would exceed `max_journal_bytes_per_run` fails the run (`error_kind` `quota_exceeded`). At the timeout the run is invoked with the entry still `pending`, and the executor records `{"received": false, "payload": null}`. |
 | `now` | `completed` with the timestamp | Never `pending`. |
 | `random` | `completed` with the value | Never `pending`. |
-| `send_event` | `completed` with `event` set | Never `pending`. Only this kind carries `event`; Temps delivers the event once, when the entry is first recorded. |
+| `send_event` | `completed` with `event` set | Never `pending`. Only this kind carries `event`; Temps delivers the event once, when the entry is first recorded. Event names starting with `temps.` are reserved and rejected. |
+| `child` | `pending` with `child` = `{"workflow": ..., "input": ...}` and no `result`; Temps completes it | Temps starts a run of `workflow` in the same environment, exactly once per entry (a rewrite finds the child it started), and records `{"run_id": ...}` as the entry's result. When the child finishes Temps completes the entry with `{"run_id", "status", "output", "error"}`, where `status` is `completed`, `failed`, `cancelled` or `deleted` (removed before it finished). The executor never records a child entry final. Only this kind carries `child`. |
 
 - `trace_id` (≤ 64 characters) and `error_ref` (≤ 128) are metadata linking
   to the attempt's span and error-tracking event.
@@ -260,12 +261,17 @@ Tagged by `type`:
 | `completed` | `output` | The run completes. An output over `max_payload_bytes` fails the run with `payload_too_large`. |
 | `failed` | `error`, `sequence`? | The run fails, keeping its journal. With `sequence`, the step at that sequence is named as the cause. |
 | `sleep` | `sequence`, `until` | The run sleeps until `until`. |
-| `wait` | `sequence`, `event`, `key`?, `timeout_at`? | The run waits for the event (matching `key` when set). An event sent before the run suspended, and not yet consumed, wakes it at once. |
+| `wait` | `sequence`, `event`, `key`?, `timeout_at`? | The run waits for the event (matching `key` when set). An event sent before the run suspended, and not yet consumed, wakes it at once. With `event` = `temps.child` and `key` = the child's run id, the run waits for the child its pending `child` entry at `sequence` started, with no timeout; a child that already finished wakes it at once. Other `temps.` names are rejected. |
 | `retry` | `sequence`, `at` | A step attempt failed; the run is retried at `at` (clamped to now). The step's attempts and backoff are the SDK's policy. |
 | `incompatible` | `sequence`, `expected`, `found` | Replay found a different step than the journal recorded. The run fails with `WorkflowIncompatible`, keeping its journal so an operator can retry from a step or cancel. |
 
 Every outcome releases the lease. The `sequence` of `sleep` and `wait` must
-name the `pending` entry recorded for it.
+name the `pending` entry recorded for it (a `child` entry for a wait on
+`temps.child`).
+
+Cancelling a run cancels its unfinished descendants. A cancelled or failed
+child wakes its parent like a completed one, and the parent decides what to
+do with the `status`.
 
 ## Failures
 

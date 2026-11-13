@@ -115,8 +115,24 @@ export function createConformanceFixtures(): ConformanceFixtures {
     return ctx.step('once', () => effect('conf-idempotent/once'));
   });
 
+  const parent = defineWorkflow('conf-parent', async (ctx) => {
+    const input = ctx.input as { n: number; fail?: boolean };
+    const before = await ctx.step('before', () => effect('conf-parent/before'));
+    const child = await ctx.child('square', 'conf-child', input);
+    return { before, child };
+  });
+
+  const child = defineWorkflow('conf-child', async (ctx) => {
+    const input = ctx.input as { n: number; fail?: boolean };
+    return ctx.step('square', () => {
+      effect('conf-child/square');
+      if (input.fail) throw new Error('the child cannot square that');
+      return input.n * input.n;
+    }, { retries: 0 });
+  });
+
   return {
-    workflows: [replay, retry, exhausted, suspend, incompatible, gatedWorkflow, idempotent],
+    workflows: [replay, retry, exhausted, suspend, incompatible, gatedWorkflow, idempotent, parent, child],
     effects,
     variant,
     gated,

@@ -127,7 +127,7 @@ CREATE TABLE IF NOT EXISTS workflow_steps (
     run_id UUID NOT NULL REFERENCES workflow_runs(id) ON DELETE CASCADE,
     sequence INTEGER NOT NULL CHECK (sequence >= 0),
     name TEXT NOT NULL CHECK (char_length(name) BETWEEN 1 AND 256),
-    kind TEXT NOT NULL CHECK (kind IN ('step', 'sleep', 'wait', 'now', 'random', 'send_event')),
+    kind TEXT NOT NULL CHECK (kind IN ('step', 'sleep', 'wait', 'now', 'random', 'send_event', 'child')),
     status TEXT NOT NULL CHECK (status IN ('pending', 'completed', 'failed')),
     attempts INTEGER NOT NULL DEFAULT 0,
     result_encrypted TEXT NULL,

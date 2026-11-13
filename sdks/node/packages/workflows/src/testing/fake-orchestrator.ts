@@ -17,10 +17,13 @@ import { createHash, generateKeyPairSync, randomUUID, sign, type KeyObject } fro
 
 import type { FetchHandler } from '../handler.js';
 import {
+  CHILD_EVENT,
   INVOKE_PATH,
+  RESERVED_EVENT_PREFIX,
   MANIFEST_PATH,
   PROTOCOL_VERSION,
   TOKEN_VERSION,
+  type ChildResult,
   type InvocationClaims,
   type InvocationKey,
   type InvokeRequest,
@@ -55,6 +58,8 @@ export interface FakeRun {
   finishedAt: number | null;
   consecutiveFailures: number;
   cancelRequested: boolean;
+  /** The run whose `child` entry started this one. */
+  parentRunId: string | null;
   wait?: { sequence: number; event: string; key: string };
 }
 
@@ -137,7 +142,12 @@ export class FakeOrchestrator {
 
   // ---- what an app does ------------------------------------------------
 
-  start(workflow: string, input: JsonValue | null = null, idempotencyKey?: string): { run: FakeRun; created: boolean } {
+  start(
+    workflow: string,
+    input: JsonValue | null = null,
+    idempotencyKey?: string,
+    parentRunId: string | null = null,
+  ): { run: FakeRun; created: boolean } {
     if (idempotencyKey) {
       for (const run of this.runs.values()) {
         if (run.workflow === workflow && run.idempotencyKey === idempotencyKey) return { run, created: false };
@@ -160,6 +170,7 @@ export class FakeOrchestrator {
       finishedAt: null,
       consecutiveFailures: 0,
       cancelRequested: false,
+      parentRunId,
     };
     this.runs.set(run.id, run);
     return { run, created: true };
@@ -186,12 +197,21 @@ export class FakeOrchestrator {
 
   // ---- what an operator does -------------------------------------------
 
+  /** Cancel a run and, with it, its children and theirs. */
   cancel(runId: string): void {
     const run = this.require(runId);
     if (TERMINAL.has(run.status)) return;
-    run.status = 'cancelled';
-    run.dueAt = null;
-    run.finishedAt = this.now;
+    const tree = [run];
+    for (let i = 0; i < tree.length; i += 1) {
+      for (const child of this.runs.values()) {
+        if (child.parentRunId === (tree[i] as FakeRun).id) tree.push(child);
+      }
+    }
+    for (const member of tree) {
+      if (TERMINAL.has(member.status)) continue;
+      Object.assign(member, { status: 'cancelled', dueAt: null, finishedAt: this.now, wait: undefined });
+    }
+    this.childFinished(run);
   }
 
   /** Cut the journal at `fromSequence` and run again. */
@@ -357,6 +377,32 @@ export class FakeOrchestrator {
 
   private finish(run: FakeRun, status: RunStatus, fields: Partial<FakeRun>): void {
     Object.assign(run, { status, dueAt: null, finishedAt: this.now, consecutiveFailures: 0, ...fields });
+    this.childFinished(run);
+  }
+
+  /** A finished child wakes its parent, if the parent is suspended on it. */
+  private childFinished(child: FakeRun): void {
+    const parent = child.parentRunId ? this.runs.get(child.parentRunId) : undefined;
+    if (!parent || parent.status !== 'waiting' || parent.wait?.event !== CHILD_EVENT || parent.wait.key !== child.id) return;
+    this.completeChild(parent, child);
+  }
+
+  private completeChild(parent: FakeRun, child: FakeRun | undefined): void {
+    if (!parent.wait) return;
+    const childId = parent.wait.key;
+    const result: ChildResult = child
+      ? {
+          run_id: child.id,
+          status: child.status as ChildResult['status'],
+          output: child.status === 'completed' ? child.output : null,
+          error: child.error ?? (child.status === 'cancelled' ? `child run ${child.id} was cancelled` : null),
+        }
+      : { run_id: childId, status: 'deleted', output: null, error: `child run ${childId} was deleted before it finished` };
+    const entry = parent.journal[parent.wait.sequence];
+    if (!entry || entry.kind !== 'child' || entry.status !== 'pending') return;
+    entry.status = 'completed';
+    entry.result = result as unknown as JsonValue;
+    Object.assign(parent, { wait: undefined, status: 'queued', dueAt: this.now });
   }
 
   private applyOutcome(run: FakeRun, outcome: Outcome): void {
@@ -376,8 +422,21 @@ export class FakeOrchestrator {
         Object.assign(run, { status: 'sleeping', dueAt: Date.parse(outcome.until) });
         return;
       case 'wait': {
-        this.requirePending(run, outcome.sequence, 'wait');
         const key = outcome.key ?? '';
+        if (outcome.event === CHILD_EVENT) {
+          this.requirePending(run, outcome.sequence, 'child');
+          const child = this.runs.get(key);
+          if (!child || child.parentRunId !== run.id || outcome.timeout_at) {
+            throw new HttpError(400, 'Validation Error', `run ${run.id} suspended on child '${key}', which is not the run its entry ${outcome.sequence} started`);
+          }
+          Object.assign(run, { status: 'waiting', dueAt: null, wait: { sequence: outcome.sequence, event: CHILD_EVENT, key } });
+          if (TERMINAL.has(child.status)) this.completeChild(run, child);
+          return;
+        }
+        if (outcome.event.startsWith(RESERVED_EVENT_PREFIX)) {
+          throw new HttpError(400, 'Validation Error', `run ${run.id} waits on '${outcome.event}', which is reserved for events Temps sends itself`);
+        }
+        this.requirePending(run, outcome.sequence, 'wait');
         run.status = 'waiting';
         run.dueAt = outcome.timeout_at ? Date.parse(outcome.timeout_at) : null;
         run.wait = { sequence: outcome.sequence, event: outcome.event, key };
@@ -550,6 +609,18 @@ export class FakeOrchestrator {
     }
     if ((write.kind === 'send_event') !== Boolean(write.event)) {
       throw invalid('only a send_event entry carries an event, and it must');
+    }
+    if (write.event?.name.startsWith(RESERVED_EVENT_PREFIX)) {
+      throw invalid(`event name '${write.event.name}' starts with '${RESERVED_EVENT_PREFIX}', which is reserved for events Temps sends itself`);
+    }
+    if (write.kind === 'child') {
+      if (write.status !== 'pending' || !write.child || write.result) {
+        throw invalid(`child ${write.sequence} of run ${run.id} is recorded pending with \`child\` and no result; Temps completes it`);
+      }
+      const { run: child } = this.start(write.child.workflow, write.child.input ?? null, `child:${run.id}:${write.sequence}`, run.id);
+      write = { ...write, result: { run_id: child.id } };
+    } else if (write.child) {
+      throw invalid(`only a child entry carries \`child\`, not ${write.kind}`);
     }
     const leaseExpiresAt = new Date(this.now + this.options.leaseMs).toISOString();
     const existing = run.journal[write.sequence];

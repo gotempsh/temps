@@ -27,6 +27,7 @@ use uuid::Uuid;
 
 use super::*;
 use crate::error::{WorkflowError, WorkflowResult};
+use crate::protocol::CHILD_EVENT;
 
 /// Key of the transaction-scoped advisory lock that serializes claims.
 const CLAIM_LOCK_KEY: i64 = 7_343_019_001;
@@ -321,8 +322,9 @@ impl WorkflowStore for PgWorkflowStore {
             .from_raw_sql(stmt(
                 "INSERT INTO workflow_runs (id, project_id, environment_id, workflow_name, status, \
                  input_encrypted, input_blob_key, input_bytes, idempotency_key, deployment_id, \
-                 started_by_user_id, started_by_credential_id, has_blob_payloads, due_at) \
-                 VALUES ($1, $2, $3, $4, 'queued', $5, $6, $7, $8, $9, $10, $11, $12, now()) \
+                 started_by_user_id, started_by_credential_id, has_blob_payloads, parent_run_id, \
+                 due_at) \
+                 VALUES ($1, $2, $3, $4, 'queued', $5, $6, $7, $8, $9, $10, $11, $12, $13, now()) \
                  ON CONFLICT (environment_id, workflow_name, idempotency_key) \
                  WHERE idempotency_key IS NOT NULL DO NOTHING \
                  RETURNING *",
@@ -339,6 +341,7 @@ impl WorkflowStore for PgWorkflowStore {
                     user.into(),
                     credential.into(),
                     run.input.blob_key.is_some().into(),
+                    run.parent_run_id.into(),
                 ],
             ))
             .one(&txn)
@@ -714,6 +717,29 @@ impl WorkflowStore for PgWorkflowStore {
             .collect())
     }
 
+    async fn cancel_descendants(&self, run_id: Uuid) -> WorkflowResult<Vec<RunRow>> {
+        // `parent_run_id` is set once, at creation, to a run that already
+        // exists, so the tree has no cycles.
+        workflow_runs::Entity::find()
+            .from_raw_sql(stmt(
+                &format!(
+                    "WITH RECURSIVE tree AS ( \
+                        SELECT id FROM workflow_runs WHERE parent_run_id = $1 \
+                        UNION SELECT c.id FROM workflow_runs c JOIN tree t ON c.parent_run_id = t.id \
+                     ) \
+                     UPDATE workflow_runs SET status = 'cancelled', error_kind = 'cancelled', \
+                     finished_at = now(), due_at = NULL, lease_token = lease_token + 1, \
+                     lease_expires_at = NULL, awaited_event_name = NULL, awaited_event_key = NULL, \
+                     awaited_sequence = NULL, blocked_reason = NULL, updated_at = now() \
+                     WHERE id IN (SELECT id FROM tree) AND status NOT IN {TERMINAL} RETURNING *"
+                ),
+                vec![run_id.into()],
+            ))
+            .all(self.db.as_ref())
+            .await
+            .map_err(WorkflowError::db("cancelling the descendants of a workflow run"))
+    }
+
     async fn cancel_run(&self, run_id: Uuid) -> WorkflowResult<Option<RunRow>> {
         workflow_runs::Entity::find()
             .from_raw_sql(stmt(
@@ -911,6 +937,32 @@ impl WorkflowStore for PgWorkflowStore {
             .collect())
     }
 
+    async fn waits_on_finished_children(&self, limit: u64) -> WorkflowResult<Vec<WaitingRun>> {
+        // The child is looked up through the parent index; comparing its id
+        // as text never fails on a key that is not a UUID.
+        let rows = WaitingRow::find_by_statement(stmt(
+            &format!(
+                "SELECT r.id, r.project_id, r.environment_id, r.lease_token, r.awaited_sequence, \
+                 r.awaited_event_name, r.awaited_event_key FROM workflow_runs r \
+                 WHERE r.status = 'waiting' AND r.awaited_event_name = $1 AND NOT EXISTS ( \
+                    SELECT 1 FROM workflow_runs c WHERE c.parent_run_id = r.id \
+                    AND c.id::text = r.awaited_event_key AND c.status NOT IN {TERMINAL} \
+                 ) ORDER BY r.updated_at LIMIT $2"
+            ),
+            vec![
+                CHILD_EVENT.into(),
+                i64::try_from(limit).unwrap_or(i64::MAX).into(),
+            ],
+        ))
+        .all(self.db.as_ref())
+        .await
+        .map_err(WorkflowError::db("reconciling child workflow results"))?;
+        Ok(rows
+            .into_iter()
+            .filter_map(WaitingRow::into_waiting)
+            .collect())
+    }
+
     async fn buffered_event(
         &self,
         run_id: Uuid,
@@ -988,8 +1040,14 @@ impl WorkflowStore for PgWorkflowStore {
             .one(&txn)
             .await
             .map_err(WorkflowError::db("delivering a workflow event"))?;
+        // A child's result completes the `child` entry; an event, a `wait`.
+        let kind = if waiting.event_name == CHILD_EVENT {
+            StepKind::Child
+        } else {
+            StepKind::Wait
+        };
         let Some(step) = step.filter(|step| {
-            step.kind == StepKind::Wait.as_str() && step.status == StepStatus::Pending.as_str()
+            step.kind == kind.as_str() && step.status == StepStatus::Pending.as_str()
         }) else {
             return Ok(WaitCompletion::NotWaiting);
         };

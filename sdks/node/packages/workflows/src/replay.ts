@@ -26,14 +26,17 @@ import {
   WorkflowIncompatibleError,
   errorMessage,
 } from './errors.js';
-import type {
-  InvokeRequest,
-  JournalEntry,
-  JsonValue,
-  Outcome,
-  StepKind,
-  StepWriteRequest,
-  WaitResult,
+import {
+  CHILD_EVENT,
+  RESERVED_EVENT_PREFIX,
+  type ChildResult,
+  type InvokeRequest,
+  type JournalEntry,
+  type JsonValue,
+  type Outcome,
+  type StepKind,
+  type StepWriteRequest,
+  type WaitResult,
 } from './protocol.js';
 import { StepAttemptError, type Telemetry } from './telemetry.js';
 import type { ExecutorTransport } from './transport.js';
@@ -108,6 +111,12 @@ function clip(message: string): string {
   return message.length > MAX_ERROR_LENGTH ? `${message.slice(0, MAX_ERROR_LENGTH)}…` : message;
 }
 
+function checkUnreserved(event: string): void {
+  if (event.startsWith(RESERVED_EVENT_PREFIX)) {
+    throw new Error(`Event name '${event}' starts with '${RESERVED_EVENT_PREFIX}', which is reserved for events Temps sends itself`);
+  }
+}
+
 export function backoffMs(options: StepOptions, attempt: number): number {
   const initial = durationMs(options.initialBackoff ?? 1000);
   const max = durationMs(options.maxBackoff ?? 300_000);
@@ -156,6 +165,7 @@ class Invocation<Input> {
       sleepUntil: (name, until) => self.sleepUntil(name, until),
       waitForEvent: (name, options) => self.waitForEvent(name, options),
       sendEvent: (name, event, options) => self.sendEvent(name, event, options),
+      child: (name, workflow, input) => self.child(name, workflow, input),
       now: (name) => self.now(name ?? 'now'),
       random: (name) => self.random(name ?? 'random'),
     };
@@ -416,6 +426,7 @@ class Invocation<Input> {
 
   async waitForEvent<T>(name: string, options: WaitOptions): Promise<WaitResult<T>> {
     checkName('Event name', options.event, 200);
+    checkUnreserved(options.event);
     const { sequence, entry } = this.next(name, 'wait');
     if (entry?.status === 'completed') return (entry.result ?? { received: false, payload: null }) as unknown as WaitResult<T>;
     const key = options.key ?? null;
@@ -438,8 +449,33 @@ class Invocation<Input> {
     this.raise(new Suspension({ type: 'wait', sequence, event: options.event, key, timeout_at: timeoutAt }));
   }
 
+  async child<T>(name: string, workflow: string, input?: JsonValue): Promise<ChildResult<T>> {
+    checkName('Workflow name', workflow, 128);
+    const { sequence, entry } = this.next(name, 'child');
+    if (entry?.status === 'completed') return entry.result as unknown as ChildResult<T>;
+    let pending = entry;
+    if (!pending) {
+      pending = await this.record({
+        sequence,
+        name,
+        kind: 'child',
+        status: 'pending',
+        attempts: 1,
+        child: { workflow, input: toJson(input, `The input of child '${name}'`) },
+      });
+      // The child may have finished, and Temps recorded its result, already.
+      if (pending.status === 'completed') return pending.result as unknown as ChildResult<T>;
+    }
+    const runId = (pending.result as { run_id?: unknown } | null)?.run_id;
+    if (typeof runId !== 'string') {
+      throw new Error(`child '${name}' (entry ${sequence}) has no child run id recorded`);
+    }
+    this.raise(new Suspension({ type: 'wait', sequence, event: CHILD_EVENT, key: runId, timeout_at: null }));
+  }
+
   async sendEvent(name: string, event: string, options: SendEventOptions = {}): Promise<void> {
     checkName('Event name', event, 200);
+    checkUnreserved(event);
     const { sequence, entry } = this.next(name, 'send_event');
     if (entry) return;
     await this.record({

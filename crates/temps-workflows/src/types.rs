@@ -90,6 +90,9 @@ pub enum StepKind {
     Now,
     Random,
     SendEvent,
+    /// A child run started by the workflow, completed by Temps with the
+    /// child's status and output when it finishes.
+    Child,
 }
 
 impl StepKind {
@@ -101,6 +104,7 @@ impl StepKind {
             StepKind::Now => "now",
             StepKind::Random => "random",
             StepKind::SendEvent => "send_event",
+            StepKind::Child => "child",
         }
     }
 
@@ -112,6 +116,7 @@ impl StepKind {
             StepKind::Now,
             StepKind::Random,
             StepKind::SendEvent,
+            StepKind::Child,
         ]
         .into_iter()
         .find(|kind| kind.as_str() == value)

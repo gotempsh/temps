@@ -203,6 +203,7 @@ impl Harness {
                     idempotency_key: None,
                     deployment_id: None,
                     starter: Starter::Machine,
+                    parent_run_id: None,
                 },
                 10_000,
             )
@@ -254,6 +255,7 @@ fn write(sequence: i32, name: &str, kind: StepKind, status: StepStatus) -> StepW
         trace_id: None,
         error_ref: None,
         event: None,
+        child: None,
     }
 }
 
@@ -1008,4 +1010,394 @@ async fn a_claim_made_before_the_manifest_was_cached_still_honours_its_concurren
     make_due(&h.env.conn, deferred.id).await;
     assert_eq!(h.tick().await, 1);
     assert_eq!(h.run(deferred.id).await.status, "completed");
+}
+
+/// `parent` starts one `child` at entry 0 and completes with its result;
+/// `child` completes with its input doubled, or fails when told to.
+pub(crate) fn parent_and_child_script() -> Script {
+    Arc::new(|engine, token, request| {
+        Box::pin(async move {
+            if request.workflow == "child" {
+                let input = request.input.clone().unwrap_or(Value::Null);
+                if input["fail"] == json!(true) {
+                    return Reply::Outcome(Outcome::Failed {
+                        error: "the child gave up".into(),
+                        sequence: None,
+                    });
+                }
+                return Reply::Outcome(Outcome::Completed {
+                    output: Some(json!({ "doubled": input["n"].as_i64().unwrap_or(0) * 2 })),
+                });
+            }
+            let entry = match request.journal.first() {
+                Some(entry) => entry.clone(),
+                None => {
+                    engine
+                        .record_step(
+                            &token,
+                            request.run_id,
+                            StepWriteRequest {
+                                child: Some(crate::protocol::ChildStart {
+                                    workflow: "child".into(),
+                                    input: request.input.clone(),
+                                }),
+                                ..write(0, "double", StepKind::Child, StepStatus::Pending)
+                            },
+                        )
+                        .await
+                        .unwrap()
+                        .entry
+                }
+            };
+            if entry.status == StepStatus::Completed {
+                return Reply::Outcome(Outcome::Completed {
+                    output: entry.result.clone(),
+                });
+            }
+            let child_id = entry.result.as_ref().unwrap()["run_id"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            Reply::Outcome(Outcome::Wait {
+                sequence: 0,
+                event: crate::protocol::CHILD_EVENT.into(),
+                key: Some(child_id),
+                timeout_at: None,
+            })
+        })
+    })
+}
+
+async fn child_of(h: &Harness, parent: Uuid) -> crate::store::RunRow {
+    let entry = h.store.step(parent, 0).await.unwrap().unwrap();
+    let opened = h
+        .codec
+        .open(
+            &WorkflowEngine::scope(&h.run(parent).await),
+            &PayloadField::StepResult(0),
+            &crate::payload::StoredPayload {
+                encrypted: entry.result_encrypted.clone(),
+                blob_key: entry.result_blob_key.clone(),
+                bytes: entry.result_bytes,
+            },
+            &WorkflowSettings::default(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let id: Uuid = opened["run_id"].as_str().unwrap().parse().unwrap();
+    h.run(id).await
+}
+
+#[tokio::test]
+async fn a_child_run_starts_once_and_its_result_wakes_the_parent() {
+    let Some(h) = harness(
+        "child workflow test",
+        &["parent", "child"],
+        parent_and_child_script(),
+        true,
+    )
+    .await
+    else {
+        return;
+    };
+    let parent = h.start("parent", json!({ "n": 21 })).await;
+    // The parent starts its child and suspends on it.
+    assert_eq!(h.tick().await, 1);
+    let waiting = h.run(parent).await;
+    assert_eq!(waiting.status, "waiting");
+    assert_eq!(waiting.awaited_event_name.as_deref(), Some("temps.child"));
+    let child = child_of(&h, parent).await;
+    assert_eq!(child.parent_run_id, Some(parent));
+    assert_eq!(child.workflow_name, "child");
+    assert_eq!(waiting.awaited_event_key, Some(child.id.to_string()));
+
+    // The child runs, and its completion makes the parent due.
+    assert_eq!(h.tick().await, 1);
+    assert_eq!(h.run(child.id).await.status, "completed");
+    assert_eq!(h.run(parent).await.status, "queued");
+    assert_eq!(h.tick().await, 1);
+    assert_eq!(h.run(parent).await.status, "completed");
+    assert_eq!(
+        h.output(parent).await,
+        Some(json!({
+            "run_id": child.id,
+            "status": "completed",
+            "output": { "doubled": 42 },
+            "error": null,
+        }))
+    );
+    // Exactly one child.
+    let children: i64 = sea_orm::ConnectionTrait::query_one(
+        &*h.env.conn,
+        sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*) AS count FROM workflow_runs WHERE parent_run_id = $1",
+            vec![parent.into()],
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .try_get("", "count")
+    .unwrap();
+    assert_eq!(children, 1);
+}
+
+#[tokio::test]
+async fn a_failed_child_reports_its_error_to_the_parent() {
+    let Some(h) = harness(
+        "failed child test",
+        &["parent", "child"],
+        parent_and_child_script(),
+        true,
+    )
+    .await
+    else {
+        return;
+    };
+    let parent = h.start("parent", json!({ "fail": true })).await;
+    h.tick().await;
+    h.tick().await;
+    h.tick().await;
+    let result = h.output(parent).await.unwrap();
+    assert_eq!(result["status"], json!("failed"));
+    assert_eq!(result["error"], json!("the child gave up"));
+    assert_eq!(result["output"], Value::Null);
+}
+
+#[tokio::test]
+async fn a_child_that_finished_before_the_wake_up_is_delivered_by_reconciliation() {
+    let Some(h) = harness(
+        "child reconcile test",
+        &["parent", "child"],
+        parent_and_child_script(),
+        true,
+    )
+    .await
+    else {
+        return;
+    };
+    let parent = h.start("parent", json!({ "n": 1 })).await;
+    h.tick().await;
+    let child = child_of(&h, parent).await;
+    // The child finishes but the wake-up is lost (a crash between the two).
+    sea_orm::ConnectionTrait::execute(
+        &*h.env.conn,
+        sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "UPDATE workflow_runs SET status = 'cancelled', finished_at = now(), due_at = NULL WHERE id = $1",
+            vec![child.id.into()],
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(h.run(parent).await.status, "waiting");
+    assert_eq!(h.engine.reconcile_children(10).await.unwrap(), 1);
+    // Nothing left to reconcile.
+    assert_eq!(h.engine.reconcile_children(10).await.unwrap(), 0);
+    h.tick().await;
+    let result = h.output(parent).await.unwrap();
+    assert_eq!(result["status"], json!("cancelled"));
+    assert_eq!(
+        result["error"],
+        json!(format!("child run {} was cancelled", child.id))
+    );
+}
+
+#[tokio::test]
+async fn a_deleted_child_is_reported_as_deleted() {
+    let Some(h) = harness(
+        "deleted child test",
+        &["parent", "child"],
+        parent_and_child_script(),
+        true,
+    )
+    .await
+    else {
+        return;
+    };
+    let parent = h.start("parent", json!({ "n": 1 })).await;
+    h.tick().await;
+    let child = child_of(&h, parent).await;
+    sea_orm::ConnectionTrait::execute(
+        &*h.env.conn,
+        sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "DELETE FROM workflow_runs WHERE id = $1",
+            vec![child.id.into()],
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(h.engine.reconcile_children(10).await.unwrap(), 1);
+    h.tick().await;
+    assert_eq!(h.output(parent).await.unwrap()["status"], json!("deleted"));
+}
+
+#[tokio::test]
+async fn a_child_entry_is_validated_and_waits_only_on_its_own_child() {
+    let observed = Arc::new(Mutex::new(Vec::<String>::new()));
+    let script: Script = {
+        let observed = observed.clone();
+        Arc::new(move |engine, token, request| {
+            let observed = observed.clone();
+            Box::pin(async move {
+                let note = |error: WorkflowError| observed.lock().unwrap().push(error.to_string());
+                // A child entry completed by the executor.
+                note(
+                    engine
+                        .record_step(
+                            &token,
+                            request.run_id,
+                            write(0, "c", StepKind::Child, StepStatus::Completed),
+                        )
+                        .await
+                        .unwrap_err(),
+                );
+                // A pending child entry without `child`.
+                note(
+                    engine
+                        .record_step(
+                            &token,
+                            request.run_id,
+                            write(0, "c", StepKind::Child, StepStatus::Pending),
+                        )
+                        .await
+                        .unwrap_err(),
+                );
+                // `child` on another kind.
+                note(
+                    engine
+                        .record_step(
+                            &token,
+                            request.run_id,
+                            StepWriteRequest {
+                                child: Some(crate::protocol::ChildStart {
+                                    workflow: "child".into(),
+                                    input: None,
+                                }),
+                                ..write(0, "c", StepKind::Wait, StepStatus::Pending)
+                            },
+                        )
+                        .await
+                        .unwrap_err(),
+                );
+                engine
+                    .record_step(
+                        &token,
+                        request.run_id,
+                        write(0, "approval", StepKind::Wait, StepStatus::Pending),
+                    )
+                    .await
+                    .unwrap();
+                // A wait entry cannot suspend on a child, nor on another
+                // reserved name.
+                for event in [crate::protocol::CHILD_EVENT, "temps.anything"] {
+                    note(
+                        engine
+                            .apply_outcome(
+                                &engine.store.get_run(request.run_id).await.unwrap().unwrap(),
+                                request.lease,
+                                Outcome::Wait {
+                                    sequence: 0,
+                                    event: event.into(),
+                                    key: Some(Uuid::new_v4().to_string()),
+                                    timeout_at: None,
+                                },
+                            )
+                            .await
+                            .unwrap_err(),
+                    );
+                }
+                Reply::Outcome(Outcome::Completed { output: None })
+            })
+        })
+    };
+    let Some(h) = harness("child validation test", &["parent"], script, true).await else {
+        return;
+    };
+    let id = h.start("parent", json!(null)).await;
+    h.tick().await;
+    assert_eq!(h.run(id).await.status, "completed");
+    let observed = observed.lock().unwrap().clone();
+    assert_eq!(observed.len(), 5, "{observed:?}");
+    assert!(
+        observed[0].contains("completed by Temps"),
+        "{}",
+        observed[0]
+    );
+    assert!(
+        observed[1].contains("names the workflow"),
+        "{}",
+        observed[1]
+    );
+    assert!(
+        observed[2].contains("only a child entry"),
+        "{}",
+        observed[2]
+    );
+    assert!(
+        observed[3].contains("not a pending child entry"),
+        "{}",
+        observed[3]
+    );
+    assert!(observed[4].contains("reserved"), "{}", observed[4]);
+}
+
+#[tokio::test]
+async fn cancelling_a_parent_cancels_its_children_and_their_children() {
+    let Some(h) = harness(
+        "child cancel test",
+        &["parent", "child"],
+        parent_and_child_script(),
+        false,
+    )
+    .await
+    else {
+        return;
+    };
+    let root = h.start("parent", json!(null)).await;
+    let mut parent = h.run(root).await;
+    let mut tree = Vec::new();
+    for sequence in 0..2 {
+        let id = h
+            .engine
+            .start_child(
+                &parent,
+                sequence,
+                &crate::protocol::ChildStart {
+                    workflow: "child".into(),
+                    input: None,
+                },
+                &WorkflowSettings::default(),
+            )
+            .await
+            .unwrap();
+        // Starting the same entry's child again finds it.
+        let again = h
+            .engine
+            .start_child(
+                &parent,
+                sequence,
+                &crate::protocol::ChildStart {
+                    workflow: "child".into(),
+                    input: None,
+                },
+                &WorkflowSettings::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(id, again);
+        tree.push(id);
+        parent = h.run(id).await;
+    }
+    let cancelled = h.store.cancel_run(root).await.unwrap().unwrap();
+    assert_eq!(cancelled.status, "cancelled");
+    let descendants = h.store.cancel_descendants(root).await.unwrap();
+    assert_eq!(descendants.len(), 2);
+    for id in tree {
+        assert_eq!(h.run(id).await.status, "cancelled");
+    }
+    assert!(h.store.cancel_descendants(root).await.unwrap().is_empty());
 }

@@ -8,6 +8,7 @@
 //! write to the [`WorkflowStore`], so any number of control-plane processes
 //! can run an engine against the same database.
 
+mod children;
 mod events;
 mod invoke;
 mod journal;

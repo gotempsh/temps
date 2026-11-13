@@ -147,7 +147,15 @@ reinvoked.
 - `step(name, fn, {retries, timeout})`; `sleep(name, duration)` and
   `sleepUntil(name, date)`; `waitForEvent(name, {event, key, timeout})`;
   `sendEvent(event, key, payload)`;
-- child workflows (M2); cancellation;
+- child workflows (M2): `ctx.child(name, workflow, input)` starts a run of
+  another workflow in the same environment, exactly once per journal entry
+  (idempotency key `child:<parent>:<sequence>`), and suspends until it
+  finishes. The parent receives `{run_id, status, output, error}` for a
+  completed, failed, cancelled or deleted child and decides itself; a child
+  failure does not fail the parent. Child waits have no timeout. Cancelling a
+  run cancels its descendants; a parent that fails while a child runs does
+  not. Event names starting with `temps.` are reserved for Temps;
+- cancellation;
 - `ctx.now()` and `ctx.random()`, recorded in the journal;
 - per-workflow concurrency limits.
 

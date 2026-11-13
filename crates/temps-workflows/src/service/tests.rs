@@ -382,3 +382,59 @@ async fn sending_an_event_reports_how_many_runs_it_woke() {
         "{error}"
     );
 }
+
+#[tokio::test]
+async fn cancelling_a_parent_cancels_its_child_and_cancelling_a_child_wakes_its_parent() {
+    let Some(h) = harness(
+        "service child cancel test",
+        &["parent", "child"],
+        crate::engine::tests::parent_and_child_script(),
+        true,
+    )
+    .await
+    else {
+        return;
+    };
+    let service = service(&h);
+    let (p, e) = (h.env.project_id, h.env.environment_id);
+    let child_of = |parent: uuid::Uuid| {
+        let h = &h;
+        async move {
+            let children = h
+                .store
+                .list_runs(e, &RunFilter::default(), 1, 100)
+                .await
+                .unwrap()
+                .0;
+            children
+                .into_iter()
+                .find(|run| run.parent_run_id == Some(parent))
+                .unwrap()
+        }
+    };
+
+    // Cancel the parent: its waiting child stops with it.
+    let (parent, _) = service
+        .start(p, e, start("parent"), Starter::Machine)
+        .await
+        .unwrap();
+    tick(&h).await;
+    assert_eq!(h.run(parent.id).await.status, "waiting");
+    let child = child_of(parent.id).await;
+    assert_eq!(child.status, "queued");
+    service.cancel(p, e, parent.id).await.unwrap();
+    assert_eq!(h.run(child.id).await.status, "cancelled");
+
+    // Cancel a child: its parent resumes and sees it was cancelled.
+    let (parent, _) = service
+        .start(p, e, start("parent"), Starter::Machine)
+        .await
+        .unwrap();
+    tick(&h).await;
+    let child = child_of(parent.id).await;
+    service.cancel(p, e, child.id).await.unwrap();
+    assert_eq!(h.run(parent.id).await.status, "queued");
+    tick(&h).await;
+    let parent = h.run(parent.id).await;
+    assert_eq!(parent.status, "completed");
+}

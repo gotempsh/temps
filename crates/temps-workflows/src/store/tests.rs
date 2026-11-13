@@ -46,6 +46,7 @@ impl Fixture {
             idempotency_key: key.map(str::to_string),
             deployment_id: None,
             starter: Starter::Machine,
+            parent_run_id: None,
         }
     }
 

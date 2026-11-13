@@ -23,7 +23,7 @@ export type JsonValue =
   | JsonValue[]
   | { [key: string]: JsonValue };
 
-export type StepKind = 'step' | 'sleep' | 'wait' | 'now' | 'random' | 'send_event';
+export type StepKind = 'step' | 'sleep' | 'wait' | 'now' | 'random' | 'send_event' | 'child';
 export type StepStatus = 'pending' | 'completed' | 'failed';
 export type RunStatus =
   | 'queued'
@@ -92,7 +92,19 @@ export interface StepWriteRequest {
   trace_id?: string | null;
   error_ref?: string | null;
   event?: EmittedEvent | null;
+  /** For `child`: the run Temps starts, exactly once, for this entry. */
+  child?: ChildStart | null;
 }
+
+export interface ChildStart {
+  workflow: string;
+  input?: JsonValue | null;
+}
+
+/** The event name a run suspends on to wait for its child; keyed by the child's run id. */
+export const CHILD_EVENT = 'temps.child';
+/** Event names starting with this are Temps' own. */
+export const RESERVED_EVENT_PREFIX = 'temps.';
 
 export interface StepWriteResponse {
   entry: JournalEntry;
@@ -154,4 +166,15 @@ export interface InvocationClaims {
 export interface WaitResult<T = JsonValue> {
   received: boolean;
   payload: T | null;
+}
+
+/** What Temps records for a finished `child`. */
+export interface ChildResult<T = JsonValue> {
+  run_id: string;
+  /** `completed`, `failed`, `cancelled`, or `deleted` (removed before it finished). */
+  status: 'completed' | 'failed' | 'cancelled' | 'deleted';
+  /** The child's output, when it completed. */
+  output: T | null;
+  /** Why it did not complete. */
+  error: string | null;
 }

@@ -20,7 +20,7 @@ use super::outcome::fit_message;
 use super::WorkflowEngine;
 use crate::error::{WorkflowError, WorkflowResult};
 use crate::payload::{PayloadField, StoredPayload};
-use crate::protocol::wait_result;
+use crate::protocol::{wait_result, RESERVED_EVENT_PREFIX};
 use crate::store::{EventRow, NewEvent, WaitCompletion, WaitingRun};
 use crate::types::{validate_key, validate_name, WorkflowSettings, MAX_EVENT_NAME};
 
@@ -70,6 +70,15 @@ impl WorkflowEngine {
 
     pub(crate) async fn seal_event(&self, spec: EventSpec<'_>) -> WorkflowResult<NewEvent> {
         validate_name("event name", spec.name, MAX_EVENT_NAME)?;
+        if spec.name.starts_with(RESERVED_EVENT_PREFIX) {
+            return Err(WorkflowError::Validation {
+                field: "event name",
+                reason: format!(
+                    "'{}' starts with '{RESERVED_EVENT_PREFIX}', which is reserved for events Temps sends itself",
+                    spec.name
+                ),
+            });
+        }
         if !spec.key.is_empty() {
             validate_key("event key", spec.key)?;
         }
@@ -203,6 +212,26 @@ impl WorkflowEngine {
         event_id: i64,
         payload: Option<Value>,
     ) -> WorkflowResult<bool> {
+        self.complete_waiting(
+            waiting,
+            Some(event_id),
+            &wait_result(payload),
+            &format!("event {event_id}"),
+        )
+        .await
+    }
+
+    /// Complete a suspended run's pending entry with `value` (an event's
+    /// wait result, a finished child's result), fenced by
+    /// [`crate::store::WorkflowStore::complete_wait`]. `what` names the
+    /// source in the error when the result breaks the journal quota.
+    pub(crate) async fn complete_waiting(
+        &self,
+        waiting: &WaitingRun,
+        event_id: Option<i64>,
+        value: &Value,
+        what: &str,
+    ) -> WorkflowResult<bool> {
         let settings = self.store.settings(waiting.environment_id).await?;
         let scope = crate::payload::PayloadScope {
             project_id: waiting.project_id,
@@ -214,9 +243,8 @@ impl WorkflowEngine {
             .seal(
                 &scope,
                 &PayloadField::StepResult(waiting.sequence),
-                &wait_result(payload),
-                // Blob keys must differ per write; the event id does.
-                event_id,
+                value,
+                waiting.lease,
                 &settings,
             )
             .await?;
@@ -224,7 +252,7 @@ impl WorkflowEngine {
             .store
             .complete_wait(
                 waiting,
-                Some(event_id),
+                event_id,
                 sealed.clone(),
                 settings.max_journal_bytes_per_run,
             )
@@ -241,7 +269,7 @@ impl WorkflowEngine {
             }) => {
                 self.codec.discard(waiting.project_id, &sealed).await;
                 let message = format!(
-                    "event {event_id} could not be delivered to wait '{}' (entry {}) of run {}: \
+                    "{what} could not be delivered to wait '{}' (entry {}) of run {}: \
                      its {result_bytes}-byte result would take the journal past the \
                      max_journal_bytes_per_run quota of {} bytes (it holds {journal_bytes})",
                     waiting.event_name,
@@ -298,8 +326,14 @@ impl WorkflowEngine {
             environment_id = waiting.environment_id,
             workflow = %workflow,
             error_kind = "quota_exceeded",
-            "workflow run failed: a delivered event exceeded its journal quota"
+            "workflow run failed: a delivered result exceeded its journal quota"
         );
+        // A failed child wakes its own parent.
+        if let Some(failed) = self.store.get_run(waiting.run_id).await? {
+            // Boxed: a parent failed here may itself be a child (bounded by
+            // the depth of the run tree).
+            Box::pin(self.child_finished(&failed)).await;
+        }
         Ok(())
     }
 

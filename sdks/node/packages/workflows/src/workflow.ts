@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import type { JsonValue, WaitResult } from './protocol.js';
+import type { ChildResult, JsonValue, WaitResult } from './protocol.js';
 
 /** Milliseconds, or a string such as `"30s"`, `"5m"`, `"2h"`, `"1d"`. */
 export type Duration = number | `${number}${'ms' | 's' | 'm' | 'h' | 'd'}`;
@@ -63,6 +63,13 @@ export interface WorkflowContext<Input = JsonValue> {
   sleepUntil(name: string, until: Date | string): Promise<void>;
   waitForEvent<T = JsonValue>(name: string, options: WaitOptions): Promise<WaitResult<T>>;
   sendEvent(name: string, event: string, options?: SendEventOptions): Promise<void>;
+  /**
+   * Start a run of `workflow` in this environment and wait until it
+   * finishes. The child starts exactly once, however often this run
+   * replays; the result says how it ended (check `status`) and carries its
+   * output. Cancelling this run cancels the child.
+   */
+  child<T = JsonValue>(name: string, workflow: string, input?: JsonValue): Promise<ChildResult<T>>;
   /** The time, recorded once and replayed. */
   now(name?: string): Promise<Date>;
   /** A number in [0, 1), recorded once and replayed. */

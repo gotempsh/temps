@@ -147,6 +147,39 @@ impl WorkflowEngine {
             }
             _ => {}
         }
+        match (write.kind, &write.child) {
+            (StepKind::Child, None) if write.status == StepStatus::Pending => {
+                return Err(invalid(format!(
+                    "pending child {} of run {run_id} names the workflow to start in `child`",
+                    write.sequence
+                )))
+            }
+            (StepKind::Child, Some(_)) if write.status != StepStatus::Pending => {
+                return Err(invalid(format!(
+                    "child {} of run {run_id} is recorded pending; Temps completes it when the child run finishes",
+                    write.sequence
+                )))
+            }
+            (StepKind::Child, Some(_)) if write.result.is_some() => {
+                return Err(invalid(format!(
+                    "pending child {} of run {run_id} carries no result; Temps records the child's run id",
+                    write.sequence
+                )))
+            }
+            (kind, Some(_)) if kind != StepKind::Child => {
+                return Err(invalid(format!(
+                    "only a child entry carries `child`, not {}",
+                    kind.as_str()
+                )))
+            }
+            _ => {}
+        }
+        if write.kind == StepKind::Child && write.status.is_final() {
+            return Err(invalid(format!(
+                "child {} of run {run_id} is completed by Temps when the child run finishes, not by the executor",
+                write.sequence
+            )));
+        }
         if write.trace_id.as_ref().is_some_and(|id| id.len() > 64) {
             return Err(WorkflowError::Validation {
                 field: "trace_id",
@@ -167,7 +200,7 @@ impl WorkflowEngine {
         self: &Arc<Self>,
         token: &str,
         run_id: Uuid,
-        write: StepWriteRequest,
+        mut write: StepWriteRequest,
     ) -> WorkflowResult<StepWriteResponse> {
         let auth = self.authorize(token, run_id).await?;
         Self::require_lease(&auth)?;
@@ -175,6 +208,28 @@ impl WorkflowEngine {
         let run = &auth.run;
         let settings = self.store.settings(run.environment_id).await?;
         let scope = Self::scope(run);
+        if write.child.is_some() {
+            // An entry recorded as something else is a replay mismatch: the
+            // write below reports it, and no child is started for it.
+            let mismatched = self
+                .store
+                .step(run.id, write.sequence)
+                .await?
+                .is_some_and(|entry| {
+                    entry.kind != StepKind::Child.as_str() || entry.name != write.name
+                });
+            if mismatched {
+                write.child = None;
+            }
+        }
+        if let Some(child) = &write.child {
+            // Started before the entry is written, exactly once per entry:
+            // a retried write finds the child by its idempotency key.
+            let child_id = self
+                .start_child(run, write.sequence, child, &settings)
+                .await?;
+            write.result = Some(serde_json::json!({ "run_id": child_id }));
+        }
 
         let result = match &write.result {
             Some(value) => {

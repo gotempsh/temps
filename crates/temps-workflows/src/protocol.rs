@@ -116,7 +116,30 @@ pub struct StepWriteRequest {
     /// For `send_event`: the event to deliver, recorded exactly once.
     #[serde(default)]
     pub event: Option<EmittedEvent>,
+    /// For `child`: the run to start, started exactly once.
+    #[serde(default)]
+    pub child: Option<ChildStart>,
 }
+
+/// A child run a `child` entry starts. Temps records the entry `pending`
+/// with `{"run_id": ...}` and completes it with the child's
+/// [`child_result`] when the child finishes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[schema(as = WorkflowChildStart)]
+pub struct ChildStart {
+    /// The child's workflow, in the same environment.
+    pub workflow: String,
+    #[serde(default)]
+    #[schema(value_type = Object)]
+    pub input: Option<Value>,
+}
+
+/// The event name a run suspended on a child waits for, with the child's run
+/// id as the key. Names starting with `temps.` are reserved: no API or
+/// workflow can send them.
+pub const CHILD_EVENT: &str = "temps.child";
+/// The prefix of event names only Temps itself uses.
+pub const RESERVED_EVENT_PREFIX: &str = "temps.";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[schema(as = WorkflowEmittedEvent)]
@@ -215,6 +238,23 @@ pub fn wait_result(payload: Option<Value>) -> Value {
         Some(payload) => serde_json::json!({ "received": true, "payload": payload }),
         None => serde_json::json!({ "received": true, "payload": null }),
     }
+}
+
+/// The result Temps records on a `child` entry when the child finishes:
+/// `status` is `completed`, `failed` or `cancelled`; `output` is the
+/// child's output when it completed, `error` its error when it did not.
+pub fn child_result(
+    run_id: Uuid,
+    status: &str,
+    output: Option<Value>,
+    error: Option<String>,
+) -> Value {
+    serde_json::json!({
+        "run_id": run_id,
+        "status": status,
+        "output": output,
+        "error": error,
+    })
 }
 
 /// The instance's invocation signing key, as SDKs receive it.

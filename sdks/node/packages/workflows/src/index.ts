@@ -39,4 +39,4 @@ export {
 } from './errors.js';
 export type { ErrorTracker, TelemetryOptions, TracerLike, SpanLike } from './telemetry.js';
 export { PROTOCOL_VERSION } from './protocol.js';
-export type { JsonValue, RunStatus, WaitResult, Outcome, JournalEntry } from './protocol.js';
+export type { ChildResult, JsonValue, RunStatus, WaitResult, Outcome, JournalEntry } from './protocol.js';

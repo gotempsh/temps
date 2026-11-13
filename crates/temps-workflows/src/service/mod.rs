@@ -361,6 +361,7 @@ impl WorkflowService {
                     idempotency_key: request.idempotency_key.clone(),
                     deployment_id: None,
                     starter,
+                    parent_run_id: None,
                 },
                 i64::from(settings.max_active_runs),
             )
@@ -408,6 +409,27 @@ impl WorkflowService {
         self.metrics
             .run_finished(project_id, environment_id, &run.workflow_name, "cancelled");
         tracing::info!(%run_id, project_id, environment_id, "workflow run cancelled");
+        // Its children stop with it; a cancelled child wakes no parent, as
+        // its parent is cancelled too.
+        match self.store.cancel_descendants(run_id).await {
+            Ok(descendants) => {
+                for child in &descendants {
+                    self.metrics.run_finished(
+                        child.project_id,
+                        child.environment_id,
+                        &child.workflow_name,
+                        "cancelled",
+                    );
+                }
+                if !descendants.is_empty() {
+                    tracing::info!(%run_id, count = descendants.len(), "cancelled the child runs of a cancelled workflow run");
+                }
+            }
+            Err(error) => {
+                tracing::error!(%run_id, %error, "could not cancel the child runs of a cancelled workflow run");
+            }
+        }
+        self.engine.child_finished(&cancelled).await;
         Ok(cancelled)
     }
 

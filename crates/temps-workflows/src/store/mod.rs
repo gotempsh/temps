@@ -54,6 +54,8 @@ pub struct NewRun {
     pub idempotency_key: Option<String>,
     pub deployment_id: Option<i32>,
     pub starter: Starter,
+    /// The run that started this one as a child.
+    pub parent_run_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone)]
@@ -316,6 +318,9 @@ pub trait WorkflowStore: Send + Sync {
     /// Cancel a non-terminal run. `None` when it was already terminal. The
     /// lease token moves on, so an in-flight invocation's writes are rejected.
     async fn cancel_run(&self, run_id: Uuid) -> WorkflowResult<Option<RunRow>>;
+    /// Cancel every unfinished descendant of `run_id` (its children, their
+    /// children, ...). Returns the runs cancelled.
+    async fn cancel_descendants(&self, run_id: Uuid) -> WorkflowResult<Vec<RunRow>>;
     /// Drop the journal from `sequence` on and run again from there. Only a
     /// terminal or stuck run; `None` otherwise.
     async fn retry_from(&self, run_id: Uuid, sequence: i32) -> WorkflowResult<Option<RunRow>>;
@@ -343,6 +348,9 @@ pub trait WorkflowStore: Send + Sync {
     /// Waiting runs with a matching event they have not consumed: the
     /// reconciliation of deliveries a crash interrupted.
     async fn undelivered_waits(&self, limit: u64) -> WorkflowResult<Vec<WaitingRun>>;
+    /// Runs suspended on a child run that finished or no longer exists: the
+    /// reconciliation of child results a crash interrupted.
+    async fn waits_on_finished_children(&self, limit: u64) -> WorkflowResult<Vec<WaitingRun>>;
     /// The oldest event matching a run's wait that the run has not consumed,
     /// received since the run started.
     async fn buffered_event(

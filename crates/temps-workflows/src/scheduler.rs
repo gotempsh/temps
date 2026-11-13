@@ -224,6 +224,9 @@ impl WorkflowScheduler {
                 if let Err(error) = self.engine.reconcile_waits(RECONCILE_BATCH).await {
                     tracing::warn!(%error, "reconciling workflow event deliveries failed");
                 }
+                if let Err(error) = self.engine.reconcile_children(RECONCILE_BATCH).await {
+                    tracing::warn!(%error, "reconciling child workflow results failed");
+                }
             }
             if last_metrics.elapsed() >= self.config.metrics_interval {
                 last_metrics = Instant::now();

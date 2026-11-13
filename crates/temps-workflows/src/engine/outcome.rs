@@ -8,11 +8,14 @@
 use chrono::Utc;
 use serde_json::Value;
 
+use uuid::Uuid;
+
+use super::children::child_key;
 use super::events::inline_only;
 use super::WorkflowEngine;
 use crate::error::{WorkflowError, WorkflowResult};
 use crate::payload::{PayloadField, StoredPayload};
-use crate::protocol::Outcome;
+use crate::protocol::{Outcome, CHILD_EVENT, RESERVED_EVENT_PREFIX};
 use crate::store::{Release, RunRow, WaitingRun};
 use crate::types::{
     validate_key, validate_name, StepKind, StepStatus, WorkflowSettings, MAX_EVENT_NAME,
@@ -87,7 +90,34 @@ impl WorkflowEngine {
             error_kind = kind,
             "workflow run failed"
         );
+        self.child_finished(&released).await;
         Ok(released)
+    }
+
+    /// A suspension on a child must name a child this run started for the
+    /// pending `child` entry at `sequence`.
+    async fn require_child(&self, run: &RunRow, sequence: i32, key: &str) -> WorkflowResult<()> {
+        self.require_pending(run, sequence, StepKind::Child).await?;
+        let child = match key.parse::<Uuid>() {
+            Ok(child_id) => self.store.get_run(child_id).await?,
+            Err(_) => None,
+        };
+        let expected = child_key(run.id, sequence);
+        let started_here = child.as_ref().is_some_and(|child| {
+            child.parent_run_id == Some(run.id)
+                && child.idempotency_key.as_deref() == Some(expected.as_str())
+        });
+        if started_here {
+            Ok(())
+        } else {
+            Err(WorkflowError::Validation {
+                field: "outcome.key",
+                reason: format!(
+                    "run {} suspended on child '{key}', which is not the run its entry {sequence} started",
+                    run.id
+                ),
+            })
+        }
     }
 
     /// The pending journal entry a suspension refers to must exist.
@@ -176,6 +206,7 @@ impl WorkflowEngine {
                             workflow = %run.workflow_name,
                             "workflow run completed"
                         );
+                        self.child_finished(&released).await;
                         Ok(released)
                     }
                     Err(error) => {
@@ -212,7 +243,29 @@ impl WorkflowEngine {
                 if !key.is_empty() {
                     validate_key("outcome.key", &key)?;
                 }
-                self.require_pending(run, sequence, StepKind::Wait).await?;
+                let on_child = event == CHILD_EVENT;
+                if on_child {
+                    if timeout_at.is_some() {
+                        return Err(WorkflowError::Validation {
+                            field: "outcome.timeout_at",
+                            reason: format!(
+                                "run {} suspended on child '{key}' with a timeout; a child wait lasts until the child finishes",
+                                run.id
+                            ),
+                        });
+                    }
+                    self.require_child(run, sequence, &key).await?;
+                } else if event.starts_with(RESERVED_EVENT_PREFIX) {
+                    return Err(WorkflowError::Validation {
+                        field: "outcome.event",
+                        reason: format!(
+                            "run {} waits on '{event}', which starts with '{RESERVED_EVENT_PREFIX}', reserved for events Temps sends itself",
+                            run.id
+                        ),
+                    });
+                } else {
+                    self.require_pending(run, sequence, StepKind::Wait).await?;
+                }
                 let released = self
                     .store
                     .release(
@@ -235,8 +288,13 @@ impl WorkflowEngine {
                     event_name: event,
                     event_key: key,
                 };
-                // An event that arrived before the run suspended.
-                if let Err(error) = self.deliver_buffered(&waiting).await {
+                if on_child {
+                    // A child that finished before the run suspended.
+                    if let Err(error) = self.deliver_finished_child(&waiting).await {
+                        tracing::warn!(run_id = %run.id, %error, "could not deliver a finished child's result; reconciliation retries it");
+                    }
+                } else if let Err(error) = self.deliver_buffered(&waiting).await {
+                    // An event that arrived before the run suspended.
                     tracing::warn!(run_id = %run.id, %error, "could not deliver a buffered workflow event; reconciliation retries it");
                 }
                 Ok(released)

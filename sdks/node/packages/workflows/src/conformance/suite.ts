@@ -245,4 +245,41 @@ export const conformanceCases: ConformanceCase[] = [
       assert.equal(fixtures.effects.get('conf-idempotent/once'), 1);
     },
   },
+  {
+    name: 'child workflows: a child starts once and the parent resumes with its output',
+    async run(target, fixtures) {
+      const { runId } = await target.start('conf-parent', { n: 7 });
+      await target.settle();
+      await until('the parent to complete', async () => (await target.run(runId)).status === 'completed');
+      const run = await target.run(runId);
+      const output = run.output as { before: number; child: { run_id: string; status: string; output: number; error: null } };
+      assert.equal(output.child.status, 'completed');
+      assert.equal(output.child.output, 49);
+      assert.equal(output.child.error, null);
+      assert.equal(fixtures.effects.get('conf-parent/before'), 1, 'the parent re-ran a step while it waited');
+      assert.equal(fixtures.effects.get('conf-child/square'), 1, 'the child ran more than once');
+      const child = await target.run(output.child.run_id);
+      assert.equal(child.status, 'completed');
+      const journal = await target.journal(runId);
+      assert.deepEqual(
+        journal.map((entry) => [entry.sequence, entry.name, entry.kind, entry.status]),
+        [
+          [0, 'before', 'step', 'completed'],
+          [1, 'square', 'child', 'completed'],
+        ],
+      );
+    },
+  },
+  {
+    name: 'child workflows: a failed child reports its error and the parent decides',
+    async run(target) {
+      const { runId } = await target.start('conf-parent', { n: 2, fail: true });
+      await target.settle();
+      await until('the parent to complete', async () => (await target.run(runId)).status === 'completed');
+      const output = (await target.run(runId)).output as { child: { status: string; output: null; error: string } };
+      assert.equal(output.child.status, 'failed');
+      assert.equal(output.child.output, null);
+      assert.match(output.child.error, /the child cannot square that/);
+    },
+  },
 ];
