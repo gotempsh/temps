@@ -71,3 +71,36 @@ test('a failed jobs read keeps the run page and explains the failure', () => {
   expect(html).toContain('Failed to load jobs')
   client.clear()
 })
+
+test('a failed refresh keeps the loaded jobs and says they may be stale', () => {
+  const client = createClient()
+  client
+    .getQueryCache()
+    .build(client, { queryKey: jobsKey })
+    .setState({
+      status: 'error',
+      data: [
+        {
+          backup_id: 1,
+          backup_uuid: '00000000-0000-4000-8000-000000000001',
+          engine: 'postgres',
+          service_name: 'orders-db',
+          service_id: 3,
+          state: 'completed',
+          started_at: '2026-01-01T00:00:00Z',
+          finished_at: '2026-01-01T00:01:00Z',
+          size_bytes: 1024,
+          error_message: null,
+          s3_source_id: 2,
+        },
+      ],
+      dataUpdatedAt: Date.now(),
+      error: Object.assign(new Error('database unavailable'), { status: 500 }),
+      fetchStatus: 'idle',
+    })
+  const html = render(client)
+  expect(html).toContain('orders-db')
+  expect(html).toContain('Couldn&#x27;t refresh jobs')
+  expect(html).not.toContain('Failed to load jobs')
+  client.clear()
+})

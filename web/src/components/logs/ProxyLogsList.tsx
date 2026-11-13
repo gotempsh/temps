@@ -5,6 +5,7 @@ import type { ProjectResponse, ProxyLogResponse } from '@/api/client'
 import {
   getEnvironmentsOptions,
   getProxyLogsOptions,
+  getProxyLogsQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
 import { AiAgentLogo } from '@/components/ui/ai-agent-logo'
 import { Badge } from '@/components/ui/badge'
@@ -20,6 +21,7 @@ import {
 } from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
 import { TimeRangeFilter } from '@/components/ui/time-range-filter'
+import { RefreshButton } from '@/components/ui/refresh-button'
 import { ResponsivePagination } from '@/components/ui/responsive-pagination'
 import { httpStatusClass } from '@/lib/http-status-class'
 import { resolveTimeRange } from '@/lib/time-range-filter'
@@ -44,7 +46,6 @@ import {
   ArrowUp,
   ArrowUpDown,
   FileSearch,
-  RefreshCw,
   SlidersHorizontal,
   X,
 } from 'lucide-react'
@@ -63,6 +64,7 @@ import {
   useListScrollRestoration,
   type ListReturnState,
 } from '@/components/table/list-navigation'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 interface ProxyLogsListProps {
   project: ProjectResponse
@@ -173,7 +175,7 @@ export default function ProxyLogsList({
   const { data: environmentsData, isLoading: environmentsLoading } = useQuery(
     getEnvironmentsOptions({ path: { project_id: project.id } })
   )
-  const query = useQuery({
+  const query = useWindowQuery({
     ...getProxyLogsOptions({
       query: {
         page,
@@ -372,19 +374,14 @@ export default function ProxyLogsList({
             : 'Browse requests handled by this project.'
         }
         actions={
-          <Button
-            variant="outline"
-            size="sm"
-            aria-disabled={query.isFetching}
-            onClick={() => {
-              if (query.isFetching) return
-              if (timeRange.startsWith('custom:')) void query.refetch()
-              else setRefreshedAt(Date.now())
-            }}
-          >
-            <RefreshCw className="mr-2 size-4" aria-hidden="true" />
-            {query.isFetching ? 'Refreshing…' : 'Refresh'}
-          </Button>
+          <RefreshButton
+            queryKeys={[
+              getProxyLogsQueryKey({ query: { project_id: project.id } }),
+            ]}
+            // A preset window ("Last 24 hours") is resolved again from now; a
+            // custom one keeps its dates and is simply refetched.
+            onRefresh={() => setRefreshedAt(Date.now())}
+          />
         }
       />
       <div className="flex flex-wrap items-center gap-2">

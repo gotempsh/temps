@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import type { QueryClient } from '@tanstack/react-query'
+import type { Query, QueryClient } from '@tanstack/react-query'
 import { httpStatusOf } from './http-error-status'
 import { isForbiddenRead, isRoleRefusal } from './read-failure'
 
@@ -46,7 +46,10 @@ export function markReadFailureHandled(error: unknown): void {
   handledListeners.forEach((listener) => listener())
 }
 
-/** Be told when a component starts explaining an error itself. */
+/**
+ * Be told when a component starts explaining an error itself, or keeps
+ * showing earlier data in its place.
+ */
 export function subscribeToHandledReadFailures(
   listener: () => void
 ): () => void {
@@ -54,6 +57,27 @@ export function subscribeToHandledReadFailures(
   return () => {
     handledListeners.delete(listener)
   }
+}
+
+/** Errors of reads whose component still shows earlier data in their place. */
+const retainedErrors = new WeakSet<object>()
+
+/**
+ * Record that `error` failed a read whose component keeps showing earlier
+ * data (a moved window that did not load): the route-level report still says
+ * the latest data is unavailable, since the page itself does not.
+ */
+export function markReadFailureRetained(error: unknown): void {
+  if (error === null || typeof error !== 'object') return
+  if (retainedErrors.has(error)) return
+  retainedErrors.add(error)
+  handledListeners.forEach((listener) => listener())
+}
+
+function isRetained(error: unknown): boolean {
+  return (
+    error !== null && typeof error === 'object' && retainedErrors.has(error)
+  )
 }
 
 function isHandled(error: unknown): boolean {
@@ -76,9 +100,24 @@ export const ROUTE_FAILURE_IGNORE = 'ignore'
  */
 export const ROUTE_FAILURE_IGNORE_REFUSAL = 'ignore-refusal'
 
+/**
+ * Whether a failed read is one its query says the page works without: any
+ * failure of an `'ignore'` query, or a 403 of an `'ignore-refusal'` one.
+ */
+export function isExpectedQueryFailure(query: Query): boolean {
+  const routeFailure = query.meta?.routeFailure
+  return (
+    routeFailure === ROUTE_FAILURE_IGNORE ||
+    (routeFailure === ROUTE_FAILURE_IGNORE_REFUSAL &&
+      isRoleRefusal(query.state.error))
+  )
+}
+
 export interface RouteQueryFailure {
   queryHash: string
   error: unknown
+  /** The page still shows earlier data in its place. */
+  retained: boolean
 }
 
 /**
@@ -100,15 +139,15 @@ export function collectRouteQueryFailures(
         query.state.data === undefined &&
         !query.isDisabled() &&
         query.getObserversCount() > 0 &&
-        query.meta?.routeFailure !== ROUTE_FAILURE_IGNORE &&
-        !(
-          query.meta?.routeFailure === ROUTE_FAILURE_IGNORE_REFUSAL &&
-          isRoleRefusal(query.state.error)
-        ) &&
+        !isExpectedQueryFailure(query) &&
         isReportableReadFailure(query.state.error) &&
         !isHandled(query.state.error),
     })
-    .map((query) => ({ queryHash: query.queryHash, error: query.state.error }))
+    .map((query) => ({
+      queryHash: query.queryHash,
+      error: query.state.error,
+      retained: isRetained(query.state.error),
+    }))
 }
 
 /**

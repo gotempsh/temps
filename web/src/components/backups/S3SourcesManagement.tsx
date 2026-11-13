@@ -13,6 +13,7 @@ import { PageHeader } from '@/components/layout/PageContainer'
 import {
   deleteS3SourceMutation,
   listS3SourcesOptions,
+  listS3SourcesQueryKey,
   runBackupForSourceMutation,
   updateS3SourceMutation,
 } from '@/api/client/@tanstack/react-query.gen'
@@ -21,6 +22,8 @@ import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { CreateActionButton } from '@/components/ui/create-action-button'
+import { RefreshButton } from '@/components/ui/refresh-button'
+import { queryKeyPrefix } from '@/lib/refresh'
 import {
   Dialog,
   DialogContent,
@@ -371,13 +374,18 @@ export function S3SourcesManagement() {
         title="Backups"
         description="Configure where backups and WAL archives are stored"
         actions={
-          shouldShowS3SourceHeaderAction(isLoading, sources.length) ? (
-            <CreateActionButton
-              to="/backups/s3-sources/new"
-              label="Add S3 source"
-              className="w-full sm:w-auto"
+          <>
+            <RefreshButton
+              queryKeys={[queryKeyPrefix(listS3SourcesQueryKey)]}
             />
-          ) : null
+            {shouldShowS3SourceHeaderAction(isLoading, sources.length) ? (
+              <CreateActionButton
+                to="/backups/s3-sources/new"
+                label="Add S3 source"
+                className="w-full sm:w-auto"
+              />
+            ) : null}
+          </>
         }
       />
 

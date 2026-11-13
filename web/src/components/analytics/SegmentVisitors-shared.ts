@@ -58,6 +58,12 @@ export interface SegmentVisitorsProps {
   value: string
   startDate: Date | undefined
   endDate: Date | undefined
+  /**
+   * Identifies the range the user picked ("last 24 hours", or a custom
+   * from/to), not the dates it resolves to. Picking another range goes back
+   * to page 1; Refresh moving the same range to now keeps the page.
+   */
+  rangeScope: string
   environment: number | undefined
   onBack: () => void
 }

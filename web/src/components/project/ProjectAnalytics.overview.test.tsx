@@ -47,7 +47,7 @@ function header() {
   return { view, row: within(element as HTMLElement) }
 }
 
-test('the overview header offers only the time filter', () => {
+test('the overview header offers the time filter and Refresh', () => {
   const { row } = header()
   expect(
     row.getByText('Traffic, audience, and engagement for Demo.')
@@ -55,7 +55,7 @@ test('the overview header offers only the time filter', () => {
   expect(row.getByRole('button', { name: '24h' })).toBeTruthy()
   // The globe has its own tab.
   expect(row.queryByText('Visitor globe')).toBeNull()
-  expect(row.queryByRole('button', { name: 'Refresh' })).toBeNull()
+  expect(row.getByRole('button', { name: 'Refresh' })).toBeTruthy()
   expect(row.queryByRole('button', { name: 'Show insights' })).toBeNull()
 })
 

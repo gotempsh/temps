@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { PageHeader } from '@/components/layout/PageContainer'
-import { cn } from '@/lib/utils'
 import {
   DeploymentResponse,
   EnvironmentResponse,
@@ -14,6 +13,7 @@ import {
   deployFromStaticMutation,
   getEnvironmentsOptions,
   getProjectDeploymentsOptions,
+  getProjectDeploymentsQueryKey,
   promoteDeploymentMutation,
   rollbackToDeploymentMutation,
   triggerProjectPipelineMutation,
@@ -29,6 +29,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
+import { RefreshButton } from '@/components/ui/refresh-button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { KeyboardShortcut } from '@/components/ui/keyboard-shortcut'
 import { ErrorAlert } from '@/components/utils/ErrorAlert'
@@ -66,7 +67,6 @@ import {
   ChevronRight,
   Loader2,
   PlusIcon,
-  RefreshCw,
   Upload,
   UploadCloud,
   Globe,
@@ -1000,18 +1000,11 @@ export function ProjectDeployments({
         title="Deployments"
         description="Every build and rollout of this service, newest first."
         actions={
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => refetch()}
-            disabled={isFetching}
-          >
-            <RefreshCw
-              className={cn('size-4', isFetching && 'animate-spin')}
-              aria-hidden="true"
-            />
-            <span className="max-sm:sr-only">Refresh</span>
-          </Button>
+          <RefreshButton
+            queryKeys={[
+              getProjectDeploymentsQueryKey({ path: { id: project.id } }),
+            ]}
+          />
         }
       />
 

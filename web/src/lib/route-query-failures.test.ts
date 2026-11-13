@@ -9,6 +9,7 @@ import {
   collectRouteQueryFailures,
   isReportableReadFailure,
   markReadFailureHandled,
+  markReadFailureRetained,
   representativeFailure,
   subscribeToHandledReadFailures,
 } from './route-query-failures'
@@ -58,6 +59,18 @@ describe('collectRouteQueryFailures', () => {
     const client = new QueryClient()
     const stop = await failedQuery(client, 'projects', problem(500))
     expect(collectRouteQueryFailures(client)).toHaveLength(1)
+    stop()
+  })
+
+  test('reports a failed read whose page keeps earlier data, marked as kept', async () => {
+    const client = new QueryClient()
+    const error = problem(500)
+    const stop = await failedQuery(client, 'moved-window', error)
+    expect(collectRouteQueryFailures(client)[0].retained).toBe(false)
+    markReadFailureRetained(error)
+    expect(collectRouteQueryFailures(client)).toEqual([
+      { queryHash: '["moved-window"]', error, retained: true },
+    ])
     stop()
   })
 
@@ -160,8 +173,12 @@ describe('collectRouteQueryFailures', () => {
 
 describe('representativeFailure', () => {
   test('prefers a failure a retry can fix over a refusal', () => {
-    const refusal = { queryHash: 'a', error: problem(403, 'Forbidden') }
-    const outage = { queryHash: 'b', error: problem(500) }
+    const refusal = {
+      queryHash: 'a',
+      error: problem(403, 'Forbidden'),
+      retained: false,
+    }
+    const outage = { queryHash: 'b', error: problem(500), retained: false }
     expect(representativeFailure([refusal, outage])).toBe(outage)
     expect(representativeFailure([refusal])).toBe(refusal)
     expect(representativeFailure([])).toBeUndefined()

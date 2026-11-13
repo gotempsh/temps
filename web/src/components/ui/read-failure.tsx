@@ -12,6 +12,8 @@ import {
 } from '@/lib/read-failure'
 import { markReadFailureHandled } from '@/lib/route-query-failures'
 
+const CACHED_NOTE = 'Showing last-known data. It is stale and may have changed.'
+
 /**
  * Inline read recovery. Retry only replays a query, never a mutation.
  *
@@ -71,7 +73,9 @@ export function ReadFailure({
     // Shown above whatever page is open, so it takes one line: the page under
     // it is still the thing the user came for. The server's reason is the
     // most specific thing to show; the full explanation is on hover.
-    const explanation = readFailureExplanation(error)
+    const explanation = cached
+      ? `${readFailureExplanation(error)} ${CACHED_NOTE}`
+      : readFailureExplanation(error)
     const full = serverDetail ? `${explanation} ${serverDetail}` : explanation
     return (
       <div
@@ -108,9 +112,7 @@ export function ReadFailure({
             <span className="font-medium">Server response:</span> {serverDetail}
           </p>
         )}
-        {cached && (
-          <p>Showing last-known data. It is stale and may have changed.</p>
-        )}
+        {cached && <p>{CACHED_NOTE}</p>}
         {retryButton}
       </AlertDescription>
     </Alert>

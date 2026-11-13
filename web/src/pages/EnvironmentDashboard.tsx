@@ -5,8 +5,11 @@ import { ReachabilityWarningBanner } from '@/components/reachability/Reachabilit
 import { PageTitle } from '@temps-sdk/ds'
 import {
   getEnvironmentOptions,
+  getEnvironmentQueryKey,
   getDeploymentOptions,
+  getDeploymentQueryKey,
   listContainersOptions,
+  listContainersQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
 import {
   Boxes,
@@ -17,6 +20,8 @@ import {
   type LucideIcon,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
+import { RefreshButton } from '@/components/ui/refresh-button'
+import { queryKeyPrefix } from '@/lib/refresh'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { ErrorAlert } from '@/components/utils/ErrorAlert'
@@ -152,6 +157,24 @@ export function EnvironmentDashboard({
             ))}
           </TabsList>
         </Tabs>
+        {activeView === 'containers' ? (
+          // The containers and their deployment; each row's CPU and memory
+          // keep their own 5 s poll.
+          <RefreshButton
+            className="shrink-0"
+            queryKeys={[
+              getEnvironmentQueryKey({
+                path: { project_id: project.id, env_id: environmentId },
+              }),
+              queryKeyPrefix(listContainersQueryKey, {
+                path: { project_id: project.id },
+              }),
+              queryKeyPrefix(getDeploymentQueryKey, {
+                path: { project_id: project.id },
+              }),
+            ]}
+          />
+        ) : null}
         {onCreateEnvironment && (
           <Button
             variant="outline"

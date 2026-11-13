@@ -17,9 +17,12 @@ import type { AuditLogResponse } from '@/api/client'
 
 import {
   listAuditLogsOptions,
+  listAuditLogsQueryKey,
   listUsersOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { AuditLogItemRow } from '@/components/audit/AuditLogItem'
+import { RefreshButton } from '@/components/ui/refresh-button'
+import { queryKeyPrefix } from '@/lib/refresh'
 import {
   SearchableSelect,
   type SearchableSelectOption,
@@ -31,8 +34,9 @@ import { usePageTitle } from '@/hooks/usePageTitle'
 import { ALL_FILTER, buildOperationOptions } from './AuditLogs-shared'
 import { useQuery } from '@tanstack/react-query'
 import { ScrollText, X } from 'lucide-react'
-import { useEffect, useMemo } from 'react'
+import { useEffect, useMemo, useReducer } from 'react'
 import { Navigate } from 'react-router'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 const ITEMS_PER_PAGE = 20
 
@@ -52,7 +56,12 @@ export function AuditLogs() {
     requestedPage <= 1000000
       ? requestedPage
       : 1
-  const window = useMemo(() => resolveTimeRange(range), [range])
+  // Refresh moves a preset window ("Last 24 hours") to now.
+  const [windowMoves, moveWindow] = useReducer((n: number) => n + 1, 0)
+  const window = useMemo(() => {
+    void windowMoves
+    return resolveTimeRange(range)
+  }, [range, windowMoves])
 
   useEffect(() => {
     setBreadcrumbs([{ label: 'Audit logs' }])
@@ -72,7 +81,7 @@ export function AuditLogs() {
     enabled: canViewAuditLogs,
   })
 
-  const { data, isLoading, isError, refetch, isFetching } = useQuery({
+  const { data, isLoading, isError, refetch, isFetching } = useWindowQuery({
     ...listAuditLogsOptions({
       query: {
         limit: ITEMS_PER_PAGE,
@@ -156,6 +165,12 @@ export function AuditLogs() {
       <PageHeader
         title="Audit logs"
         description="Activity across the platform — authentication, service changes, skills, MCP servers, and more."
+        actions={
+          <RefreshButton
+            queryKeys={[queryKeyPrefix(listAuditLogsQueryKey)]}
+            onRefresh={moveWindow}
+          />
+        }
       />
 
       <div
