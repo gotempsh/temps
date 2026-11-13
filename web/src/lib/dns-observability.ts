@@ -90,6 +90,8 @@ export const testResolutionSchema = z.object({
     ),
   record_type: z.enum(DNS_TEST_RECORD_TYPES),
   project_id: z.number().int().positive().nullable(),
+  /** One of your sandboxes (ADR 105); never together with `project_id`. */
+  sandbox_id: z.string().min(1).nullable(),
 })
 export type TestResolutionValues = z.infer<typeof testResolutionSchema>
 
@@ -220,6 +222,7 @@ export const DNS_PARAMS = {
   testType: 'type',
   testNode: 'from',
   testProject: 'project',
+  testSandbox: 'sandbox',
 } as const
 export type DnsParam = (typeof DNS_PARAMS)[keyof typeof DNS_PARAMS]
 
@@ -312,7 +315,11 @@ export function recordTestParams(
   }
 }
 
-/** The form's values from the URL (`name`, `type`, `from`, `project`). */
+/**
+ * The form's values from the URL (`name`, `type`, `from`, `project`,
+ * `sandbox`). A link naming both a project and a sandbox asks as the
+ * sandbox: the server refuses both at once.
+ */
 export function testValuesFromUrl(
   get: (key: DnsParam) => string | null,
   resolvers: DnsResolverEntry[]
@@ -320,6 +327,7 @@ export function testValuesFromUrl(
   const type = get(DNS_PARAMS.testType)
   const from = parseIntParam(get(DNS_PARAMS.testNode))
   const project = parseIntParam(get(DNS_PARAMS.testProject))
+  const sandbox = get(DNS_PARAMS.testSandbox)?.trim() || null
   return {
     name: get(DNS_PARAMS.testName) ?? '',
     record_type: (DNS_TEST_RECORD_TYPES as readonly string[]).includes(
@@ -333,7 +341,9 @@ export function testValuesFromUrl(
       from !== undefined && resolvers.some((r) => r.node_id === from)
         ? from
         : defaultResolverNode(resolvers),
-    project_id: project !== undefined && project > 0 ? project : null,
+    project_id:
+      sandbox === null && project !== undefined && project > 0 ? project : null,
+    sandbox_id: sandbox,
   }
 }
 

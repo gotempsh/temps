@@ -10,6 +10,9 @@
  * environment of it, call this whole project or one environment of it. The
  * project card manages every grant; an environment's card manages the grants
  * on that environment and shows the project-wide ones as inherited.
+ *
+ * A grant can also name one of the user's sandboxes (ADR 105), listed under
+ * the project callers.
  */
 import {
   createInternalAccessGrant,
@@ -69,6 +72,7 @@ import {
   toCreateRequest,
   type InternalAccessFormValues,
 } from './internal-access'
+import { InternalAccessSandboxGrants } from './InternalAccessSandboxGrants'
 
 interface InternalAccessCardProps {
   projectId: number
@@ -161,6 +165,7 @@ export function InternalAccessCard({
     queryFn: () => fetchEnvironments(projectId),
     enabled: !isEnvironment,
   })
+
   const callerEnvironments = useQuery({
     queryKey: ['internal-access', 'environments', callerProjectId],
     queryFn: () => fetchEnvironments(callerProjectId ?? 0),
@@ -225,8 +230,8 @@ export function InternalAccessCard({
     ? 'Internal access to this environment'
     : 'Internal access'
   const description = isEnvironment
-    ? `Other projects that may call ${exampleAddress(projectSlug, environmentSlug)}.`
-    : `Other projects that may call this project's *.temps.local addresses.`
+    ? `Other projects and sandboxes that may call ${exampleAddress(projectSlug, environmentSlug)}.`
+    : `Other projects and sandboxes that may call this project's *.temps.local addresses.`
 
   const onSubmit = form.handleSubmit((values) => create.mutate(values))
   const grants = grantsQuery.data
@@ -428,6 +433,16 @@ export function InternalAccessCard({
             </Button>
           </form>
         </Form>
+
+        <InternalAccessSandboxGrants
+          projectId={projectId}
+          projectName={projectName}
+          projectSlug={projectSlug}
+          environmentId={environmentId}
+          environmentName={environmentName}
+          environmentSlug={environmentSlug}
+          ownEnvironments={ownEnvironments.data}
+        />
       </div>
 
       <ConfirmDeleteDialog

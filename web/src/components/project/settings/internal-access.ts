@@ -2,15 +2,17 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 /**
- * Internal access grants (ADR 101): which other projects may call this
- * project's `*.temps.local` addresses. Pure helpers for the card and the DNS
+ * Internal access grants (ADR 101, ADR 105): which other projects, and which
+ * sandboxes, may call this project's `*.temps.local` addresses. Pure helpers for the card and the DNS
  * test tool, kept apart so they are tested without rendering.
  */
 import { z } from 'zod'
 import type {
   CreateInternalAccessGrantRequest,
+  CreateInternalAccessSandboxGrantRequest,
   DnsInternalAccess,
   InternalAccessGrantResponse,
+  InternalAccessSandboxGrantResponse,
 } from '@/api/client/types.gen'
 
 /** Mirrors `MAX_DESCRIPTION_LENGTH` in the network-policy service. */
@@ -174,5 +176,113 @@ export function internalAccessDiagnostic(
         detail: `The name resolves, but ${owner} belongs to another project. The internal proxy refuses ${askedAsName} until ${access.target_project_name} allows it under Internal access.`,
         setupPath: access.setup_path,
       }
+  }
+}
+
+// ── Sandbox callers (ADR 105) ───────────────────────────────────────────────
+
+const CHOOSE_SANDBOX = 'Choose the sandbox that will make the calls'
+
+export const sandboxGrantFormSchema = z.object({
+  /** Public id of one of the user's sandboxes; `''` until one is picked. */
+  sandboxId: z.string().min(1, { error: CHOOSE_SANDBOX }),
+  /** `null`: every environment of this project. */
+  targetEnvironmentId: z.number().int().positive().nullable(),
+  description: z.string().max(MAX_GRANT_DESCRIPTION_LENGTH, {
+    error: `At most ${MAX_GRANT_DESCRIPTION_LENGTH} characters`,
+  }),
+})
+
+export type SandboxGrantFormValues = z.infer<typeof sandboxGrantFormSchema>
+
+export function emptySandboxGrantForm(
+  environmentId?: number
+): SandboxGrantFormValues {
+  return {
+    sandboxId: '',
+    targetEnvironmentId: environmentId ?? null,
+    description: '',
+  }
+}
+
+/** `null` while no sandbox is picked. */
+export function toCreateSandboxRequest(
+  values: SandboxGrantFormValues
+): CreateInternalAccessSandboxGrantRequest | null {
+  if (values.sandboxId === '') return null
+  const description = values.description.trim()
+  return {
+    sandbox_id: values.sandboxId,
+    target_environment_id: values.targetEnvironmentId,
+    description: description === '' ? null : description,
+  }
+}
+
+/**
+ * "Sandbox agent scratchpad · sbx_… (stopped)": the name its owner gave it,
+ * and the id a refused call names.
+ */
+export function sandboxCallerLabel(
+  grant: InternalAccessSandboxGrantResponse
+): string {
+  const state =
+    grant.sandbox_status === 'running' ? '' : ` (${grant.sandbox_status})`
+  return `Sandbox ${namedSandbox(grant.sandbox_name, grant.sandbox_id)}${state}`
+}
+
+/** "agent scratchpad · sbx_…", or just the id when it has no other name. */
+export function namedSandbox(name: string, id: string): string {
+  const label = name.trim()
+  return label === '' || label === id ? id : `${label} · ${id}`
+}
+
+/** What a sandbox grant opens on this project. */
+export function sandboxTargetLabel(
+  grant: InternalAccessSandboxGrantResponse
+): string {
+  return grant.target_environment_id == null
+    ? 'Every environment'
+    : (grant.target_environment_name ??
+        `Environment ${grant.target_environment_id}`)
+}
+
+/** On an environment's card, a project-wide sandbox grant is inherited. */
+export function isSandboxGrantInherited(
+  grant: InternalAccessSandboxGrantResponse,
+  environmentId?: number
+): boolean {
+  return environmentId !== undefined && grant.target_environment_id == null
+}
+
+/** The command a sandbox runs to call an internal address. */
+export function sandboxCurl(
+  projectSlug: string,
+  environmentSlug = 'production'
+) {
+  return `curl -sS ${exampleAddress(projectSlug, environmentSlug)}/`
+}
+
+/**
+ * What the DNS test tool says about a sandbox calling an internal name
+ * (ADR 105). A sandbox is never "the same project".
+ */
+export function sandboxAccessDiagnostic(
+  access: DnsInternalAccess,
+  sandboxId: string
+): InternalAccessDiagnostic {
+  const owner = `${access.target_project_name} (${access.target_environment_name})`
+  if (access.reach === 'granted') {
+    return {
+      tone: 'success',
+      title: 'Calls are allowed',
+      detail: `${owner} lets sandbox ${sandboxId} call this address over plain http.`,
+      setupPath: null,
+    }
+  }
+  return {
+    tone: 'error',
+    title: 'Calls get 403',
+    detail: `The internal proxy refuses sandbox ${sandboxId} until ${access.target_project_name} adds it as a caller under Internal access.`,
+    setupPath: access.setup_path,
   }
 }

@@ -5,18 +5,27 @@ import { expect, test } from 'bun:test'
 import type {
   DnsInternalAccess,
   InternalAccessGrantResponse,
+  InternalAccessSandboxGrantResponse,
 } from '@/api/client/types.gen'
 import {
   allowLabel,
   callerLabel,
   clampGrantsPage,
   emptyGrantForm,
+  emptySandboxGrantForm,
   exampleAddress,
   internalAccessDiagnostic,
   internalAccessFormSchema,
   isInherited,
+  isSandboxGrantInherited,
+  sandboxAccessDiagnostic,
+  sandboxCallerLabel,
+  sandboxCurl,
+  sandboxGrantFormSchema,
+  sandboxTargetLabel,
   targetLabel,
   toCreateRequest,
+  toCreateSandboxRequest,
 } from './internal-access'
 
 const grant: InternalAccessGrantResponse = {
@@ -143,4 +152,102 @@ test('a page past the end of the grants goes back to the last page that has any'
   // No grants left: page 1, which says so.
   expect(clampGrantsPage(3, 0, 20)).toBe(1)
   expect(clampGrantsPage(0, 10, 20)).toBe(1)
+})
+
+const sandboxGrant: InternalAccessSandboxGrantResponse = {
+  id: 41,
+  target_project_id: 1,
+  target_project_name: 'Orders API',
+  target_project_slug: 'orders-api',
+  target_environment_id: null,
+  target_environment_name: null,
+  sandbox_id: 'sbx_alpha',
+  sandbox_name: 'agent scratchpad',
+  sandbox_status: 'running',
+  description: null,
+  created_by: 9,
+  created_at: '2026-11-12T10:00:00Z',
+}
+
+test('a sandbox grant names the sandbox, and its state when not running', () => {
+  expect(sandboxCallerLabel(sandboxGrant)).toBe(
+    'Sandbox agent scratchpad · sbx_alpha'
+  )
+  expect(
+    sandboxCallerLabel({ ...sandboxGrant, sandbox_status: 'stopped' })
+  ).toBe('Sandbox agent scratchpad · sbx_alpha (stopped)')
+  // A sandbox with no name of its own, or named after its id, shows the id once.
+  expect(sandboxCallerLabel({ ...sandboxGrant, sandbox_name: '  ' })).toBe(
+    'Sandbox sbx_alpha'
+  )
+  expect(
+    sandboxCallerLabel({ ...sandboxGrant, sandbox_name: 'sbx_alpha' })
+  ).toBe('Sandbox sbx_alpha')
+  expect(sandboxTargetLabel(sandboxGrant)).toBe('Every environment')
+  expect(
+    sandboxTargetLabel({
+      ...sandboxGrant,
+      target_environment_id: 4,
+      target_environment_name: 'staging',
+    })
+  ).toBe('staging')
+  expect(isSandboxGrantInherited(sandboxGrant, 4)).toBe(true)
+  expect(isSandboxGrantInherited(sandboxGrant)).toBe(false)
+})
+
+test('the sandbox form needs a sandbox and sends a trimmed reason', () => {
+  const empty = emptySandboxGrantForm(7)
+  expect(empty).toEqual({
+    sandboxId: '',
+    targetEnvironmentId: 7,
+    description: '',
+  })
+  expect(sandboxGrantFormSchema.safeParse(empty).success).toBe(false)
+  expect(toCreateSandboxRequest(empty)).toBeNull()
+  expect(
+    toCreateSandboxRequest({
+      sandboxId: 'sbx_alpha',
+      targetEnvironmentId: null,
+      description: '  agent tests the API ',
+    })
+  ).toEqual({
+    sandbox_id: 'sbx_alpha',
+    target_environment_id: null,
+    description: 'agent tests the API',
+  })
+  expect(
+    toCreateSandboxRequest({
+      sandboxId: 'sbx_alpha',
+      targetEnvironmentId: 3,
+      description: '   ',
+    })?.description
+  ).toBeNull()
+})
+
+test('the sandbox curl line is plain http on the internal name', () => {
+  expect(sandboxCurl('orders-api', 'staging')).toBe(
+    'curl -sS http://staging.orders-api.temps.local/'
+  )
+})
+
+test('the DNS test tool tells a sandbox where its grant is missing', () => {
+  const access: DnsInternalAccess = {
+    target_project_id: 1,
+    target_project_name: 'Orders API',
+    target_project_slug: 'orders-api',
+    target_environment_id: 4,
+    target_environment_name: 'production',
+    reach: 'not_granted',
+    setup_path: '/projects/orders-api/settings/security#internal-access',
+  }
+  const refused = sandboxAccessDiagnostic(access, 'sbx_alpha')
+  expect(refused.tone).toBe('error')
+  expect(refused.detail).toContain('sandbox sbx_alpha')
+  expect(refused.setupPath).toBe(access.setup_path)
+  const allowed = sandboxAccessDiagnostic(
+    { ...access, reach: 'granted' },
+    'sbx_alpha'
+  )
+  expect(allowed.tone).toBe('success')
+  expect(allowed.setupPath).toBeNull()
 })

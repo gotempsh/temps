@@ -291,7 +291,7 @@ describe('a single-server control plane serving its own containers (ADR-104)', (
   const controlPlane = (internal_proxy: DnsResolverEntry['internal_proxy']) =>
     resolver({ listen_address: '172.20.0.1:53', internal_proxy })
 
-  test('its routing shows like a worker\'s, on the app network gateway', () => {
+  test("its routing shows like a worker's, on the app network gateway", () => {
     const serving = controlPlane({
       listening: true,
       address: '172.20.0.1:80',
@@ -458,10 +458,17 @@ describe('tabs and links', () => {
       record_type: 'AAAA',
       node_id: 4,
       project_id: 3,
+      sandbox_id: null,
     })
     // Nothing in the URL: an empty name, A, the first node that answers.
     expect(testValuesFromUrl(() => null, [hostedControlPlane, master])).toEqual(
-      { name: '', record_type: 'A', node_id: 4, project_id: null }
+      {
+        name: '',
+        record_type: 'A',
+        node_id: 4,
+        project_id: null,
+        sandbox_id: null,
+      }
     )
     // An unknown node or type is not trusted.
     params.set('from', '99')
@@ -470,6 +477,19 @@ describe('tabs and links', () => {
       record_type: 'A',
       node_id: 0,
     })
+  })
+
+  test('a Test link can ask as a sandbox, never as a sandbox and a project', () => {
+    const params = new URLSearchParams(
+      'name=production.shop.temps.local&from=4&project=3&sandbox=sbx_alpha'
+    )
+    expect(
+      testValuesFromUrl((key) => params.get(key), [hostedControlPlane, master])
+    ).toMatchObject({ project_id: null, sandbox_id: 'sbx_alpha' })
+    params.set('sandbox', '  ')
+    expect(
+      testValuesFromUrl((key) => params.get(key), [hostedControlPlane, master])
+    ).toMatchObject({ project_id: 3, sandbox_id: null })
   })
 
   test('the default node skips resolvers that cannot answer', () => {
