@@ -165,6 +165,7 @@ LAYERS: dict[str, str] = {
     "temps-teams": "domain",
     "temps-vulnerability-scanner": "domain",
     "temps-webhooks": "domain",
+    "temps-workflows": "domain",
     # observability
     "temps-analytics": "observability",
     "temps-analytics-backend": "observability",

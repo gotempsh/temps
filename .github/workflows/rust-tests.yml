@@ -1479,7 +1479,7 @@ jobs:
               package(temps-config) or package(temps-notifications) or
               package(temps-deployer) or package(temps-deployment-logs) or
               package(temps-domains) or package(temps-projects) or
-              package(temps-node-agent) or
+              package(temps-node-agent) or package(temps-workflows) or
               (package(temps-metrics) and kind(=lib)) or
               package(temps-runtime-health) or
               (package(temps-ai-agents) and kind(=lib)) or

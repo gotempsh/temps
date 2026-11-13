@@ -117,6 +117,9 @@ CREATE INDEX IF NOT EXISTS workflow_runs_waiting_event
 CREATE INDEX IF NOT EXISTS workflow_runs_finished ON workflow_runs(finished_at)
     WHERE finished_at IS NOT NULL;
 CREATE INDEX IF NOT EXISTS workflow_runs_project ON workflow_runs(project_id);
+-- Counting active runs for `max_active_runs` reads only active rows.
+CREATE INDEX IF NOT EXISTS workflow_runs_active ON workflow_runs(environment_id)
+    WHERE status NOT IN ('completed', 'failed', 'cancelled');
 CREATE INDEX IF NOT EXISTS workflow_runs_parent ON workflow_runs(parent_run_id)
     WHERE parent_run_id IS NOT NULL;
 

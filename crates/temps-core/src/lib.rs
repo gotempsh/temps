@@ -29,6 +29,7 @@ pub mod error;
 pub mod error_builder;
 pub mod error_metrics;
 pub mod escape;
+pub mod executor_endpoints;
 pub mod feature_maturity;
 pub mod gate;
 pub mod gate_access;
@@ -47,12 +48,14 @@ pub mod node_pki;
 pub mod notifications;
 pub mod on_demand;
 pub mod openapi;
+pub mod payload_blobs;
 pub mod plugin;
 pub mod plugin_builder;
 pub mod problemdetails;
 pub mod project_access;
 pub mod project_deletion;
 pub mod project_ip_gate;
+pub mod project_metrics;
 pub mod public_hostname;
 pub mod public_hostname_resolver;
 pub mod public_status_page;
@@ -146,6 +149,9 @@ pub use env_vars_provider::{
 };
 pub use error::*;
 pub use error_builder::*;
+pub use executor_endpoints::{
+    ExecutorEndpoint, ExecutorEndpointSet, ExecutorEndpoints, ExecutorEndpointsError,
+};
 pub use jobs::*;
 pub use log_storage_config::LogStorageConfig;
 pub use managed_backup_schedule::{
@@ -159,6 +165,7 @@ pub use managed_backup_scoped_credentials::{
     ScopedS3CredentialRequest, MANAGED_SCOPED_CREDENTIAL_MAX_LIFETIME,
 };
 pub use on_demand::*;
+pub use payload_blobs::{PayloadBlobError, PayloadBlobStore};
 pub use project_access::{
     ApplicationDataNetworkReconciler, MembershipPermissionResolver, ProjectAccessChecker,
 };
@@ -166,6 +173,10 @@ pub use project_deletion::{
     ProjectDeletionHook, ProjectDeletionHookError, ProjectDeletionHooks, ProjectDeletionHooksFailed,
 };
 pub use project_ip_gate::{OpenIpGate, ProjectIpGate, ProjectIpGateSlot};
+pub use project_metrics::{
+    NoopProjectMetricsSink, ProjectMetricKind, ProjectMetricSample, ProjectMetricsError,
+    ProjectMetricsSink,
+};
 pub use public_hostname::{base_domain as public_base_domain, PublicHostnameStrategy};
 pub use public_hostname_resolver::{
     match_strategy, PublicHostnameResolver, StandardHostnameResolver,
