@@ -439,7 +439,7 @@ impl MariaDbService {
         {
             env.push(format!("AWS_ENDPOINT={endpoint}"));
         }
-        if s3_credentials.force_path_style {
+        if s3_credentials.uses_path_style() {
             env.push("AWS_S3_FORCE_PATH_STYLE=true".to_string());
         }
         if let Some(target_user_data) = target_user_data {

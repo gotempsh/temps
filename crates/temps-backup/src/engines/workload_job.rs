@@ -326,14 +326,19 @@ pub fn job_env(password: &str, s3: &S3JobTarget) -> Vec<(String, String)> {
         env.push(("AWS_SESSION_TOKEN".to_string(), token.clone()));
     }
     if let Some(endpoint) = s3.endpoint.as_ref().filter(|e| !e.trim().is_empty()) {
-        let endpoint = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
-            endpoint.clone()
-        } else {
-            format!("https://{endpoint}")
-        };
+        // Same rule as every other client: a bare `host:port` is the plain
+        // HTTP the source was validated with. This path used to guess
+        // HTTPS instead, so a worker job failed against a source the
+        // control plane's own test had just accepted.
+        let endpoint = temps_core::s3_endpoint::endpoint_url(endpoint);
         env.push(("AWS_ENDPOINT".to_string(), endpoint));
     }
-    if s3.force_path_style {
+    if s3.force_path_style
+        || s3
+            .endpoint
+            .as_deref()
+            .is_some_and(temps_core::s3_endpoint::endpoint_host_is_ip_literal)
+    {
         env.push(("AWS_S3_FORCE_PATH_STYLE".to_string(), "true".to_string()));
     }
     env
@@ -1890,7 +1895,7 @@ mod tests {
         );
         assert_eq!(
             env.get("AWS_ENDPOINT").map(String::as_str),
-            Some("https://s3.internal.example:9000")
+            Some("http://s3.internal.example:9000")
         );
         assert_eq!(
             env.get("AWS_S3_FORCE_PATH_STYLE").map(String::as_str),

@@ -10,7 +10,7 @@ use super::*;
 use crate::externalsvc::{ExternalService, ServiceConfig, ServiceResourceLimits};
 use std::collections::HashMap;
 use std::time::Duration;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use urlencoding;
 
 pub(super) fn shell_export_assignment(line: &str) -> Option<String> {
@@ -23,6 +23,144 @@ pub(super) fn shell_export_assignment(line: &str) -> Option<String> {
             .next()
             .is_some_and(|character| character == '_' || character.is_ascii_alphabetic());
     valid_key.then(|| format!("export {key}={}", shell_escape(value)))
+}
+
+/// A shell command that replaces `path` with `lines` atomically.
+///
+/// `archive_command` sources `walg.env` for every segment, so the live file
+/// must never be seen half written, and a failed write (a full disk is
+/// likely exactly when WAL has piled up) must leave the old file intact.
+/// The lines go to a sibling temporary file created mode 0600, which is
+/// renamed over `path` only after the whole write succeeded; on failure the
+/// temporary file is removed and the command exits non-zero. Leftovers of
+/// an earlier write killed mid-way are removed first.
+///
+/// Every write holds an `flock` on `<path>.lock` (where `flock` exists), so
+/// two writers never interleave. With `expected_checksum` (a `cksum < path`
+/// line from [`WalgEnvSnapshot`]) the file is only replaced if it still
+/// has that content under the lock; otherwise the command exits
+/// [`WALG_ENV_CHANGED_EXIT`] and leaves it alone, so a repair computed from
+/// an older snapshot never overwrites what a backup or repoint just wrote.
+pub(crate) fn atomic_write_command(
+    lines: &[String],
+    path: &str,
+    expected_checksum: Option<&str>,
+) -> String {
+    let path = shell_escape(path);
+    let unchanged_check = expected_checksum
+        .map(|checksum| {
+            format!(
+                "if [ \"$(cksum < {path} 2>/dev/null)\" != {checksum} ]; then exit {WALG_ENV_CHANGED_EXIT}; fi; ",
+                checksum = shell_escape(checksum),
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        "umask 077; exec 9>>{path}.lock || exit 1; \
+         if command -v flock >/dev/null 2>&1; then flock -w 30 9 || exit {WALG_ENV_LOCK_BUSY_EXIT}; fi; \
+         {unchanged_check}\
+         rm -f {path}.tmp.*; tmp={path}.tmp.$$; \
+         if printf '%s\\n' {lines} > \"$tmp\" && chmod 600 \"$tmp\" && mv -f \"$tmp\" {path}; \
+         then exit 0; else rm -f \"$tmp\"; exit 1; fi",
+        lines = lines
+            .iter()
+            .map(|line| shell_escape(line))
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
+/// Exit code of [`atomic_write_command`] when the file no longer has the
+/// expected content.
+pub(crate) const WALG_ENV_CHANGED_EXIT: i64 = 3;
+
+/// Exit code of [`atomic_write_command`] when another writer held the lock
+/// for 30 seconds.
+pub(crate) const WALG_ENV_LOCK_BUSY_EXIT: i64 = 4;
+
+/// What a conditional write of `walg.env` did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WalgEnvWrite {
+    Written,
+    /// The file changed since the snapshot the new contents were built
+    /// from; it was left as it is.
+    ChangedConcurrently,
+}
+
+/// One consistent read of `walg.env`: its checksum, its text, and the
+/// `WALG_`/`AWS_` assignments the shell sees when sourcing it, all taken
+/// from the same copy of the file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WalgEnvSnapshot {
+    pub(crate) checksum: String,
+    pub(crate) raw: String,
+    pub(crate) evaluated: Vec<String>,
+}
+
+/// The user that owns and writes `walg.env`, and the only one that may
+/// source it.
+pub(crate) const WALG_ENV_OWNER: &str = "postgres";
+
+const SNAPSHOT_NO_FILE: &str = "__TEMPS_NO_WALG_ENV__";
+const SNAPSHOT_CKSUM: &str = "__TEMPS_WALG_ENV_CKSUM__";
+const SNAPSHOT_RAW: &str = "__TEMPS_WALG_ENV_RAW__";
+const SNAPSHOT_EVAL: &str = "__TEMPS_WALG_ENV_EVAL__";
+/// Printed only once the evaluated assignments are complete: output cut
+/// short anywhere before it is an incomplete snapshot, never an empty one.
+const SNAPSHOT_END: &str = "__TEMPS_WALG_ENV_END__";
+
+/// Copies `walg.env` once and reports everything from that copy, so the
+/// checksum, text and assignments always describe the same file.
+///
+/// The copy holds credentials, so it is removed on every way out: the
+/// `EXIT` trap is set as soon as `mktemp` created it, before the copy that
+/// can fail part way (a full `/tmp`, the file vanishing).
+const WALG_ENV_SNAPSHOT_SCRIPT: &str = "f=/var/lib/postgresql/walg.env; \
+     [ -f \"$f\" ] || { echo __TEMPS_NO_WALG_ENV__; exit 0; }; \
+     umask 077; snap=$(mktemp \"${TMPDIR:-/tmp}/walg-env.XXXXXX\") || exit 1; \
+     trap 'rm -f \"$snap\"' EXIT; \
+     cp \"$f\" \"$snap\" || exit 1; \
+     echo __TEMPS_WALG_ENV_CKSUM__; cksum < \"$snap\"; \
+     echo __TEMPS_WALG_ENV_RAW__; cat \"$snap\"; echo; \
+     echo __TEMPS_WALG_ENV_EVAL__; \
+     env -i sh -c '. \"$1\" && env' sh \"$snap\" | grep -E '^(WALG_|AWS_)'; \
+     echo __TEMPS_WALG_ENV_END__; exit 0";
+
+/// Parse what [`WALG_ENV_SNAPSHOT_SCRIPT`] printed: `Ok(None)` when there is
+/// no file.
+pub(crate) fn parse_walg_env_snapshot(
+    output: &str,
+) -> std::result::Result<Option<WalgEnvSnapshot>, String> {
+    if output.lines().any(|line| line == SNAPSHOT_NO_FILE) {
+        return Ok(None);
+    }
+    let missing = || "the walg.env snapshot is incomplete".to_string();
+    let after_cksum = output
+        .split_once(&format!("{SNAPSHOT_CKSUM}\n"))
+        .ok_or_else(missing)?
+        .1;
+    let (checksum, after_raw) = after_cksum
+        .split_once(&format!("\n{SNAPSHOT_RAW}\n"))
+        .ok_or_else(missing)?;
+    let (raw, after_eval) = after_raw
+        .rsplit_once(&format!("\n{SNAPSHOT_EVAL}\n"))
+        .ok_or_else(missing)?;
+    // Without the end marker the assignments may be cut short; an empty
+    // list would read as "no AWS_ENDPOINT" and skip the repair silently.
+    let evaluated = after_eval
+        .trim_end_matches('\n')
+        .strip_suffix(SNAPSHOT_END)
+        .ok_or_else(missing)?;
+    Ok(Some(WalgEnvSnapshot {
+        checksum: checksum.trim().to_string(),
+        raw: raw.to_string(),
+        evaluated: evaluated
+            .lines()
+            .map(str::trim_end)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect(),
+    }))
 }
 
 /// What enabling WAL archiving did to the running service.
@@ -44,6 +182,199 @@ pub(super) struct PostgresArchiveVerificationError {
 impl From<PostgresArchiveVerificationError> for EngineError {
     fn from(error: PostgresArchiveVerificationError) -> Self {
         EngineError::failed(error.service_name.clone(), error.to_string())
+    }
+}
+
+/// WAL-G could not write to the archive target with the exact settings
+/// `walg.env` would hold. Raised before `walg.env` is written, so a broken
+/// target is reported when archiving is turned on or re-pointed instead of
+/// PostgreSQL silently keeping every WAL segment until the disk fills.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error(
+    "WAL archive target check failed for PostgreSQL service '{service_name}': WAL-G could not \
+     write to {endpoint} (scheme {scheme}, path-style addressing {path_style}, {path_style_reason}): \
+     {message}. Archiving settings were not changed",
+    path_style = if *force_path_style { "on" } else { "off" }
+)]
+pub struct ArchiveTargetCheckError {
+    pub service_name: String,
+    /// `AWS_ENDPOINT` as WAL-G received it, or "AWS S3" when unset.
+    pub endpoint: String,
+    /// `http`, `https`, or `aws` for AWS S3 itself.
+    pub scheme: String,
+    pub force_path_style: bool,
+    pub path_style_reason: String,
+    /// WAL-G's own error, credentials redacted.
+    pub message: String,
+}
+
+/// Boxed where it is returned: it carries six strings, too large to pass
+/// by value through every `Result`.
+impl From<Box<ArchiveTargetCheckError>> for EngineError {
+    fn from(error: Box<ArchiveTargetCheckError>) -> Self {
+        EngineError::failed(error.service_name.clone(), error.to_string())
+    }
+}
+
+/// What a successful archive target check verified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveTargetCheck {
+    pub endpoint: String,
+    pub scheme: String,
+    pub force_path_style: bool,
+    pub path_style_reason: String,
+}
+
+/// Upper bound of one archive target check. WAL-G retries a failing request
+/// for minutes by default; `S3_MAX_RETRIES=1` makes it report the first
+/// error, and this bounds a target that never answers.
+const ARCHIVE_TARGET_CHECK_TIMEOUT_SECS: u64 = 60;
+
+/// Upper bound of removing the check's probe after a successful upload.
+/// Best effort: a removal that fails or hangs never fails the check.
+const ARCHIVE_PROBE_CLEANUP_TIMEOUT_SECS: u64 = 30;
+
+/// How long the exec running the check may take: the upload and the
+/// cleanup run one after the other, each under its own `timeout`, plus a
+/// margin for starting the shell. A slow but successful upload followed by
+/// a stalled removal must still reach the line that reports the upload's
+/// exit code, or a writable target would read as a failed check.
+fn archive_target_check_exec_deadline() -> Duration {
+    Duration::from_secs(ARCHIVE_TARGET_CHECK_TIMEOUT_SECS + ARCHIVE_PROBE_CLEANUP_TIMEOUT_SECS + 15)
+}
+
+/// The settings a check reports: what `walg_env` hands WAL-G.
+fn archive_target_settings(
+    walg_env: &[String],
+    s3_credentials: &crate::externalsvc::S3Credentials,
+) -> ArchiveTargetCheck {
+    let endpoint = walg_env
+        .iter()
+        .find_map(|line| line.strip_prefix("AWS_ENDPOINT="))
+        .map(str::to_string);
+    let force_path_style = walg_env
+        .iter()
+        .any(|line| line == "AWS_S3_FORCE_PATH_STYLE=true");
+    // The reason follows what WAL-G is actually given, so a report never
+    // says "off, forced on".
+    let ip_endpoint = endpoint
+        .as_deref()
+        .is_some_and(temps_core::s3_endpoint::endpoint_host_is_ip_literal);
+    let reason = if !force_path_style || s3_credentials.force_path_style {
+        temps_core::s3_endpoint::PathStyleReason::Configured
+    } else if ip_endpoint {
+        temps_core::s3_endpoint::PathStyleReason::IpAddressEndpoint
+    } else {
+        s3_credentials.path_style().reason
+    };
+    let scheme = match endpoint.as_deref() {
+        // What WAL-G does with a scheme-less endpoint, which is the failure
+        // this report exists to explain.
+        Some(endpoint) if !endpoint.contains("://") => "missing (WAL-G uses https)".to_string(),
+        Some(endpoint) => temps_core::s3_endpoint::S3Endpoint::parse(endpoint, None)
+            .map(|parsed| parsed.scheme().to_string())
+            .unwrap_or_else(|_| "unknown".to_string()),
+        None => "aws".to_string(),
+    };
+    ArchiveTargetCheck {
+        endpoint: endpoint.unwrap_or_else(|| format!("AWS S3 (region {})", s3_credentials.region)),
+        scheme,
+        force_path_style,
+        path_style_reason: reason.describe().to_string(),
+    }
+}
+
+/// The one object the archive target check writes, at the root of the
+/// service's WAL-G prefix, outside `basebackups_005/` and `wal_005/` (the
+/// only folders WAL-G reads for backups and WAL).
+pub(crate) const ARCHIVE_CHECK_PROBE_KEY: &str = "temps-archive-check";
+
+/// The archive target check, run in the service's container with the
+/// `WALG_`/`AWS_` settings in its environment.
+///
+/// It uploads a 5-byte probe to the fixed [`ARCHIVE_CHECK_PROBE_KEY`]
+/// (`st put -f` overwrites it), then tries to remove it. A worker node's
+/// scoped archive credential may write but never delete, so its removal is
+/// refused; because the key is fixed, the next check overwrites the same
+/// object instead of leaving another one. (`wal-g st check write` uploads a
+/// randomly named object and only warns when it cannot delete it, which
+/// left one object per scoped backup.)
+///
+/// The script always exits 0 and prints the upload's exit code on its last
+/// line, so a refusal is read as WAL-G's answer rather than a failed exec.
+pub(crate) fn archive_target_check_script() -> String {
+    format!(
+        "if command -v wal-g >/dev/null 2>&1; then \
+         probe=$(mktemp) && printf temps > \"$probe\" && \
+         timeout {ARCHIVE_TARGET_CHECK_TIMEOUT_SECS} wal-g st put -f --no-compress --no-encrypt \
+           \"$probe\" {ARCHIVE_CHECK_PROBE_KEY} 2>&1; code=$?; \
+         rm -f \"$probe\"; \
+         if [ \"$code\" -eq 0 ]; then \
+           timeout {ARCHIVE_PROBE_CLEANUP_TIMEOUT_SECS} wal-g st rm {ARCHIVE_CHECK_PROBE_KEY} >/dev/null 2>&1 || true; \
+         fi; \
+         else echo 'wal-g is not installed in this image'; code=127; fi; \
+         echo \"{CHECK_EXIT_MARKER}$code\"; exit 0"
+    )
+}
+
+/// Prefix of the last line the check script prints: WAL-G's exit code.
+const CHECK_EXIT_MARKER: &str = "__TEMPS_WALG_CHECK_EXIT__=";
+
+/// Split the check script's output into WAL-G's own output and its exit
+/// code.
+///
+/// The script always exits 0, so its marker line is the only record of what
+/// WAL-G answered. Output without a readable marker (a stream cut short, an
+/// exec that died) is `Err` with whatever output did arrive: it never counts
+/// as a passed check.
+fn split_check_exit(output: &str) -> std::result::Result<(String, i64), String> {
+    let Some(at) = output.rfind(CHECK_EXIT_MARKER) else {
+        return Err(output.to_string());
+    };
+    match output[at + CHECK_EXIT_MARKER.len()..].trim().parse::<i64>() {
+        Ok(code) => Ok((output[..at].to_string(), code)),
+        Err(_) => Err(output.to_string()),
+    }
+}
+
+/// The part of WAL-G's output worth showing: its error lines, or the tail.
+fn summarize_walg_output(output: &str) -> String {
+    let errors: Vec<&str> = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            line.starts_with("ERROR")
+                || line.starts_with("caused by")
+                || line.contains("wal-g is not installed")
+        })
+        .collect();
+    let picked = if errors.is_empty() {
+        output
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .rev()
+            .take(3)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+    } else {
+        errors
+    };
+    let joined = picked.join(" | ");
+    if joined.is_empty() {
+        return "no output".to_string();
+    }
+    const LIMIT: usize = 800;
+    if joined.len() > LIMIT {
+        let cut = (0..=LIMIT)
+            .rev()
+            .find(|i| joined.is_char_boundary(*i))
+            .unwrap_or(0);
+        format!("{}…", &joined[..cut])
+    } else {
+        joined
     }
 }
 
@@ -237,28 +568,52 @@ impl PostgresService {
         walg_env: &[String],
         target_path: &str,
     ) -> Result<()> {
-        use bollard::exec::{CreateExecOptions, StartExecOptions};
-
         // Only WAL-G / AWS envs go into the file — PG connection envs (PGHOST,
         // PGUSER, etc.) are not needed by wal-g archive/fetch from inside PG.
-        let env_file_lines: Vec<&String> = walg_env
+        let file_lines: Vec<String> = walg_env
             .iter()
             .filter(|line| line.starts_with("WALG_") || line.starts_with("AWS_"))
+            .filter_map(|line| shell_export_assignment(line))
             .collect();
+        self.write_file_lines_at(container_name, &file_lines, target_path)
+            .await
+    }
+
+    /// Replace the file at `target_path` with `lines`, verbatim, owned by
+    /// `postgres` and readable only by it (it holds credentials). Atomic:
+    /// see [`atomic_write_command`].
+    async fn write_file_lines_at(
+        &self,
+        container_name: &str,
+        lines: &[String],
+        target_path: &str,
+    ) -> Result<()> {
+        match self
+            .write_file_lines_if_unchanged(container_name, lines, target_path, None)
+            .await?
+        {
+            WalgEnvWrite::Written => Ok(()),
+            // Without an expected checksum the file is always replaced.
+            WalgEnvWrite::ChangedConcurrently => Err(EngineError::failed(
+                &self.name,
+                format!("walg.env on container '{container_name}' changed while it was written"),
+            )),
+        }
+    }
+
+    /// [`Self::write_file_lines_at`], but only if the file still has the
+    /// content `expected_checksum` describes (see [`atomic_write_command`]).
+    async fn write_file_lines_if_unchanged(
+        &self,
+        container_name: &str,
+        lines: &[String],
+        target_path: &str,
+        expected_checksum: Option<&str>,
+    ) -> Result<WalgEnvWrite> {
+        use bollard::exec::{CreateExecOptions, StartExecOptions};
 
         let walg_env_path = target_path;
-
-        let write_cmd = format!(
-            "printf '%s\\n' {} > {} && chmod 600 {}",
-            env_file_lines
-                .iter()
-                .filter_map(|line| shell_export_assignment(line)
-                    .map(|assignment| shell_escape(&assignment)))
-                .collect::<Vec<_>>()
-                .join(" "),
-            walg_env_path,
-            walg_env_path,
-        );
+        let write_cmd = atomic_write_command(lines, walg_env_path, expected_checksum);
 
         let exec = self
             .docker
@@ -268,7 +623,7 @@ impl PostgresService {
                     cmd: Some(vec!["sh", "-c", &write_cmd]),
                     attach_stdout: Some(false),
                     attach_stderr: Some(false),
-                    user: Some("postgres"),
+                    user: Some(WALG_ENV_OWNER),
                     ..Default::default()
                 },
             )
@@ -286,16 +641,30 @@ impl PostgresService {
         loop {
             let inspect = self.docker.inspect_exec(&exec.id).await?;
             if inspect.running == Some(false) {
-                if inspect.exit_code != Some(0) {
-                    return Err(EngineError::failed(
-                        &self.name,
-                        format!(
-                            "Failed to write walg.env on container '{}' (exit code {:?})",
-                            container_name, inspect.exit_code
-                        ),
-                    ));
+                match inspect.exit_code {
+                    Some(0) => break,
+                    Some(WALG_ENV_CHANGED_EXIT) if expected_checksum.is_some() => {
+                        return Ok(WalgEnvWrite::ChangedConcurrently)
+                    }
+                    Some(WALG_ENV_LOCK_BUSY_EXIT) => {
+                        return Err(EngineError::failed(
+                            &self.name,
+                            format!(
+                                "Could not write {walg_env_path} on container '{container_name}': \
+                                 another write held its lock for 30 seconds"
+                            ),
+                        ))
+                    }
+                    code => {
+                        return Err(EngineError::failed(
+                            &self.name,
+                            format!(
+                                "Failed to write {walg_env_path} on container '{container_name}' \
+                                 (exit code {code:?}); the previous file is unchanged"
+                            ),
+                        ))
+                    }
                 }
-                break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
@@ -304,7 +673,7 @@ impl PostgresService {
             "Written WAL-G credentials to {} on container '{}'",
             walg_env_path, container_name
         );
-        Ok(())
+        Ok(WalgEnvWrite::Written)
     }
 
     /// The env file lives at `/var/lib/postgresql/walg.env` on the shared volume, so it:
@@ -963,8 +1332,111 @@ impl PostgresService {
         let walg_env = self
             .archive_walg_env(&container_name, s3_credentials, walg_prefix)
             .await;
+        // Prove the target accepts a write with exactly these settings
+        // before archiving depends on them. Turning archiving on against a
+        // target WAL-G cannot reach does not fail loudly later: PostgreSQL
+        // keeps every segment until the disk is full.
+        self.check_archive_target_env(&container_name, &walg_env, s3_credentials)
+            .await?;
         self.enable_wal_archiving(&container_name, &walg_env, &postgres_config, allow_restart)
             .await
+    }
+
+    /// Check that WAL-G can write to the archive target of this service
+    /// (see [`archive_target_check_script`]), with the settings `walg.env`
+    /// would hold, without writing `walg.env`. Read-only for the database. The outer error is a
+    /// service that cannot be checked at all; the inner one is the target's
+    /// answer.
+    pub async fn check_archive_target(
+        &self,
+        service_config: ServiceConfig,
+        s3_credentials: &crate::externalsvc::S3Credentials,
+        walg_prefix: &str,
+    ) -> std::result::Result<
+        std::result::Result<ArchiveTargetCheck, Box<ArchiveTargetCheckError>>,
+        EngineError,
+    > {
+        let postgres_config = self.get_postgres_config(service_config)?;
+        let container_name = self.get_live_container_name(&postgres_config);
+        let walg_env = self
+            .archive_walg_env(&container_name, s3_credentials, walg_prefix)
+            .await;
+        Ok(self
+            .check_archive_target_env(&container_name, &walg_env, s3_credentials)
+            .await)
+    }
+
+    async fn check_archive_target_env(
+        &self,
+        container_name: &str,
+        walg_env: &[String],
+        s3_credentials: &crate::externalsvc::S3Credentials,
+    ) -> std::result::Result<ArchiveTargetCheck, Box<ArchiveTargetCheckError>> {
+        let settings = archive_target_settings(walg_env, s3_credentials);
+        let failure = |message: String| {
+            Box::new(ArchiveTargetCheckError {
+                service_name: self.name.clone(),
+                endpoint: settings.endpoint.clone(),
+                scheme: settings.scheme.clone(),
+                force_path_style: settings.force_path_style,
+                path_style_reason: settings.path_style_reason.clone(),
+                message,
+            })
+        };
+        let mut env: Vec<String> = walg_env
+            .iter()
+            .filter(|line| line.starts_with("WALG_") || line.starts_with("AWS_"))
+            .cloned()
+            .collect();
+        env.push("S3_MAX_RETRIES=1".to_string());
+        let script = archive_target_check_script();
+        let redact = crate::externalsvc::SensitiveValues::new().s3_credentials(s3_credentials);
+        let result = crate::externalsvc::exec_util::run_exec(
+            &self.docker,
+            container_name,
+            vec!["sh".to_string(), "-c".to_string(), script],
+            Some(env),
+            archive_target_check_exec_deadline(),
+        )
+        .await
+        .map_err(|error| failure(redact.redact(&format!("could not run the check: {error}"))))?;
+        let (output, exit_code) = split_check_exit(&result.output).map_err(|partial| {
+            failure(format!(
+                "the check ended without reporting WAL-G's result (exec exit code {}): {}",
+                result.exit_code,
+                summarize_walg_output(&redact.redact(&partial))
+            ))
+        })?;
+        let result = crate::externalsvc::exec_util::ExecResult { exit_code, output };
+        match result.exit_code {
+            0 => {
+                info!(
+                    service = %self.name,
+                    endpoint = %settings.endpoint,
+                    scheme = %settings.scheme,
+                    force_path_style = settings.force_path_style,
+                    "WAL archive target accepted a WAL-G write check"
+                );
+                Ok(settings)
+            }
+            124 => Err(failure(format!(
+                "no answer within {ARCHIVE_TARGET_CHECK_TIMEOUT_SECS} seconds ({})",
+                summarize_walg_output(&redact.redact(&result.output))
+            ))),
+            code => {
+                let message = summarize_walg_output(&redact.redact(&result.output));
+                warn!(
+                    service = %self.name,
+                    endpoint = %settings.endpoint,
+                    scheme = %settings.scheme,
+                    force_path_style = settings.force_path_style,
+                    exit_code = code,
+                    error = %message,
+                    "WAL archive target refused a WAL-G write check"
+                );
+                Err(failure(message))
+            }
+        }
     }
 
     /// The variables `archive_command` reads from `walg.env`.
@@ -974,26 +1446,10 @@ impl PostgresService {
         s3_credentials: &crate::externalsvc::S3Credentials,
         walg_prefix: &str,
     ) -> Vec<String> {
-        let mut walg_env: Vec<String> = vec![
-            format!("WALG_S3_PREFIX={}", walg_prefix),
-            format!("AWS_ACCESS_KEY_ID={}", s3_credentials.access_key_id),
-            format!("AWS_SECRET_ACCESS_KEY={}", s3_credentials.secret_key),
-            format!("AWS_REGION={}", s3_credentials.region),
-        ];
-        // Absent unless this source holds a temporary (STS-style)
-        // credential, so a long-lived one produces the exact environment
-        // it always did.
-        walg_env.extend(s3_credentials.session_token_env());
-        if let Some(resolved_endpoint) = s3_credentials
+        let resolved_endpoint = s3_credentials
             .resolve_endpoint_for_container(&self.docker, container_name)
-            .await
-        {
-            walg_env.push(format!("AWS_ENDPOINT={}", resolved_endpoint));
-        }
-        if s3_credentials.force_path_style {
-            walg_env.push("AWS_S3_FORCE_PATH_STYLE=true".to_string());
-        }
-        walg_env
+            .await;
+        archive_walg_env_lines(s3_credentials, walg_prefix, resolved_endpoint.as_deref())
     }
 
     /// Replace the credential in `walg.env` with a fresh one for the same
@@ -1036,313 +1492,524 @@ impl PostgresService {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[cfg(feature = "docker-tests")]
-    use crate::externalsvc::{ExternalService, ServiceConfig};
-    use bollard::Docker;
-    use std::sync::Arc;
+/// The lines of `walg.env`, the file `archive_command` sources before every
+/// `wal-g wal-push`. `resolved_endpoint` is the endpoint as the container
+/// reaches it ([`crate::externalsvc::S3Credentials::resolve_endpoint_for_container`]),
+/// always with an explicit scheme: WAL-G reads a scheme-less `AWS_ENDPOINT`
+/// as HTTPS.
+pub(crate) fn archive_walg_env_lines(
+    s3_credentials: &crate::externalsvc::S3Credentials,
+    walg_prefix: &str,
+    resolved_endpoint: Option<&str>,
+) -> Vec<String> {
+    let mut walg_env: Vec<String> = vec![
+        format!("WALG_S3_PREFIX={}", walg_prefix),
+        format!("AWS_ACCESS_KEY_ID={}", s3_credentials.access_key_id),
+        format!("AWS_SECRET_ACCESS_KEY={}", s3_credentials.secret_key),
+        format!("AWS_REGION={}", s3_credentials.region),
+    ];
+    // Absent unless this source holds a temporary (STS-style) credential, so
+    // a long-lived one produces the exact environment it always did.
+    walg_env.extend(s3_credentials.session_token_env());
+    if let Some(resolved_endpoint) = resolved_endpoint {
+        walg_env.push(format!(
+            "AWS_ENDPOINT={}",
+            temps_core::s3_endpoint::endpoint_url(resolved_endpoint)
+        ));
+    }
+    // Virtual-hosted addressing (`<bucket>.<host>`) cannot resolve for an IP
+    // literal: decide on the endpoint the container actually dials as well
+    // as the stored one.
+    if s3_credentials.uses_path_style()
+        || resolved_endpoint.is_some_and(temps_core::s3_endpoint::endpoint_host_is_ip_literal)
+    {
+        walg_env.push("AWS_S3_FORCE_PATH_STYLE=true".to_string());
+    }
+    walg_env
+}
 
-    /// A private, run-owned PostgreSQL fixture exercises PostgreSQL's real
-    /// archive_command show hook. The fixture supplies separate off/on servers;
-    /// this test only reads their settings and never changes their workloads.
-    #[tokio::test]
-    async fn archive_settings_handles_postgres_disabled_command_display() {
-        let Some(fixture_path) = std::env::var_os("TEMPS_TEST_ARCHIVE_SETTINGS_FIXTURE") else {
-            eprintln!(
-                "Skipping archive settings integration regression: no owned fixture supplied"
-            );
-            return;
-        };
-        #[derive(serde::Deserialize)]
-        struct Fixture {
-            off: PostgresConfig,
-            on: PostgresConfig,
+/// How `live` (a container's `walg.env`) differs from `generated` in what
+/// decides where and how WAL-G connects: the endpoint and path style.
+/// Credentials are never compared or named.
+pub(crate) fn walg_env_drift(live: &[String], generated: &[String]) -> Option<String> {
+    let differences = walg_env_differences(live, generated);
+    if differences.is_empty() {
+        return None;
+    }
+    // A restart is only promised when the part of the start-time repair
+    // that does not depend on the store, forcing path style for an IP
+    // endpoint, removes every difference. The scheme a bare endpoint gets
+    // is whichever the store answers first (HTTPS before HTTP), not the
+    // source's, so a scheme or host difference is left to a backup, which
+    // rewrites the file from the S3 source.
+    let restart_repairs_it = repair_walg_env_lines(live, None)
+        .is_some_and(|repaired| walg_env_differences(&repaired, generated).is_empty());
+    let fix = if restart_repairs_it {
+        "Restart the service: Temps repairs this walg.env when it starts, without changing \
+         where WAL is archived"
+    } else {
+        "Run a backup of the service to rewrite walg.env from its S3 source"
+    };
+    Some(format!(
+        "The running container's walg.env {}, and PostgreSQL archives with that file. {fix}.",
+        differences.join(" and ")
+    ))
+}
+
+/// The endpoint and path-style differences [`walg_env_drift`] reports.
+fn walg_env_differences(live: &[String], generated: &[String]) -> Vec<String> {
+    fn endpoint(lines: &[String]) -> Option<&str> {
+        lines
+            .iter()
+            .find_map(|line| line.strip_prefix("AWS_ENDPOINT="))
+    }
+    fn path_style(lines: &[String]) -> bool {
+        lines.iter().any(|line| {
+            line.strip_prefix("AWS_S3_FORCE_PATH_STYLE=")
+                .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+        })
+    }
+    fn on_off(on: bool) -> &'static str {
+        if on {
+            "on"
+        } else {
+            "off"
         }
-        let fixture: Fixture = serde_json::from_slice(
-            &std::fs::read(fixture_path).expect("read private owned PostgreSQL fixture"),
+    }
+    let mut differences = Vec::new();
+    let (live_endpoint, generated_endpoint) = (endpoint(live), endpoint(generated));
+    if live_endpoint != generated_endpoint {
+        let describe = |endpoint: Option<&str>| match endpoint {
+            Some(endpoint) if !endpoint.contains("://") => {
+                format!("{endpoint} (no scheme, so WAL-G uses https)")
+            }
+            Some(endpoint) => endpoint.to_string(),
+            None => "AWS S3".to_string(),
+        };
+        differences.push(format!(
+            "sends WAL to {} instead of {}",
+            describe(live_endpoint),
+            describe(generated_endpoint)
+        ));
+    }
+    let (live_path_style, generated_path_style) = (path_style(live), path_style(generated));
+    if live_path_style != generated_path_style {
+        differences.push(format!(
+            "has path-style addressing {} instead of {}",
+            on_off(live_path_style),
+            on_off(generated_path_style)
+        ));
+    }
+    differences
+}
+
+/// Signals every process whose command line starts with `wal-g wal-push `
+/// (the images ship no `pkill`) and prints `ended <pid>` for each.
+const STALE_WAL_PUSH_SCRIPT: &str = "for p in /proc/[0-9]*; do \
+     case \"$(tr '\\0' ' ' < \"$p/cmdline\" 2>/dev/null)\" in \
+       'wal-g wal-push '*) kill \"${p#/proc/}\" 2>/dev/null && echo \"ended ${p#/proc/}\";; \
+     esac; \
+   done; exit 0";
+
+/// Bring a `walg.env` written by an older Temps up to the current rule, or
+/// `None` when it already follows it.
+///
+/// `lines` are the file's `KEY=value` assignments as the shell sees them.
+/// An IP-literal endpoint gets `AWS_S3_FORCE_PATH_STYLE=true`. A scheme-less
+/// `AWS_ENDPOINT` gets `bare_endpoint_scheme`, the scheme WAL-G was found to
+/// reach the store over ([`WalgEnvRepairProbe`]), and is left as it is when
+/// that is `None`: WAL-G dials a scheme-less endpoint over HTTPS, so writing
+/// `http://` without knowing would downgrade a store it already reaches over
+/// TLS. Credentials, prefix and every other assignment are unchanged: this
+/// never changes which repository WAL is archived to. The file itself is
+/// patched by [`patch_walg_env_file`], which keeps every line it does not
+/// repair.
+pub(crate) fn repair_walg_env_lines(
+    lines: &[String],
+    bare_endpoint_scheme: Option<temps_core::s3_endpoint::S3Scheme>,
+) -> Option<Vec<String>> {
+    let endpoint = lines
+        .iter()
+        .find_map(|line| line.strip_prefix("AWS_ENDPOINT="))?;
+    let with_scheme = if endpoint.contains("://") {
+        None
+    } else {
+        bare_endpoint_scheme.and_then(|scheme| {
+            temps_core::s3_endpoint::S3Endpoint::parse(
+                endpoint,
+                Some(scheme == temps_core::s3_endpoint::S3Scheme::Https),
+            )
+            .ok()
+            .map(|parsed| parsed.url())
+        })
+    };
+    let has_path_style = lines.iter().any(|line| {
+        line.strip_prefix("AWS_S3_FORCE_PATH_STYLE=")
+            .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+    });
+    let needs_path_style =
+        !has_path_style && temps_core::s3_endpoint::endpoint_host_is_ip_literal(endpoint);
+    if with_scheme.is_none() && !needs_path_style {
+        return None;
+    }
+    let mut repaired: Vec<String> = lines
+        .iter()
+        .filter(|line| !(needs_path_style && line.starts_with("AWS_S3_FORCE_PATH_STYLE=")))
+        .map(
+            |line| match (&with_scheme, line.starts_with("AWS_ENDPOINT=")) {
+                (Some(url), true) => format!("AWS_ENDPOINT={url}"),
+                _ => line.clone(),
+            },
         )
-        .expect("parse private owned PostgreSQL fixture");
-        let docker = Arc::new(Docker::connect_with_local_defaults().expect("Docker configuration"));
-        let service = PostgresService::new("archive-settings-regression".to_string(), docker);
-        let off = service
-            .active_archive_settings(&fixture.off, "/bin/true")
-            .await
-            .expect("off policy must not wait for a command hidden by PostgreSQL");
-        assert_eq!(off, ("off".to_string(), "(disabled)".to_string()));
-        assert!(fixture.off.container_name.is_some());
-        let refusal = service
-            .enable_wal_archiving(
-                fixture.off.container_name.as_deref().unwrap(),
-                &["WALG_S3_PREFIX=s3://test-bucket/unused".to_string()],
-                &fixture.off,
-                true,
-            )
-            .await
-            .expect_err("an imported off-policy container must never be recreated");
-        assert!(refusal
-            .to_string()
-            .contains("imported database has archive_mode off"));
-        assert_eq!(
-            service
-                .active_archive_settings(&fixture.off, "/bin/true")
-                .await
-                .expect("the refused imported workload remains usable"),
-            off
-        );
-        let on = service
-            .active_archive_settings(&fixture.on, "/bin/true")
-            .await
-            .expect("on policy must expose the exact configured command");
-        assert_eq!(on, ("on".to_string(), "/bin/true".to_string()));
-        let error = service
-            .active_archive_settings(&fixture.on, "wal-g wal-push %p")
-            .await
-            .expect_err("active archiving must reject a different command");
-        assert!(error
-            .reason
-            .contains("expected archive command did not apply"));
+        .collect();
+    if needs_path_style {
+        repaired.push("AWS_S3_FORCE_PATH_STYLE=true".to_string());
     }
+    Some(repaired)
+}
 
-    #[test]
-    fn imported_restore_rejects_effective_command_line_archive_policy() {
-        assert!(imported_archive_mode_is_command_line("on", "command line"));
-        assert!(imported_archive_mode_is_command_line(
-            "always",
-            "command line"
-        ));
-        assert!(!imported_archive_mode_is_command_line(
-            "off",
-            "command line"
-        ));
-        assert!(!imported_archive_mode_is_command_line(
-            "on",
-            "configuration file"
-        ));
-    }
+/// An exec error from reading `walg.env`, without the output it captured.
+///
+/// `run_exec` appends whatever the command printed after its first line, and
+/// the reader prints the file: credentials included. Only the first line
+/// (what failed, where, and the command, which holds no secret) is kept for
+/// the logs.
+pub(crate) fn exec_error_without_output(error: &str) -> String {
+    let first = error.lines().next().unwrap_or_default().trim_end();
+    format!("{first} (the command's output is not shown: it holds walg.env)")
+}
 
-    #[test]
-    fn imported_restore_detects_startup_archive_mode_override() {
-        let command = |args: &[&str]| {
-            args.iter()
-                .map(|arg| String::from(*arg))
-                .collect::<Vec<_>>()
-        };
-        assert!(postgres_cmd_pins_archive_mode_on(&command(&[
-            "postgres",
-            "-c",
-            "archive_mode=on"
-        ])));
-        assert!(postgres_cmd_pins_archive_mode_on(&command(&[
-            "postgres",
-            "-carchive_mode=always"
-        ])));
-        assert!(postgres_cmd_pins_archive_mode_on(&command(&[
-            "postgres",
-            "--archive_mode=on"
-        ])));
-        assert!(!postgres_cmd_pins_archive_mode_on(&command(&[
-            "postgres",
-            "-c",
-            "archive_mode=off"
-        ])));
-        assert!(!postgres_cmd_pins_archive_mode_on(&command(&[
-            "postgres",
-            "-c",
-            "archive_mode=on",
-            "-c",
-            "archive_mode=off"
-        ])));
-        assert!(!postgres_cmd_pins_archive_mode_on(&command(&[
-            "postgres",
-            "-c",
-            "archive_command=/bin/true"
-        ])));
-        assert!(postgres_cmd_pins_archive_mode_on(&command(&[
-            "postgres",
-            "-c",
-            "ARCHIVE_MODE=ON"
-        ])));
-        assert!(postgres_cmd_pins_archive_mode_on(&command(&[
-            "postgres",
-            "-cARCHIVE_MODE=ALWAYS"
-        ])));
-        assert!(!postgres_cmd_pins_archive_mode_on(&command(&[
-            "postgres",
-            "-c",
-            "ARCHIVE_MODE=on",
-            "-c",
-            "archive_mode=off"
-        ])));
-        assert!(postgres_cmd_pins_archive_mode_on(&command(&[
-            "postgres",
-            "-c",
-            "archive_mode=off",
-            "-c",
-            "ARCHIVE_MODE=always"
-        ])));
+/// How the start-time repair learns which scheme a scheme-less endpoint is
+/// reached over: a read-only `wal-g st ls` of the archive prefix, HTTPS
+/// first (what WAL-G already uses for it), then plain HTTP.
+pub(crate) struct WalgEnvRepairProbe;
 
-        assert!(postgres_cmd_pins_archive_mode_on(&command(&[
-            "postgres",
-            "--archive-mode=on"
-        ])));
-        assert!(!postgres_cmd_pins_archive_mode_on(&command(&[
-            "postgres",
-            "--ARCHIVE-MODE=always",
-            "--archive_mode=off"
-        ])));
-    }
+impl WalgEnvRepairProbe {
+    /// Bound on each listing; one retry at most, so an unreachable store
+    /// delays the start by seconds, not WAL-G's own long retry loop.
+    pub(crate) const TIMEOUT_SECS: u64 = 15;
 
-    fn backup_with_metadata(metadata: serde_json::Value) -> temps_entities::backups::Model {
-        temps_entities::backups::Model {
-            id: 1,
-            name: "backup".into(),
-            backup_id: "selected-backup".into(),
-            schedule_id: None,
-            schedule_run_id: None,
-            backup_type: "external_service".into(),
-            state: "completed".into(),
-            started_at: chrono::Utc::now(),
-            finished_at: Some(chrono::Utc::now()),
-            size_bytes: None,
-            file_count: None,
-            s3_source_id: 1,
-            s3_location: "s3://bucket/repository".into(),
-            error_message: None,
-            metadata: metadata.to_string(),
-            checksum: None,
-            compression_type: "lz4".into(),
-            created_by: 1,
-            expires_at: None,
-            tags: "[]".into(),
-        }
-    }
+    /// The order schemes are tried in: a store WAL-G reaches over TLS keeps
+    /// TLS, and plain HTTP is written only when TLS fails and HTTP works.
+    pub(crate) const ORDER: [temps_core::s3_endpoint::S3Scheme; 2] = [
+        temps_core::s3_endpoint::S3Scheme::Https,
+        temps_core::s3_endpoint::S3Scheme::Http,
+    ];
 
-    #[test]
-    fn walg_restore_selector_uses_persisted_backup_identity() {
-        let backup = backup_with_metadata(serde_json::json!({
-            "walg_identity_version": 1,
-            "walg_target_user_data": {"temps_backup_id": "selected-backup"}
-        }));
-        assert_eq!(
-            walg_target_user_data(&backup).expect("valid metadata should parse"),
-            Some(r#"{"temps_backup_id":"selected-backup"}"#.to_string())
-        );
-    }
-
-    #[test]
-    fn walg_restore_selector_rejects_incomplete_identity_metadata() {
-        let backup = backup_with_metadata(serde_json::json!({"walg_identity_version": 1}));
-        let error = walg_target_user_data(&backup).expect_err("missing selector must fail closed");
-        assert!(error
-            .to_string()
-            .contains("missing its WAL-G target user data"));
-    }
-
-    #[test]
-    fn walg_restore_selector_rejects_mismatched_backup_identity() {
-        let backup = backup_with_metadata(serde_json::json!({
-            "walg_identity_version": 1,
-            "walg_target_user_data": {"temps_backup_id": "different-backup"}
-        }));
-        let error = walg_target_user_data(&backup).expect_err("mismatched selector must fail");
-        assert!(error.to_string().contains("for a different backup"));
-    }
-
-    #[test]
-    fn sourced_walg_values_are_shell_quoted() {
-        assert_eq!(
-            shell_export_assignment("WALG_S3_PREFIX=s3://bucket/ok;touch${IFS}/tmp/pwn;#"),
-            Some("export WALG_S3_PREFIX='s3://bucket/ok;touch${IFS}/tmp/pwn;#'".to_string())
-        );
-        assert_eq!(
-            shell_export_assignment("AWS_SECRET_ACCESS_KEY=abc'def"),
-            Some("export AWS_SECRET_ACCESS_KEY='abc'\\''def'".to_string())
-        );
-        assert!(shell_export_assignment("BAD-KEY=value").is_none());
-    }
-
-    /// Regression test: `compute_desired_enable_archiving()` must find a
-    /// pre-existing `walg.env` on the data volume even when there is no
-    /// live container to probe directly. Without the volume-probe fallback,
-    /// `start()`'s `need_create` path (force_recreate, node failover, or an
-    /// externally-removed container) would silently bake `archive_mode=off`
-    /// into the recreated container even though WAL-G was already
-    /// configured on the volume.
-    #[cfg(feature = "docker-tests")]
-    #[tokio::test]
-    async fn test_walg_env_probed_from_volume_when_container_missing() {
-        use std::net::TcpListener;
-        let port = TcpListener::bind("127.0.0.1:0")
-            .expect("failed to bind for port allocation")
-            .local_addr()
-            .expect("failed to read local addr")
-            .port();
-
-        let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
-        let service = PostgresService::new("test-walg-volume-probe".to_string(), docker.clone());
-
-        let config = ServiceConfig {
-            name: "test-walg-volume-probe".to_string(),
-            service_type: crate::externalsvc::ServiceType::Postgres,
-            version: None,
-            parameters: serde_json::json!({
-                "host": "localhost",
-                "port": port.to_string(),
-                "database": "testdb",
-                "username": "testuser",
-                "password": "testpass123",
-                "max_connections": 100,
-                "ssl_mode": "disable",
-                "docker_image": "gotempsh/postgres-walg:18-bookworm"
-            }),
-        };
-
-        service.init(config).await.expect("init should succeed");
-        let container_name = service.get_container_name();
-
-        // No walg.env written yet -- archiving must read as not desired.
-        assert!(
-            !service.compute_desired_enable_archiving().await,
-            "fresh service should not have archiving enabled"
-        );
-
-        service
-            .write_walg_env_file(&container_name, &["AWS_ACCESS_KEY_ID=test".to_string()])
-            .await
-            .expect("failed to write walg.env");
-
-        // Sanity check: the live container reports archiving desired.
-        assert!(
-            service.compute_desired_enable_archiving().await,
-            "live container should report walg.env as present"
-        );
-
-        // Remove the container but keep the volume, simulating
-        // force_recreate / node failover / an externally-removed container.
-        docker
-            .remove_container(
-                &container_name,
-                Some(bollard::query_parameters::RemoveContainerOptions {
-                    force: true,
-                    ..Default::default()
-                }),
-            )
-            .await
-            .expect("failed to remove container");
-
-        assert!(
-            service.compute_desired_enable_archiving().await,
-            "archiving must still read as desired from the volume once the container is gone"
-        );
-
-        // Cleanup: volume (container is already gone).
-        let _ = docker
-            .remove_volume(
-                &format!("{container_name}_data"),
-                None::<bollard::query_parameters::RemoveVolumeOptions>,
-            )
-            .await;
+    pub(crate) fn script() -> String {
+        format!(
+            "if command -v wal-g >/dev/null 2>&1; then \
+             timeout {} wal-g st ls >/dev/null 2>&1; code=$?; \
+             else code=127; fi; echo \"{CHECK_EXIT_MARKER}$code\"; exit 0",
+            Self::TIMEOUT_SECS
+        )
     }
 }
+
+/// The two settings the start-time repair rewrites.
+const REPAIRED_WALG_KEYS: [&str; 2] = ["AWS_ENDPOINT", "AWS_S3_FORCE_PATH_STYLE"];
+
+/// Whether a `walg.env` line assigns `key` (`KEY=…` or `export KEY=…`).
+fn assigns(line: &str, key: &str) -> bool {
+    let line = line.trim_start();
+    let line = match line.strip_prefix("export") {
+        Some(rest) if rest.starts_with([' ', '\t']) => rest.trim_start(),
+        _ => line,
+    };
+    line.strip_prefix(key)
+        .is_some_and(|rest| rest.starts_with('='))
+}
+
+/// The lines of `walg.env` after the repair: every line of `raw` kept
+/// byte for byte (comments, other variables such as an operator's
+/// `S3_MAX_RETRIES`, quoting) except the `AWS_ENDPOINT` and
+/// `AWS_S3_FORCE_PATH_STYLE` assignments, which are replaced by those in
+/// `repaired` (from [`repair_walg_env_lines`]) at the end of the file, where
+/// they also win over any assignment this did not recognise.
+pub(crate) fn patch_walg_env_file(raw: &str, repaired: &[String]) -> Vec<String> {
+    let mut lines: Vec<String> = raw
+        .lines()
+        .filter(|line| !REPAIRED_WALG_KEYS.iter().any(|key| assigns(line, key)))
+        .map(str::to_string)
+        .collect();
+    lines.extend(
+        repaired
+            .iter()
+            .filter(|line| {
+                REPAIRED_WALG_KEYS.iter().any(|key| {
+                    line.strip_prefix(key)
+                        .is_some_and(|rest| rest.starts_with('='))
+                })
+            })
+            .filter_map(|line| shell_export_assignment(line)),
+    );
+    lines
+}
+
+impl PostgresService {
+    /// End the `wal-g wal-push` processes running in the container, after
+    /// `walg.env` was repaired.
+    ///
+    /// PostgreSQL starts archiving as soon as it is up, before Temps repairs
+    /// the file, so the first attempt runs with the old settings, and
+    /// WAL-G retrying an endpoint it cannot reach holds that attempt open for
+    /// up to a quarter of an hour. Ending it is safe: PostgreSQL counts it as
+    /// a failed attempt, keeps the segment and retries it, now with the
+    /// repaired file. Only processes whose command line starts with
+    /// `wal-g wal-push ` are signalled. Best effort.
+    async fn end_stale_wal_pushes(&self, container_name: &str) {
+        let result = crate::externalsvc::exec_util::run_exec(
+            &self.docker,
+            container_name,
+            vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                STALE_WAL_PUSH_SCRIPT.to_string(),
+            ],
+            None,
+            Duration::from_secs(15),
+        )
+        .await;
+        match result {
+            Ok(result) => {
+                let ended = result
+                    .output
+                    .lines()
+                    .filter(|line| line.starts_with("ended "))
+                    .count();
+                if ended > 0 {
+                    info!(
+                        service = %self.name,
+                        container = container_name,
+                        ended,
+                        "Ended wal-push attempts started with the old walg.env; PostgreSQL \
+                         retries those segments with the repaired file"
+                    );
+                }
+            }
+            Err(error) => warn!(
+                service = %self.name,
+                container = container_name,
+                error = %error,
+                "Could not end wal-push attempts started with the old walg.env; archiving \
+                 resumes once they give up"
+            ),
+        }
+    }
+
+    /// The `WALG_`/`AWS_` assignments of the container's `walg.env` as the
+    /// shell sees them, `None` when there is no file (archiving was never
+    /// configured on this container).
+    async fn read_live_walg_env(
+        &self,
+        container_name: &str,
+    ) -> std::result::Result<Option<Vec<String>>, String> {
+        Ok(self
+            .read_walg_env_snapshot(container_name)
+            .await?
+            .map(|snapshot| snapshot.evaluated))
+    }
+
+    /// One consistent [`WalgEnvSnapshot`] of the container's `walg.env`, or
+    /// `None` when there is no file. `env -i`: only what the file sets, not
+    /// the container's own environment.
+    pub(crate) async fn read_walg_env_snapshot(
+        &self,
+        container_name: &str,
+    ) -> std::result::Result<Option<WalgEnvSnapshot>, String> {
+        // As `postgres`, never the image's default (root in the official
+        // images): the snapshot sources the file, which `postgres` owns and
+        // can write, so as root it would run whatever was put in it as root.
+        let result = crate::externalsvc::exec_util::run_exec_as(
+            &self.docker,
+            container_name,
+            vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                WALG_ENV_SNAPSHOT_SCRIPT.to_string(),
+            ],
+            None,
+            Duration::from_secs(15),
+            Some(WALG_ENV_OWNER),
+        )
+        .await
+        .map_err(|error| exec_error_without_output(&error.to_string()))?;
+        if result.exit_code != 0 {
+            return Err(format!("reading walg.env exited with {}", result.exit_code));
+        }
+        parse_walg_env_snapshot(&result.output)
+    }
+
+    /// How the running container's `walg.env` differs from the settings
+    /// Temps generates for its archive target, if it does. `None` when they
+    /// agree, when there is no file, or when it cannot be read (a check
+    /// must not fail because of this comparison).
+    pub async fn live_walg_env_drift(
+        &self,
+        service_config: ServiceConfig,
+        s3_credentials: &crate::externalsvc::S3Credentials,
+        walg_prefix: &str,
+    ) -> Option<String> {
+        let postgres_config = self.get_postgres_config(service_config).ok()?;
+        let container_name = self.get_live_container_name(&postgres_config);
+        let live = match self.read_live_walg_env(&container_name).await {
+            Ok(live) => live?,
+            Err(error) => {
+                debug!(
+                    service = %self.name,
+                    container = %container_name,
+                    error = %error,
+                    "Could not read walg.env to compare it with the archive target settings"
+                );
+                return None;
+            }
+        };
+        let generated = self
+            .archive_walg_env(&container_name, s3_credentials, walg_prefix)
+            .await;
+        walg_env_drift(&live, &generated)
+    }
+
+    /// The scheme WAL-G reaches a `walg.env`'s scheme-less `AWS_ENDPOINT`
+    /// over, or `None` when the endpoint has a scheme or neither works.
+    ///
+    /// Each scheme is tried with a read-only listing of the archive prefix
+    /// ([`WalgEnvRepairProbe`]), with the file's own settings and its
+    /// path-style repair applied, so an IP endpoint is not misread as
+    /// unreachable because of `<bucket>.<ip>` addressing. Nothing is written
+    /// to the store.
+    async fn reachable_bare_endpoint_scheme(
+        &self,
+        container_name: &str,
+        evaluated: &[String],
+    ) -> Option<temps_core::s3_endpoint::S3Scheme> {
+        let endpoint = evaluated
+            .iter()
+            .find_map(|line| line.strip_prefix("AWS_ENDPOINT="))?;
+        if endpoint.contains("://") {
+            return None;
+        }
+        let base = repair_walg_env_lines(evaluated, None).unwrap_or_else(|| evaluated.to_vec());
+        for scheme in WalgEnvRepairProbe::ORDER {
+            let Some(probe_env) = repair_walg_env_lines(&base, Some(scheme)) else {
+                continue;
+            };
+            let mut env: Vec<String> = probe_env
+                .into_iter()
+                .filter(|line| line.starts_with("WALG_") || line.starts_with("AWS_"))
+                .collect();
+            env.push("S3_MAX_RETRIES=1".to_string());
+            let result = crate::externalsvc::exec_util::run_exec(
+                &self.docker,
+                container_name,
+                vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    WalgEnvRepairProbe::script(),
+                ],
+                Some(env),
+                Duration::from_secs(WalgEnvRepairProbe::TIMEOUT_SECS + 15),
+            )
+            .await;
+            match result.map(|result| split_check_exit(&result.output)) {
+                Ok(Ok((_, 0))) => return Some(scheme),
+                Ok(Ok((_, code))) => debug!(
+                    service = %self.name,
+                    container = container_name,
+                    scheme = scheme.as_str(),
+                    exit_code = code,
+                    "WAL-G could not list the archive over this scheme"
+                ),
+                Ok(Err(_)) | Err(_) => debug!(
+                    service = %self.name,
+                    container = container_name,
+                    scheme = scheme.as_str(),
+                    "The archive listing returned no result"
+                ),
+            }
+        }
+        warn!(
+            service = %self.name,
+            container = container_name,
+            "walg.env has an AWS_ENDPOINT without a scheme and WAL-G reached the store over \
+             neither https nor http; leaving the scheme unchanged. Run Test archive target, \
+             or a backup, which rewrites walg.env from the S3 source"
+        );
+        None
+    }
+
+    /// Repair the `walg.env` an existing service carries, on start.
+    ///
+    /// Installs that predate explicit endpoint schemes have a `walg.env`
+    /// whose `AWS_ENDPOINT` is a bare `host:port`, which WAL-G dials over
+    /// HTTPS: every `wal-push` to a plain-HTTP store fails and PostgreSQL
+    /// keeps every segment. `archive_command` sources the file per segment,
+    /// so rewriting it takes effect on the next segment, with no reload and
+    /// no restart. Best effort: a failure is logged and the start goes on,
+    /// leaving the file as it was; the next backup rewrites it from the S3
+    /// source anyway.
+    pub(super) async fn repair_walg_env_on_start(&self, container_name: &str) {
+        // One snapshot: what is checked, patched and compared before the
+        // write all describe the same file.
+        let snapshot = match self.read_walg_env_snapshot(container_name).await {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => return,
+            Err(error) => {
+                warn!(
+                    service = %self.name,
+                    container = container_name,
+                    error = %error,
+                    "Could not read walg.env to check its S3 endpoint; leaving it unchanged"
+                );
+                return;
+            }
+        };
+        let bare_endpoint_scheme = self
+            .reachable_bare_endpoint_scheme(container_name, &snapshot.evaluated)
+            .await;
+        let Some(repaired) = repair_walg_env_lines(&snapshot.evaluated, bare_endpoint_scheme)
+        else {
+            return;
+        };
+        // Patched, not regenerated, so nothing else in the file is lost; and
+        // written only if nobody rewrote the file since the snapshot.
+        let patched = patch_walg_env_file(&snapshot.raw, &repaired);
+        match self
+            .write_file_lines_if_unchanged(
+                container_name,
+                &patched,
+                "/var/lib/postgresql/walg.env",
+                Some(&snapshot.checksum),
+            )
+            .await
+        {
+            Ok(WalgEnvWrite::Written) => {
+                info!(
+                    service = %self.name,
+                    container = container_name,
+                    scheme = bare_endpoint_scheme.map(|scheme| scheme.as_str()),
+                    "Repaired walg.env: AWS_ENDPOINT carries the scheme WAL-G reaches the \
+                     store over and path style is forced for an IP endpoint; WAL archiving \
+                     uses it from the next attempt"
+                );
+                self.end_stale_wal_pushes(container_name).await;
+            }
+            Ok(WalgEnvWrite::ChangedConcurrently) => info!(
+                service = %self.name,
+                container = container_name,
+                "walg.env was rewritten (by a backup or repoint) while it was being repaired; \
+                 keeping the newer file, which Temps generated with the current rules"
+            ),
+            Err(error) => warn!(
+                service = %self.name,
+                container = container_name,
+                error = %error,
+                "Could not rewrite walg.env with an explicit S3 endpoint scheme; WAL archiving \
+                 may still be failing until the next backup rewrites it"
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;

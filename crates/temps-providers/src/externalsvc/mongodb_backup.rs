@@ -272,14 +272,10 @@ pub fn walg_stream_env(
     if let Some(endpoint) = container_endpoint {
         env.push(format!(
             "AWS_ENDPOINT={}",
-            if endpoint.starts_with("http") {
-                endpoint
-            } else {
-                format!("http://{endpoint}")
-            }
+            temps_core::s3_endpoint::endpoint_url(&endpoint)
         ));
     }
-    if s3.force_path_style {
+    if s3.uses_path_style() {
         env.push("AWS_S3_FORCE_PATH_STYLE=true".into());
     }
     env

@@ -2872,6 +2872,51 @@ export type ArchiveFlagResponse = {
 
 export type ArchiveMode = 'off' | 'on' | 'always' | 'unknown';
 
+/**
+ * What WAL-G said about a service's archive target.
+ */
+export type ArchiveTargetTestResponse = {
+    checked_at: string;
+    /**
+     * `AWS_ENDPOINT` exactly as WAL-G receives it.
+     */
+    endpoint: string;
+    /**
+     * Whether WAL-G uses path-style addressing.
+     */
+    force_path_style: boolean;
+    /**
+     * Set when the running container's `walg.env` differs from these
+     * settings: PostgreSQL archives with that file, so archiving can be
+     * failing even when this check passes. Says how to fix it.
+     */
+    live_settings_drift?: string | null;
+    /**
+     * A confirmation, or WAL-G's error with credentials redacted.
+     */
+    message: string;
+    /**
+     * Whether WAL-G could write a probe object to the archive target, which
+     * is what `archive_command` needs. The object is never read back, and
+     * its removal afterwards is best effort: `ok` says nothing about read
+     * or delete permission.
+     */
+    ok: boolean;
+    /**
+     * Why path style has that value.
+     */
+    path_style_reason: string;
+    /**
+     * The S3 source WAL is archived to.
+     */
+    s3_source_id: number;
+    s3_source_name: string;
+    /**
+     * `http`, `https`, or `aws` for AWS S3 itself.
+     */
+    scheme: string;
+};
+
 export type ArtifactAssembleRequest = {
     checksum: string;
     chunks: Array<string>;
@@ -9013,11 +9058,14 @@ export type CreateS3SourceRequest = {
     bucket_name: string;
     bucket_path: string;
     /**
-     * Optional endpoint URL for S3-compatible services like MinIO
+     * Optional endpoint for S3-compatible services like MinIO or RustFS,
+     * with or without a scheme. Stored with an explicit scheme: without
+     * one, `use_tls` decides it (plain `http://` when that is unset too).
      */
     endpoint?: string | null;
     /**
-     * Whether to use path-style addressing (default: true)
+     * Whether to use path-style addressing (default: true). Forced on for
+     * an IP-address endpoint and a Temps-managed object store.
      */
     force_path_style?: boolean | null;
     /**
@@ -9032,6 +9080,12 @@ export type CreateS3SourceRequest = {
      * provider; stored encrypted and never returned.
      */
     secret_key: SecretString;
+    /**
+     * Whether the endpoint is reached over TLS. Only needed for an endpoint
+     * entered without a scheme; one that conflicts with the endpoint's
+     * scheme is rejected.
+     */
+    use_tls?: boolean | null;
     worker_credentials?: WorkerCredentialsPolicy | null;
 };
 
@@ -23712,6 +23766,11 @@ export type PatchSettingsRequest = {
     image?: string | null;
 };
 
+/**
+ * Why path-style addressing is or is not used.
+ */
+export type PathStyleReason = 'configured' | 'ip_address_endpoint' | 'managed_object_store';
+
 export type PathVisitors = {
     name: string;
     percentage: number;
@@ -24737,6 +24796,7 @@ export type PortMapping = {
 export type PostgresWalHealth = {
     /**
      * Number of `archive_status*.ready` files — un-shipped WAL segments.
+     * 0 when `archive_status_unreadable` is set.
      */
     archive_backlog: number;
     /**
@@ -24744,9 +24804,36 @@ export type PostgresWalHealth = {
      * when archiving is effectively disabled despite `archive_mode = on`.
      */
     archive_command?: string | null;
+    /**
+     * The `archive_library` setting (PostgreSQL 15+), when one archives WAL
+     * instead of `archive_command`.
+     */
+    archive_library?: string | null;
     archive_mode: ArchiveMode;
+    /**
+     * Age of the oldest `archive_status*.ready` file (seconds), `None`
+     * when no segment is waiting.
+     */
+    archive_oldest_ready_age_secs?: number | null;
+    /**
+     * The role may not list `archive_status`: the backlog, the oldest
+     * waiting segment's age and stall detection are unknown.
+     */
+    archive_status_unreadable?: boolean;
+    /**
+     * Segments archived since the statistics were last reset.
+     */
+    archiver_archived_count?: number | null;
     archiver_failed_count?: number | null;
+    /**
+     * When a segment was last archived successfully.
+     */
+    archiver_last_archived_at?: string | null;
     archiver_last_failed_at?: string | null;
+    /**
+     * The segment whose archiving failed last.
+     */
+    archiver_last_failed_wal?: string | null;
     /**
      * `max_wal_size` setting in bytes (parsed from `pg_settings`).
      */
@@ -29437,6 +29524,15 @@ export type S3SourceResponse = {
     bucket_name: string;
     bucket_path: string;
     created_at: number;
+    /**
+     * The endpoint every client (WAL-G, restore and worker jobs) receives,
+     * always with an explicit scheme. `None` for AWS S3 itself.
+     */
+    effective_endpoint?: string | null;
+    /**
+     * Whether clients actually use path-style addressing.
+     */
+    effective_force_path_style: boolean;
     endpoint?: string | null;
     force_path_style?: boolean | null;
     id: number;
@@ -29448,6 +29544,12 @@ export type S3SourceResponse = {
      */
     managed_by_cloud: boolean;
     name: string;
+    /**
+     * Why `effective_force_path_style` has its value: the source's own
+     * setting, or forced because the endpoint is an IP address or a
+     * Temps-managed object store.
+     */
+    path_style_reason: PathStyleReason;
     region: string;
     updated_at: number;
     /**
@@ -37152,7 +37254,8 @@ export type UpdateS3SourceRequest = {
      */
     bucket_path?: string | null;
     /**
-     * Optional new endpoint URL for S3-compatible services
+     * Optional new endpoint for S3-compatible services, with or without a
+     * scheme. An empty string clears it (AWS S3 itself).
      */
     endpoint?: string | null;
     /**
@@ -37168,6 +37271,11 @@ export type UpdateS3SourceRequest = {
      */
     region?: string | null;
     secret_key?: SecretString | null;
+    /**
+     * Whether the endpoint is reached over TLS; decides the scheme of an
+     * endpoint entered without one, and must agree with one entered with it.
+     */
+    use_tls?: boolean | null;
     worker_credentials?: WorkerCredentialsPolicy | null;
 };
 
@@ -38332,6 +38440,18 @@ export type WalWarning = {
 } | {
     kind: 'archive_mode_without_command';
 } | {
+    kind: 'archive_stall_check_unavailable';
+} | {
+    kind: 'archive_failing';
+    last_archived_at?: string | null;
+    last_failed_at?: string | null;
+    last_failed_wal?: string | null;
+    /**
+     * How long the oldest un-archived segment has waited, when
+     * archiving has stalled rather than (or as well as) failed.
+     */
+    stalled_secs?: number | null;
+} | {
     kind: 'wal_not_recycled';
     oldest_age_secs: number;
 };
@@ -39396,6 +39516,15 @@ export type S3SourceResponseWritable = {
     bucket_name: string;
     bucket_path: string;
     created_at: number;
+    /**
+     * The endpoint every client (WAL-G, restore and worker jobs) receives,
+     * always with an explicit scheme. `None` for AWS S3 itself.
+     */
+    effective_endpoint?: string | null;
+    /**
+     * Whether clients actually use path-style addressing.
+     */
+    effective_force_path_style: boolean;
     endpoint?: string | null;
     force_path_style?: boolean | null;
     id: number;
@@ -39407,6 +39536,12 @@ export type S3SourceResponseWritable = {
      */
     managed_by_cloud: boolean;
     name: string;
+    /**
+     * Why `effective_force_path_style` has its value: the source's own
+     * setting, or forced because the endpoint is an IP address or a
+     * Temps-managed object store.
+     */
+    path_style_reason: PathStyleReason;
     region: string;
     secret_key: string;
     updated_at: number;
@@ -56471,6 +56606,56 @@ export type UpgradeServiceResponses = {
 };
 
 export type UpgradeServiceResponse = UpgradeServiceResponses[keyof UpgradeServiceResponses];
+
+export type TestWalArchiveTargetData = {
+    body?: never;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/wal-archive/test';
+};
+
+export type TestWalArchiveTargetErrors = {
+    /**
+     * The service is not PostgreSQL
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Service not found
+     */
+    404: ProblemDetails;
+    /**
+     * Archiving is not set up, its S3 source is gone, the service runs on a worker node, it is a cluster (no continuous archiving), or local workloads are disabled
+     */
+    409: ProblemDetails;
+    /**
+     * The check could not run
+     */
+    500: ProblemDetails;
+};
+
+export type TestWalArchiveTargetError = TestWalArchiveTargetErrors[keyof TestWalArchiveTargetErrors];
+
+export type TestWalArchiveTargetResponses = {
+    /**
+     * The check ran; `ok` says whether WAL-G could write to the archive target
+     */
+    200: ArchiveTargetTestResponse;
+};
+
+export type TestWalArchiveTargetResponse = TestWalArchiveTargetResponses[keyof TestWalArchiveTargetResponses];
 
 export type GetPostgresWalHealthData = {
     body?: never;

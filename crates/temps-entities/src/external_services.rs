@@ -107,7 +107,7 @@ pub struct Model {
     /// (`healthcheck_retries` is a count). NULL inherits the instance default
     /// (`AppSettings.managed_service_healthchecks`), then Temps' built-in
     /// value. Applied when the container is next created or recreated. Added
-    /// by `m20261112_000001_add_external_services_healthcheck_overrides`.
+    /// by `m20261113_000001_add_external_services_healthcheck_overrides`.
     pub healthcheck_interval_secs: Option<i32>,
     pub healthcheck_start_interval_secs: Option<i32>,
     pub healthcheck_start_period_secs: Option<i32>,

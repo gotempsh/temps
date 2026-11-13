@@ -6123,6 +6123,69 @@
         ],
         "type": "string"
       },
+      "ArchiveTargetTestResponse": {
+        "description": "What WAL-G said about a service's archive target.",
+        "properties": {
+          "checked_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "endpoint": {
+            "description": "`AWS_ENDPOINT` exactly as WAL-G receives it.",
+            "example": "http://10.0.0.5:9000",
+            "type": "string"
+          },
+          "force_path_style": {
+            "description": "Whether WAL-G uses path-style addressing.",
+            "type": "boolean"
+          },
+          "live_settings_drift": {
+            "description": "Set when the running container's `walg.env` differs from these\nsettings: PostgreSQL archives with that file, so archiving can be\nfailing even when this check passes. Says how to fix it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "message": {
+            "description": "A confirmation, or WAL-G's error with credentials redacted.",
+            "type": "string"
+          },
+          "ok": {
+            "description": "Whether WAL-G could write a probe object to the archive target, which\nis what `archive_command` needs. The object is never read back, and\nits removal afterwards is best effort: `ok` says nothing about read\nor delete permission.",
+            "type": "boolean"
+          },
+          "path_style_reason": {
+            "description": "Why path style has that value.",
+            "example": "forced: the endpoint is an IP address",
+            "type": "string"
+          },
+          "s3_source_id": {
+            "description": "The S3 source WAL is archived to.",
+            "format": "int32",
+            "type": "integer"
+          },
+          "s3_source_name": {
+            "type": "string"
+          },
+          "scheme": {
+            "description": "`http`, `https`, or `aws` for AWS S3 itself.",
+            "example": "http",
+            "type": "string"
+          }
+        },
+        "required": [
+          "ok",
+          "s3_source_id",
+          "s3_source_name",
+          "endpoint",
+          "scheme",
+          "force_path_style",
+          "path_style_reason",
+          "message",
+          "checked_at"
+        ],
+        "type": "object"
+      },
       "ArtifactAssembleRequest": {
         "properties": {
           "checksum": {
@@ -18648,7 +18711,7 @@
             "type": "string"
           },
           "endpoint": {
-            "description": "Optional endpoint URL for S3-compatible services like MinIO",
+            "description": "Optional endpoint for S3-compatible services like MinIO or RustFS,\nwith or without a scheme. Stored with an explicit scheme: without\none, `use_tls` decides it (plain `http://` when that is unset too).",
             "example": "http://minio.example.com:9000",
             "type": [
               "string",
@@ -18656,7 +18719,7 @@
             ]
           },
           "force_path_style": {
-            "description": "Whether to use path-style addressing (default: true)",
+            "description": "Whether to use path-style addressing (default: true). Forced on for\nan IP-address endpoint and a Temps-managed object store.",
             "example": true,
             "type": [
               "boolean",
@@ -18680,6 +18743,14 @@
           "secret_key": {
             "$ref": "#/components/schemas/SecretString",
             "description": "Secret access key that goes with the access key ID. Shown once by the\nprovider; stored encrypted and never returned."
+          },
+          "use_tls": {
+            "description": "Whether the endpoint is reached over TLS. Only needed for an endpoint\nentered without a scheme; one that conflicts with the endpoint's\nscheme is rejected.",
+            "example": false,
+            "type": [
+              "boolean",
+              "null"
+            ]
           },
           "worker_credentials": {
             "oneOf": [
@@ -51044,6 +51115,15 @@
         },
         "type": "object"
       },
+      "PathStyleReason": {
+        "description": "Why path-style addressing is or is not used.",
+        "enum": [
+          "configured",
+          "ip_address_endpoint",
+          "managed_object_store"
+        ],
+        "type": "string"
+      },
       "PathVisitors": {
         "properties": {
           "name": {
@@ -52898,7 +52978,7 @@
       "PostgresWalHealth": {
         "properties": {
           "archive_backlog": {
-            "description": "Number of `archive_status/*.ready` files — un-shipped WAL segments.",
+            "description": "Number of `archive_status/*.ready` files — un-shipped WAL segments.\n0 when `archive_status_unreadable` is set.",
             "format": "int64",
             "type": "integer"
           },
@@ -52909,8 +52989,35 @@
               "null"
             ]
           },
+          "archive_library": {
+            "description": "The `archive_library` setting (PostgreSQL 15+), when one archives WAL\ninstead of `archive_command`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "archive_mode": {
             "$ref": "#/components/schemas/ArchiveMode"
+          },
+          "archive_oldest_ready_age_secs": {
+            "description": "Age of the oldest `archive_status/*.ready` file (seconds), `None`\nwhen no segment is waiting.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "archive_status_unreadable": {
+            "description": "The role may not list `archive_status`: the backlog, the oldest\nwaiting segment's age and stall detection are unknown.",
+            "type": "boolean"
+          },
+          "archiver_archived_count": {
+            "description": "Segments archived since the statistics were last reset.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "archiver_failed_count": {
             "format": "int64",
@@ -52919,8 +53026,23 @@
               "null"
             ]
           },
+          "archiver_last_archived_at": {
+            "description": "When a segment was last archived successfully.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "archiver_last_failed_at": {
             "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "archiver_last_failed_wal": {
+            "description": "The segment whose archiving failed last.",
             "type": [
               "string",
               "null"
@@ -62861,6 +62983,18 @@
             "format": "int64",
             "type": "integer"
           },
+          "effective_endpoint": {
+            "description": "The endpoint every client (WAL-G, restore and worker jobs) receives,\nalways with an explicit scheme. `None` for AWS S3 itself.",
+            "example": "http://10.0.0.5:9000",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "effective_force_path_style": {
+            "description": "Whether clients actually use path-style addressing.",
+            "type": "boolean"
+          },
           "endpoint": {
             "example": "http://minio.example.com:9000",
             "type": [
@@ -62888,6 +63022,10 @@
           "name": {
             "type": "string"
           },
+          "path_style_reason": {
+            "$ref": "#/components/schemas/PathStyleReason",
+            "description": "Why `effective_force_path_style` has its value: the source's own\nsetting, or forced because the endpoint is an IP address or a\nTemps-managed object store."
+          },
           "region": {
             "type": "string"
           },
@@ -62912,6 +63050,8 @@
           "access_key_id",
           "secret_key",
           "region",
+          "effective_force_path_style",
+          "path_style_reason",
           "is_default",
           "managed_by_cloud",
           "worker_credentials",
@@ -79157,7 +79297,7 @@
             ]
           },
           "endpoint": {
-            "description": "Optional new endpoint URL for S3-compatible services",
+            "description": "Optional new endpoint for S3-compatible services, with or without a\nscheme. An empty string clears it (AWS S3 itself).",
             "example": "http://minio.example.com:9000",
             "type": [
               "string",
@@ -79195,6 +79335,14 @@
               {
                 "type": "null"
               }
+            ]
+          },
+          "use_tls": {
+            "description": "Whether the endpoint is reached over TLS; decides the scheme of an\nendpoint entered without one, and must agree with one entered with it.",
+            "example": false,
+            "type": [
+              "boolean",
+              "null"
             ]
           },
           "worker_credentials": {
@@ -82241,13 +82389,71 @@
             "type": "object"
           },
           {
-            "description": "`archive_mode = on` but `archive_command` is empty / `/bin/true`.\nWAL accumulates forever waiting for a destination that never accepts.",
+            "description": "`archive_mode = on` and nothing stores WAL, with no `archive_library`\neither. With an empty `archive_command`, PostgreSQL keeps every\nsegment waiting for a command and `pg_wal` grows; with a no-op such as\n`/bin/true`, every segment is counted as archived and recycled, and\nnothing is stored. `archive_command` on the snapshot tells them apart.",
             "properties": {
               "kind": {
                 "enum": [
                   "archive_mode_without_command"
                 ],
                 "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Archiving is on, but the monitoring role may not list\n`archive_status` (`pg_ls_archive_statusdir()` needs superuser or\n`pg_monitor`), so a stalled archiver that has reported no failure\nyet cannot be detected, and the waiting-segment count reads 0.",
+            "properties": {
+              "kind": {
+                "enum": [
+                  "archive_stall_check_unavailable"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "`archive_command`'s most recent attempt failed and nothing has\narchived since: PostgreSQL keeps every segment from here on.",
+            "properties": {
+              "kind": {
+                "enum": [
+                  "archive_failing"
+                ],
+                "type": "string"
+              },
+              "last_archived_at": {
+                "format": "date-time",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "last_failed_at": {
+                "format": "date-time",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "last_failed_wal": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "stalled_secs": {
+                "description": "How long the oldest un-archived segment has waited, when\narchiving has stalled rather than (or as well as) failed.",
+                "format": "int64",
+                "type": [
+                  "integer",
+                  "null"
+                ]
               }
             },
             "required": [
@@ -112663,6 +112869,103 @@
           }
         },
         "summary": "Upgrade external service to new Docker image with data migration\nThis endpoint uses service-specific upgrade procedures (e.g., pg_upgrade for PostgreSQL)",
+        "tags": [
+          "External Services"
+        ]
+      }
+    },
+    "/external-services/{id}/wal-archive/test": {
+      "post": {
+        "operationId": "test_wal_archive_target",
+        "parameters": [
+          {
+            "description": "External service ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArchiveTargetTestResponse"
+                }
+              }
+            },
+            "description": "The check ran; `ok` says whether WAL-G could write to the archive target"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The service is not PostgreSQL"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Service not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Archiving is not set up, its S3 source is gone, the service runs on a worker node, it is a cluster (no continuous archiving), or local workloads are disabled"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The check could not run"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
         "tags": [
           "External Services"
         ]

@@ -375,6 +375,8 @@ impl TempsPlugin for ProvidersPlugin {
             crate::handlers::workload_handlers::configure_routes().with_state(app_state.clone());
         let server_tls_routes =
             crate::handlers::server_tls_handlers::configure_routes().with_state(app_state.clone());
+        let archive_target_routes = crate::handlers::archive_target_handlers::configure_routes()
+            .with_state(app_state.clone());
         let healthcheck_defaults =
             context.require_service::<crate::services::HealthcheckDefaultsService>();
         let healthcheck_routes = crate::handlers::healthcheck_handlers::configure_routes()
@@ -390,6 +392,7 @@ impl TempsPlugin for ProvidersPlugin {
             .merge(data_import_routes)
             .merge(workload_routes)
             .merge(server_tls_routes)
+            .merge(archive_target_routes)
             .merge(healthcheck_routes);
         Some(PluginRoutes::new(router))
     }
@@ -405,11 +408,20 @@ impl TempsPlugin for ProvidersPlugin {
         let workload = <WorkloadModeApiDoc as OpenApiTrait>::openapi();
         use crate::handlers::server_tls_handlers::ServerTlsApiDoc;
         let server_tls = <ServerTlsApiDoc as OpenApiTrait>::openapi();
+        use crate::handlers::archive_target_handlers::ArchiveTargetApiDoc;
+        let archive_target = <ArchiveTargetApiDoc as OpenApiTrait>::openapi();
         use crate::handlers::healthcheck_handlers::HealthcheckApiDoc;
         let healthcheck = <HealthcheckApiDoc as OpenApiTrait>::openapi();
         Some(merge_openapi_schemas(
             base,
-            vec![pg_stat, data_import, workload, server_tls, healthcheck],
+            vec![
+                pg_stat,
+                data_import,
+                workload,
+                server_tls,
+                archive_target,
+                healthcheck,
+            ],
         ))
     }
 }

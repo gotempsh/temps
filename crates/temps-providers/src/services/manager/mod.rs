@@ -4,6 +4,7 @@
 //! `ExternalServiceManager` methods, grouped by concern. Each submodule adds
 //! an `impl ExternalServiceManager` block.
 
+mod archive_target;
 mod backup_support;
 mod cluster_auth;
 mod cluster_backup;
@@ -30,6 +31,7 @@ mod server_tls;
 mod stats_poll;
 mod wal_health;
 
+pub use archive_target::{ArchiveTargetTestError, ArchiveTargetTestOutcome};
 pub use healthcheck::{
     service_overrides, HealthcheckApplied, HealthcheckCapability, ServiceHealthcheck,
     ServiceHealthcheckUpdate,

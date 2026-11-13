@@ -41,6 +41,7 @@ pub use manager::{
     service_overrides, HealthcheckApplied, HealthcheckCapability, ServiceHealthcheck,
     ServiceHealthcheckUpdate,
 };
+pub use manager::{ArchiveTargetTestError, ArchiveTargetTestOutcome};
 pub use manager::{WalHealthReading, WalHealthUnchecked, WalProbeOutcome};
 #[cfg(test)]
 pub(crate) use manager::{HEALTHCHECK_CHANNEL, HEALTHCHECK_REGISTRY_TEST_LOCK};

@@ -531,3 +531,27 @@ fn a_binlog_credential_is_reused_within_its_lifetime_only() {
         "the source's own credential is never cached"
     );
 }
+
+/// The binary-log archiver addresses a store the way its backups do: an
+/// unset `force_path_style` on a hostname endpoint means path style, and an
+/// explicit choice is kept.
+#[test]
+fn binlog_uploads_treat_an_unset_path_style_as_every_other_client_does() {
+    let encryption = temps_core::EncryptionService::new(
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    )
+    .unwrap();
+    let mut source = binlog_source(Utc::now());
+    source.access_key_id = encryption.encrypt_string("access").unwrap();
+    source.secret_key = encryption.encrypt_string("secret").unwrap();
+    source.endpoint = Some("http://objects.example.internal:9000".to_string());
+
+    source.force_path_style = None;
+    let creds = s3_credentials_from_source(&encryption, &source).unwrap();
+    assert!(creds.force_path_style);
+    assert_eq!(creds.access_key_id, "access");
+
+    source.force_path_style = Some(false);
+    let creds = s3_credentials_from_source(&encryption, &source).unwrap();
+    assert!(!creds.force_path_style);
+}

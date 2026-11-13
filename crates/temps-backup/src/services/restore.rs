@@ -769,7 +769,7 @@ impl RestoreService {
                             endpoint: s3_source.endpoint.clone(),
                             bucket_name: s3_source.bucket_name.clone(),
                             bucket_path: s3_source.bucket_path.clone(),
-                            force_path_style: s3_source.force_path_style.unwrap_or(true),
+                            force_path_style: s3_source.effective_path_style(true).force_path_style,
                         };
                         let client = build_s3_client(&creds);
                         if let Ok(Some(loc)) = resolve_backup_location_from_s3(
@@ -2815,7 +2815,7 @@ async fn run_restore_inner(
         endpoint: s3_source.endpoint.clone(),
         bucket_name: s3_source.bucket_name.clone(),
         bucket_path: s3_source.bucket_path.clone(),
-        force_path_style: s3_source.force_path_style.unwrap_or(true),
+        force_path_style: s3_source.effective_path_style(true).force_path_style,
     };
 
     // Build a plaintext copy of the source row. The original model carries

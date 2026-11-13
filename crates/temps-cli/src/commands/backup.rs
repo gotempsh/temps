@@ -147,7 +147,7 @@ struct ListBackupsArgs {
 struct RestoreBackupArgs {
     /// Database connection URL to restore to. Prefer TEMPS_DATABASE_URL (or TEMPS_DATABASE_URL_FILE / the systemd credential temps_database_url): the flag form puts the password in the process command line
     #[arg(long, env = "TEMPS_DATABASE_URL", hide_env_values = true)]
-    database_url: String,
+    database_url: Option<String>,
 
     /// Temps data directory whose recovery secrets will be restored
     #[arg(long, env = "TEMPS_DATA_DIR")]
@@ -232,7 +232,7 @@ struct RestoreServiceArgs {
 
     /// Database URL for the temps database (needed to query service config). Prefer TEMPS_DATABASE_URL (or TEMPS_DATABASE_URL_FILE / the systemd credential temps_database_url): the flag form puts the password in the process command line
     #[arg(long, env = "TEMPS_DATABASE_URL", hide_env_values = true)]
-    database_url: String,
+    database_url: Option<String>,
 
     /// S3 region
     #[arg(long, env = "S3_REGION", default_value = "us-east-1")]
@@ -378,6 +378,13 @@ impl BackupCommand {
     }
 
     fn execute_restore(args: RestoreBackupArgs) -> anyhow::Result<()> {
+        // A restore overwrites what it targets, so the target must be this
+        // command's own configuration, never a discovered service.
+        let database_url = crate::database_url_source::resolve_database_url(
+            args.database_url.as_deref(),
+            crate::database_url_source::UrlDiscovery::ThisProcess,
+        )?
+        .into_url();
         info!("Restoring backup from S3: {}", args.backup_id);
 
         // Create tokio runtime for async operations
@@ -515,16 +522,14 @@ impl BackupCommand {
             )?;
         }
 
-        if !args.database_url.starts_with("postgres://")
-            && !args.database_url.starts_with("postgresql://")
-        {
+        if !database_url.starts_with("postgres://") && !database_url.starts_with("postgresql://") {
             return Err(anyhow::anyhow!(
                 "Only PostgreSQL databases are supported. Database URL must start with postgres:// or postgresql://"
             ));
         }
 
         rt.block_on(Self::validate_restore_dry_run(
-            &args.database_url,
+            &database_url,
             &s3_client,
             &args.bucket_name,
             backup,
@@ -595,7 +600,7 @@ impl BackupCommand {
         println!(
             "{} {}",
             "Target Database:".bright_white(),
-            Self::redact_database_url(&args.database_url).bright_white()
+            Self::redact_database_url(&database_url).bright_white()
         );
         println!();
         println!(
@@ -713,7 +718,7 @@ impl BackupCommand {
 
         println!("{}", "Restoring PostgreSQL database...".bright_white());
         let is_plain_sql = backup_key.ends_with(".sql.gz") || backup_key.ends_with(".sql");
-        Self::restore_postgres(&rt, &args.database_url, &final_backup_path, is_plain_sql)?;
+        Self::restore_postgres(&rt, &database_url, &final_backup_path, is_plain_sql)?;
         drop(decompressed_backup);
 
         // The PostgreSQL restore is the primary mutation the operator
@@ -722,7 +727,7 @@ impl BackupCommand {
         // services or materialize secrets in the wrong storage model.
         let restored_db = rt
             .block_on(sea_orm::Database::connect(temps_database::connect_options(
-                &args.database_url,
+                &database_url,
             )))
             .map_err(|error| {
                 anyhow::anyhow!(
@@ -740,7 +745,7 @@ impl BackupCommand {
         // Restore external services only after the restored database's durable
         // installation mode has accepted this recovery configuration.
         rt.block_on(Self::restore_external_services(
-            &args.database_url,
+            &database_url,
             &s3_client,
             &s3_credentials,
             &metadata,
@@ -2040,6 +2045,13 @@ impl BackupCommand {
     }
 
     fn execute_restore_service(args: RestoreServiceArgs) -> anyhow::Result<()> {
+        // A restore overwrites what it targets, so the target must be this
+        // command's own configuration, never a discovered service.
+        let database_url = crate::database_url_source::resolve_database_url(
+            args.database_url.as_deref(),
+            crate::database_url_source::UrlDiscovery::ThisProcess,
+        )?
+        .into_url();
         info!(
             "Restoring external service from backup: {}",
             args.service_name
@@ -2186,7 +2198,7 @@ impl BackupCommand {
         println!("{}", "Connecting to temps database...".bright_white());
         let db = rt
             .block_on(Database::connect(temps_database::connect_options(
-                &args.database_url,
+                &database_url,
             )))
             .map_err(|e| anyhow::anyhow!("Failed to connect to temps database: {}", e))?;
 

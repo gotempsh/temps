@@ -131,7 +131,7 @@ instead of starting an app that cannot resolve its dependency hostnames.
 
 | Variable             | CLI Flag         | Default    | Description                  |
 | -------------------- | ---------------- | ---------- | ---------------------------- |
-| `TEMPS_DATABASE_URL` | `--database-url` | (required) | PostgreSQL connection string |
+| `TEMPS_DATABASE_URL` | `--database-url` | -- | PostgreSQL connection string. `serve`, `proxy` and `setup` need a database URL from this, the flag, `TEMPS_DATABASE_URL_FILE` or the `temps_database_url` credential |
 | `TEMPS_DATABASE_URL_FILE` | -- | -- | Path to a file whose content is the connection string. Used only when `TEMPS_DATABASE_URL` is not set |
 
 When neither variable is set, Temps also reads the systemd credential
@@ -139,6 +139,36 @@ When neither variable is set, Temps also reads the systemd credential
 from `$CREDENTIALS_DIRECTORY`. Prefer any of these over `--database-url`: the
 flag puts the password in `ps` output and in the service definition, and Temps
 logs a warning when it is used.
+
+Admin commands run from a shell on the server's host (`temps doctor`,
+`temps migrate`, `temps reset-admin-password`, `temps api-key`,
+`temps domain import`, `temps backfill`, `temps network setup-multi-node`, and
+the pre-update lock-capacity check of `temps upgrade`) fall back to the
+installed service when none of the above is set: they read `--database-url`
+and `--data-dir` from `/etc/systemd/system/temps.service` (with its drop-ins,
+`Environment=`, `EnvironmentFile=` and `LoadCredential=`) or from the launchd
+agent `~/Library/LaunchAgents/dev.temps.temps.plist`, and say which file they
+used. With the server's database, a command that needs the encryption key reads
+it the way the server does (the service's `TEMPS_ENCRYPTION_KEY` /
+`TEMPS_ENCRYPTION_KEY_FILE`, else its data directory) and never creates one.
+A URL is the server's database when it names the same host, port and database
+as the service's URL: `postgres://` or `postgresql://`, an explicit default
+port, credentials and options such as `sslmode` do not matter, but `localhost`
+and `127.0.0.1` count as different hosts. With any other database, or when the
+service definition is ignored (`temps doctor` shows why), these commands
+resolve the key as `temps serve` would on this host, and may create one.
+If this shell sets any of `TEMPS_STATELESS`, `TEMPS_AUTH_SECRET`,
+`TEMPS_AUTH_SECRET_FILE`, `TEMPS_ENCRYPTION_KEY` or `TEMPS_ENCRYPTION_KEY_FILE`,
+the shell's settings replace all of the service's secret settings (to test an
+injected secret). These commands print to stderr which key they used and from
+which environment, and `temps doctor` reports the same. When the service's own
+URL cannot be read (for example a root-only `EnvironmentFile=` read without
+sudo), they cannot tell whether the database is the server's, so they create no
+key and use only one set in this shell: run them with sudo, or set
+`TEMPS_ENCRYPTION_KEY` / `TEMPS_ENCRYPTION_KEY_FILE` and pass `--data-dir`.
+`temps serve`, `temps proxy`, `temps setup` and `temps backup restore` never
+fall back: they use only their own configuration. When no source supplies a
+URL, the error lists every place that was checked.
 
 ### Database URL Format
 
