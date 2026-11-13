@@ -1,10 +1,29 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { beforeEach, describe, expect, mock, test } from 'bun:test'
+import { afterAll, beforeEach, describe, expect, mock, test } from 'bun:test'
 import { MemoryRouter } from 'react-router'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+
+// `mock.module` lasts for the whole `bun test` process, so every module
+// replaced below is put back after this file: otherwise each test file that
+// runs later gets this file's fake user, plugins and platform features.
+const MOCKED_MODULES = [
+  '@/contexts/AuthContext',
+  '@/contexts/BreadcrumbContext',
+  '@/hooks/usePlatformFeatures',
+  '@/hooks/usePageTitle',
+  '@/hooks/useSensitiveActionVerification',
+  '@/hooks/usePlugins',
+] as const
+const realModules = new Map<string, Record<string, unknown>>()
+for (const path of MOCKED_MODULES) {
+  realModules.set(path, { ...(await import(path)) })
+}
+afterAll(() => {
+  for (const [path, real] of realModules) mock.module(path, () => real)
+})
 
 let role = 'reader'
 let pluginsSupported = true
