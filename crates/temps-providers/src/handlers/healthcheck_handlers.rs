@@ -93,6 +93,7 @@ fn healthcheck_specific_problem(error: &ExternalServiceError) -> Option<Problem>
     use ExternalServiceError as E;
     let (problem, title) = match error {
         E::InvalidHealthcheck { .. } => (bad_request(), "Invalid Healthcheck"),
+        E::HealthcheckSettingsBusy { .. } => (conflict(), "Healthcheck Settings Busy"),
         E::HealthcheckUnsupported { .. } => {
             (conflict(), "Healthcheck Not Available For This Service")
         }
@@ -1081,6 +1082,57 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         let detail = body["detail"].as_str().unwrap_or_default();
         assert!(detail.contains("60s"), "{detail}");
+    }
+
+    /// Another process may have saved a default this one's registry has not
+    /// heard of yet: an override is checked against the default as saved.
+    #[tokio::test]
+    async fn an_override_is_checked_against_the_saved_default_not_a_stale_copy() {
+        let _registry = REGISTRY_LOCK.lock().await;
+        let Some(database) = test_database("saved default check test").await else {
+            return;
+        };
+        let db = database.connection_arc();
+        let row = insert_service(db.as_ref(), "cache-saved-default", "redis", "standalone").await;
+        let app = state(db, RecordingAuditLogger::default());
+        let (status, body) = body_json(
+            update_healthcheck_defaults(
+                RequireAuth(auth(temps_auth::Role::Admin)),
+                State(app.clone()),
+                Extension(metadata()),
+                Json(interval(15)),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        // This process has not heard of it.
+        temps_providers_core::healthcheck::registry::set_instance_default(
+            HealthcheckOverrides::default(),
+        );
+
+        // A 20s timeout fits the built-in 30s interval, not the saved 15s.
+        let (status, body) = body_json(
+            update_service_healthcheck(
+                RequireAuth(auth(temps_auth::Role::Admin)),
+                State(app),
+                Path(row.id),
+                Extension(metadata()),
+                Json(HealthcheckOverrides {
+                    timeout_secs: Some(20),
+                    ..Default::default()
+                }),
+            )
+            .await,
+        )
+        .await;
+        temps_providers_core::healthcheck::registry::clear_service(row.id);
+        temps_providers_core::healthcheck::registry::set_instance_default(
+            HealthcheckOverrides::default(),
+        );
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let detail = body["detail"].as_str().unwrap_or_default();
+        assert!(detail.contains("15s"), "{detail}");
     }
 
     #[tokio::test]

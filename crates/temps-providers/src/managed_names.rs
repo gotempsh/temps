@@ -694,6 +694,7 @@ pub fn enable_failure_problem(kind: ManagedServiceKind, error: &ExternalServiceE
         | ExternalServiceError::ClusterNotSettled { .. }
         | ExternalServiceError::ClusterBusy { .. }
         | ExternalServiceError::LockTimeout { .. }
+        | ExternalServiceError::HealthcheckSettingsBusy { .. }
         | ExternalServiceError::DeletionFailed { .. }
         | ExternalServiceError::ServiceHasLinkedProjects { .. }
         | ExternalServiceError::EnvironmentVariableNotFound { .. }

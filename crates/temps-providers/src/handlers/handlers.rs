@@ -213,6 +213,7 @@ fn data_safety_problem(error: &crate::services::ExternalServiceError) -> Option<
         | E::ClusterNotSettled { .. }
         | E::ClusterBusy { .. }
         | E::LockTimeout { .. }
+        | E::HealthcheckSettingsBusy { .. }
         | E::Engine { .. } => None,
     }
 }
@@ -279,6 +280,7 @@ fn service_name_problem(error: &crate::services::ExternalServiceError) -> Option
         | E::ClusterNotSettled { .. }
         | E::ClusterBusy { .. }
         | E::LockTimeout { .. }
+        | E::HealthcheckSettingsBusy { .. }
         | E::Engine { .. }
         | E::NoSandboxAccessEngine { .. }
         | E::SandboxAccessUnsupported { .. }
@@ -305,6 +307,7 @@ fn cluster_placement_problem(error: &crate::services::ExternalServiceError) -> O
         E::ClusterNotSettled { .. } => "Cluster Not Ready",
         E::ClusterBusy { .. } => "Cluster Busy",
         E::LockTimeout { .. } => "Service Busy",
+        E::HealthcheckSettingsBusy { .. } => "Healthcheck Settings Busy",
         // A worker node at its limit of backups and restores: retry once
         // one finishes.
         E::NodeBusy { .. } => "Node Busy",

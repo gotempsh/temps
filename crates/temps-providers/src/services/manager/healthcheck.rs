@@ -18,7 +18,7 @@ use bollard::query_parameters::InspectContainerOptions;
 use chrono::Utc;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseBackend, EntityTrait,
-    QueryFilter, QuerySelect, Set, Statement,
+    QueryFilter, QuerySelect, Set, Statement, TransactionTrait,
 };
 use serde::Serialize;
 use temps_entities::external_service_workload_mode::ServiceWorkloadMode;
@@ -204,6 +204,25 @@ fn container_engine(
     })))
 }
 
+/// What a container recreated to apply its healthcheck was given: Docker's
+/// record of it when it can be read, else `expected`, what it was created
+/// with. A daemon without `StartInterval` support does not store the start
+/// interval, so that one is the one it was sent.
+fn applied_timings(
+    running: Option<HealthcheckTimings>,
+    expected: HealthcheckTimings,
+    support: StartIntervalSupport,
+) -> HealthcheckTimings {
+    match running {
+        Some(running) if support == StartIntervalSupport::Unsupported => HealthcheckTimings {
+            start_interval_secs: expected.start_interval_secs,
+            ..running
+        },
+        Some(running) => running,
+        None => expected,
+    }
+}
+
 /// The healthcheck as Docker stored it, in whole seconds.
 fn timings_of(health: &HealthConfig) -> Option<HealthcheckTimings> {
     let secs = |nanos: Option<i64>| -> Option<u32> { u32::try_from(nanos? / 1_000_000_000).ok() };
@@ -258,6 +277,38 @@ pub(crate) static HEALTHCHECK_REGISTRY_TEST_LOCK: tokio::sync::Mutex<()> =
 /// The Postgres channel [`ExternalServiceManager::notify_healthcheck_change`]
 /// sends a changed service's id on.
 pub(crate) const HEALTHCHECK_CHANNEL: &str = "external_service_healthcheck_change";
+
+/// Take the database lock every healthcheck settings save holds, for the
+/// rest of `txn`: the instance default and each service's overrides are
+/// checked against each other, and [`HEALTHCHECK_WRITES`] only orders the
+/// saves of one process. Under it, each save reads what the others
+/// committed before checking the combination.
+async fn lock_healthcheck_settings(
+    txn: &sea_orm::DatabaseTransaction,
+) -> Result<(), sea_orm::DbErr> {
+    txn.execute_unprepared(
+        "SELECT pg_advisory_xact_lock(hashtextextended('external-service-healthcheck-settings', 0))",
+    )
+    .await
+    .map(|_| ())
+}
+
+/// The instance default as saved, read in `txn`: not this process's
+/// registry copy, which another process's save may not have reached yet.
+async fn saved_instance_default(
+    txn: &sea_orm::DatabaseTransaction,
+) -> Result<HealthcheckOverrides, sea_orm::DbErr> {
+    let row = temps_entities::settings::Entity::find_by_id(1)
+        .one(txn)
+        .await?;
+    Ok(row
+        .map(|row| {
+            overrides_from_settings(
+                temps_config::AppSettings::from_json(row.data).managed_service_healthchecks,
+            )
+        })
+        .unwrap_or_default())
+}
 
 impl ExternalServiceManager {
     /// Why Temps will not recreate a control-plane service's container from
@@ -464,12 +515,14 @@ impl ExternalServiceManager {
                 service_id: Some(service_id),
                 source,
             })?;
-        // Held through the commit and the registry publish; the combination
-        // check reads the instance default under it too.
+        // Held through the commit and the registry publish, so the registry
+        // ends with the overrides saved last.
         let _writes = HEALTHCHECK_WRITES.lock().await;
         let service = self.get_service(service_id).await?;
         let target = self.healthcheck_target(&service)?;
-        if !overrides.is_empty() {
+        let engine = if overrides.is_empty() {
+            None
+        } else {
             let Some(engine) = target.engine else {
                 return Err(ExternalServiceError::HealthcheckUnsupported {
                     service_id,
@@ -481,20 +534,14 @@ impl ExternalServiceManager {
                         .unwrap_or_else(|| "it has no Docker healthcheck".to_string()),
                 });
             };
-            let builtin = HealthcheckTimings::builtin(engine);
-            healthcheck::resolve(&overrides, &registry::instance_default(), &builtin)
-                .validate(healthcheck::readiness_wait_secs(engine))
-                .map_err(|source| ExternalServiceError::InvalidHealthcheck {
-                    service_id: Some(service_id),
-                    source,
-                })?;
-        }
+            Some(engine)
+        };
 
         const OPERATION: &str = "saving the healthcheck overrides of";
         let txn = begin_bounded_transaction(&self.db, service_id, OPERATION, SERVICE_LOCK_TIMEOUT)
             .await?;
         let (previous, service_name) =
-            match Self::write_healthcheck_overrides(&txn, service_id, &overrides).await {
+            match Self::write_healthcheck_overrides(&txn, service_id, &overrides, engine).await {
                 Ok(saved) => saved,
                 Err(error) => {
                     let error = lock_timeout_or_database_error(
@@ -534,12 +581,27 @@ impl ExternalServiceManager {
         })
     }
 
-    /// The locked read-compare-write behind [`Self::set_service_healthcheck`].
+    /// The locked check and read-compare-write behind
+    /// [`Self::set_service_healthcheck`]. `engine` is set when there are
+    /// overrides to check: against the instance default as saved, under the
+    /// healthcheck settings lock, so a default saved meanwhile by any process
+    /// is either seen here or checked against these overrides itself.
     async fn write_healthcheck_overrides(
         txn: &sea_orm::DatabaseTransaction,
         service_id: i32,
         overrides: &HealthcheckOverrides,
+        engine: Option<ManagedEngine>,
     ) -> Result<(HealthcheckOverrides, String), ExternalServiceError> {
+        lock_healthcheck_settings(txn).await?;
+        if let Some(engine) = engine {
+            let instance = saved_instance_default(txn).await?;
+            healthcheck::resolve(overrides, &instance, &HealthcheckTimings::builtin(engine))
+                .validate(healthcheck::readiness_wait_secs(engine))
+                .map_err(|source| ExternalServiceError::InvalidHealthcheck {
+                    service_id: Some(service_id),
+                    source,
+                })?;
+        }
         let service = external_services::Entity::find_by_id(service_id)
             .lock_exclusive()
             .one(txn)
@@ -569,7 +631,7 @@ impl ExternalServiceManager {
     ) -> Result<HealthcheckApplied, ExternalServiceError> {
         let service = self.get_service(service_id).await?;
         let engine = self.apply_now_engine(&service)?;
-        let timings = healthcheck::resolve_for(engine, &service_overrides(&service)).timings;
+        let container_name = self.healthcheck_target(&service)?.container_name;
         // Checked again once the service's lock is held: a stop that
         // finished while this waited must not be undone by the recreate.
         self.recreate_service_container_preserving_data(
@@ -582,7 +644,21 @@ impl ExternalServiceManager {
             Some(docker) => healthcheck::start_interval_support(docker).await,
             None => StartIntervalSupport::Supported,
         };
-        let timings = healthcheck::effective_timings(timings, support);
+        // Resolved now, not before the recreate: an override saved while it
+        // waited for the service's lock reached the new container.
+        let expected = match container_name.as_deref() {
+            Some(name) => healthcheck::resolved_timings(engine, name),
+            None => healthcheck::resolve_for(engine, &service_overrides(&service)).timings,
+        };
+        let running = match container_name.as_deref() {
+            Some(name) => self.running_healthcheck(name).await,
+            None => None,
+        };
+        let timings = applied_timings(
+            running,
+            healthcheck::effective_timings(expected, support),
+            support,
+        );
         info!(
             service_id,
             interval_secs = timings.interval_secs,
@@ -596,6 +672,40 @@ impl ExternalServiceManager {
             service_name: service.name,
             timings,
         })
+    }
+
+    /// Open a transaction holding the healthcheck settings lock, for saving
+    /// the instance default: hold it until the default is saved, then commit
+    /// it. A wait longer than `timeout` is
+    /// [`ExternalServiceError::HealthcheckSettingsBusy`].
+    pub(crate) async fn lock_healthcheck_settings_for(
+        &self,
+        operation: &'static str,
+        timeout: Duration,
+    ) -> Result<sea_orm::DatabaseTransaction, ExternalServiceError> {
+        let busy = |error: ExternalServiceError| match error {
+            ExternalServiceError::DatabaseError { reason } if is_lock_timeout_message(&reason) => {
+                ExternalServiceError::HealthcheckSettingsBusy {
+                    operation,
+                    timeout_secs: timeout.as_secs().max(1),
+                }
+            }
+            other => other,
+        };
+        let txn = self.db.begin().await?;
+        // An integer we format ourselves; `SET` cannot bind a parameter.
+        let bound = format!(
+            "SET LOCAL lock_timeout = '{}ms'",
+            timeout.as_millis().max(1)
+        );
+        let locked = match txn.execute_unprepared(&bound).await {
+            Ok(_) => lock_healthcheck_settings(&txn).await,
+            Err(error) => Err(error),
+        };
+        match locked {
+            Ok(()) => Ok(txn),
+            Err(error) => Err(rollback_before_error(txn, busy(error.into())).await),
+        }
     }
 
     /// Forget a deleted service's overrides. Under [`HEALTHCHECK_WRITES`],
@@ -1194,6 +1304,31 @@ mod tests {
         assert_eq!(column(Some(30)), Some(30));
         assert_eq!(to_column(Some(u32::MAX)), None);
         assert_eq!(to_column(Some(60)), Some(60));
+    }
+
+    #[test]
+    fn apply_now_reports_what_the_replacement_container_was_given() {
+        let expected = HealthcheckTimings::builtin(ManagedEngine::Redis);
+        // An override saved while Apply now waited reached the container.
+        let running = HealthcheckTimings {
+            interval_secs: 120,
+            ..expected
+        };
+        use StartIntervalSupport::{Supported, Unsupported};
+        assert_eq!(applied_timings(Some(running), expected, Supported), running);
+        // Docker below API 1.44 does not store the start interval.
+        let unstored = HealthcheckTimings {
+            start_interval_secs: 0,
+            ..running
+        };
+        assert_eq!(
+            applied_timings(Some(unstored), expected, Unsupported),
+            HealthcheckTimings {
+                start_interval_secs: expected.start_interval_secs,
+                ..running
+            }
+        );
+        assert_eq!(applied_timings(None, expected, Supported), expected);
     }
 
     #[test]

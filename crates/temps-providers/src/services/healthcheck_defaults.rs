@@ -179,11 +179,58 @@ impl HealthcheckDefaultsService {
         &self,
         overrides: HealthcheckOverrides,
     ) -> Result<HealthcheckDefaultsUpdate, ExternalServiceError> {
+        self.update_within(overrides, super::SERVICE_LOCK_TIMEOUT)
+            .await
+    }
+
+    /// [`Self::update`], waiting at most `lock_timeout` for another
+    /// healthcheck settings save.
+    async fn update_within(
+        &self,
+        overrides: HealthcheckOverrides,
+        lock_timeout: Duration,
+    ) -> Result<HealthcheckDefaultsUpdate, ExternalServiceError> {
         validate_instance_default(&overrides)?;
-        // Held through the save and the registry publish, so no service
-        // override is saved against the old default in between, and the
-        // registry ends with the default saved last.
+        // Held through the save and the registry publish, so the registry
+        // ends with the default saved last.
         let _writes = HEALTHCHECK_WRITES.lock().await;
+        // Held until the default is saved, so no service override is saved
+        // against the old default in between, by any process.
+        let lock = self
+            .services
+            .lock_healthcheck_settings_for("saving the healthcheck defaults", lock_timeout)
+            .await?;
+        let saved = match self.save_checked(overrides).await {
+            Ok(saved) => saved,
+            Err(error) => return Err(super::rollback_before_error(lock, error).await),
+        };
+        if let Err(error) = lock.commit().await {
+            // The default is saved; only the lock's release failed, and its
+            // connection's end releases it.
+            warn!(%error, "Could not release the healthcheck settings lock after saving the defaults");
+        }
+        let (previous, saved) = saved;
+        let current = overrides_from_settings(saved);
+        registry::set_instance_default(current);
+        info!(
+            interval_secs = ?current.interval_secs,
+            start_interval_secs = ?current.start_interval_secs,
+            start_period_secs = ?current.start_period_secs,
+            timeout_secs = ?current.timeout_secs,
+            retries = ?current.retries,
+            "Managed service healthcheck defaults saved; applied when containers are next created"
+        );
+        Ok(HealthcheckDefaultsUpdate { previous, current })
+    }
+
+    /// Check `overrides` against every service's saved overrides and save
+    /// them, under the healthcheck settings lock: the previous and the saved
+    /// default.
+    async fn save_checked(
+        &self,
+        overrides: HealthcheckOverrides,
+    ) -> Result<(HealthcheckOverrides, ManagedServiceHealthcheckSettings), ExternalServiceError>
+    {
         self.services
             .check_instance_default_against_services(&overrides)
             .await?;
@@ -198,17 +245,7 @@ impl HealthcheckDefaultsService {
             .map_err(|e| ExternalServiceError::DatabaseError {
                 reason: format!("failed to save the managed service healthcheck defaults: {e}"),
             })?;
-        let current = overrides_from_settings(saved);
-        registry::set_instance_default(current);
-        info!(
-            interval_secs = ?current.interval_secs,
-            start_interval_secs = ?current.start_interval_secs,
-            start_period_secs = ?current.start_period_secs,
-            timeout_secs = ?current.timeout_secs,
-            retries = ?current.retries,
-            "Managed service healthcheck defaults saved; applied when containers are next created"
-        );
-        Ok(HealthcheckDefaultsUpdate { previous, current })
+        Ok((previous, saved))
     }
 
     /// The saved instance default, or the one the registry has when the
@@ -419,7 +456,11 @@ mod tests {
 
     /// The service reading and writing through `db`.
     fn defaults_on(db: sea_orm::DatabaseConnection) -> HealthcheckDefaultsService {
-        let db = Arc::new(db);
+        defaults_on_shared(Arc::new(db))
+    }
+
+    /// [`defaults_on`] for a connection shared with the test.
+    fn defaults_on_shared(db: Arc<sea_orm::DatabaseConnection>) -> HealthcheckDefaultsService {
         let manager = Arc::new(ExternalServiceManager::new_with_handle(
             db.clone(),
             Arc::new(temps_core::EncryptionService::new_from_password(
@@ -526,6 +567,64 @@ mod tests {
             read.interval_secs,
             Some(60),
             "the first notification was read"
+        );
+    }
+
+    /// A default save waits for every other healthcheck settings save, in
+    /// any process, and says so when the wait runs out.
+    #[tokio::test]
+    async fn a_default_save_waits_for_another_healthcheck_settings_save() {
+        use sea_orm::{ConnectionTrait, TransactionTrait};
+        let _registry = crate::services::HEALTHCHECK_REGISTRY_TEST_LOCK.lock().await;
+        let database = match temps_test_utils::TestDatabase::with_migrations().await {
+            Ok(database) => database,
+            Err(error)
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+            {
+                eprintln!(
+                    "Skipping a_default_save_waits_for_another_healthcheck_settings_save: {error}"
+                );
+                return;
+            }
+            Err(error) => panic!("test database setup failed: {error}"),
+        };
+        let db = database.connection_arc();
+        let defaults = defaults_on_shared(db.clone());
+        let interval = |secs| HealthcheckOverrides {
+            interval_secs: Some(secs),
+            ..Default::default()
+        };
+
+        // Another process's save holds the lock.
+        let other = db.begin().await.expect("begin");
+        other
+            .execute_unprepared(
+                "SELECT pg_advisory_xact_lock(hashtextextended('external-service-healthcheck-settings', 0))",
+            )
+            .await
+            .expect("lock");
+        let waited = defaults
+            .update_within(interval(60), Duration::from_millis(300))
+            .await;
+        other.rollback().await.expect("release");
+        let saved = defaults
+            .update_within(interval(60), Duration::from_secs(10))
+            .await;
+        registry::set_instance_default(HealthcheckOverrides::default());
+
+        assert!(
+            matches!(
+                waited,
+                Err(ExternalServiceError::HealthcheckSettingsBusy {
+                    operation: "saving the healthcheck defaults",
+                    ..
+                })
+            ),
+            "{waited:?}"
+        );
+        assert_eq!(
+            saved.expect("saved once the other save finished").current,
+            interval(60)
         );
     }
 

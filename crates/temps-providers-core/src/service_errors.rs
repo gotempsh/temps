@@ -268,6 +268,18 @@ pub enum ExternalServiceError {
         timeout_secs: u64,
     },
 
+    /// Healthcheck settings (the instance default and every service's
+    /// overrides) are saved one at a time across all Temps processes, so
+    /// each is checked against the other as saved. This one waited too long
+    /// for another save to finish.
+    #[error(
+        "Timed out after {timeout_secs}s waiting for another healthcheck settings save while          {operation}. Nothing was saved; retry once the other save finishes"
+    )]
+    HealthcheckSettingsBusy {
+        operation: &'static str,
+        timeout_secs: u64,
+    },
+
     #[error("Failed to delete service {id}: {reason}")]
     DeletionFailed { id: i32, reason: String },
 
@@ -595,6 +607,7 @@ pub fn worker_node_required(error: &ExternalServiceError) -> Option<Problem> {
         | E::ClusterNotSettled { .. }
         | E::ClusterBusy { .. }
         | E::LockTimeout { .. }
+        | E::HealthcheckSettingsBusy { .. }
         | E::Engine { .. } => None,
     }
 }
