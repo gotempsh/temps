@@ -154,6 +154,12 @@ impl WorkflowScheduler {
 
     /// Claim and start as many due runs as there are free invoker slots.
     /// Returns how many were started.
+    /// No invocation is in flight (tests drive `dispatch` until idle).
+    #[cfg(test)]
+    pub(crate) fn is_idle(&self) -> bool {
+        self.pool.available_permits() == self.config.invokers
+    }
+
     pub async fn dispatch(self: &Arc<Self>) -> usize {
         let mut started = 0;
         loop {
