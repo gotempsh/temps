@@ -144,7 +144,7 @@ impl TempsPlugin for ProvidersPlugin {
                 Err(error) => tracing::error!(
                     error = %error,
                     "Could not load the managed service healthcheck overrides; new containers \
-                     use the instance default until the next refresh"
+                     use the instance default until the healthcheck listener reads them"
                 ),
             }
             healthcheck_defaults.spawn_registry_sync();

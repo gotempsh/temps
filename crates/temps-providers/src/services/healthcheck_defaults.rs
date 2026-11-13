@@ -220,7 +220,7 @@ impl HealthcheckDefaultsService {
                 warn!(
                     %error,
                     "Could not read the managed service healthcheck defaults; keeping the last \
-                     loaded instance default until the next refresh"
+                     loaded instance default until they change"
                 );
                 registry::instance_default()
             }
@@ -417,32 +417,17 @@ mod tests {
         assert_eq!(published.interval_secs, Some(90));
     }
 
-    /// The listener reconnects (and reloads) on an error, so a failed read
-    /// must be reported, while a service that cannot be classified must not
-    /// be, or it would reconnect forever.
-    #[tokio::test]
-    async fn only_a_database_error_fails_a_notification() {
-        use sea_orm::{DatabaseBackend, DbErr, MockDatabase};
-        let _registry = crate::services::HEALTHCHECK_REGISTRY_TEST_LOCK.lock().await;
-        let unclassifiable = temps_entities::external_services::Model {
-            service_type: "not-an-engine".to_string(),
-            healthcheck_interval_secs: Some(60),
-            ..crate::services::test_support::encrypted_service_model(990_301, serde_json::json!({}))
-        };
-        let db = Arc::new(
-            MockDatabase::new(DatabaseBackend::Postgres)
-                .append_query_results([vec![unclassifiable]])
-                .append_query_errors([DbErr::Custom("connection reset".into())])
-                .into_connection(),
-        );
+    /// The service reading and writing through `db`.
+    fn defaults_on(db: sea_orm::DatabaseConnection) -> HealthcheckDefaultsService {
+        let db = Arc::new(db);
         let manager = Arc::new(ExternalServiceManager::new_with_handle(
             db.clone(),
             Arc::new(temps_core::EncryptionService::new_from_password(
-                "healthcheck notification test",
+                "healthcheck defaults test",
             )),
             Arc::new(temps_core::DockerHandle::disabled(
                 "control-plane",
-                "healthcheck notification test",
+                "healthcheck defaults test",
             )),
             true,
             Arc::new(temps_dns::DnsRegistry::new(db.clone())),
@@ -459,7 +444,109 @@ mod tests {
             ),
             db,
         ));
-        let defaults = HealthcheckDefaultsService::new(config, manager);
+        HealthcheckDefaultsService::new(config, manager)
+    }
+
+    /// A failed read is retried: the listener gives up its subscription, so
+    /// the sync loop reconnects and reloads everything, rather than staying
+    /// subscribed with what it failed to read. Listens on a real database;
+    /// the reads go to a mock that fails.
+    #[tokio::test]
+    async fn a_failed_reload_reconnects_the_listener() {
+        use sea_orm::{ConnectionTrait, DatabaseBackend, DbErr, MockDatabase};
+        let _registry = crate::services::HEALTHCHECK_REGISTRY_TEST_LOCK.lock().await;
+        let database = match temps_test_utils::TestDatabase::new().await {
+            Ok(database) => database,
+            Err(error)
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+            {
+                eprintln!("Skipping a_failed_reload_reconnects_the_listener: {error}");
+                return;
+            }
+            Err(error) => panic!("test database setup failed: {error}"),
+        };
+        let gives_up = |defaults: HealthcheckDefaultsService| {
+            let url = database.database_url.clone();
+            tokio::spawn(async move { defaults.listen_for_registry_changes(&url).await })
+        };
+
+        // The reload after subscribing fails.
+        let listening = gives_up(defaults_on(
+            MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
+        ));
+        tokio::time::timeout(Duration::from_secs(10), listening)
+            .await
+            .expect("a failed reload after subscribing gives the subscription up")
+            .expect("listener task");
+
+        // The reload succeeds (settings unreadable, no overrides), one
+        // notification is read, and the next one fails.
+        let service_id = 990_311;
+        let named = temps_entities::external_services::Model {
+            service_type: "not-an-engine".to_string(),
+            healthcheck_interval_secs: Some(60),
+            ..crate::services::test_support::encrypted_service_model(
+                service_id,
+                serde_json::json!({}),
+            )
+        };
+        let mut listening = gives_up(defaults_on(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_errors([DbErr::Custom("settings unavailable".into())])
+                .append_query_results([Vec::<temps_entities::external_services::Model>::new()])
+                .append_query_results([vec![named]])
+                .append_query_errors([DbErr::Custom("connection reset".into())])
+                .into_connection(),
+        ));
+        let notifier = database.connection_arc();
+        // Sent until it gives up: one sent before it subscribed is lost.
+        let gave_up = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                notifier
+                    .execute(sea_orm::Statement::from_sql_and_values(
+                        sea_orm::DatabaseBackend::Postgres,
+                        "SELECT pg_notify($1, $2)",
+                        [HEALTHCHECK_CHANNEL.into(), service_id.to_string().into()],
+                    ))
+                    .await
+                    .expect("notify");
+                tokio::select! {
+                    result = &mut listening => return result,
+                    () = tokio::time::sleep(Duration::from_millis(100)) => {}
+                }
+            }
+        })
+        .await;
+        let read = registry::for_service(service_id);
+        registry::clear_service(service_id);
+        gave_up
+            .expect("a failed notification read gives the subscription up")
+            .expect("listener task");
+        assert_eq!(
+            read.interval_secs,
+            Some(60),
+            "the first notification was read"
+        );
+    }
+
+    /// The listener reconnects (and reloads) on an error, so a failed read
+    /// must be reported, while a service that cannot be classified must not
+    /// be, or it would reconnect forever.
+    #[tokio::test]
+    async fn only_a_database_error_fails_a_notification() {
+        use sea_orm::{DatabaseBackend, DbErr, MockDatabase};
+        let _registry = crate::services::HEALTHCHECK_REGISTRY_TEST_LOCK.lock().await;
+        let unclassifiable = temps_entities::external_services::Model {
+            service_type: "not-an-engine".to_string(),
+            healthcheck_interval_secs: Some(60),
+            ..crate::services::test_support::encrypted_service_model(990_301, serde_json::json!({}))
+        };
+        let defaults = defaults_on(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![unclassifiable]])
+                .append_query_errors([DbErr::Custom("connection reset".into())])
+                .into_connection(),
+        );
 
         let classified = defaults.handle_registry_notification("990301").await;
         let published = registry::for_service(990_301);
