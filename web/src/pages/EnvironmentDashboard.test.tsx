@@ -7,6 +7,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router'
 import { installBrowserWindow } from '@/test/dom'
 import { client as apiClient } from '@/api/client/client.gen'
+import { restoreApiClient } from '@/test/api-client'
 import { getEnvironmentOptions } from '@/api/client/@tanstack/react-query.gen'
 import type { EnvironmentResponse, ProjectResponse } from '@/api/client'
 import { EnvironmentDashboard } from './EnvironmentDashboard'
@@ -15,7 +16,7 @@ installBrowserWindow()
 const original = apiClient.getConfig()
 afterEach(() => {
   cleanup()
-  apiClient.setConfig(original)
+  restoreApiClient(original)
 })
 
 test('the environment name is left to the project bar and "New environment" sits in the tab row', () => {

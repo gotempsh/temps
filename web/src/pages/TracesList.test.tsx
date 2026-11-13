@@ -7,6 +7,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter, useLocation } from 'react-router'
 import type { EnvironmentResponse, ProjectResponse } from '@/api/client'
 import { client } from '@/api/client/client.gen'
+import { restoreApiClient } from '@/test/api-client'
 import {
   ProjectEnvironmentContext,
   type ProjectEnvironmentContextValue,
@@ -19,7 +20,7 @@ installBrowserWindow()
 const originalConfig = client.getConfig()
 afterEach(() => {
   cleanup()
-  client.setConfig(originalConfig)
+  restoreApiClient(originalConfig)
 })
 
 /** Shows the current query string, so the test can read the URL. */

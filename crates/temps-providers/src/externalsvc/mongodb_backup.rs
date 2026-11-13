@@ -46,7 +46,9 @@ use tracing::{info, warn};
 
 use super::mongodb::MongodbService;
 use super::naming::mongodb_container_name;
-use super::postgres_walg_backup::{run_walg_exec, WalgBaseBackupError};
+use super::postgres_walg_backup::{
+    refuse_overlapping_backup_push, run_walg_exec, WalgBaseBackupError,
+};
 use super::worker_data::{dump_credentials, dump_to_s3, DumpEngine, WorkerDataError};
 use super::{ExternalService, RestoreContext, S3Credentials, ServiceConfig, ServiceType};
 
@@ -194,6 +196,12 @@ pub enum MongodbBackupError {
     },
     #[error("MongoDB backup in container '{container}' was cancelled")]
     Cancelled { container: String },
+    #[error(
+        "A wal-g backup-push of MongoDB service {service_id} is still running in '{container}', \
+         left by an earlier attempt whose agent restarted or passed its deadline. Nothing was \
+         started; the backup can run once it ends"
+    )]
+    BackupPushRunning { service_id: i32, container: String },
     #[error("MongoDB service {service_id}: pulling the mongodump image {image} failed: {reason}")]
     HelperImage {
         service_id: i32,
@@ -232,6 +240,7 @@ impl MongodbBackupError {
             | Self::BackupPush { .. }
             | Self::Exec { .. }
             | Self::Cancelled { .. }
+            | Self::BackupPushRunning { .. }
             | Self::HelperImage { .. }
             | Self::Archive { .. } => false,
         }
@@ -274,6 +283,39 @@ pub fn walg_stream_env(
         env.push("AWS_S3_FORCE_PATH_STYLE=true".into());
     }
     env
+}
+
+/// A WAL-G exec's error as this engine's: `operation` names the step for
+/// an error that has no variant here.
+fn walg_error(
+    error: WalgBaseBackupError,
+    container_name: &str,
+    operation: &'static str,
+) -> MongodbBackupError {
+    match error {
+        WalgBaseBackupError::Cancelled { container } => MongodbBackupError::Cancelled { container },
+        WalgBaseBackupError::Exec {
+            container,
+            operation,
+            reason,
+        } => MongodbBackupError::Exec {
+            container,
+            operation,
+            reason,
+        },
+        WalgBaseBackupError::BackupPushRunning {
+            service_id,
+            container,
+        } => MongodbBackupError::BackupPushRunning {
+            service_id,
+            container,
+        },
+        other => MongodbBackupError::Exec {
+            container: container_name.to_string(),
+            operation,
+            reason: other.to_string(),
+        },
+    }
 }
 
 /// The root URI of the database inside its own container.
@@ -381,6 +423,15 @@ pub async fn mongodb_backup(
         Some(MongodbBackupMode::Archive { .. }) => false,
     };
     if walg {
+        refuse_overlapping_backup_push(&docker, service_id, &container_name, "MongoDB", cancel)
+            .await
+            .map_err(|error| {
+                walg_error(
+                    error,
+                    &container_name,
+                    "check for a running wal-g backup-push",
+                )
+            })?;
         let prefix = walg_prefix(&s3.bucket_name, &s3.bucket_path, &service);
         let endpoint = s3
             .resolve_endpoint_for_container(&docker, &container_name)
@@ -395,25 +446,7 @@ pub async fn mongodb_backup(
         info!(service_id, repository = %prefix, "MongoDB WAL-G stream backup starting");
         let output = run_walg_exec(&docker, &container_name, "wal-g backup-push", &env, cancel)
             .await
-            .map_err(|error| match error {
-                WalgBaseBackupError::Cancelled { container } => {
-                    MongodbBackupError::Cancelled { container }
-                }
-                WalgBaseBackupError::Exec {
-                    container,
-                    operation,
-                    reason,
-                } => MongodbBackupError::Exec {
-                    container,
-                    operation,
-                    reason,
-                },
-                other => MongodbBackupError::Exec {
-                    container: container_name.clone(),
-                    operation: "run wal-g backup-push",
-                    reason: other.to_string(),
-                },
-            })?;
+            .map_err(|error| walg_error(error, &container_name, "run wal-g backup-push"))?;
         if output.exit_code != 0 {
             return Err(MongodbBackupError::BackupPush {
                 service_id,
@@ -1022,5 +1055,56 @@ mod tests {
         let tail = bounded_tail(&value);
         assert!(tail.ends_with("END"));
         assert!(tail.starts_with('…'));
+    }
+}
+
+/// Against a real Docker daemon. Skips without Docker.
+#[cfg(test)]
+#[cfg(feature = "docker-tests")]
+mod docker_tests {
+    use super::*;
+    use crate::externalsvc::postgres_walg_backup::docker_tests::{
+        container, docker_or_skip, let_the_push_start, remove, unreachable_s3, SURVIVING_PUSH,
+    };
+
+    /// As for PostgreSQL: a retry after the agent restarted, or after the
+    /// deadline, must not start a second `backup-push` while the first one
+    /// still streams the dump.
+    #[tokio::test]
+    async fn a_surviving_backup_push_is_not_overlapped() {
+        let Some(docker) = docker_or_skip().await else {
+            return;
+        };
+        let name = container(&docker, SURVIVING_PUSH).await;
+        let_the_push_start().await;
+        let result = mongodb_backup(
+            Arc::clone(&docker),
+            MongodbBackup {
+                service_id: 42,
+                container_name: name.clone(),
+                service_config: ServiceConfig {
+                    name: "orders".to_string(),
+                    service_type: ServiceType::Mongodb,
+                    version: None,
+                    parameters: serde_json::json!({ "username": "root", "password": "pw" }),
+                },
+                s3: unreachable_s3(),
+                backup_uuid: "b-2".to_string(),
+                mode: Some(MongodbBackupMode::WalgStream),
+            },
+            &CancellationToken::new(),
+        )
+        .await;
+        remove(&docker, &name).await;
+        let error = result.expect_err("a second backup-push must not start");
+        assert!(
+            matches!(
+                &error,
+                MongodbBackupError::BackupPushRunning { service_id: 42, container } if container == &name
+            ),
+            "unexpected error: {error}"
+        );
+        assert!(error.to_string().contains("still running"), "{error}");
+        assert!(!error.is_refusal(), "a retry can succeed once it ends");
     }
 }
