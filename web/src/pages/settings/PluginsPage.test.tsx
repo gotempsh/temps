@@ -1,68 +1,30 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { beforeEach, describe, expect, mock, test } from 'bun:test'
+import { beforeEach, describe, expect, test } from 'bun:test'
 import { MemoryRouter } from 'react-router'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { getPlatformFeaturesQueryKey } from '@/api/client/@tanstack/react-query.gen'
+import type { PlatformFeatures } from '@/api/client/types.gen'
+import { AuthContext } from '@/contexts/AuthContext-shared'
+import { BreadcrumbProvider } from '@/contexts/BreadcrumbContext'
+import {
+  PLUGIN_REPORTING_QUERY_KEY,
+  PLUGINS_QUERY_KEY,
+} from '@/hooks/usePlugins'
+import { PluginsPage } from './PluginsPage'
 
+// Real providers and a seeded query cache, never `mock.module`: a module mock
+// lasts for the whole `bun test` process, so a fake `useAuth` or `usePlugins`
+// here would reach every test file that runs after this one.
 let role = 'reader'
 let pluginsSupported = true
-let reportingEnabledValues: boolean[] = []
-
-mock.module('@/contexts/AuthContext', () => ({
-  useAuth: () => ({ user: { role } }),
-}))
-
-mock.module('@/contexts/BreadcrumbContext', () => ({
-  useBreadcrumbs: () => ({ setBreadcrumbs: () => undefined }),
-}))
-
-mock.module('@/hooks/usePlatformFeatures', () => ({
-  usePlatformFeatures: () => ({ data: { external_plugins: pluginsSupported } }),
-}))
-
-mock.module('@/hooks/usePageTitle', () => ({
-  usePageTitle: () => undefined,
-}))
-
-mock.module('@/hooks/useSensitiveActionVerification', () => ({
-  useSensitiveActionVerification: () => ({
-    handleSensitiveActionError: () => false,
-    verificationDialog: null,
-  }),
-}))
-
-mock.module('@/hooks/usePlugins', () => ({
-  PLUGINS_QUERY_KEY: ['external-plugins'],
-  usePlugins: () => ({ data: [], isLoading: false }),
-  usePluginInstallationReporting: (enabled = true) => {
-    reportingEnabledValues.push(enabled)
-    return {
-      data: { enabled: false },
-      isLoading: false,
-      isError: false,
-    }
-  },
-  useSetPluginInstallationReporting: () => ({
-    isPending: false,
-    mutateAsync: () => Promise.resolve(),
-  }),
-  useReloadPlugins: () => ({
-    isPending: false,
-    mutateAsync: () => Promise.resolve(),
-  }),
-  useUninstallPlugin: () => ({
-    isPending: false,
-    mutateAsync: () => Promise.resolve(),
-  }),
-}))
-
-const { PluginsPage } = await import('./PluginsPage')
+let client: QueryClient
 
 function renderPage() {
-  const client = new QueryClient({
-    defaultOptions: { queries: { retry: false } },
+  client = new QueryClient({
+    defaultOptions: { queries: { retry: false, staleTime: Infinity } },
   })
   client.setQueryData(['repository-plugin-catalog'], {
     available: true,
@@ -71,14 +33,42 @@ function renderPage() {
     platform: 'linux-amd64-gnu',
     plugins: [],
   })
+  client.setQueryData(getPlatformFeaturesQueryKey(), {
+    external_plugins: pluginsSupported,
+  } as PlatformFeatures)
+  client.setQueryData(PLUGINS_QUERY_KEY, [])
   return renderToStaticMarkup(
     <QueryClientProvider client={client}>
       <MemoryRouter>
-        <PluginsPage />
+        <AuthContext.Provider
+          value={{
+            user: {
+              id: 1,
+              name: 'Example User',
+              username: 'example',
+              avatar_url: '',
+              mfa_enabled: false,
+              role,
+            },
+            isLoading: false,
+            error: null,
+            logout: async () => {},
+            refetch: () => {},
+          }}
+        >
+          <BreadcrumbProvider>
+            <PluginsPage />
+          </BreadcrumbProvider>
+        </AuthContext.Provider>
       </MemoryRouter>
     </QueryClientProvider>
   )
 }
+
+/** Whether the page asked for the installation-reporting setting. */
+const readReporting = () =>
+  client.getQueryCache().find({ queryKey: PLUGIN_REPORTING_QUERY_KEY }) !==
+  undefined
 
 describe('PluginsPage management permissions', () => {
   test('explains durable storage requirements while keeping plugins discoverable', () => {
@@ -91,7 +81,6 @@ describe('PluginsPage management permissions', () => {
   })
 
   beforeEach(() => {
-    reportingEnabledValues = []
     pluginsSupported = true
   })
 
@@ -100,7 +89,7 @@ describe('PluginsPage management permissions', () => {
 
     const markup = renderPage()
 
-    expect(reportingEnabledValues).toEqual([])
+    expect(readReporting()).toBe(false)
     expect(markup).toContain('Browse')
     expect(markup).toContain('system administrator')
     expect(markup).not.toContain('Reload Plugins')
@@ -115,7 +104,7 @@ describe('PluginsPage management permissions', () => {
 
     const markup = renderPage()
 
-    expect(reportingEnabledValues).toEqual([])
+    expect(readReporting()).toBe(false)
     expect(markup).not.toContain('Reload plugins')
     expect(markup).toContain('Available plugins')
     expect(markup).toContain('Install from GitHub')
