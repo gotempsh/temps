@@ -15,6 +15,8 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Box } from 'lucide-react'
 import { useState } from 'react'
+import { ErrorAlert } from '@/components/utils/ErrorAlert'
+import { problemDetail } from '@/lib/api-problem'
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import {
   createInternalAccessSandboxGrant,
@@ -70,7 +72,22 @@ export function InternalAccessSandboxGrants({
   const sandboxes = useQuery(userSandboxesOptions())
   const grants = useQuery(sandboxGrantsOptions(projectId, environmentId))
   const lookup = lookupOf(grants)
-  const listed = sandboxesForAllowList(sandboxes.data?.sandboxes ?? [], search)
+  // Existing callers come from the project's grants, independently of the
+  // bounded, owner-scoped choices for new access. Never fetch another owner's
+  // sandbox details just to render or revoke a grant.
+  const callers = new Map<string, SandboxCaller>(
+    (sandboxes.data?.sandboxes ?? []).map((sandbox) => [sandbox.id, sandbox])
+  )
+  for (const grant of grants.data?.items ?? []) {
+    if (!callers.has(grant.sandbox_id)) {
+      callers.set(grant.sandbox_id, {
+        id: grant.sandbox_id,
+        name: grant.sandbox_name,
+        status: grant.sandbox_status,
+      })
+    }
+  }
+  const listed = sandboxesForAllowList([...callers.values()], search)
   const shownPage = clampGrantsPage(page, listed.length, GRANTS_PAGE_SIZE)
   const truncated =
     (sandboxes.data?.pagination.count ?? 0) > SANDBOX_LOOKUP_LIMIT
@@ -88,17 +105,28 @@ export function InternalAccessSandboxGrants({
         setSearch(value)
         setPage(1)
       }}
-      searchLabel="Search your sandboxes"
+      searchLabel="Search sandbox callers"
       note={
         truncated
-          ? `Your ${SANDBOX_LOOKUP_LIMIT} newest sandboxes, running ones first; search covers only these.`
-          : 'Your sandboxes, running ones first.'
+          ? `Existing callers and your ${SANDBOX_LOOKUP_LIMIT} newest sandboxes, running ones first; search covers these.`
+          : 'Existing callers and your sandboxes, running ones first.'
       }
     >
       <LookupNotice lookup={lookup} plural="sandboxes" />
+      {sandboxes.isError && listed.length > 0 ? (
+        <ErrorAlert
+          title="Could not load your sandboxes"
+          description={problemDetail(
+            sandboxes.error,
+            'New sandbox choices could not be loaded.'
+          )}
+          retry={() => void sandboxes.refetch()}
+          retrying={sandboxes.isFetching}
+        />
+      ) : null}
       <AllowListRows
-        isPending={sandboxes.isPending}
-        isError={sandboxes.isError}
+        isPending={sandboxes.isPending && listed.length === 0}
+        isError={sandboxes.isError && listed.length === 0}
         error={sandboxes.error}
         retry={() => void sandboxes.refetch()}
         retrying={sandboxes.isFetching}
@@ -107,7 +135,7 @@ export function InternalAccessSandboxGrants({
           listed.length > 0
             ? null
             : search.trim() === ''
-              ? 'You have no sandboxes.'
+              ? 'No existing callers or sandboxes to allow.'
               : `No sandbox matches “${search.trim()}”.`
         }
       >
@@ -135,8 +163,10 @@ export function InternalAccessSandboxGrants({
   )
 }
 
-/** "e2e-alias-caller", or the id when it has no other name. */
-function sandboxName(sandbox: SandboxInner): string {
+type SandboxCaller = Pick<SandboxInner, 'id' | 'name' | 'status'>
+
+/** The sandbox name, or its id when it has no other name. */
+function sandboxName(sandbox: SandboxCaller): string {
   return sandbox.name.trim() === '' ? sandbox.id : sandbox.name
 }
 
@@ -150,7 +180,7 @@ function SandboxCallerRow({
   blockReason,
   onChanged,
 }: {
-  sandbox: SandboxInner
+  sandbox: SandboxCaller
   projectId: number
   targetName: string
   environmentId?: number

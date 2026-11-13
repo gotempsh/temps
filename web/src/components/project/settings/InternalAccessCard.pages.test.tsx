@@ -308,3 +308,90 @@ test('Limit… allows with a narrower scope and a reason', async () => {
   )
   api.restore()
 })
+
+test.each([false, true])(
+  'existing sandbox callers remain removable outside owned choices (lookup fails: %s)',
+  async (lookupFails) => {
+    let grants = [
+      { ...sandboxGrant('sbx_shared'), sandbox_name: 'Shared caller' },
+    ]
+    const api = mockApi({
+      'GET /projects': projectsRoute(0),
+      'GET /v1/sandboxes': () =>
+        lookupFails
+          ? jsonResponse({ title: 'Unavailable' }, 503)
+          : jsonResponse({ pagination: { count: 101 }, sandboxes: [] }),
+      'GET /projects/1/internal-access': () => list([]),
+      'GET /projects/1/internal-access/sandboxes': () => list(grants),
+      'DELETE /projects/1/internal-access/sandboxes/70': () => {
+        grants = []
+        return new Response(null, { status: 204 })
+      },
+    })
+    try {
+      renderCard()
+      const remove = await screen.findByRole('button', {
+        name: 'Remove internal access for Shared caller',
+      })
+      const row = remove.closest('li') as HTMLElement
+      expect(within(row).getByText('Allowed')).toBeTruthy()
+      expect(within(row).getByText(/sbx_shared/)).toBeTruthy()
+      expect(within(row).queryByRole('button', { name: /Allow/ })).toBeNull()
+      fireEvent.click(remove)
+      const dialog = await screen.findByRole('alertdialog')
+      fireEvent.click(within(dialog).getByRole('button', { name: 'Remove' }))
+      await waitFor(() =>
+        expect(
+          api.called('DELETE', '/projects/1/internal-access/sandboxes/70')
+        ).toBe(true)
+      )
+      await waitFor(() =>
+        expect(screen.queryByText('Shared caller')).toBeNull()
+      )
+      expect(
+        screen.queryByRole('button', { name: 'Allow Shared caller' })
+      ).toBeNull()
+    } finally {
+      api.restore()
+    }
+  }
+)
+
+test('grant-only sandbox callers can be paged and searched without duplicate owned rows', async () => {
+  const grants = [
+    sandboxGrant('sbx_e2e'),
+    ...Array.from({ length: 21 }, (_, index) => ({
+      ...sandboxGrant(`sbx_shared_${index}`),
+      id: 100 + index,
+      sandbox_name: `Shared caller ${index}`,
+    })),
+  ]
+  const api = mockApi({
+    'GET /projects': projectsRoute(0),
+    'GET /v1/sandboxes': sandboxesRoute(),
+    'GET /projects/1/internal-access': () => list([]),
+    'GET /projects/1/internal-access/sandboxes': () => list(grants),
+  })
+  try {
+    renderCard()
+    await screen.findByRole('button', {
+      name: 'Remove internal access for e2e caller',
+    })
+    expect(screen.getAllByText('e2e caller')).toHaveLength(1)
+    const section = screen.getByRole('region', { name: 'Sandboxes' })
+    expect(within(section).queryByText('Shared caller 20')).toBeNull()
+    fireEvent.click(within(section).getByLabelText('Next page'))
+    await within(section).findByRole('button', {
+      name: 'Remove internal access for Shared caller 20',
+    })
+    fireEvent.change(within(section).getByRole('searchbox'), {
+      target: { value: 'sbx_shared_20' },
+    })
+    await within(section).findByRole('button', {
+      name: 'Remove internal access for Shared caller 20',
+    })
+    expect(within(section).getAllByRole('listitem')).toHaveLength(1)
+  } finally {
+    api.restore()
+  }
+})

@@ -191,7 +191,9 @@ test('sandboxes list running ones first', () => {
   expect(markup.indexOf('agent scratchpad')).toBeLessThan(
     markup.indexOf('idle box')
   )
-  expect(markup).toContain('Your sandboxes, running ones first.')
+  expect(markup).toContain(
+    'Existing callers and your sandboxes, running ones first.'
+  )
 })
 
 test('an allowed caller reads Allowed with its scope, and can be removed', () => {
