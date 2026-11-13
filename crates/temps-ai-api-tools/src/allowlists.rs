@@ -901,6 +901,26 @@ pub const AI_WRITE_ALLOWLIST: &[&str] = &[
     "request_sandbox_service",
     "approve_sandbox_service",
     "revoke_sandbox_service",
+    // ── Internal access (ADR 101, ADR 105 D8) ──
+    // Let one of the user's sandboxes call a project's *.temps.local
+    // addresses: what a sandbox's 403 "add sandbox … as a caller" asks for.
+    // Safe to propose: the handler holds the user to projects:write on the
+    // project and to owning that sandbox, and audits the grant as them. It
+    // widens network reach, so it is in HUMAN_CONSENT_OPERATIONS: only the
+    // owner's confirmation of that exact card in the console runs it, never
+    // a permission mode or an MCP confirm_action, so a prompt-injected agent
+    // in the sandbox cannot grant itself access.
+    "create_internal_access_sandbox_grant",
+    // Stop a sandbox calling a project. It only narrows reach; a DELETE is
+    // never approved automatically, so the user still confirms it.
+    "delete_internal_access_sandbox_grant",
+    // Let another project call this one's internal addresses. Same guards as
+    // the console (projects:write on the project being called, and being
+    // able to see the caller), and the same human-only consent as the
+    // sandbox grant above.
+    "create_internal_access_grant",
+    // Stop another project calling this one; confirmed like any DELETE.
+    "delete_internal_access_grant",
     // ── Deployment lifecycle (reversible / safe) ──
     // Redeploy the project from its configured branch —
     // what a "redeploy main" request maps to
@@ -1589,5 +1609,34 @@ mod sandbox_service_tests {
             assert!(!AI_READ_ALLOWLIST.contains(&operation));
         }
         assert!(!AI_WRITE_ALLOWLIST.contains(&"confirm_pending_action"));
+    }
+
+    #[test]
+    fn chat_can_propose_internal_access_and_only_a_person_grants_it() {
+        for operation in [
+            "list_internal_access_grants",
+            "list_internal_access_sandbox_grants",
+            "list_sandbox_internal_addresses",
+        ] {
+            assert!(AI_READ_ALLOWLIST.contains(&operation), "{operation}");
+        }
+        for (operation, needs_consent) in [
+            ("create_internal_access_sandbox_grant", true),
+            ("create_internal_access_grant", true),
+            ("delete_internal_access_sandbox_grant", false),
+            ("delete_internal_access_grant", false),
+        ] {
+            assert!(AI_WRITE_ALLOWLIST.contains(&operation), "{operation}");
+            assert!(!AI_READ_ALLOWLIST.contains(&operation), "{operation}");
+            assert!(
+                !ai_read_safe_posts().iter().any(|safe| safe == operation),
+                "{operation}"
+            );
+            assert_eq!(
+                temps_core::ai_tool_call::requires_human_consent(operation),
+                needs_consent,
+                "{operation}"
+            );
+        }
     }
 }

@@ -218,6 +218,8 @@ Nothing waits on a resolver or a dead listener.
   never looks the name up itself, and names the node whose proxy decides.
 - **Refusals:** every egress refusal for a `.temps.local` name says what is
   missing and where to fix it.
+- **The assistant:** asked to let a sandbox call a project, or shown its
+  403, it proposes the grant for the person to confirm (D8).
 
 ### D7. An environment also answers at its subdomain
 
@@ -267,6 +269,48 @@ A database's name points at container addresses that change on restart. If
 its publish were refused, the database's name would be stranded on a dead
 address, the same reason the ADR-055 backfill ranks databases first.
 
+### D8. The assistant proposes a grant; only its owner makes it
+
+The AI assistant may propose, through `temps_write`, the four grant
+operations: creating and deleting a sandbox grant or a project grant. This is
+the vault-link path (ADR 103), not a new one. It reads the same lists the
+console does (`list_internal_access_sandbox_grants`,
+`list_internal_access_grants`, `list_sandbox_internal_addresses`), and the
+`connect-a-service` playbook starts from the 403 a sandbox gets. The replayed
+request runs through the same handlers, so the same rules hold:
+`projects:write` and project scope on the target, owning the sandbox, seeing
+the calling project, the 100-grant limit, and the audit entry written as the
+person, with "via Temps AI assistant" in its user agent.
+
+**Creating a grant needs the owner's confirmation of that exact action.** A
+grant widens what a sandbox or a project can reach, so both create operations
+join `HUMAN_CONSENT_OPERATIONS` with the vault session, link and bundle:
+
+- The conversation's permission mode never approves them, Auto included. The
+  chat waits for the person.
+- The pending action runs only when `confirmed_by` is the user who owns it.
+- Only that confirmation, made in the console, attaches `ConfirmedAiWrite` to
+  the replayed request. Each create handler calls
+  `require_human_confirmation`, which refuses an assistant request without
+  it with 403 `HUMAN_CALLER_REQUIRED` before touching the database. The rule
+  therefore holds however the operation is reached.
+
+Deleting a grant only narrows reach. It needs no such consent, but a DELETE
+is never approved automatically, so the person still confirms it.
+
+**MCP.** The MCP server shares the assistant's write allowlist, so it exposes
+the four operations the same way it exposes vault links. Its `confirm_action`
+holds a proposal token, which is not the person's confirmation in the
+console. A grant created through MCP is therefore always refused. Revoking
+works once confirmed there.
+
+We considered and rejected:
+
+- **Keeping the operations away from the assistant, as before.** It left a
+  sandbox agent stuck on a 403 that it could only describe.
+- **Letting permission modes approve grants like other writes.** A sandbox
+  runs code and reads pages that its owner never saw.
+
 ## Threat model
 
 - **A sandbox forging its identity.** Identity is the source address of the
@@ -298,6 +342,19 @@ address, the same reason the ADR-055 backfill ranks databases first.
   re-check. A stopped sandbox keeps its grants and has no running proxy.
   Moving a sandbox to another node, or renaming its container, re-announces
   the snapshot.
+
+- **A prompt-injected agent granting itself access.** An agent in a sandbox
+  acts with its owner's session. A page, file or command output can tell it
+  to let its own sandbox call a project, and it may then propose that grant.
+  Nothing it can produce creates the grant (D8): no tool argument, no
+  proposal token, no MCP `confirm_action` and no permission mode. Only its
+  owner's confirmation of that exact pending action, in the console, does.
+  The proposal names the sandbox, the project and the environments, so a
+  grant the owner did not ask for is visible before it exists.
+- **An agent holding a raw API key.** A key can call the grant API directly,
+  without the assistant. Such a call is the key's own, bounded by the key's
+  scope and role and audited under it. D8 does not change that; it only keeps
+  the assistant from creating grants without the owner.
 
 ## Consequences
 

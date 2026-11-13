@@ -928,6 +928,69 @@ mod tests {
         );
     }
 
+    /// The same holds for internal access (ADR-105 D8): an MCP client may
+    /// propose letting a sandbox or a project call another project, but its
+    /// `confirm_action` reaches the grant handler without the owner's
+    /// confirmation, so the grant is refused and nothing widens.
+    #[tokio::test]
+    async fn mcp_confirmation_cannot_grant_internal_access() {
+        use axum::response::IntoResponse;
+        use temps_core::ai_tool_call::{require_human_confirmation, AiToolCall, ConfirmedAiWrite};
+        for operation in [
+            "create_internal_access_sandbox_grant",
+            "create_internal_access_grant",
+        ] {
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let reached = calls.clone();
+            let handler = move |req: axum::extract::Request| {
+                let reached = reached.clone();
+                async move {
+                    reached.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    match require_human_confirmation(
+                        req.extensions().get::<AiToolCall>(),
+                        req.extensions().get::<ConfirmedAiWrite>(),
+                        operation,
+                    ) {
+                        Ok(()) => axum::http::StatusCode::CREATED.into_response(),
+                        Err(problem) => problem.into_response(),
+                    }
+                }
+            };
+            let router = axum::Router::new().route("/grants", axum::routing::post(handler));
+            let api = serde_json::from_value(json!({"openapi":"3.1.0","info":{"title":"Fixture","version":"1"},
+                "paths":{"/grants":{"post":{"operationId":operation,"responses":{"201":{"description":"ok"}}}}}})).unwrap();
+            let (state, _, _) = fixture();
+            state.write_api_tools.set(
+                temps_ai_api_tools::InternalApiCaller::new_write_allowlisted(
+                    router,
+                    &api,
+                    vec![operation.into()],
+                ),
+            );
+            let proposal = super::execute(
+                &state,
+                &auth(3, true),
+                &metadata(),
+                "temps_write",
+                &json!({"command":operation}),
+            )
+            .await
+            .unwrap();
+            let token = proposal.proposal_token.unwrap();
+            let args = state.proposals.peek(&token).unwrap().arguments;
+            let refused = confirm(&state, &auth(3, true), &metadata(), &token, args)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(refused.contains("403"), "{operation}: {refused}");
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "{operation}: the handler ran and refused; nothing was granted"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn feature_flag_reads_preserve_keys_types_and_values_through_router_replay() {
         for operation in ["list_flags", "get_flag", "get_flag_snapshot"] {

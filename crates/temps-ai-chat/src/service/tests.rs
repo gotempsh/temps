@@ -7116,6 +7116,11 @@ fn vault_sessions_always_require_human_consent_in_chat() {
         serde_json::json!({"operation":"create_vault_link","method":"POST"}),
         serde_json::json!({"operation":"create_access_bundle_general","method":"POST"}),
         serde_json::json!({"steps":[{"operation":"create_access_session_general","method":"POST"}]}),
+        // Granting internal access widens what a project or a sandbox can
+        // reach, so auto-approve never grants it either (ADR-105 D8).
+        serde_json::json!({"operation":"create_internal_access_sandbox_grant","method":"POST"}),
+        serde_json::json!({"operation":"create_internal_access_grant","method":"POST"}),
+        serde_json::json!({"steps":[{"operation":"create_internal_access_sandbox_grant","method":"POST"}]}),
     ] {
         for kind in [PermissionKind::ToolApproval, PermissionKind::PlanApproval] {
             let request = PermissionRequest {

@@ -665,7 +665,9 @@ fn params_carry_secret_handle(value: &serde_json::Value) -> bool {
     }
 }
 
-/// A write that spends a provided credential or grants durable sandbox access.
+/// A write that spends a provided credential or grants durable access: a
+/// sandbox service, a vault session, link or bundle, or an internal access
+/// grant ([`temps_core::ai_tool_call::HUMAN_CONSENT_OPERATIONS`]).
 /// Permission modes that
 /// approve non-destructive writes on their own must not approve these: the
 /// other fields of the same request (an endpoint, a base URL) are chosen by the
@@ -674,18 +676,17 @@ fn params_carry_secret_handle(value: &serde_json::Value) -> bool {
 fn platform_request_requires_human(request: &PermissionRequest) -> bool {
     let flagged = |value: &serde_json::Value| {
         // Durable access spends an existing credential even without a secret handle.
-        matches!(
-            value.get("operation").and_then(serde_json::Value::as_str),
-            Some(
-                "approve_sandbox_service"
-                    | "create_access_session_general"
-                    | "create_vault_link"
-                    | "create_access_bundle_general"
-            )
-        ) || value
-            .get("carries_handle")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
+        value
+            .get("operation")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|operation| {
+                operation == "approve_sandbox_service"
+                    || temps_core::ai_tool_call::requires_human_consent(operation)
+            })
+            || value
+                .get("carries_handle")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
     };
     flagged(&request.input)
         || request

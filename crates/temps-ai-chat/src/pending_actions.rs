@@ -528,10 +528,8 @@ impl PendingActionService {
         let user_id = auth.user_id();
         let action = self.get(project_id, user_id, public_id).await?;
 
-        if matches!(
-            action.operation_id.as_str(),
-            "create_access_session_general" | "create_vault_link" | "create_access_bundle_general"
-        ) && confirmed_by != Some(user_id)
+        if temps_core::ai_tool_call::requires_human_consent(&action.operation_id)
+            && confirmed_by != Some(user_id)
         {
             return Err(PendingActionError::PermissionDenied {
                 public_id: public_id.to_owned(),
@@ -1677,5 +1675,61 @@ mod tests {
             matches!(err, PendingActionError::Unavailable),
             "unexpected: {err:?}"
         );
+    }
+
+    // A grant of internal access stays staged until its owner confirms that
+    // exact action: a confirmation not attributed to them (an automatic
+    // approval, an MCP client, anything the model produced) is refused before
+    // the row is claimed, so nothing executes.
+    #[tokio::test]
+    async fn an_internal_access_grant_runs_only_on_its_owners_confirmation() {
+        for operation in [
+            "create_internal_access_sandbox_grant",
+            "create_internal_access_grant",
+        ] {
+            for confirmed_by in [None, Some(2)] {
+                let mut action = make_proposed(1, "grant", 7);
+                action.operation_id = operation.to_string();
+                let db = MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results(vec![vec![action]])
+                    .into_connection();
+                let svc = make_svc(db);
+                let err = svc
+                    .confirm(Some(7), "grant", &make_auth(), confirmed_by, None)
+                    .await
+                    .expect_err("a grant without its owner's confirmation must not run");
+                assert!(
+                    matches!(
+                        err,
+                        PendingActionError::PermissionDenied { ref permission, .. }
+                            if permission == "explicit human confirmation"
+                    ),
+                    "{operation} {confirmed_by:?}: {err:?}"
+                );
+            }
+
+            // The owner's own confirmation goes on to claim and execute it
+            // (here the write handle is not wired, so it ends Unavailable).
+            let mut action = make_proposed(1, "grant", 7);
+            action.operation_id = operation.to_string();
+            let mut failed = action.clone();
+            failed.status = "failed".to_string();
+            let db = MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![action]])
+                .append_exec_results(vec![MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .append_query_results(vec![vec![failed]])
+                .into_connection();
+            let err = make_svc(db)
+                .confirm(Some(7), "grant", &make_auth(), Some(1), None)
+                .await
+                .expect_err("no write handle in this fixture");
+            assert!(
+                matches!(err, PendingActionError::Unavailable),
+                "{operation}: {err:?}"
+            );
+        }
     }
 }

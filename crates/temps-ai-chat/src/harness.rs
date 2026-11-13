@@ -464,6 +464,46 @@ mod tests {
     }
 
     #[test]
+    fn connect_playbook_grants_internal_access_only_with_human_consent() {
+        let playbook = all()
+            .iter()
+            .find(|p| p.name == "connect-a-service")
+            .unwrap();
+        let allowlists = include_str!("../../temps-ai-api-tools/src/allowlists.rs");
+        for operation in [
+            "list_sandbox_internal_addresses",
+            "list_internal_access_sandbox_grants",
+            "list_internal_access_grants",
+            "create_internal_access_sandbox_grant",
+            "create_internal_access_grant",
+            "delete_internal_access_sandbox_grant",
+            "delete_internal_access_grant",
+        ] {
+            assert!(playbook.body.contains(operation), "{operation}");
+            assert!(
+                allowlists.contains(&format!("\"{operation}\"")),
+                "{operation} must be available to chat"
+            );
+        }
+        // The playbook starts from the sandbox's 403, as the node agent
+        // words it, and holds the grant to the person's own confirmation.
+        let refusal = include_str!("../../temps-node-agent/src/internal_access.rs");
+        assert!(refusal.contains("internal route is not accessible from sandbox"));
+        assert!(playbook
+            .body
+            .contains("internal route is not accessible from sandbox"));
+        let words = playbook
+            .body
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(words.contains(
+            "The person must confirm that pending action in the console, including in Auto mode"
+        ));
+        assert!(playbook.description.contains("*.temps.local"));
+    }
+
+    #[test]
     fn connect_playbook_supports_chat_only_vault_consent() {
         let playbook = all()
             .iter()

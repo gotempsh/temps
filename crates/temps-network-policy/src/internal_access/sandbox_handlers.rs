@@ -348,6 +348,8 @@ pub async fn create_internal_access_sandbox_grant(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<InternalAccessAppState>>,
     Extension(metadata): Extension<RequestMetadata>,
+    ai_call: Option<Extension<temps_core::ai_tool_call::AiToolCall>>,
+    confirmation: Option<Extension<temps_core::ai_tool_call::ConfirmedAiWrite>>,
     Path(project_id): Path<i32>,
     Json(request): Json<CreateInternalAccessSandboxGrantRequest>,
 ) -> Result<impl IntoResponse, Problem> {
@@ -359,6 +361,13 @@ pub async fn create_internal_access_sandbox_grant(
     );
     deny_deployment_token!(auth);
     project_scope_guard!(auth, project_id);
+    // An agent, even one inside this very sandbox, may propose the grant;
+    // only the owner's confirmation in the console makes it (ADR-105 D8).
+    temps_core::ai_tool_call::require_human_confirmation(
+        ai_call.as_ref().map(|m| &m.0),
+        confirmation.as_ref().map(|m| &m.0),
+        "create_internal_access_sandbox_grant",
+    )?;
     let user_id = requesting_user(&auth)?;
 
     let grant = state

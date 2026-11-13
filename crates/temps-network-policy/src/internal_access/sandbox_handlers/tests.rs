@@ -16,6 +16,8 @@ use temps_entities::deployment_tokens::DeploymentTokenPermission;
 use temps_entities::users;
 use tower::ServiceExt;
 
+use temps_core::ai_tool_call::{AiToolCall, ConfirmedAiWrite};
+
 use super::super::error::InternalAccessError;
 use super::super::handlers::router;
 use super::super::service::InternalAccessService;
@@ -164,10 +166,27 @@ fn create_succeeds() -> MockDatabase {
 }
 
 async fn create_status(auth: AuthContext, state: Arc<InternalAccessAppState>) -> StatusCode {
-    match create_internal_access_sandbox_grant(
+    match create_as(auth, state, None, None).await {
+        Ok(status) => status,
+        Err(problem) => problem.status_code,
+    }
+}
+
+/// Create a sandbox grant the way the assistant's replayed request reaches
+/// the handler: `ai_call` marks it as the assistant's, `confirmed` as the
+/// owner's confirmation of that exact pending action in the console.
+async fn create_as(
+    auth: AuthContext,
+    state: Arc<InternalAccessAppState>,
+    ai_call: Option<AiToolCall>,
+    confirmed: Option<ConfirmedAiWrite>,
+) -> Result<StatusCode, Problem> {
+    create_internal_access_sandbox_grant(
         RequireAuth(auth),
         State(state),
         Extension(metadata()),
+        ai_call.map(Extension),
+        confirmed.map(Extension),
         Path(TARGET),
         Json(CreateInternalAccessSandboxGrantRequest {
             target_environment_id: None,
@@ -176,10 +195,7 @@ async fn create_status(auth: AuthContext, state: Arc<InternalAccessAppState>) ->
         }),
     )
     .await
-    {
-        Ok(response) => response.into_response().status(),
-        Err(problem) => problem.status_code,
-    }
+    .map(|response| response.into_response().status())
 }
 
 async fn delete_status(auth: AuthContext, state: Arc<InternalAccessAppState>) -> StatusCode {
@@ -429,4 +445,85 @@ async fn sandbox_errors_are_problem_details_with_the_ids() {
         let body = serde_json::to_string(&problem.body).expect("serializable");
         assert!(body.contains(needle), "{body}");
     }
+}
+
+#[tokio::test]
+async fn a_sandbox_agent_cannot_grant_its_own_sandbox_without_the_owner() {
+    // The agent inside sbx_alpha acts with its owner's session. Whether the
+    // conversation auto-approves, an MCP client confirms, or a page it read
+    // told it to, the request carries no `ConfirmedAiWrite` and stops here.
+    let (state, audit) = state(untouched(), Some(&[TARGET]));
+    let problem = create_as(
+        AuthContext::new_session(user(), Role::User),
+        state,
+        Some(AiToolCall),
+        None,
+    )
+    .await
+    .expect_err("an unconfirmed assistant grant must be refused");
+    assert_eq!(problem.status_code, StatusCode::FORBIDDEN);
+    assert_eq!(
+        problem.body.get("error_code").and_then(|v| v.as_str()),
+        Some("HUMAN_CALLER_REQUIRED")
+    );
+    assert_eq!(
+        problem.body.get("operation").and_then(|v| v.as_str()),
+        Some("create_internal_access_sandbox_grant")
+    );
+    assert!(audit.operations.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_confirmed_assistant_sandbox_grant_is_audited_as_the_user() {
+    let (state, audit) = state(create_succeeds(), Some(&[TARGET]));
+    let status = create_as(
+        AuthContext::new_session(user(), Role::User),
+        state,
+        Some(AiToolCall),
+        Some(ConfirmedAiWrite),
+    )
+    .await
+    .expect("the owner's confirmation lets the grant through");
+    assert_eq!(status, StatusCode::CREATED);
+    let operations = audit.operations.lock().unwrap().clone();
+    assert_eq!(operations.len(), 1);
+    assert_eq!(operations[0].0, SANDBOX_GRANT_CREATED);
+    assert!(
+        operations[0].1.contains("\"user_id\":9"),
+        "{}",
+        operations[0].1
+    );
+}
+
+#[tokio::test]
+async fn a_confirmation_cannot_name_someone_elses_sandbox() {
+    let db = MockDatabase::new(DatabaseBackend::Postgres)
+        .append_query_results([vec![id_row(TARGET)]])
+        .append_query_results([Vec::<Row>::new()]);
+    let (state, audit) = state(db, Some(&[TARGET]));
+    let problem = create_as(
+        AuthContext::new_session(user(), Role::User),
+        state,
+        Some(AiToolCall),
+        Some(ConfirmedAiWrite),
+    )
+    .await
+    .expect_err("another user's sandbox stays not found");
+    assert_eq!(problem.status_code, StatusCode::NOT_FOUND);
+    assert!(audit.operations.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_confirmation_does_not_let_a_reader_grant() {
+    let (state, audit) = state(untouched(), None);
+    let problem = create_as(
+        AuthContext::new_session(user(), Role::Reader),
+        state,
+        Some(AiToolCall),
+        Some(ConfirmedAiWrite),
+    )
+    .await
+    .expect_err("a reader cannot grant, confirmed or not");
+    assert_eq!(problem.status_code, StatusCode::FORBIDDEN);
+    assert!(audit.operations.lock().unwrap().is_empty());
 }

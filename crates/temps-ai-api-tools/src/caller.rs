@@ -1095,8 +1095,10 @@ impl InternalApiCaller {
     ///
     /// `approval` says who approved the write. Only [`WriteApproval::OwnerInApp`]
     /// marks the request [`temps_core::ai_tool_call::ConfirmedAiWrite`], which the
-    /// vault session and link handlers require before an assistant may grant
-    /// access; a relayed proposal token is not evidence of human consent.
+    /// vault session, link and bundle handlers and the internal access grant
+    /// handlers require before an assistant may grant access
+    /// ([`temps_core::ai_tool_call::HUMAN_CONSENT_OPERATIONS`]); a relayed
+    /// proposal token is not evidence of human consent.
     pub async fn execute_approved_write(
         &self,
         operation_id: &str,
@@ -1118,12 +1120,7 @@ impl InternalApiCaller {
             }
         }
         if approval == WriteApproval::OwnerInApp
-            && matches!(
-                operation_id,
-                "create_access_session_general"
-                    | "create_vault_link"
-                    | "create_access_bundle_general"
-            )
+            && temps_core::ai_tool_call::requires_human_consent(operation_id)
         {
             return self.call_inner(operation_id, params, scope, true).await;
         }

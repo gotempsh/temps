@@ -386,6 +386,8 @@ pub async fn create_internal_access_grant(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<InternalAccessAppState>>,
     Extension(metadata): Extension<RequestMetadata>,
+    ai_call: Option<Extension<temps_core::ai_tool_call::AiToolCall>>,
+    confirmation: Option<Extension<temps_core::ai_tool_call::ConfirmedAiWrite>>,
     Path(project_id): Path<i32>,
     Json(request): Json<CreateInternalAccessGrantRequest>,
 ) -> Result<impl IntoResponse, Problem> {
@@ -397,6 +399,13 @@ pub async fn create_internal_access_grant(
     );
     deny_deployment_token!(auth);
     project_scope_guard!(auth, project_id);
+    // An assistant may propose a grant, but only its owner's confirmation in
+    // the console may make one (ADR-105 D8).
+    temps_core::ai_tool_call::require_human_confirmation(
+        ai_call.as_ref().map(|m| &m.0),
+        confirmation.as_ref().map(|m| &m.0),
+        "create_internal_access_grant",
+    )?;
     // Naming a project in a grant requires being able to see it.
     project_access_guard!(
         auth,
