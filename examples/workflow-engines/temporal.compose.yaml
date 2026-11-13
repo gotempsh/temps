@@ -1,0 +1,107 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+services:
+  gateway:
+    build:
+      context: ./gateway
+      args:
+        ENGINE: temporal
+    environment:
+      ENGINE_USER: ${ENGINE_USER:-admin}
+      ENGINE_PASSWORD: ${ENGINE_PASSWORD:?Set a generated password of at least 24 characters}
+    ports:
+      - "127.0.0.1::8080"
+    cap_drop: [ALL]
+    mem_limit: 64m
+    cpus: 0.25
+    healthcheck:
+      test: [CMD, wget, -q, -O, /dev/null, "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+  postgres:
+    user: postgres
+    image: postgres:17.6-alpine@sha256:ef257d85f76e48da1c64832459b59fcaba1a4dac97bf5d7450c77753542eee94
+    environment:
+      POSTGRES_USER: temporal
+      POSTGRES_PASSWORD: ${DATABASE_PASSWORD:?Set a generated database password}
+    volumes:
+      - temporal-postgres:/var/lib/postgresql/data
+    cap_drop: [ALL]
+    mem_limit: 256m
+    cpus: 0.5
+    healthcheck:
+      test: [CMD, pg_isready, -U, temporal]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  schema:
+    build:
+      context: ./temporal
+      dockerfile: Schema.Dockerfile
+    environment:
+      SQL_PASSWORD: ${DATABASE_PASSWORD:?Set a generated database password}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    cap_drop: [ALL]
+    mem_limit: 256m
+    cpus: 0.5
+    restart: "no"
+  temporal:
+    build:
+      context: ./temporal
+      dockerfile: Server.Dockerfile
+    environment:
+      DB: postgres12
+      DB_PORT: "5432"
+      POSTGRES_SEEDS: postgres
+      POSTGRES_USER: temporal
+      POSTGRES_PWD: ${DATABASE_PASSWORD:?Set a generated database password}
+      DBNAME: temporal
+      VISIBILITY_DBNAME: temporal_visibility
+      BIND_ON_IP: 0.0.0.0
+      SQL_MAX_CONNS: "5"
+      SQL_MAX_IDLE_CONNS: "2"
+      SQL_VIS_MAX_CONNS: "5"
+      SQL_VIS_MAX_IDLE_CONNS: "2"
+      GOMEMLIMIT: 512MiB
+    depends_on:
+      schema:
+        condition: service_completed_successfully
+    cap_drop: [ALL]
+    mem_limit: 768m
+    cpus: 1.0
+    healthcheck:
+      test: [CMD, nc, -z, localhost, "7233"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+  namespace:
+    image: temporalio/admin-tools:1.30.1@sha256:4db77a7fd8a7663dfabce417d861117ad82ab88edc1bb8667d3b317d50d42cd3
+    entrypoint: [/bin/sh, -ec]
+    command:
+      - temporal operator namespace describe --namespace default >/dev/null 2>&1 || temporal operator namespace create --namespace default --retention 3d
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+    depends_on:
+      temporal:
+        condition: service_healthy
+    cap_drop: [ALL]
+    mem_limit: 128m
+    cpus: 0.25
+    restart: "no"
+  ui:
+    image: temporalio/ui:2.44.1@sha256:0240f934c5f4204656c68651f384d656b6cfa2e737cd8fd85a03640b72b9b4e7
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_UI_PORT: "8080"
+      GOMEMLIMIT: 96MiB
+    depends_on:
+      temporal:
+        condition: service_healthy
+    cap_drop: [ALL]
+    mem_limit: 128m
+    cpus: 0.25
+volumes:
+  temporal-postgres:
