@@ -414,30 +414,52 @@ pub struct LabelledImages {
 /// would never reach newer images when the oldest ones all stay; paging
 /// through with the cursor reaches every image in turn.
 pub fn page_labelled_images(
-    mut images: Vec<LabelledImage>,
+    images: Vec<LabelledImage>,
     after: Option<&ListCursor>,
     max: usize,
 ) -> LabelledImages {
-    let position = |image: &LabelledImage| (image.created, image.image_id.clone());
-    if let Some(after) = after {
-        let start = (after.created, after.image_id.clone());
-        images.retain(|image| position(image) > start);
+    let (images, unlisted) = select_page(images, after, max, |image| {
+        (image.created, image.image_id.as_str())
+    });
+    LabelledImages {
+        next: next_cursor(&images, unlisted),
+        images,
+        unlisted,
     }
-    images.sort_by_key(position);
-    let unlisted = images.len().saturating_sub(max);
-    images.truncate(max);
-    let next = (unlisted > 0)
+}
+
+/// The page of `items` after `after`, oldest first by `position`, at most
+/// `max` long, and how many further items were left out. Works in place:
+/// the items before the cursor and past the page are dropped before the
+/// caller converts anything, so what it builds is bounded by `max`.
+fn select_page<T>(
+    mut items: Vec<T>,
+    after: Option<&ListCursor>,
+    max: usize,
+    position: impl Fn(&T) -> (i64, &str),
+) -> (Vec<T>, usize) {
+    if let Some(after) = after {
+        let start = (after.created, after.image_id.as_str());
+        items.retain(|item| position(item) > start);
+    }
+    let unlisted = items.len().saturating_sub(max);
+    if unlisted > 0 && max > 0 {
+        items.select_nth_unstable_by(max - 1, |a, b| position(a).cmp(&position(b)));
+    }
+    items.truncate(max);
+    items.sort_unstable_by(|a, b| position(a).cmp(&position(b)));
+    (items, unlisted)
+}
+
+/// Where the page after `images` starts, when `unlisted` images remain.
+fn next_cursor(images: &[LabelledImage], unlisted: usize) -> Option<ListCursor> {
+    (unlisted > 0)
         .then(|| images.last())
         .flatten()
         .map(|last| ListCursor {
             created: last.created,
             image_id: last.image_id.clone(),
-        });
-    LabelledImages {
-        images,
-        unlisted,
-        next,
-    }
+        })
 }
 
 /// Images labelled `key=value` after `after`, oldest first and bounded by
@@ -466,6 +488,13 @@ pub async fn list_labelled_images(
             operation: "list labelled images",
             source,
         })?;
+    // Docker cannot page an image listing, so the reply holds every image
+    // carrying this label (this owner's images on this daemon). Narrow it
+    // to the page before converting anything, so what is built and handed
+    // on is bounded by MAX_LABELLED_IMAGES.
+    let (images, unlisted) = select_page(images, after, MAX_LABELLED_IMAGES, |image| {
+        (image.created, image.id.as_str())
+    });
     let images: Vec<LabelledImage> = images
         .into_iter()
         .map(|image| LabelledImage {
@@ -484,7 +513,11 @@ pub async fn list_labelled_images(
             in_use_by: None,
         })
         .collect();
-    let mut page = page_labelled_images(images, after, MAX_LABELLED_IMAGES);
+    let mut page = LabelledImages {
+        next: next_cursor(&images, unlisted),
+        images,
+        unlisted,
+    };
     if check_usage {
         for image in &mut page.images {
             image.in_use_by = match container_using_image(docker, &image.image_id).await {
@@ -513,34 +546,36 @@ pub async fn remove_unused_images(
             max: MAX_IMAGE_REMOVAL_BATCH,
         });
     }
-    // Whether another owner's images share this daemon, once per guard in
-    // the batch (in practice one).
-    let mut shared_hosts: HashMap<(String, Option<String>), bool> = HashMap::new();
-    for guard in requests
-        .iter()
-        .filter_map(|request| request.owner_guard.as_ref())
-        .filter(|guard| guard.keep_unlabelled_when_shared)
-    {
-        let key = (guard.label.clone(), guard.owner.clone());
-        if let std::collections::hash_map::Entry::Vacant(slot) = shared_hosts.entry(key) {
-            slot.insert(another_owner_present(docker, &guard.label, guard.owner.as_deref()).await);
-        }
-    }
+    // Whether another owner's images share this daemon, asked at most once
+    // per guard in the batch (in practice one), and only when an image
+    // without an owner label turns up: listing every owner's images is the
+    // one daemon-wide read here, and labelled images never need it.
+    let mut shared_hosts = SharedHosts::new();
     let mut outcomes = Vec::with_capacity(requests.len());
     for request in requests {
-        let shared_host = request
-            .owner_guard
-            .as_ref()
-            .and_then(|guard| shared_hosts.get(&(guard.label.clone(), guard.owner.clone())))
-            .copied()
-            .unwrap_or(false);
-        let status = remove_one(docker, request, shared_host).await;
+        let status = remove_one(docker, request, &mut shared_hosts).await;
         outcomes.push(ImageRemovalOutcome {
             reference: request.reference.clone(),
             status,
         });
     }
     Ok(outcomes)
+}
+
+/// Answers of [`another_owner_present`] within one batch, by guard label and
+/// owner.
+type SharedHosts = HashMap<(String, Option<String>), bool>;
+
+/// The guard whose shared-host answer [`decide_on_host`] needs for `image`:
+/// only an image without the guard's owner label, under a guard that keeps
+/// such images on a shared host. Any other image is decided without it.
+fn guard_needing_shared_host<'a>(
+    request: &'a ImageRemovalRequest,
+    image: &InspectedImage,
+) -> Option<&'a OwnerGuard> {
+    request.owner_guard.as_ref().filter(|guard| {
+        guard.keep_unlabelled_when_shared && !image.labels.contains_key(&guard.label)
+    })
 }
 
 /// Whether the daemon holds any image carrying `label` with a value other
@@ -568,7 +603,7 @@ pub async fn another_owner_present(docker: &Docker, label: &str, owner: Option<&
 async fn remove_one(
     docker: &Docker,
     request: &ImageRemovalRequest,
-    shared_host: bool,
+    shared_hosts: &mut SharedHosts,
 ) -> ImageRemovalStatus {
     let image = match inspect_reference(docker, &request.reference).await {
         Ok(Some(image)) => image,
@@ -576,6 +611,21 @@ async fn remove_one(
         Err(error) => {
             return ImageRemovalStatus::Failed {
                 reason: format!("Failed to inspect image '{}': {error}", request.reference),
+            }
+        }
+    };
+    let shared_host = match guard_needing_shared_host(request, &image) {
+        None => false,
+        Some(guard) => {
+            let key = (guard.label.clone(), guard.owner.clone());
+            match shared_hosts.get(&key) {
+                Some(&known) => known,
+                None => {
+                    let found =
+                        another_owner_present(docker, &guard.label, guard.owner.as_deref()).await;
+                    shared_hosts.insert(key, found);
+                    found
+                }
             }
         }
     };
@@ -779,6 +829,58 @@ mod tests {
         };
         let tied = page_labelled_images(images, Some(&after_a), 1);
         assert_eq!(ids(&tied), ["b"]);
+    }
+
+    /// The page is chosen before anything is converted, so a listing far
+    /// larger than the page keeps exactly the oldest `max` after the cursor.
+    #[test]
+    fn a_page_keeps_only_the_oldest_after_the_cursor() {
+        let images: Vec<LabelledImage> = (0..50)
+            .rev()
+            .map(|n| listed(&format!("img-{n:02}"), n / 2))
+            .collect();
+        let page = page_labelled_images(images.clone(), None, 5);
+        let ids: Vec<&str> = page.images.iter().map(|i| i.image_id.as_str()).collect();
+        assert_eq!(ids, ["img-00", "img-01", "img-02", "img-03", "img-04"]);
+        assert_eq!(page.unlisted, 45);
+        let after = page.next.as_ref().expect("more to list");
+        assert_eq!((after.created, after.image_id.as_str()), (2, "img-04"));
+        let rest = page_labelled_images(images.clone(), Some(after), 100);
+        assert_eq!(rest.images.len(), 45);
+        assert_eq!(rest.images[0].image_id, "img-05");
+        assert_eq!((rest.unlisted, rest.next), (0, None));
+        let none = page_labelled_images(images, None, 0);
+        assert!(none.images.is_empty());
+        assert_eq!(none.unlisted, 50);
+    }
+
+    /// Only an image without an owner label, under a guard that keeps such
+    /// images on a shared host, needs the daemon-wide listing of owners; a
+    /// batch of labelled images never lists them.
+    #[test]
+    fn only_an_unlabelled_image_needs_the_shared_host_listing() {
+        let keeping = OwnerGuard {
+            keep_unlabelled_when_shared: true,
+            ..guard(Some("a.b"))
+        };
+        let request = ImageRemovalRequest::new("app-1:latest", None).with_owner_guard(keeping);
+        let unlabelled = inspected(APP, &["app-1:latest"]);
+        assert_eq!(
+            guard_needing_shared_host(&request, &unlabelled).map(|g| g.label.as_str()),
+            Some(OWNER_LABEL)
+        );
+        for owner in ["a.b", "other"] {
+            let mut labelled = inspected(APP, &["app-1:latest"]);
+            labelled
+                .labels
+                .insert(OWNER_LABEL.to_string(), owner.to_string());
+            assert!(guard_needing_shared_host(&request, &labelled).is_none());
+        }
+        let sweeping =
+            ImageRemovalRequest::new("app-1:latest", None).with_owner_guard(guard(Some("a.b")));
+        assert!(guard_needing_shared_host(&sweeping, &unlabelled).is_none());
+        let unguarded = ImageRemovalRequest::new("app-1:latest", None);
+        assert!(guard_needing_shared_host(&unguarded, &unlabelled).is_none());
     }
 
     #[test]
