@@ -39,6 +39,7 @@ function mockTraffic() {
   const summaryRouteEnds: string[] = []
   const prompts: string[] = []
   const refreshes: boolean[] = []
+  const traffic = { total: 120 }
   mockApi({
     [`GET ${base}/proxy-log-access`]: () =>
       jsonResponse({ can_read_proxy_logs: false }),
@@ -49,7 +50,7 @@ function mockTraffic() {
         overall_error_rate: 0,
         points: [],
         total_errors: 0,
-        total_requests: 120,
+        total_requests: traffic.total,
       })
     },
     [`POST ${base}/query`]: () =>
@@ -91,10 +92,13 @@ function mockTraffic() {
     }
     return sdkFetch(input, init)
   }) as typeof fetch
-  return { timeseriesEnds, summaryRouteEnds, prompts, refreshes }
+  return { timeseriesEnds, summaryRouteEnds, prompts, refreshes, traffic }
 }
 
-function renderTab(open: AiAssistantValue['open'] = () => {}) {
+function renderTab(
+  open: AiAssistantValue['open'] = () => {},
+  entry = '/api-traffic?filter=24hours'
+) {
   return render(
     <QueryClientProvider
       client={
@@ -104,7 +108,7 @@ function renderTab(open: AiAssistantValue['open'] = () => {}) {
       <AiAssistantContext.Provider
         value={{ open } as unknown as AiAssistantValue}
       >
-        <MemoryRouter initialEntries={['/api-traffic?filter=24hours']}>
+        <MemoryRouter initialEntries={[entry]}>
           <ApiTrafficTab
             project={
               {
@@ -196,4 +200,27 @@ test('after a Refresh, Generate keeps the open summary; Refresh summary makes a 
   await waitFor(() => expect(traffic.prompts).toHaveLength(2))
   expect(traffic.refreshes).toEqual([false, true])
   expect(traffic.prompts[1]).toContain(traffic.timeseriesEnds[1])
+})
+
+test('Refresh summary on a custom range summarizes the traffic it has now', async () => {
+  const traffic = mockTraffic()
+  renderTab(
+    () => {},
+    '/api-traffic?filter=custom&from=2026-01-01T00:00:00.000Z&to=2026-01-02T00:00:00.000Z'
+  )
+  const generate = await screen.findByRole('button', {
+    name: 'Generate AI traffic summary',
+  })
+  await waitFor(() => expect(generate.hasAttribute('disabled')).toBe(false))
+  fireEvent.click(generate)
+  await screen.findByText('Traffic is steady')
+  expect(traffic.prompts[0]).toContain('"requests":120')
+
+  // Late events land in the same fixed window.
+  traffic.traffic.total = 480
+  fireEvent.click(screen.getByRole('button', { name: 'Refresh summary' }))
+
+  await waitFor(() => expect(traffic.prompts).toHaveLength(2))
+  expect(traffic.prompts[1]).toContain('"requests":480')
+  expect(traffic.refreshes).toEqual([false, true])
 })

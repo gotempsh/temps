@@ -3,9 +3,7 @@
 
 import { useEnvironmentFilter } from '@/components/project-frame/use-environment-filter'
 import {
-  getApiCallersOptions,
   getApiTrafficProxyLogAccessOptions,
-  getApiRoutesOptions,
   getApiSummaryOptions,
   getApiTimeseriesOptions,
   getApiTimeseriesQueryKey,
@@ -15,6 +13,8 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import {
   aggregateApiTraffic,
+  getApiCallers,
+  getApiRoutes,
   getApiSummary,
   getApiTimeseries,
 } from '@/api/client'
@@ -573,9 +573,15 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
   }
   const summaryTimeseriesQuery = useQuery({
     // A key of its own, outside the page's Refresh, so the summary's context
-    // stays on its window. It starts from the chart's copy when that is the
-    // same window, so asking for a summary does not fetch it twice.
-    queryKey: ['api-traffic-summary-context', summaryTimeseriesRequest],
+    // stays on its window. The first summary starts from the chart's copy
+    // when that is the same window, so asking does not fetch it twice;
+    // "Refresh summary" (a new nonce) reads the window again, so a custom
+    // range summarizes the traffic it has now, not what it had before.
+    queryKey: [
+      'api-traffic-summary-context',
+      summaryTimeseriesRequest,
+      summaryRefreshNonce,
+    ],
     queryFn: async ({ signal }) => {
       const { data } = await getApiTimeseries({
         ...summaryTimeseriesRequest,
@@ -585,36 +591,66 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
       return data
     },
     initialData: () =>
-      queryClient.getQueryData(
-        getApiTimeseriesOptions(summaryTimeseriesRequest).queryKey
-      ),
+      summaryRefreshNonce === 0
+        ? queryClient.getQueryData(
+            getApiTimeseriesOptions(summaryTimeseriesRequest).queryKey
+          )
+        : undefined,
     staleTime: Infinity,
     enabled: enabled && summaryRequested,
   })
+  const summaryRoutesRequest = {
+    path: { project_id: project.id },
+    query: {
+      start_date: summaryWindow.startIso ?? '',
+      end_date: summaryWindow.endIso ?? '',
+      environment_id: selectedEnvironment,
+      limit: pageSize,
+      offset: 0,
+    },
+  }
   const summaryRoutesQuery = useQuery({
-    ...getApiRoutesOptions({
-      path: { project_id: project.id },
-      query: {
-        start_date: summaryWindow.startIso ?? '',
-        end_date: summaryWindow.endIso ?? '',
-        environment_id: selectedEnvironment,
-        limit: pageSize,
-        offset: 0,
-      },
-    }),
+    // Read again for "Refresh summary", like the timeseries above.
+    queryKey: [
+      'api-traffic-summary-routes',
+      summaryRoutesRequest,
+      summaryRefreshNonce,
+    ],
+    queryFn: async ({ signal }) => {
+      const { data } = await getApiRoutes({
+        ...summaryRoutesRequest,
+        signal,
+        throwOnError: true,
+      })
+      return data
+    },
     enabled: enabled && summaryRequested,
   })
+  const summaryCallersRequest = {
+    path: { project_id: project.id },
+    query: {
+      start_date: summaryWindow.startIso ?? '',
+      end_date: summaryWindow.endIso ?? '',
+      environment_id: selectedEnvironment,
+      limit: pageSize,
+      offset: 0,
+    },
+  }
   const summaryCallersQuery = useQuery({
-    ...getApiCallersOptions({
-      path: { project_id: project.id },
-      query: {
-        start_date: summaryWindow.startIso ?? '',
-        end_date: summaryWindow.endIso ?? '',
-        environment_id: selectedEnvironment,
-        limit: pageSize,
-        offset: 0,
-      },
-    }),
+    // Read again for "Refresh summary", like the timeseries above.
+    queryKey: [
+      'api-traffic-summary-callers',
+      summaryCallersRequest,
+      summaryRefreshNonce,
+    ],
+    queryFn: async ({ signal }) => {
+      const { data } = await getApiCallers({
+        ...summaryCallersRequest,
+        signal,
+        throwOnError: true,
+      })
+      return data
+    },
     enabled: enabled && summaryRequested,
   })
 
