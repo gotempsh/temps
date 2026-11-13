@@ -799,6 +799,51 @@ async fn test_update_s3_source_resubmitting_stored_values_does_not_probe() {
     assert_eq!(updated.name, "renamed");
 }
 
+/// A source saved before endpoints were normalised stores a bare
+/// `host:port`. An edit form sends it back as it was; it normalises to the
+/// `http://` form clients always used, the same destination, so a rename
+/// still probes nothing (the destination here is unreachable).
+#[tokio::test]
+async fn test_update_s3_source_resubmitting_a_legacy_bare_endpoint_does_not_probe() {
+    let encryption = EncryptionService::new("test_encryption_key_1234567890ab").unwrap();
+    let mut source = operator_s3_source(&encryption);
+    source.endpoint = Some("temps-s3-probe.invalid:9000".to_string());
+    let renamed = s3_sources::Model {
+        name: "renamed".to_string(),
+        endpoint: Some("http://temps-s3-probe.invalid:9000".to_string()),
+        ..source.clone()
+    };
+    let db = Arc::new(
+        MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![source.clone()]])
+            .append_query_results(vec![vec![renamed]])
+            .into_connection(),
+    );
+    let Ok(service) = build_service_for_mock(db.clone()) else {
+        return;
+    };
+
+    let updated = service
+        .update_s3_source(
+            31,
+            crate::handlers::backup_handler::UpdateS3SourceRequest {
+                name: Some("renamed".to_string()),
+                bucket_name: Some(source.bucket_name.clone()),
+                bucket_path: None,
+                access_key_id: None,
+                secret_key: None,
+                region: Some(source.region.clone()),
+                endpoint: source.endpoint.clone(),
+                force_path_style: source.force_path_style,
+                worker_credentials: None,
+                use_tls: None,
+            },
+        )
+        .await
+        .expect("the same destination in its legacy form needs no connectivity check");
+    assert_eq!(updated.name, "renamed");
+}
+
 /// A rename sends the masked credentials back unchanged: nothing about
 /// the connection changed, so nothing is probed and the stored
 /// credentials are kept instead of being replaced by `***`.

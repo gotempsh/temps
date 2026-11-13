@@ -621,9 +621,16 @@ impl BackupService {
                 &current.secret_key,
             )
             || differs(&request.region, &current.region)
-            || endpoint_change
-                .as_ref()
-                .is_some_and(|endpoint| &current.endpoint != endpoint)
+            // Compared as clients reach them: a legacy bare `minio:9000`
+            // sent back as stored normalises to `http://minio:9000`, the
+            // same destination, so it is not a change.
+            || endpoint_change.as_ref().is_some_and(|endpoint| {
+                endpoint
+                    .as_deref()
+                    .filter(|endpoint| !endpoint.trim().is_empty())
+                    .map(temps_core::s3_endpoint::endpoint_url)
+                    != current.endpoint_url()
+            })
             || request
                 .force_path_style
                 .is_some_and(|path_style| current.force_path_style != Some(path_style));
