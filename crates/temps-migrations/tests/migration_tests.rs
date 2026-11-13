@@ -8760,3 +8760,134 @@ async fn test_restore_runs_restored_login_migration_up_and_down() -> anyhow::Res
     assert!(!has_column(&db).await?, "dropped by down");
     Ok(())
 }
+
+/// ADR-103: the workflow tables apply to an existing database, enforce the
+/// journal's idempotency key and the run's idempotency key, cascade with
+/// their project, and roll back only when no run or event would be lost.
+#[tokio::test]
+async fn test_workflow_tables_up_down_and_refusal_with_live_runs() -> anyhow::Result<()> {
+    if external_db_configured() {
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!("Skipping workflow tables migration test: Docker unavailable: {error}");
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    let name = "m20261113_000001_create_workflow_tables";
+    let before = Migrator::migrations().len() as u32 - steps_back_to(name);
+    Migrator::up(&db, Some(before)).await?;
+
+    async fn table_count(db: &DatabaseConnection) -> anyhow::Result<i64> {
+        let row = db
+            .query_one(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT count(*)::BIGINT AS n FROM information_schema.tables \
+                 WHERE table_schema = current_schema() AND table_name IN ( \
+                 'workflow_runs', 'workflow_steps', 'workflow_events', \
+                 'workflow_environment_settings', 'workflow_credentials')"
+                    .to_string(),
+            ))
+            .await?
+            .expect("count returns a row");
+        Ok(row.try_get::<i64>("", "n")?)
+    }
+    assert_eq!(table_count(&db).await?, 0, "absent before the migration");
+
+    // An existing project and environment, created before the migration.
+    db.execute_unprepared(
+        "INSERT INTO projects \
+         (name, repo_name, repo_owner, directory, main_branch, preset, created_at, updated_at, slug) \
+         VALUES ('Workflows', '', '', '.', 'main', 'dockerfile', now(), now(), 'workflows-test')",
+    )
+    .await?;
+    db.execute_unprepared(
+        "INSERT INTO environments (name, slug, subdomain, host, upstreams, created_at, updated_at, project_id) \
+         SELECT 'production', 'production', 'workflows-test-production', 'workflows.test', '[]', now(), now(), id \
+         FROM projects WHERE slug = 'workflows-test'",
+    )
+    .await?;
+
+    Migrator::up(&db, Some(1)).await?;
+    assert_eq!(table_count(&db).await?, 5, "created by the migration");
+
+    let insert_run = |id: &str, key: &str| {
+        format!(
+            "INSERT INTO workflow_runs (id, project_id, environment_id, workflow_name, status, idempotency_key, due_at) \
+             SELECT '{id}', e.project_id, e.id, 'onboarding', 'queued', '{key}', now() \
+             FROM environments e JOIN projects p ON p.id = e.project_id WHERE p.slug = 'workflows-test'"
+        )
+    };
+    db.execute_unprepared(&insert_run("00000000-0000-4000-8000-000000000001", "k1"))
+        .await?;
+    // The same idempotency key in the same environment and workflow is refused.
+    assert!(db
+        .execute_unprepared(&insert_run("00000000-0000-4000-8000-000000000002", "k1"))
+        .await
+        .is_err());
+    db.execute_unprepared(
+        "INSERT INTO workflow_steps (run_id, sequence, name, kind, status, lease_token) \
+         VALUES ('00000000-0000-4000-8000-000000000001', 0, 'charge', 'step', 'completed', 1)",
+    )
+    .await?;
+    // One entry per (run, sequence): the journal's idempotency key.
+    assert!(db
+        .execute_unprepared(
+            "INSERT INTO workflow_steps (run_id, sequence, name, kind, status, lease_token) \
+             VALUES ('00000000-0000-4000-8000-000000000001', 0, 'charge', 'step', 'completed', 2)",
+        )
+        .await
+        .is_err());
+    // An unknown status is rejected by the CHECK constraint.
+    assert!(db
+        .execute_unprepared(
+            "UPDATE workflow_runs SET status = 'paused' \
+             WHERE id = '00000000-0000-4000-8000-000000000001'",
+        )
+        .await
+        .is_err());
+
+    // A live run blocks the rollback, and the tables survive the attempt.
+    let refused = Migrator::down(&db, Some(steps_back_to(name))).await;
+    assert!(refused.is_err(), "down must refuse while runs exist");
+    assert_eq!(table_count(&db).await?, 5);
+
+    // Deleting the project removes its runs and journal (ON DELETE CASCADE).
+    db.execute_unprepared("DELETE FROM projects WHERE slug = 'workflows-test'")
+        .await?;
+    let remaining = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT (SELECT count(*) FROM workflow_runs)::BIGINT + \
+                    (SELECT count(*) FROM workflow_steps)::BIGINT AS n"
+                .to_string(),
+        ))
+        .await?
+        .expect("count returns a row");
+    assert_eq!(remaining.try_get::<i64>("", "n")?, 0);
+
+    Migrator::down(&db, Some(steps_back_to(name))).await?;
+    assert_eq!(table_count(&db).await?, 0, "dropped by down");
+    Ok(())
+}

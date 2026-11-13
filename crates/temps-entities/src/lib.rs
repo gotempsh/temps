@@ -282,7 +282,12 @@ pub mod sandbox_snapshots;
 pub mod sandboxes;
 
 // Workflow memory
+pub mod workflow_credentials;
+pub mod workflow_environment_settings;
+pub mod workflow_events;
 pub mod workflow_memory;
+pub mod workflow_runs;
+pub mod workflow_steps;
 
 pub mod prelude;
 
