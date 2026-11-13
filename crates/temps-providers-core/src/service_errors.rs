@@ -273,7 +273,8 @@ pub enum ExternalServiceError {
     /// each is checked against the other as saved. This one waited too long
     /// for another save to finish.
     #[error(
-        "Timed out after {timeout_secs}s waiting for another healthcheck settings save while          {operation}. Nothing was saved; retry once the other save finishes"
+        "Timed out after {timeout_secs}s waiting for another healthcheck settings save while \
+         {operation}. Nothing was saved; retry once the other save finishes"
     )]
     HealthcheckSettingsBusy {
         operation: &'static str,

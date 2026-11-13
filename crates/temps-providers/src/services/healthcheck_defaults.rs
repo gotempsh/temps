@@ -622,6 +622,12 @@ mod tests {
             ),
             "{waited:?}"
         );
+        // What the 409 tells the operator.
+        assert_eq!(
+            waited.unwrap_err().to_string(),
+            "Timed out after 1s waiting for another healthcheck settings save while saving the \
+             healthcheck defaults. Nothing was saved; retry once the other save finishes"
+        );
         assert_eq!(
             saved.expect("saved once the other save finished").current,
             interval(60)
