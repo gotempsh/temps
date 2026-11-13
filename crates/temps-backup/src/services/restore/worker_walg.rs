@@ -193,7 +193,7 @@ async fn archive_window(
         endpoint: source.endpoint.clone(),
         bucket_name: source.bucket_name.clone(),
         bucket_path: source.bucket_path.clone(),
-        force_path_style: source.force_path_style.unwrap_or(true),
+        force_path_style: source.effective_path_style(true).force_path_style,
     };
     let client = build_s3_client(&credentials);
     let prefix = walg_key_prefix(&source.bucket_path, &service.name);

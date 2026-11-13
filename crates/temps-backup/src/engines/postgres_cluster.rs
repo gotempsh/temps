@@ -175,7 +175,7 @@ impl BackupEngine for PostgresClusterEngine {
             endpoint: s3_source.endpoint.clone(),
             bucket_name: s3_source.bucket_name.clone(),
             bucket_path: s3_source.bucket_path.clone(),
-            force_path_style: s3_source.force_path_style.unwrap_or(true),
+            force_path_style: s3_source.effective_path_style(true).force_path_style,
         }
         .resolve_endpoint_for_container(&deps.docker, &primary_container)
         .await;
@@ -202,14 +202,10 @@ impl BackupEngine for PostgresClusterEngine {
         ));
         walg_env.extend(v2_common::walg_identity_env(&backup_uuid));
         if let Some(ep) = container_endpoint {
-            let url = if ep.starts_with("http") {
-                ep
-            } else {
-                format!("http://{}", ep)
-            };
+            let url = temps_core::s3_endpoint::endpoint_url(&ep);
             walg_env.push(format!("AWS_ENDPOINT={}", url));
         }
-        if s3_source.force_path_style.unwrap_or(true) {
+        if s3_source.effective_path_style(true).force_path_style {
             walg_env.push("AWS_S3_FORCE_PATH_STYLE=true".to_string());
         }
 

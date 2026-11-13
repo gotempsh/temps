@@ -204,7 +204,7 @@ async fn walg_env(
     if let Some(endpoint) = s3.resolve_endpoint_for_container(docker, container).await {
         env.push(format!("AWS_ENDPOINT={endpoint}"));
     }
-    if s3.force_path_style {
+    if s3.uses_path_style() {
         env.push("AWS_S3_FORCE_PATH_STYLE=true".to_string());
     }
     env

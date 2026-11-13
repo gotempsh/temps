@@ -479,7 +479,7 @@ pub fn build_s3_client(
 
     let builder = s3_config_builder(
         &s3_source.region,
-        s3_source.force_path_style.unwrap_or(true),
+        s3_source.effective_path_style(true).force_path_style,
         creds,
         s3_source.endpoint.as_deref(),
     );

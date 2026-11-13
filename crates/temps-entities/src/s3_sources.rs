@@ -119,6 +119,48 @@ impl Related<super::external_services::Entity> for Entity {
     }
 }
 
+impl Model {
+    /// The endpoint with an explicit scheme, as every client receives it.
+    /// `None` for AWS S3 itself.
+    pub fn endpoint_url(&self) -> Option<String> {
+        self.endpoint
+            .as_deref()
+            .filter(|endpoint| !endpoint.trim().is_empty())
+            .map(temps_core::s3_endpoint::endpoint_url)
+    }
+
+    /// Path-style addressing as clients must use it, and why.
+    ///
+    /// `default_when_unset` is what a NULL `force_path_style` means at the
+    /// calling site. An IP-literal endpoint, or a source backed by a
+    /// Temps-managed object store, forces path style whatever the setting.
+    ///
+    /// When the source never set `force_path_style` and the endpoint forces
+    /// it, the forcing reason is reported rather than "as configured": the
+    /// operator configured nothing.
+    pub fn effective_path_style(
+        &self,
+        default_when_unset: bool,
+    ) -> temps_core::s3_endpoint::EffectivePathStyle {
+        use temps_core::s3_endpoint::{effective_path_style, EffectivePathStyle, PathStyleReason};
+        let endpoint = self.endpoint.as_deref();
+        let managed = self.backing_service_id.is_some();
+        match self.force_path_style {
+            Some(configured) => effective_path_style(endpoint, configured, managed),
+            None => match effective_path_style(endpoint, false, managed) {
+                EffectivePathStyle {
+                    reason: PathStyleReason::Configured,
+                    ..
+                } => EffectivePathStyle {
+                    force_path_style: default_when_unset,
+                    reason: PathStyleReason::Configured,
+                },
+                forced => forced,
+            },
+        }
+    }
+}
+
 #[async_trait]
 impl ActiveModelBehavior for ActiveModel {
     async fn before_save<C>(mut self, _db: &C, insert: bool) -> Result<Self, DbErr>
@@ -401,6 +443,32 @@ mod tests {
             endpoint: None,
             force_path_style: Some(true),
         }
+    }
+
+    #[test]
+    fn unset_path_style_on_an_ip_endpoint_reports_why_it_is_forced() {
+        use temps_core::s3_endpoint::PathStyleReason;
+        let mut source = model_with_session_token(None);
+        source.force_path_style = None;
+        source.endpoint = Some("http://10.0.0.5:9000".to_string());
+        let effective = source.effective_path_style(true);
+        assert!(effective.force_path_style);
+        assert_eq!(effective.reason, PathStyleReason::IpAddressEndpoint);
+
+        // A hostname with nothing set keeps the caller's default.
+        source.endpoint = Some("https://s3.example.com".to_string());
+        let effective = source.effective_path_style(false);
+        assert!(!effective.force_path_style);
+        assert_eq!(effective.reason, PathStyleReason::Configured);
+
+        // An explicit choice on an IP endpoint that already matches is the
+        // operator's, not an override.
+        source.endpoint = Some("http://10.0.0.5:9000".to_string());
+        source.force_path_style = Some(true);
+        assert_eq!(
+            source.effective_path_style(true).reason,
+            PathStyleReason::Configured
+        );
     }
 
     fn model_with_session_token(session_token: Option<String>) -> Model {

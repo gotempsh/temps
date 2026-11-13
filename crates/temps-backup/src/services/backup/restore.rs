@@ -556,7 +556,7 @@ impl BackupService {
             endpoint: s3_source.endpoint.clone(),
             bucket_name: s3_source.bucket_name.clone(),
             bucket_path: s3_source.bucket_path.clone(),
-            force_path_style: s3_source.force_path_style.unwrap_or(true),
+            force_path_style: s3_source.effective_path_style(true).force_path_style,
         };
         if let Some(resolved_endpoint) = s3_creds
             .resolve_endpoint_for_container(&docker, &container_id)
@@ -564,7 +564,7 @@ impl BackupService {
         {
             walg_env.push(format!("AWS_ENDPOINT={}", resolved_endpoint));
         }
-        if s3_source.force_path_style.unwrap_or(true) {
+        if s3_source.effective_path_style(true).force_path_style {
             walg_env.push("AWS_S3_FORCE_PATH_STYLE=true".to_string());
         }
 
@@ -1138,6 +1138,7 @@ mod tests {
             is_default: None,
             backing_service_id: None,
             worker_credentials: None,
+            use_tls: None,
         };
 
         let s3_source = source_backup_service
@@ -1208,6 +1209,7 @@ mod tests {
             is_default: None,
             backing_service_id: None,
             worker_credentials: None,
+            use_tls: None,
         };
 
         let target_s3_source = target_backup_service

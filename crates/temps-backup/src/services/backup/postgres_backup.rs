@@ -834,6 +834,7 @@ mod tests {
             is_default: None,
             backing_service_id: None,
             worker_credentials: None,
+            use_tls: None,
         };
 
         let s3_source = backup_service

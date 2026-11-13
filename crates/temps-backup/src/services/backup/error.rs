@@ -29,6 +29,16 @@ pub enum BackupError {
         cause: String,
     },
 
+    /// The endpoint entered for an S3 source cannot be used as entered:
+    /// unsupported scheme, malformed, or a scheme that disagrees with the
+    /// TLS setting next to it. Nothing is saved.
+    #[error("Invalid endpoint for S3 source '{source_name}': {error}")]
+    InvalidS3Endpoint {
+        source_name: String,
+        #[source]
+        error: temps_core::s3_endpoint::S3EndpointError,
+    },
+
     #[error("Schedule error: {0}")]
     Schedule(String),
 

@@ -13,6 +13,7 @@ import type {
 import { collectRouteQueryFailures } from '@/lib/route-query-failures'
 import { installBrowserWindow } from '@/test/dom'
 import { jsonResponse, mockApi } from '@/test/fetch-mock'
+import { MemoryRouter } from 'react-router'
 import { WalHealthPanel } from './WalHealthPanel'
 
 installBrowserWindow()
@@ -48,14 +49,16 @@ function renderPanel(settings: Partial<PostgresWalHealth>, isImported = false) {
     capability
   )
   return renderToStaticMarkup(
-    <QueryClientProvider client={client}>
-      <WalHealthPanel
-        serviceId={7}
-        serviceType="postgres"
-        onBackup={() => {}}
-        isImported={isImported}
-      />
-    </QueryClientProvider>
+    <MemoryRouter>
+      <QueryClientProvider client={client}>
+        <WalHealthPanel
+          serviceId={7}
+          serviceType="postgres"
+          onBackup={() => {}}
+          isImported={isImported}
+        />
+      </QueryClientProvider>
+    </MemoryRouter>
   )
 }
 
@@ -93,6 +96,84 @@ describe('post-restore WAL archiving guidance', () => {
     expect(markup).toContain('archive_command is empty')
     expect(markup).toContain('can fill disk')
     expect(markup).not.toContain('discards WAL')
+  })
+})
+
+describe('continuous archiving status', () => {
+  test('archiving that works is shown, with the test action', () => {
+    const markup = renderPanel({
+      archive_command: 'wal-g wal-push %p',
+      warnings: [],
+      archiver_last_archived_at: '2026-01-01T00:00:00Z',
+    })
+    expect(markup).toContain('WAL archiving:')
+    expect(markup).toContain('Archiving')
+    expect(markup).toContain('Test archive target')
+  })
+
+  test('failing archiving is critical and names the segment', () => {
+    const markup = renderPanel({
+      archive_command: 'wal-g wal-push %p',
+      archiver_last_archived_at: '2026-01-01T00:00:00Z',
+      archiver_last_failed_at: '2026-01-01T01:00:00Z',
+      archiver_last_failed_wal: '000000010000000000000042',
+      warnings: [
+        {
+          kind: 'archive_failing',
+          last_failed_wal: '000000010000000000000042',
+          last_failed_at: '2026-01-01T01:00:00Z',
+          last_archived_at: '2026-01-01T00:00:00Z',
+        },
+      ],
+    })
+    expect(markup).toContain('WAL is filling disk')
+    expect(markup).toContain(
+      'WAL archiving is failing at segment 000000010000000000000042'
+    )
+    expect(markup).toContain('Failing')
+  })
+
+  test('a stalled archiver says so even before any attempt fails', () => {
+    const markup = renderPanel({
+      archive_command: 'wal-g wal-push %p',
+      archiver_last_archived_at: '2026-01-01T00:00:00Z',
+      archive_backlog: 5,
+      archive_oldest_ready_age_secs: 840,
+      warnings: [
+        {
+          kind: 'archive_failing',
+          last_failed_wal: null,
+          last_failed_at: null,
+          last_archived_at: '2026-01-01T00:00:00Z',
+          stalled_secs: 840,
+        },
+      ],
+    })
+    expect(markup).toContain(
+      'WAL archiving has stalled: a segment has waited 14 min'
+    )
+    expect(markup).toContain('retrying an endpoint it cannot reach')
+    expect(markup).toContain('5 segments')
+  })
+
+  test('a role that cannot list archive_status says stalls are invisible', () => {
+    const markup = renderPanel({
+      archive_command: 'wal-g wal-push %p',
+      archiver_last_archived_at: '2026-01-01T00:00:00Z',
+      archive_status_unreadable: true,
+      warnings: [{ kind: 'archive_stall_check_unavailable' }],
+    })
+    expect(markup).toContain('Stalled WAL archiving cannot be detected')
+    expect(markup).toContain('Grant pg_monitor')
+    expect(markup).toContain(
+      'Unknown: the database role may not list archive_status'
+    )
+    expect(markup).not.toContain('0 segments')
+  })
+
+  test('archiving off shows no archiving status', () => {
+    const markup = renderPanel({ archive_mode: 'off', warnings: [] })
+    expect(markup).not.toContain('Test archive target')
   })
 })
 

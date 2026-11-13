@@ -373,7 +373,7 @@ impl ExternalServiceManager {
                 endpoint: s3_source.endpoint.clone(),
                 bucket_name: s3_source.bucket_name.clone(),
                 bucket_path: s3_source.bucket_path.clone(),
-                force_path_style: s3_source.force_path_style.unwrap_or(true),
+                force_path_style: s3_source.effective_path_style(true).force_path_style,
             };
 
             // The layout every PostgreSQL WAL-G backup uses, on the control
@@ -889,8 +889,14 @@ mod tests {
                 archive_mode,
                 archive_command: None,
                 archive_backlog: 0,
+                archive_library: None,
+                archive_status_unreadable: false,
                 archiver_failed_count: None,
                 archiver_last_failed_at: None,
+                archiver_archived_count: None,
+                archiver_last_archived_at: None,
+                archiver_last_failed_wal: None,
+                archive_oldest_ready_age_secs: None,
                 stale_slots: Vec::new(),
                 oldest_wal_age_secs: 0,
                 warnings: Vec::new(),

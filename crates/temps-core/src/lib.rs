@@ -72,6 +72,7 @@ pub mod node_labels;
 pub mod retention;
 pub mod retry;
 pub mod runtime;
+pub mod s3_endpoint;
 pub mod sandbox_preview_relay;
 pub mod sandbox_runtime;
 pub mod secret_string;

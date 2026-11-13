@@ -27,6 +27,7 @@ pub use migration::m20260916_000001_reconcile_otel_trace_summaries::{
     trace_summary_rebuild_delta_sql, trace_summary_rebuild_initial_sql,
 };
 pub use migration::m20261107_000003_unique_custom_domain_hostname::Migration as UniqueCustomDomainHostnameMigration;
+pub use migration::m20261112_000001_seed_postgres_wal_archiving_alert_rules::Migration as SeedPostgresWalArchivingAlertRulesMigration;
 pub use migration::Migrator;
 
 pub use migration::m20261022_000001_dns_name_claims::{

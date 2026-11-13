@@ -311,6 +311,7 @@ async fn disable_and_enable_schedule_reconcile_s3_lifecycle_rules() {
             is_default: None,
             backing_service_id: None,
             worker_credentials: None,
+            use_tls: None,
         })
         .await
         .expect("Failed to create S3 source");

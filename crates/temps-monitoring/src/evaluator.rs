@@ -46,7 +46,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use sea_orm::sea_query::Expr;
-use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
+use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QuerySelect};
 use temps_core::log_transitions::{FailureLatch, FailureLog, KeyedFailureLatch};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
@@ -1288,6 +1288,18 @@ impl AlertEvaluator {
                 // (and its notification) records which service breached.
                 return (Some(ps.project_id), None, None, Some(svc_id));
             }
+            // Not linked to a project (a database run on its own): still a
+            // host-wide alarm, but one that names the service, as long as
+            // it still exists (the column is a foreign key).
+            if let Ok(Some(_)) = temps_entities::external_services::Entity::find_by_id(svc_id)
+                .select_only()
+                .column(temps_entities::external_services::Column::Id)
+                .into_tuple::<i32>()
+                .one(self.db.as_ref())
+                .await
+            {
+                return (None, None, None, Some(svc_id));
+            }
         }
 
         // Node-scoped rules (and the fallback for a rule whose deployment/
@@ -1503,6 +1515,9 @@ pub use temps_alarms::default_rules::{
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+mod wal_archiving_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1613,7 +1628,7 @@ mod tests {
 
     // ── alarm_type_for_rule() ───────────────────────────────────────────────────
 
-    fn make_rule(
+    pub(super) fn make_rule(
         service_id: Option<i32>,
         deployment_id: Option<i32>,
     ) -> monitoring_alert_rules::Model {
@@ -1737,7 +1752,7 @@ mod tests {
     };
 
     /// No-op metrics store — `resolve_alarm_context` never touches it.
-    struct NoopStore;
+    pub(super) struct NoopStore;
 
     #[async_trait]
     impl MetricsStore for NoopStore {
@@ -1774,7 +1789,7 @@ mod tests {
         }
     }
 
-    struct NoopNotifications;
+    pub(super) struct NoopNotifications;
 
     #[async_trait]
     impl NotificationService for NoopNotifications {
@@ -1789,7 +1804,7 @@ mod tests {
         }
     }
 
-    struct NoopQueue;
+    pub(super) struct NoopQueue;
 
     #[async_trait]
     impl temps_core::JobQueue for NoopQueue {
@@ -1801,7 +1816,7 @@ mod tests {
         }
     }
 
-    fn evaluator_with_db(db: DatabaseConnection) -> AlertEvaluator {
+    pub(super) fn evaluator_with_db(db: DatabaseConnection) -> AlertEvaluator {
         evaluator_with_shared_db(Arc::new(db))
     }
 
@@ -2458,23 +2473,42 @@ mod tests {
     async fn resolve_alarm_context_service_rule_without_project_keeps_service_id() {
         let rule = make_rule(Some(9), None);
 
-        // project_services lookup returns nothing.
+        // project_services lookup returns nothing; the service exists.
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![Vec::<temps_entities::project_services::Model>::new()])
+            .append_query_results(vec![vec![std::collections::BTreeMap::from([(
+                "id".to_string(),
+                sea_orm::Value::Int(Some(9)),
+            )])]])
             .into_connection();
 
         let evaluator = evaluator_with_db(db);
         let (project_id, environment_id, deployment_id, service_id) =
             evaluator.resolve_alarm_context(&rule).await;
 
-        // Falls through to a system-wide (no project) alarm — no project
-        // mapping found, and there's no project to misattribute it to.
+        // A system-wide (no project) alarm: there's no project to
+        // misattribute it to, but it names the service that breached.
         assert_eq!(project_id, None);
         assert_eq!(environment_id, None);
         assert_eq!(deployment_id, None);
-        // service_id is None here because the fallback path can't attribute it
-        // to a project; the alarm is still stored as system-wide.
-        assert_eq!(service_id, None);
+        assert_eq!(service_id, Some(9));
+    }
+
+    /// A rule whose service row is gone cannot reference it (foreign key):
+    /// the alarm is system-wide with no service.
+    #[tokio::test]
+    async fn resolve_alarm_context_for_a_deleted_service_has_no_service_id() {
+        let rule = make_rule(Some(9), None);
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![Vec::<temps_entities::project_services::Model>::new()])
+            .append_query_results(vec![Vec::<
+                std::collections::BTreeMap<String, sea_orm::Value>,
+            >::new()])
+            .into_connection();
+
+        let evaluator = evaluator_with_db(db);
+        let context = evaluator.resolve_alarm_context(&rule).await;
+        assert_eq!(context, (None, None, None, None));
     }
 
     /// Node-scoped rules (proxy metrics) have no project/service/deployment
@@ -2500,7 +2534,7 @@ mod tests {
 
     // ── volume gates ───────────────────────────────────────────────────────────
 
-    fn latest(pairs: &[(&str, f64)]) -> HashMap<String, f64> {
+    pub(super) fn latest(pairs: &[(&str, f64)]) -> HashMap<String, f64> {
         pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
     }
 
