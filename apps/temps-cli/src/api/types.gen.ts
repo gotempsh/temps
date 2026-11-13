@@ -38320,6 +38320,21 @@ export type WorkflowAwaitedEventResponse = {
 };
 
 /**
+ * A child run a `child` entry starts. Temps records the entry `pending`
+ * with `{"run_id": ...}` and completes it with the child's
+ * [`child_result`] when the child finishes.
+ */
+export type WorkflowChildStart = {
+    input?: {
+        [key: string]: unknown;
+    };
+    /**
+     * The child's workflow, in the same environment.
+     */
+    workflow: string;
+};
+
+/**
  * The environment's workflow credential, never its token.
  */
 export type WorkflowCredentialStatusResponse = {
@@ -38614,7 +38629,7 @@ export type WorkflowSettings = {
 /**
  * What a journal entry records.
  */
-export type WorkflowStepKind = 'step' | 'sleep' | 'wait' | 'now' | 'random' | 'send_event';
+export type WorkflowStepKind = 'step' | 'sleep' | 'wait' | 'now' | 'random' | 'send_event' | 'child';
 
 export type WorkflowStepListResponse = {
     page: number;
@@ -38672,6 +38687,7 @@ export type WorkflowStepWriteRequest = {
      * Attempts made so far, this one included.
      */
     attempts: number;
+    child?: WorkflowChildStart | null;
     duration_ms?: number | null;
     error?: string | null;
     /**

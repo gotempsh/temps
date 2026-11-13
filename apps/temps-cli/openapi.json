@@ -83043,6 +83043,22 @@
         ],
         "type": "object"
       },
+      "WorkflowChildStart": {
+        "description": "A child run a `child` entry starts. Temps records the entry `pending`\nwith `{\"run_id\": ...}` and completes it with the child's\n[`child_result`] when the child finishes.",
+        "properties": {
+          "input": {
+            "type": "object"
+          },
+          "workflow": {
+            "description": "The child's workflow, in the same environment.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "workflow"
+        ],
+        "type": "object"
+      },
       "WorkflowCredentialStatusResponse": {
         "description": "The environment's workflow credential, never its token.",
         "properties": {
@@ -83837,7 +83853,8 @@
           "wait",
           "now",
           "random",
-          "send_event"
+          "send_event",
+          "child"
         ],
         "type": "string"
       },
@@ -83992,6 +84009,17 @@
             "description": "Attempts made so far, this one included.",
             "format": "int32",
             "type": "integer"
+          },
+          "child": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/WorkflowChildStart",
+                "description": "For `child`: the run to start, started exactly once."
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "duration_ms": {
             "format": "int64",
