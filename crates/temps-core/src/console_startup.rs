@@ -266,10 +266,16 @@ fn redact_key_values(text: &str) -> String {
         let starts_word =
             key_start == 0 || !is_word_byte(bytes[key_start - 1]) || bytes[key_start - 1] == b'_';
         let mut value_start = key_end;
-        // JSON/debug output may quote the key as well as the value.
-        if key_start > 0
-            && matches!(bytes[key_start - 1], b'\'' | b'"')
-            && bytes.get(value_start) == Some(&bytes[key_start - 1])
+        // JSON/debug output may quote the key as well as the value; the
+        // quote opens before the whole name (`"AWS_SECRET_ACCESS_KEY"`), not
+        // before the secret word inside it.
+        let mut name_start = key_start;
+        while name_start > 0 && is_word_byte(bytes[name_start - 1]) {
+            name_start -= 1;
+        }
+        if name_start > 0
+            && matches!(bytes[name_start - 1], b'\'' | b'"')
+            && bytes.get(value_start) == Some(&bytes[name_start - 1])
         {
             value_start += 1;
         }
@@ -457,6 +463,14 @@ mod tests {
              AWS_ACCESS_KEY_ID=AKIDEXAMPLE AWS_REGION=us-east-1"
         );
         assert_eq!(redact_secrets("DB_PASSWORD=x"), "DB_PASSWORD=***");
+        assert_eq!(
+            redact_secrets(r#"{"AWS_SECRET_ACCESS_KEY": "hidden", "AWS_REGION": "us-east-1"}"#),
+            r#"{"AWS_SECRET_ACCESS_KEY": "***", "AWS_REGION": "us-east-1"}"#
+        );
+        assert_eq!(
+            redact_secrets("'AWS_SESSION_TOKEN': 'hidden'"),
+            "'AWS_SESSION_TOKEN': '***'"
+        );
     }
 
     #[test]
