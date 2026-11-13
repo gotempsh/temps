@@ -52,7 +52,7 @@ pub use plugin_registry::{PluginDispatchGuard, PluginToolsRegistry};
 
 pub use caller::{
     ApiCallScope, ApiToolResponse, BuiltRequest, InternalApiCaller, PreparedWrite,
-    ProjectSelectorScope, WritePrepareOutcome,
+    ProjectSelectorScope, WriteApproval, WritePrepareOutcome,
 };
 pub use error::ApiToolError;
 pub use handle::{ApiToolsHandle, WriteApiToolsHandle};

@@ -216,6 +216,9 @@ pub(crate) async fn confirm(
             pending.params,
             &scope(auth, metadata),
             pending.plugin_revision.as_deref(),
+            // The model received this token and may have called
+            // confirm_action itself, so it cannot vouch for human consent.
+            temps_ai_api_tools::WriteApproval::ProposalToken,
         )
         .await;
     let event = McpCliWriteAudit {
@@ -866,6 +869,63 @@ mod tests {
         assert!(result.content[0].text.contains("via Temps AI assistant"));
         assert!(!result.content[0].text.contains("192.0.2.10"));
         assert!(audit.0.lock().unwrap()[0].contains("192.0.2.20"));
+    }
+
+    /// The model receives the proposal token and can call confirm_action
+    /// itself, so confirming over MCP must not count as the human consent the
+    /// vault session and link handlers require.
+    #[tokio::test]
+    async fn mcp_confirmation_cannot_stand_in_for_human_consent_to_vault_access() {
+        use axum::response::IntoResponse;
+        use temps_core::ai_tool_call::{require_human_confirmation, AiToolCall, ConfirmedAiWrite};
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reached = calls.clone();
+        let handler = move |req: axum::extract::Request| {
+            let reached = reached.clone();
+            async move {
+                reached.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                match require_human_confirmation(
+                    req.extensions().get::<AiToolCall>(),
+                    req.extensions().get::<ConfirmedAiWrite>(),
+                    "create_access_session_general",
+                ) {
+                    Ok(()) => axum::http::StatusCode::ACCEPTED.into_response(),
+                    Err(problem) => problem.into_response(),
+                }
+            }
+        };
+        let router = axum::Router::new().route("/session", axum::routing::post(handler));
+        let api = serde_json::from_value(json!({"openapi":"3.1.0","info":{"title":"Fixture","version":"1"},
+            "paths":{"/session":{"post":{"operationId":"create_access_session_general","responses":{"202":{"description":"ok"}}}}}})).unwrap();
+        let (state, _, _) = fixture();
+        state.write_api_tools.set(
+            temps_ai_api_tools::InternalApiCaller::new_write_allowlisted(
+                router,
+                &api,
+                vec!["create_access_session_general".into()],
+            ),
+        );
+        let proposal = super::execute(
+            &state,
+            &auth(3, true),
+            &metadata(),
+            "temps_write",
+            &json!({"command":"create_access_session_general"}),
+        )
+        .await
+        .unwrap();
+        let token = proposal.proposal_token.unwrap();
+        let args = state.proposals.peek(&token).unwrap().arguments;
+        let refused = confirm(&state, &auth(3, true), &metadata(), &token, args)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("403"), "{refused}");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the handler ran and refused; nothing was granted"
+        );
     }
 
     #[tokio::test]

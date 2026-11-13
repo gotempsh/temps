@@ -935,7 +935,8 @@ mod tests {
                 "plugin.reports.create",
                 json!({}),
                 &scope,
-                prepared.plugin_revision.as_deref()
+                prepared.plugin_revision.as_deref(),
+                crate::WriteApproval::OwnerInApp,
             )
             .await
             .is_err());
@@ -1223,6 +1224,7 @@ mod tests {
                 prepared.params,
                 &scope,
                 prepared.plugin_revision.as_deref(),
+                crate::WriteApproval::OwnerInApp,
             )
             .await
             .unwrap();
@@ -1277,8 +1279,30 @@ mod tests {
             ordinary,
             crate::ApiToolError::Upstream { status: 403, .. }
         ));
+        // A relayed proposal token (an MCP client's confirm_action) is
+        // something the model itself can replay, so it is not consent.
+        let relayed = caller
+            .execute_approved_write(
+                "create_access_session_general",
+                json!({}),
+                &scope,
+                None,
+                crate::WriteApproval::ProposalToken,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            relayed,
+            crate::ApiToolError::Upstream { status: 403, .. }
+        ));
         let confirmed = caller
-            .execute_approved_write("create_access_session_general", json!({}), &scope, None)
+            .execute_approved_write(
+                "create_access_session_general",
+                json!({}),
+                &scope,
+                None,
+                crate::WriteApproval::OwnerInApp,
+            )
             .await
             .unwrap();
         assert_eq!(confirmed.status, 202);

@@ -633,6 +633,8 @@ impl PendingActionService {
                 executable_params,
                 &scope,
                 action.plugin_revision.as_deref(),
+                // The owner confirmed it here; the endpoint refuses assistants.
+                temps_ai_api_tools::WriteApproval::OwnerInApp,
             )
             .await;
 
