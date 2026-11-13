@@ -57,6 +57,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
+import { problemDetail } from '@/lib/api-problem'
 import { queryKeyPrefix } from '@/lib/refresh'
 import { SortableTableHead } from '@/components/ui/sortable-table-head'
 import { Link } from 'react-router'
@@ -765,11 +766,22 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
   })
   const summaryData =
     structuredSummary.value ?? cliSummaryQuery.data?.summary ?? undefined
-  const summaryError =
-    cliSummaryQuery.data?.unavailable_reason ??
-    (structuredSummary.failureStatus === 409
-      ? undefined
-      : structuredSummary.error)
+  // The traffic the summary is made from: if a read failed, the AI was never
+  // asked, and the card says so ("Try again" reads it again).
+  const summaryContextFailure = [
+    summaryTimeseriesQuery,
+    summaryRoutesQuery,
+    summaryCallersQuery,
+  ].find((query) => query.isError)
+  const summaryError = summaryContextFailure
+    ? `Couldn't read the API traffic to summarize: ${problemDetail(
+        summaryContextFailure.error,
+        'the server did not answer.'
+      )}`
+    : (cliSummaryQuery.data?.unavailable_reason ??
+      (structuredSummary.failureStatus === 409
+        ? undefined
+        : structuredSummary.error))
   const summaryCanGenerate = canStartApiTrafficSummary({
     analyticsEnabled: enabled,
     timeseriesPending: timeseriesQuery.isPending,

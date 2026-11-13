@@ -39,7 +39,7 @@ function mockTraffic() {
   const summaryRouteEnds: string[] = []
   const prompts: string[] = []
   const refreshes: boolean[] = []
-  const traffic = { total: 120 }
+  const traffic = { total: 120, routesFail: false }
   mockApi({
     [`GET ${base}/proxy-log-access`]: () =>
       jsonResponse({ can_read_proxy_logs: false }),
@@ -66,6 +66,15 @@ function mockTraffic() {
       }),
     [`GET ${base}/routes`]: (request) => {
       summaryRouteEnds.push(new URL(request.url).searchParams.get('end_date')!)
+      if (traffic.routesFail)
+        return jsonResponse(
+          {
+            title: 'Internal Server Error',
+            status: 500,
+            detail: 'Route stats are being rebuilt',
+          },
+          500
+        )
       return jsonResponse({ routes: [], total_routes: 0 })
     },
     [`GET ${base}/callers`]: () =>
@@ -223,4 +232,32 @@ test('Refresh summary on a custom range summarizes the traffic it has now', asyn
   await waitFor(() => expect(traffic.prompts).toHaveLength(2))
   expect(traffic.prompts[1]).toContain('"requests":480')
   expect(traffic.refreshes).toEqual([false, true])
+})
+
+test('a summary whose traffic read fails says so, and Try again reads it again', async () => {
+  const traffic = mockTraffic()
+  renderTab()
+  const generate = await screen.findByRole('button', {
+    name: 'Generate AI traffic summary',
+  })
+  await waitFor(() => expect(generate.hasAttribute('disabled')).toBe(false))
+  fireEvent.click(generate)
+  await screen.findByText('Traffic is steady')
+
+  traffic.traffic.routesFail = true
+  fireEvent.click(screen.getByRole('button', { name: 'Refresh summary' }))
+
+  await screen.findByText('Summary unavailable')
+  expect(
+    screen.getByText(
+      "Couldn't read the API traffic to summarize: Route stats are being rebuilt"
+    )
+  ).toBeTruthy()
+  expect(traffic.prompts).toHaveLength(1)
+
+  traffic.traffic.routesFail = false
+  fireEvent.click(screen.getByRole('button', { name: 'Try again' }))
+
+  await waitFor(() => expect(traffic.prompts).toHaveLength(2))
+  await screen.findByText('Traffic is steady')
 })
