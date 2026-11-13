@@ -13,7 +13,9 @@ import {
   CommandPaletteSuggestions,
   indexedMainNavItems,
   projectNavItems,
+  projectNavItemsFor,
 } from './CommandPalette'
+import { INTERNAL_ACCESS_SECTION_ID } from '@/components/project/settings/internal-access'
 import {
   platformSettingNavigationItems,
   settingsPageNavigationItems,
@@ -104,6 +106,21 @@ describe('project pages in the palette', () => {
         url: tab.url,
         icon: tab.icon,
       })
+    }
+  })
+
+  test('a project finds its Internal access card by name and by temps.local', () => {
+    const items = projectNavItemsFor({ source_type: 'git', preset: 'nextjs' })
+    const fuse = new Fuse(items, NAV_FUSE_OPTIONS)
+    for (const query of ['internal access', 'temps.local']) {
+      const [first] = fuse.search(query)
+      expect({ query, title: first?.item.title, url: first?.item.url }).toEqual(
+        {
+          query,
+          title: 'Internal access',
+          url: `settings/security#${INTERNAL_ACCESS_SECTION_ID}`,
+        }
+      )
     }
   })
 })
