@@ -108,24 +108,66 @@ const PRODUCER: &str = "dump_status=\"${TMPDIR:-/tmp}/temps-import-dump.$$\"; \
      printf 'COMMIT;\\n'";
 
 /// Strips the `pg_attver` column option from a plain-text dump when `strip`
-/// is 1, and passes everything else through, `COPY` data untouched whatever
-/// it contains. A statement left with no option at all is dropped; one that
-/// also sets other options keeps them. It contains no single quote, so it is
-/// passed through the environment and quoted as a whole.
+/// is 1, and passes everything else through. A statement left with no option
+/// at all is dropped; one that also sets other options keeps them.
+///
+/// Only a statement `pg_dump` itself wrote is rewritten: a line is touched
+/// only when it starts at the top level of the script, outside `COPY` data,
+/// a single-quoted string, a dollar-quoted body (`$$ ... $$`, `$tag$ ...
+/// $tag$`, a function's source) and a double-quoted identifier, all of which
+/// may span lines and contain text that looks like the statement. The
+/// script's lexical state is tracked across lines for that; `COPY` data is
+/// passed through without scanning. `pg_dump` sets
+/// `standard_conforming_strings`, so a quote inside a string is always
+/// doubled, never backslash-escaped. Single quotes are written `\047`, so the
+/// program can be passed through the environment and quoted as a whole.
 const DUMP_FILTER_AWK: &str = r#"!strip { print; next }
 copy && /^\\\.$/ { copy = 0; print; next }
 copy { print; next }
-/^COPY .* FROM stdin;$/ { copy = 1; print; next }
-/^ALTER TABLE .* ALTER COLUMN .* SET \(.*pg_attver=[0-9]+.*\);$/ {
+function scan(s,    i, n, c, p, rest) {
+  n = length(s); i = 1
+  while (i <= n) {
+    if (state == "dollar") {
+      p = index(substr(s, i), tag); if (p == 0) return
+      i += p - 1 + length(tag); state = ""; continue
+    }
+    if (state == "quote") {
+      p = index(substr(s, i), "\047"); if (p == 0) return
+      i += p
+      if (substr(s, i, 1) == "\047") { i++; continue }
+      state = ""; continue
+    }
+    if (state == "ident") {
+      p = index(substr(s, i), "\""); if (p == 0) return
+      i += p
+      if (substr(s, i, 1) == "\"") { i++; continue }
+      state = ""; continue
+    }
+    c = substr(s, i, 1)
+    if (c == "-" && substr(s, i + 1, 1) == "-") return
+    if (c == "\047") { state = "quote"; i++; continue }
+    if (c == "\"") { state = "ident"; i++; continue }
+    if (c == "$") {
+      rest = substr(s, i)
+      if (match(rest, /^\$[A-Za-z_][A-Za-z_0-9]*\$/) || match(rest, /^\$\$/)) {
+        tag = substr(rest, 1, RLENGTH); state = "dollar"; i += RLENGTH; continue
+      }
+    }
+    i++
+  }
+}
+{ top = (state == "") }
+top && /^COPY .* FROM stdin;$/ { copy = 1; print; next }
+top && /^ALTER TABLE .* ALTER COLUMN .* SET \(.*pg_attver=[0-9]+.*\);$/ {
   line = $0
   gsub(/pg_attver=[0-9]+, /, "", line)
   gsub(/, pg_attver=[0-9]+/, "", line)
   gsub(/pg_attver=[0-9]+/, "", line)
-  if (line ~ / SET \(\);$/) next
-  print line
+  if (line !~ / SET \(\);$/) print line
+  scan($0)
   next
 }
-{ print }
+{ scan($0); print }
 "#;
 
 /// Stops at the first error; output other than errors is discarded.
@@ -653,6 +695,44 @@ SELECT 1;
         );
         // A target that accepts the option gets the dump as it is.
         assert_eq!(filter(dump, "0"), dump);
+    }
+
+    /// Text inside a function body, a string or a quoted identifier is never
+    /// rewritten, however much it looks like the statement `pg_dump` writes:
+    /// only top-level statements are.
+    #[test]
+    fn the_dump_filter_leaves_function_bodies_strings_and_identifiers_alone() {
+        let dump = "\
+CREATE FUNCTION public.migration_script() RETURNS text
+    LANGUAGE sql
+    AS $_$SELECT '
+ALTER TABLE ONLY public.items ALTER COLUMN id SET (pg_attver=1);
+'::text$_$;
+CREATE FUNCTION public.plain() RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+ALTER TABLE ONLY public.items ALTER COLUMN id SET (pg_attver=2);
+END $$;
+COMMENT ON TABLE public.items IS 'it''s
+ALTER TABLE ONLY public.items ALTER COLUMN id SET (pg_attver=3);
+done';
+CREATE TABLE public.\"odd$name'\" (id integer);
+ALTER TABLE ONLY public.\"odd$name'\" ALTER COLUMN id SET (pg_attver=4);
+ALTER TABLE ONLY public.items ALTER COLUMN id SET (pg_attver=5);
+SELECT 1;
+";
+        let stripped = filter(dump, "1");
+        // Every quoted occurrence survives; only the two top-level
+        // statements (after the quoted identifier closed) are dropped.
+        for kept in ["pg_attver=1", "pg_attver=2", "pg_attver=3"] {
+            assert!(stripped.contains(kept), "{kept} was rewritten:\n{stripped}");
+        }
+        for dropped in ["pg_attver=4", "pg_attver=5"] {
+            assert!(
+                !stripped.contains(dropped),
+                "{dropped} was kept:\n{stripped}"
+            );
+        }
+        assert!(stripped.ends_with("SELECT 1;\n"), "{stripped}");
     }
 
     #[test]
