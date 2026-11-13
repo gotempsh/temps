@@ -166,6 +166,44 @@ fn managed_engine(kind: EngineKind) -> Option<ManagedEngine> {
     }
 }
 
+/// The engine whose healthcheck timings a service's container gets. A
+/// MinIO-engine service runs on `S3Service`, which builds its container for
+/// the server its image runs, RustFS for every new one: that is its stored
+/// `server`. Without one the service predates the field and was created as
+/// MinIO, as `S3Service` and the remote create path assume; `S3Service`
+/// stores the kind it reads from the image when it next creates the
+/// container.
+fn container_engine(
+    service_id: i32,
+    kind: EngineKind,
+    parameters: &std::collections::HashMap<String, serde_json::Value>,
+) -> Result<Option<ManagedEngine>, ExternalServiceError> {
+    if kind != EngineKind::Minio {
+        return Ok(managed_engine(kind));
+    }
+    let server = match parameters.get("server") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(value)) if value.trim().is_empty() => None,
+        Some(serde_json::Value::String(value)) => Some(
+            crate::externalsvc::s3::S3ServerKind::parse(value).map_err(|error| {
+                ExternalServiceError::ParameterValidationFailed {
+                    service_id,
+                    reason: error.to_string(),
+                }
+            })?,
+        ),
+        Some(other) => {
+            return Err(ExternalServiceError::ParameterValidationFailed {
+                service_id,
+                reason: format!("invalid S3 server kind {other}: expected 'rustfs' or 'minio'"),
+            })
+        }
+    };
+    Ok(Some(server.map_or(ManagedEngine::Minio, |server| {
+        server.managed_engine()
+    })))
+}
+
 /// The healthcheck as Docker stored it, in whole seconds.
 fn timings_of(health: &HealthConfig) -> Option<HealthcheckTimings> {
     let secs = |nanos: Option<i64>| -> Option<u32> { u32::try_from(nanos? / 1_000_000_000).ok() };
@@ -280,7 +318,7 @@ impl ExternalServiceManager {
             service_type,
             &parameters,
         )?;
-        let Some(engine) = managed_engine(selection.kind) else {
+        let Some(engine) = container_engine(service.id, selection.kind, &parameters)? else {
             return Ok(unsupported(
                 "its engine's container has no Docker healthcheck; Temps checks it through its \
                  S3 API"
@@ -1156,6 +1194,57 @@ mod tests {
         assert_eq!(column(Some(30)), Some(30));
         assert_eq!(to_column(Some(u32::MAX)), None);
         assert_eq!(to_column(Some(60)), Some(60));
+    }
+
+    #[test]
+    fn a_minio_engine_service_gets_the_timings_of_the_server_it_runs() {
+        use std::collections::HashMap;
+        let with_server = |server: serde_json::Value| {
+            HashMap::from([
+                (
+                    "docker_image".to_string(),
+                    serde_json::json!("object-store:1"),
+                ),
+                ("server".to_string(), server),
+            ])
+        };
+        let engine = |parameters: &HashMap<String, serde_json::Value>| {
+            container_engine(7, EngineKind::Minio, parameters)
+        };
+        // New MinIO-engine services run the RustFS image.
+        assert_eq!(
+            engine(&with_server(serde_json::json!("rustfs"))).unwrap(),
+            Some(ManagedEngine::Rustfs)
+        );
+        assert_eq!(
+            engine(&with_server(serde_json::json!("MinIO"))).unwrap(),
+            Some(ManagedEngine::Minio)
+        );
+        // Created before `server` was stored: as MinIO.
+        assert_eq!(engine(&HashMap::new()).unwrap(), Some(ManagedEngine::Minio));
+        assert_eq!(
+            engine(&with_server(serde_json::json!(""))).unwrap(),
+            Some(ManagedEngine::Minio)
+        );
+        for invalid in [serde_json::json!("ceph"), serde_json::json!(3)] {
+            assert!(
+                matches!(
+                    engine(&with_server(invalid.clone())),
+                    Err(ExternalServiceError::ParameterValidationFailed { service_id: 7, .. })
+                ),
+                "{invalid}"
+            );
+        }
+        // Other engines ignore it.
+        assert_eq!(
+            container_engine(
+                7,
+                EngineKind::Redis,
+                &with_server(serde_json::json!("rustfs"))
+            )
+            .unwrap(),
+            Some(ManagedEngine::Redis)
+        );
     }
 
     #[test]

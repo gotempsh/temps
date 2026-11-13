@@ -526,6 +526,17 @@ mod tests {
         service_type: &str,
         topology: &str,
     ) -> external_services::Model {
+        insert_service_with(db, name, service_type, topology, "{}").await
+    }
+
+    /// [`insert_service`] with `parameters`, as JSON.
+    async fn insert_service_with(
+        db: &DatabaseConnection,
+        name: &str,
+        service_type: &str,
+        topology: &str,
+        parameters: &str,
+    ) -> external_services::Model {
         let encryption = temps_core::EncryptionService::new_from_password(ENCRYPTION_PASSWORD);
         let now = chrono::Utc::now();
         external_services::ActiveModel {
@@ -533,7 +544,9 @@ mod tests {
             service_type: Set(service_type.to_string()),
             status: Set("running".to_string()),
             config: Set(Some(
-                encryption.encrypt_string("{}").expect("encrypt config"),
+                encryption
+                    .encrypt_string(parameters)
+                    .expect("encrypt config"),
             )),
             created_at: Set(now),
             updated_at: Set(now),
@@ -1012,6 +1025,62 @@ mod tests {
         })
         .await;
         assert!(announced.is_ok(), "no notification for service {}", row.id);
+    }
+
+    /// A MinIO-type service running the RustFS image gets RustFS' timings
+    /// and 60 s readiness wait, so it is shown and checked against them.
+    #[tokio::test]
+    async fn a_minio_service_running_rustfs_is_shown_and_checked_as_rustfs() {
+        let _registry = REGISTRY_LOCK.lock().await;
+        let Some(database) = test_database("minio-engine healthcheck test").await else {
+            return;
+        };
+        let db = database.connection_arc();
+        let row = insert_service_with(
+            db.as_ref(),
+            "objects-on-rustfs",
+            "minio",
+            "standalone",
+            r#"{"server":"rustfs"}"#,
+        )
+        .await;
+        let app = state(db, RecordingAuditLogger::default());
+
+        let (status, body) = body_json(
+            get_service_healthcheck(
+                RequireAuth(auth(temps_auth::Role::Admin)),
+                State(app.clone()),
+                Path(row.id),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["effective"]["timings"]["start_period_secs"], 60,
+            "{body}"
+        );
+
+        // A first check 60 s in fits MinIO's 90 s wait, not RustFS' 60 s.
+        let (status, body) = body_json(
+            update_service_healthcheck(
+                RequireAuth(auth(temps_auth::Role::Admin)),
+                State(app),
+                Path(row.id),
+                Extension(metadata()),
+                Json(HealthcheckOverrides {
+                    start_period_secs: Some(0),
+                    interval_secs: Some(60),
+                    ..Default::default()
+                }),
+            )
+            .await,
+        )
+        .await;
+        temps_providers_core::healthcheck::registry::clear_service(row.id);
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let detail = body["detail"].as_str().unwrap_or_default();
+        assert!(detail.contains("60s"), "{detail}");
     }
 
     #[tokio::test]
