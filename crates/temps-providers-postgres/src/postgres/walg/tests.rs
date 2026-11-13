@@ -285,11 +285,6 @@ mod plain_http_ip_archive_docker_tests {
         exec("echo '# kept: operator note' >> /var/lib/postgresql/walg.env")
             .await
             .map_err(|e| format!("append to walg.env: {e}"))?;
-        // Records who sources the file when Temps reads it: the image's
-        // default exec user is root, and the file is the postgres user's.
-        exec("echo 'export AWS_TEMPS_READER_UID=\"$(id -u)\"' >> /var/lib/postgresql/walg.env")
-            .await
-            .map_err(|e| format!("append to walg.env: {e}"))?;
         exec(
             "head -c 16777216 /dev/zero > /tmp/pg_wal/000000010000000000000002; \
              . /var/lib/postgresql/walg.env && \
@@ -328,14 +323,6 @@ mod plain_http_ip_archive_docker_tests {
             .await
             .map_err(|e| format!("read repaired walg.env: {e}"))?
             .ok_or("walg.env is gone after the repair")?;
-        let reader_uid = snapshot
-            .evaluated
-            .iter()
-            .find_map(|line| line.strip_prefix("AWS_TEMPS_READER_UID="))
-            .ok_or("the reader-uid line was not evaluated")?;
-        if reader_uid == "0" {
-            return Err("walg.env was sourced as root when Temps read it".to_string());
-        }
         let raw = snapshot.raw.clone();
         if !raw.contains("# kept: operator note") {
             return Err(format!("the repair dropped a line it does not fix: {raw}"));
@@ -386,6 +373,122 @@ mod plain_http_ip_archive_docker_tests {
             ));
         }
         Ok(())
+    }
+
+    /// Temps evaluates `walg.env` by sourcing it, so whatever the file runs
+    /// runs as the user Temps reads it as. In a container whose exec default
+    /// is root (the WAL-G image's own default), that must still be the
+    /// postgres user who owns the file.
+    async fn run_snapshot_reader_uid(
+        docker: &Arc<bollard::Docker>,
+        walg_name: &str,
+    ) -> Result<(), String> {
+        docker
+            .create_container(
+                Some(
+                    CreateContainerOptionsBuilder::default()
+                        .name(walg_name)
+                        .build(),
+                ),
+                ContainerCreateBody {
+                    image: Some(WALG_IMAGE.to_string()),
+                    entrypoint: Some(vec!["sleep".to_string()]),
+                    cmd: Some(vec!["600".to_string()]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|e| format!("create WAL-G container: {e}"))?;
+        docker
+            .start_container(walg_name, None)
+            .await
+            .map_err(|e| format!("start WAL-G container: {e}"))?;
+        let exec_as = |script: &str, user: Option<&'static str>| {
+            crate::externalsvc::exec_util::run_exec_as(
+                docker,
+                walg_name,
+                vec!["sh".to_string(), "-c".to_string(), script.to_string()],
+                None,
+                Duration::from_secs(30),
+                user,
+            )
+        };
+        let default_uid = exec_as("id -u", None)
+            .await
+            .map_err(|e| format!("read the default exec uid: {e}"))?;
+        if default_uid.output.trim() != "0" {
+            return Err(format!(
+                "the container's default exec user is uid {}, not root, so this test \
+                 cannot tell who Temps reads walg.env as",
+                default_uid.output.trim()
+            ));
+        }
+        let postgres_uid = exec_as("id -u postgres", None)
+            .await
+            .map_err(|e| format!("read the postgres uid: {e}"))?;
+        let postgres_uid = postgres_uid.output.trim().to_string();
+        if postgres_uid.is_empty() || postgres_uid == "0" {
+            return Err(format!("unexpected postgres uid {postgres_uid:?}"));
+        }
+        exec_as(
+            "echo 'export AWS_TEMPS_READER_UID=\"$(id -u)\"' > /var/lib/postgresql/walg.env",
+            Some(super::super::WALG_ENV_OWNER),
+        )
+        .await
+        .map_err(|e| format!("write walg.env: {e}"))?;
+
+        let service = PostgresService::new("walg-env-reader".to_string(), docker.clone());
+        let snapshot = service
+            .read_walg_env_snapshot(walg_name)
+            .await
+            .map_err(|e| format!("read walg.env: {e}"))?
+            .ok_or("walg.env was not found")?;
+        let reader_uid = snapshot
+            .evaluated
+            .iter()
+            .find_map(|line| line.strip_prefix("AWS_TEMPS_READER_UID="))
+            .ok_or_else(|| format!("the reader-uid line was not evaluated: {snapshot:?}"))?;
+        if reader_uid != postgres_uid {
+            return Err(format!(
+                "walg.env was sourced as uid {reader_uid}, not as the postgres user \
+                 (uid {postgres_uid})"
+            ));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn walg_env_is_sourced_as_postgres_when_exec_defaults_to_root() {
+        let Ok(docker) = bollard::Docker::connect_with_local_defaults() else {
+            eprintln!("Skipping walg.env reader test: no Docker configuration");
+            return;
+        };
+        if docker.ping().await.is_err() {
+            eprintln!("Skipping walg.env reader test: Docker is not reachable");
+            return;
+        }
+        if !ensure_image(&docker, WALG_IMAGE).await {
+            return;
+        }
+        let docker = Arc::new(docker);
+        let run_id = uuid::Uuid::new_v4().simple().to_string();
+        let walg_name = format!("temps-test-walg-reader-{}", &run_id[..12]);
+        let outcome = run_snapshot_reader_uid(&docker, &walg_name).await;
+        // Only the container this test created.
+        let _ = docker
+            .remove_container(
+                &walg_name,
+                Some(
+                    RemoveContainerOptionsBuilder::default()
+                        .force(true)
+                        .v(true)
+                        .build(),
+                ),
+            )
+            .await;
+        if let Err(reason) = outcome {
+            panic!("{reason}");
+        }
     }
 
     #[tokio::test]
