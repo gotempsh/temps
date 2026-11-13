@@ -298,16 +298,17 @@ impl WorkflowScheduler {
     pub async fn apply_retention(&self) -> u64 {
         let mut deleted = 0;
         for _ in 0..RETENTION_ROUNDS {
-            let expired = match self.store.expired_runs(RETENTION_BATCH).await {
+            // Rows first, blobs after: a blob left behind by a failed delete
+            // is only storage, while a blob deleted under a run that is still
+            // live (retried meanwhile) would break its replay.
+            let expired = match self.store.delete_expired_runs(RETENTION_BATCH).await {
                 Ok(expired) => expired,
                 Err(error) => {
-                    tracing::warn!(%error, "finding expired workflow runs failed");
+                    tracing::warn!(%error, "deleting expired workflow runs failed");
                     break;
                 }
             };
-            if expired.is_empty() {
-                break;
-            }
+            deleted += expired.len() as u64;
             for run in expired.iter().filter(|run| run.has_blob_payloads) {
                 self.codec
                     .delete_run_blobs(&PayloadScope {
@@ -316,14 +317,6 @@ impl WorkflowScheduler {
                         run_id: run.run_id,
                     })
                     .await;
-            }
-            let ids: Vec<_> = expired.iter().map(|run| run.run_id).collect();
-            match self.store.delete_runs(&ids).await {
-                Ok(count) => deleted += count,
-                Err(error) => {
-                    tracing::warn!(%error, "deleting expired workflow runs failed");
-                    break;
-                }
             }
             if (expired.len() as u64) < RETENTION_BATCH {
                 break;

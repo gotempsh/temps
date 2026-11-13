@@ -171,6 +171,28 @@ async fn starting_honours_idempotency_keys_and_the_active_run_quota() {
 }
 
 #[tokio::test]
+async fn concurrent_starts_cannot_exceed_the_active_run_quota() {
+    let Some(f) = fixture("admission race test").await else {
+        return;
+    };
+    // Every start counts zero active runs unless the starts are serialized.
+    let starts = (0..8).map(|i| {
+        f.store
+            .insert_run(f.new_run(&format!("burst-{i}"), None), 1)
+    });
+    let results = futures::future::join_all(starts).await;
+    let created = results
+        .iter()
+        .filter(|result| matches!(result, Ok(StartOutcome::Created(_))))
+        .count();
+    let refused = results
+        .iter()
+        .filter(|result| matches!(result, Err(WorkflowError::QuotaExceeded { .. })))
+        .count();
+    assert_eq!((created, refused), (1, 7), "{results:?}");
+}
+
+#[tokio::test]
 async fn claims_respect_environment_and_workflow_concurrency() {
     let Some(f) = fixture("concurrency test").await else {
         return;
@@ -854,7 +876,7 @@ async fn retention_deletes_only_finished_runs_past_their_window() {
         .await
         .unwrap();
     let active = f.start("active").await;
-    assert!(f.store.expired_runs(10).await.unwrap().is_empty());
+    assert!(f.store.delete_expired_runs(10).await.unwrap().is_empty());
     f.conn
         .execute_unprepared(
             "UPDATE workflow_runs SET finished_at = now() - interval '31 days' \
@@ -862,14 +884,46 @@ async fn retention_deletes_only_finished_runs_past_their_window() {
         )
         .await
         .unwrap();
-    let expired = f.store.expired_runs(10).await.unwrap();
+    let expired = f.store.delete_expired_runs(10).await.unwrap();
     assert_eq!(
         expired.iter().map(|e| e.run_id).collect::<Vec<_>>(),
         [old.id]
     );
-    assert_eq!(f.store.delete_runs(&[old.id, active.id]).await.unwrap(), 1);
+    assert!(f.store.get_run(old.id).await.unwrap().is_none());
     assert!(f.store.get_run(active.id).await.unwrap().is_some());
-    assert_eq!(f.store.delete_runs(&[]).await.unwrap(), 0);
+    assert!(f.store.delete_expired_runs(10).await.unwrap().is_empty());
+
+    // A run past retention that an operator retries is live again: retention
+    // leaves it, and its payloads, alone.
+    f.conn
+        .execute_unprepared("DELETE FROM workflow_runs")
+        .await
+        .unwrap();
+    let retried = f.start("retried").await;
+    let claim = f.claim_one().await.run;
+    f.store
+        .release(
+            retried.id,
+            claim.lease_token,
+            Release::Completed {
+                output: StoredPayload::default(),
+            },
+        )
+        .await
+        .unwrap();
+    f.conn
+        .execute_unprepared(
+            "UPDATE workflow_runs SET finished_at = now() - interval '31 days' \
+             WHERE finished_at IS NOT NULL",
+        )
+        .await
+        .unwrap();
+    assert!(f.store.retry_from(retried.id, 0).await.unwrap().is_some());
+    assert!(f.store.delete_expired_runs(10).await.unwrap().is_empty());
+    assert_eq!(
+        f.store.get_run(retried.id).await.unwrap().unwrap().status,
+        "queued"
+    );
 
     f.store
         .insert_event(NewEvent {

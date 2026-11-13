@@ -258,6 +258,15 @@ pub trait WorkflowStore: Send + Sync {
         batch: u64,
         limits: &[WorkflowLimit],
     ) -> WorkflowResult<Vec<ClaimedRun>>;
+    /// Runs of `workflow_name` in the environment holding a lease, other than
+    /// `except`: the check a claim made without the workflow's concurrency
+    /// limit (its manifest was not cached yet) repeats before invoking.
+    async fn running_count(
+        &self,
+        environment_id: i32,
+        workflow_name: &str,
+        except: Uuid,
+    ) -> WorkflowResult<i64>;
     /// Give a claimed run back without counting an attempt (nothing could be
     /// invoked), due again at `retry_at`, with the reason shown to users.
     async fn block_claimed(
@@ -362,7 +371,8 @@ pub trait WorkflowStore: Send + Sync {
     ) -> WorkflowResult<HashMap<String, WorkflowSummary>>;
     async fn queue_stats(&self) -> WorkflowResult<Vec<QueueStat>>;
     async fn journal_sizes(&self) -> WorkflowResult<Vec<JournalSize>>;
-    async fn expired_runs(&self, batch: u64) -> WorkflowResult<Vec<ExpiredRun>>;
-    async fn delete_runs(&self, run_ids: &[Uuid]) -> WorkflowResult<u64>;
+    /// Delete up to `batch` finished runs past their environment's retention
+    /// and return them, so their blobs can be removed afterwards.
+    async fn delete_expired_runs(&self, batch: u64) -> WorkflowResult<Vec<ExpiredRun>>;
     async fn delete_expired_events(&self, batch: u64) -> WorkflowResult<u64>;
 }

@@ -22,9 +22,15 @@ use crate::protocol::{InvokeRequest, JournalEntry, PROTOCOL_VERSION};
 use crate::store::{ClaimedRun, RunRow, WorkflowLimit};
 use crate::types::{RunStatus, StepKind, StepStatus, WorkflowSettings};
 
+/// How soon a run deferred for its workflow's concurrency limit is due again.
+/// By then the manifest is cached and the claim itself applies the limit.
+const CONCURRENCY_RETRY_SECS: i64 = 2;
+
 enum Failure {
     /// Nothing to invoke; not an attempt.
     Blocked(String),
+    /// The workflow's concurrency limit is reached; not an attempt.
+    Deferred(String),
     /// The invocation failed.
     Failed {
         category: &'static str,
@@ -64,6 +70,17 @@ impl WorkflowEngine {
                     .await
                 {
                     tracing::error!(run_id = %run.id, %error, "could not give back a blocked workflow run; its lease expiry will");
+                }
+            }
+            Err(Failure::Deferred(reason)) => {
+                tracing::debug!(run_id = %run.id, environment_id = run.environment_id, %reason, "workflow run deferred");
+                let retry_at = Utc::now() + Duration::seconds(CONCURRENCY_RETRY_SECS);
+                if let Err(error) = self
+                    .store
+                    .block_claimed(run.id, lease, claim.previous_status, &reason, retry_at)
+                    .await
+                {
+                    tracing::error!(run_id = %run.id, %error, "could not give back a deferred workflow run; its lease expiry will");
                 }
             }
             Err(Failure::Failed { category, reason }) => {
@@ -134,11 +151,11 @@ impl WorkflowEngine {
                 category: "manifest",
                 reason,
             })?;
-        if !manifest
+        let Some(served) = manifest
             .workflows
             .iter()
-            .any(|workflow| workflow.name == run.workflow_name)
-        {
+            .find(|workflow| workflow.name == run.workflow_name)
+        else {
             let served: Vec<&str> = manifest
                 .workflows
                 .iter()
@@ -157,6 +174,20 @@ impl WorkflowEngine {
                     }
                 ),
             });
+        };
+        // A claim made before this environment's manifest was cached could
+        // not apply the workflow's limit: check it now, before any code runs.
+        if let Some(limit) = served.concurrency {
+            let running = self
+                .store
+                .running_count(run.environment_id, &run.workflow_name, run.id)
+                .await?;
+            if running >= i64::from(limit) {
+                return Err(Failure::Deferred(format!(
+                    "Waiting for a slot: workflow '{}' runs at most {limit} at once and {running} are running",
+                    run.workflow_name
+                )));
+            }
         }
 
         let now = Utc::now();

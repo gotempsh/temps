@@ -79,7 +79,9 @@ impl Backend for BlobService {
     }
 
     async fn delete(&self, project_id: i32, keys: Vec<String>) -> Result<i64, BlobError> {
-        self.del(project_id, keys).await
+        // Not `del`: it skips objects it failed to delete, and the caller
+        // drops its reference to them once this succeeds.
+        self.delete_each(project_id, keys).await
     }
 }
 

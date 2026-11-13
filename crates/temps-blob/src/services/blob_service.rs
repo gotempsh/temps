@@ -261,6 +261,43 @@ impl BlobService {
         Ok(deleted)
     }
 
+    /// Delete blobs, failing on the first object that could not be deleted,
+    /// with its key. Unlike [`Self::del`], which skips failures for the
+    /// best-effort API, a caller that drops its only reference to the objects
+    /// afterwards (workflow payload cleanup) learns that some remain.
+    pub async fn delete_each(
+        &self,
+        project_id: i32,
+        pathnames: Vec<String>,
+    ) -> Result<i64, BlobError> {
+        if pathnames.is_empty() {
+            return Ok(0);
+        }
+        let client = self
+            .rustfs_service
+            .get_connection()
+            .await
+            .map_err(|e| BlobError::ConnectionFailed(e.to_string()))?;
+        let keys = pathnames
+            .iter()
+            .map(|pathname| self.object_key(project_id, pathname))
+            .collect();
+        delete_keys(keys, |key| {
+            let client = client.clone();
+            async move {
+                client
+                    .delete_object()
+                    .bucket(DEFAULT_BUCKET)
+                    .key(&key)
+                    .send()
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            }
+        })
+        .await
+    }
+
     /// Get blob metadata
     pub async fn head(&self, project_id: i32, pathname: &str) -> Result<BlobInfo, BlobError> {
         let client = self
@@ -529,6 +566,22 @@ fn guess_content_type(pathname: &str) -> String {
     .to_string()
 }
 
+/// Delete `keys` one by one with `delete`, stopping at the first failure.
+async fn delete_keys<F, Fut>(keys: Vec<String>, delete: F) -> Result<i64, BlobError>
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    let mut deleted = 0i64;
+    for key in keys {
+        delete(key.clone())
+            .await
+            .map_err(|reason| BlobError::S3(format!("deleting object {key} failed: {reason}")))?;
+        deleted += 1;
+    }
+    Ok(deleted)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -591,6 +644,43 @@ mod tests {
         assert_eq!(
             service.blob_url(123, "images/avatar.png"),
             "/api/blob/123/images/avatar.png"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_keys_stops_at_the_first_failure_and_names_its_key() {
+        let attempted = std::sync::Mutex::new(Vec::new());
+        let result = delete_keys(vec!["a".into(), "b".into(), "c".into()], |key| {
+            attempted.lock().unwrap().push(key.clone());
+            async move {
+                if key == "b" {
+                    Err("AccessDenied".to_string())
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+        let error = result.unwrap_err();
+        assert!(matches!(error, BlobError::S3(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("deleting object b failed: AccessDenied"),
+            "{error}"
+        );
+        assert_eq!(*attempted.lock().unwrap(), ["a", "b"]);
+    }
+
+    #[tokio::test]
+    async fn delete_keys_counts_every_deleted_key() {
+        let deleted = delete_keys(vec!["a".into(), "b".into()], |_| async { Ok(()) })
+            .await
+            .unwrap();
+        assert_eq!(deleted, 2);
+        assert_eq!(
+            delete_keys(Vec::new(), |_| async { Ok(()) }).await.unwrap(),
+            0
         );
     }
 }

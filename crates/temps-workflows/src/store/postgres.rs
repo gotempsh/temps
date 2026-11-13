@@ -30,6 +30,10 @@ use crate::error::{WorkflowError, WorkflowResult};
 
 /// Key of the transaction-scoped advisory lock that serializes claims.
 const CLAIM_LOCK_KEY: i64 = 7_343_019_001;
+/// Class of the per-environment advisory lock (`pg_advisory_xact_lock(class,
+/// environment_id)`) that serializes starts, so concurrent starts cannot both
+/// pass the `max_active_runs` count.
+const ADMISSION_LOCK_CLASS: i32 = 734_302;
 /// Most due rows one claim ranks. Rows beyond it wait for a later claim; the
 /// window keeps a claim's cost bounded however large the backlog grows.
 const CLAIM_WINDOW: i64 = 10_000;
@@ -267,6 +271,12 @@ impl WorkflowStore for PgWorkflowStore {
             .begin()
             .await
             .map_err(WorkflowError::db("starting a workflow run"))?;
+        txn.execute(stmt(
+            "SELECT pg_advisory_xact_lock($1, $2)",
+            vec![ADMISSION_LOCK_CLASS.into(), run.environment_id.into()],
+        ))
+        .await
+        .map_err(WorkflowError::db("serializing workflow starts"))?;
         if let Some(key) = &run.idempotency_key {
             let existing = workflow_runs::Entity::find()
                 .filter(workflow_runs::Column::EnvironmentId.eq(run.environment_id))
@@ -459,6 +469,28 @@ impl WorkflowStore for PgWorkflowStore {
                 })
             })
             .collect()
+    }
+
+    async fn running_count(
+        &self,
+        environment_id: i32,
+        workflow_name: &str,
+        except: Uuid,
+    ) -> WorkflowResult<i64> {
+        let row = self
+            .db
+            .query_one(stmt(
+                "SELECT count(*)::BIGINT AS n FROM workflow_runs \
+                 WHERE environment_id = $1 AND workflow_name = $2 AND status = 'running' \
+                 AND id <> $3",
+                vec![environment_id.into(), workflow_name.into(), except.into()],
+            ))
+            .await
+            .map_err(WorkflowError::db("counting running workflow runs"))?;
+        row.map(|row| row.try_get::<i64>("", "n"))
+            .transpose()
+            .map_err(WorkflowError::db("counting running workflow runs"))
+            .map(|count| count.unwrap_or(0))
     }
 
     async fn block_claimed(
@@ -1301,7 +1333,7 @@ impl WorkflowStore for PgWorkflowStore {
             .collect())
     }
 
-    async fn expired_runs(&self, batch: u64) -> WorkflowResult<Vec<ExpiredRun>> {
+    async fn delete_expired_runs(&self, batch: u64) -> WorkflowResult<Vec<ExpiredRun>> {
         #[derive(FromQueryResult)]
         struct Row {
             id: Uuid,
@@ -1309,20 +1341,30 @@ impl WorkflowStore for PgWorkflowStore {
             environment_id: i32,
             has_blob_payloads: bool,
         }
+        // One statement: the row is locked and its expiry checked again as it
+        // is deleted, so a run retried after it was picked (queued again,
+        // finished_at cleared) is skipped rather than deleted, and the caller
+        // removes the blobs only of runs that are gone.
         let rows = Row::find_by_statement(stmt(
             &format!(
-                "SELECT r.id, r.project_id, r.environment_id, r.has_blob_payloads \
-                 FROM workflow_runs r \
-                 LEFT JOIN workflow_environment_settings s ON s.environment_id = r.environment_id \
-                 WHERE r.finished_at IS NOT NULL AND r.status IN {TERMINAL} \
-                 AND r.finished_at < now() - COALESCE(s.retention_days, 30) * interval '1 day' \
-                 ORDER BY r.finished_at LIMIT $1"
+                "DELETE FROM workflow_runs r USING ( \
+                     SELECT c.id FROM workflow_runs c \
+                     LEFT JOIN workflow_environment_settings s ON s.environment_id = c.environment_id \
+                     WHERE c.finished_at IS NOT NULL AND c.status IN {TERMINAL} \
+                     AND c.finished_at < now() - COALESCE(s.retention_days, 30) * interval '1 day' \
+                     ORDER BY c.finished_at LIMIT $1 FOR UPDATE OF c SKIP LOCKED \
+                 ) expired \
+                 WHERE r.id = expired.id AND r.finished_at IS NOT NULL AND r.status IN {TERMINAL} \
+                 AND r.finished_at < now() - COALESCE( \
+                     (SELECT s.retention_days FROM workflow_environment_settings s \
+                      WHERE s.environment_id = r.environment_id), 30) * interval '1 day' \
+                 RETURNING r.id, r.project_id, r.environment_id, r.has_blob_payloads"
             ),
             vec![i64::try_from(batch).unwrap_or(i64::MAX).into()],
         ))
         .all(self.db.as_ref())
         .await
-        .map_err(WorkflowError::db("finding expired workflow runs"))?;
+        .map_err(WorkflowError::db("deleting expired workflow runs"))?;
         Ok(rows
             .into_iter()
             .map(|row| ExpiredRun {
@@ -1332,30 +1374,6 @@ impl WorkflowStore for PgWorkflowStore {
                 has_blob_payloads: row.has_blob_payloads,
             })
             .collect())
-    }
-
-    async fn delete_runs(&self, run_ids: &[Uuid]) -> WorkflowResult<u64> {
-        if run_ids.is_empty() {
-            return Ok(0);
-        }
-        let ids = serde_json::Value::Array(
-            run_ids
-                .iter()
-                .map(|id| serde_json::Value::String(id.to_string()))
-                .collect(),
-        );
-        let result = self
-            .db
-            .execute(stmt(
-                &format!(
-                    "DELETE FROM workflow_runs WHERE id IN \
-                     (SELECT (jsonb_array_elements_text($1::jsonb))::uuid) AND status IN {TERMINAL}"
-                ),
-                vec![ids.into()],
-            ))
-            .await
-            .map_err(WorkflowError::db("deleting expired workflow runs"))?;
-        Ok(result.rows_affected())
     }
 
     async fn delete_expired_events(&self, batch: u64) -> WorkflowResult<u64> {

@@ -86,6 +86,8 @@ pub(crate) struct Harness {
 struct FakeState {
     engine: Arc<WorkflowEngine>,
     workflows: Vec<String>,
+    /// The concurrency every workflow of the manifest declares.
+    concurrency: Option<u32>,
     script: Script,
 }
 
@@ -93,7 +95,7 @@ async fn manifest(State(state): State<FakeState>) -> Json<Value> {
     Json(json!({
         "protocol_version": 1,
         "sdk": "fake",
-        "workflows": state.workflows.iter().map(|name| json!({"name": name})).collect::<Vec<_>>(),
+        "workflows": state.workflows.iter().map(|name| json!({"name": name, "concurrency": state.concurrency})).collect::<Vec<_>>(),
     }))
 }
 
@@ -122,12 +124,23 @@ pub(crate) async fn harness(
     script: Script,
     live: bool,
 ) -> Option<Harness> {
+    harness_with(test, workflows, script, live, None, None).await
+}
+
+pub(crate) async fn harness_with(
+    test: &str,
+    workflows: &[&str],
+    script: Script,
+    live: bool,
+    blobs: Option<Arc<dyn temps_core::PayloadBlobStore>>,
+    concurrency: Option<u32>,
+) -> Option<Harness> {
     let env = test_environment(test).await?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base_url = format!("http://{}", listener.local_addr().unwrap());
     let encryption = Arc::new(EncryptionService::new("12345678901234567890123456789012").unwrap());
     let store = Arc::new(PgWorkflowStore::new(env.conn.clone()));
-    let codec = Arc::new(PayloadCodec::new(encryption.clone(), None));
+    let codec = Arc::new(PayloadCodec::new(encryption.clone(), blobs));
     let engine = Arc::new(WorkflowEngine::new(
         store.clone(),
         codec.clone(),
@@ -141,6 +154,7 @@ pub(crate) async fn harness(
     let state = FakeState {
         engine: engine.clone(),
         workflows: workflows.iter().map(|name| name.to_string()).collect(),
+        concurrency,
         script,
     };
     let router = Router::new()
@@ -710,4 +724,114 @@ async fn payloads_never_reach_the_logs() {
     for secret in [SECRET_INPUT, SECRET_STEP, SECRET_OUTPUT, SECRET_ERROR] {
         assert!(!logs.contains(secret), "{secret} was logged");
     }
+}
+
+#[tokio::test]
+async fn a_retried_step_write_keeps_the_blob_result_the_first_write_committed() {
+    // The first write commits, its response is lost and the SDK sends the
+    // same write again under the same lease.
+    let script: Script = Arc::new(move |engine, token, request| {
+        Box::pin(async move {
+            let big = json!({ "report": "r".repeat(8 * 1024) });
+            let first = engine
+                .record_step(&token, request.run_id, completed(0, "report", big.clone()))
+                .await
+                .unwrap();
+            assert!(!first.already_recorded);
+            let again = engine
+                .record_step(&token, request.run_id, completed(0, "report", big.clone()))
+                .await
+                .unwrap();
+            assert!(again.already_recorded);
+            assert_eq!(again.entry.result, Some(big));
+            Reply::Outcome(Outcome::Completed { output: None })
+        })
+    });
+    let blobs = Arc::new(crate::payload::tests::MemoryBlobs::default());
+    let Some(h) = harness_with(
+        "retried blob write test",
+        &["reports"],
+        script,
+        true,
+        Some(blobs.clone()),
+        None,
+    )
+    .await
+    else {
+        return;
+    };
+    let settings = WorkflowSettings {
+        inline_payload_limit_bytes: 1024,
+        ..WorkflowSettings::default()
+    };
+    h.store
+        .upsert_settings(h.env.project_id, h.env.environment_id, &settings)
+        .await
+        .unwrap();
+    let id = h.start("reports", json!({})).await;
+    assert_eq!(h.tick().await, 1);
+    let run = h.run(id).await;
+    assert_eq!(run.status, "completed", "{:?}", run.blocked_reason);
+    // The journal still reads: the committed object was not deleted.
+    let (entries, _) = h.engine.journal_entries(&run, 0, &settings).await.unwrap();
+    assert_eq!(
+        entries[0].result.as_ref().unwrap()["report"]
+            .as_str()
+            .unwrap()
+            .len(),
+        8 * 1024
+    );
+    assert_eq!(
+        blobs.objects.lock().unwrap().len(),
+        1,
+        "the losing write's object was not discarded"
+    );
+}
+
+#[tokio::test]
+async fn a_claim_made_before_the_manifest_was_cached_still_honours_its_concurrency() {
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let script: Script = {
+        let invocations = invocations.clone();
+        Arc::new(move |_engine, _token, _request| {
+            invocations.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move { Reply::Outcome(Outcome::Completed { output: None }) })
+        })
+    };
+    let Some(h) = harness_with(
+        "cold manifest test",
+        &["exports"],
+        script,
+        true,
+        None,
+        Some(1),
+    )
+    .await
+    else {
+        return;
+    };
+    let first = h.start("exports", json!({})).await;
+    let second = h.start("exports", json!({})).await;
+    // Nothing is cached yet: the claim takes both, without the limit.
+    assert_eq!(h.tick().await, 2);
+    assert_eq!(
+        invocations.load(Ordering::SeqCst),
+        1,
+        "both runs of a concurrency-1 workflow ran"
+    );
+    let runs = [h.run(first).await, h.run(second).await];
+    let deferred = runs.iter().find(|run| run.status != "completed").unwrap();
+    assert_eq!(deferred.attempt, 0, "a deferral spent an attempt");
+    assert!(
+        deferred
+            .blocked_reason
+            .as_deref()
+            .unwrap()
+            .contains("runs at most 1 at once"),
+        "{:?}",
+        deferred.blocked_reason
+    );
+    make_due(&h.env.conn, deferred.id).await;
+    assert_eq!(h.tick().await, 1);
+    assert_eq!(h.run(deferred.id).await.status, "completed");
 }

@@ -79,12 +79,16 @@ impl PayloadScope {
         aad.into_bytes()
     }
 
+    /// A key no other write uses. A write that loses a race (a retried
+    /// callback, a second delivery of an event) discards its own object and
+    /// never the one the winning write committed under the same lease.
     fn blob_key(&self, field: &PayloadField, lease: i64) -> String {
         format!(
-            "{BLOB_PREFIX}/{}/{}/{}-{lease}",
+            "{BLOB_PREFIX}/{}/{}/{}-{lease}-{}",
             self.environment_id,
             self.run_id,
-            field.label()
+            field.label(),
+            Uuid::new_v4().simple()
         )
     }
 

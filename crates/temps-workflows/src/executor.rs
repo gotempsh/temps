@@ -26,6 +26,8 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub const MANIFEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Largest manifest accepted.
 pub const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
+/// The largest per-workflow concurrency a manifest may declare.
+pub const MAX_WORKFLOW_CONCURRENCY: u32 = 1_000_000;
 /// Tokens stay valid this long past the invocation deadline, so the
 /// executor's last journal write is not rejected for a few seconds of skew.
 pub const TOKEN_GRACE_SECS: i64 = 60;
@@ -149,6 +151,22 @@ impl ExecutorClient {
                 reason: format!(
                     "the SDK speaks protocol version {}",
                     manifest.protocol_version
+                ),
+            });
+        }
+        // Limits feed every claim's query as Postgres `int`s: one out of range
+        // would fail claims for every environment, so the manifest is refused.
+        if let Some(workflow) = manifest.workflows.iter().find(|workflow| {
+            workflow
+                .concurrency
+                .is_some_and(|limit| limit == 0 || limit > MAX_WORKFLOW_CONCURRENCY)
+        }) {
+            return Err(ExecutorCallError::Protocol {
+                url,
+                reason: format!(
+                    "workflow '{}' declares concurrency {}; use 1 to {MAX_WORKFLOW_CONCURRENCY}",
+                    workflow.name,
+                    workflow.concurrency.unwrap_or_default()
                 ),
             });
         }
@@ -345,6 +363,34 @@ mod tests {
             .unwrap();
         assert_eq!(manifest.workflows[0].name, "orders");
         assert_eq!(manifest.workflows[0].concurrency, Some(2));
+    }
+
+    #[tokio::test]
+    async fn a_manifest_with_an_out_of_range_concurrency_is_refused() {
+        for limit in [0_u64, 2_147_483_648] {
+            let base = serve(Router::new().route(
+                MANIFEST_PATH,
+                get(move || async move {
+                    Json(serde_json::json!({
+                        "protocol_version": 1,
+                        "workflows": [{"name": "orders"}, {"name": "emails", "concurrency": limit}]
+                    }))
+                }),
+            ))
+            .await;
+            let error = ExecutorClient::new()
+                .unwrap()
+                .manifest(&signer(), 1, 1, &endpoint(base))
+                .await
+                .unwrap_err();
+            assert_eq!(error.category(), "protocol", "{error}");
+            assert!(
+                error
+                    .to_string()
+                    .contains("workflow 'emails' declares concurrency"),
+                "{error}"
+            );
+        }
     }
 
     #[tokio::test]
