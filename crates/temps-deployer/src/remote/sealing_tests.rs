@@ -285,6 +285,7 @@ fn build_request(source: &std::path::Path, value: Option<&str>) -> crate::BuildR
     .unwrap();
     std::fs::write(source.join("app"), "hello").unwrap();
     crate::BuildRequest {
+        labels: Default::default(),
         build_secrets: Default::default(),
         cache_from: Vec::new(),
         image_name: "web:worker".to_string(),

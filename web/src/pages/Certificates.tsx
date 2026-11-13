@@ -11,6 +11,7 @@ import { Badge } from '@/components/ui/badge'
 import { Card } from '@/components/ui/card'
 import { CopyButton } from '@/components/ui/copy-button'
 import { EmptyState } from '@/components/ui/empty-state'
+import { RefreshButton } from '@/components/ui/refresh-button'
 import {
   Sheet,
   SheetContent,
@@ -135,6 +136,7 @@ export function Certificates() {
             recorded here.
           </>
         }
+        actions={<RefreshButton queryKeys={[['listOnDemandCerts']]} />}
       />
 
       {/* Table */}

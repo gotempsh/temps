@@ -72,6 +72,10 @@ impl From<BackupError> for Problem {
                 .with_title("Validation Error")
                 .with_detail(msg.clone()),
 
+            BackupError::InvalidS3Endpoint { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Invalid S3 Endpoint")
+                .with_detail(error.to_string()),
+
             BackupError::Schedule(ref msg) => problemdetails::new(StatusCode::BAD_REQUEST)
                 .with_title("Schedule Error")
                 .with_detail(msg.clone()),
@@ -277,10 +281,19 @@ pub struct CreateS3SourceRequest {
     /// provider; stored encrypted and never returned.
     pub secret_key: SecretString,
     pub region: String,
-    /// Optional endpoint URL for S3-compatible services like MinIO
+    /// Optional endpoint for S3-compatible services like MinIO or RustFS,
+    /// with or without a scheme. Stored with an explicit scheme: without
+    /// one, `use_tls` decides it (plain `http://` when that is unset too).
     #[schema(example = "http://minio.example.com:9000")]
     pub endpoint: Option<String>,
-    /// Whether to use path-style addressing (default: true)
+    /// Whether the endpoint is reached over TLS. Only needed for an endpoint
+    /// entered without a scheme; one that conflicts with the endpoint's
+    /// scheme is rejected.
+    #[serde(default)]
+    #[schema(example = false)]
+    pub use_tls: Option<bool>,
+    /// Whether to use path-style addressing (default: true). Forced on for
+    /// an IP-address endpoint and a Temps-managed object store.
     #[schema(example = true)]
     pub force_path_style: Option<bool>,
     /// When true, make this the default source (will swap out any existing default).
@@ -341,9 +354,15 @@ pub struct UpdateS3SourceRequest {
     pub secret_key: Option<SecretString>,
     /// Optional new region
     pub region: Option<String>,
-    /// Optional new endpoint URL for S3-compatible services
+    /// Optional new endpoint for S3-compatible services, with or without a
+    /// scheme. An empty string clears it (AWS S3 itself).
     #[schema(example = "http://minio.example.com:9000")]
     pub endpoint: Option<String>,
+    /// Whether the endpoint is reached over TLS; decides the scheme of an
+    /// endpoint entered without one, and must agree with one entered with it.
+    #[serde(default)]
+    #[schema(example = false)]
+    pub use_tls: Option<bool>,
     /// Optional new path-style addressing setting
     #[schema(example = true)]
     pub force_path_style: Option<bool>,
@@ -665,7 +684,17 @@ pub struct S3SourceResponse {
     pub region: String,
     #[schema(example = "http://minio.example.com:9000")]
     pub endpoint: Option<String>,
+    /// The endpoint every client (WAL-G, restore and worker jobs) receives,
+    /// always with an explicit scheme. `None` for AWS S3 itself.
+    #[schema(example = "http://10.0.0.5:9000")]
+    pub effective_endpoint: Option<String>,
     pub force_path_style: Option<bool>,
+    /// Whether clients actually use path-style addressing.
+    pub effective_force_path_style: bool,
+    /// Why `effective_force_path_style` has its value: the source's own
+    /// setting, or forced because the endpoint is an IP address or a
+    /// Temps-managed object store.
+    pub path_style_reason: temps_core::s3_endpoint::PathStyleReason,
     pub is_default: bool,
     /// True when this source was auto-provisioned by a Temps Cloud link
     /// rather than entered by an operator. Managed sources cannot be edited
@@ -869,6 +898,10 @@ pub struct SourceBackupEntry {
 
 impl From<temps_entities::s3_sources::Model> for S3SourceResponse {
     fn from(source: temps_entities::s3_sources::Model) -> Self {
+        // `true` when unset: what every client building from this source
+        // assumes for a NULL `force_path_style`.
+        let path_style = source.effective_path_style(true);
+        let effective_endpoint = source.endpoint_url();
         Self {
             id: source.id,
             name: source.name,
@@ -878,6 +911,9 @@ impl From<temps_entities::s3_sources::Model> for S3SourceResponse {
             access_key_id: "***".to_string(),
             secret_key: "***".to_string(),
             region: source.region,
+            effective_endpoint,
+            effective_force_path_style: path_style.force_path_style,
+            path_style_reason: path_style.reason,
             endpoint: source.endpoint,
             force_path_style: source.force_path_style,
             is_default: source.is_default,

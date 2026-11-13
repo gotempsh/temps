@@ -31,9 +31,10 @@ pub use migration::m20260916_000001_reconcile_otel_trace_summaries::{
     trace_summary_rebuild_delta_sql, trace_summary_rebuild_initial_sql,
 };
 pub use migration::m20261107_000003_unique_custom_domain_hostname::Migration as UniqueCustomDomainHostnameMigration;
-pub use migration::m20261112_000008_legacy_standalone_vault_coverage::Migration as LegacyStandaloneVaultCoverageMigration;
-pub use migration::m20261112_000009_legacy_vault_revocation_fence::Migration as LegacyVaultRevocationFenceMigration;
-pub use migration::m20261112_000010_vault_membership_fence::Migration as VaultMembershipFenceMigration;
+pub use migration::m20261112_000001_seed_postgres_wal_archiving_alert_rules::Migration as SeedPostgresWalArchivingAlertRulesMigration;
+pub use migration::m20261113_000009_legacy_standalone_vault_coverage::Migration as LegacyStandaloneVaultCoverageMigration;
+pub use migration::m20261113_000010_legacy_vault_revocation_fence::Migration as LegacyVaultRevocationFenceMigration;
+pub use migration::m20261113_000011_vault_membership_fence::Migration as VaultMembershipFenceMigration;
 pub use migration::Migrator;
 
 pub use migration::m20261022_000001_dns_name_claims::{
@@ -101,6 +102,6 @@ pub use migration::m20261105_000001_project_data_purges::{
     fk_index_name as project_fk_index_name, FK_INDEXES as PROJECT_FK_INDEXES,
 };
 
-pub use migration::m20261112_000001_general_access_vaults::{
+pub use migration::m20261113_000002_general_access_vaults::{
     GENERAL_VAULT_CONSUMER_INDEXES, GENERAL_VAULT_MIGRATION,
 };

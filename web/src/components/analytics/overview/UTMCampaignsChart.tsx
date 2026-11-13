@@ -13,12 +13,12 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
-import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import { Megaphone } from 'lucide-react'
 import * as React from 'react'
 import { useNavigate, useSearchParams } from 'react-router'
 import { buildAnalyticsDimensionUrl } from './viewAllUrl'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 type UtmDimension =
   'utm_source' | 'utm_medium' | 'utm_campaign' | 'utm_term' | 'utm_content'
@@ -48,7 +48,7 @@ export function UTMCampaignsChart({
   const [searchParams] = useSearchParams()
   const [dimension, setDimension] = React.useState<UtmDimension>('utm_source')
 
-  const { data, isLoading, error } = useQuery({
+  const { data, isLoading, error } = useWindowQuery({
     ...getPropertyBreakdownOptions({
       path: {
         project_id: project.id,

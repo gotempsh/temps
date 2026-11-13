@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+pub mod archive_target_handlers;
 pub mod audit;
 pub mod data_import_handlers;
 #[allow(clippy::module_inception)]

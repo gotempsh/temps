@@ -88,6 +88,17 @@ const REFERENCE_INDEXES: &[ReferenceIndex] = &[
         partial: true,
         hypertable: false,
     },
+    // Not an IP reference: the deleted-project image cleanup and the nightly
+    // sweep of orphaned images ask which deployments still name a given
+    // image (`image_references::referenced_images`). Without it each check
+    // scans every deployment.
+    ReferenceIndex {
+        name: "idx_deployments_image_name",
+        table: "deployments",
+        column: "image_name",
+        partial: true,
+        hypertable: false,
+    },
 ];
 
 impl ReferenceIndex {
@@ -1513,6 +1524,19 @@ mod tests {
                 format!("DROP INDEX IF EXISTS {}", index.name)
             );
         }
+    }
+
+    #[test]
+    fn deployments_are_indexed_by_image_name_for_image_reference_checks() {
+        let index = REFERENCE_INDEXES
+            .iter()
+            .find(|index| index.name == "idx_deployments_image_name")
+            .expect("the image reference index is built");
+        assert_eq!(
+            index.create_sql(),
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_deployments_image_name ON deployments \
+             (image_name) WHERE image_name IS NOT NULL"
+        );
     }
 
     #[test]

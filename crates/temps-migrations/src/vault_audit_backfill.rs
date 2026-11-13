@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Attribute audit events written before `m20261112_000012_vault_audit_attribution`
+//! Attribute audit events written before `m20261113_000013_vault_audit_attribution`
 //! to their vaults, once.
 //!
 //! Each batch reads the next audit rows by primary key, up to the last id that

@@ -4,13 +4,18 @@
 import {
   getProjectsOptions,
   revenueGlobalEventsOptions,
+  revenueGlobalEventsQueryKey,
+  revenueMetricsGlobalMrrQueryKey,
   revenueMetricsGlobalMrrOptions,
   revenueMetricsGlobalSummaryOptions,
+  revenueMetricsGlobalSummaryQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
 import { PageHeader } from '@/components/layout/PageContainer'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
+import { RefreshButton } from '@/components/ui/refresh-button'
+import { queryKeyPrefix } from '@/lib/refresh'
 import { DateRangePicker } from '@/components/ui/date-range-picker'
 import { EmptyState } from '@/components/ui/empty-state'
 import {
@@ -34,6 +39,7 @@ import { DollarSign, X } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { DateRange } from 'react-day-picker'
 import { Link } from 'react-router'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 const ALL_PROJECTS = '__all_projects__'
 const ALL_TYPES = '__all_types__'
@@ -76,8 +82,8 @@ export function Revenue() {
     ...revenueMetricsGlobalSummaryOptions(),
   })
 
-  const eventsQuery = useQuery(
-    revenueGlobalEventsOptions({
+  const eventsQuery = useWindowQuery({
+    ...revenueGlobalEventsOptions({
       query: {
         project_id:
           projectFilter !== ALL_PROJECTS ? Number(projectFilter) : undefined,
@@ -91,8 +97,8 @@ export function Revenue() {
               : typeFilter,
         limit: 200,
       },
-    })
-  )
+    }),
+  })
 
   const projectOptions = useMemo<SearchableSelectOption[]>(() => {
     const opts: SearchableSelectOption[] = [
@@ -159,6 +165,15 @@ export function Revenue() {
       <PageHeader
         title="Revenue"
         description="Transactions, invoices, and subscription events across every service."
+        actions={
+          <RefreshButton
+            queryKeys={[
+              revenueMetricsGlobalMrrQueryKey(),
+              revenueMetricsGlobalSummaryQueryKey(),
+              queryKeyPrefix(revenueGlobalEventsQueryKey),
+            ]}
+          />
+        }
       />
 
       <div className="grid gap-3 grid-cols-2 md:grid-cols-3 lg:grid-cols-6">

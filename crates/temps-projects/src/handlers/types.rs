@@ -30,6 +30,9 @@ pub struct AppState {
     pub config_service: Arc<temps_config::ConfigService>,
     pub public_hostname_resolver: Arc<dyn temps_core::PublicHostnameResolver>,
     pub project_archive_cleaner: Arc<dyn temps_core::ProjectArchiveCleaner>,
+    /// Removes a deleted project's built images from the runtimes holding
+    /// them, best-effort, after its rows are gone.
+    pub project_image_cleaner: Arc<dyn temps_core::ProjectImageCleaner>,
     pub telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
     /// Optional checker enforcing team-based project access for human sessions.
     ///

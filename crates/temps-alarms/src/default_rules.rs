@@ -24,8 +24,8 @@ use tracing::{debug, info};
 ///
 /// # Engines supported
 ///
-/// - `"postgres"` — 6 default rules covering connections, cache hit ratio,
-///   replication lag and deadlocks.
+/// - `"postgres"` — 8 default rules covering connections, cache hit ratio,
+///   replication lag, deadlocks, failing WAL archiving and WAL backlog.
 /// - `"redis"` — 4 default rules covering memory fragmentation, eviction,
 ///   client count and keyspace hit ratio. The two ratio rules are only
 ///   evaluated once the instance has real volume (see [`volume_gate`]), so an
@@ -479,8 +479,46 @@ pub fn postgres_default_seeds() -> Vec<RuleSeed> {
             severity: "warning",
             for_duration_secs: 0,
         },
+        // WAL archiving: for 10 minutes, either the most recent
+        // `archive_command` attempt failed with nothing archived since, or a
+        // segment has waited 5 minutes or more to be archived (WAL-G retrying
+        // an unreachable endpoint records no failure). PostgreSQL keeps every
+        // segment it cannot archive, so this is the early warning of a disk
+        // that will fill. A success resets the gauge to 0 and resolves it.
+        // Always 0 while archiving is off.
+        RuleSeed {
+            name: PG_ARCHIVING_FAILING_RULE,
+            metric_name: "pg.archiver_failing",
+            threshold: 0.5,
+            comparator: ">",
+            severity: "critical",
+            for_duration_secs: PG_ARCHIVING_FAILING_FOR_SECS,
+        },
+        // `pg_wal` more than 4x `max_wal_size` for 15 minutes. A checkpoint
+        // brings a healthy server back under ~1x within minutes; staying
+        // above means WAL is not being recycled (failing archiving, a stale
+        // replication slot).
+        RuleSeed {
+            name: PG_WAL_BACKLOG_RULE,
+            metric_name: "pg.wal_dir_to_max_wal_size_ratio",
+            threshold: PG_WAL_BACKLOG_RATIO,
+            comparator: ">",
+            severity: "critical",
+            for_duration_secs: PG_WAL_BACKLOG_FOR_SECS,
+        },
     ]
 }
+
+/// Name of the default "WAL archiving failing" rule.
+pub const PG_ARCHIVING_FAILING_RULE: &str = "WAL archiving failing";
+/// How long archiving must keep failing or stalled before it fires.
+pub const PG_ARCHIVING_FAILING_FOR_SECS: i32 = 600;
+/// Name of the default "WAL backlog" rule.
+pub const PG_WAL_BACKLOG_RULE: &str = "WAL backlog: pg_wal above 4x max_wal_size";
+/// `pg_wal` size, as a multiple of `max_wal_size`, above which it fires.
+pub const PG_WAL_BACKLOG_RATIO: f64 = 4.0;
+/// How long `pg_wal` must stay above the ratio before it fires.
+pub const PG_WAL_BACKLOG_FOR_SECS: i32 = 900;
 
 pub fn redis_default_seeds() -> Vec<RuleSeed> {
     vec![
@@ -1029,9 +1067,9 @@ mod tests {
     }
 
     #[test]
-    fn postgres_defaults_generates_six_rules() {
+    fn postgres_defaults_generates_eight_rules() {
         let rules = postgres_defaults(42);
-        assert_eq!(rules.len(), 6);
+        assert_eq!(rules.len(), 8);
         for r in &rules {
             assert_eq!(r.service_id.clone().unwrap(), Some(42));
             assert_eq!(r.deployment_id.clone().unwrap(), None);

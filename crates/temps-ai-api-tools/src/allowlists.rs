@@ -1069,6 +1069,11 @@ pub const AI_WRITE_ALLOWLIST: &[&str] = &[
     "update_environment_subdomain",
     // ── Backups: run and manage, never create the destination ──
     "run_external_service_backup",
+    // Writes, reads back and deletes one probe object in the archive bucket
+    // with the service's own WAL-G settings; it takes no credential and
+    // changes no configuration, but it does touch the bucket, so it is a
+    // confirmed write rather than a safe read.
+    "test_wal_archive_target",
     "cancel_backup",
     "cancel_schedule_run",
     "detach_schedule_service",

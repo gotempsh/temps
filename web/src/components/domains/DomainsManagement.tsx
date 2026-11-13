@@ -7,7 +7,9 @@ import { PageHeader } from '@/components/layout/PageContainer'
 
 import {
   deleteDomainMutation,
+  listDomainsQueryKey,
   listIngressHostnamesOptions,
+  listIngressHostnamesQueryKey,
   renewDomainMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { ROUTE_FAILURE_IGNORE_REFUSAL } from '@/lib/route-query-failures'
@@ -26,6 +28,8 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { EmptyState } from '@/components/ui/empty-state'
+import { RefreshButton } from '@/components/ui/refresh-button'
+import { queryKeyPrefix } from '@/lib/refresh'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import {
   Collapsible,
@@ -314,7 +318,13 @@ export function DomainsManagement({
         description="Every domain this install serves, and how each gets HTTPS: its own certificate or a tunnel"
         actions={
           <>
-            {' '}
+            <RefreshButton
+              queryKeys={[
+                queryKeyPrefix(listDomainsQueryKey),
+                allTunnelsOptions().queryKey,
+                queryKeyPrefix(listIngressHostnamesQueryKey),
+              ]}
+            />
             {canCreateDomains ? (
               <CreateActionButton
                 to="/domains/add"

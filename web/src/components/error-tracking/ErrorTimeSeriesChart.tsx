@@ -24,6 +24,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import { useMemo, useState } from 'react'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 interface ErrorTimeSeriesChartProps {
   project: ProjectResponse
@@ -63,7 +64,7 @@ export function ErrorTimeSeriesChart({
     setSelectedBucket(defaultBucket)
   }
 
-  const { data, isLoading, error } = useQuery({
+  const { data, isLoading, error } = useWindowQuery({
     ...getErrorTimeSeriesOptions({
       path: {
         project_id: project.id,

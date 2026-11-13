@@ -10,17 +10,30 @@ import type {
 } from '@/api/client'
 import {
   containerMetricsGetHistoryOptions,
+  containerMetricsGetHistoryQueryKey,
   getApiRoutesOptions,
+  getApiRoutesQueryKey,
   getApiTimeseriesOptions,
+  getApiTimeseriesQueryKey,
   getEnvironmentsOptions,
   getErrorDashboardStatsOptions,
+  getErrorDashboardStatsQueryKey,
   getHourlyVisitsOptions,
+  getHourlyVisitsQueryKey,
+  getLastDeploymentQueryKey,
+  getProjectDeploymentsQueryKey,
   getUniqueCountsOptions,
+  getUniqueCountsQueryKey,
   hasAnalyticsEventsOptions,
+  hasAnalyticsEventsQueryKey,
   listContainerHistoryOptions,
+  listContainerHistoryQueryKey,
   listErrorGroupsOptions,
+  listErrorGroupsQueryKey,
   queryTraceSummariesOptions,
+  queryTraceSummariesQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
+import { PageHeader } from '@/components/layout/PageContainer'
 import { ThresholdLineChart } from '@/components/charts/threshold-line-chart'
 import { VisitorSparkline } from '@/components/dashboard/VisitorSparkline'
 import { LastDeployment } from '@/components/deployments/LastDeployment'
@@ -31,6 +44,8 @@ import { ClusterDnsStaleBanner } from '@/components/settings/ClusterDnsCoverage'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader } from '@/components/ui/card'
+import { RefreshButton } from '@/components/ui/refresh-button'
+import { queryKeyPrefix, sameWindow } from '@/lib/refresh'
 import { Skeleton } from '@/components/ui/skeleton'
 import { TimeAgo } from '@/components/utils/TimeAgo'
 import { cn } from '@/lib/utils'
@@ -38,11 +53,12 @@ import { buildProjectAnalyticsCountRequest } from '@/lib/project-analytics-summa
 import { useQueries, useQuery } from '@tanstack/react-query'
 import { format, subDays } from 'date-fns'
 import { ArrowRight, Sparkles } from 'lucide-react'
-import { useMemo } from 'react'
+import { useMemo, useReducer } from 'react'
 import { Link } from 'react-router'
 import { formatAxisNumber } from '@/lib/chart-axis-ticks'
 import { PROJECT_TOUR_EVENT } from './ProjectTour'
 import { errorRatePoints, errorRateTone } from './error-rate-chart'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 interface ProjectOverviewProps {
   project: ProjectResponse
@@ -56,13 +72,15 @@ export function ProjectOverview({
   lastDeployment,
   environmentId,
 }: ProjectOverviewProps) {
-  const { startDate, endDate } = useMemo(
-    () => ({
+  // The last 24 hours, moved to now by Refresh.
+  const [windowMoves, moveWindow] = useReducer((n: number) => n + 1, 0)
+  const { startDate, endDate } = useMemo(() => {
+    void windowMoves
+    return {
       startDate: subDays(new Date(), 1),
       endDate: new Date(),
-    }),
-    []
-  )
+    }
+  }, [windowMoves])
 
   const analyticsCapabilityQuery = useQuery({
     ...hasAnalyticsEventsOptions({ path: { project_id: project.id } }),
@@ -74,18 +92,19 @@ export function ProjectOverview({
     end_date: endDate.toISOString(),
   }
 
-  const visitorsQuery = useQuery({
-    ...getUniqueCountsOptions({
-      ...buildProjectAnalyticsCountRequest(
-        project.id,
-        analyticsWindow,
-        'visitors'
-      ),
-    }),
+  const visitorsOptions = getUniqueCountsOptions({
+    ...buildProjectAnalyticsCountRequest(
+      project.id,
+      analyticsWindow,
+      'visitors'
+    ),
+  })
+  const visitorsQuery = useWindowQuery({
+    ...visitorsOptions,
     enabled: analyticsEnabled,
   })
 
-  const pageViewsQuery = useQuery({
+  const pageViewsQuery = useWindowQuery({
     ...getUniqueCountsOptions({
       ...buildProjectAnalyticsCountRequest(
         project.id,
@@ -96,18 +115,19 @@ export function ProjectOverview({
     enabled: analyticsEnabled,
   })
 
-  const returningVisitorsQuery = useQuery({
-    ...getUniqueCountsOptions({
-      ...buildProjectAnalyticsCountRequest(
-        project.id,
-        analyticsWindow,
-        'returning_visitors'
-      ),
-    }),
+  const returningVisitorsOptions = getUniqueCountsOptions({
+    ...buildProjectAnalyticsCountRequest(
+      project.id,
+      analyticsWindow,
+      'returning_visitors'
+    ),
+  })
+  const returningVisitorsQuery = useWindowQuery({
+    ...returningVisitorsOptions,
     enabled: analyticsEnabled,
   })
 
-  const hourlyVisitorsQuery = useQuery({
+  const hourlyVisitorsQuery = useWindowQuery({
     ...getHourlyVisitsOptions({
       path: { project_id: project.id },
       query: { ...analyticsWindow, aggregation_level: 'visitors' },
@@ -119,7 +139,7 @@ export function ProjectOverview({
     data: errorStats,
     isPending: isLoadingErrors,
     isError: hasErrorStatsError,
-  } = useQuery({
+  } = useWindowQuery({
     ...getErrorDashboardStatsOptions({
       query: {
         start_time: startDate.toISOString(),
@@ -131,7 +151,7 @@ export function ProjectOverview({
     enabled: !!project.id,
   })
 
-  const apiTrafficQuery = useQuery({
+  const apiTrafficQuery = useWindowQuery({
     ...getApiTimeseriesOptions({
       path: { project_id: project.id },
       query: {
@@ -142,7 +162,7 @@ export function ProjectOverview({
     enabled: !!project.id,
   })
 
-  const apiRoutesQuery = useQuery({
+  const apiRoutesQuery = useWindowQuery({
     ...getApiRoutesOptions({
       path: { project_id: project.id },
       query: {
@@ -155,7 +175,7 @@ export function ProjectOverview({
     enabled: !!project.id,
   })
 
-  const recentErrorsQuery = useQuery({
+  const recentErrorsQuery = useWindowQuery({
     ...listErrorGroupsOptions({
       path: { project_id: project.id },
       query: {
@@ -170,7 +190,7 @@ export function ProjectOverview({
     enabled: !!project.id,
   })
 
-  const tracesQuery = useQuery({
+  const tracesQuery = useWindowQuery({
     ...queryTraceSummariesOptions({
       query: {
         project_id: project.id,
@@ -208,11 +228,43 @@ export function ProjectOverview({
   const recentErrors = recentErrorsQuery.data?.data ?? []
   const visitors = visitorsQuery.data?.count ?? 0
   const returningVisitors = returningVisitorsQuery.data?.count ?? 0
-  const returningVisitorRate =
-    visitors > 0 ? (returningVisitors / visitors) * 100 : 0
+  // A share of one window's visitors, never the new window's returning
+  // visitors over the previous window's visitors while they load.
+  const returningVisitorRate = !sameWindow(
+    [visitorsOptions.queryKey, visitorsQuery],
+    [returningVisitorsOptions.queryKey, returningVisitorsQuery]
+  )
+    ? undefined
+    : visitors > 0
+      ? (returningVisitors / visitors) * 100
+      : 0
 
   return (
     <>
+      <PageHeader
+        title="Overview"
+        actions={
+          <RefreshButton
+            // Every query the cards show; only those on screen refetch.
+            queryKeys={[
+              queryKeyPrefix(getProjectDeploymentsQueryKey),
+              // The latest-deployment card's data comes from the project page.
+              getLastDeploymentQueryKey({ path: { id: project.id } }),
+              queryKeyPrefix(hasAnalyticsEventsQueryKey),
+              queryKeyPrefix(getUniqueCountsQueryKey),
+              queryKeyPrefix(getHourlyVisitsQueryKey),
+              queryKeyPrefix(getErrorDashboardStatsQueryKey),
+              queryKeyPrefix(getApiTimeseriesQueryKey),
+              queryKeyPrefix(getApiRoutesQueryKey),
+              queryKeyPrefix(listErrorGroupsQueryKey),
+              queryKeyPrefix(queryTraceSummariesQueryKey),
+              queryKeyPrefix(listContainerHistoryQueryKey),
+              queryKeyPrefix(containerMetricsGetHistoryQueryKey),
+            ]}
+            onRefresh={moveWindow}
+          />
+        }
+      />
       <ProjectFailureBanner project={project} lastDeployment={lastDeployment} />
       <ProjectVaultAccess projectId={project.id} />
       <ClusterDnsStaleBanner projectId={project.id} />
@@ -417,7 +469,8 @@ export function VisitorAnalyticsCard({
   visitors: number
   pageViews: number
   returningVisitors: number
-  returningRate: number
+  /** Undefined while the two counts are of different windows. */
+  returningRate: number | undefined
   hourlyVisitors: EventTimeline[]
   loading: boolean
   error: boolean
@@ -510,7 +563,11 @@ export function VisitorAnalyticsCard({
               />
               <AnalyticsValue
                 label="Returning rate"
-                value={`${returningRate.toFixed(0)}%`}
+                value={
+                  returningRate === undefined
+                    ? '—'
+                    : `${returningRate.toFixed(0)}%`
+                }
               />
             </dl>
           </div>

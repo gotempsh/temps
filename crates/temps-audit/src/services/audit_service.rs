@@ -30,7 +30,7 @@ pub struct AuditLogFilter<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResourceReadPlan {
     /// Through `access_vault_audit_events`, filled when each event is written
-    /// (`m20261112_000012_vault_audit_attribution`): three bounded index walks,
+    /// (`m20261113_000013_vault_audit_attribution`): three bounded index walks,
     /// whatever the vault's history.
     Attributed,
     /// By enumerating the children at read time: one probe per session,

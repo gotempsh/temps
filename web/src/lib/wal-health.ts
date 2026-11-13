@@ -50,7 +50,8 @@ export function notCheckedFromProblem(
   if (!reason) return null
   return {
     reason,
-    checked_at: typeof record.checked_at === 'string' ? record.checked_at : null,
+    checked_at:
+      typeof record.checked_at === 'string' ? record.checked_at : null,
   }
 }
 
@@ -74,6 +75,7 @@ export function severityOf(warning: WalWarning): WalWarningSeverity {
     case 'wal_bloat':
       return warning.ratio >= 10 ? 'critical' : 'warning'
     case 'stale_slot':
+    case 'archive_failing':
       return 'critical'
     default:
       return 'warning'
@@ -91,4 +93,35 @@ export function formatBytes(bytes: number): string {
     unit++
   }
   return `${n < 10 ? n.toFixed(1) : Math.round(n)} ${units[unit]}`
+}
+
+export type ArchivingState =
+  'archiving' | 'failing' | 'waiting' | 'discarding' | 'no_command'
+
+/** Stall threshold, the server's `ARCHIVE_STALL_SECS`. */
+export const ARCHIVE_STALL_SECS = 300
+
+/**
+ * The server's `archive_mode_without_command` warning means nothing stores
+ * WAL (an `archive_library` that archives is never flagged). Discarding when
+ * `archive_command` is a no-op such as `/bin/true`: PostgreSQL counts every
+ * segment as archived and recycles it, so `pg_stat_archiver` reads as
+ * healthy while nothing is stored. No command when it is empty: PostgreSQL
+ * keeps every segment waiting for one, so `pg_wal` grows.
+ * Failing when the last failure is newer than the last success, or when a
+ * segment has waited five minutes (WAL-G retrying without failing yet).
+ */
+export function archivingState(snapshot: PostgresWalHealth): ArchivingState {
+  if (snapshot.warnings.some((w) => w.kind === 'archive_mode_without_command'))
+    return snapshot.archive_command?.trim() ? 'discarding' : 'no_command'
+  const failedAt = snapshot.archiver_last_failed_at
+  const archivedAt = snapshot.archiver_last_archived_at
+  if (
+    failedAt &&
+    (!archivedAt || Date.parse(failedAt) > Date.parse(archivedAt))
+  )
+    return 'failing'
+  if ((snapshot.archive_oldest_ready_age_secs ?? 0) >= ARCHIVE_STALL_SECS)
+    return 'failing'
+  return archivedAt ? 'archiving' : 'waiting'
 }

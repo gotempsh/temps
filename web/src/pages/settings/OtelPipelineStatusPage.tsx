@@ -3,6 +3,8 @@
 
 import { PageHeader } from '@temps-sdk/ds'
 import { TimeRangeFilter } from '@/components/ui/time-range-filter'
+import { RefreshButton } from '@/components/ui/refresh-button'
+import { queryKeyPrefix } from '@/lib/refresh'
 import { resolveTimeRange } from '@/lib/time-range-filter'
 
 import { ACTIVATION_SECTION_ANCHOR } from '@/components/observe/CloudTelemetryActivationSection'
@@ -38,8 +40,11 @@ import { usePageTitle } from '@/hooks/usePageTitle'
 import {
   getCurrentBulkActivationJobOptions,
   getIngestErrorsOptions,
+  getIngestErrorsQueryKey,
   getPipelineHistoryOptions,
+  getPipelineHistoryQueryKey,
   getPipelineStatsOptions,
+  getPipelineStatsQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
 import type {
   BulkActivationJobResponse,
@@ -674,6 +679,15 @@ export function OtelPipelineStatusPage() {
             metrics store every {sampleIntervalSeconds}&nbsp;s and can trigger
             alarms.
           </>
+        }
+        actions={
+          <RefreshButton
+            queryKeys={[
+              queryKeyPrefix(getPipelineStatsQueryKey),
+              queryKeyPrefix(getPipelineHistoryQueryKey),
+              queryKeyPrefix(getIngestErrorsQueryKey),
+            ]}
+          />
         }
       />
 

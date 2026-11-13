@@ -6,7 +6,7 @@
 //! Downgrade refuses to discard links or authorization provenance.
 use sea_orm_migration::prelude::*;
 
-pub const GENERAL_VAULT_MIGRATION: &str = "m20261112_000001_general_access_vaults";
+pub const GENERAL_VAULT_MIGRATION: &str = "m20261113_000002_general_access_vaults";
 pub const GENERAL_VAULT_CONSUMER_INDEXES: &[(&str, &str)] = &[
     ("sandbox_service_grant_consumer", "sandbox_service_grants"),
     ("sandbox_access_runtime_consumer", "sandbox_access_runtimes"),

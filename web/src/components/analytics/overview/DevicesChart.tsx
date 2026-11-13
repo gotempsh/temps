@@ -12,13 +12,13 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
-import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import { BarChart3 } from 'lucide-react'
 import * as React from 'react'
 import { useNavigate, useSearchParams } from 'react-router'
 import { DeviceIcon } from './TechnologyIcon'
 import { buildAnalyticsDimensionUrl } from './viewAllUrl'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 const DEVICE_COLORS: Record<string, string> = {
   Desktop: 'var(--chart-1)',
@@ -41,7 +41,7 @@ export function DevicesChart({
 }: DevicesChartProps) {
   const navigate = useNavigate()
   const [searchParams] = useSearchParams()
-  const { data, isLoading, error } = useQuery({
+  const { data, isLoading, error } = useWindowQuery({
     ...getPropertyBreakdownOptions({
       path: {
         project_id: project.id,

@@ -427,6 +427,13 @@ pub fn prepare_build_context(
         platform: request.platform.clone(),
         cache_namespace,
         build_args,
+        // Only Temps' image ownership labels travel; a worker refuses others.
+        labels: request
+            .labels
+            .iter()
+            .filter(|(key, _)| key.starts_with(crate::build_protocol::IMAGE_LABEL_PREFIX))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
     };
     spec.validate().map_err(BuilderError::InvalidContext)?;
     let archive_file = tempfile::NamedTempFile::new().map_err(BuilderError::IoError)?;
@@ -526,6 +533,50 @@ struct RemotePullImageRequest {
 struct RemotePullImageResponse {
     image_id: String,
 }
+
+/// Wire body for `POST /agent/images/remove`: images the control plane
+/// wants gone from the node, removed there only if no container on the node
+/// was created from them. At most [`crate::MAX_IMAGE_REMOVAL_BATCH`].
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct RemoveImagesRequest {
+    #[schema(value_type = Vec<Object>)]
+    pub images: Vec<crate::ImageRemovalRequest>,
+}
+
+/// Path of the agent's image removal endpoint.
+pub const REMOVE_IMAGES_PATH: &str = "/agent/images/remove";
+
+/// How long one removal batch may take on a node before the control plane
+/// gives up on it. Generous: deleting layers of large images is slow, and a
+/// timeout only leaves the images for the node's housekeeping.
+const REMOVE_IMAGES_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Wire body for `POST /agent/images/owned`: list the images on the node
+/// that the Temps install `owner` built for its project `project_id`.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ListOwnedImagesRequest {
+    /// The value of the install's [`crate::IMAGE_OWNER_LABEL`].
+    pub owner: String,
+    /// The value of [`crate::IMAGE_PROJECT_LABEL`]: one project's images
+    /// are listed at a time, so the daemon's answer stays that size.
+    pub project_id: i32,
+    /// Where the previous page ended. Optional on the wire: an agent that
+    /// predates it always starts at the oldest image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<Object>)]
+    pub after: Option<crate::ListCursor>,
+}
+
+/// Path of the agent's owned-image listing endpoint.
+pub const LIST_OWNED_IMAGES_PATH: &str = "/agent/images/owned";
+
+/// Largest image-removal answer read from a node: 500 outcomes of a few
+/// hundred bytes each, with room to spare.
+const MAX_REMOVE_IMAGES_RESPONSE_BYTES: usize = 1024 * 1024;
+
+/// Largest owned-image listing read from a node:
+/// [`crate::MAX_LABELLED_IMAGES`] entries of at most a few kilobytes each.
+const MAX_OWNED_IMAGES_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
 /// Response envelope from the agent API.
 #[derive(Deserialize)]
@@ -1153,6 +1204,55 @@ impl RemoteNodeDeployer {
         Ok(())
     }
 
+    /// POST `body` to one of the agent's image endpoints and read its answer,
+    /// bounded to `limit` bytes. An agent that predates the endpoint answers
+    /// with the router's bare 404/405: a typed error saying to upgrade it.
+    async fn agent_image_call<B: Serialize, T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+        limit: usize,
+        what: &str,
+    ) -> Result<T, DeployerError> {
+        let location = format!("node {}", self.node_name);
+        let fail = |reason: String| DeployerError::ImageRemoval {
+            location: location.clone(),
+            reason,
+        };
+        let url = format!("{}{}", self.agent_url, path);
+        let response = self
+            .client
+            .post(&url)
+            .bearer_auth(&self.token)
+            .timeout(REMOVE_IMAGES_TIMEOUT)
+            .json(body)
+            .send()
+            .await
+            .map_err(|error| fail(format!("failed to reach the agent at {url}: {error}")))?;
+        let status = response.status();
+        if matches!(
+            status,
+            reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED
+        ) {
+            return Err(fail(format!(
+                "its agent does not support {what} (HTTP {status}); upgrade the worker \
+                 agent, or manage the images on that host"
+            )));
+        }
+        let envelope: AgentResponse<T> = bounded_json(response, &format!("{what} at {url}"), limit)
+            .await
+            .map_err(|error| fail(format!("{error} (HTTP {status})")))?;
+        if !envelope.success {
+            return Err(fail(format!(
+                "the agent answered HTTP {status}: {}",
+                envelope.error.unwrap_or_default()
+            )));
+        }
+        envelope
+            .data
+            .ok_or_else(|| fail(format!("the agent at {url} returned success but no data")))
+    }
+
     /// Get the node name this deployer targets.
     pub fn node_name(&self) -> &str {
         &self.node_name
@@ -1568,6 +1668,55 @@ impl ContainerDeployer for RemoteNodeDeployer {
             "/agent/images/{}/exists",
             urlencoding::encode(image_name)
         ))
+        .await
+    }
+
+    async fn remove_unused_images(
+        &self,
+        requests: &[crate::ImageRemovalRequest],
+    ) -> Result<Vec<crate::ImageRemovalOutcome>, DeployerError> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        let outcomes: Vec<crate::ImageRemovalOutcome> = self
+            .agent_image_call(
+                REMOVE_IMAGES_PATH,
+                &RemoveImagesRequest {
+                    images: requests.to_vec(),
+                },
+                MAX_REMOVE_IMAGES_RESPONSE_BYTES,
+                "removing images",
+            )
+            .await?;
+        if outcomes.len() != requests.len() {
+            return Err(DeployerError::ImageRemoval {
+                location: format!("node {}", self.node_name),
+                reason: format!(
+                    "the agent returned {} outcomes for {} images",
+                    outcomes.len(),
+                    requests.len()
+                ),
+            });
+        }
+        Ok(outcomes)
+    }
+
+    async fn list_owned_images(
+        &self,
+        owner: &str,
+        project_id: i32,
+        after: Option<&crate::ListCursor>,
+    ) -> Result<crate::LabelledImages, DeployerError> {
+        self.agent_image_call(
+            LIST_OWNED_IMAGES_PATH,
+            &ListOwnedImagesRequest {
+                owner: owner.to_string(),
+                project_id,
+                after: after.cloned(),
+            },
+            MAX_OWNED_IMAGES_RESPONSE_BYTES,
+            "listing images",
+        )
         .await
     }
 }
@@ -2454,6 +2603,7 @@ mod tests {
         )
         .expect("git config");
         let request = BuildRequest {
+            labels: Default::default(),
             build_secrets: Default::default(),
             cache_from: Vec::new(),
             image_name: "app:latest".to_string(),
@@ -2628,6 +2778,7 @@ mod tests {
         std::fs::write(source.path().join("Dockerfile"), "FROM scratch\n").expect("Dockerfile");
         std::os::unix::fs::symlink("/etc/passwd", source.path().join("linked")).expect("symlink");
         let request = BuildRequest {
+            labels: Default::default(),
             build_secrets: Default::default(),
             cache_from: Vec::new(),
             image_name: "app:latest".to_string(),
@@ -2663,6 +2814,7 @@ mod tests {
 
     fn context_request(root: &Path, dockerfile: Option<PathBuf>) -> BuildRequest {
         BuildRequest {
+            labels: Default::default(),
             build_secrets: Default::default(),
             cache_from: Vec::new(),
             image_name: "app:latest".to_string(),
@@ -3519,6 +3671,171 @@ mod tests {
         server.await.expect("mock agent task");
     }
 
+    /// Answer one request with `status_line` and `body`, handing the raw
+    /// request back once it has been answered.
+    async fn one_shot_agent(
+        status_line: &'static str,
+        body: &'static str,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock agent");
+        let address = listener.local_addr().expect("mock agent address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept request");
+            // One read may return only part of the request: read the head,
+            // then exactly the body its Content-Length announces.
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            let head_end = loop {
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break end + 4;
+                }
+                let read = stream.read(&mut buffer).await.expect("read request head");
+                assert!(read > 0, "connection closed before the request head ended");
+                request.extend_from_slice(&buffer[..read]);
+            };
+            let head = String::from_utf8_lossy(&request[..head_end]).to_ascii_lowercase();
+            let body_len = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            while request.len() < head_end + body_len {
+                let read = stream.read(&mut buffer).await.expect("read request body");
+                assert!(read > 0, "connection closed before the request body ended");
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let response = format!(
+                "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+            String::from_utf8_lossy(&request).into_owned()
+        });
+        (address, server)
+    }
+
+    fn test_remote(address: std::net::SocketAddr) -> RemoteNodeDeployer {
+        RemoteNodeDeployer::new(
+            format!("http://{address}"),
+            "test-token".to_string(),
+            "worker-test".to_string(),
+        )
+        .expect("create remote deployer")
+    }
+
+    #[tokio::test]
+    async fn remove_unused_images_posts_the_batch_and_returns_the_agents_outcomes() {
+        let (address, server) = one_shot_agent(
+            "200 OK",
+            r#"{"success":true,"data":[{"reference":"app-1:latest","status":"removed","image_id":"sha256:aa"},{"reference":"app-2:latest","status":"absent"}],"error":null}"#,
+        )
+        .await;
+        let outcomes = test_remote(address)
+            .remove_unused_images(&[
+                crate::ImageRemovalRequest::new("app-1:latest", Some("sha256:aa".to_string())),
+                crate::ImageRemovalRequest::new("app-2:latest", None),
+            ])
+            .await
+            .expect("outcomes from the agent");
+        let request = server.await.expect("mock agent task");
+
+        assert!(
+            request.starts_with("POST /agent/images/remove "),
+            "{request}"
+        );
+        assert!(
+            request.contains(r#""expected_image_id":"sha256:aa""#),
+            "{request}"
+        );
+        assert!(outcomes[0].status.is_removed());
+        assert_eq!(outcomes[1].status, crate::ImageRemovalStatus::Absent);
+    }
+
+    #[tokio::test]
+    async fn list_owned_images_asks_for_this_owner_and_returns_the_listing() {
+        let (address, server) = one_shot_agent(
+            "200 OK",
+            r#"{"success":true,"data":{"images":[{"image_id":"sha256:aa","tags":["app-1:latest"],"labels":{"sh.temps.image.project_id":"7"},"created":10,"in_use_by":"c0ffee"}],"unlisted":2},"error":null}"#,
+        )
+        .await;
+        let listed = test_remote(address)
+            .list_owned_images(
+                "install-a.marker-b",
+                7,
+                Some(&crate::ListCursor {
+                    created: 9,
+                    image_id: "sha256:99".to_string(),
+                }),
+            )
+            .await
+            .expect("the agent's listing");
+        let request = server.await.expect("mock agent task");
+
+        assert!(
+            request.starts_with("POST /agent/images/owned "),
+            "{request}"
+        );
+        assert!(
+            request.contains(r#""owner":"install-a.marker-b""#),
+            "{request}"
+        );
+        assert!(request.contains(r#""project_id":7"#), "{request}");
+        assert!(
+            request.contains(r#""after":{"created":9,"image_id":"sha256:99"}"#),
+            "{request}"
+        );
+        assert_eq!(listed.unlisted, 2);
+        assert_eq!(listed.images[0].in_use_by.as_deref(), Some("c0ffee"));
+    }
+
+    /// A node cannot make the control plane buffer an arbitrary answer.
+    #[tokio::test]
+    async fn an_oversized_agent_answer_is_refused_before_it_is_parsed() {
+        let huge: &'static str = Box::leak(
+            format!(
+                r#"{{"success":true,"data":[{{"reference":"{}","status":"absent"}}],"error":null}}"#,
+                "x".repeat(MAX_REMOVE_IMAGES_RESPONSE_BYTES + 1)
+            )
+            .into_boxed_str(),
+        );
+        let (address, server) = one_shot_agent("200 OK", huge).await;
+        let result = test_remote(address)
+            .remove_unused_images(&[crate::ImageRemovalRequest::new("app-1:latest", None)])
+            .await;
+        server.abort();
+        assert!(
+            matches!(result, Err(DeployerError::ImageRemoval { .. })),
+            "{result:?}"
+        );
+    }
+
+    /// An agent from before the endpoint answers with the router's bare 404:
+    /// a typed error that says to upgrade, not a JSON parse failure.
+    #[tokio::test]
+    async fn remove_unused_images_on_an_older_agent_says_to_upgrade_it() {
+        let (address, server) = one_shot_agent("404 Not Found", "").await;
+        let result = test_remote(address)
+            .remove_unused_images(&[crate::ImageRemovalRequest::new("app-1:latest", None)])
+            .await;
+        server.await.expect("mock agent task");
+
+        match result {
+            Err(DeployerError::ImageRemoval { location, reason }) => {
+                assert_eq!(location, "node worker-test");
+                assert!(reason.contains("upgrade the worker agent"), "{reason}");
+            }
+            other => panic!("expected an image removal error, got {other:?}"),
+        }
+    }
+
     /// Answer one request on a local port with `status_line` and a failed
     /// agent envelope, and return the agent's address.
     async fn one_shot_agent_failure(
@@ -3907,6 +4224,7 @@ mod tests {
         .unwrap();
         let result = deployer
             .build_image(BuildRequest {
+                labels: Default::default(),
                 build_secrets: Default::default(),
                 cache_from: Vec::new(),
                 image_name: "test:latest".to_string(),
@@ -3937,6 +4255,7 @@ mod tests {
         let source = tempfile::tempdir().unwrap();
         let result = deployer
             .build_image(BuildRequest {
+                labels: Default::default(),
                 build_secrets: crate::BuildSecrets::new(
                     [("API_KEY".to_string(), "secret-value-1725".to_string())].into(),
                 ),

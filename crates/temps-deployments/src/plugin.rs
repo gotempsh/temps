@@ -398,6 +398,12 @@ impl TempsPlugin for DeploymentsPlugin {
                 deployment_service.clone() as Arc<dyn temps_core::DeploymentContainerCleaner>;
             context.register_service(deployment_container_cleaner);
 
+            // Read a deleted project's built images before its rows cascade
+            // away, and remove them from every runtime holding them after.
+            let project_image_cleaner =
+                deployment_service.clone() as Arc<dyn temps_core::ProjectImageCleaner>;
+            context.register_service(project_image_cleaner);
+
             // Remote container log source — lets the log-aggregator collect logs
             // from containers on remote worker nodes into searchable history. The
             // aggregator picks this up via get_service and runs its reconcile
@@ -569,6 +575,21 @@ impl TempsPlugin for DeploymentsPlugin {
                     temps_config::ImageRetentionSettings::default()
                 }
             };
+            // Images of deleted projects: swept on this host when it runs
+            // workloads, and on every reachable worker node through its
+            // agent, with this install's owner ID (database row + data
+            // directory marker).
+            let orphan_sweeper =
+                temps_docker_housekeeping::services::orphaned_images::OrphanImageSweeper::new(
+                    db.clone(),
+                )
+                .with_local_daemon(local_workloads.local_workloads_enabled().then(|| {
+                    Arc::new(crate::services::DefaultDockerClient)
+                        as Arc<dyn temps_docker_housekeeping::services::orphaned_images::OwnedImageDaemon>
+                }))
+                .with_worker_daemons(deployment_service.clone()
+                    as Arc<dyn temps_docker_housekeeping::services::orphaned_images::WorkerImageDaemons>)
+                .with_data_dir(config_service.data_dir());
             let docker_cleanup = Arc::new(
                 crate::services::DockerCleanupService::new(
                     Arc::new(crate::services::DefaultDockerClient),
@@ -577,7 +598,8 @@ impl TempsPlugin for DeploymentsPlugin {
                 )
                 .with_static_dir(config_service.static_dir())
                 .with_image_retention(&image_retention)
-                .with_config_service(config_service.clone()),
+                .with_config_service(config_service.clone())
+                .with_orphan_sweeper(orphan_sweeper),
             );
             // The cleanup scheduler prunes images, containers and build cache
             // on THIS host's Docker daemon. With no local workloads there is
@@ -594,8 +616,19 @@ impl TempsPlugin for DeploymentsPlugin {
             } else {
                 tracing::info!(
                     "local workloads are disabled for this process; not starting the Docker \
-                     cleanup scheduler (worker nodes prune their own daemons)"
+                     cleanup scheduler (worker nodes prune their own daemons), only the sweep \
+                     of worker nodes' images of deleted projects"
                 );
+                // A worker's own housekeeping has no database, so it cannot
+                // tell a deleted project's image from a live one: the
+                // control plane sweeps workers whether or not it runs
+                // workloads itself.
+                tokio::spawn({
+                    let cleanup_service = docker_cleanup.clone();
+                    async move {
+                        cleanup_service.start_orphan_sweep_scheduler().await;
+                    }
+                });
             }
 
             // Get screenshot service (required)

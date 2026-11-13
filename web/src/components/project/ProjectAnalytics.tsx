@@ -19,6 +19,25 @@ import {
   getEventsCountOptions,
   getHourlyVisitsOptions,
   hasAnalyticsEventsOptions,
+  getAiAgentBreakdownQueryKey,
+  getAiPageBreakdownQueryKey,
+  getAiStatusBreakdownQueryKey,
+  getAiAgentTimelineQueryKey,
+  getEventDetailQueryKey,
+  getEventEntriesQueryKey,
+  getEventVisitorsQueryKey,
+  getEventsCountQueryKey,
+  getHourlyVisitsQueryKey,
+  getPageFlowQueryKey,
+  getPagePathDetailQueryKey,
+  getPagePathVisitorsQueryKey,
+  getPagePathsQueryKey,
+  getPagePathsSparklinesQueryKey,
+  getProjectSessionReplaysQueryKey,
+  getPropertyBreakdownQueryKey,
+  getUniqueCountsQueryKey,
+  getVisitorsQueryKey,
+  hasAnalyticsEventsQueryKey,
   listAnalyticsIngestKeysOptions,
   getAnalyticsIngestKeyEndpointOptions,
   revokeAnalyticsIngestKeyMutation,
@@ -113,6 +132,9 @@ import {
   ScrollableTabsList,
   TabsTrigger,
 } from '@/components/ui/tabs'
+import { RefreshButton } from '@/components/ui/refresh-button'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
+import { queryKeyPrefix } from '@/lib/refresh'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
   analyticsIngestBaseUrl,
@@ -123,7 +145,12 @@ import { cn } from '@/lib/utils'
 import type { ChartDateRange } from '@/lib/chart-range-selection'
 import { CreateFunnel } from '@/pages/CreateFunnel'
 import { EditFunnel } from '@/pages/EditFunnel'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import {
+  useMutation,
+  useQuery,
+  useQueryClient,
+  type QueryKey,
+} from '@tanstack/react-query'
 import { format } from 'date-fns'
 import { toast } from 'sonner'
 import { useUrlState } from '@temps-sdk/ds'
@@ -147,7 +174,6 @@ import {
   Info,
   KeyRound,
   Loader2,
-  RefreshCw,
   RotateCcw,
   Terminal,
 } from 'lucide-react'
@@ -196,7 +222,7 @@ export function VisitorChart({
     'events' | 'sessions' | 'visitors'
   >('visitors')
 
-  const { data, isLoading, error } = useQuery({
+  const { data, isLoading, error } = useWindowQuery({
     ...getHourlyVisitsOptions({
       path: {
         project_id: project.id,
@@ -234,10 +260,14 @@ export interface AnalyticsFiltersProps {
   onFilterChange: (filter: QuickFilter) => void
   onDateRangeChange: (range: DateRange | undefined) => void
   onEnvironmentChange: (environment: number | undefined) => void
-  /** Leave out on a page that should offer only the filters. */
+  /**
+   * The queries the page shows; with them the bar offers Refresh (see
+   * `RefreshButton`). Leave out on a page that should offer only the filters.
+   */
+  refreshQueryKeys?: readonly QueryKey[]
+  /** Moves a relative range to now before refreshing (`useAdvancingDateRange`'s `advance`). */
   onRefresh?: () => void
-  isRefreshing?: boolean
-  /** Extra page-level actions rendered before the refresh button. */
+  /** Extra page-level actions rendered after the refresh button. */
   actions?: React.ReactNode
   /** Extra controls rendered next to the environment selector, on the left side. */
   leftActions?: React.ReactNode
@@ -251,8 +281,8 @@ export function AnalyticsFilters({
   onFilterChange,
   onDateRangeChange,
   onEnvironmentChange,
+  refreshQueryKeys,
   onRefresh,
-  isRefreshing = false,
   actions,
   leftActions,
 }: AnalyticsFiltersProps) {
@@ -295,20 +325,10 @@ export function AnalyticsFilters({
 
       <div className="flex flex-wrap items-center gap-2">
         <div className="flex flex-wrap items-center gap-2">
+          {refreshQueryKeys ? (
+            <RefreshButton queryKeys={refreshQueryKeys} onRefresh={onRefresh} />
+          ) : null}
           {actions}
-          {onRefresh && (
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={onRefresh}
-              disabled={isRefreshing}
-            >
-              <RefreshCw
-                className={cn('h-4 w-4', isRefreshing && 'animate-spin')}
-              />
-              Refresh
-            </Button>
-          )}
           <DateTimeRange
             value={(() => {
               const { startDate, endDate } = getDateRangeFromFilter({
@@ -371,33 +391,11 @@ function PagesTab({ project }: PagesTabProps) {
     [filterParam, fromParam, toParam]
   )
   const [selectedEnvironment, setSelectedEnvironment] = useEnvironmentFilter()
-  const [isRefreshing, setIsRefreshing] = React.useState(false)
-  const queryClient = useQueryClient()
-
-  const { startDate, endDate } = React.useMemo(
-    () => getDateRangeFromFilter(dateFilter),
-    [dateFilter]
+  // Moves only when the user refreshes: these tabs never polled.
+  const { startDate, endDate, advance } = useAdvancingDateRange(
+    dateFilter,
+    null
   )
-
-  const handleRefresh = React.useCallback(async () => {
-    setIsRefreshing(true)
-    try {
-      await queryClient.invalidateQueries({
-        predicate: (query) => {
-          const key = query.queryKey[0] as {
-            _id?: string
-            query?: { project_id?: number }
-          }
-          return (
-            !!key?._id?.startsWith('getPage') &&
-            key.query?.project_id === project.id
-          )
-        },
-      })
-    } finally {
-      setIsRefreshing(false)
-    }
-  }, [queryClient, project.id])
 
   // Sync date filter to URL search params (preserves path param)
   const updateDateFilter = React.useCallback(
@@ -453,8 +451,14 @@ function PagesTab({ project }: PagesTabProps) {
           })
         }
         onEnvironmentChange={setSelectedEnvironment}
-        onRefresh={handleRefresh}
-        isRefreshing={isRefreshing}
+        refreshQueryKeys={[
+          queryKeyPrefix(getPagePathsQueryKey),
+          queryKeyPrefix(getPagePathsSparklinesQueryKey),
+          queryKeyPrefix(getPagePathDetailQueryKey),
+          queryKeyPrefix(getPagePathVisitorsQueryKey),
+          queryKeyPrefix(getAiPageBreakdownQueryKey),
+        ]}
+        onRefresh={advance}
       />
 
       {/* Show PageDetail when a path is selected, otherwise show Pages list */}
@@ -511,12 +515,10 @@ function EventDetailTab({ project }: EventDetailTabProps) {
     }
   )
   const [selectedEnvironment, setSelectedEnvironment] = useEnvironmentFilter()
-  const [isRefreshing, setIsRefreshing] = React.useState(false)
-  const queryClient = useQueryClient()
-
-  const { startDate, endDate } = React.useMemo(
-    () => getDateRangeFromFilter(dateFilter),
-    [dateFilter]
+  // Moves only when the user refreshes: these tabs never polled.
+  const { startDate, endDate, advance } = useAdvancingDateRange(
+    dateFilter,
+    null
   )
 
   // Sync date filter to URL so deep links and back-navigation keep the range.
@@ -540,21 +542,6 @@ function EventDetailTab({ project }: EventDetailTabProps) {
     },
     [searchParams, setSearchParams]
   )
-
-  const handleRefresh = React.useCallback(() => {
-    setIsRefreshing(true)
-    queryClient.invalidateQueries({
-      predicate: (query) => {
-        const key = query.queryKey[0] as string
-        return !!(
-          key &&
-          typeof key === 'string' &&
-          (key.includes('getEventDetail') || key.includes('getEventVisitors'))
-        )
-      },
-    })
-    setTimeout(() => setIsRefreshing(false), 1000)
-  }, [queryClient])
 
   if (!eventName) {
     return (
@@ -581,8 +568,12 @@ function EventDetailTab({ project }: EventDetailTabProps) {
           })
         }
         onEnvironmentChange={setSelectedEnvironment}
-        onRefresh={handleRefresh}
-        isRefreshing={isRefreshing}
+        refreshQueryKeys={[
+          queryKeyPrefix(getEventDetailQueryKey),
+          queryKeyPrefix(getEventEntriesQueryKey),
+          queryKeyPrefix(getEventVisitorsQueryKey),
+        ]}
+        onRefresh={advance}
       />
 
       <EventDetail
@@ -641,29 +632,11 @@ function DimensionTab({ project }: DimensionTabProps) {
     }
   )
   const [selectedEnvironment, setSelectedEnvironment] = useEnvironmentFilter()
-  const [isRefreshing, setIsRefreshing] = React.useState(false)
-  const queryClient = useQueryClient()
-
-  const { startDate, endDate } = React.useMemo(
-    () => getDateRangeFromFilter(dateFilter),
-    [dateFilter]
+  // Moves only when the user refreshes: these tabs never polled.
+  const { startDate, endDate, advance } = useAdvancingDateRange(
+    dateFilter,
+    null
   )
-
-  const handleRefresh = React.useCallback(() => {
-    setIsRefreshing(true)
-    queryClient.invalidateQueries({
-      predicate: (query) => {
-        const key = query.queryKey[0] as string
-        return !!(
-          key &&
-          typeof key === 'string' &&
-          (key.includes('getPropertyBreakdown') ||
-            key.includes('getEventsCount'))
-        )
-      },
-    })
-    setTimeout(() => setIsRefreshing(false), 1000)
-  }, [queryClient])
 
   const updateDateFilter = React.useCallback(
     (next: AnalyticsDateFilter) => {
@@ -715,8 +688,11 @@ function DimensionTab({ project }: DimensionTabProps) {
           })
         }
         onEnvironmentChange={setSelectedEnvironment}
-        onRefresh={handleRefresh}
-        isRefreshing={isRefreshing}
+        refreshQueryKeys={[
+          queryKeyPrefix(getPropertyBreakdownQueryKey),
+          queryKeyPrefix(getEventsCountQueryKey),
+        ]}
+        onRefresh={advance}
       />
 
       <DimensionList
@@ -776,29 +752,11 @@ function AiAgentsTab({ project, view = 'overview' }: AiAgentsTabProps) {
     }
   )
   const [selectedEnvironment, setSelectedEnvironment] = useEnvironmentFilter()
-  const [isRefreshing, setIsRefreshing] = React.useState(false)
-  const queryClient = useQueryClient()
-
-  const { startDate, endDate } = React.useMemo(
-    () => getDateRangeFromFilter(dateFilter),
-    [dateFilter]
+  // Moves only when the user refreshes: these tabs never polled.
+  const { startDate, endDate, advance } = useAdvancingDateRange(
+    dateFilter,
+    null
   )
-
-  const handleRefresh = React.useCallback(() => {
-    setIsRefreshing(true)
-    queryClient.invalidateQueries({
-      predicate: (query) => {
-        const key = query.queryKey[0] as string
-        return !!(
-          key &&
-          typeof key === 'string' &&
-          (key.includes('getAiAgentBreakdown') ||
-            key.includes('getAiPageBreakdown'))
-        )
-      },
-    })
-    setTimeout(() => setIsRefreshing(false), 1000)
-  }, [queryClient])
 
   const updateDateFilter = React.useCallback(
     (next: AnalyticsDateFilter) => {
@@ -876,8 +834,13 @@ function AiAgentsTab({ project, view = 'overview' }: AiAgentsTabProps) {
           })
         }
         onEnvironmentChange={setSelectedEnvironment}
-        onRefresh={handleRefresh}
-        isRefreshing={isRefreshing}
+        refreshQueryKeys={[
+          queryKeyPrefix(getAiAgentBreakdownQueryKey),
+          queryKeyPrefix(getAiPageBreakdownQueryKey),
+          queryKeyPrefix(getAiStatusBreakdownQueryKey),
+          queryKeyPrefix(getAiAgentTimelineQueryKey),
+        ]}
+        onRefresh={advance}
       />
 
       <AiAgentsDetail
@@ -932,12 +895,10 @@ function SegmentVisitorsTab({ project }: SegmentVisitorsTabProps) {
     }
   )
   const [selectedEnvironment, setSelectedEnvironment] = useEnvironmentFilter()
-  const [isRefreshing, setIsRefreshing] = React.useState(false)
-  const queryClient = useQueryClient()
-
-  const { startDate, endDate } = React.useMemo(
-    () => getDateRangeFromFilter(dateFilter),
-    [dateFilter]
+  // Moves only when the user refreshes: these tabs never polled.
+  const { startDate, endDate, advance } = useAdvancingDateRange(
+    dateFilter,
+    null
   )
 
   const updateDateFilter = React.useCallback(
@@ -960,17 +921,6 @@ function SegmentVisitorsTab({ project }: SegmentVisitorsTabProps) {
     },
     [searchParams, setSearchParams]
   )
-
-  const handleRefresh = React.useCallback(() => {
-    setIsRefreshing(true)
-    queryClient.invalidateQueries({
-      predicate: (query) => {
-        const key = query.queryKey[0] as string
-        return !!(key && typeof key === 'string' && key.includes('getVisitors'))
-      },
-    })
-    setTimeout(() => setIsRefreshing(false), 1000)
-  }, [queryClient])
 
   if (!isDimensionKey(rawDimension) || !rawValue) {
     return (
@@ -1012,8 +962,8 @@ function SegmentVisitorsTab({ project }: SegmentVisitorsTabProps) {
           })
         }
         onEnvironmentChange={setSelectedEnvironment}
-        onRefresh={handleRefresh}
-        isRefreshing={isRefreshing}
+        refreshQueryKeys={[queryKeyPrefix(getVisitorsQueryKey)]}
+        onRefresh={advance}
       />
 
       <SegmentVisitors
@@ -1022,6 +972,7 @@ function SegmentVisitorsTab({ project }: SegmentVisitorsTabProps) {
         value={value}
         startDate={startDate}
         endDate={endDate}
+        rangeScope={`${dateFilter.quickFilter}\u0000${dateFilter.dateRange?.from?.getTime() ?? ''}\u0000${dateFilter.dateRange?.to?.getTime() ?? ''}`}
         environment={selectedEnvironment}
         onBack={() => {
           const params = new URLSearchParams()
@@ -1055,28 +1006,11 @@ function SessionReplaysTab({ project }: SessionReplaysTabProps) {
     dateRange: undefined,
   })
   const [selectedEnvironment, setSelectedEnvironment] = useEnvironmentFilter()
-  const [isRefreshing, setIsRefreshing] = React.useState(false)
-  const queryClient = useQueryClient()
-
-  const { startDate, endDate } = React.useMemo(
-    () => getDateRangeFromFilter(dateFilter),
-    [dateFilter]
+  // Moves only when the user refreshes: these tabs never polled.
+  const { startDate, endDate, advance } = useAdvancingDateRange(
+    dateFilter,
+    null
   )
-
-  const handleRefresh = React.useCallback(() => {
-    setIsRefreshing(true)
-    queryClient.invalidateQueries({
-      predicate: (query) => {
-        const key = query.queryKey[0] as string
-        return !!(
-          key &&
-          typeof key === 'string' &&
-          (key.includes('visitors') || key.includes('sessions'))
-        )
-      },
-    })
-    setTimeout(() => setIsRefreshing(false), 1000)
-  }, [queryClient])
 
   return (
     <div className="space-y-6">
@@ -1096,8 +1030,8 @@ function SessionReplaysTab({ project }: SessionReplaysTabProps) {
           }))
         }
         onEnvironmentChange={setSelectedEnvironment}
-        onRefresh={handleRefresh}
-        isRefreshing={isRefreshing}
+        refreshQueryKeys={[queryKeyPrefix(getProjectSessionReplaysQueryKey)]}
+        onRefresh={advance}
       />
 
       {/* Session Replays Component */}
@@ -1121,24 +1055,11 @@ function JourneyTab({ project }: JourneyTabProps) {
     dateRange: undefined,
   })
   const [selectedEnvironment, setSelectedEnvironment] = useEnvironmentFilter()
-  const [isRefreshing, setIsRefreshing] = React.useState(false)
-  const queryClient = useQueryClient()
-
-  const { startDate, endDate } = React.useMemo(
-    () => getDateRangeFromFilter(dateFilter),
-    [dateFilter]
+  // Moves only when the user refreshes: these tabs never polled.
+  const { startDate, endDate, advance } = useAdvancingDateRange(
+    dateFilter,
+    null
   )
-
-  const handleRefresh = React.useCallback(() => {
-    setIsRefreshing(true)
-    queryClient.invalidateQueries({
-      predicate: (query) => {
-        const key = query.queryKey[0] as string
-        return !!(key && typeof key === 'string' && key.includes('getPageFlow'))
-      },
-    })
-    setTimeout(() => setIsRefreshing(false), 1000)
-  }, [queryClient])
 
   return (
     <div className="space-y-6">
@@ -1157,8 +1078,8 @@ function JourneyTab({ project }: JourneyTabProps) {
           }))
         }
         onEnvironmentChange={setSelectedEnvironment}
-        onRefresh={handleRefresh}
-        isRefreshing={isRefreshing}
+        refreshQueryKeys={[queryKeyPrefix(getPageFlowQueryKey)]}
+        onRefresh={advance}
       />
 
       <PageFlow
@@ -1295,8 +1216,8 @@ export function ProjectAnalyticsOverview({
   // /setup — the empty-state banner below already covers "no data yet".
   const showSetupOverride = useProjectTourActive()
   const [insightsOpen, setInsightsOpen] = useInsightsOpen()
-  // No refresh button: a relative range moves forward on its own.
-  const { startDate, endDate } = useAdvancingDateRange(dateFilter)
+  // A relative range moves forward on its own; Refresh moves it right away.
+  const { startDate, endDate, advance } = useAdvancingDateRange(dateFilter)
 
   // Keep chart selections provisional until the user reviews the timestamps.
   const handleChartZoom = React.useCallback((from: Date, to: Date) => {
@@ -1360,6 +1281,15 @@ export function ProjectAnalyticsOverview({
                 })
               }
               onEnvironmentChange={setSelectedEnvironment}
+              refreshQueryKeys={[
+                queryKeyPrefix(hasAnalyticsEventsQueryKey),
+                queryKeyPrefix(getUniqueCountsQueryKey),
+                queryKeyPrefix(getHourlyVisitsQueryKey),
+                queryKeyPrefix(getEventsCountQueryKey),
+                queryKeyPrefix(getPropertyBreakdownQueryKey),
+                queryKeyPrefix(getAiAgentBreakdownQueryKey),
+              ]}
+              onRefresh={advance}
             />
           }
         />
@@ -1546,7 +1476,7 @@ interface ChartProps {
 function EventsChart({ project, startDate, endDate, environment }: ChartProps) {
   const navigate = useNavigate()
   const [searchParams] = useSearchParams()
-  const { data, isLoading, error } = useQuery({
+  const { data, isLoading, error } = useWindowQuery({
     ...getEventsCountOptions({
       path: {
         project_id: project.id,

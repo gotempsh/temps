@@ -24,6 +24,21 @@ use std::pin::Pin;
 use temps_core::UtcDateTime;
 use thiserror::Error;
 
+pub use temps_docker_util::image_removal::{
+    ImageRemovalOutcome, ImageRemovalRequest, ImageRemovalStatus, LabelledImage, LabelledImages,
+    ListCursor, OwnerGuard, MAX_IMAGE_REMOVAL_BATCH, MAX_LABELLED_IMAGES,
+};
+
+/// The image label naming the Temps install that built an image (see
+/// `temps_docker_housekeeping::services::image_ownership`). A node lists
+/// images by it and [`IMAGE_PROJECT_LABEL`]:
+/// [`ContainerDeployer::list_owned_images`].
+pub const IMAGE_OWNER_LABEL: &str = "sh.temps.image.instance";
+
+/// The image label naming the project an image was built for, local to the
+/// install named by [`IMAGE_OWNER_LABEL`].
+pub const IMAGE_PROJECT_LABEL: &str = "sh.temps.image.project_id";
+
 /// Backpressure-aware byte stream used when importing an OCI image.
 ///
 /// Keeping this at the trait boundary lets remote agents forward an upload
@@ -287,6 +302,24 @@ pub enum DeployerError {
     #[error("Other error: {0}")]
     Other(String),
 
+    /// Images on `location` could not be checked or removed, as a worker
+    /// node's agent reported it (its answer is all there is to keep).
+    /// Nothing is removed when this is returned: per-image failures are
+    /// reported in the outcomes instead.
+    #[error("Cannot remove images on {location}: {reason}")]
+    ImageRemoval { location: String, reason: String },
+
+    /// The Docker daemon at `location` failed to `operation`, with its
+    /// error kept whole. Nothing is removed when this is returned.
+    #[error("Cannot {operation} on {location}: {source}")]
+    ImageInventory {
+        location: String,
+        operation: &'static str,
+        /// Boxed: the Docker error is large and this variant is rare.
+        #[source]
+        source: Box<temps_docker_util::DockerUtilError>,
+    },
+
     /// The local Docker daemon is unavailable in this process. Returned when
     /// a deployment is requested on a control-plane node that runs no
     /// workloads; applications must be deployed on worker nodes joined with
@@ -325,6 +358,12 @@ pub struct BuildRequest {
     pub build_args_buildkit: HashMap<String, String>,
     pub platform: Option<String>,
     pub log_path: PathBuf,
+    /// Labels to stamp on the built image, on top of `built-by=temps`. Temps
+    /// records which install, project and deployment built it here
+    /// (`sh.temps.image.*`), so housekeeping can tell its own images from anyone
+    /// else's after the database rows that named them are gone.
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
     /// Values served to the Dockerfile's `RUN --mount=type=secret` steps. Never
     /// serialized, so they cannot travel over the worker build protocol.
     ///
@@ -1330,6 +1369,46 @@ pub trait ContainerDeployer: Send + Sync {
     async fn image_exists(&self, _image_name: &str) -> Result<bool, DeployerError> {
         Ok(true)
     }
+
+    /// Remove each requested image that no container on this runtime uses,
+    /// running or stopped, judged by image ID (see
+    /// [`temps_docker_util::image_removal`]). One outcome per request, in
+    /// order; at most [`MAX_IMAGE_REMOVAL_BATCH`] requests per call.
+    ///
+    /// A request whose image or containers cannot be read is reported
+    /// `Failed` in its outcome and nothing is removed for it. The call fails
+    /// as a whole, removing nothing, only when the runtime cannot be reached,
+    /// the batch is too large, or the runtime cannot remove images at all,
+    /// which is what this default says.
+    async fn remove_unused_images(
+        &self,
+        _requests: &[ImageRemovalRequest],
+    ) -> Result<Vec<ImageRemovalOutcome>, DeployerError> {
+        Err(DeployerError::ImageRemoval {
+            location: "this container runtime".to_string(),
+            reason: "it does not support removing images".to_string(),
+        })
+    }
+
+    /// The images on this runtime that the Temps install `owner` built for
+    /// its project `project_id` (labelled [`IMAGE_OWNER_LABEL`]`=owner` and
+    /// [`IMAGE_PROJECT_LABEL`]`=project_id`) after `after`, oldest first and
+    /// bounded by [`MAX_LABELLED_IMAGES`], with where the next page starts,
+    /// each with a container created from it if there is one. Only labels
+    /// under the image ownership prefix are kept. Asking for one project's
+    /// images keeps the daemon's answer, which Docker cannot limit, to that
+    /// project. This default says the runtime cannot list images.
+    async fn list_owned_images(
+        &self,
+        _owner: &str,
+        _project_id: i32,
+        _after: Option<&ListCursor>,
+    ) -> Result<LabelledImages, DeployerError> {
+        Err(DeployerError::ImageRemoval {
+            location: "this container runtime".to_string(),
+            reason: "it does not support listing images".to_string(),
+        })
+    }
 }
 
 /// Combined trait for both building and deploying
@@ -1677,6 +1756,7 @@ mod tests {
         build_args.insert("ENV".to_string(), "production".to_string());
 
         let request = BuildRequest {
+            labels: Default::default(),
             build_secrets: Default::default(),
             cache_from: Vec::new(),
             image_name: "test-image:latest".to_string(),
@@ -1912,6 +1992,7 @@ mod tests {
     #[test]
     fn test_serde_serialization() {
         let request = BuildRequest {
+            labels: Default::default(),
             build_secrets: Default::default(),
             cache_from: Vec::new(),
             image_name: "test:latest".to_string(),
@@ -1985,6 +2066,7 @@ CMD ["echo", "Hello from container"]
         build_args.insert("RUST_VERSION".to_string(), "1.70".to_string());
 
         let request = BuildRequest {
+            labels: Default::default(),
             build_secrets: Default::default(),
             cache_from: Vec::new(),
             image_name: "test-app:v1.0".to_string(),
@@ -2255,6 +2337,7 @@ CMD ["echo", "Hello from container"]
     #[test]
     fn build_secrets_never_reach_debug_output_or_the_wire() {
         let request = BuildRequest {
+            labels: Default::default(),
             build_secrets: BuildSecrets::new(
                 [("API_KEY".to_string(), "secret-value-1725".to_string())].into(),
             ),

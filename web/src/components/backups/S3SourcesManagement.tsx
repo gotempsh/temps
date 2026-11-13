@@ -4,11 +4,16 @@
 'use client'
 
 import { Checkbox } from '@/components/ui/checkbox'
+import {
+  S3EndpointPreviewLine,
+  S3PathStyleField,
+} from '@/components/backups/S3EndpointHints'
 import { PageHeader } from '@/components/layout/PageContainer'
 
 import {
   deleteS3SourceMutation,
   listS3SourcesOptions,
+  listS3SourcesQueryKey,
   runBackupForSourceMutation,
   updateS3SourceMutation,
 } from '@/api/client/@tanstack/react-query.gen'
@@ -17,6 +22,8 @@ import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { CreateActionButton } from '@/components/ui/create-action-button'
+import { RefreshButton } from '@/components/ui/refresh-button'
+import { queryKeyPrefix } from '@/lib/refresh'
 import {
   Dialog,
   DialogContent,
@@ -149,26 +156,17 @@ function S3SourceForm({
               setFormData({ ...formData, endpoint: e.target.value })
             }
           />
+          <S3EndpointPreviewLine endpoint={formData.endpoint} />
         </div>
         <div className="grid gap-2">
-          <Label
-            htmlFor="forcePathStyle"
-            className="flex items-center space-x-2"
-          >
-            <Checkbox
-              id="forcePathStyle"
-              checked={formData.force_path_style || false}
-              onCheckedChange={(checked) =>
-                setFormData({ ...formData, force_path_style: checked === true })
-              }
-            />
-            <div>
-              <span>Force Path Style</span>
-              <p className="text-xs text-muted-foreground">
-                Enable for RustFS/MinIO compatibility
-              </p>
-            </div>
-          </Label>
+          <S3PathStyleField
+            id="forcePathStyle"
+            endpoint={formData.endpoint}
+            checked={formData.force_path_style || false}
+            onCheckedChange={(checked) =>
+              setFormData({ ...formData, force_path_style: checked })
+            }
+          />
         </div>
         <div className="grid gap-2">
           <Label
@@ -376,13 +374,18 @@ export function S3SourcesManagement() {
         title="Backups"
         description="Configure where backups and WAL archives are stored"
         actions={
-          shouldShowS3SourceHeaderAction(isLoading, sources.length) ? (
-            <CreateActionButton
-              to="/backups/s3-sources/new"
-              label="Add S3 source"
-              className="w-full sm:w-auto"
+          <>
+            <RefreshButton
+              queryKeys={[queryKeyPrefix(listS3SourcesQueryKey)]}
             />
-          ) : null
+            {shouldShowS3SourceHeaderAction(isLoading, sources.length) ? (
+              <CreateActionButton
+                to="/backups/s3-sources/new"
+                label="Add S3 source"
+                className="w-full sm:w-auto"
+              />
+            ) : null}
+          </>
         }
       />
 

@@ -306,7 +306,7 @@ async fn physical_backup_on_this_host(
         endpoint: s3_source.endpoint.clone(),
         bucket_name: s3_source.bucket_name.clone(),
         bucket_path: s3_source.bucket_path.clone(),
-        force_path_style: s3_source.force_path_style.unwrap_or(true),
+        force_path_style: s3_source.effective_path_style(true).force_path_style,
     };
     node_half::physical_backup(
         docker,

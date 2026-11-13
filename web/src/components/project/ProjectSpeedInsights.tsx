@@ -9,11 +9,16 @@ import { ProjectResponse } from '@/api/client'
 import {
   getEnvironmentsOptions,
   getGroupedPageMetricsOptions,
+  getGroupedPageMetricsQueryKey,
   getMetricsOverTimeOptions,
+  getMetricsOverTimeQueryKey,
   hasPerformanceMetricsOptions,
+  hasPerformanceMetricsQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
+import { RefreshButton } from '@/components/ui/refresh-button'
+import { queryKeyPrefix } from '@/lib/refresh'
 import {
   Card,
   CardContent,
@@ -60,13 +65,13 @@ import {
   Code2,
   Info,
   Monitor,
-  RefreshCw,
   Smartphone,
   X,
   Zap,
 } from 'lucide-react'
-import { useMemo, useState } from 'react'
+import { useMemo, useReducer, useState } from 'react'
 import { Link } from 'react-router'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 type MetricKey = 'lcp' | 'inp' | 'cls' | 'ttfb' | 'fcp'
 
@@ -361,7 +366,7 @@ function SpeedBreakdownCard({
   const [sortKey, setSortKey] = useState<BreakdownSortKey>('events')
   const [sortDirection, setSortDirection] = useState<SortDirection>('desc')
 
-  const { data, isLoading, isError } = useQuery({
+  const { data, isLoading, isError } = useWindowQuery({
     ...getGroupedPageMetricsOptions({
       query: {
         start_date: startDate,
@@ -578,7 +583,13 @@ export function ProjectSpeedInsights({ project }: ProjectSpeedInsightsProps) {
   const effectiveEnvironment =
     selectedEnvironment ?? environmentsData?.[0]?.id ?? null
 
-  const window = useMemo(() => resolveTimeRange(timeRange), [timeRange])
+  // A preset ("last 24 hours") is resolved against now; Refresh resolves it
+  // again so the refetch asks for the window that ends now.
+  const [windowMoves, moveWindow] = useReducer((n: number) => n + 1, 0)
+  const window = useMemo(() => {
+    void windowMoves
+    return resolveTimeRange(timeRange)
+  }, [timeRange, windowMoves])
   const startDate = window.from
   const endDate = window.to
 
@@ -592,8 +603,7 @@ export function ProjectSpeedInsights({ project }: ProjectSpeedInsightsProps) {
     data: metrics,
     isLoading,
     error,
-    refetch,
-  } = useQuery({
+  } = useWindowQuery({
     ...getMetricsOverTimeOptions({
       query: {
         start_date: startDate,
@@ -845,18 +855,20 @@ export function ProjectSpeedInsights({ project }: ProjectSpeedInsightsProps) {
               </SelectContent>
             </Select>
 
-            <Button
-              aria-label="Refresh"
-              variant="outline"
-              size="sm"
-              className="h-8"
-              onClick={() => refetch()}
-              disabled={isLoading}
-            >
-              <RefreshCw
-                className={cn('h-3.5 w-3.5', isLoading && 'animate-spin')}
-              />
-            </Button>
+            <RefreshButton
+              queryKeys={[
+                queryKeyPrefix(hasPerformanceMetricsQueryKey, {
+                  query: { project_id: project.id },
+                }),
+                queryKeyPrefix(getMetricsOverTimeQueryKey, {
+                  query: { project_id: project.id },
+                }),
+                queryKeyPrefix(getGroupedPageMetricsQueryKey, {
+                  query: { project_id: project.id },
+                }),
+              ]}
+              onRefresh={moveWindow}
+            />
           </div>
         }
       />

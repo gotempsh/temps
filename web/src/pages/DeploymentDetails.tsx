@@ -7,8 +7,10 @@ import {
   deployFromImageMutation,
   deployFromStaticMutation,
   getDeploymentOptions,
+  getDeploymentQueryKey,
   getFailureReportPreviewOptions,
   getDeploymentJobsOptions,
+  getDeploymentJobsQueryKey,
   pauseDeploymentMutation,
   resumeDeploymentMutation,
   rollbackToDeploymentMutation,
@@ -24,6 +26,7 @@ import { RollbackToLastSuccessful } from '@/components/deployments/RollbackToLas
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
+import { RefreshButton } from '@/components/ui/refresh-button'
 import { CopyButton } from '@/components/ui/copy-button'
 import {
   Dialog,
@@ -988,6 +991,10 @@ function DeploymentHeader({
   const shortHash = deployment.commit_hash?.slice(0, 7)
   const firstLine = deployment.commit_message?.split('\n')[0]
   const hasCommit = Boolean(shortHash || firstLine || deployment.branch)
+  const deploymentPath = {
+    project_id: project.id,
+    deployment_id: deployment.id,
+  }
   return (
     <div className="flex flex-col gap-3 border-b border-gray-950/10 dark:border-white/10 pb-5 sm:flex-row sm:items-center sm:justify-between">
       <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-3 gap-y-2 sm:flex-nowrap">
@@ -1060,6 +1067,12 @@ function DeploymentHeader({
         )}
       </div>
       <div className="flex shrink-0 items-center gap-2">
+        <RefreshButton
+          queryKeys={[
+            getDeploymentQueryKey({ path: deploymentPath }),
+            getDeploymentJobsQueryKey({ path: deploymentPath }),
+          ]}
+        />
         {wasDeployed && primaryUrl && <VisitButton url={primaryUrl} />}
         <SecondaryActions deployment={deployment} actions={actions} />
       </div>

@@ -23,8 +23,11 @@ import {
 } from '@/lib/attribute-facets'
 import { RecordLink, RecordRow } from '@temps-sdk/ds'
 import { Link } from 'react-router'
-import { useQuery } from '@tanstack/react-query'
-import { queryGlobalTraceSummariesOptions } from '@/api/client/@tanstack/react-query.gen'
+import {
+  queryGlobalTraceSummariesOptions,
+  queryGlobalTraceSummariesQueryKey,
+} from '@/api/client/@tanstack/react-query.gen'
+import { queryKeyPrefix } from '@/lib/refresh'
 import {
   GlobalPage,
   GlobalPagination,
@@ -43,6 +46,8 @@ import { Badge } from '@/components/ui/badge'
 import { SortableTableHead } from '@/components/ui/sortable-table-head'
 import { TimeAgo } from '@/components/utils/TimeAgo'
 import { OBSERVABILITY_PAGE_SIZE } from '@/lib/global-observability'
+import { useGlobalPageInRange } from '@/hooks/useGlobalView'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 export default function GlobalTraces() {
   const view = useGlobalView()
@@ -104,7 +109,7 @@ export default function GlobalTraces() {
     urlValue,
     patchView,
   ])
-  const query = useQuery({
+  const query = useWindowQuery({
     ...queryGlobalTraceSummariesOptions({
       query: {
         project_id: view.projectId,
@@ -125,6 +130,12 @@ export default function GlobalTraces() {
     <ServiceIcon service={{ id, name }} size="sm" />
   )
   const traces = query.data?.data ?? []
+  useGlobalPageInRange(
+    view,
+    query.data && !query.isPlaceholderData
+      ? { rows: traces.length, total: query.data.total }
+      : undefined
+  )
   // Bars compare traces on this page, so the slowest one fills its track.
   const slowestMs = Math.max(0, ...traces.map((trace) => trace.duration_ms))
   return (
@@ -132,8 +143,7 @@ export default function GlobalTraces() {
       title="Traces"
       description="Follow requests across services."
       view={view}
-      fetching={query.isFetching}
-      refresh={() => void query.refetch()}
+      refreshQueryKeys={[queryKeyPrefix(queryGlobalTraceSummariesQueryKey)]}
       searchLabel="Search span names"
       filterNotice={attribute.notice}
       filters={

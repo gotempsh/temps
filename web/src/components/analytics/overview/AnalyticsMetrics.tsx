@@ -7,7 +7,8 @@ import { Button } from '@/components/ui/button'
 import { getUniqueCountsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { ProjectResponse } from '@/api/client/types.gen'
 
-import { useQuery } from '@tanstack/react-query'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
+import { sameWindow } from '@/lib/refresh'
 
 interface AnalyticsMetricsProps {
   project: ProjectResponse
@@ -23,23 +24,24 @@ export function AnalyticsMetrics({
   environment,
 }: AnalyticsMetricsProps) {
   // Fetch unique visitors
-  const visitorsQuery = useQuery({
-    ...getUniqueCountsOptions({
-      path: {
-        project_id: project.id,
-      },
-      query: {
-        start_date: startDate ? startDate.toISOString() : '',
-        end_date: endDate ? endDate.toISOString() : '',
-        environment_id: environment,
-        metric: 'visitors',
-      },
-    }),
+  const visitorsOptions = getUniqueCountsOptions({
+    path: {
+      project_id: project.id,
+    },
+    query: {
+      start_date: startDate ? startDate.toISOString() : '',
+      end_date: endDate ? endDate.toISOString() : '',
+      environment_id: environment,
+      metric: 'visitors',
+    },
+  })
+  const visitorsQuery = useWindowQuery({
+    ...visitorsOptions,
     enabled: !!startDate && !!endDate,
   })
 
   // Fetch unique sessions
-  const sessionsQuery = useQuery({
+  const sessionsQuery = useWindowQuery({
     ...getUniqueCountsOptions({
       path: {
         project_id: project.id,
@@ -55,23 +57,24 @@ export function AnalyticsMetrics({
   })
 
   // Fetch visitors who were seen before the selected range
-  const returningVisitorsQuery = useQuery({
-    ...getUniqueCountsOptions({
-      path: {
-        project_id: project.id,
-      },
-      query: {
-        start_date: startDate ? startDate.toISOString() : '',
-        end_date: endDate ? endDate.toISOString() : '',
-        environment_id: environment,
-        metric: 'returning_visitors',
-      },
-    }),
+  const returningVisitorsOptions = getUniqueCountsOptions({
+    path: {
+      project_id: project.id,
+    },
+    query: {
+      start_date: startDate ? startDate.toISOString() : '',
+      end_date: endDate ? endDate.toISOString() : '',
+      environment_id: environment,
+      metric: 'returning_visitors',
+    },
+  })
+  const returningVisitorsQuery = useWindowQuery({
+    ...returningVisitorsOptions,
     enabled: !!startDate && !!endDate,
   })
 
   // Fetch unique paths
-  const pathsQuery = useQuery({
+  const pathsQuery = useWindowQuery({
     ...getUniqueCountsOptions({
       path: {
         project_id: project.id,
@@ -99,8 +102,14 @@ export function AnalyticsMetrics({
 
   const uniqueVisitors = visitorsQuery.data?.count ?? 0
   const returningVisitors = returningVisitorsQuery.data?.count ?? 0
-  const returningPercentage =
-    uniqueVisitors > 0
+  // A share of one window's visitors, never the new window's returning
+  // visitors over the previous window's visitors while they load.
+  const returningPercentage = !sameWindow(
+    [visitorsOptions.queryKey, visitorsQuery],
+    [returningVisitorsOptions.queryKey, returningVisitorsQuery]
+  )
+    ? undefined
+    : uniqueVisitors > 0
       ? Math.round((returningVisitors / uniqueVisitors) * 100)
       : 0
 

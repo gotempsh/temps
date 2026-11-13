@@ -3,14 +3,18 @@
 
 'use client'
 
+import { describePathStyleReason } from '@/lib/s3-endpoint'
 import {
   deleteBackupScheduleMutation,
   disableBackupScheduleMutation,
   enableBackupScheduleMutation,
   getBackupOptions,
   getS3SourceOptions,
+  getS3SourceQueryKey,
   listBackupSchedulesOptions,
+  listBackupSchedulesQueryKey,
   listSourceBackupsOptions,
+  listSourceBackupsQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
 import {
   BackupScheduleResponse,
@@ -33,6 +37,8 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { EmptyState } from '@/components/ui/empty-state'
+import { RefreshButton } from '@/components/ui/refresh-button'
+import { queryKeyPrefix } from '@/lib/refresh'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
   Table,
@@ -495,6 +501,13 @@ export function S3SourceDetail() {
       title={source.name}
       actions={
         <>
+          <RefreshButton
+            queryKeys={[
+              getS3SourceQueryKey({ path: { id: sourceId! } }),
+              listSourceBackupsQueryKey({ path: { id: sourceId! } }),
+              queryKeyPrefix(listBackupSchedulesQueryKey),
+            ]}
+          />
           {backAction}
           <Button
             variant="outline"
@@ -1008,7 +1021,7 @@ export function S3SourceDetail() {
                     Endpoint URL
                   </dt>
                   <dd className="break-all text-base sm:text-sm">
-                    {source.endpoint}
+                    {source.effective_endpoint ?? source.endpoint}
                   </dd>
                 </div>
               )}
@@ -1016,12 +1029,21 @@ export function S3SourceDetail() {
                 <dt className="text-base font-medium text-muted-foreground sm:text-sm">
                   Force path style
                 </dt>
-                <dd className="text-base sm:text-sm">
+                <dd className="space-y-1 text-base sm:text-sm">
                   <Badge
-                    variant={source.force_path_style ? 'default' : 'secondary'}
+                    variant={
+                      source.effective_force_path_style
+                        ? 'default'
+                        : 'secondary'
+                    }
                   >
-                    {source.force_path_style ? 'Enabled' : 'Disabled'}
+                    {source.effective_force_path_style ? 'Enabled' : 'Disabled'}
                   </Badge>
+                  {source.path_style_reason !== 'configured' && (
+                    <p className="text-xs text-muted-foreground">
+                      {describePathStyleReason(source.path_style_reason)}
+                    </p>
+                  )}
                 </dd>
               </div>
               <WorkerCredentialsFact source={source} />

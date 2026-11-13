@@ -124,6 +124,89 @@ pub trait ProjectArchiveCleaner: Send + Sync {
     ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>>;
 }
 
+/// An image a project's builds recorded producing: the `image_tag` (and
+/// `image_id`, when recorded) of a successful `BuildImageJob`, the same
+/// record image retention trusts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectImage {
+    pub reference: String,
+    pub image_id: Option<String>,
+}
+
+/// What deleting a project will try to remove from its runtimes, read while
+/// its build records still exist (they go with the project row).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProjectImagePlan {
+    pub project_id: i32,
+    /// The project's built images that no other project references.
+    pub images: Vec<ProjectImage>,
+    /// Runtimes that may hold them and can be reached: `None` is this host,
+    /// `Some(id)` a worker node (active, draining or drained) that built them
+    /// or ran the project's containers.
+    pub nodes: Vec<Option<i32>>,
+    /// Worker nodes that may hold them but are not reachable now (offline,
+    /// pending): not contacted, so a down node cannot hold the deletion
+    /// open. Their copies stay labelled for the nightly sweep, which covers
+    /// the node once it is reachable again.
+    pub offline_nodes: Vec<i32>,
+    /// References kept because a deployment of another project names the
+    /// same tag or image ID.
+    pub shared: Vec<String>,
+}
+
+/// What [`ProjectImageCleaner::remove_project_images`] did. Counts are per
+/// image per runtime; an image a runtime never had is not counted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct ProjectImageCleanupReport {
+    pub removed: u64,
+    /// Kept for safety: shared with another project, used by a container,
+    /// the tag now naming another image, or refused by Docker.
+    pub skipped: u64,
+    /// Removals that failed on a runtime that answered.
+    pub failed: u64,
+    /// Runtimes that could not be asked at all (unreachable node, agent too
+    /// old to remove images); their copies stay on that host.
+    pub unreachable_runtimes: u64,
+}
+
+/// Why the images built for a project could not be read before deleting it.
+#[derive(Debug, Error)]
+pub enum ProjectImageCleanupError {
+    /// The source is the implementation's own error (a database error), kept
+    /// whole rather than flattened, behind a box so this crate does not
+    /// depend on the database layer.
+    #[error(
+        "Failed to read the images built for project {project_id} before deleting it: {source}"
+    )]
+    Plan {
+        project_id: i32,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+}
+
+/// Removes the images built for a project when it is deleted. Implemented by
+/// `temps-deployments`, consumed through the service registry like
+/// [`DeploymentContainerCleaner`].
+///
+/// Best-effort by design: [`Self::remove_project_images`] cannot fail, so an
+/// image that cannot be removed never blocks or rolls back a deletion.
+/// Anything left behind is labelled with its project and is removed by the
+/// nightly sweep of images whose project no longer exists.
+#[async_trait]
+pub trait ProjectImageCleaner: Send + Sync {
+    /// Read the project's built images and the runtimes holding them. Call
+    /// before the project row is deleted: the records cascade away with it.
+    async fn plan_project_image_cleanup(
+        &self,
+        project_id: i32,
+    ) -> Result<ProjectImagePlan, ProjectImageCleanupError>;
+
+    /// Remove the planned images from each runtime, each only if no
+    /// container there was created from it. Logs every image kept or failed.
+    async fn remove_project_images(&self, plan: &ProjectImagePlan) -> ProjectImageCleanupReport;
+}
+
 /// The result of a [`DeploymentGate`] check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GateDecision {
