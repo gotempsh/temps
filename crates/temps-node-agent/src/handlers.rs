@@ -401,6 +401,7 @@ fn container_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
         | temps_deployer::DeployerError::ResourceAllocationFailed(_)
         | temps_deployer::DeployerError::SecretMountFailed { .. }
         | temps_deployer::DeployerError::ImageRemoval { .. }
+        | temps_deployer::DeployerError::ImageInventory { .. }
         | temps_deployer::DeployerError::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
         // DockerUnavailable is returned when the control-plane node has no
         // Docker daemon; the caller should direct traffic to a worker node.

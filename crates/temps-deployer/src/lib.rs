@@ -302,16 +302,28 @@ pub enum DeployerError {
     #[error("Other error: {0}")]
     Other(String),
 
+    /// Images on `location` could not be checked or removed, as a worker
+    /// node's agent reported it (its answer is all there is to keep).
+    /// Nothing is removed when this is returned: per-image failures are
+    /// reported in the outcomes instead.
+    #[error("Cannot remove images on {location}: {reason}")]
+    ImageRemoval { location: String, reason: String },
+
+    /// The Docker daemon at `location` failed to `operation`, with its
+    /// error kept whole. Nothing is removed when this is returned.
+    #[error("Cannot {operation} on {location}: {source}")]
+    ImageInventory {
+        location: String,
+        operation: &'static str,
+        /// Boxed: the Docker error is large and this variant is rare.
+        #[source]
+        source: Box<temps_docker_util::DockerUtilError>,
+    },
+
     /// The local Docker daemon is unavailable in this process. Returned when
     /// a deployment is requested on a control-plane node that runs no
     /// workloads; applications must be deployed on worker nodes joined with
     /// `temps join`.
-    /// Images on `location` could not be checked or removed. Nothing is
-    /// removed when this is returned: per-image failures are reported in the
-    /// outcomes instead.
-    #[error("Cannot remove images on {location}: {reason}")]
-    ImageRemoval { location: String, reason: String },
-
     #[error(transparent)]
     DockerUnavailable(#[from] temps_core::DockerUnavailable),
 }

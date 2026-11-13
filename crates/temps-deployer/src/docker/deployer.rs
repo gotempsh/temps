@@ -1356,9 +1356,10 @@ impl ContainerDeployer for DockerRuntime {
         let docker = self.require_docker()?;
         temps_docker_util::remove_unused_images(&docker, requests)
             .await
-            .map_err(|error| DeployerError::ImageRemoval {
+            .map_err(|source| DeployerError::ImageInventory {
                 location: "the local Docker daemon".to_string(),
-                reason: error.to_string(),
+                operation: "remove images",
+                source: Box::new(source),
             })
     }
 
@@ -1381,9 +1382,10 @@ impl ContainerDeployer for DockerRuntime {
             after,
         )
         .await
-        .map_err(|error| DeployerError::ImageRemoval {
+        .map_err(|source| DeployerError::ImageInventory {
             location: "the local Docker daemon".to_string(),
-            reason: error.to_string(),
+            operation: "list a deleted project's images",
+            source: Box::new(source),
         })
     }
 }

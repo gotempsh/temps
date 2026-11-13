@@ -1219,3 +1219,48 @@ mod health_probe_docker_protocol_tests {
         server.abort();
     }
 }
+
+/// A Docker failure while listing or removing images keeps the daemon's own
+/// error as the source, rather than flattening it into text.
+#[tokio::test]
+async fn image_inventory_failures_keep_the_docker_error_as_their_source() {
+    use std::error::Error as _;
+    let docker =
+        bollard::Docker::connect_with_http("http://127.0.0.1:9", 5, bollard::API_DEFAULT_VERSION)
+            .unwrap();
+    let runtime = DockerRuntime::new(Arc::new(docker), false, "temps-test-network".to_string());
+
+    let listing =
+        crate::ContainerDeployer::list_owned_images(&runtime, "install-a.marker-b", 7, None)
+            .await
+            .expect_err("nothing listens on port 9");
+    let DeployerError::ImageInventory { source, .. } = &listing else {
+        panic!("expected an inventory error: {listing:?}");
+    };
+    assert!(
+        matches!(
+            **source,
+            temps_docker_util::DockerUtilError::ImageInventory { .. }
+        ),
+        "{source:?}"
+    );
+    assert!(
+        listing.source().and_then(|cause| cause.source()).is_some(),
+        "the Docker client's error is still in the chain: {listing:?}"
+    );
+
+    let too_many: Vec<crate::ImageRemovalRequest> = (0..=crate::MAX_IMAGE_REMOVAL_BATCH)
+        .map(|n| crate::ImageRemovalRequest::new(format!("app-{n}:latest"), None))
+        .collect();
+    let removal = crate::ContainerDeployer::remove_unused_images(&runtime, &too_many)
+        .await
+        .expect_err("over the batch limit");
+    assert!(
+        matches!(
+            &removal,
+            DeployerError::ImageInventory { source, .. }
+                if matches!(**source, temps_docker_util::DockerUtilError::ImageBatchTooLarge { .. })
+        ),
+        "{removal:?}"
+    );
+}
