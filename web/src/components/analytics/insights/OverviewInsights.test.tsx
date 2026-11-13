@@ -67,3 +67,56 @@ test('Ask AI waits while a moved window still shows the previous stats', async (
   releaseSessions?.()
   await waitFor(() => expect(askAi().hasAttribute('disabled')).toBe(false))
 })
+
+test("a moved window's visitors are never divided by the previous window's sessions", async () => {
+  mockApi({
+    'GET /projects/17/unique-counts': (request) => {
+      const query = new URL(request.url).searchParams
+      const isMoved = query.get('end_date') !== dayEnd.toISOString()
+      if (query.get('metric') === 'visitors')
+        return jsonResponse({ count: isMoved ? 300 : 100 })
+      // The moved window's sessions fail; the previous window had 200.
+      if (isMoved) return jsonResponse({ detail: 'unavailable' }, 503)
+      return jsonResponse({ count: 200 })
+    },
+    'GET /projects/17/hourly-visits': () => jsonResponse([]),
+    'GET /projects/17/events/properties/breakdown': () =>
+      jsonResponse({ items: [], property: 'channel', total: 0 }),
+  })
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  const view = (start: Date, end: Date) => (
+    <QueryClientProvider client={client}>
+      <AiAssistantContext.Provider
+        value={{ open: () => {} } as unknown as AiAssistantValue}
+      >
+        <OverviewInsights
+          project={project}
+          startDate={start}
+          endDate={end}
+          environment={undefined}
+        />
+      </AiAssistantContext.Provider>
+    </QueryClientProvider>
+  )
+  const { rerender } = render(view(dayStart, dayEnd))
+  await waitFor(() =>
+    expect(screen.getByText('Visitors come back for more.')).toBeTruthy()
+  )
+
+  moveWindows(() => rerender(view(moved(dayStart), moved(dayEnd))))
+
+  // 200 old sessions over 300 new visitors would read "one-and-done".
+  await waitFor(() =>
+    expect(screen.queryByText('Visitors come back for more.')).toBeNull()
+  )
+  await waitFor(() =>
+    expect(
+      client.getQueryCache().findAll({
+        predicate: (query) => query.state.status === 'error',
+      })
+    ).toHaveLength(1)
+  )
+  expect(screen.queryByText('Most visits are one-and-done.')).toBeNull()
+})

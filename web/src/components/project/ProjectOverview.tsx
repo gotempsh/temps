@@ -44,7 +44,7 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader } from '@/components/ui/card'
 import { RefreshButton } from '@/components/ui/refresh-button'
-import { queryKeyPrefix } from '@/lib/refresh'
+import { queryKeyPrefix, sameWindow } from '@/lib/refresh'
 import { Skeleton } from '@/components/ui/skeleton'
 import { TimeAgo } from '@/components/utils/TimeAgo'
 import { cn } from '@/lib/utils'
@@ -91,14 +91,15 @@ export function ProjectOverview({
     end_date: endDate.toISOString(),
   }
 
+  const visitorsOptions = getUniqueCountsOptions({
+    ...buildProjectAnalyticsCountRequest(
+      project.id,
+      analyticsWindow,
+      'visitors'
+    ),
+  })
   const visitorsQuery = useWindowQuery({
-    ...getUniqueCountsOptions({
-      ...buildProjectAnalyticsCountRequest(
-        project.id,
-        analyticsWindow,
-        'visitors'
-      ),
-    }),
+    ...visitorsOptions,
     enabled: analyticsEnabled,
   })
 
@@ -113,14 +114,15 @@ export function ProjectOverview({
     enabled: analyticsEnabled,
   })
 
+  const returningVisitorsOptions = getUniqueCountsOptions({
+    ...buildProjectAnalyticsCountRequest(
+      project.id,
+      analyticsWindow,
+      'returning_visitors'
+    ),
+  })
   const returningVisitorsQuery = useWindowQuery({
-    ...getUniqueCountsOptions({
-      ...buildProjectAnalyticsCountRequest(
-        project.id,
-        analyticsWindow,
-        'returning_visitors'
-      ),
-    }),
+    ...returningVisitorsOptions,
     enabled: analyticsEnabled,
   })
 
@@ -225,8 +227,16 @@ export function ProjectOverview({
   const recentErrors = recentErrorsQuery.data?.data ?? []
   const visitors = visitorsQuery.data?.count ?? 0
   const returningVisitors = returningVisitorsQuery.data?.count ?? 0
-  const returningVisitorRate =
-    visitors > 0 ? (returningVisitors / visitors) * 100 : 0
+  // A share of one window's visitors, never the new window's returning
+  // visitors over the previous window's visitors while they load.
+  const returningVisitorRate = !sameWindow(
+    [visitorsOptions.queryKey, visitorsQuery],
+    [returningVisitorsOptions.queryKey, returningVisitorsQuery]
+  )
+    ? undefined
+    : visitors > 0
+      ? (returningVisitors / visitors) * 100
+      : 0
 
   return (
     <>
@@ -457,7 +467,8 @@ export function VisitorAnalyticsCard({
   visitors: number
   pageViews: number
   returningVisitors: number
-  returningRate: number
+  /** Undefined while the two counts are of different windows. */
+  returningRate: number | undefined
   hourlyVisitors: EventTimeline[]
   loading: boolean
   error: boolean
@@ -550,7 +561,11 @@ export function VisitorAnalyticsCard({
               />
               <AnalyticsValue
                 label="Returning rate"
-                value={`${returningRate.toFixed(0)}%`}
+                value={
+                  returningRate === undefined
+                    ? '—'
+                    : `${returningRate.toFixed(0)}%`
+                }
               />
             </dl>
           </div>

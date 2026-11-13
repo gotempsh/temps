@@ -16,6 +16,7 @@ import {
   previousWindowQuery,
   queryKeyPrefix,
   recordWindowMove,
+  sameWindow,
 } from './refresh'
 
 describe('formatUpdatedAgo', () => {
@@ -189,6 +190,98 @@ describe('keepPreviousWindow', () => {
 
   test('has nothing to keep without a previous query', () => {
     expect(keepPreviousWindow(key(window))(rows, undefined)).toBeUndefined()
+  })
+})
+
+describe('sameWindow', () => {
+  const count = (metric: string, query: Record<string, string>) =>
+    [
+      {
+        _id: 'getUniqueCounts',
+        baseUrl: '',
+        path: { project_id: 7 },
+        query: { ...query, metric },
+      },
+    ] as const
+  const first = {
+    start_date: '2026-01-01T00:00:00Z',
+    end_date: '2026-01-02T00:00:00Z',
+  }
+  const second = {
+    start_date: '2026-01-01T00:05:00Z',
+    end_date: '2026-01-02T00:05:00Z',
+  }
+  const third = {
+    start_date: '2026-01-01T00:10:00Z',
+    end_date: '2026-01-02T00:10:00Z',
+  }
+  const loadedData = { data: { count: 1 }, isPlaceholderData: false }
+  const keptData = { data: { count: 1 }, isPlaceholderData: true }
+
+  /** A cache where both metrics loaded `first`, both moved to `second`. */
+  function movedOnce() {
+    const client = new QueryClient()
+    for (const metric of ['visitors', 'sessions'])
+      client.setQueryData(count(metric, first), { count: 1 })
+    const cache = client.getQueryCache()
+    for (const metric of ['visitors', 'sessions'])
+      recordWindowMove(cache, count(metric, first), count(metric, second))
+    return { client, cache }
+  }
+
+  test('holds for counts that loaded the same window', () => {
+    expect(
+      sameWindow(
+        [count('visitors', first), loadedData],
+        [count('sessions', first), loadedData]
+      )
+    ).toBe(true)
+  })
+
+  test('holds while both moved windows still show the previous one', () => {
+    movedOnce()
+    expect(
+      sameWindow(
+        [count('visitors', second), keptData],
+        [count('sessions', second), keptData]
+      )
+    ).toBe(true)
+  })
+
+  test('fails when one moved window loaded and the other shows the previous one', () => {
+    movedOnce()
+    expect(
+      sameWindow(
+        [count('visitors', second), loadedData],
+        [count('sessions', second), keptData]
+      )
+    ).toBe(false)
+  })
+
+  test('fails when both show earlier windows, but not the same one', () => {
+    const { client, cache } = movedOnce()
+    // Visitors loaded the second window; sessions failed it, then both moved.
+    client.setQueryData(count('visitors', second), { count: 1 })
+    for (const metric of ['visitors', 'sessions'])
+      recordWindowMove(cache, count(metric, second), count(metric, third))
+    expect(
+      sameWindow(
+        [count('visitors', third), keptData],
+        [count('sessions', third), keptData]
+      )
+    ).toBe(false)
+  })
+
+  test('fails while a count has no data', () => {
+    expect(
+      sameWindow(
+        [count('visitors', first), loadedData],
+        [
+          count('sessions', first),
+          { data: undefined, isPlaceholderData: false },
+        ]
+      )
+    ).toBe(false)
   })
 })
 

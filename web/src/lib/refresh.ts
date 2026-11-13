@@ -99,7 +99,7 @@ export function isMovingWindows(): boolean {
  * loads, and falls back to if it fails. Bounded: the oldest moves are
  * forgotten first.
  */
-const movedFrom = new Map<string, string>()
+const movedFrom = new Map<string, { hash: string; queryKey: QueryKey }>()
 const MOVES_REMEMBERED = 500
 
 /**
@@ -122,9 +122,9 @@ export function recordWindowMove(
   const fromHash = hashKey(from)
   const origin =
     queryCache.get(fromHash)?.state.data !== undefined
-      ? fromHash
+      ? { hash: fromHash, queryKey: from }
       : movedFrom.get(fromHash)
-  if (origin === undefined || origin === toHash) return
+  if (origin === undefined || origin.hash === toHash) return
   movedFrom.set(toHash, origin)
   if (movedFrom.size > MOVES_REMEMBERED) {
     const [oldest] = movedFrom.keys()
@@ -151,7 +151,7 @@ export function keepPreviousWindow(queryKey: QueryKey) {
     previousQuery?: { queryKey: QueryKey }
   ): T | undefined =>
     previousQuery !== undefined &&
-    movedFrom.get(current) === hashKey(previousQuery.queryKey)
+    movedFrom.get(current)?.hash === hashKey(previousQuery.queryKey)
       ? previous
       : undefined
 }
@@ -161,7 +161,7 @@ export function keepPreviousWindow(queryKey: QueryKey) {
  * or undefined when `queryKey` is not a moved window.
  */
 export function windowMovedFrom(queryKey: QueryKey): string | undefined {
-  return movedFrom.get(hashKey(queryKey))
+  return movedFrom.get(hashKey(queryKey))?.hash
 }
 
 /**
@@ -175,6 +175,46 @@ export function previousWindowQuery(
 ): Query | undefined {
   const from = movedFrom.get(hashKey(queryKey))
   if (from === undefined) return undefined
-  const query = queryCache.get(from)
+  const query = queryCache.get(from.hash)
   return query?.state.data === undefined ? undefined : query
+}
+
+/** A window query's key and what it shows: its data, and whether that data is an earlier window's. */
+export type WindowRead = readonly [
+  queryKey: QueryKey,
+  result: { data: unknown; isPlaceholderData: boolean },
+]
+
+/** The window parameters anywhere in `value`, as `[name, value]` pairs. */
+function windowParams(value: unknown, into: [string, unknown][] = []) {
+  if (Array.isArray(value)) value.forEach((entry) => windowParams(entry, into))
+  else if (value !== null && typeof value === 'object') {
+    for (const [key, entry] of Object.entries(value)) {
+      if (WINDOW_PARAMS.has(key)) into.push([key, entry])
+      else windowParams(entry, into)
+    }
+  }
+  return into
+}
+
+/** The window whose data a window query shows, or undefined without data. */
+function shownWindow([queryKey, result]: WindowRead): string | undefined {
+  if (result.data === undefined) return undefined
+  const shownKey = result.isPlaceholderData
+    ? movedFrom.get(hashKey(queryKey))?.queryKey
+    : queryKey
+  if (shownKey === undefined) return undefined
+  const params = windowParams(shownKey).sort(([a], [b]) => a.localeCompare(b))
+  return hashKey(params)
+}
+
+/**
+ * Whether window queries all show data of the same window. While moved
+ * windows load, or after one fails, each query shows its own last window
+ * that loaded, so a value computed from two of them (a ratio, a share) may
+ * pair counts of different windows: compute it only when this holds.
+ */
+export function sameWindow(...reads: WindowRead[]): boolean {
+  const [first, ...rest] = reads.map(shownWindow)
+  return first !== undefined && rest.every((window) => window === first)
 }

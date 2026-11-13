@@ -16,6 +16,7 @@ import {
 import { InsightsPanel } from './InsightsPanel'
 import type { AiInsightContext, Insight } from './types'
 import { useWindowQuery } from '@/hooks/useWindowQuery'
+import { sameWindow } from '@/lib/refresh'
 
 interface OverviewInsightsProps {
   project: ProjectResponse
@@ -46,20 +47,16 @@ export function OverviewInsights({
     environment_id: environment,
   }
 
-  const visitorsQuery = useWindowQuery({
-    ...getUniqueCountsOptions({
-      path: { project_id: project.id },
-      query: { ...baseQuery, metric: 'visitors' },
-    }),
-    enabled,
+  const visitorsOptions = getUniqueCountsOptions({
+    path: { project_id: project.id },
+    query: { ...baseQuery, metric: 'visitors' },
   })
-  const sessionsQuery = useWindowQuery({
-    ...getUniqueCountsOptions({
-      path: { project_id: project.id },
-      query: { ...baseQuery, metric: 'sessions' },
-    }),
-    enabled,
+  const visitorsQuery = useWindowQuery({ ...visitorsOptions, enabled })
+  const sessionsOptions = getUniqueCountsOptions({
+    path: { project_id: project.id },
+    query: { ...baseQuery, metric: 'sessions' },
   })
+  const sessionsQuery = useWindowQuery({ ...sessionsOptions, enabled })
   const hourlyQuery = useWindowQuery({
     ...getHourlyVisitsOptions({
       path: { project_id: project.id },
@@ -124,12 +121,21 @@ export function OverviewInsights({
     [countriesQuery.data]
   )
 
+  // Sessions per visitor only from counts of one window, never the new
+  // window's visitors over the previous window's sessions.
+  const countsShareWindow = sameWindow(
+    [visitorsOptions.queryKey, visitorsQuery],
+    [sessionsOptions.queryKey, sessionsQuery]
+  )
+
   const insights = useMemo<Insight[]>(() => {
     const timing = deriveTimingInsights(hourlyQuery.data ?? [], 'visitors')
-    const returnRate = deriveReturnRateInsight(
-      visitorsQuery.data?.count ?? 0,
-      sessionsQuery.data?.count ?? 0
-    )
+    const returnRate = countsShareWindow
+      ? deriveReturnRateInsight(
+          visitorsQuery.data?.count ?? 0,
+          sessionsQuery.data?.count ?? 0
+        )
+      : null
     const channels = deriveBreakdownInsights({
       rows: channelRows,
       singular: 'channel',
@@ -151,6 +157,7 @@ export function OverviewInsights({
     ].slice(0, MAX_OVERVIEW_INSIGHTS)
   }, [
     hourlyQuery.data,
+    countsShareWindow,
     visitorsQuery.data,
     sessionsQuery.data,
     channelRows,

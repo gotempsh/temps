@@ -8,6 +8,7 @@ import { getUniqueCountsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { ProjectResponse } from '@/api/client/types.gen'
 
 import { useWindowQuery } from '@/hooks/useWindowQuery'
+import { sameWindow } from '@/lib/refresh'
 
 interface AnalyticsMetricsProps {
   project: ProjectResponse
@@ -23,18 +24,19 @@ export function AnalyticsMetrics({
   environment,
 }: AnalyticsMetricsProps) {
   // Fetch unique visitors
+  const visitorsOptions = getUniqueCountsOptions({
+    path: {
+      project_id: project.id,
+    },
+    query: {
+      start_date: startDate ? startDate.toISOString() : '',
+      end_date: endDate ? endDate.toISOString() : '',
+      environment_id: environment,
+      metric: 'visitors',
+    },
+  })
   const visitorsQuery = useWindowQuery({
-    ...getUniqueCountsOptions({
-      path: {
-        project_id: project.id,
-      },
-      query: {
-        start_date: startDate ? startDate.toISOString() : '',
-        end_date: endDate ? endDate.toISOString() : '',
-        environment_id: environment,
-        metric: 'visitors',
-      },
-    }),
+    ...visitorsOptions,
     enabled: !!startDate && !!endDate,
   })
 
@@ -55,18 +57,19 @@ export function AnalyticsMetrics({
   })
 
   // Fetch visitors who were seen before the selected range
+  const returningVisitorsOptions = getUniqueCountsOptions({
+    path: {
+      project_id: project.id,
+    },
+    query: {
+      start_date: startDate ? startDate.toISOString() : '',
+      end_date: endDate ? endDate.toISOString() : '',
+      environment_id: environment,
+      metric: 'returning_visitors',
+    },
+  })
   const returningVisitorsQuery = useWindowQuery({
-    ...getUniqueCountsOptions({
-      path: {
-        project_id: project.id,
-      },
-      query: {
-        start_date: startDate ? startDate.toISOString() : '',
-        end_date: endDate ? endDate.toISOString() : '',
-        environment_id: environment,
-        metric: 'returning_visitors',
-      },
-    }),
+    ...returningVisitorsOptions,
     enabled: !!startDate && !!endDate,
   })
 
@@ -99,8 +102,14 @@ export function AnalyticsMetrics({
 
   const uniqueVisitors = visitorsQuery.data?.count ?? 0
   const returningVisitors = returningVisitorsQuery.data?.count ?? 0
-  const returningPercentage =
-    uniqueVisitors > 0
+  // A share of one window's visitors, never the new window's returning
+  // visitors over the previous window's visitors while they load.
+  const returningPercentage = !sameWindow(
+    [visitorsOptions.queryKey, visitorsQuery],
+    [returningVisitorsOptions.queryKey, returningVisitorsQuery]
+  )
+    ? undefined
+    : uniqueVisitors > 0
       ? Math.round((returningVisitors / uniqueVisitors) * 100)
       : 0
 
