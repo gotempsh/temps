@@ -1171,8 +1171,10 @@ impl ExternalServiceManager {
             })
             .await
             .map_err(ExternalServiceError::from)?;
-        // A later service that reuses the name must not inherit these.
+        // A later service that reuses the name must not inherit these, here
+        // or in another process.
         Self::forget_healthcheck_overrides(service_id).await;
+        self.notify_healthcheck_change(service_id).await;
 
         // Stop the per-cluster role reconciler before dropping its records,
         // otherwise a tick mid-deletion could re-write what we just removed.

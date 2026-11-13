@@ -37,6 +37,12 @@ impl Table {
 
     fn insert_service(&mut self, entry: ServiceHealthcheckEntry) {
         self.remove_service(entry.service_id);
+        // Container names are unique on a daemon: another service that held
+        // this one was deleted, maybe by another process, and its overrides
+        // must not reach the container of the service that now has it.
+        if let Some(container) = &entry.container_name {
+            self.by_container.remove(container);
+        }
         if entry.overrides.is_empty() {
             return;
         }
@@ -164,6 +170,24 @@ mod tests {
         table.remove_service(1);
         assert!(!table.by_container.contains_key("rustfs-a"));
         assert!(!table.by_service.contains_key(&1));
+    }
+
+    #[test]
+    fn a_service_that_reuses_a_container_name_does_not_inherit_its_overrides() {
+        let mut table = Table::default();
+        // Deleted by another process: this one still has it.
+        table.insert_service(entry(1, Some("redis-orders"), overrides(60)));
+        // A new service with the same name and no overrides of its own.
+        table.insert_service(entry(
+            2,
+            Some("redis-orders"),
+            HealthcheckOverrides::default(),
+        ));
+        assert!(!table.by_container.contains_key("redis-orders"));
+        // One with overrides of its own gets those.
+        table.insert_service(entry(1, Some("redis-orders"), overrides(60)));
+        table.insert_service(entry(3, Some("redis-orders"), overrides(90)));
+        assert_eq!(table.by_container.get("redis-orders"), Some(&3));
     }
 
     #[test]

@@ -130,9 +130,9 @@ impl TempsPlugin for ProvidersPlugin {
             // with, loaded before routes serve so no create races them. Also
             // on a process without local workloads: the workload specs of
             // worker databases are computed here. Reads only rows with an
-            // override, so a default install reads none. Reloaded
-            // periodically after that, so what another process sharing the
-            // database saves reaches the containers this one creates.
+            // override, so a default install reads none. Kept current after
+            // that, so what another process sharing the database saves
+            // reaches the containers this one creates.
             let healthcheck_defaults = Arc::new(crate::services::HealthcheckDefaultsService::new(
                 context.require_service::<temps_config::ConfigService>(),
                 external_service_manager.clone(),
@@ -147,7 +147,7 @@ impl TempsPlugin for ProvidersPlugin {
                      use the instance default until the next refresh"
                 ),
             }
-            healthcheck_defaults.spawn_registry_refresh();
+            healthcheck_defaults.spawn_registry_sync();
             context.register_service(healthcheck_defaults);
 
             if !local_workloads.local_workloads_enabled() {

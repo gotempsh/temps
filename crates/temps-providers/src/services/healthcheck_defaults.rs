@@ -8,7 +8,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use sqlx::postgres::PgListener;
 
 use serde::Serialize;
 use temps_config::{ConfigService, ManagedServiceHealthcheckSettings};
@@ -16,10 +16,10 @@ use temps_providers_core::externalsvc::recreate_guard::ManagedEngine;
 use temps_providers_core::healthcheck::{
     self, registry, HealthcheckOverrides, HealthcheckTimings, ResolvedHealthcheck,
 };
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use utoipa::ToSchema;
 
-use super::manager::HEALTHCHECK_WRITES;
+use super::manager::{HEALTHCHECK_CHANNEL, HEALTHCHECK_WRITES};
 use super::{ExternalServiceError, ExternalServiceManager};
 
 /// Every engine whose containers get a Temps-built healthcheck.
@@ -127,21 +127,9 @@ pub fn validate_instance_default(
     Ok(())
 }
 
-/// How often [`HealthcheckDefaultsService::spawn_registry_refresh`] reads
-/// what changed into this process's registry. A save publishes to the
-/// registry of the process that made it; another process sharing the
-/// database gets it within this long.
-pub const REGISTRY_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
-
-/// How far before the previous pass each pass looks back, so a row whose
-/// `updated_at` came from a process with a slower clock, or from a
-/// transaction that committed late, is still read.
-const REGISTRY_CHANGE_OVERLAP: Duration = Duration::from_secs(60);
-
-/// Every this many passes, reload the registry in full instead: a deleted
-/// service leaves no row to see, and a write that did not bump `updated_at`
-/// is caught here (every 10 minutes).
-const REGISTRY_RECOVERY_PASSES: u32 = 20;
+/// How long the listener for other processes' healthcheck changes waits
+/// before connecting again after it lost (or could not open) its connection.
+const LISTENER_RETRY: Duration = Duration::from_secs(10);
 
 /// Reads and writes the instance default.
 pub struct HealthcheckDefaultsService {
@@ -237,54 +225,126 @@ impl HealthcheckDefaultsService {
         self.services.load_healthcheck_registry(instance).await
     }
 
-    /// Publish the saved instance default (a cached settings read) and the
-    /// overrides of every service row updated after `since`. Under
-    /// [`HEALTHCHECK_WRITES`], like [`Self::reload_registry`].
-    pub async fn reload_registry_changes(
+    /// Reload the one service a notification on [`HEALTHCHECK_CHANNEL`]
+    /// names. A payload that is not a service id is logged and ignored.
+    pub async fn handle_registry_notification(
         &self,
-        since: DateTime<Utc>,
-    ) -> Result<usize, ExternalServiceError> {
+        payload: &str,
+    ) -> Result<(), ExternalServiceError> {
+        let Ok(service_id) = payload.parse::<i32>() else {
+            warn!(
+                payload,
+                "Ignoring a healthcheck change notification that names no service id"
+            );
+            return Ok(());
+        };
         let _writes = HEALTHCHECK_WRITES.lock().await;
-        registry::set_instance_default(self.saved_instance_default().await);
-        self.services.publish_healthcheck_changes_since(since).await
+        self.services.reload_service_healthcheck(service_id).await
     }
 
-    /// Keep the registry current for the life of the process. Every
-    /// [`REGISTRY_REFRESH_INTERVAL`] a pass reads only the service rows
-    /// updated since the previous one, so an idle instance reads none; every
-    /// [`REGISTRY_RECOVERY_PASSES`]th pass reloads in full, for deletions.
-    /// A failed pass is logged, and the next one looks back to the last
-    /// pass that succeeded.
-    pub fn spawn_registry_refresh(self: &Arc<Self>) {
+    /// Keep the registry current with what other processes save, for the
+    /// life of the process. Nothing is polled:
+    ///
+    /// - the instance default arrives through
+    ///   [`ConfigService::subscribe_managed_service_healthchecks`], fed by
+    ///   the settings `NOTIFY` listener;
+    /// - a service's overrides, rename or deletion arrive as its id on
+    ///   [`HEALTHCHECK_CHANNEL`], and only that service is read again. The
+    ///   listener reloads everything each time it (re)subscribes, since a
+    ///   change sent while it was not listening is not delivered again.
+    pub fn spawn_registry_sync(self: &Arc<Self>) {
         let service = Arc::clone(self);
+        let mut defaults = self.config.subscribe_managed_service_healthchecks();
         tokio::spawn(async move {
-            let mut ticks = tokio::time::interval(REGISTRY_REFRESH_INTERVAL);
-            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            // The first tick completes at once; startup has just loaded it.
-            ticks.tick().await;
-            let overlap = chrono::Duration::from_std(REGISTRY_CHANGE_OVERLAP)
-                .unwrap_or_else(|_| chrono::Duration::seconds(60));
-            let mut since = Utc::now() - overlap;
-            let mut passes: u32 = 0;
-            loop {
-                ticks.tick().await;
-                passes = passes.wrapping_add(1);
-                let started = Utc::now();
-                let result = if passes.is_multiple_of(REGISTRY_RECOVERY_PASSES) {
-                    service.reload_registry().await
-                } else {
-                    service.reload_registry_changes(since).await
-                };
-                match result {
-                    Ok(_) => since = started - overlap,
-                    Err(error) => warn!(
-                        %error,
-                        "Could not refresh the managed service healthcheck overrides; keeping \
-                         the last loaded ones until the next refresh"
-                    ),
+            while defaults.changed().await.is_ok() {
+                let current = *defaults.borrow_and_update();
+                if let Some(settings) = current {
+                    // After a save in this process, which holds it through
+                    // its own publish: the registry ends with the latest.
+                    let _writes = HEALTHCHECK_WRITES.lock().await;
+                    registry::set_instance_default(overrides_from_settings(settings));
                 }
             }
         });
+
+        let service_listener = Arc::clone(&service);
+        let database_url = self.config.get_database_url();
+        tokio::spawn(async move {
+            loop {
+                service_listener
+                    .listen_for_registry_changes(&database_url)
+                    .await;
+                tokio::time::sleep(LISTENER_RETRY).await;
+            }
+        });
+    }
+
+    /// Subscribe to [`HEALTHCHECK_CHANNEL`], reload everything, then reload
+    /// each service named until the connection is lost.
+    async fn listen_for_registry_changes(&self, database_url: &str) {
+        let retry_secs = LISTENER_RETRY.as_secs();
+        let mut listener = match PgListener::connect(database_url).await {
+            Ok(listener) => listener,
+            Err(error) => {
+                warn!(
+                    %error,
+                    retry_secs,
+                    "Could not connect to listen for other Temps processes' healthcheck \
+                     changes; retrying"
+                );
+                return;
+            }
+        };
+        if let Err(error) = listener.listen(HEALTHCHECK_CHANNEL).await {
+            warn!(
+                %error,
+                retry_secs,
+                "Could not listen for other Temps processes' healthcheck changes; retrying"
+            );
+            return;
+        }
+        if let Err(error) = self.reload_registry().await {
+            warn!(
+                %error,
+                "Could not reload the managed service healthcheck overrides after \
+                 subscribing; keeping the last loaded ones"
+            );
+        }
+        debug!("Listening for managed service healthcheck changes");
+        loop {
+            // `try_recv` rather than `recv`, which reconnects silently and
+            // would drop what was sent in between without a reload.
+            match listener.try_recv().await {
+                Ok(Some(notification)) => {
+                    if let Err(error) = self
+                        .handle_registry_notification(notification.payload())
+                        .await
+                    {
+                        warn!(
+                            %error,
+                            payload = notification.payload(),
+                            "Could not reload the healthcheck overrides of a changed service; \
+                             it keeps the last loaded ones until the next change or reconnect"
+                        );
+                    }
+                }
+                Ok(None) => {
+                    warn!(
+                        retry_secs,
+                        "Lost the connection listening for healthcheck changes; reconnecting"
+                    );
+                    return;
+                }
+                Err(error) => {
+                    warn!(
+                        %error,
+                        retry_secs,
+                        "Error listening for healthcheck changes; reconnecting"
+                    );
+                    return;
+                }
+            }
+        }
     }
 }
 

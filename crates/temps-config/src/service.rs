@@ -947,6 +947,11 @@ pub struct ConfigService {
     /// reach subscribers. Subscribers are woken only when the value actually
     /// changes. See [`ConfigService::subscribe_build_limits`].
     build_limits: tokio::sync::watch::Sender<Option<BuildLimitsSettings>>,
+    /// The managed service healthcheck defaults of the newest settings
+    /// snapshot that reached the cache, fed like `build_limits`. See
+    /// [`ConfigService::subscribe_managed_service_healthchecks`].
+    managed_service_healthchecks:
+        tokio::sync::watch::Sender<Option<crate::ManagedServiceHealthcheckSettings>>,
     /// The ClickHouse wire-compression mode this process builds its clients
     /// with. Resolved once at startup from the stored
     /// `clickhouse.compression` setting (see
@@ -1001,6 +1006,7 @@ impl ConfigService {
             expose_platform_identity: std::sync::atomic::AtomicBool::new(false),
             listener_handle: std::sync::Mutex::new(None),
             build_limits: tokio::sync::watch::channel(None).0,
+            managed_service_healthchecks: tokio::sync::watch::channel(None).0,
             clickhouse_compression: ClickHouseCompression::default(),
         }
     }
@@ -1017,9 +1023,37 @@ impl ConfigService {
         self.build_limits.subscribe()
     }
 
-    /// Hand the build limits of a snapshot that is becoming the cached one to
-    /// subscribers. Called under the settings-cache generation guard, like
-    /// [`publish_process_wide_settings`], so a stale read cannot publish.
+    /// Follow the managed service healthcheck defaults
+    /// (`AppSettings.managed_service_healthchecks`).
+    ///
+    /// Like [`Self::subscribe_build_limits`]: the receiver holds the latest
+    /// value (`None` until settings have been read once) and is notified
+    /// only when the defaults change, whichever process saved them. The
+    /// providers plugin uses this to give containers this process creates
+    /// a default another process saved.
+    pub fn subscribe_managed_service_healthchecks(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Option<crate::ManagedServiceHealthcheckSettings>> {
+        self.managed_service_healthchecks.subscribe()
+    }
+
+    /// Hand the settings that have subscribers, from a snapshot that is
+    /// becoming the cached one, to them. Called under the settings-cache
+    /// generation guard, like [`publish_process_wide_settings`], so a stale
+    /// read cannot publish.
+    fn publish_subscribed_settings(&self, settings: &AppSettings) {
+        self.publish_build_limits(settings);
+        let healthchecks = settings.managed_service_healthchecks;
+        self.managed_service_healthchecks
+            .send_if_modified(|current| {
+                if *current == Some(healthchecks) {
+                    return false;
+                }
+                *current = Some(healthchecks);
+                true
+            });
+    }
+
     fn publish_build_limits(&self, settings: &AppSettings) {
         let published = self.build_limits.send_if_modified(|current| {
             if current.as_ref() == Some(&settings.build_limits) {
@@ -1656,7 +1690,7 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         );
         publish_process_wide_settings(&settings);
         if publish_limits {
-            self.publish_build_limits(&settings);
+            self.publish_subscribed_settings(&settings);
         }
         cache.snapshot = Some((settings, std::time::Instant::now()));
         true
@@ -1677,7 +1711,7 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
             std::sync::atomic::Ordering::Relaxed,
         );
         publish_process_wide_settings(&settings);
-        self.publish_build_limits(&settings);
+        self.publish_subscribed_settings(&settings);
         cache.snapshot = Some((settings, std::time::Instant::now()));
         true
     }
@@ -6462,6 +6496,54 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    #[tokio::test]
+    async fn healthcheck_default_subscribers_see_loaded_and_changed_defaults_only() {
+        let row = |interval_secs: Option<u32>, preview_domain: &str| {
+            let mut s = AppSettings::default();
+            s.managed_service_healthchecks.interval_secs = interval_secs;
+            let mut data = s.to_json();
+            data["preview_domain"] = serde_json::json!(preview_domain);
+            settings::Model {
+                id: 1,
+                data,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            }
+        };
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![
+                vec![row(Some(60), "one.example.com")],
+                vec![row(Some(90), "one.example.com")],
+                vec![row(Some(90), "two.example.com")],
+            ])
+            .into_connection();
+        let svc = ConfigService::new(test_config(), Arc::new(db));
+        let mut defaults = svc.subscribe_managed_service_healthchecks();
+        assert_eq!(*defaults.borrow_and_update(), None, "nothing loaded yet");
+
+        // Another process saved: its NOTIFY invalidates the cache, which
+        // reloads the row.
+        svc.invalidate_settings_cache().await;
+        assert!(defaults.has_changed().expect("sender alive"));
+        assert_eq!(
+            defaults.borrow_and_update().and_then(|d| d.interval_secs),
+            Some(60)
+        );
+
+        svc.invalidate_settings_cache().await;
+        assert!(defaults.has_changed().expect("sender alive"));
+        assert_eq!(
+            defaults.borrow_and_update().and_then(|d| d.interval_secs),
+            Some(90)
+        );
+
+        svc.invalidate_settings_cache().await;
+        assert!(
+            !defaults.has_changed().expect("sender alive"),
+            "a save that leaves the healthcheck defaults alone must not wake subscribers"
+        );
     }
 
     #[tokio::test]

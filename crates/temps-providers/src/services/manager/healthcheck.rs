@@ -17,7 +17,8 @@ use bollard::models::HealthConfig;
 use bollard::query_parameters::InspectContainerOptions;
 use chrono::Utc;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Condition, EntityTrait, QueryFilter, QuerySelect, Set,
+    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseBackend, EntityTrait,
+    QueryFilter, QuerySelect, Set, Statement,
 };
 use serde::Serialize;
 use temps_entities::external_service_workload_mode::ServiceWorkloadMode;
@@ -208,6 +209,17 @@ struct HealthcheckTarget {
 /// instance default is checked against the service overrides it will be
 /// combined with. Writes are rare operator actions.
 pub(crate) static HEALTHCHECK_WRITES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Serializes the tests that set, reset or read the process-wide healthcheck
+/// registry, which every test in this crate's binary shares. Not
+/// [`HEALTHCHECK_WRITES`]: the code under test takes that itself.
+#[cfg(test)]
+pub(crate) static HEALTHCHECK_REGISTRY_TEST_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
+/// The Postgres channel [`ExternalServiceManager::notify_healthcheck_change`]
+/// sends a changed service's id on.
+pub(crate) const HEALTHCHECK_CHANNEL: &str = "external_service_healthcheck_change";
 
 impl ExternalServiceManager {
     /// Why Temps will not recreate a control-plane service's container from
@@ -463,6 +475,7 @@ impl ExternalServiceManager {
             container_name: target.container_name,
             overrides,
         });
+        self.notify_healthcheck_change(service_id).await;
         info!(
             service_id,
             interval_secs = ?overrides.interval_secs,
@@ -571,6 +584,7 @@ impl ExternalServiceManager {
             container_name: target.container_name,
             overrides: service_overrides(&service),
         });
+        self.notify_healthcheck_change(service_id).await;
         Ok(())
     }
 
@@ -604,9 +618,10 @@ impl ExternalServiceManager {
 
     /// Load the instance default and every service that overrides its
     /// healthcheck, so the engines create containers with them. Run at
-    /// startup, before routes serve, and then periodically by
-    /// [`crate::services::HealthcheckDefaultsService::reload_registry`] to
-    /// pick up what other processes saved. Reads only rows with an override.
+    /// startup, before routes serve, and again each time the listener for
+    /// other processes' changes (re)subscribes
+    /// ([`crate::services::HealthcheckDefaultsService::spawn_registry_sync`]).
+    /// Reads only rows with an override.
     ///
     /// The instance default is published first: when the services cannot be
     /// read, new containers still get it rather than the built-in timings.
@@ -646,50 +661,51 @@ impl ExternalServiceManager {
         Ok(count)
     }
 
-    /// Publish the overrides of every service row updated after `since`,
-    /// and forget those of a changed row that no longer has any. Only a row
-    /// with an override has its parameters decrypted (for its container
-    /// name). Call it holding [`HEALTHCHECK_WRITES`]. Returns the rows read.
-    pub(crate) async fn publish_healthcheck_changes_since(
-        &self,
-        since: chrono::DateTime<Utc>,
-    ) -> Result<usize, ExternalServiceError> {
-        let rows = external_services::Entity::find()
-            .filter(external_services::Column::UpdatedAt.gt(since))
-            .all(self.db.as_ref())
-            .await?;
-        for row in &rows {
-            let overrides = service_overrides(row);
-            if overrides.is_empty() {
-                registry::clear_service(row.id);
-                continue;
-            }
-            let container_name = match self.healthcheck_target(row) {
-                Ok(target) => target.container_name,
-                Err(error) => {
-                    warn!(
-                        service_id = row.id,
-                        %error,
-                        "Could not resolve the container of a service with healthcheck \
-                         overrides; its control-plane container keeps the defaults until the \
-                         next refresh"
-                    );
-                    None
-                }
-            };
-            registry::set_service(registry::ServiceHealthcheckEntry {
-                service_id: row.id,
-                container_name,
-                overrides,
-            });
-        }
-        if !rows.is_empty() {
-            debug!(
-                services = rows.len(),
-                "Published changed managed service healthcheck overrides"
+    /// Tell every Temps process sharing the database that `service_id`'s
+    /// healthcheck overrides or container name changed, or that it was
+    /// deleted; each reloads that one service
+    /// ([`Self::reload_service_healthcheck`]). Best-effort: a missed
+    /// notification is caught when the listener next (re)subscribes, which
+    /// reloads everything.
+    pub(crate) async fn notify_healthcheck_change(&self, service_id: i32) {
+        let statement = Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT pg_notify($1, $2)",
+            [HEALTHCHECK_CHANNEL.into(), service_id.to_string().into()],
+        );
+        if let Err(error) = self.db.execute(statement).await {
+            warn!(
+                service_id,
+                %error,
+                "Could not tell other Temps processes that the healthcheck overrides of \
+                 external service {} changed; they get them when their listener next \
+                 reconnects or they restart",
+                service_id
             );
         }
-        Ok(rows.len())
+    }
+
+    /// Read one service's overrides into the registry again, or forget them
+    /// when the service has none or no longer exists. Call it holding
+    /// [`HEALTHCHECK_WRITES`].
+    pub(crate) async fn reload_service_healthcheck(
+        &self,
+        service_id: i32,
+    ) -> Result<(), ExternalServiceError> {
+        let Some(row) = external_services::Entity::find_by_id(service_id)
+            .one(self.db.as_ref())
+            .await?
+        else {
+            registry::clear_service(service_id);
+            return Ok(());
+        };
+        let target = self.healthcheck_target(&row)?;
+        registry::set_service(registry::ServiceHealthcheckEntry {
+            service_id,
+            container_name: target.container_name,
+            overrides: service_overrides(&row),
+        });
+        Ok(())
     }
 
     /// Every service row with at least one healthcheck override (none on a
@@ -970,6 +986,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_renamed_service_keeps_its_overrides_under_its_new_container_name() {
+        let _registry = HEALTHCHECK_REGISTRY_TEST_LOCK.lock().await;
         use crate::services::test_support::encrypted_service_model;
         // Ids and names no other test uses: the table is process-wide.
         let before = external_services::Model {
@@ -1013,6 +1030,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_delete_forgets_overrides_only_after_a_save_in_flight_published() {
+        let _registry = HEALTHCHECK_REGISTRY_TEST_LOCK.lock().await;
         let service_id = 990_102;
         let container = "hc-delete-in-flight";
         let held = HEALTHCHECK_WRITES.lock().await;
@@ -1038,6 +1056,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_instance_default_is_kept_when_the_services_cannot_be_read() {
+        let _registry = HEALTHCHECK_REGISTRY_TEST_LOCK.lock().await;
         use sea_orm::{DatabaseBackend, DbErr, MockDatabase};
         let db = std::sync::Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)

@@ -441,12 +441,13 @@ mod tests {
     use axum::body::Body;
     use axum::http::StatusCode;
     use sea_orm::{
-        ActiveModelTrait, ColumnTrait, DatabaseBackend, DatabaseConnection, EntityTrait,
-        MockDatabase, QueryFilter, Set,
+        ActiveModelTrait, DatabaseBackend, DatabaseConnection, EntityTrait, MockDatabase, Set,
     };
     use std::sync::Mutex;
     use temps_entities::external_services;
     use tower::ServiceExt;
+
+    use crate::services::HEALTHCHECK_REGISTRY_TEST_LOCK as REGISTRY_LOCK;
 
     #[derive(Clone, Default)]
     struct RecordingAuditLogger {
@@ -811,6 +812,7 @@ mod tests {
 
     #[tokio::test]
     async fn saving_the_instance_default_is_audit_logged_with_both_values() {
+        let _registry = REGISTRY_LOCK.lock().await;
         let Some(database) = test_database("healthcheck defaults handler test").await else {
             return;
         };
@@ -859,6 +861,7 @@ mod tests {
     #[tokio::test]
     async fn a_reload_picks_up_what_another_process_saved() {
         use temps_providers_core::healthcheck::registry;
+        let _registry = REGISTRY_LOCK.lock().await;
         let Some(database) = test_database("healthcheck registry reload test").await else {
             return;
         };
@@ -907,13 +910,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_refresh_pass_reads_only_the_services_changed_since_the_last() {
+    async fn a_change_notification_reloads_only_the_service_it_names() {
         use temps_providers_core::healthcheck::registry;
-        let Some(database) = test_database("healthcheck registry changes test").await else {
+        let _registry = REGISTRY_LOCK.lock().await;
+        let Some(database) = test_database("healthcheck notification test").await else {
             return;
         };
         let db = database.connection_arc();
-        let now = chrono::Utc::now();
         let with_interval = |row: &external_services::Model, interval: i32| {
             let mut active: external_services::ActiveModel = row.clone().into();
             active.healthcheck_interval_secs = Set(Some(interval));
@@ -924,49 +927,96 @@ mod tests {
             .update(db.as_ref())
             .await
             .expect("save the changed override");
-        let untouched = insert_service(db.as_ref(), "cache-untouched", "redis", "standalone").await;
-        with_interval(&untouched, 120)
+        let quiet = insert_service(db.as_ref(), "cache-quiet", "redis", "standalone").await;
+        with_interval(&quiet, 120)
             .update(db.as_ref())
             .await
-            .expect("save the old override");
-        // Saved an hour ago. A bulk update, as the entity's save hook stamps
-        // `updated_at` with the current time.
-        external_services::Entity::update_many()
-            .col_expr(
-                external_services::Column::UpdatedAt,
-                sea_orm::sea_query::Expr::value(now - chrono::Duration::hours(1)),
-            )
-            .filter(external_services::Column::Id.eq(untouched.id))
-            .exec(db.as_ref())
-            .await
-            .expect("backdate the old override");
-        // Cleared by another process; this one still has it.
+            .expect("save the other override");
+        // Cleared and deleted by another process; this one still has them.
         let cleared = insert_service(db.as_ref(), "cache-cleared", "redis", "standalone").await;
-        registry::set_service(registry::ServiceHealthcheckEntry {
-            service_id: cleared.id,
-            container_name: None,
-            overrides: interval(60),
-        });
+        let deleted = cleared.id + 1_000;
+        for (service_id, container) in [(cleared.id, None), (deleted, Some("redis-gone"))] {
+            registry::set_service(registry::ServiceHealthcheckEntry {
+                service_id,
+                container_name: container.map(str::to_string),
+                overrides: interval(60),
+            });
+        }
         let app = state(db, RecordingAuditLogger::default());
 
-        let result = app
-            .defaults
-            .reload_registry_changes(now - chrono::Duration::seconds(60))
-            .await;
-        let published = [changed.id, untouched.id, cleared.id].map(registry::for_service);
+        for payload in [
+            changed.id.to_string(),
+            cleared.id.to_string(),
+            deleted.to_string(),
+            "not-a-service".to_string(),
+        ] {
+            app.defaults
+                .handle_registry_notification(&payload)
+                .await
+                .unwrap_or_else(|error| panic!("{payload}: {error}"));
+        }
+        let published = [changed.id, quiet.id, cleared.id, deleted].map(registry::for_service);
+        let gone_by_name = registry::for_container("redis-gone");
         // The registry is process-wide; put it back before asserting.
-        for id in [changed.id, untouched.id, cleared.id] {
+        for id in [changed.id, quiet.id, cleared.id, deleted] {
             registry::clear_service(id);
         }
-        registry::set_instance_default(HealthcheckOverrides::default());
-        assert_eq!(result.expect("refresh"), 2, "only the two changed rows");
         assert_eq!(published[0], interval(90));
-        assert!(published[1].is_empty(), "not read: {:?}", published[1]);
-        assert!(published[2].is_empty(), "forgotten: {:?}", published[2]);
+        assert!(
+            published[1].is_empty(),
+            "not named, not read: {:?}",
+            published[1]
+        );
+        assert!(published[2].is_empty(), "cleared: {:?}", published[2]);
+        assert!(published[3].is_empty(), "deleted: {:?}", published[3]);
+        assert!(gone_by_name.is_empty(), "deleted: {gone_by_name:?}");
+    }
+
+    #[tokio::test]
+    async fn a_saved_override_is_announced_to_other_processes() {
+        use sqlx::postgres::PgListener;
+        let _registry = REGISTRY_LOCK.lock().await;
+        let Some(database) = test_database("healthcheck announcement test").await else {
+            return;
+        };
+        let db = database.connection_arc();
+        let row = insert_service(db.as_ref(), "cache-announced", "redis", "standalone").await;
+        let mut listener = PgListener::connect(&database.database_url)
+            .await
+            .expect("connect a listener");
+        listener
+            .listen(crate::services::HEALTHCHECK_CHANNEL)
+            .await
+            .expect("listen");
+        let app = state(db, RecordingAuditLogger::default());
+
+        let result = update_service_healthcheck(
+            RequireAuth(auth(temps_auth::Role::Admin)),
+            State(app),
+            Path(row.id),
+            Extension(metadata()),
+            Json(interval(120)),
+        )
+        .await;
+        temps_providers_core::healthcheck::registry::clear_service(row.id);
+        let (status, body) = body_json(result).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        // Other tests share the channel; wait for this service's id.
+        let announced = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let notification = listener.recv().await.expect("receive");
+                if notification.payload() == row.id.to_string() {
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(announced.is_ok(), "no notification for service {}", row.id);
     }
 
     #[tokio::test]
     async fn a_service_override_is_saved_audit_logged_and_shown_as_its_source() {
+        let _registry = REGISTRY_LOCK.lock().await;
         let Some(database) = test_database("service healthcheck handler test").await else {
             return;
         };
@@ -1240,6 +1290,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_default_that_would_invalidate_a_service_override_is_refused() {
+        let _registry = REGISTRY_LOCK.lock().await;
         let Some(database) = test_database("healthcheck default conflict test").await else {
             return;
         };

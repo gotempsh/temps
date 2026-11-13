@@ -42,6 +42,8 @@ pub use manager::{
     ServiceHealthcheckUpdate,
 };
 pub use manager::{WalHealthReading, WalHealthUnchecked, WalProbeOutcome};
+#[cfg(test)]
+pub(crate) use manager::{HEALTHCHECK_CHANNEL, HEALTHCHECK_REGISTRY_TEST_LOCK};
 pub use schema::*;
 pub use temps_providers_core::service_errors::*;
 pub use transactions::*;
