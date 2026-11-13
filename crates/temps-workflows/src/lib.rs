@@ -14,9 +14,11 @@
 pub mod engine;
 pub mod error;
 pub mod executor;
+pub mod handlers;
 pub mod manifest;
 pub mod metrics;
 pub mod payload;
+pub mod plugin;
 pub mod protocol;
 pub mod scheduler;
 pub mod service;
@@ -28,6 +30,7 @@ pub mod types;
 
 pub use engine::WorkflowEngine;
 pub use error::{WorkflowError, WorkflowResult};
+pub use plugin::WorkflowsPlugin;
 pub use scheduler::{SchedulerConfig, WorkflowScheduler};
 pub use service::WorkflowService;
 pub use store::{PgWorkflowStore, WorkflowStore};

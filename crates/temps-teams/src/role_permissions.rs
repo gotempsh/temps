@@ -46,6 +46,7 @@ const VIEWER: &[Permission] = &[
     Permission::FunnelRead,
     Permission::DeploymentTokensRead,
     Permission::EdgeRulesRead,
+    Permission::WorkflowsRead,
 ];
 
 /// `viewer` plus the ability to ship code and manage what shipping it
@@ -60,6 +61,10 @@ const DEPLOYER_ADDITIONS: &[Permission] = &[
     Permission::PipelinesWrite,
     Permission::PipelinesExecute,
     Permission::StacksWrite,
+    // Durable workflows (ADR-103): start, operate and signal runs.
+    Permission::WorkflowRunsCreate,
+    Permission::WorkflowRunsWrite,
+    Permission::WorkflowEventsCreate,
 ];
 
 /// `deployer` plus full operational control of a project — every
@@ -108,6 +113,11 @@ const ADMIN_ADDITIONS: &[Permission] = &[
     // Edge rules decide who reaches the project (ADR-089), like its domains
     // and IP rules: project configuration, not something a deploy needs.
     Permission::EdgeRulesWrite,
+    // Workflow settings, credentials, run deletion and reading decrypted
+    // payloads (ADR-103) are project administration.
+    Permission::WorkflowsWrite,
+    Permission::WorkflowRunsDelete,
+    Permission::WorkflowPayloadsRead,
 ];
 
 /// `admin` plus the one thing only an owner can do: delete the project.
@@ -244,6 +254,30 @@ mod tests {
                     "project role {role:?} must never hold instance-admin permission {s}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn workflow_permissions_follow_the_team_tiers() {
+        let viewer = as_set(TeamRole::Viewer);
+        let deployer = as_set(TeamRole::Deployer);
+        let admin = as_set(TeamRole::Admin);
+        assert!(viewer.contains(&Permission::WorkflowsRead));
+        assert!(!viewer.contains(&Permission::WorkflowRunsCreate));
+        for permission in [
+            Permission::WorkflowRunsCreate,
+            Permission::WorkflowRunsWrite,
+            Permission::WorkflowEventsCreate,
+        ] {
+            assert!(deployer.contains(&permission), "{permission}");
+        }
+        for permission in [
+            Permission::WorkflowsWrite,
+            Permission::WorkflowRunsDelete,
+            Permission::WorkflowPayloadsRead,
+        ] {
+            assert!(!deployer.contains(&permission), "{permission}");
+            assert!(admin.contains(&permission), "{permission}");
         }
     }
 }

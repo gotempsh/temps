@@ -624,8 +624,39 @@ impl WorkflowService {
             })
     }
 
-    /// Whether a run's status lets an app read its output.
-    pub fn is_finished(run: &RunRow) -> bool {
-        RunStatus::parse(&run.status).is_some_and(RunStatus::is_terminal)
+    /// The run with its output (completed) or error message (failed), for
+    /// the app that holds the environment's credential.
+    pub async fn run_result(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+        run_id: Uuid,
+    ) -> WorkflowResult<(RunRow, Option<Value>, Option<String>)> {
+        let run = self.get_run(project_id, environment_id, run_id).await?;
+        let settings = self.store.settings(environment_id).await?;
+        let scope = WorkflowEngine::scope(&run);
+        match RunStatus::parse(&run.status) {
+            Some(RunStatus::Completed) => {
+                let output = self
+                    .codec
+                    .open(
+                        &scope,
+                        &PayloadField::RunOutput,
+                        &run_output(&run),
+                        &settings,
+                    )
+                    .await?;
+                Ok((run, output, None))
+            }
+            Some(RunStatus::Failed) => {
+                let error = self
+                    .codec
+                    .open(&scope, &PayloadField::RunError, &run_error(&run), &settings)
+                    .await?
+                    .and_then(|value| value.as_str().map(str::to_string));
+                Ok((run, None, error))
+            }
+            _ => Ok((run, None, None)),
+        }
     }
 }

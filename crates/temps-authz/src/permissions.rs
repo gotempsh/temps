@@ -264,6 +264,17 @@ pub enum Permission {
     // being able to change the project itself.
     EdgeRulesRead,
     EdgeRulesWrite,
+
+    // Durable workflow permissions (ADR-103). Runs, their steps and events
+    // are separate from deployments; reading decrypted payloads is its own
+    // permission, held by admins only.
+    WorkflowsRead,
+    WorkflowsWrite,
+    WorkflowRunsCreate,
+    WorkflowRunsWrite,
+    WorkflowRunsDelete,
+    WorkflowEventsCreate,
+    WorkflowPayloadsRead,
 }
 
 impl fmt::Display for Permission {
@@ -418,6 +429,13 @@ impl fmt::Display for Permission {
             Permission::SandboxesExec => "sandboxes:exec",
             Permission::EdgeRulesRead => "edge_rules:read",
             Permission::EdgeRulesWrite => "edge_rules:write",
+            Permission::WorkflowsRead => "workflows:read",
+            Permission::WorkflowsWrite => "workflows:write",
+            Permission::WorkflowRunsCreate => "workflow_runs:create",
+            Permission::WorkflowRunsWrite => "workflow_runs:write",
+            Permission::WorkflowRunsDelete => "workflow_runs:delete",
+            Permission::WorkflowEventsCreate => "workflow_events:create",
+            Permission::WorkflowPayloadsRead => "workflow_payloads:read",
         };
         write!(f, "{}", name)
     }
@@ -576,6 +594,13 @@ impl Permission {
             "sandboxes:exec" => Some(Permission::SandboxesExec),
             "edge_rules:read" => Some(Permission::EdgeRulesRead),
             "edge_rules:write" => Some(Permission::EdgeRulesWrite),
+            "workflows:read" => Some(Permission::WorkflowsRead),
+            "workflows:write" => Some(Permission::WorkflowsWrite),
+            "workflow_runs:create" => Some(Permission::WorkflowRunsCreate),
+            "workflow_runs:write" => Some(Permission::WorkflowRunsWrite),
+            "workflow_runs:delete" => Some(Permission::WorkflowRunsDelete),
+            "workflow_events:create" => Some(Permission::WorkflowEventsCreate),
+            "workflow_payloads:read" => Some(Permission::WorkflowPayloadsRead),
             _ => None,
         }
     }
@@ -730,6 +755,13 @@ impl Permission {
             Permission::SandboxesExec,
             Permission::EdgeRulesRead,
             Permission::EdgeRulesWrite,
+            Permission::WorkflowsRead,
+            Permission::WorkflowsWrite,
+            Permission::WorkflowRunsCreate,
+            Permission::WorkflowRunsWrite,
+            Permission::WorkflowRunsDelete,
+            Permission::WorkflowEventsCreate,
+            Permission::WorkflowPayloadsRead,
         ]
     }
 }
@@ -943,6 +975,13 @@ impl Role {
                 Permission::SandboxesExec,
                 Permission::EdgeRulesRead,
                 Permission::EdgeRulesWrite,
+                Permission::WorkflowsRead,
+                Permission::WorkflowsWrite,
+                Permission::WorkflowRunsCreate,
+                Permission::WorkflowRunsWrite,
+                Permission::WorkflowRunsDelete,
+                Permission::WorkflowEventsCreate,
+                Permission::WorkflowPayloadsRead,
             ],
             // Platform administrator: the same platform/user/settings-admin permission
             // set as `Role::Admin`, but read-only on deployable resources (Projects and
@@ -1090,6 +1129,7 @@ impl Role {
                 Permission::StacksCreate,
                 Permission::SandboxesRead,
                 Permission::EdgeRulesRead,
+                Permission::WorkflowsRead,
             ],
             Role::User => &[
                 Permission::ProjectsRead,
@@ -1199,6 +1239,10 @@ impl Role {
                 Permission::SandboxesExec,
                 Permission::EdgeRulesRead,
                 Permission::EdgeRulesWrite,
+                Permission::WorkflowsRead,
+                Permission::WorkflowRunsCreate,
+                Permission::WorkflowRunsWrite,
+                Permission::WorkflowEventsCreate,
             ],
             Role::Reader => &[
                 Permission::ProjectsRead,
@@ -1241,6 +1285,7 @@ impl Role {
                 Permission::StacksRead,
                 Permission::SandboxesRead,
                 Permission::EdgeRulesRead,
+                Permission::WorkflowsRead,
             ],
             Role::ApiReader => &[
                 Permission::ProjectsRead,
@@ -1752,5 +1797,45 @@ mod tests {
                 Permission::AnalyticsRead,
             ]
         );
+    }
+
+    #[test]
+    fn workflow_permissions_round_trip_and_follow_the_adr_role_table() {
+        let all = [
+            (Permission::WorkflowsRead, "workflows:read"),
+            (Permission::WorkflowsWrite, "workflows:write"),
+            (Permission::WorkflowRunsCreate, "workflow_runs:create"),
+            (Permission::WorkflowRunsWrite, "workflow_runs:write"),
+            (Permission::WorkflowRunsDelete, "workflow_runs:delete"),
+            (Permission::WorkflowEventsCreate, "workflow_events:create"),
+            (Permission::WorkflowPayloadsRead, "workflow_payloads:read"),
+        ];
+        for (permission, name) in &all {
+            assert_eq!(permission.to_string(), *name);
+            assert_eq!(Permission::from_str(name).as_ref(), Some(permission));
+            assert!(Permission::all().contains(permission));
+            assert!(Role::Admin.has_permission(permission), "admin lacks {name}");
+        }
+        let user = [
+            Permission::WorkflowsRead,
+            Permission::WorkflowRunsCreate,
+            Permission::WorkflowRunsWrite,
+            Permission::WorkflowEventsCreate,
+        ];
+        for (permission, name) in &all {
+            assert_eq!(
+                Role::User.has_permission(permission),
+                user.contains(permission),
+                "user / {name}"
+            );
+            let read_only = *permission == Permission::WorkflowsRead;
+            assert_eq!(Role::Reader.has_permission(permission), read_only, "reader / {name}");
+            assert_eq!(
+                Role::PlatformAdmin.has_permission(permission),
+                read_only,
+                "platform admin / {name}"
+            );
+            assert!(!Role::ApiReader.has_permission(permission));
+        }
     }
 }

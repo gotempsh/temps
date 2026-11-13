@@ -242,7 +242,10 @@ async fn credentials_are_shown_once_stored_hashed_and_revocable() {
     let service = service(&h);
     let (p, e) = (h.env.project_id, h.env.environment_id);
     assert!(service.credential(p, e).await.unwrap().is_none());
-    let issued = service.rotate_credential(p, e, Some(h.env.user_id)).await.unwrap();
+    let issued = service
+        .rotate_credential(p, e, Some(h.env.user_id))
+        .await
+        .unwrap();
     assert!(issued.token.starts_with("twf_"));
     assert_ne!(issued.credential.token_hash, issued.token);
     assert!(!format!("{issued:?}").contains(&issued.token));
@@ -255,7 +258,10 @@ async fn credentials_are_shown_once_stored_hashed_and_revocable() {
         issued.credential.id
     );
 
-    let rotated = service.rotate_credential(p, e, Some(h.env.user_id)).await.unwrap();
+    let rotated = service
+        .rotate_credential(p, e, Some(h.env.user_id))
+        .await
+        .unwrap();
     assert!(matches!(
         service.authenticate_credential(&issued.token).await,
         Err(WorkflowError::InvalidCredential { .. })
