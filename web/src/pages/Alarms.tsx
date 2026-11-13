@@ -12,6 +12,8 @@ import {
   silenceAlarmMutation,
   unsilenceAlarmMutation,
 } from '@/api/client/@tanstack/react-query.gen'
+import { RefreshButton } from '@/components/ui/refresh-button'
+import { queryKeyPrefix } from '@/lib/refresh'
 import { bulkUpdateProjectAlarms } from '@/api/client'
 import type {
   AlarmResponse,
@@ -620,18 +622,33 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
     </Select>
   )
 
+  const refresh = hasProject ? (
+    <RefreshButton
+      queryKeys={[
+        getProjectAlarmsSummaryQueryKey({ path: projectPath }),
+        queryKeyPrefix(listProjectAlarmsQueryKey, { path: projectPath }),
+      ]}
+    />
+  ) : null
+
   return (
     <div className="space-y-4">
       {/* Header */}
       {embedded ? (
         <div className="flex flex-col gap-2 sm:flex-row sm:justify-end">
+          {refresh}
           {projectPicker}
         </div>
       ) : (
         <PageHeader
           title="Alarms"
           description="Firing history across metrics, containers, uptime, and databases — acknowledge or resolve from one place, one at a time or in bulk by selecting rows."
-          actions={projectPicker}
+          actions={
+            <>
+              {refresh}
+              {projectPicker}
+            </>
+          }
         />
       )}
 

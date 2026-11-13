@@ -16,7 +16,6 @@ import {
   CardTitle,
 } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
-import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import { FileText } from 'lucide-react'
 import { useMemo } from 'react'
@@ -29,6 +28,7 @@ import {
 } from './insights'
 import type { AiInsightContext } from './insights'
 import { PageListItem } from './PageListItem'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 interface PagesProps {
   project: ProjectResponse
@@ -46,7 +46,13 @@ export function Pages({
   const [insightsOpen, setInsightsOpen] = useInsightsOpen()
 
   // Fetch page paths
-  const { data, isLoading, error, refetch } = useQuery({
+  const {
+    data,
+    isLoading,
+    error,
+    refetch,
+    isPlaceholderData: isPreviousWindow,
+  } = useWindowQuery({
     ...getPagePathsOptions({
       query: {
         project_id: project.id,
@@ -68,7 +74,7 @@ export function Pages({
   }, [pagePaths])
 
   // Fetch all sparklines in a single batch request
-  const { data: sparklineData } = useQuery({
+  const { data: sparklineData } = useWindowQuery({
     ...getPagePathsSparklinesOptions({
       query: {
         project_id: project.id,
@@ -100,7 +106,8 @@ export function Pages({
   )
 
   const aiContext = useMemo<AiInsightContext | undefined>(() => {
-    if (!pagePaths?.length) return undefined
+    // The previous window's pages while a moved one loads: not for the AI.
+    if (!pagePaths?.length || isPreviousWindow) return undefined
     return {
       surface: 'top pages',
       rangeStart: startDate?.toISOString(),
@@ -114,7 +121,7 @@ export function Pages({
         })),
       },
     }
-  }, [pagePaths, startDate, endDate])
+  }, [pagePaths, isPreviousWindow, startDate, endDate])
 
   if (error) {
     return (
@@ -140,6 +147,7 @@ export function Pages({
           insights={insights}
           isLoading={isLoading}
           aiContext={aiContext}
+          aiPending={isPreviousWindow}
           project={{ id: project.id, slug: project.slug, name: project.name }}
         />
       )}

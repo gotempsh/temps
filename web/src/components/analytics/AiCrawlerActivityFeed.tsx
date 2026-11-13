@@ -1,11 +1,16 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { getProxyLogsOptions } from '@/api/client/@tanstack/react-query.gen'
+import {
+  getProxyLogsOptions,
+  getProxyLogsQueryKey,
+} from '@/api/client/@tanstack/react-query.gen'
 import { ProxyLogResponse } from '@/api/client/types.gen'
 import { AiAgentLogo } from '@/components/ui/ai-agent-logo'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { RefreshButton } from '@/components/ui/refresh-button'
+import { queryKeyPrefix } from '@/lib/refresh'
 import { Skeleton } from '@/components/ui/skeleton'
 import { DateTimeRange } from '@/components/ui/date-time-range'
 import { ResponsivePagination } from '@/components/ui/responsive-pagination'
@@ -19,11 +24,12 @@ import {
 } from '@/components/ui/select'
 import { AGENT_TO_PROVIDER, AI_PROVIDERS } from '@/lib/ai-agents'
 import { proxyLogDetailUrl } from '@/lib/proxy-log-navigation'
-import { useQuery } from '@tanstack/react-query'
 import { format, formatDistanceToNow } from 'date-fns'
-import { Bot, ExternalLink, RefreshCw } from 'lucide-react'
+import { Bot, ExternalLink } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { Link, useSearchParams } from 'react-router'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
+import { usePageInRange } from '@/hooks/usePageInRange'
 
 const ALL = '__all__'
 const PAGE_SIZE_OPTIONS = [25, 50, 100] as const
@@ -65,15 +71,18 @@ export function AiCrawlerActivityFeed({
   const range = searchParams.get('range') || '24h'
   const rangeEnd = searchParams.get('range_end')
   const [initialAnchor] = useState(Date.now)
+  // Refresh moves the anchor right away; the URL catches up with the same
+  // instant, so the window does not wait for the navigation to land.
+  const [refreshAnchor, setRefreshAnchor] = useState<number | null>(null)
   // Store preset and anchor together in the URL: changing either must not
   // briefly query the previous preset with the new anchor. Paging keeps both.
   const timeRange = useMemo(() => {
     const anchor = rangeEnd ? Date.parse(rangeEnd) : NaN
     return resolveTimeRange(
       range,
-      Number.isFinite(anchor) ? anchor : initialAnchor
+      refreshAnchor ?? (Number.isFinite(anchor) ? anchor : initialAnchor)
     )
-  }, [range, rangeEnd, initialAnchor])
+  }, [range, rangeEnd, initialAnchor, refreshAnchor])
 
   const provider = searchParams.get('ai_provider') || ''
   const agent = searchParams.get('ai_agent') || ''
@@ -108,7 +117,7 @@ export function AiCrawlerActivityFeed({
     setSearchParams(next, { replace: true })
   }
 
-  const { data, isLoading, error, refetch } = useQuery({
+  const { data, isLoading, error, isPlaceholderData } = useWindowQuery({
     ...getProxyLogsOptions({
       query: {
         project_id: projectId || null,
@@ -128,9 +137,26 @@ export function AiCrawlerActivityFeed({
     staleTime: 1000 * 15,
   })
 
+  // A preset ("last 24 hours") ends now again; a custom range only refetches.
+  // Filters and the page stay as they are.
+  const moveWindowToNow = () => {
+    if (timeRange.preset === 'custom') return
+    const now = Date.now()
+    setRefreshAnchor(now)
+    const next = new URLSearchParams(searchParams)
+    next.set('range_end', new Date(now).toISOString())
+    setSearchParams(next, { replace: true })
+  }
+
   const logs = data?.logs ?? []
   const totalPages = data?.total_pages ?? 0
   const total = data?.total ?? 0
+  // A moved window can hold fewer pages than the one on screen.
+  usePageInRange(
+    page,
+    data && !isPlaceholderData ? { rows: logs.length, totalPages } : undefined,
+    (inRange) => setParam('page', inRange > 1 ? String(inRange) : null)
+  )
 
   const hasActiveFilters = Boolean(provider || agent || path)
 
@@ -141,6 +167,7 @@ export function AiCrawlerActivityFeed({
           value={timeRange}
           maxRangeDays={projectId ? 30 : 7}
           onChange={(value) => {
+            setRefreshAnchor(null)
             const next = new URLSearchParams(searchParams)
             next.set('range', serializeTimeRange(value))
             if (value.preset === 'custom') next.delete('range_end')
@@ -149,22 +176,14 @@ export function AiCrawlerActivityFeed({
             setSearchParams(next, { replace: true })
           }}
         />
-        <Button
-          variant="outline"
-          size="sm"
-          aria-label="Refresh AI crawler activity"
-          onClick={() => {
-            const next = new URLSearchParams(searchParams)
-            if (timeRange.preset !== 'custom')
-              next.set('range_end', new Date().toISOString())
-            next.delete('page')
-            setSearchParams(next, { replace: true })
-            if (timeRange.preset === 'custom' && page === 1) void refetch()
-          }}
-        >
-          <RefreshCw className="h-4 w-4" />
-          Refresh
-        </Button>
+        <RefreshButton
+          queryKeys={[
+            queryKeyPrefix(getProxyLogsQueryKey, {
+              query: { is_ai_agent: true },
+            }),
+          ]}
+          onRefresh={moveWindowToNow}
+        />
       </div>
       <p className="text-xs text-muted-foreground">
         {format(new Date(timeRange.from), 'PPpp')} –{' '}

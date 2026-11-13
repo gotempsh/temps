@@ -4,6 +4,7 @@ import { PageTitle } from '@temps-sdk/ds'
 import {
   getGenaiTraceOptions,
   queryGenaiTracesOptions,
+  queryGenaiTracesQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
 import type {
   GenAiSpanDetail,
@@ -23,6 +24,8 @@ import { problemDetail } from '@/lib/api-problem'
 import { AiProviderSelect } from '@/components/ai/AiProviderSelect'
 import { AiActivityEmptyState } from '@/components/ai/AiActivityEmptyState'
 import { DateTimeRange } from '@/components/ui/date-time-range'
+import { RefreshButton } from '@/components/ui/refresh-button'
+import { queryKeyPrefix } from '@/lib/refresh'
 import type { DateTimeRangeValue } from '@/lib/date-time-range'
 
 import {
@@ -214,6 +217,7 @@ import {
   compareAiModelIdsByRelevance,
   sortAiModelIdsByRelevance,
 } from '@/lib/ai-model-ranking'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 // Mutation errors here are thrown ProblemDetails response bodies, not Error
 // instances -- String(error) on an object stringifies to "[object Object]"
@@ -853,6 +857,7 @@ type TimeRange = { label: string; hours: number }
 function useTimeRangeSelection(): [
   { range: TimeRange; endMs: number },
   (value: DateTimeRangeValue) => void,
+  () => void,
 ] {
   const [selection, setSelection] = useState(() => ({
     range: { label: '1d', hours: 24 },
@@ -868,6 +873,13 @@ function useTimeRangeSelection(): [
         },
         endMs: Date.parse(value.to),
       }),
+    // Refresh: a preset ("last 24 hours") ends now again; a custom range stays.
+    () =>
+      setSelection((current) =>
+        current.range.label === 'custom'
+          ? current
+          : { ...current, endMs: Date.now() }
+      ),
   ]
 }
 
@@ -955,6 +967,32 @@ const providerChartConfig = {
   request_count: { label: 'Requests', color: 'var(--chart-1)' },
 } satisfies ChartConfig
 
+/**
+ * A usage read that failed with nothing loaded. Says so instead of showing
+ * zero or "no data", which would read as a quiet gateway.
+ */
+function UsageReadFailed({
+  label,
+  onRetry,
+}: {
+  label: string
+  onRetry: () => void
+}) {
+  return (
+    <div className="flex h-[200px] flex-col items-center justify-center gap-2 text-center text-sm">
+      <p className="text-destructive">Couldn&apos;t load {label}.</p>
+      <Button variant="outline" size="sm" onClick={onRetry}>
+        Retry
+      </Button>
+    </div>
+  )
+}
+
+/** A stat card's value when its read failed with nothing loaded. */
+function UsageStatFailed() {
+  return <p className="text-sm text-destructive">Couldn&apos;t load</p>
+}
+
 function LogCostCell({
   log,
   pricingMap,
@@ -972,7 +1010,8 @@ function LogCostCell({
 }
 
 export function UsageAnalytics() {
-  const [{ range: timeRange, endMs }, selectTimeRange] = useTimeRangeSelection()
+  const [{ range: timeRange, endMs }, selectTimeRange, moveToNow] =
+    useTimeRangeSelection()
 
   const timeParams = useMemo(() => {
     const to = new Date(endMs).toISOString()
@@ -981,21 +1020,34 @@ export function UsageAnalytics() {
     return { from, to, bucket }
   }, [endMs, timeRange])
 
-  const { data: summary, isLoading: summaryLoading } = useQuery({
-    queryKey: ['aiUsage', 'summary', timeParams.from, timeParams.to],
+  // The window is named in each key ({ from, to }), so a Refresh that moves
+  // it keeps the numbers on screen and picking another range does not.
+  const {
+    data: summary,
+    isLoading: summaryLoading,
+    isError: summaryError,
+  } = useWindowQuery({
+    queryKey: [
+      'aiUsage',
+      'summary',
+      { from: timeParams.from, to: timeParams.to },
+    ],
     queryFn: () =>
       fetchJson<UsageSummary>(
         buildUsageUrl('summary', { from: timeParams.from, to: timeParams.to })
       ),
   })
 
-  const { data: timeseries, isLoading: timeseriesLoading } = useQuery({
+  const {
+    data: timeseries,
+    isLoading: timeseriesLoading,
+    isError: timeseriesError,
+    refetch: refetchTimeseries,
+  } = useWindowQuery({
     queryKey: [
       'aiUsage',
       'timeseries',
-      timeParams.from,
-      timeParams.to,
-      timeParams.bucket,
+      { from: timeParams.from, to: timeParams.to, bucket: timeParams.bucket },
     ],
     queryFn: () =>
       fetchJson<TimeseriesBucket[]>(
@@ -1007,8 +1059,17 @@ export function UsageAnalytics() {
       ),
   })
 
-  const { data: byProvider } = useQuery({
-    queryKey: ['aiUsage', 'by-provider', timeParams.from, timeParams.to],
+  const {
+    data: byProvider,
+    isLoading: byProviderLoading,
+    isError: byProviderError,
+    refetch: refetchByProvider,
+  } = useWindowQuery({
+    queryKey: [
+      'aiUsage',
+      'by-provider',
+      { from: timeParams.from, to: timeParams.to },
+    ],
     queryFn: () =>
       fetchJson<ProviderUsage[]>(
         buildUsageUrl('by-provider', {
@@ -1018,8 +1079,17 @@ export function UsageAnalytics() {
       ),
   })
 
-  const { data: topModels } = useQuery({
-    queryKey: ['aiUsage', 'top-models', timeParams.from, timeParams.to],
+  const {
+    data: topModels,
+    isLoading: topModelsLoading,
+    isError: topModelsError,
+    refetch: refetchTopModels,
+  } = useWindowQuery({
+    queryKey: [
+      'aiUsage',
+      'top-models',
+      { from: timeParams.from, to: timeParams.to },
+    ],
     queryFn: () =>
       fetchJson<ModelUsage[]>(
         buildUsageUrl('top-models', {
@@ -1140,6 +1210,12 @@ export function UsageAnalytics() {
     )
   }, [topModels, pricingMap])
 
+  // Failed with nothing to show: never rendered as zero usage.
+  const summaryFailed = summaryError && !summary
+  const timeseriesFailed = timeseriesError && !timeseries
+  const byProviderFailed = byProviderError && !byProvider
+  const topModelsFailed = topModelsError && !topModels
+
   const chartTimeseries = useMemo(
     () =>
       (timeseries ?? []).map((b) => ({
@@ -1163,7 +1239,8 @@ export function UsageAnalytics() {
       {/* Time range selector */}
       <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
         <h3 className="text-lg font-semibold">Usage analytics</h3>
-        <div className="flex gap-1">
+        <div className="flex flex-wrap items-center gap-2">
+          <RefreshButton queryKeys={[['aiUsage']]} onRefresh={moveToNow} />
           <AiTimeRange
             range={timeRange}
             endMs={endMs}
@@ -1184,6 +1261,8 @@ export function UsageAnalytics() {
           <CardContent>
             {summaryLoading ? (
               <Skeleton className="h-7 w-16" />
+            ) : summaryFailed ? (
+              <UsageStatFailed />
             ) : (
               <div className="text-2xl font-bold">
                 {formatTokenCount(summary?.total_requests ?? 0)}
@@ -1201,6 +1280,8 @@ export function UsageAnalytics() {
           <CardContent>
             {summaryLoading ? (
               <Skeleton className="h-7 w-16" />
+            ) : summaryFailed ? (
+              <UsageStatFailed />
             ) : (
               <div className="text-2xl font-bold">
                 {formatTokenCount(summary?.total_tokens ?? 0)}
@@ -1218,6 +1299,8 @@ export function UsageAnalytics() {
           <CardContent>
             {summaryLoading ? (
               <Skeleton className="h-7 w-16" />
+            ) : summaryFailed ? (
+              <UsageStatFailed />
             ) : (
               <div className="text-2xl font-bold">
                 {Math.round(summary?.avg_latency_ms ?? 0)}ms
@@ -1235,6 +1318,8 @@ export function UsageAnalytics() {
           <CardContent>
             {summaryLoading ? (
               <Skeleton className="h-7 w-16" />
+            ) : summaryFailed ? (
+              <UsageStatFailed />
             ) : (
               <div className="text-2xl font-bold">
                 {summary && summary.total_requests > 0
@@ -1252,8 +1337,10 @@ export function UsageAnalytics() {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            {summaryLoading ? (
+            {summaryLoading || topModelsLoading ? (
               <Skeleton className="h-7 w-16" />
+            ) : topModelsFailed ? (
+              <UsageStatFailed />
             ) : (
               <div className="text-2xl font-bold">
                 {formatCost(totalEstimatedCost)}
@@ -1271,6 +1358,11 @@ export function UsageAnalytics() {
         <CardContent>
           {timeseriesLoading ? (
             <Skeleton className="h-[200px] w-full" />
+          ) : timeseriesFailed ? (
+            <UsageReadFailed
+              label="requests over time"
+              onRetry={() => void refetchTimeseries()}
+            />
           ) : chartTimeseries.length === 0 ? (
             <EmptyState
               icon={Activity}
@@ -1312,6 +1404,11 @@ export function UsageAnalytics() {
           <CardContent>
             {timeseriesLoading ? (
               <Skeleton className="h-[200px] w-full" />
+            ) : timeseriesFailed ? (
+              <UsageReadFailed
+                label="usage over time"
+                onRetry={() => void refetchTimeseries()}
+              />
             ) : chartTimeseries.length === 0 ? (
               <div className="h-[200px] flex items-center justify-center text-sm text-muted-foreground">
                 No data
@@ -1363,6 +1460,11 @@ export function UsageAnalytics() {
           <CardContent>
             {timeseriesLoading ? (
               <Skeleton className="h-[200px] w-full" />
+            ) : timeseriesFailed ? (
+              <UsageReadFailed
+                label="usage over time"
+                onRetry={() => void refetchTimeseries()}
+              />
             ) : chartTimeseries.length === 0 ? (
               <div className="h-[200px] flex items-center justify-center text-sm text-muted-foreground">
                 No data
@@ -1408,7 +1510,14 @@ export function UsageAnalytics() {
             <CardTitle className="text-base">By provider</CardTitle>
           </CardHeader>
           <CardContent>
-            {!byProvider || byProvider.length === 0 ? (
+            {byProviderLoading ? (
+              <Skeleton className="h-[200px] w-full" />
+            ) : byProviderFailed ? (
+              <UsageReadFailed
+                label="usage by provider"
+                onRetry={() => void refetchByProvider()}
+              />
+            ) : !byProvider || byProvider.length === 0 ? (
               <div className="h-[200px] flex items-center justify-center text-sm text-muted-foreground">
                 No data
               </div>
@@ -1457,7 +1566,18 @@ export function UsageAnalytics() {
             <CardTitle className="text-base">Top models</CardTitle>
           </CardHeader>
           <CardContent>
-            {!topModels || topModels.length === 0 ? (
+            {topModelsLoading ? (
+              <div className="space-y-3">
+                {['a', 'b', 'c', 'd'].map((key) => (
+                  <Skeleton key={key} className="h-5 w-full" />
+                ))}
+              </div>
+            ) : topModelsFailed ? (
+              <UsageReadFailed
+                label="top models"
+                onRetry={() => void refetchTopModels()}
+              />
+            ) : !topModels || topModels.length === 0 ? (
               <div className="h-[200px] flex items-center justify-center text-sm text-muted-foreground">
                 No data
               </div>
@@ -3381,7 +3501,8 @@ export function AgentActivity() {
   const [selectedProjectId, setSelectedProjectId] = useState<
     number | undefined
   >(projects[0]?.id)
-  const [{ range: timeRange, endMs }, selectTimeRange] = useTimeRangeSelection()
+  const [{ range: timeRange, endMs }, selectTimeRange, moveToNow] =
+    useTimeRangeSelection()
   const [systemFilter, setSystemFilter] = useState<string>('')
   const [selectedTraceId, setSelectedTraceId] = useState<string | null>(null)
   const [selectedTraceBounds, setSelectedTraceBounds] =
@@ -3403,7 +3524,7 @@ export function AgentActivity() {
     data: tracesResponse,
     isLoading: tracesLoading,
     error: tracesError,
-  } = useQuery({
+  } = useWindowQuery({
     ...queryGenaiTracesOptions({
       query: {
         project_id: projectId,
@@ -3477,7 +3598,15 @@ export function AgentActivity() {
               setSystemFilter(value === 'all' ? '' : value)
             }
           />
-          <div className="flex gap-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <RefreshButton
+              queryKeys={[
+                queryKeyPrefix(queryGenaiTracesQueryKey, {
+                  query: { project_id: projectId },
+                }),
+              ]}
+              onRefresh={moveToNow}
+            />
             <AiTimeRange
               range={timeRange}
               endMs={endMs}
@@ -3721,7 +3850,8 @@ export function ProjectAgentActivity({
   projectId: number
   projectSlug: string
 }) {
-  const [{ range: timeRange, endMs }, selectTimeRange] = useTimeRangeSelection()
+  const [{ range: timeRange, endMs }, selectTimeRange, moveToNow] =
+    useTimeRangeSelection()
   const [systemFilter, setSystemFilter] = useState<string>('')
   const [searchParams, setSearchParams] = useSearchParams()
   const selectedTraceId = searchParams.get('trace') || null
@@ -3754,7 +3884,7 @@ export function ProjectAgentActivity({
     data: tracesResponse,
     isLoading: tracesLoading,
     error: tracesError,
-  } = useQuery({
+  } = useWindowQuery({
     ...queryGenaiTracesOptions({
       query: {
         project_id: projectId,
@@ -3806,7 +3936,15 @@ export function ProjectAgentActivity({
               setSystemFilter(value === 'all' ? '' : value)
             }
           />
-          <div className="flex gap-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <RefreshButton
+              queryKeys={[
+                queryKeyPrefix(queryGenaiTracesQueryKey, {
+                  query: { project_id: projectId },
+                }),
+              ]}
+              onRefresh={moveToNow}
+            />
             <AiTimeRange
               range={timeRange}
               endMs={endMs}

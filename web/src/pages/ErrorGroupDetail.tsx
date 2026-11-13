@@ -13,7 +13,9 @@ import {
 import {
   getEnvironmentsOptions,
   getErrorGroupOptions,
+  getErrorGroupQueryKey,
   listErrorEventsOptions,
+  listErrorEventsQueryKey,
   listUsersOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { AutofixIncidentCard } from '@/components/autofix/AutofixIncidentCard'
@@ -23,6 +25,8 @@ import { updateErrorGroupMutation } from '@/api/client/@tanstack/react-query.gen
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { Badge } from '@/components/ui/badge'
+import { RefreshButton } from '@/components/ui/refresh-button'
+import { queryKeyPrefix } from '@/lib/refresh'
 import { Button } from '@/components/ui/button'
 import {
   Card,
@@ -276,6 +280,7 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
     )
   }
 
+  const groupPath = { group_id: errorGroup.id, project_id: project.id }
   const latestEvent = errorEvents?.data?.[0] as ErrorEventResponse | undefined
   const sentryEvent = latestEvent ? extractSentryEvent(latestEvent.data) : null
 
@@ -343,6 +348,12 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
             aria-label="Error actions"
             className="flex shrink-0 items-center gap-2"
           >
+            <RefreshButton
+              queryKeys={[
+                getErrorGroupQueryKey({ path: groupPath }),
+                queryKeyPrefix(listErrorEventsQueryKey, { path: groupPath }),
+              ]}
+            />
             {(errorGroup as any).status !== 'resolved' && (
               <FixErrorWithAgentButton
                 error={{

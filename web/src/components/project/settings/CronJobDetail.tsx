@@ -3,8 +3,12 @@
 
 import {
   getCronByIdOptions,
+  getCronByIdQueryKey,
   getCronExecutionsOptions,
+  getCronExecutionsQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
+import { RefreshButton } from '@/components/ui/refresh-button'
+import { queryKeyPrefix } from '@/lib/refresh'
 import type { CronExecutionInfo, ProjectResponse } from '@/api/client'
 import { useQuery } from '@tanstack/react-query'
 import {
@@ -80,23 +84,18 @@ export function CronJobDetail({ project }: CronJobDetailProps) {
     environmentId: string
     cronId: string
   }>()
+  const cronPath = {
+    project_id: project.id,
+    env_id: Number(environmentId),
+    cron_id: Number(cronId),
+  }
   const cronQuery = useQuery({
-    ...getCronByIdOptions({
-      path: {
-        project_id: project.id,
-        env_id: Number(environmentId),
-        cron_id: Number(cronId),
-      },
-    }),
+    ...getCronByIdOptions({ path: cronPath }),
   })
 
   const executionsQuery = useQuery({
     ...getCronExecutionsOptions({
-      path: {
-        project_id: project.id,
-        env_id: Number(environmentId),
-        cron_id: Number(cronId),
-      },
+      path: cronPath,
       query: {
         page: 1,
         per_page: 10,
@@ -118,12 +117,18 @@ export function CronJobDetail({ project }: CronJobDetailProps) {
         >
           <ArrowLeft className="size-4" />
         </Button>
-        <div>
+        <div className="min-w-0 flex-1">
           <h2 className="text-lg font-medium">Cron job details</h2>
           <p className="text-sm text-muted-foreground">
             View cron job configuration and execution history
           </p>
         </div>
+        <RefreshButton
+          queryKeys={[
+            getCronByIdQueryKey({ path: cronPath }),
+            queryKeyPrefix(getCronExecutionsQueryKey, { path: cronPath }),
+          ]}
+        />
       </div>
 
       <Card>

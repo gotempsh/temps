@@ -13,7 +13,7 @@ import {
 import { Skeleton } from '@/components/ui/skeleton'
 import { SegmentedControl } from '@/components/ui/segmented-control'
 import { cn } from '@/lib/utils'
-import { useQuery } from '@tanstack/react-query'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 import { iso31661Alpha2ToNumeric } from 'iso-3166/1-a2-to-1-n'
 import { useMemo, useState } from 'react'
 import type { GeoJsonObject } from 'geojson'
@@ -109,7 +109,7 @@ export function SpeedWorldMap({
   const [metric, setMetric] = useState<MapMetric>('ttfb')
   const [hover, setHover] = useState<HoverInfo | null>(null)
 
-  const { data, isLoading } = useQuery({
+  const { data, isLoading } = useWindowQuery({
     ...getGroupedPageMetricsOptions({
       query: {
         start_date: startDate,

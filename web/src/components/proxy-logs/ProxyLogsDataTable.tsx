@@ -40,7 +40,6 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import {
   AlertCircle,
@@ -58,11 +57,19 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useSearchParams } from 'react-router'
 import { IpLink } from '@/components/data-display/IpLink'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
+import { usePageInRange } from '@/hooks/usePageInRange'
 
 interface ProxyLogsDataTableProps {
   projectId?: number
   environmentId?: number
   onRowClick?: (log: ProxyLogResponse) => void
+  /**
+   * When the page last asked for fresh rows. A preset window ("Last 24
+   * hours") is resolved again from this instant, so a refresh also moves the
+   * window's start instead of only reaching further past its end.
+   */
+  refreshedAt?: number
 }
 
 /**
@@ -314,6 +321,7 @@ export function ProxyLogsDataTable({
   projectId,
   environmentId,
   onRowClick,
+  refreshedAt,
 }: ProxyLogsDataTableProps) {
   const [searchParams, setSearchParams] = useSearchParams()
   const isInitialMount = useRef(true)
@@ -432,6 +440,8 @@ export function ProxyLogsDataTable({
    * render would make the query key unstable and refetch on every keystroke.
    */
   const timeWindow = useMemo(() => {
+    // `refreshedAt` is the page's Refresh: a new value re-reads the clock.
+    void refreshedAt
     if (timeRange === 'custom') {
       return {
         start: filters.start_date || null,
@@ -439,9 +449,9 @@ export function ProxyLogsDataTable({
       }
     }
     return { start: timeRangeToStartDate(timeRange), end: null }
-  }, [timeRange, filters.start_date, filters.end_date])
+  }, [timeRange, filters.start_date, filters.end_date, refreshedAt])
 
-  const { data, isLoading, error } = useQuery({
+  const { data, isLoading, error, isPlaceholderData } = useWindowQuery({
     ...getProxyLogsOptions({
       query: {
         project_id: scopedProjectId ?? null,
@@ -499,7 +509,18 @@ export function ProxyLogsDataTable({
       },
     }),
     staleTime: 1000 * 30, // 30 seconds
+    // A refresh moves the window, so the key changes: keep the current rows
+    // (and their count) on screen until the next ones arrive instead of
+    // collapsing the table into a spinner.
   })
+  // A moved window can hold fewer pages than the one on screen.
+  usePageInRange(
+    page,
+    data && !isPlaceholderData
+      ? { rows: data.logs.length, totalPages: data.total_pages }
+      : undefined,
+    setPage
+  )
 
   const handleSort = (column: string) => {
     if (sortBy === column) {

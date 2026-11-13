@@ -11,9 +11,11 @@ import {
   getClusterHealthQueryKey,
   getProjectsOptions,
   getServiceOptions,
+  getServiceQueryKey,
   getServicePreviewEnvironmentVariablesMaskedOptions,
   linkServiceToProjectMutation,
   listServiceProjectsOptions,
+  listServiceProjectsQueryKey,
   startServiceMutation,
   stopServiceMutation,
 } from '@/api/client/@tanstack/react-query.gen'
@@ -90,6 +92,7 @@ import {
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { EnvVariablesDisplay } from '@/components/ui/env-variables-display'
 import { ServiceLogo } from '@/components/ui/service-logo'
+import { RefreshButton } from '@/components/ui/refresh-button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { TimeAgo } from '@/components/utils/TimeAgo'
 import { ServiceReadinessPanel } from '@/components/storage/ServiceReadinessPanel'
@@ -262,6 +265,7 @@ export function ServiceDetail() {
     isLoading,
     error: queryError,
     refetch,
+    isFetching: isFetchingService,
   } = useQuery({
     ...getServiceOptions({
       path: { id: parseInt(id!) },
@@ -689,7 +693,9 @@ export function ServiceDetail() {
     )
   }
 
-  if (queryError || !service) {
+  // A failed refresh keeps the loaded page (and its open dialogs); only a
+  // service that never loaded is replaced by the error.
+  if (!service) {
     return (
       <PageState
         variant="failed"
@@ -778,6 +784,18 @@ export function ServiceDetail() {
         facts={facts}
         actions={
           <>
+            <RefreshButton
+              queryKeys={[
+                getServiceQueryKey({ path: { id: service.service.id } }),
+                listServiceProjectsQueryKey({
+                  path: { id: service.service.id },
+                }),
+                ['pg-upgrades', id],
+                externalServiceBackupsQueryKey(service.service.id),
+                // The header badge and the health strip.
+                ['service-health', service.service.id],
+              ]}
+            />
             {/*
               Linked projects: collapsed into a header chip so the body of the
               page can stay focused on Health + Configuration. Click to see the
@@ -1022,6 +1040,19 @@ export function ServiceDetail() {
         main={
           <>
             {error ? <Callout tone="error">{error}</Callout> : null}
+            {queryError ? (
+              <Callout tone="error" title="Couldn't refresh service">
+                Showing the last loaded service.{' '}
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => void refetch()}
+                  disabled={isFetchingService}
+                >
+                  Retry service
+                </Button>
+              </Callout>
+            ) : null}
 
             <ActiveRestoreBanner serviceId={service.service.id} />
 

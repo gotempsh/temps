@@ -1,10 +1,11 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { afterEach, expect, test } from 'bun:test'
+import { afterEach, expect, spyOn, test } from 'bun:test'
 import { cleanup, fireEvent, render, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter, Route, Routes, useParams } from 'react-router'
+import { toast } from 'sonner'
 import type { DomainResponse } from '@/api/client/types.gen'
 import { PlatformAccessContext } from '@/contexts/PlatformAccessContext-shared'
 import { installBrowserWindow } from '@/test/dom'
@@ -13,7 +14,10 @@ import { collectRouteQueryFailures } from '@/lib/route-query-failures'
 import { DomainsManagement } from './DomainsManagement'
 
 installBrowserWindow()
-afterEach(cleanup)
+afterEach(() => {
+  cleanup()
+  spyOn(toast, 'error').mockRestore()
+})
 
 const domain: DomainResponse = {
   id: 12,
@@ -116,6 +120,32 @@ test('a role refused the tunnel reads still lists certificates, with no page fai
     expect(errored.length).toBe(2)
   })
   expect(collectRouteQueryFailures(client)).toEqual([])
+})
+
+test('for a role refused the tunnel reads, Refresh succeeds without an error toast', async () => {
+  const failure = spyOn(toast, 'error').mockImplementation(() => 'id')
+  const denied = () =>
+    jsonResponse({ title: 'Access denied', detail: 'settings:read' }, 403)
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  const view = renderTable(client, {
+    'GET /ingress/connectors': denied,
+    'GET /ingress/hostnames': denied,
+  })
+  await waitFor(() =>
+    expect(
+      client
+        .getQueryCache()
+        .findAll()
+        .filter((q) => q.state.status === 'error')
+    ).toHaveLength(2)
+  )
+
+  fireEvent.click(view.getByRole('button', { name: 'Refresh' }))
+
+  await view.findByText('Updated just now')
+  expect(failure).not.toHaveBeenCalled()
 })
 
 test('a real failure of the tunnel reads is still reported, not shown as an empty list', async () => {

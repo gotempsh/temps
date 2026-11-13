@@ -13,6 +13,7 @@ import { EmailsSentList } from '@/components/email/EmailsSentList'
 import { PageContainer, PageHeader } from '@/components/layout/PageContainer'
 import { SdkDocumentation } from '@/components/email/SdkDocumentation'
 import { PublicIngressNotice } from '@/components/settings/PublicIngressNotice'
+import { RefreshButton } from '@/components/ui/refresh-button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
@@ -57,6 +58,20 @@ export function Email() {
       <PageHeader
         title="Email"
         description="Send email from your own domains, and see what happened to each one."
+        actions={
+          activeTab === 'overview' ? (
+            <RefreshButton
+              queryKeys={[
+                ['email-stats'],
+                ['email-event-stats'],
+                ['email-domains'],
+                ['email-providers'],
+                ['emails'],
+                ['all-email-events'],
+              ]}
+            />
+          ) : undefined
+        }
       />
 
       <PublicIngressNotice title="Opens, clicks and delivery events will not be recorded" />

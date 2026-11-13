@@ -7,10 +7,15 @@ import { MonitorPathForm } from './MonitorPathForm'
 import { ProjectResponse, StatusBucket } from '@/api/client'
 import {
   getBucketedStatusOptions,
+  getBucketedStatusQueryKey,
   getCurrentMonitorStatusOptions,
+  getCurrentMonitorStatusQueryKey,
   getMonitorOptions,
+  getMonitorQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
 import { Badge } from '@/components/ui/badge'
+import { RefreshButton } from '@/components/ui/refresh-button'
+import { queryKeyPrefix } from '@/lib/refresh'
 import { Button } from '@/components/ui/button'
 import {
   Card,
@@ -28,6 +33,7 @@ import {
   PopoverTrigger,
 } from '@/components/ui/popover'
 import { useQuery } from '@tanstack/react-query'
+import { Callout } from '@temps-sdk/ds'
 import {
   Activity,
   AlertCircle,
@@ -35,7 +41,7 @@ import {
   Clock,
   TrendingUp,
 } from 'lucide-react'
-import { useMemo, useState, useRef } from 'react'
+import { useMemo, useReducer, useState, useRef } from 'react'
 import { Link, useParams } from 'react-router'
 import { reachabilityPath } from '@/lib/reachability-page'
 import { format, subDays } from 'date-fns'
@@ -47,6 +53,7 @@ import {
   formatUptime,
   unknownTimeNote,
 } from '@/lib/monitor-uptime'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 interface MonitorDetailProps {
   project: ProjectResponse
@@ -193,8 +200,11 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
   const [dateRange, setDateRange] = useState<DateRange | undefined>(undefined)
   const [hoveredBucket, setHoveredBucket] = useState<number | null>(null)
 
+  // Refresh moves a preset window ("Last 24 hours") to now.
+  const [windowMoves, moveWindow] = useReducer((n: number) => n + 1, 0)
   // Memoize start and end dates to prevent unnecessary refetches
   const { startDate, endDate } = useMemo(() => {
+    void windowMoves
     const now = new Date()
     if (activeFilter === 'custom' && dateRange) {
       return {
@@ -237,7 +247,7 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
         }
       }
     }
-  }, [activeFilter, dateRange])
+  }, [activeFilter, dateRange, windowMoves])
 
   // Resolution is derived from the selected range — no standalone selector,
   // so there are no invalid (range × granularity) combinations.
@@ -251,6 +261,7 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
     isLoading: isLoadingMonitor,
     error: monitorError,
     refetch: refetchMonitor,
+    isFetching: isFetchingMonitor,
   } = useQuery({
     ...getMonitorOptions({
       path: {
@@ -264,7 +275,7 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
     isLoading: isLoadingCurrentMonitorStatus,
     error: currentMonitorStatusError,
     refetch: refetchCurrentMonitorStatus,
-  } = useQuery({
+  } = useWindowQuery({
     ...getCurrentMonitorStatusOptions({
       path: {
         monitor_id: parseInt(monitorId || '0'),
@@ -281,7 +292,7 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
     isLoading: isLoadingStatus,
     error: statusError,
     refetch: refetchStatus,
-  } = useQuery({
+  } = useWindowQuery({
     ...getBucketedStatusOptions({
       path: {
         monitor_id: parseInt(monitorId || '0'),
@@ -309,7 +320,12 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
     [currentMonitorStatus]
   )
 
-  if (monitorError || currentMonitorStatusError) {
+  // A failed refresh keeps the loaded page (and the path form); only data
+  // that never loaded is replaced by the error.
+  if (
+    (monitorError && !monitor) ||
+    (currentMonitorStatusError && !currentMonitorStatus)
+  ) {
     return (
       <div>
         <ErrorAlert
@@ -367,6 +383,19 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
 
   return (
     <div className="space-y-6">
+      {monitorError ? (
+        <Callout tone="error" title="Couldn't refresh monitor">
+          Showing the last loaded monitor.{' '}
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => void refetchMonitor()}
+            disabled={isFetchingMonitor}
+          >
+            Retry monitor
+          </Button>
+        </Callout>
+      ) : null}
       {/* Header */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-4">
@@ -387,9 +416,23 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
             </p>
           </div>
         </div>
-        <Badge variant={monitor.is_active ? 'default' : 'secondary'}>
-          {monitor.is_active ? 'Active' : 'Inactive'}
-        </Badge>
+        <div className="flex items-center gap-2">
+          <RefreshButton
+            queryKeys={[
+              getMonitorQueryKey({ path: { monitor_id: monitor.id } }),
+              queryKeyPrefix(getCurrentMonitorStatusQueryKey, {
+                path: { monitor_id: monitor.id },
+              }),
+              queryKeyPrefix(getBucketedStatusQueryKey, {
+                path: { monitor_id: monitor.id },
+              }),
+            ]}
+            onRefresh={moveWindow}
+          />
+          <Badge variant={monitor.is_active ? 'default' : 'secondary'}>
+            {monitor.is_active ? 'Active' : 'Inactive'}
+          </Badge>
+        </div>
       </div>
 
       {/* Date Range Filter */}
