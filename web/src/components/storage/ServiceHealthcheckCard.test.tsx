@@ -9,14 +9,18 @@ import {
   render,
   waitFor,
 } from '@testing-library/react'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router'
+import { getServiceHealthcheckQueryKey } from '@/api/client/@tanstack/react-query.gen'
 import type {
   HealthcheckOverrides,
   HealthcheckTimings,
   ServiceHealthcheck,
 } from '@/api/client/types.gen'
 import { installBrowserWindow } from '@/test/dom'
+import { jsonResponse, mockApi } from '@/test/fetch-mock'
 import {
+  ServiceHealthcheckCard,
   ServiceHealthcheckView,
   type ServiceHealthcheckViewProps,
 } from './ServiceHealthcheckCard'
@@ -343,4 +347,81 @@ test('a failed save is shown beside Save and cleared by the next edit', async ()
     target: { value: '90' },
   })
   await waitFor(() => expect(onEdit).toHaveBeenCalled())
+})
+
+test("a save that finishes after another service's page opened stays with its own service", async () => {
+  const other: ServiceHealthcheck = {
+    ...STANDALONE,
+    service_id: 8,
+    service_name: 'sessions-cache',
+    overrides: { ...NO_OVERRIDES, interval_secs: 300 },
+  }
+  const saved: ServiceHealthcheck = {
+    ...STANDALONE,
+    overrides: { ...NO_OVERRIDES, interval_secs: 120 },
+  }
+  let finishSave: (response: Response) => void = () => {}
+  const api = mockApi({
+    'GET /external-services/7/healthcheck': () => jsonResponse(STANDALONE),
+    'GET /external-services/8/healthcheck': () => jsonResponse(other),
+    'PUT /external-services/7/healthcheck': () =>
+      new Promise<Response>((resolve) => (finishSave = resolve)),
+  })
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  const card = (serviceId: number, serviceName: string) => (
+    <QueryClientProvider client={queryClient}>
+      <MemoryRouter>
+        <ServiceHealthcheckCard
+          serviceId={serviceId}
+          serviceName={serviceName}
+        />
+      </MemoryRouter>
+    </QueryClientProvider>
+  )
+  try {
+    const rendered = render(card(7, 'orders-cache'))
+    const interval = (await rendered.findByLabelText(
+      'Interval (s)'
+    )) as HTMLInputElement
+    fireEvent.change(interval, { target: { value: '120' } })
+    await act(async () => {
+      fireEvent.click(rendered.getByRole('button', { name: 'Save overrides' }))
+    })
+    await waitFor(() =>
+      expect(api.called('PUT', '/external-services/7/healthcheck')).toBe(true)
+    )
+
+    // The page moves to another service while the save is in flight.
+    rendered.rerender(card(8, 'sessions-cache'))
+    await waitFor(() =>
+      expect(
+        (rendered.getByLabelText('Interval (s)') as HTMLInputElement).value
+      ).toBe('300')
+    )
+    // Its fields are not locked by the other service's save.
+    expect(
+      (rendered.getByLabelText('Interval (s)') as HTMLInputElement).disabled
+    ).toBe(false)
+
+    await act(async () => finishSave(jsonResponse(saved)))
+    const key = (id: number) => getServiceHealthcheckQueryKey({ path: { id } })
+    await waitFor(() =>
+      expect(
+        queryClient.getQueryData<ServiceHealthcheck>(key(7))?.overrides
+          .interval_secs
+      ).toBe(120)
+    )
+    expect(
+      queryClient.getQueryData<ServiceHealthcheck>(key(8))?.overrides
+        .interval_secs
+    ).toBe(300)
+    expect(
+      (rendered.getByLabelText('Interval (s)') as HTMLInputElement).value
+    ).toBe('300')
+  } finally {
+    api.restore()
+    queryClient.clear()
+  }
 })

@@ -6,6 +6,7 @@
 //! mirrored into the registry the engines read when they create a container.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::Serialize;
 use temps_config::{ConfigService, ManagedServiceHealthcheckSettings};
@@ -13,7 +14,7 @@ use temps_providers_core::externalsvc::recreate_guard::ManagedEngine;
 use temps_providers_core::healthcheck::{
     self, registry, HealthcheckOverrides, HealthcheckTimings, ResolvedHealthcheck,
 };
-use tracing::info;
+use tracing::{info, warn};
 use utoipa::ToSchema;
 
 use super::manager::HEALTHCHECK_WRITES;
@@ -124,6 +125,12 @@ pub fn validate_instance_default(
     Ok(())
 }
 
+/// How often [`HealthcheckDefaultsService::spawn_registry_refresh`] reads
+/// the saved healthcheck settings back into this process's registry. A save
+/// publishes to the registry of the process that made it; another process
+/// sharing the database gets it within this long.
+pub const REGISTRY_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+
 /// Reads and writes the instance default.
 pub struct HealthcheckDefaultsService {
     config: Arc<ConfigService>,
@@ -187,6 +194,53 @@ impl HealthcheckDefaultsService {
             "Managed service healthcheck defaults saved; applied when containers are next created"
         );
         Ok(HealthcheckDefaultsUpdate { previous, current })
+    }
+
+    /// Replace this process's registry with the saved instance default and
+    /// every service's saved overrides, including what another process
+    /// saved. Under [`HEALTHCHECK_WRITES`], so a save in this process cannot
+    /// be overwritten by a read taken before it committed.
+    ///
+    /// When the settings cannot be read, the registry keeps the instance
+    /// default it has, and the service overrides are still read.
+    pub async fn reload_registry(&self) -> Result<usize, ExternalServiceError> {
+        let _writes = HEALTHCHECK_WRITES.lock().await;
+        let instance = match self.config.get_settings().await {
+            Ok(settings) => overrides_from_settings(settings.managed_service_healthchecks),
+            Err(error) => {
+                warn!(
+                    %error,
+                    "Could not read the managed service healthcheck defaults; keeping the last \
+                     loaded instance default until the next refresh"
+                );
+                registry::instance_default()
+            }
+        };
+        self.services.load_healthcheck_registry(instance).await
+    }
+
+    /// Reload the registry every [`REGISTRY_REFRESH_INTERVAL`], for the life
+    /// of the process. Each pass is one cached settings read and one query
+    /// returning only the services with an override (none on a default
+    /// install). A failed pass is logged and retried on the next one.
+    pub fn spawn_registry_refresh(self: &Arc<Self>) {
+        let service = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut ticks = tokio::time::interval(REGISTRY_REFRESH_INTERVAL);
+            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // The first tick completes at once; startup has just loaded it.
+            ticks.tick().await;
+            loop {
+                ticks.tick().await;
+                if let Err(error) = service.reload_registry().await {
+                    warn!(
+                        %error,
+                        "Could not refresh the managed service healthcheck overrides; keeping \
+                         the last loaded ones until the next refresh"
+                    );
+                }
+            }
+        });
     }
 }
 

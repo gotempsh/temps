@@ -186,7 +186,7 @@ export function ServiceHealthcheckView({
         onEdit={onEdit}
       />
 
-      <div className="flex flex-col gap-3 rounded-lg border p-4 sm:flex-row sm:items-center sm:justify-between">
+      <div className="flex flex-col gap-3 border-t pt-4 sm:flex-row sm:items-center sm:justify-between">
         <div className="min-w-0 space-y-1">
           <p className="text-sm font-medium">{APPLY_ON_RECREATE}</p>
           <p className="text-xs text-muted-foreground">
@@ -266,11 +266,17 @@ export function ServiceHealthcheckCard({
     getServiceHealthcheckOptions({ path: { id: serviceId } })
   )
 
+  // The card is reused when another service's page opens, and a request
+  // still in flight then finishes with this render's callbacks: each one
+  // writes to the service it was sent for, captured when it was sent.
+  const target = () => ({ serviceName, queryKey })
+
   const save = useMutation({
     ...updateServiceHealthcheckMutation(),
-    onSuccess: (result) => {
-      queryClient.setQueryData(queryKey, result)
-      toast.success(`Health check settings saved for ${serviceName}`, {
+    onMutate: target,
+    onSuccess: (result, _variables, sent) => {
+      queryClient.setQueryData(sent.queryKey, result)
+      toast.success(`Health check settings saved for ${sent.serviceName}`, {
         description: APPLY_ON_RECREATE,
       })
     },
@@ -278,23 +284,40 @@ export function ServiceHealthcheckCard({
       toast.error('Could not save the health check settings', {
         description: problemDetail(error, 'The settings were not changed.'),
       }),
-    onSettled: () => void queryClient.invalidateQueries({ queryKey }),
+    onSettled: (_data, _error, _variables, sent) => {
+      if (sent) void queryClient.invalidateQueries({ queryKey: sent.queryKey })
+    },
   })
 
   const apply = useMutation({
     ...applyServiceHealthcheckMutation(),
-    onSuccess: (result) => {
+    onMutate: target,
+    onSuccess: (result, _variables, sent) => {
       // Null when it could not be read back; onSettled reads it again.
       if (result.healthcheck)
-        queryClient.setQueryData(queryKey, result.healthcheck)
-      toast.success(`${serviceName} was recreated with its health check`)
+        queryClient.setQueryData(sent.queryKey, result.healthcheck)
+      toast.success(`${sent.serviceName} was recreated with its health check`)
     },
-    onError: (error) =>
-      toast.error(`Could not recreate ${serviceName}`, {
+    onError: (error, _variables, sent) =>
+      toast.error(`Could not recreate ${sent?.serviceName ?? serviceName}`, {
         description: problemDetail(error, 'The original container was kept.'),
       }),
-    onSettled: () => void queryClient.invalidateQueries({ queryKey }),
+    onSettled: (_data, _error, _variables, sent) => {
+      if (sent) void queryClient.invalidateQueries({ queryKey: sent.queryKey })
+    },
   })
+
+  // Another service's page: its form must not show this one's save as
+  // pending or failed.
+  const { reset: resetSave } = save
+  const { reset: resetApply } = apply
+  const seenService = useRef(serviceId)
+  useEffect(() => {
+    if (seenService.current === serviceId) return
+    seenService.current = serviceId
+    resetSave()
+    resetApply()
+  }, [serviceId, resetSave, resetApply])
 
   return (
     <Card>

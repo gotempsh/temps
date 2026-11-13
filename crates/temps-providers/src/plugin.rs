@@ -130,31 +130,25 @@ impl TempsPlugin for ProvidersPlugin {
             // with, loaded before routes serve so no create races them. Also
             // on a process without local workloads: the workload specs of
             // worker databases are computed here. Reads only rows with an
-            // override, so a default install reads none.
-            let config_service = context.require_service::<temps_config::ConfigService>();
-            let healthcheck_default = match config_service.get_settings().await {
-                Ok(settings) => {
-                    crate::services::overrides_from_settings(settings.managed_service_healthchecks)
+            // override, so a default install reads none. Reloaded
+            // periodically after that, so what another process sharing the
+            // database saves reaches the containers this one creates.
+            let healthcheck_defaults = Arc::new(crate::services::HealthcheckDefaultsService::new(
+                context.require_service::<temps_config::ConfigService>(),
+                external_service_manager.clone(),
+            ));
+            match healthcheck_defaults.reload_registry().await {
+                Ok(services) => {
+                    tracing::info!(services, "Loaded managed service healthcheck overrides")
                 }
-                Err(error) => {
-                    tracing::error!(
-                        error = %error,
-                        "Could not read the managed service healthcheck defaults; new \
-                         containers use the built-in timings until the next start"
-                    );
-                    Default::default()
-                }
-            };
-            if let Err(error) = external_service_manager
-                .load_healthcheck_registry(healthcheck_default)
-                .await
-            {
-                tracing::error!(
+                Err(error) => tracing::error!(
                     error = %error,
                     "Could not load the managed service healthcheck overrides; new containers \
-                     use the instance default until the next start"
-                );
+                     use the instance default until the next refresh"
+                ),
             }
+            healthcheck_defaults.spawn_registry_refresh();
+            context.register_service(healthcheck_defaults);
 
             if !local_workloads.local_workloads_enabled() {
                 tracing::info!(
@@ -381,10 +375,8 @@ impl TempsPlugin for ProvidersPlugin {
             crate::handlers::workload_handlers::configure_routes().with_state(app_state.clone());
         let server_tls_routes =
             crate::handlers::server_tls_handlers::configure_routes().with_state(app_state.clone());
-        let healthcheck_defaults = Arc::new(crate::services::HealthcheckDefaultsService::new(
-            context.require_service::<temps_config::ConfigService>(),
-            app_state.external_service_manager.clone(),
-        ));
+        let healthcheck_defaults =
+            context.require_service::<crate::services::HealthcheckDefaultsService>();
         let healthcheck_routes = crate::handlers::healthcheck_handlers::configure_routes()
             .with_state(Arc::new(
                 crate::handlers::healthcheck_handlers::HealthcheckState {

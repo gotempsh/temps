@@ -27,7 +27,7 @@ use temps_providers_core::healthcheck::{
     self, registry, HealthcheckOverrides, HealthcheckTimings, ResolvedHealthcheck,
     StartIntervalSupport,
 };
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use utoipa::ToSchema;
 
 use super::super::engine_selection::{EngineKind, EngineSelection};
@@ -603,8 +603,10 @@ impl ExternalServiceManager {
     }
 
     /// Load the instance default and every service that overrides its
-    /// healthcheck, so the engines create containers with them. Run once at
-    /// startup, before routes serve. Reads only rows with an override.
+    /// healthcheck, so the engines create containers with them. Run at
+    /// startup, before routes serve, and then periodically by
+    /// [`crate::services::HealthcheckDefaultsService::reload_registry`] to
+    /// pick up what other processes saved. Reads only rows with an override.
     ///
     /// The instance default is published first: when the services cannot be
     /// read, new containers still get it rather than the built-in timings.
@@ -637,7 +639,7 @@ impl ExternalServiceManager {
         }
         let count = entries.len();
         registry::replace_all(instance_default, entries);
-        info!(
+        debug!(
             services = count,
             "Loaded managed service healthcheck overrides"
         );

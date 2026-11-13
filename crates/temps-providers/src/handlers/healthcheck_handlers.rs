@@ -856,6 +856,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_reload_picks_up_what_another_process_saved() {
+        use temps_providers_core::healthcheck::registry;
+        let Some(database) = test_database("healthcheck registry reload test").await else {
+            return;
+        };
+        let db = database.connection_arc();
+        let row = insert_service(db.as_ref(), "cache-elsewhere", "redis", "standalone").await;
+        let app = state(db.clone(), RecordingAuditLogger::default());
+
+        // Another process saves both, publishing only to its own registry.
+        let mut active: external_services::ActiveModel = row.clone().into();
+        active.healthcheck_interval_secs = Set(Some(90));
+        active.update(db.as_ref()).await.expect("save the override");
+        let other_process = temps_config::ConfigService::new(
+            Arc::new(
+                temps_config::ServerConfig::new(
+                    "127.0.0.1:3000".to_string(),
+                    "postgresql://test".to_string(),
+                    None,
+                    Some("127.0.0.1:8000".to_string()),
+                )
+                .expect("ServerConfig::new"),
+            ),
+            db,
+        );
+        other_process
+            .update_managed_service_healthcheck_settings(|section| {
+                section.retries = Some(4);
+            })
+            .await
+            .expect("save the instance default");
+
+        let result = app.defaults.reload_registry().await;
+        let instance = registry::instance_default();
+        let service = registry::for_service(row.id);
+        // The registry is process-wide; put it back before asserting.
+        registry::set_instance_default(HealthcheckOverrides::default());
+        registry::clear_service(row.id);
+        assert_eq!(result.expect("reload"), 1);
+        assert_eq!(
+            instance,
+            HealthcheckOverrides {
+                retries: Some(4),
+                ..Default::default()
+            }
+        );
+        assert_eq!(service, interval(90));
+    }
+
+    #[tokio::test]
     async fn a_service_override_is_saved_audit_logged_and_shown_as_its_source() {
         let Some(database) = test_database("service healthcheck handler test").await else {
             return;
