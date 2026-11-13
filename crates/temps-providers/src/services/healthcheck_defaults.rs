@@ -8,6 +8,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
+
 use serde::Serialize;
 use temps_config::{ConfigService, ManagedServiceHealthcheckSettings};
 use temps_providers_core::externalsvc::recreate_guard::ManagedEngine;
@@ -126,10 +128,20 @@ pub fn validate_instance_default(
 }
 
 /// How often [`HealthcheckDefaultsService::spawn_registry_refresh`] reads
-/// the saved healthcheck settings back into this process's registry. A save
-/// publishes to the registry of the process that made it; another process
-/// sharing the database gets it within this long.
+/// what changed into this process's registry. A save publishes to the
+/// registry of the process that made it; another process sharing the
+/// database gets it within this long.
 pub const REGISTRY_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How far before the previous pass each pass looks back, so a row whose
+/// `updated_at` came from a process with a slower clock, or from a
+/// transaction that committed late, is still read.
+const REGISTRY_CHANGE_OVERLAP: Duration = Duration::from_secs(60);
+
+/// Every this many passes, reload the registry in full instead: a deleted
+/// service leaves no row to see, and a write that did not bump `updated_at`
+/// is caught here (every 10 minutes).
+const REGISTRY_RECOVERY_PASSES: u32 = 20;
 
 /// Reads and writes the instance default.
 pub struct HealthcheckDefaultsService {
@@ -196,16 +208,10 @@ impl HealthcheckDefaultsService {
         Ok(HealthcheckDefaultsUpdate { previous, current })
     }
 
-    /// Replace this process's registry with the saved instance default and
-    /// every service's saved overrides, including what another process
-    /// saved. Under [`HEALTHCHECK_WRITES`], so a save in this process cannot
-    /// be overwritten by a read taken before it committed.
-    ///
-    /// When the settings cannot be read, the registry keeps the instance
-    /// default it has, and the service overrides are still read.
-    pub async fn reload_registry(&self) -> Result<usize, ExternalServiceError> {
-        let _writes = HEALTHCHECK_WRITES.lock().await;
-        let instance = match self.config.get_settings().await {
+    /// The saved instance default, or the one the registry has when the
+    /// settings cannot be read.
+    async fn saved_instance_default(&self) -> HealthcheckOverrides {
+        match self.config.get_settings().await {
             Ok(settings) => overrides_from_settings(settings.managed_service_healthchecks),
             Err(error) => {
                 warn!(
@@ -215,14 +221,40 @@ impl HealthcheckDefaultsService {
                 );
                 registry::instance_default()
             }
-        };
+        }
+    }
+
+    /// Replace this process's registry with the saved instance default and
+    /// every service's saved overrides, including what another process
+    /// saved. Under [`HEALTHCHECK_WRITES`], so a save in this process cannot
+    /// be overwritten by a read taken before it committed.
+    ///
+    /// When the settings cannot be read, the registry keeps the instance
+    /// default it has, and the service overrides are still read.
+    pub async fn reload_registry(&self) -> Result<usize, ExternalServiceError> {
+        let _writes = HEALTHCHECK_WRITES.lock().await;
+        let instance = self.saved_instance_default().await;
         self.services.load_healthcheck_registry(instance).await
     }
 
-    /// Reload the registry every [`REGISTRY_REFRESH_INTERVAL`], for the life
-    /// of the process. Each pass is one cached settings read and one query
-    /// returning only the services with an override (none on a default
-    /// install). A failed pass is logged and retried on the next one.
+    /// Publish the saved instance default (a cached settings read) and the
+    /// overrides of every service row updated after `since`. Under
+    /// [`HEALTHCHECK_WRITES`], like [`Self::reload_registry`].
+    pub async fn reload_registry_changes(
+        &self,
+        since: DateTime<Utc>,
+    ) -> Result<usize, ExternalServiceError> {
+        let _writes = HEALTHCHECK_WRITES.lock().await;
+        registry::set_instance_default(self.saved_instance_default().await);
+        self.services.publish_healthcheck_changes_since(since).await
+    }
+
+    /// Keep the registry current for the life of the process. Every
+    /// [`REGISTRY_REFRESH_INTERVAL`] a pass reads only the service rows
+    /// updated since the previous one, so an idle instance reads none; every
+    /// [`REGISTRY_RECOVERY_PASSES`]th pass reloads in full, for deletions.
+    /// A failed pass is logged, and the next one looks back to the last
+    /// pass that succeeded.
     pub fn spawn_registry_refresh(self: &Arc<Self>) {
         let service = Arc::clone(self);
         tokio::spawn(async move {
@@ -230,14 +262,26 @@ impl HealthcheckDefaultsService {
             ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             // The first tick completes at once; startup has just loaded it.
             ticks.tick().await;
+            let overlap = chrono::Duration::from_std(REGISTRY_CHANGE_OVERLAP)
+                .unwrap_or_else(|_| chrono::Duration::seconds(60));
+            let mut since = Utc::now() - overlap;
+            let mut passes: u32 = 0;
             loop {
                 ticks.tick().await;
-                if let Err(error) = service.reload_registry().await {
-                    warn!(
+                passes = passes.wrapping_add(1);
+                let started = Utc::now();
+                let result = if passes.is_multiple_of(REGISTRY_RECOVERY_PASSES) {
+                    service.reload_registry().await
+                } else {
+                    service.reload_registry_changes(since).await
+                };
+                match result {
+                    Ok(_) => since = started - overlap,
+                    Err(error) => warn!(
                         %error,
                         "Could not refresh the managed service healthcheck overrides; keeping \
                          the last loaded ones until the next refresh"
-                    );
+                    ),
                 }
             }
         });

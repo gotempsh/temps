@@ -646,6 +646,52 @@ impl ExternalServiceManager {
         Ok(count)
     }
 
+    /// Publish the overrides of every service row updated after `since`,
+    /// and forget those of a changed row that no longer has any. Only a row
+    /// with an override has its parameters decrypted (for its container
+    /// name). Call it holding [`HEALTHCHECK_WRITES`]. Returns the rows read.
+    pub(crate) async fn publish_healthcheck_changes_since(
+        &self,
+        since: chrono::DateTime<Utc>,
+    ) -> Result<usize, ExternalServiceError> {
+        let rows = external_services::Entity::find()
+            .filter(external_services::Column::UpdatedAt.gt(since))
+            .all(self.db.as_ref())
+            .await?;
+        for row in &rows {
+            let overrides = service_overrides(row);
+            if overrides.is_empty() {
+                registry::clear_service(row.id);
+                continue;
+            }
+            let container_name = match self.healthcheck_target(row) {
+                Ok(target) => target.container_name,
+                Err(error) => {
+                    warn!(
+                        service_id = row.id,
+                        %error,
+                        "Could not resolve the container of a service with healthcheck \
+                         overrides; its control-plane container keeps the defaults until the \
+                         next refresh"
+                    );
+                    None
+                }
+            };
+            registry::set_service(registry::ServiceHealthcheckEntry {
+                service_id: row.id,
+                container_name,
+                overrides,
+            });
+        }
+        if !rows.is_empty() {
+            debug!(
+                services = rows.len(),
+                "Published changed managed service healthcheck overrides"
+            );
+        }
+        Ok(rows.len())
+    }
+
     /// Every service row with at least one healthcheck override (none on a
     /// default install).
     async fn services_with_healthcheck_overrides(

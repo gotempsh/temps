@@ -441,7 +441,8 @@ mod tests {
     use axum::body::Body;
     use axum::http::StatusCode;
     use sea_orm::{
-        ActiveModelTrait, DatabaseBackend, DatabaseConnection, EntityTrait, MockDatabase, Set,
+        ActiveModelTrait, ColumnTrait, DatabaseBackend, DatabaseConnection, EntityTrait,
+        MockDatabase, QueryFilter, Set,
     };
     use std::sync::Mutex;
     use temps_entities::external_services;
@@ -903,6 +904,65 @@ mod tests {
             }
         );
         assert_eq!(service, interval(90));
+    }
+
+    #[tokio::test]
+    async fn a_refresh_pass_reads_only_the_services_changed_since_the_last() {
+        use temps_providers_core::healthcheck::registry;
+        let Some(database) = test_database("healthcheck registry changes test").await else {
+            return;
+        };
+        let db = database.connection_arc();
+        let now = chrono::Utc::now();
+        let with_interval = |row: &external_services::Model, interval: i32| {
+            let mut active: external_services::ActiveModel = row.clone().into();
+            active.healthcheck_interval_secs = Set(Some(interval));
+            active
+        };
+        let changed = insert_service(db.as_ref(), "cache-changed", "redis", "standalone").await;
+        with_interval(&changed, 90)
+            .update(db.as_ref())
+            .await
+            .expect("save the changed override");
+        let untouched = insert_service(db.as_ref(), "cache-untouched", "redis", "standalone").await;
+        with_interval(&untouched, 120)
+            .update(db.as_ref())
+            .await
+            .expect("save the old override");
+        // Saved an hour ago. A bulk update, as the entity's save hook stamps
+        // `updated_at` with the current time.
+        external_services::Entity::update_many()
+            .col_expr(
+                external_services::Column::UpdatedAt,
+                sea_orm::sea_query::Expr::value(now - chrono::Duration::hours(1)),
+            )
+            .filter(external_services::Column::Id.eq(untouched.id))
+            .exec(db.as_ref())
+            .await
+            .expect("backdate the old override");
+        // Cleared by another process; this one still has it.
+        let cleared = insert_service(db.as_ref(), "cache-cleared", "redis", "standalone").await;
+        registry::set_service(registry::ServiceHealthcheckEntry {
+            service_id: cleared.id,
+            container_name: None,
+            overrides: interval(60),
+        });
+        let app = state(db, RecordingAuditLogger::default());
+
+        let result = app
+            .defaults
+            .reload_registry_changes(now - chrono::Duration::seconds(60))
+            .await;
+        let published = [changed.id, untouched.id, cleared.id].map(registry::for_service);
+        // The registry is process-wide; put it back before asserting.
+        for id in [changed.id, untouched.id, cleared.id] {
+            registry::clear_service(id);
+        }
+        registry::set_instance_default(HealthcheckOverrides::default());
+        assert_eq!(result.expect("refresh"), 2, "only the two changed rows");
+        assert_eq!(published[0], interval(90));
+        assert!(published[1].is_empty(), "not read: {:?}", published[1]);
+        assert!(published[2].is_empty(), "forgotten: {:?}", published[2]);
     }
 
     #[tokio::test]
