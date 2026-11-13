@@ -161,6 +161,8 @@ struct SnapshotRoute {
     /// leaves the route admitting its own project only.
     #[serde(default)]
     allowed_callers: Vec<temps_core::internal_access::InternalAccessCaller>,
+    #[serde(default)]
+    allowed_sandboxes: Vec<temps_core::internal_access::InternalAccessSandboxCaller>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -579,6 +581,7 @@ fn snapshot_route_into_entry(route: SnapshotRoute) -> RouteEntry {
         gate: route.gate,
         shield: route.shield,
         allowed_callers: route.allowed_callers,
+        allowed_sandboxes: route.allowed_sandboxes,
     }
 }
 
@@ -655,6 +658,7 @@ mod tests {
             gate: None,
             shield: None,
             allowed_callers: Vec::new(),
+            allowed_sandboxes: Vec::new(),
         }
     }
 

@@ -119,8 +119,11 @@ the number of the ADR they belong to; they do not take a number of their own.
 | [098](./098-internal-proxy-own-port.md) | The worker's internal proxy listens on its own port, and containers' port 80 is redirected to it | Proposed | amends [095](./095-internal-dns-observability.md) |
 | [099](./099-worker-backups-run-the-local-engines.md) | Backups of a worker's services run the local engines through its agent | Proposed | amends [055](./055-workload-plane-and-runtime-drivers.md); amended by [102](./102-scoped-s3-credentials-for-worker-jobs.md) |
 | [100](./100-control-plane-backup-without-docker.md) | The control-plane backup dumps with the local PostgreSQL client when there is no Docker | Accepted |  |
-| [101](./101-internal-access-grants.md) | Internal access grants let another project call a project's `*.temps.local` routes | Proposed |  |
+| [101](./101-internal-access-grants.md) | Internal access grants let another project call a project's `*.temps.local` routes | Proposed | amended by [105](./105-sandbox-internal-access.md) |
 | [102](./102-scoped-s3-credentials-for-worker-jobs.md) | A worker receives S3 credentials scoped to the job, never the source's own | Proposed | amends [099](./099-worker-backups-run-the-local-engines.md) |
+| [103](./103-general-access-vaults.md) | General access vaults with explicit consumer links | Proposed |  |
+| [104](./104-single-server-internal-routing.md) | A single-server control plane serves its own containers' `*.temps.local` names | Proposed |  |
+| [105](./105-sandbox-internal-access.md) | A sandbox can call a project's internal address when that project allows it | Proposed | amends [101](./101-internal-access-grants.md) |
 
 ## Supporting documents
 

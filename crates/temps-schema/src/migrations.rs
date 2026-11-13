@@ -201,8 +201,15 @@ pub async fn run_migrations(db: &DbConnection) -> SchemaResult<()> {
         };
     }
 
+    if status
+        .pending()
+        .iter()
+        .any(|name| name == temps_migrations::GENERAL_VAULT_MIGRATION)
+    {
+        crate::maintenance::prepare_consumer_constraints(db).await?;
+    }
     match timeout(MIGRATION_TIMEOUT, Migrator::up(db, None)).await {
-        Ok(Ok(())) => Ok(()),
+        Ok(Ok(())) => finish_vault_link_backfill(db).await,
         Ok(Err(e)) if is_lock_exhaustion(&e) => {
             // `Migrator::up` applies every pending migration and stops at the
             // failed one, whose transaction rolled back: it is the first one
@@ -227,6 +234,15 @@ pub async fn run_migrations(db: &DbConnection) -> SchemaResult<()> {
             MIGRATION_TIMEOUT.as_secs()
         ))
         .into()),
+    }
+}
+
+/// Finish authorization-data upgrades before exposing the migrated schema.
+/// Runs on every startup so an interrupted batch resumes even with no pending DDL.
+async fn finish_vault_link_backfill(db: &DbConnection) -> SchemaResult<()> {
+    match timeout(MIGRATION_TIMEOUT, temps_migrations::backfill_legacy_vault_links(db)).await {
+        Ok(result) => result.map_err(|error| ServiceError::Database(format!("Failed to backfill legacy vault links: {error}")).into()),
+        Err(_) => Err(ServiceError::Database("Legacy vault-link backfill exceeded 600 seconds; retry temps migrate to resume committed batches".into()).into()),
     }
 }
 
@@ -368,6 +384,12 @@ where
             .map(|migration| migration.name().to_string())
             .collect()
     };
+    if pending_names
+        .iter()
+        .any(|name| name == temps_migrations::GENERAL_VAULT_MIGRATION)
+    {
+        crate::maintenance::prepare_consumer_constraints(db).await?;
+    }
     // Only the newer-schema path applies migrations itself, so only it needs
     // the migration objects; `Migrator::up(db, Some(1))` finds its own.
     let newer_schema_migrations = if newer_schema {
@@ -449,6 +471,9 @@ where
         }
     }
 
+    if report.failed().is_none() {
+        finish_vault_link_backfill(db).await?;
+    }
     Ok(report)
 }
 

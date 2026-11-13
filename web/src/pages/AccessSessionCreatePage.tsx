@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 import { useEffect, useRef, useState } from 'react'
-import { Link, useNavigate, useParams } from 'react-router'
+import { Link, useNavigate, useParams, useSearchParams } from 'react-router'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useForm, useWatch } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
@@ -17,17 +17,23 @@ import {
   Status,
 } from '@temps-sdk/ds'
 import {
-  createAccessSession,
+  createAccessSessionGeneral,
+  createVaultLink,
   type AccessBundleResponse,
   type AccessServiceResponse,
 } from '@/api/client'
 import {
-  accessCapabilityOptions,
+  generalAccessCapabilityOptions,
+  getVaultEligibilityOptions,
+  getAccessVaultGeneralOptions,
   getAccessVaultOptions,
+  getSandboxOptions,
   listSandboxesOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { accessBundleOptions } from '@/components/service-access/access-bundle-query'
 import { ServiceProviderLogo } from '@/components/service-access/service-providers'
+import { formatLifetime } from '@/components/service-access/lifetime'
+import { isServiceAccessUnavailable } from '@/components/service-access/session-issue-error'
 import { sessionHref } from '@/components/service-access/session-navigation'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { problemDetail } from '@/lib/api-problem'
@@ -41,12 +47,12 @@ type Snapshot = {
   services: AccessServiceResponse[]
 }
 export default function AccessSessionCreatePage() {
-  const { projectId = '', vaultId = '', bundleId = '' } = useParams()
+  const { vaultId = '', bundleId = '', projectId } = useParams()
   return (
     <SessionCreate
       key={`${projectId}:${vaultId}:${bundleId}`}
-      projectId={Number(projectId)}
       vaultId={vaultId}
+      projectId={projectId === undefined ? undefined : Number(projectId)}
       bundleId={bundleId}
     />
   )
@@ -56,31 +62,44 @@ function SessionCreate({
   vaultId,
   bundleId,
 }: {
-  projectId: number
+  projectId?: number
   vaultId: string
   bundleId: string
 }) {
+  const [search] = useSearchParams()
+  const sandboxId = search.get('sandbox') ?? undefined
+  const consumerQuery = sandboxId
+    ? `?sandbox=${encodeURIComponent(sandboxId)}`
+    : ''
   const valid =
-    Number.isInteger(projectId) &&
-    projectId > 0 &&
-    projectId <= 2147483647 &&
     !!vaultId &&
-    !!bundleId
-  const base = `/vault/projects/${projectId}/vaults/${encodeURIComponent(vaultId)}`
-  const back = `${base}/bundles/${encodeURIComponent(bundleId)}`
+    !!bundleId &&
+    (projectId === undefined ||
+      (Number.isSafeInteger(projectId) && projectId > 0))
+  const base = `/vault${projectId === undefined ? '' : `/projects/${projectId}`}/vaults/${encodeURIComponent(vaultId)}`
+  const back = `${base}/bundles/${encodeURIComponent(bundleId)}${consumerQuery}`
   const bundle = useQuery({
-    ...accessBundleOptions(projectId, vaultId, bundleId),
+    ...accessBundleOptions(vaultId, bundleId, sandboxId, projectId),
     enabled: valid,
   })
-  const vault = useQuery({
-    ...getAccessVaultOptions({
-      path: { project_id: projectId, vault_id: vaultId },
+  const generalVault = useQuery({
+    ...getAccessVaultGeneralOptions({
+      path: { vault_id: vaultId },
+      query: sandboxId ? { sandbox_id: sandboxId } : undefined,
     }),
-    enabled: valid,
+    enabled: valid && projectId === undefined,
     refetchOnMount: 'always',
   })
+  const projectVault = useQuery({
+    ...getAccessVaultOptions({
+      path: { vault_id: vaultId, project_id: projectId ?? 0 },
+    }),
+    enabled: valid && projectId !== undefined,
+    refetchOnMount: 'always',
+  })
+  const vault = projectId === undefined ? generalVault : projectVault
   const capability = useQuery({
-    ...accessCapabilityOptions({ path: { project_id: projectId } }),
+    ...generalAccessCapabilityOptions(),
     enabled: valid,
   })
   const [snapshot, setSnapshot] = useState<Snapshot>()
@@ -102,12 +121,22 @@ function SessionCreate({
   useEffect(() => {
     setBreadcrumbs([
       { label: 'Vault', href: '/vault' },
-      { label: vault.data?.vault.name ?? 'Vault', href: base },
+      {
+        label: vault.data?.vault.name ?? 'Vault',
+        href: `${base}${consumerQuery}`,
+      },
       { label: bundle.data?.name ?? 'Access bundle', href: back },
       { label: 'Create session' },
     ])
     return () => setBreadcrumbs([])
-  }, [setBreadcrumbs, base, back, bundle.data?.name, vault.data?.vault.name])
+  }, [
+    setBreadcrumbs,
+    base,
+    back,
+    consumerQuery,
+    bundle.data?.name,
+    vault.data?.vault.name,
+  ])
   const error = bundle.error || vault.error || capability.error
   const canIssue =
     !error &&
@@ -145,15 +174,16 @@ function SessionCreate({
           )}
           {capability.data && !capability.data.can_manage_requests && (
             <Callout title="Approval permission required">
-              Project and sandbox write permissions are required to issue a
-              session.
+              Sandbox write permission and a covering vault link are required.
+              Project links also require project access.
             </Callout>
           )}
           {snapshot ? (
             <SessionForm
-              projectId={projectId}
               vaultId={vaultId}
+              initialSandboxId={sandboxId}
               snapshot={snapshot}
+              canManage={capability.data?.can_manage_services === true}
               canIssue={canIssue}
               back={back}
             />
@@ -166,15 +196,17 @@ function SessionCreate({
   )
 }
 function SessionForm({
-  projectId,
   vaultId,
   snapshot,
+  initialSandboxId,
+  canManage,
   canIssue,
   back,
 }: {
-  projectId: number
   vaultId: string
   snapshot: Snapshot
+  initialSandboxId?: string
+  canManage: boolean
   canIssue: boolean
   back: string
 }) {
@@ -190,7 +222,7 @@ function SessionForm({
   const [page, setPage] = useState(1)
   const sandboxes = useQuery({
     ...listSandboxesOptions({
-      query: { project_id: projectId, page, page_size: 20 },
+      query: { page, page_size: 20 },
     }),
     refetchInterval: 10000,
   })
@@ -200,15 +232,50 @@ function SessionForm({
   )
   const form = useForm<z.infer<typeof schema>>({
     resolver: zodResolver(schema),
-    defaultValues: { sandbox_id: '', ttl_seconds: Math.min(maxTtl, 900) },
+    defaultValues: {
+      sandbox_id: initialSandboxId ?? '',
+      ttl_seconds: Math.min(maxTtl, 900),
+    },
   })
   const selected = useWatch({ control: form.control, name: 'sandbox_id' })
+  // The session is approved for this sandbox, so it is always named here, even
+  // when it is not on the list page shown (a preselected older sandbox, or
+  // after paging away from the choice).
+  const selectedOnPage = sandboxes.data?.sandboxes.find(
+    (s) => s.id === selected
+  )
+  const selectedDetail = useQuery({
+    ...getSandboxOptions({ path: { id: selected } }),
+    enabled: !!selected && sandboxes.isSuccess && !selectedOnPage,
+    retry: false,
+  })
+  const target = selected
+    ? (selectedOnPage ?? selectedDetail.data?.sandbox)
+    : undefined
+  const eligibility = useQuery({
+    ...getVaultEligibilityOptions({
+      path: { vault_id: vaultId, sandbox_id: selected },
+    }),
+    enabled: !!selected,
+    retry: false,
+  })
+  const link = useMutation({
+    mutationFn: () =>
+      createVaultLink({
+        path: { vault_id: vaultId },
+        body: { sandbox_id: selected },
+        throwOnError: true,
+      }),
+    onSuccess: () => {
+      void eligibility.refetch()
+    },
+  })
   const consent = useRef<
     { fingerprint: string; requestId: string } | undefined
   >(undefined)
   const issue = useMutation({
     mutationFn: async (values: z.infer<typeof schema>) => {
-      if (!canIssue)
+      if (!canIssue || !eligibility.isSuccess || eligibility.isFetching)
         throw new Error(
           'Session approval is unavailable. Check your permissions and refresh.'
         )
@@ -227,15 +294,15 @@ function SessionForm({
       const fingerprint = JSON.stringify(body)
       if (consent.current?.fingerprint !== fingerprint)
         consent.current = { fingerprint, requestId: crypto.randomUUID() }
-      return createAccessSession({
-        path: { project_id: projectId, vault_id: vaultId },
+      return createAccessSessionGeneral({
+        path: { vault_id: vaultId },
         body: { ...body, request_id: consent.current.requestId },
         throwOnError: true,
       })
     },
     onSuccess: ({ data }) => {
       void client.invalidateQueries({
-        queryKey: [{ _id: 'listAccessSessions' }],
+        queryKey: [{ _id: 'listAccessSessionsGeneral' }],
       })
       void client.invalidateQueries({
         queryKey: [{ _id: 'listServiceGrants' }],
@@ -243,6 +310,13 @@ function SessionForm({
       if (mounted.current) navigate(sessionHref(data))
     },
   })
+  const { reset: resetIssue } = issue
+  useEffect(() => {
+    resetIssue()
+  }, [selected, resetIssue])
+  // This refusal is about the host or the sandbox image, so retrying the same
+  // request cannot work; say so and keep Approve inert until the choice changes.
+  const unavailable = issue.isError && isServiceAccessUnavailable(issue.error)
   const invalidBundle =
     snapshot.services.length === 0 ||
     snapshot.services.length > 16 ||
@@ -252,7 +326,15 @@ function SessionForm({
     <Settings
       title="Create session"
       saveLabel="Approve session"
-      dirty={canIssue && !invalidBundle && !sandboxes.isError}
+      dirty={
+        canIssue &&
+        eligibility.isSuccess &&
+        !eligibility.isFetching &&
+        !invalidBundle &&
+        !unavailable &&
+        !sandboxes.isError &&
+        target?.id === selected
+      }
       saving={issue.isPending}
       onCancel={() => {
         if (!issue.isPending) navigate(back)
@@ -264,21 +346,63 @@ function SessionForm({
       }}
     >
       <fieldset disabled={issue.isPending} className="space-y-6">
-        <div className="rounded-lg border p-4 space-y-3">
-          <h2 className="font-semibold">{snapshot.bundle.name}</h2>
+        <div className="space-y-3 rounded-lg border p-4">
+          <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
+            <h2 className="font-semibold">{snapshot.bundle.name}</h2>
+            <p className="text-xs text-muted-foreground">
+              Up to {formatLifetime(maxTtl)}
+            </p>
+          </div>
           {snapshot.services.map((s) => (
             <div key={s.id} className="flex items-start gap-3">
               <ServiceProviderLogo service={s} />
               <div className="min-w-0">
                 <p className="text-sm font-medium">{s.name}</p>
                 <p className="break-all text-xs text-muted-foreground">
-                  {s.policy.origin} · {s.policy.methods.join(', ')} ·{' '}
+                  {s.policy.origin}
+                </p>
+                <p className="break-all text-xs text-muted-foreground">
+                  {s.policy.methods.join(', ')} ·{' '}
                   {s.policy.path_prefixes.join(', ')}
                 </p>
               </div>
             </div>
           ))}
         </div>
+        {selected && eligibility.isError && (
+          <Callout title="Sandbox access needs a covering link">
+            {problemDetail(
+              eligibility.error,
+              'An administrator must link this sandbox or its project to this vault.'
+            )}
+            {canManage && (
+              <Button
+                type="button"
+                variant="outline"
+                disabled={link.isPending}
+                aria-busy={link.isPending}
+                onClick={() => link.mutate()}
+              >
+                Link this sandbox
+              </Button>
+            )}
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => void eligibility.refetch()}
+            >
+              Check again
+            </Button>
+          </Callout>
+        )}
+        {link.isError && (
+          <Callout tone="error" title="Could not link sandbox">
+            {problemDetail(
+              link.error,
+              'Check vault credential restrictions and retry.'
+            )}
+          </Callout>
+        )}
         {invalidBundle && (
           <Callout tone="error" title="Bundle cannot issue a sandbox session">
             Choose 1–16 enabled services with credentials, then return here to
@@ -292,7 +416,31 @@ function SessionForm({
             Vault.
           </p>
           {selected && (
-            <p className="text-xs break-all">Selected: {selected}</p>
+            <div className="rounded-md border bg-muted/40 p-3">
+              <p className="text-xs text-muted-foreground">Session for</p>
+              {target ? (
+                <>
+                  <p className="break-words text-sm font-medium">
+                    {target.name}
+                  </p>
+                  <p className="break-all font-mono text-xs text-muted-foreground">
+                    {target.id}
+                  </p>
+                  {!selectedOnPage && (
+                    <p className="text-xs text-muted-foreground">
+                      Not on the list page shown below.
+                    </p>
+                  )}
+                </>
+              ) : selectedDetail.isError ? (
+                <p className="break-all text-sm text-destructive">
+                  Could not load sandbox {selected}. Choose a sandbox from the
+                  list.
+                </p>
+              ) : (
+                <Skeleton className="mt-1 h-5 w-48" />
+              )}
+            </div>
           )}
           {sandboxes.isError && (
             <Callout tone="error" title="Could not load sandboxes">
@@ -328,14 +476,17 @@ function SessionForm({
                         : 'Resume this sandbox before issuing access'}
                     </span>
                   </span>
-                  <Status tone="idle" label={s.status} />
+                  <Status
+                    tone={s.status === 'running' ? 'ok' : 'idle'}
+                    label={s.status}
+                  />
                 </label>
               ))}
             </div>
           )}
           {sandboxes.data?.sandboxes.length === 0 && (
             <p className="text-sm text-muted-foreground">
-              No sandboxes in this project.{' '}
+              No sandboxes available.{' '}
               <Link to="/sandboxes" className="underline">
                 Create a sandbox
               </Link>
@@ -360,7 +511,7 @@ function SessionForm({
         </fieldset>
         <Field
           label="Session lifetime (seconds)"
-          description={`Maximum ${maxTtl / 60} minutes. This session cannot be extended; create a new one when it expires.`}
+          description={`Maximum ${formatLifetime(maxTtl)}. It cannot be extended; create a new session when it expires.`}
           error={form.formState.errors.ttl_seconds?.message}
         >
           {(props) => (
@@ -376,7 +527,15 @@ function SessionForm({
             />
           )}
         </Field>
-        {issue.isError && (
+        {unavailable && (
+          <Callout tone="error" title="This sandbox can't host service access">
+            {problemDetail(
+              issue.error,
+              'Service access needs a Linux host running Docker locally, or a worker node.'
+            )}
+          </Callout>
+        )}
+        {issue.isError && !unavailable && (
           <Callout tone="error" title="Could not issue session">
             {problemDetail(
               issue.error,

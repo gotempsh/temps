@@ -12,6 +12,13 @@ use std::time::Duration;
 use temps_core::{ServiceError, ServiceResult};
 use tracing::debug;
 
+mod access_vault_indexes;
+mod audit_scope_indexes;
+mod vault_audit_backfill;
+
+pub(crate) use access_vault_indexes::prepare_consumer_constraints;
+pub use vault_audit_backfill::{run_vault_audit_backfill, VaultAuditBackfillSummary};
+
 const PERMISSION_DENIED_RETENTION_INDEX: &str = "idx_audit_logs_permission_denied_retention";
 
 /// An index on a column that references `ip_geolocations` (or on
@@ -1098,8 +1105,12 @@ where
     // index does not hold back the other set until the next retry.
     let reference = build_reference_indexes(&mut *connection, on_progress).await;
     let foreign_keys = build_project_foreign_key_indexes(&mut *connection, on_progress).await;
+    let vaults = access_vault_indexes::build(connection, on_progress).await;
+    let audit_scopes = audit_scope_indexes::build(connection, on_progress).await;
     reference?;
     foreign_keys?;
+    vaults?;
+    audit_scopes?;
 
     Ok(())
 }

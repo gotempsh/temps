@@ -1404,6 +1404,7 @@ mod tests {
                             serde_json::json!({}),
                             &scope,
                             revision.as_deref(),
+                            temps_ai_api_tools::WriteApproval::OwnerInApp,
                         )
                         .await
                 };

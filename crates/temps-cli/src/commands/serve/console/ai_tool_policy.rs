@@ -21,19 +21,14 @@ use super::{ai_read_allowlist, ai_read_safe_posts, ai_write_allowlist};
 /// Operations withheld from the assistant, grouped by the reason they are.
 pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
     (
-        "vault, bundle and session administration is console-only; assistants use the scoped sandbox service operations",
+        "vault configuration is managed by instance administrators; general sessions have a separate human confirmation path",
         &[
-            "create_access_bundle",
-            "create_access_session",
-            "create_access_vault",
-            "get_access_session",
-            "get_access_vault",
-            "list_access_bundles",
-            "list_access_sessions",
-            "list_access_vaults",
-            "revoke_access_session",
-            "update_access_bundle",
-            "update_access_vault",
+            "create_access_bundle", "create_access_vault_general",
+            "update_access_bundle_general", "update_access_vault_general",
+            "delete_access_vault_general", "delete_access_bundle_general", "delete_access_service_general",
+            "create_access_service_general", "update_access_service_general",
+            "create_access_session", "create_access_vault", "get_access_session", "get_access_vault",
+            "list_access_bundles", "list_access_sessions", "list_access_vaults", "revoke_access_session", "update_access_bundle", "update_access_vault",
         ],
     ),
     (
@@ -58,13 +53,6 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
     (
         "granting plugin AI access is an operator decision behind step-up; the assistant must not enable its own tools",
         &["put_plugin_ai_tools"],
-    ),
-    (
-        "decides which projects may call another project's internal addresses (ADR 101), a network boundary between projects; the owner of the project being called sets it in the console, and revoking one cuts off a caller that depends on it",
-        &[
-            "create_internal_access_grant",
-            "delete_internal_access_grant",
-        ],
     ),
     (
         "revokes every visitor's gate session for an address; a security action the user takes themselves, behind step-up",

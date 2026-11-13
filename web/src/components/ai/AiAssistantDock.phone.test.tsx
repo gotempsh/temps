@@ -74,6 +74,9 @@ const originalMatchMedia = window.matchMedia
 const mediaListeners = new Set<() => void>()
 
 beforeEach(() => {
+  // The dock reopens the chat it last remembered (`temps.ai.activeChat` in
+  // localStorage), and storage outlives a test file: start from none.
+  localStorage.clear()
   // happy-dom never fires `change` on a MediaQueryList when the viewport
   // moves, so share one listener set and notify it from setViewport.
   window.matchMedia = ((query: string) => ({

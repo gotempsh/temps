@@ -35,6 +35,20 @@
 /// operation_id without duplicating the list — see `ai_tool_allowlist_tests`
 /// in the console (`temps-cli`), which checks it against the real API.
 pub const AI_READ_ALLOWLIST: &[&str] = &[
+    "get_vault_eligibility",
+    "sandbox_access_vaults",
+    "project_access_vaults",
+    "general_access_capability",
+    // Static provider metadata only; no saved credentials or configuration.
+    "service_catalog",
+    "list_access_services_general",
+    "get_access_service_general",
+    "list_access_vaults_general",
+    "get_access_vault_general",
+    "list_access_bundles_general",
+    "list_access_sessions_general",
+    "get_access_session_general",
+    "list_vault_links",
     // Vault metadata is masked; grants never return upstream credentials.
     "list_access_services",
     "get_access_service",
@@ -844,6 +858,13 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     // project and environment ids, names and a description, no credential.
     // ProjectsRead on the project, narrowed to it.
     "list_internal_access_grants",
+    // Which sandboxes may call a project's internal addresses (ADR 105):
+    // sandbox ids, labels and a description, no credential. ProjectsRead on
+    // the project, narrowed to it.
+    "list_internal_access_sandbox_grants",
+    // The internal hostnames and `curl` lines one of the caller's own
+    // sandboxes may use (ADR 105), no credential; scoped to that user.
+    "list_sandbox_internal_addresses",
     "get_ingress_settings",
     "get_rule",
     "get_workload_mode",
@@ -872,11 +893,39 @@ pub fn ai_read_allowlist() -> Vec<String> {
 /// site) so tests can assert it stays disjoint from `ai_read_safe_posts()`,
 /// which is the one rule holding up the read-only-POST mechanism.
 pub const AI_WRITE_ALLOWLIST: &[&str] = &[
+    "create_vault_link",
+    "delete_vault_link",
+    // A bundle only defines a service selection and lifetime; saving it grants
+    // nothing. It still needs explicit human confirmation like the link and the
+    // session, because the model picks the services and lifetime on the card.
+    "create_access_bundle_general",
+    "create_access_session_general",
+    "revoke_access_session_general",
     // Same scoped user authorization as the console, through the existing
     // assistant write policy. This does not let the agent change that policy.
     "request_sandbox_service",
     "approve_sandbox_service",
     "revoke_sandbox_service",
+    // ── Internal access (ADR 101, ADR 105 D8) ──
+    // Let one of the user's sandboxes call a project's *.temps.local
+    // addresses: what a sandbox's 403 "add sandbox … as a caller" asks for.
+    // Safe to propose: the handler holds the user to projects:write on the
+    // project and to owning that sandbox, and audits the grant as them. It
+    // widens network reach, so it is in HUMAN_CONSENT_OPERATIONS: only the
+    // owner's confirmation of that exact card in the console runs it, never
+    // a permission mode or an MCP confirm_action, so a prompt-injected agent
+    // in the sandbox cannot grant itself access.
+    "create_internal_access_sandbox_grant",
+    // Stop a sandbox calling a project. It only narrows reach; a DELETE is
+    // never approved automatically, so the user still confirms it.
+    "delete_internal_access_sandbox_grant",
+    // Let another project call this one's internal addresses. Same guards as
+    // the console (projects:write on the project being called, and being
+    // able to see the caller), and the same human-only consent as the
+    // sandbox grant above.
+    "create_internal_access_grant",
+    // Stop another project calling this one; confirmed like any DELETE.
+    "delete_internal_access_grant",
     // ── Deployment lifecycle (reversible / safe) ──
     // Redeploy the project from its configured branch —
     // what a "redeploy main" request maps to
@@ -1559,6 +1608,7 @@ mod sandbox_service_tests {
     #[test]
     fn chat_can_discover_and_manage_scoped_sandbox_access() {
         for operation in [
+            "service_catalog",
             "list_access_services",
             "get_access_service",
             "list_sandbox_services",
@@ -1574,5 +1624,34 @@ mod sandbox_service_tests {
             assert!(!AI_READ_ALLOWLIST.contains(&operation));
         }
         assert!(!AI_WRITE_ALLOWLIST.contains(&"confirm_pending_action"));
+    }
+
+    #[test]
+    fn chat_can_propose_internal_access_and_only_a_person_grants_it() {
+        for operation in [
+            "list_internal_access_grants",
+            "list_internal_access_sandbox_grants",
+            "list_sandbox_internal_addresses",
+        ] {
+            assert!(AI_READ_ALLOWLIST.contains(&operation), "{operation}");
+        }
+        for (operation, needs_consent) in [
+            ("create_internal_access_sandbox_grant", true),
+            ("create_internal_access_grant", true),
+            ("delete_internal_access_sandbox_grant", false),
+            ("delete_internal_access_grant", false),
+        ] {
+            assert!(AI_WRITE_ALLOWLIST.contains(&operation), "{operation}");
+            assert!(!AI_READ_ALLOWLIST.contains(&operation), "{operation}");
+            assert!(
+                !ai_read_safe_posts().iter().any(|safe| safe == operation),
+                "{operation}"
+            );
+            assert_eq!(
+                temps_core::ai_tool_call::requires_human_consent(operation),
+                needs_consent,
+                "{operation}"
+            );
+        }
     }
 }

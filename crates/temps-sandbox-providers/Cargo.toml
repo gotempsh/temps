@@ -66,8 +66,8 @@ tempfile = { workspace = true }
 microsandbox = { workspace = true }
 
 [dev-dependencies]
-tokenless-core = { git = "https://github.com/gotempsh/tokenless", rev = "03c94edcd6ec214164863540d7b372dac219b3ac" }
-tokenless-control = { git = "https://github.com/gotempsh/tokenless", rev = "03c94edcd6ec214164863540d7b372dac219b3ac" }
+tokenless-core = { git = "https://github.com/gotempsh/tokenless", rev = "1e2e2946e448dc4bb7c8f778241ad0279fc6bb34" }
+tokenless-control = { git = "https://github.com/gotempsh/tokenless", rev = "1e2e2946e448dc4bb7c8f778241ad0279fc6bb34" }
 temps-test-utils = { path = "../temps-test-utils" }
 # ADR-055 golden captures of the container-create request.
 temps-docker-capture = { path = "../temps-docker-capture" }

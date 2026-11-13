@@ -28,9 +28,9 @@ const vault: AccessVaultResponse = {
 test('vault edits send the selected version, keep existing members and preserve a rejected draft', async () => {
   let submitted: unknown
   const api = mockApi({
-    'GET /projects/7/access-services': () =>
+    'GET /access-services': () =>
       jsonResponse({ items: [], total: 0, page: 1, page_size: 20 }),
-    'PUT /projects/7/access-vaults/vault_test': async (request) => {
+    'PUT /access-vaults/vault_test': async (request) => {
       submitted = await request.json()
       return jsonResponse(
         { detail: 'Vault changed; reload before editing' },
@@ -93,7 +93,7 @@ test('vault fields stay disabled until a pending save completes', async () => {
   })
   let closed = false
   const api = mockApi({
-    'GET /projects/7/access-services': () =>
+    'GET /access-services': () =>
       jsonResponse({
         items: [
           {
@@ -106,7 +106,7 @@ test('vault fields stay disabled until a pending save completes', async () => {
         page: 1,
         page_size: 20,
       }),
-    'PUT /projects/7/access-vaults/vault_test': () => pending,
+    'PUT /access-vaults/vault_test': () => pending,
   })
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
@@ -162,13 +162,13 @@ test('a conflict preserves the draft until the user reviews and adopts the lates
   const versions: number[] = []
   let failRead = true
   const api = mockApi({
-    'GET /projects/7/access-services': () =>
+    'GET /access-services': () =>
       jsonResponse({ items: [], total: 0, page: 1, page_size: 20 }),
-    'GET /projects/7/access-vaults/vault_test': () =>
+    'GET /access-vaults/vault_test': () =>
       failRead
         ? jsonResponse({ detail: 'Try again' }, 503)
         : jsonResponse({ vault: saved, services: [] }),
-    'PUT /projects/7/access-vaults/vault_test': async (request) => {
+    'PUT /access-vaults/vault_test': async (request) => {
       const body = (await request.json()) as {
         name: string
         service_ids: string[]

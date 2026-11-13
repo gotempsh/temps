@@ -8,6 +8,7 @@ mod binding;
 pub use binding::{PreparedBinding, MAX_BINDING_GRANTS};
 mod policy;
 pub use policy::compile_policy;
+pub mod delivery;
 
 use std::collections::BTreeMap;
 
@@ -24,7 +25,7 @@ use crate::{error::AccessError, types::SandboxAccessPolicy};
 
 /// The immutable SDK contract this adapter is compiled against. Upgrading the
 /// dependency does not by itself enable live access.
-pub const SDK_REVISION: &str = "03c94edcd6ec214164863540d7b372dac219b3ac";
+pub const SDK_REVISION: &str = "1e2e2946e448dc4bb7c8f778241ad0279fc6bb34";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IntegrationBlocker {
@@ -50,7 +51,7 @@ pub const BLOCKERS: &[IntegrationBlocker] = &[
 /// Docker and microVM transports must resolve this before attaching streams.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BindingTarget {
-    pub project_id: i32,
+    pub project_id: Option<i32>,
     pub sandbox_id: i32,
     pub incarnation_id: Uuid,
     pub node_id: Uuid,
@@ -97,6 +98,7 @@ pub enum PreparationError {
 pub struct PreparedSession {
     target: BindingTarget,
     grant_id: String,
+    delivery: Option<crate::types::CredentialDelivery>,
     rule: RuleScope,
     claims: SessionClaims,
 }
@@ -116,12 +118,12 @@ impl PreparedSession {
             grant_id: request.grant_id.clone(),
             reason,
         };
-        if request.target.project_id <= 0
+        if request.target.project_id.is_some_and(|id| id <= 0)
             || request.target.sandbox_id <= 0
             || request.service_version <= 0
         {
             return Err(invalid(
-                "project ID, sandbox ID and service version must be positive",
+                "sandbox ID, service version and any project ID must be positive",
             ));
         }
         if [request.target.incarnation_id, request.target.node_id]
@@ -154,7 +156,7 @@ impl PreparedSession {
         // the absolute deadline. This does not claim the SDK cuts open streams.
         let ttl = u64::try_from(remaining.num_seconds())
             .map_err(|_| invalid("remaining lifetime cannot be represented"))?;
-        let (_, rule) =
+        let (policy, rule) =
             compile_policy(&request.policy).map_err(|source| PreparationError::Policy {
                 grant_id: request.grant_id.clone(),
                 source,
@@ -164,8 +166,11 @@ impl PreparedSession {
             operation,
             source,
         };
-        let scope = Scope::parse(&format!("temps:project:{}", request.target.project_id))
-            .map_err(|source| sdk("scope compilation", source))?;
+        let scope_name = match request.target.project_id {
+            Some(id) => format!("temps:project:{id}"),
+            None => format!("temps:sandbox:{}", request.target.sandbox_id),
+        };
+        let scope = Scope::parse(&scope_name).map_err(|source| sdk("scope compilation", source))?;
         let binding_id = request.target.incarnation_id.to_string();
         let labels = BTreeMap::from([
             ("grant_id".into(), request.grant_id.to_string()),
@@ -194,6 +199,7 @@ impl PreparedSession {
         Ok(Self {
             target: request.target,
             grant_id: request.grant_id.clone(),
+            delivery: policy.delivery,
             rule,
             claims,
         })
@@ -204,6 +210,10 @@ impl PreparedSession {
     }
     pub fn grant_id(&self) -> &str {
         &self.grant_id
+    }
+    /// How this grant's credential is sent; `None` is a plain bearer token.
+    pub fn delivery(&self) -> Option<&crate::types::CredentialDelivery> {
+        self.delivery.as_ref()
     }
     pub fn rule(&self) -> &RuleScope {
         &self.rule

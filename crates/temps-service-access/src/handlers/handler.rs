@@ -29,13 +29,89 @@ use temps_core::{
 use utoipa::OpenApi;
 
 #[derive(OpenApi)]
-#[openapi(paths(super::assignments::list_sandbox_services, super::assignments::request_sandbox_service, super::assignments::approve_sandbox_service, super::assignments::revoke_sandbox_service,super::sessions::list_access_sessions, super::sessions::get_access_session, super::sessions::create_access_session, super::sessions::revoke_access_session,super::vaults::list_access_vaults,super::vaults::get_access_vault,super::vaults::create_access_vault,super::vaults::update_access_vault,super::vaults::list_access_bundles,super::vaults::create_access_bundle,super::vaults::update_access_bundle,super::approval::approve_service_grant, access_capability, get_access_service, list_access_services, create_access_service, update_access_service, list_service_grants, request_service_grant, revoke_service_grant),
-    components(schemas(RequestSandboxService, ApproveSandboxService, RevokeSandboxService, SandboxServiceResponse, SandboxServiceList, SandboxServiceStatus,CreateAccessSession, AccessSessionConsumer, SessionServiceVersion, AccessSessionResponse, AccessSessionStatus, AccessSessionDetail, AccessSessionList,AccessVaultResponse, AccessVaultOverview, AccessVaultList, AccessVaultDetail, SaveAccessVault, AccessBundleResponse, AccessBundleList, SaveAccessBundle,ApproveServiceGrant, ServiceGrantApproval, AccessCapability, AccessCapabilityState, SandboxAccessPolicy, AccessMethod, SaveAccessService, AccessServiceResponse, AccessServiceList, RequestServiceGrant, RevokeServiceGrant, ServiceGrantResponse, ServiceGrantList, ServiceGrantStatus)),
+#[openapi(paths(super::general_services::service_catalog,super::links::get_vault_eligibility,super::general_services::delete_access_service_general,super::links::delete_access_vault_general,super::links::delete_access_bundle_general,super::links::sandbox_access_vaults,super::links::project_access_vaults,super::general_services::general_access_capability,super::general_services::list_access_services_general,super::general_services::get_access_service_general,super::general_services::create_access_service_general,super::general_services::update_access_service_general,super::general_sessions::list_access_sessions_general,super::general_sessions::get_access_session_general,super::general_sessions::create_access_session_general,super::general_sessions::revoke_access_session_general,super::links::list_vault_links,super::links::create_vault_link,super::links::delete_vault_link,super::general_vaults::list_access_vaults_general,super::general_vaults::get_access_vault_general,super::general_vaults::create_access_vault_general,super::general_vaults::update_access_vault_general,super::general_vaults::list_access_bundles_general,super::general_vaults::create_access_bundle_general,super::general_vaults::update_access_bundle_general,super::assignments::list_sandbox_services, super::assignments::request_sandbox_service, super::assignments::approve_sandbox_service, super::assignments::revoke_sandbox_service,super::sessions::list_access_sessions, super::sessions::get_access_session, super::sessions::create_access_session, super::sessions::revoke_access_session,super::vaults::list_access_vaults,super::vaults::get_access_vault,super::vaults::create_access_vault,super::vaults::update_access_vault,super::vaults::list_access_bundles,super::vaults::create_access_bundle,super::vaults::update_access_bundle,super::approval::approve_service_grant, access_capability, get_access_service, list_access_services, create_access_service, update_access_service, list_service_grants, request_service_grant, revoke_service_grant),
+    components(schemas(crate::link_types::CreateVaultLink,crate::link_types::VaultLinkResponse,crate::link_types::VaultLinkList,RequestSandboxService, ApproveSandboxService, RevokeSandboxService, SandboxServiceResponse, SandboxServiceList, SandboxServiceStatus,CreateAccessSession, AccessSessionConsumer, SessionServiceVersion, AccessSessionResponse, AccessSessionStatus, AccessSessionDetail, AccessSessionList,AccessVaultResponse, AccessVaultOverview, AccessVaultList, AccessVaultDetail, SaveAccessVault, AccessBundleResponse, AccessBundleList, SaveAccessBundle,ApproveServiceGrant, ServiceGrantApproval, AccessCapability, AccessCapabilityState, SandboxAccessPolicy, AccessMethod, SaveAccessService, AccessServiceResponse, AccessServiceList, RequestServiceGrant, RevokeServiceGrant, ServiceGrantResponse, ServiceGrantList, ServiceGrantStatus)),
     tags((name="Sandbox service access", description="Saved service policies and time-limited access requests; runtime integration is not installed")))]
 pub struct ServiceAccessApiDoc;
 
 pub fn configure_routes() -> Router<Arc<AccessAppState>> {
     Router::new()
+        .route(
+            "/service-access/catalog",
+            get(super::general_services::service_catalog),
+        )
+        .route(
+            "/access-vaults/{vault_id}/consumers/{sandbox_id}",
+            get(super::links::get_vault_eligibility),
+        )
+        .route(
+            "/sandboxes/{sandbox_id}/access-vaults",
+            get(super::links::sandbox_access_vaults),
+        )
+        .route(
+            "/projects/{project_id}/linked-vaults",
+            get(super::links::project_access_vaults),
+        )
+        .route(
+            "/service-access/capability",
+            get(super::general_services::general_access_capability),
+        )
+        .route(
+            "/access-services",
+            get(super::general_services::list_access_services_general)
+                .post(super::general_services::create_access_service_general),
+        )
+        .route(
+            "/access-services/{service_id}",
+            get(super::general_services::get_access_service_general)
+                .put(super::general_services::update_access_service_general)
+                .delete(super::general_services::delete_access_service_general),
+        )
+        .route(
+            "/access-sessions",
+            get(super::general_sessions::list_access_sessions_general),
+        )
+        .route(
+            "/access-sessions/{session_id}",
+            get(super::general_sessions::get_access_session_general),
+        )
+        .route(
+            "/access-sessions/{session_id}/revoke",
+            post(super::general_sessions::revoke_access_session_general),
+        )
+        .route(
+            "/access-vaults/{vault_id}/sessions",
+            post(super::general_sessions::create_access_session_general),
+        )
+        .route(
+            "/access-vaults/{vault_id}/links",
+            get(super::links::list_vault_links).post(super::links::create_vault_link),
+        )
+        .route(
+            "/access-vaults/{vault_id}/links/{link_id}",
+            axum::routing::delete(super::links::delete_vault_link),
+        )
+        .route(
+            "/access-vaults",
+            get(super::general_vaults::list_access_vaults_general)
+                .post(super::general_vaults::create_access_vault_general),
+        )
+        .route(
+            "/access-vaults/{vault_id}",
+            get(super::general_vaults::get_access_vault_general)
+                .put(super::general_vaults::update_access_vault_general)
+                .delete(super::links::delete_access_vault_general),
+        )
+        .route(
+            "/access-vaults/{vault_id}/bundles",
+            get(super::general_vaults::list_access_bundles_general)
+                .post(super::general_vaults::create_access_bundle_general),
+        )
+        .route(
+            "/access-vaults/{vault_id}/bundles/{bundle_id}",
+            axum::routing::put(super::general_vaults::update_access_bundle_general)
+                .delete(super::links::delete_access_bundle_general),
+        )
         .route(
             "/projects/{project_id}/sandboxes/{sandbox_id}/services",
             get(super::assignments::list_sandbox_services)
@@ -110,6 +186,21 @@ pub fn configure_routes() -> Router<Arc<AccessAppState>> {
 impl From<AccessError> for Problem {
     fn from(error: AccessError) -> Self {
         let (status, title) = match &error {
+            AccessError::VaultSessionRequired { .. } => (
+                StatusCode::CONFLICT,
+                "Vault service requires a bundle session",
+            ),
+            AccessError::UncoveredSandbox { .. } => {
+                (StatusCode::FORBIDDEN, "Sandbox is not linked to vault")
+            }
+            AccessError::GitLinkConflict { .. } => (
+                StatusCode::CONFLICT,
+                "GitHub credential source restricts this link",
+            ),
+            AccessError::Catalog { .. } => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Service catalog could not be loaded",
+            ),
             AccessError::NotFound { .. } => {
                 (StatusCode::NOT_FOUND, "Service access resource not found")
             }
@@ -123,7 +214,7 @@ impl From<AccessError> for Problem {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Service access delivery could not be queued",
             ),
-            AccessError::Database { .. } => (
+            AccessError::ResourceDatabase { .. } | AccessError::Database { .. } => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Service access storage failed",
             ),
@@ -150,15 +241,18 @@ impl From<AccessError> for Problem {
     }
 }
 
-pub(super) async fn audit(
+pub(super) async fn audit<'a>(
     state: &AccessAppState,
     auth: &temps_authz::AuthContext,
     metadata: RequestMetadata,
-    project_id: i32,
-    resource_id: &str,
+    project_id: impl Into<Option<i32>>,
+    resource: impl Into<super::audit::AuditResource<'a>>,
     version: i32,
     operation: &'static str,
 ) {
+    let project_id = project_id.into();
+    let resource = resource.into();
+    let resource_id = resource.id;
     let event = AccessAudit {
         context: AuditContext {
             user_id: auth.user_id(),
@@ -167,12 +261,14 @@ pub(super) async fn audit(
         },
         project_id,
         resource_id: resource_id.into(),
+        vault_id: resource.vault_id.map(str::to_owned),
+        service_scope_key: resource.service_scope_key,
         version,
         operation,
     };
     if state.audit_service.create_audit_log(&event).await.is_err() {
         tracing::error!(
-            project_id,
+            ?project_id,
             resource_id,
             operation,
             "Failed to record service access audit event"
@@ -206,7 +302,7 @@ pub async fn access_capability(
         &state.project_access_checker
     );
     let mut capability = state.service.capability();
-    capability.can_manage_services = permission_available(
+    let project_write = permission_available(
         async {
             project_permission_guard!(
                 auth,
@@ -218,7 +314,8 @@ pub async fn access_capability(
         }
         .await,
     )?;
-    capability.can_manage_requests = capability.can_manage_services
+    capability.can_manage_services = auth.is_admin() && project_write;
+    capability.can_manage_requests = project_write
         && permission_available(
             async {
                 project_permission_guard!(
@@ -299,6 +396,11 @@ pub async fn create_access_service(
     Json(request): Json<SaveAccessService>,
 ) -> Result<impl IntoResponse, Problem> {
     deny_deployment_token!(auth);
+    if !auth.is_admin() {
+        return Err(temps_core::error_builder::forbidden()
+            .detail("Vault management requires an instance administrator")
+            .build());
+    }
     project_scope_guard!(auth, project_id);
     project_permission_guard!(
         auth,
@@ -325,7 +427,7 @@ pub async fn create_access_service(
         &auth,
         metadata,
         project_id,
-        &response.id,
+        super::audit::AuditResource::service(&response.id, response.version),
         response.version,
         "SANDBOX_ACCESS_SERVICE_CREATED",
     )
@@ -344,6 +446,11 @@ pub async fn update_access_service(
     Json(request): Json<SaveAccessService>,
 ) -> Result<impl IntoResponse, Problem> {
     deny_deployment_token!(auth);
+    if !auth.is_admin() {
+        return Err(temps_core::error_builder::forbidden()
+            .detail("Vault management requires an instance administrator")
+            .build());
+    }
     project_scope_guard!(auth, project_id);
     project_permission_guard!(
         auth,
@@ -370,7 +477,7 @@ pub async fn update_access_service(
         &auth,
         metadata,
         project_id,
-        &response.id,
+        super::audit::AuditResource::service(&response.id, response.version),
         response.version,
         "SANDBOX_ACCESS_SERVICE_UPDATED",
     )

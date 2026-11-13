@@ -236,6 +236,9 @@ impl WorkerProxy {
             Capability::BindingUpdates,
             Capability::CredentialExpiry,
             Capability::RevocationAck,
+            // A sandbox must never read back the credential it was spared,
+            // e.g. from an upstream that echoes its request headers.
+            Capability::ResponseRedaction,
         ]) {
             plane.abort();
             return Err(RuntimeError::DataPlane {

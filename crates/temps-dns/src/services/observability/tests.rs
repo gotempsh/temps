@@ -641,3 +641,68 @@ async fn ingest_stores_state_log_and_counter_deltas() {
         .unwrap()
         .is_none());
 }
+
+/// ADR-104 D4: the control plane's internal routing is stored on node 0's
+/// report row next to its resolver report, survives the next ingest until it
+/// is rewritten, and clears when the control plane stops serving.
+#[tokio::test]
+async fn the_control_plane_internal_routing_is_stored_with_its_report() {
+    let Some(test_db) = test_db().await else {
+        return;
+    };
+    let db = test_db.connection_arc();
+    let store = Arc::new(RecordingStore::default());
+    let service = DnsObservabilityService::new(db.clone(), store);
+    let read = || async {
+        dns_resolver_reports::Entity::find_by_id(0)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap()
+            .internal_proxy
+    };
+
+    let t0 = chrono::SubsecRound::trunc_subsecs(Utc::now(), 6);
+    service
+        .ingest(
+            0,
+            ReportOutcome::Report(Box::new(report("inst-1", counters(1, 0, 10), Vec::new()))),
+            t0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(read().await, None, "a new row has nothing reported");
+
+    let serving = serde_json::json!({
+        "address": "172.20.0.1:80",
+        "listening": true,
+        "mode": "redirect",
+        "proxy_address": "172.20.0.1:591",
+        "redirect": "installed",
+    });
+    service
+        .record_control_plane_internal_proxy(Some(serving.clone()))
+        .await
+        .unwrap();
+    assert_eq!(read().await, Some(serving.clone()));
+
+    service
+        .ingest(
+            0,
+            ReportOutcome::Report(Box::new(report("inst-1", counters(2, 0, 20), Vec::new()))),
+            t0 + chrono::Duration::seconds(30),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        read().await,
+        Some(serving),
+        "an ingest keeps the stored state"
+    );
+
+    service
+        .record_control_plane_internal_proxy(None)
+        .await
+        .unwrap();
+    assert_eq!(read().await, None);
+}

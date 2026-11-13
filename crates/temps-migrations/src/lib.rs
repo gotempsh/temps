@@ -15,6 +15,10 @@
 )]
 pub use sea_orm_migration::prelude::*;
 
+mod general_vault_backfill;
+pub use general_vault_backfill::backfill_legacy_vault_links;
+mod vault_audit_backfill;
+pub use vault_audit_backfill::{backfill_vault_audit_attribution, VaultAuditBackfillSummary};
 mod migration;
 #[cfg(test)]
 mod migration_order;
@@ -28,6 +32,9 @@ pub use migration::m20260916_000001_reconcile_otel_trace_summaries::{
 };
 pub use migration::m20261107_000003_unique_custom_domain_hostname::Migration as UniqueCustomDomainHostnameMigration;
 pub use migration::m20261112_000001_seed_postgres_wal_archiving_alert_rules::Migration as SeedPostgresWalArchivingAlertRulesMigration;
+pub use migration::m20261113_000009_legacy_standalone_vault_coverage::Migration as LegacyStandaloneVaultCoverageMigration;
+pub use migration::m20261113_000010_legacy_vault_revocation_fence::Migration as LegacyVaultRevocationFenceMigration;
+pub use migration::m20261113_000011_vault_membership_fence::Migration as VaultMembershipFenceMigration;
 pub use migration::Migrator;
 
 pub use migration::m20261022_000001_dns_name_claims::{
@@ -93,4 +100,8 @@ pub use migration::m20261105_000001_project_data_purges::DETACHED_PARENTS as PRO
 /// `temps_schema::run_post_migration_indexes`, not inside the migration.
 pub use migration::m20261105_000001_project_data_purges::{
     fk_index_name as project_fk_index_name, FK_INDEXES as PROJECT_FK_INDEXES,
+};
+
+pub use migration::m20261113_000002_general_access_vaults::{
+    GENERAL_VAULT_CONSUMER_INDEXES, GENERAL_VAULT_MIGRATION,
 };

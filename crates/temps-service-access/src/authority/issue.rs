@@ -12,7 +12,7 @@ use temps_service_access_runtime::{
 use tokenless_core::{
     egress::EgressPolicy,
     ids::{CredentialId, NodeId},
-    injection::{InjectedHeader, InjectedHeaders},
+    injection::{InjectedHeader, InjectedHeaders, SecretMaterial},
     seal::{seal, SealPublicKey},
     session::SessionSigner,
     snapshot::{
@@ -195,22 +195,41 @@ impl AuthorityStore {
                     invalid(row.id, "seal grant credential", "grant rule is missing")
                 })?;
                 let credential_id = CredentialId(rule_id.0);
-                let headers = InjectedHeaders {
-                    headers: vec![InjectedHeader {
-                        name: "authorization".into(),
-                        value: if grant.rule().git.is_some() {
-                            use base64::Engine;
-                            let basic =
-                                Zeroizing::new(format!("x-access-token:{}", credential.expose()));
-                            format!(
-                                "Basic {}",
-                                base64::engine::general_purpose::STANDARD.encode(basic.as_bytes())
-                            )
-                        } else {
-                            format!("Bearer {}", credential.expose())
+                let (headers, strip_headers) = if grant.rule().git.is_some() {
+                    use base64::Engine;
+                    let basic = Zeroizing::new(format!("x-access-token:{}", credential.expose()));
+                    (
+                        InjectedHeaders {
+                            headers: vec![InjectedHeader::credential(
+                                "authorization",
+                                format!(
+                                    "Basic {}",
+                                    base64::engine::general_purpose::STANDARD
+                                        .encode(basic.as_bytes())
+                                ),
+                            )],
+                            substitutions: Vec::new(),
+                            // The worker redacts these from Git responses.
+                            secrets: vec![
+                                SecretMaterial::new(credential.expose()),
+                                SecretMaterial::new(basic.as_str()),
+                            ],
                         },
-                    }],
-                    substitutions: Vec::new(),
+                        vec![
+                            "authorization".to_string(),
+                            "proxy-authorization".to_string(),
+                            "cookie".to_string(),
+                        ],
+                    )
+                } else {
+                    crate::tokenless::delivery::render(grant.delivery(), credential.expose())
+                        .map_err(|_| {
+                            invalid(
+                                row.id,
+                                "render grant credential",
+                                "stored credential does not fit the service's credential format",
+                            )
+                        })?
                 };
                 let encoded = Zeroizing::new(serde_json::to_vec(&headers).map_err(|source| {
                     AuthorityError::Encoding {
@@ -229,11 +248,7 @@ impl AuthorityStore {
                     scope: grant.claims().scope.clone(),
                     credential_id,
                     allow: grant.rule().clone(),
-                    strip_headers: vec![
-                        "authorization".into(),
-                        "proxy-authorization".into(),
-                        "cookie".into(),
-                    ],
+                    strip_headers,
                     headers: sealed,
                     not_after: Some(grant.claims().exp),
                 });
@@ -338,15 +353,14 @@ pub(super) fn validate_bindings(
             let credential = binding.credentials.get(grant.grant_id()).ok_or_else(|| {
                 invalid(boot_id, "validate policy", "grant credential is missing")
             })?;
-            let value = credential.expose();
-            if value.is_empty()
-                || value.len() > 16384
-                || !value.bytes().all(|b| (33..=126).contains(&b))
-            {
+            if !crate::tokenless::delivery::credential_text_is_sendable(
+                grant.delivery(),
+                credential.expose(),
+            ) {
                 return Err(invalid(
                     boot_id,
                     "validate credential",
-                    "bearer credential must be 1 to 16384 printable non-space ASCII bytes",
+                    "credential must be 1 to 16384 bytes: printable non-space ASCII for a token, or text without control characters for a Basic password",
                 ));
             }
         }

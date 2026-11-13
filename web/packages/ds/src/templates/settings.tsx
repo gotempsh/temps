@@ -9,6 +9,7 @@ import { cn } from '../lib/cn'
 
 export interface SettingsProps {
   title: ReactNode
+  headerActions?: ReactNode
   description?: ReactNode
   /** Field-label -> message, e.g. from react-hook-form's `formState.errors`. */
   errors?: Record<string, string | undefined>
@@ -35,6 +36,7 @@ export interface SettingsProps {
  */
 export function Settings({
   title,
+  headerActions,
   description,
   errors = {},
   onSubmit,
@@ -50,6 +52,7 @@ export function Settings({
   const Container = embedded ? 'section' : PageContainer
   return (
     <Container
+      {...(!embedded ? { width: 'form' as const } : {})}
       className={cn(
         embedded &&
           'min-w-0 overflow-clip rounded-lg border bg-card text-card-foreground',
@@ -64,7 +67,11 @@ export function Settings({
           )}
         </div>
       ) : (
-        <PageHeader title={title} description={description} />
+        <PageHeader
+          title={title}
+          description={description}
+          actions={headerActions}
+        />
       )}
       <form
         onSubmit={(event) => {

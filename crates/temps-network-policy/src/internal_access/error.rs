@@ -40,6 +40,21 @@ pub enum InternalAccessError {
     )]
     TooManyGrants { project_id: i32, limit: u64 },
 
+    #[error(
+        "Sandbox {sandbox_id} not found among your sandboxes, or it has been destroyed; a \
+         grant can only name a sandbox you own"
+    )]
+    SandboxNotFound { sandbox_id: String },
+
+    #[error("Internal access sandbox grant {grant_id} not found on project {project_id}")]
+    SandboxGrantNotFound { project_id: i32, grant_id: i32 },
+
+    #[error("Project {target_project_id} already grants this scope to sandbox {sandbox_id}")]
+    DuplicateSandboxGrant {
+        target_project_id: i32,
+        sandbox_id: String,
+    },
+
     #[error("Grant description is {length} characters long; the most allowed is {max}")]
     DescriptionTooLong { length: usize, max: usize },
 

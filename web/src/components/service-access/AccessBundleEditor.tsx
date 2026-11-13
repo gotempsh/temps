@@ -8,8 +8,8 @@ import { z } from 'zod'
 import { Checkbox, Input } from '@temps-sdk/ui'
 import { Callout, Field, Settings } from '@temps-sdk/ds'
 import {
-  createAccessBundle,
-  updateAccessBundle,
+  createAccessBundleGeneral,
+  updateAccessBundleGeneral,
   type AccessBundleResponse,
   type AccessServiceResponse,
 } from '@/api/client'
@@ -24,14 +24,12 @@ const schema = z.object({
   ttl_seconds: z.number().int().min(60).max(86400),
 })
 export function AccessBundleEditor({
-  projectId,
   vaultId,
   services,
   onClose,
   canWrite,
   initialBundle,
 }: {
-  projectId: number
   vaultId: string
   services: AccessServiceResponse[]
   onClose: () => void
@@ -60,26 +58,26 @@ export function AccessBundleEditor({
   const selected = useWatch({ control: form.control, name: 'service_ids' })
   const save = useMutation({
     mutationFn: async (values: z.infer<typeof schema>) => {
-      if (!canWrite) throw new Error('Project write permission required')
+      if (!canWrite)
+        throw new Error('Instance administrator permission is required')
       if (initialSnapshot)
-        return updateAccessBundle({
+        return updateAccessBundleGeneral({
           path: {
-            project_id: projectId,
             vault_id: vaultId,
             bundle_id: initialSnapshot.id,
           },
           body: { ...values, expected_version: initialSnapshot.version },
           throwOnError: true,
         })
-      return createAccessBundle({
-        path: { project_id: projectId, vault_id: vaultId },
+      return createAccessBundleGeneral({
+        path: { vault_id: vaultId },
         body: values,
         throwOnError: true,
       })
     },
     onSuccess: () => {
       void client.invalidateQueries({
-        queryKey: [{ _id: 'listAccessBundles' }],
+        queryKey: [{ _id: 'listAccessBundlesGeneral' }],
       })
       if (!initialSnapshot) form.reset()
       if (mounted.current) onClose()
@@ -101,6 +99,11 @@ export function AccessBundleEditor({
         Services: form.formState.errors.service_ids?.message,
       }}
     >
+      {!canWrite && (
+        <p className="text-sm text-muted-foreground">
+          Instance administrator permission is required
+        </p>
+      )}
       <fieldset disabled={save.isPending} className="space-y-4">
         <Field label="Bundle name" error={form.formState.errors.name?.message}>
           {(props) => <Input {...form.register('name')} {...props} />}

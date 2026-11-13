@@ -71,6 +71,10 @@ async fn fresh_consent_database_failure_retains_project_and_operation() {
     let service = ServiceAccessService::new(
         Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
+                .append_exec_results([sea_orm::MockExecResult {
+                    rows_affected: 1,
+                    ..Default::default()
+                }])
                 .append_query_errors([sea_orm::DbErr::Custom("driver detail".into())])
                 .into_connection(),
         ),
@@ -118,6 +122,7 @@ async fn postgres_fresh_consent_is_scoped_atomic_bounded_and_preserves_retiremen
                     origin: "https://api.github.com".into(),
                     path_prefixes: vec!["/user".into()],
                     methods: vec![AccessMethod::Get],
+                    delivery: None,
                 },
                 max_ttl_seconds: 60,
                 enabled: true,
@@ -350,6 +355,7 @@ async fn worker_admission_rejects_overflow_and_legacy_rows_still_reconcile() {
                     origin: "https://api.github.com".into(),
                     path_prefixes: vec!["/user".into()],
                     methods: vec![AccessMethod::Get],
+                    delivery: None,
                 },
                 max_ttl_seconds: 60,
                 enabled: true,
@@ -373,10 +379,18 @@ async fn worker_admission_rejects_overflow_and_legacy_rows_still_reconcile() {
         )
         .await
         .unwrap();
+    // Give the healthy binding explicit priority; application-created and
+    // database-created timestamps must not assume identical clocks.
+    db.execute_unprepared(&format!(
+        "UPDATE sandbox_access_runtime_records SET created_at=now()-interval '1 minute' WHERE id='{}'",
+        healthy.runtime_id
+    ))
+    .await
+    .unwrap();
     // Seed historical open runtimes left behind by destroyed sandboxes.
     db.execute_unprepared("INSERT INTO sandboxes(id,public_id,name,user_id,project_id,status,backend) SELECT n,'sbx_capacity_'||n,'capacity',9601,9601,'destroyed','docker' FROM generate_series(10001,10128) n").await.unwrap();
     let boot = worker.identity().boot_id;
-    db.execute_unprepared(&format!("INSERT INTO sandbox_access_runtimes(id,project_id,sandbox_id,authority_id,provider_identity,provider_name,provider_backend) SELECT gen_random_uuid(),9601,id,'{boot}','container-'||id,'temps-sandbox-capacity_'||id,'docker' FROM sandboxes WHERE id BETWEEN 10001 AND 10127")).await.unwrap();
+    db.execute_unprepared(&format!("INSERT INTO sandbox_access_runtime_records(id,project_id,sandbox_id,authority_id,provider_identity,provider_name,provider_backend) SELECT gen_random_uuid(),9601,id,'{boot}','container-'||id,'temps-sandbox-capacity_'||id,'docker' FROM sandboxes WHERE id BETWEEN 10001 AND 10127")).await.unwrap();
     db.execute_unprepared("UPDATE sandboxes SET status='running' WHERE id=10128")
         .await
         .unwrap();
@@ -404,7 +418,7 @@ async fn worker_admission_rejects_overflow_and_legacy_rows_still_reconcile() {
         .unwrap();
     // Simulate an excess row accepted by an older version. Neither scheduling nor
     // planning may reject the entire worker before retiring these stale rows.
-    db.execute_unprepared(&format!("INSERT INTO sandbox_access_runtimes(id,project_id,sandbox_id,authority_id,provider_identity,provider_name,provider_backend) VALUES(gen_random_uuid(),9601,10128,'{boot}','container-extra','temps-sandbox-capacity_10128','docker')")).await.unwrap();
+    db.execute_unprepared(&format!("INSERT INTO sandbox_access_runtime_records(id,project_id,sandbox_id,authority_id,provider_identity,provider_name,provider_backend) VALUES(gen_random_uuid(),9601,10128,'{boot}','container-extra','temps-sandbox-capacity_10128','docker')")).await.unwrap();
     let queue = DeliveryQueue::new(db.clone());
     assert!(queue.schedule_due(16).await.unwrap().queued > 0);
     let planner = PolicyPlanner::new(
@@ -421,14 +435,16 @@ async fn worker_admission_rejects_overflow_and_legacy_rows_still_reconcile() {
     db.execute_unprepared("UPDATE sandboxes SET status='running' WHERE id BETWEEN 10001 AND 10128")
         .await
         .unwrap();
+    // Leave clock-skew headroom below the 60-second cap: this tests capacity,
+    // not equality between the database clock and the signing host's clock.
     db.execute_unprepared(&format!(r#"
 INSERT INTO sandbox_service_grants(id,project_id,service_id,sandbox_id,service_version,policy_snapshot,created_by,expires_at)
-SELECT 'grant_'||replace(gen_random_uuid()::text,'-',''),9601,g.service_id,r.sandbox_id,g.service_version,g.policy_snapshot,9601,now()+interval '60 seconds'
-FROM sandbox_access_runtimes r CROSS JOIN sandbox_service_grants g
+SELECT 'grant_'||replace(gen_random_uuid()::text,'-',''),9601,g.service_id,r.sandbox_id,g.service_version,g.policy_snapshot,9601,now()+interval '50 seconds'
+FROM sandbox_access_runtime_records r CROSS JOIN sandbox_service_grants g
 WHERE r.sandbox_id BETWEEN 10001 AND 10128 AND g.id='{}';
 INSERT INTO sandbox_access_authorizations(grant_id,request_id,requested_ttl,runtime_id,project_id,sandbox_id,approved_by)
 SELECT g.id,gen_random_uuid(),60,r.id,9601,r.sandbox_id,9601
-FROM sandbox_access_runtimes r JOIN sandbox_service_grants g ON g.sandbox_id=r.sandbox_id WHERE r.sandbox_id BETWEEN 10001 AND 10128;
+FROM sandbox_access_runtime_records r JOIN sandbox_service_grants g ON g.sandbox_id=r.sandbox_id WHERE r.sandbox_id BETWEEN 10001 AND 10128;
 "#, healthy.grant_id)).await.unwrap();
     let overflow = planner.prepare(boot).await.unwrap();
     assert_eq!(overflow.bindings.len(), 128);

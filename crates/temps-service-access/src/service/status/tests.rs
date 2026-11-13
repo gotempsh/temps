@@ -15,6 +15,7 @@ fn grant() -> ServiceGrantResponse {
             path_prefixes: vec!["/v1".into()],
             methods: vec![AccessMethod::Get],
             github_repository: None,
+            delivery: None,
         },
         status: ServiceGrantStatus::PendingApproval,
         reason: String::new(),

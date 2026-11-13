@@ -860,6 +860,10 @@ fn resolve_body_params(op: &Operation, openapi: &utoipa::openapi::OpenApi) -> Ve
             ty = "object".to_string();
         }
 
+        // An array of objects: say what one element looks like. The model
+        // cannot guess `{service_id, version}` from "<json array of objects>".
+        let item_shape = resolved_prop.and_then(|schema| array_item_shape(schema, openapi));
+
         // Description from the property schema.
         //
         // The `$ref` arm matters more than it looks. A property that points at a
@@ -872,6 +876,17 @@ fn resolve_body_params(op: &Operation, openapi: &utoipa::openapi::OpenApi) -> Ve
             RefOr::T(Schema::Object(prop_obj)) => prop_obj.description.clone(),
             RefOr::Ref(r) if !r.description.trim().is_empty() => Some(r.description.clone()),
             _ => None,
+        };
+
+        let description = match (description, item_shape) {
+            (description, Some(shape)) => {
+                let items = format!("each item is an {}", shape.describe());
+                Some(match description {
+                    Some(text) => format!("{text} ({items})"),
+                    None => items,
+                })
+            }
+            (description, None) => description,
         };
 
         params.push(ParamSpec {
@@ -1032,15 +1047,25 @@ fn variant_shape(
     item: &RefOr<Schema>,
     openapi: &utoipa::openapi::OpenApi,
 ) -> Option<(String, String, Vec<ObjectField>)> {
-    let Schema::AllOf(all_of) = deref_schema(item, openapi)? else {
-        return None;
+    // A newtype variant is an `allOf` of the payload `$ref` and the tag object.
+    // A struct variant (`Sandbox { sandbox_id }`) is one plain object that
+    // carries the tag next to its own fields.
+    let resolved = deref_schema(item, openapi)?;
+    let members: Vec<&Schema> = match resolved {
+        Schema::AllOf(all_of) => all_of
+            .items
+            .iter()
+            .filter_map(|member| deref_schema(member, openapi))
+            .collect(),
+        Schema::Object(_) => vec![resolved],
+        _ => return None,
     };
 
     let mut fields: Vec<ObjectField> = Vec::new();
     let mut tag: Option<(String, String)> = None;
 
-    for member in &all_of.items {
-        let Some(Schema::Object(o)) = deref_schema(member, openapi) else {
+    for member in members {
+        let Schema::Object(o) = member else {
             continue;
         };
         for field in object_fields(o, openapi) {
@@ -1064,6 +1089,19 @@ fn variant_shape(
 
     let (tag_prop, tag_value) = tag?;
     Some((tag_prop, tag_value, fields))
+}
+
+/// The shape of each item of an array of objects, so `--services` can say what
+/// one element looks like instead of only "a json array of objects".
+fn array_item_shape(schema: &Schema, openapi: &utoipa::openapi::OpenApi) -> Option<ObjectShape> {
+    use utoipa::openapi::schema::ArrayItems;
+    let Schema::Array(array) = schema else {
+        return None;
+    };
+    let ArrayItems::RefOrSchema(item) = &array.items else {
+        return None;
+    };
+    resolve_object_shape(item, openapi).filter(ObjectShape::is_informative)
 }
 
 /// Convert a single utoipa [`Parameter`] into a [`ParamSpec`].
@@ -2169,6 +2207,103 @@ mod tests {
             shape.describe().contains("\"kind\": \"static\""),
             "{}",
             shape.describe()
+        );
+    }
+
+    /// Found against a live model: `create_access_session_general` takes a
+    /// `consumer` that is an internally tagged enum whose variant is a struct
+    /// (`Sandbox { sandbox_id }`), which utoipa emits as a plain object, not an
+    /// `allOf`. The shape resolver only knew the `allOf` form, so `--help` showed
+    /// a bare string flag and the model sent `sandbox:sbx_x` and a quoted JSON
+    /// string; both were rejected with HTTP 422. The services list is an array
+    /// of objects whose element shape was equally invisible.
+    #[test]
+    fn struct_variant_union_and_array_items_are_described_for_the_model() {
+        // The schemas as utoipa emits them for the real request types.
+        let api: utoipa::openapi::OpenApi = serde_json::from_value(serde_json::json!({
+            "openapi": "3.1.0",
+            "info": {"title": "Test API", "version": "1.0.0"},
+            "paths": {
+                "/access-sessions": {
+                    "post": {
+                        "operationId": "create_access_session_general",
+                        "requestBody": {
+                            "required": true,
+                            "content": {"application/json": {"schema": {
+                                "$ref": "#/components/schemas/CreateAccessSession"
+                            }}}
+                        },
+                        "responses": {"201": {"description": "created"}}
+                    }
+                }
+            },
+            "components": {"schemas": {
+                "CreateAccessSession": {
+                    "type": "object",
+                    "required": ["bundle_id", "consumer", "services"],
+                    "properties": {
+                        "bundle_id": {"type": "string"},
+                        "consumer": {"$ref": "#/components/schemas/AccessSessionConsumer"},
+                        "services": {
+                            "type": "array",
+                            "description": "Exact policies the operator reviewed.",
+                            "items": {"$ref": "#/components/schemas/SessionServiceVersion"}
+                        }
+                    }
+                },
+                "AccessSessionConsumer": {
+                    "oneOf": [{
+                        "type": "object",
+                        "required": ["sandbox_id", "kind"],
+                        "properties": {
+                            "kind": {"type": "string", "enum": ["sandbox"]},
+                            "sandbox_id": {"type": "string"}
+                        }
+                    }]
+                },
+                "SessionServiceVersion": {
+                    "type": "object",
+                    "required": ["service_id", "version"],
+                    "properties": {
+                        "service_id": {"type": "string"},
+                        "version": {"type": "integer", "format": "int32"}
+                    }
+                }
+            }}
+        }))
+        .expect("the fragment parses");
+        let index = ReadOnlyApiIndex::from_openapi_write_allowlist(
+            &api,
+            &["create_access_session_general"],
+        );
+        let op = index
+            .get("create_access_session_general")
+            .expect("the operation is in the committed spec");
+
+        let consumer = op
+            .params
+            .iter()
+            .find(|p| p.name == "consumer")
+            .expect("consumer flag");
+        assert_eq!(consumer.ty, "object", "a quoted JSON flag must be decoded");
+        let shape = consumer
+            .object_shape
+            .as_ref()
+            .expect("the struct-variant union resolves");
+        assert_eq!(shape.discriminator.as_deref(), Some("kind"));
+        assert!(shape
+            .describe()
+            .contains("{\"kind\": \"sandbox\", \"sandbox_id\": <string>}"));
+
+        let services = op
+            .params
+            .iter()
+            .find(|p| p.name == "services")
+            .expect("services flag");
+        let description = services.description.as_deref().unwrap_or_default();
+        assert!(
+            description.contains("service_id") && description.contains("version"),
+            "{description}"
         );
     }
 

@@ -5,6 +5,7 @@ use super::{handler::audit, AccessAppState};
 use crate::{
     coordinator::CoordinatorError,
     service::FreshConsent,
+    transport::TransportError,
     types::{ApproveServiceGrant, RequestServiceGrant, ServiceGrantApproval},
 };
 use axum::{
@@ -30,6 +31,10 @@ impl From<CoordinatorError> for Problem {
             CoordinatorError::Invalid { .. } => {
                 (StatusCode::CONFLICT, "Sandbox service access changed")
             }
+            CoordinatorError::Transport(TransportError::Unsupported { .. }) => (
+                StatusCode::CONFLICT,
+                "Service access is unavailable for this sandbox",
+            ),
             CoordinatorError::Transport(_) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Sandbox worker could not confirm service access",
@@ -149,4 +154,33 @@ pub async fn approve_service_grant(
             expires_at: receipt.expires_at,
         }),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_unsupported_sandbox_is_a_conflict_that_names_the_fix_not_a_worker_outage() {
+        let problem = Problem::from(CoordinatorError::Transport(TransportError::Unsupported {
+            sandbox_id: "sbx_test".into(),
+            operation: "inspect",
+            reason: "needs a Linux Docker host".into(),
+        }));
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        let body = serde_json::to_value(&problem.body).unwrap();
+        assert!(body["detail"]
+            .as_str()
+            .unwrap()
+            .contains("needs a Linux Docker host"));
+    }
+
+    #[test]
+    fn a_masked_provider_failure_stays_a_service_unavailable() {
+        let problem = Problem::from(CoordinatorError::Transport(TransportError::Busy {
+            sandbox_id: "sbx_test".into(),
+            operation: "inspect",
+        }));
+        assert_eq!(problem.status_code, StatusCode::SERVICE_UNAVAILABLE);
+    }
 }

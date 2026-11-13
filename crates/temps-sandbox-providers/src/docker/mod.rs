@@ -50,7 +50,10 @@ mod provider;
 mod recover;
 mod snapshot;
 
-pub use egress::SANDBOX_MODEL_RELAY_BASE_URL;
+pub use egress::{
+    egress_proxy_sandbox, publish_internal_proxy_address, SANDBOX_EGRESS_NETWORK,
+    SANDBOX_MODEL_RELAY_BASE_URL,
+};
 pub use files::{
     directory_upload_files, stage_directory_upload, DirectoryUploadPlan, SkippedUploadEntry,
     UploadSkipReason,
@@ -62,8 +65,8 @@ pub use network::{sandbox_network_name, SANDBOX_PREVIEW_GATEWAY_LABEL};
 
 use egress::{
     recovered_container_matches_egress_policy, sandbox_container_environment,
-    sandbox_egress_proxy_name, sandbox_mcp_relay_url, SANDBOX_EGRESS_NETWORK,
-    SANDBOX_EGRESS_POLICY_LABEL, SANDBOX_EGRESS_POLICY_VERSION,
+    sandbox_egress_proxy_name, sandbox_mcp_relay_url, SANDBOX_EGRESS_POLICY_LABEL,
+    SANDBOX_EGRESS_POLICY_VERSION,
 };
 use exec::{
     agent_runtime_exec_config, has_harness_recovery_capability, runtime_health_exec_config,

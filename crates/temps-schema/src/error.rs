@@ -13,6 +13,23 @@ use thiserror::Error;
 /// PostgreSQL server (a setting and a restart), not in Temps or the data.
 #[derive(Debug, Error)]
 pub enum SchemaError {
+    #[error("Failed to validate access vault constraint '{constraint}' on '{table}': {reason}")]
+    VaultConstraint {
+        constraint: &'static str,
+        table: &'static str,
+        reason: String,
+    },
+    #[error("Failed to {operation} access vault index '{index}': {reason}")]
+    VaultIndex {
+        index: &'static str,
+        operation: &'static str,
+        reason: String,
+    },
+    #[error("Failed to attribute pre-migration audit events to their access vaults: {source}")]
+    VaultAuditBackfill {
+        #[source]
+        source: sea_orm::DbErr,
+    },
     #[error(transparent)]
     LockSlotsExhausted(Box<LockSlotsExhausted>),
 
@@ -32,6 +49,9 @@ impl From<SchemaError> for ServiceError {
     /// [`ServiceError::Configuration`] with the full advice as its message.
     fn from(error: SchemaError) -> Self {
         match error {
+            error @ (SchemaError::VaultIndex { .. }
+            | SchemaError::VaultConstraint { .. }
+            | SchemaError::VaultAuditBackfill { .. }) => ServiceError::Database(error.to_string()),
             // A server setting the operator has to change.
             SchemaError::LockSlotsExhausted(error) => ServiceError::Configuration {
                 message: error.to_string(),

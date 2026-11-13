@@ -11,10 +11,10 @@ import {
   PageContainer,
   Status,
 } from '@temps-sdk/ds'
-import { revokeAccessSession } from '@/api/client'
+import { revokeAccessSessionGeneral } from '@/api/client'
 import {
-  accessCapabilityOptions,
-  getAccessSessionOptions,
+  generalAccessCapabilityOptions,
+  getAccessSessionGeneralOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { ServiceProviderLogo } from '@/components/service-access/service-providers'
 import { useSessionClock } from '@/components/service-access/session-navigation'
@@ -24,57 +24,48 @@ import { problemDetail } from '@/lib/api-problem'
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 
 export default function AccessSessionDetailPage() {
-  const { projectId = '', vaultId = '', sessionId = '' } = useParams()
+  const { vaultId = '', sessionId = '' } = useParams()
   return (
     <SessionDetail
-      key={`${projectId}:${vaultId}:${sessionId}`}
-      projectId={Number(projectId)}
+      key={`${vaultId}:${sessionId}`}
       vaultId={vaultId}
       sessionId={sessionId}
     />
   )
 }
 function SessionDetail({
-  projectId,
   vaultId,
   sessionId,
 }: {
-  projectId: number
   vaultId: string
   sessionId: string
 }) {
-  const valid =
-    Number.isInteger(projectId) &&
-    projectId > 0 &&
-    projectId <= 2147483647 &&
-    !!sessionId &&
-    !!vaultId
-  const base = `/vault/projects/${projectId}/vaults/${encodeURIComponent(vaultId)}`
-  const back = `${base}?tab=sessions`
+  const valid = !!sessionId && !!vaultId
+  const base = `/vault/vaults/${encodeURIComponent(vaultId)}`
   const query = useQuery({
-    ...getAccessSessionOptions({
-      path: { project_id: projectId, session_id: sessionId },
+    ...getAccessSessionGeneralOptions({
+      path: { session_id: sessionId },
     }),
     enabled: valid,
     refetchInterval: 3000,
   })
   const capability = useQuery({
-    ...accessCapabilityOptions({ path: { project_id: projectId } }),
+    ...generalAccessCapabilityOptions(),
     enabled: valid,
   })
   const [confirming, setConfirming] = useState(false)
   const client = useQueryClient()
   const revoke = useMutation({
     mutationFn: () =>
-      revokeAccessSession({
-        path: { project_id: projectId, session_id: sessionId },
+      revokeAccessSessionGeneral({
+        path: { session_id: sessionId },
         throwOnError: true,
       }),
     onSuccess: () => {
       setConfirming(false)
       void query.refetch()
       void client.invalidateQueries({
-        queryKey: [{ _id: 'listAccessSessions' }],
+        queryKey: [{ _id: 'listAccessSessionsGeneral' }],
       })
       void client.invalidateQueries({
         queryKey: [{ _id: 'listServiceGrants' }],
@@ -82,16 +73,20 @@ function SessionDetail({
     },
   })
   const session = query.data?.session
+  const consumerQuery = session
+    ? `sandbox=${encodeURIComponent(session.consumer.sandbox_id)}`
+    : ''
+  const back = `${base}?tab=sessions&${consumerQuery}`
   const { setBreadcrumbs } = useBreadcrumbs()
   useEffect(() => {
     setBreadcrumbs([
       { label: 'Vault', href: '/vault' },
-      { label: 'Vault', href: base },
+      { label: 'Vault', href: `${base}?${consumerQuery}` },
       { label: 'Sessions', href: back },
       { label: session?.bundle_name ?? 'Session' },
     ])
     return () => setBreadcrumbs([])
-  }, [setBreadcrumbs, base, back, session?.bundle_name])
+  }, [setBreadcrumbs, base, back, consumerQuery, session?.bundle_name])
   const mismatch = session && session.vault_id !== vaultId
   const now = useSessionClock()
   const issued =
@@ -158,7 +153,7 @@ function SessionDetail({
                   label: 'Access bundle',
                   value: (
                     <Link
-                      to={`${base}/bundles/${encodeURIComponent(session.bundle_id)}`}
+                      to={`${base}/bundles/${encodeURIComponent(session.bundle_id)}?${consumerQuery}`}
                       className="underline"
                     >
                       {session.bundle_name} · v{session.bundle_version}

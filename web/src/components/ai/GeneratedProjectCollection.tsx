@@ -29,7 +29,7 @@ function repositoryLabel(project: ProjectCollectionItem): string | null {
  * artifacts and intercepted `get_projects` read-tool receipts. */
 export function GeneratedProjectCollection({
   presentation,
-  title = 'Services',
+  title = 'Projects',
   framed = true,
 }: {
   presentation: ProjectCollectionPresentation
@@ -66,7 +66,7 @@ export function GeneratedProjectCollection({
             <h3 className="truncate text-sm font-semibold">{title}</h3>
             <p className="text-[11px] text-muted-foreground">
               {presentation.total}{' '}
-              {presentation.total === 1 ? 'service' : 'services'} · access
+              {presentation.total === 1 ? 'project' : 'projects'} · access
               checked live
             </p>
           </div>
@@ -80,7 +80,7 @@ export function GeneratedProjectCollection({
 
       {presentation.items.length === 0 ? (
         <div className="border-t px-4 py-5 text-xs text-muted-foreground">
-          No services are visible to your current role.
+          No projects are visible to your current role.
         </div>
       ) : (
         <div className="divide-y border-t">

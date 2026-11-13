@@ -31,6 +31,7 @@ async fn renewal_sweep_shares_policy_and_fences_revisions_and_failed_references(
                     origin: "https://api.example.com".into(),
                     path_prefixes: vec!["/".into()],
                     methods: vec![AccessMethod::Get],
+                    delivery: None,
                 },
                 max_ttl_seconds: 300,
                 enabled: true,

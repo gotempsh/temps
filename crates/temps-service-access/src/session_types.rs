@@ -29,6 +29,10 @@ pub struct SessionServiceVersion {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CreateAccessSession {
+    /// Server-only link authorized by the handler; never accepted from JSON.
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub(crate) authorized_link_id: Option<String>,
     /// Stable for retries of this approval. A new session needs a new UUID.
     #[schema(value_type = String, format = "uuid")]
     pub request_id: Uuid,
@@ -49,7 +53,7 @@ pub enum AccessSessionStatus {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct AccessSessionResponse {
     pub id: String,
-    pub project_id: i32,
+    pub project_id: Option<i32>,
     pub vault_id: String,
     pub bundle_id: String,
     pub bundle_name: String,

@@ -64,7 +64,7 @@ async fn slow_connections_cannot_starve_healthy_github_bindings() {
         for id in 1..=stalled + 1 {
             let runtime = sandbox_access_runtimes::Model {
                 id: Uuid::new_v4(),
-                project_id: id,
+                project_id: Some(id),
                 sandbox_id: id,
                 node_id: None,
                 provider_identity: format!("container-{id}"),
@@ -118,4 +118,78 @@ async fn slow_connections_cannot_starve_healthy_github_bindings() {
         assert_eq!(resolver.active.load(Ordering::SeqCst), 0);
         assert!(started.elapsed() <= Duration::from_millis(3100));
     }
+}
+
+/// A Basic password saved with spaces or non-ASCII letters must reach the
+/// worker: planning covers every binding on the worker, so refusing it there
+/// would also stop renewal for the worker's other sandboxes.
+#[tokio::test]
+async fn saved_basic_passwords_with_spaces_or_accents_are_planned() {
+    let planner = planner(None);
+    let boot = Uuid::new_v4();
+    let now = Utc::now();
+    let authority = temps_entities::sandbox_access_authorities::Model {
+        id: boot,
+        node_id: None,
+        sdk_node_id: Uuid::new_v4(),
+        seal_public_key: STANDARD.encode([1u8; 32]),
+        snapshot_key_encrypted: String::new(),
+        session_key_encrypted: String::new(),
+        ca_certificate: String::new(),
+        ca_key_encrypted: String::new(),
+        snapshot_version: 0,
+        desired_revision: 1,
+        next_reconcile_at: None,
+        closed_at: None,
+        created_at: now,
+        updated_at: now,
+    };
+    let runtime = sandbox_access_runtimes::Model {
+        id: Uuid::new_v4(),
+        project_id: Some(1),
+        sandbox_id: 1,
+        node_id: None,
+        provider_identity: "container-1".into(),
+        authority_id: Some(boot),
+        provider_backend: Some("docker".into()),
+        provider_name: Some("sandbox-1".into()),
+        lease_expires_at: None,
+        desired_version: 1,
+        applied_version: 0,
+        applied_revision: None,
+        applied_grant_ids: vec![],
+        closed_at: None,
+        created_at: now,
+        updated_at: now,
+    };
+    let saved = [
+        "account:correct horse battery staple",
+        "account:contraseña-ñandú",
+    ];
+    let candidates: Vec<_> = saved
+        .iter()
+        .map(|secret| {
+            let mut grant = candidate(1, 1);
+            grant.admin = true;
+            grant.runtime_id = runtime.id;
+            grant.policy = serde_json::json!({
+                "origin": "https://registry.example.com", "path_prefixes": ["/v2"], "methods": ["GET"],
+                "delivery": {"format": {"method": "basic"}}
+            });
+            grant.credential_encrypted = Some(encryption().encrypt(secret.as_bytes()).unwrap());
+            grant
+        })
+        .collect();
+    let plan = planner
+        .prepare_rows(boot, authority, vec![runtime], candidates)
+        .await
+        .unwrap();
+    assert_eq!(plan.bindings.len(), 1);
+    let binding = &plan.bindings[0];
+    assert_eq!(binding.plan.grants().len(), saved.len());
+    let mut planned: Vec<_> = binding.credentials.values().map(|c| c.expose()).collect();
+    planned.sort_unstable();
+    let mut expected = saved.to_vec();
+    expected.sort_unstable();
+    assert_eq!(planned, expected);
 }

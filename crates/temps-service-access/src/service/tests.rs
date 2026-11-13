@@ -19,6 +19,13 @@ fn service(db: MockDatabase) -> ServiceAccessService {
 fn db() -> MockDatabase {
     MockDatabase::new(DatabaseBackend::Postgres)
 }
+// Service saves execute the management lock and immutable scope insert.
+fn service_write_db() -> MockDatabase {
+    db().append_exec_results((0..2).map(|_| sea_orm::MockExecResult {
+        last_insert_id: 0,
+        rows_affected: 0,
+    }))
+}
 fn project_row() -> BTreeMap<String, sea_orm::Value> {
     BTreeMap::from([("id".into(), 7.into())])
 }
@@ -41,12 +48,14 @@ fn policy() -> SandboxAccessPolicy {
         origin: "https://api.example.com".into(),
         path_prefixes: vec!["/v1".into()],
         methods: vec![AccessMethod::Get],
+        delivery: None,
     }
 }
 fn row() -> services::Model {
     services::Model {
+        retired_at: None,
         id: "svc_test".into(),
-        project_id: 7,
+        project_id: Some(7),
         name: "API".into(),
         policy: serde_json::to_value(policy()).unwrap(),
         max_ttl_seconds: 900,
@@ -62,7 +71,7 @@ fn grant() -> grants::Model {
     grants::Model {
         assignment_id: None,
         id: "grant_test".into(),
-        project_id: 7,
+        project_id: Some(7),
         service_id: "svc_test".into(),
         sandbox_id: 42,
         service_version: 1,
@@ -256,7 +265,10 @@ async fn list_not_found_and_database_failures_are_contextual() {
     let s = service(db().append_query_results([Vec::<BTreeMap<String, sea_orm::Value>>::new()]));
     assert!(matches!(
         s.list_services(7, page()).await,
-        Err(AccessError::NotFound { project_id: 7, .. })
+        Err(AccessError::NotFound {
+            project_id: Some(7),
+            ..
+        })
     ));
     let s = service(db().append_query_errors([DbErr::Custom("sensitive-driver-message".into())]));
     let err = s.list_services(7, page()).await.unwrap_err();
@@ -268,7 +280,8 @@ async fn saves_only_encrypted_credentials_and_supports_rotation() {
     let mut saved = row();
     saved.credential_encrypted = Some("encrypted".into());
     let s = service(
-        db().append_query_results([vec![project_row()]])
+        service_write_db()
+            .append_query_results([vec![project_row()]])
             .append_query_results([vec![saved.clone()]]),
     );
     let mut req = request();
@@ -295,13 +308,15 @@ async fn saves_only_encrypted_credentials_and_supports_rotation() {
     );
 }
 fn db_with_update(old: services::Model, new: services::Model) -> MockDatabase {
-    db().append_query_results([vec![project_row()]])
+    service_write_db()
+        .append_query_results([vec![project_row()]])
         .append_query_results([vec![old], vec![new]])
 }
 #[tokio::test]
 async fn service_update_detects_stale_versions_and_missing_rows() {
     let s = service(
-        db().append_query_results([vec![project_row()]])
+        service_write_db()
+            .append_query_results([vec![project_row()]])
             .append_query_results([vec![row()]]),
     );
     let mut req = request();
@@ -311,7 +326,8 @@ async fn service_update_detects_stale_versions_and_missing_rows() {
         Err(AccessError::Conflict { version: 2, .. })
     ));
     let s = service(
-        db().append_query_results([vec![project_row()]])
+        service_write_db()
+            .append_query_results([vec![project_row()]])
             .append_query_results([Vec::<services::Model>::new()]),
     );
     let mut req = request();
@@ -443,7 +459,8 @@ async fn list_grants_joins_services_without_n_plus_one() {
 #[tokio::test]
 async fn write_failures_roll_back_without_leaking_driver_details() {
     let s = service(
-        db().append_query_results([vec![project_row()]])
+        service_write_db()
+            .append_query_results([vec![project_row()]])
             .append_query_errors([DbErr::Custom("secret-write-error".into())]),
     );
     let error = s.save_service(7, None, request()).await.unwrap_err();
@@ -451,7 +468,7 @@ async fn write_failures_roll_back_without_leaking_driver_details() {
         error,
         AccessError::Database {
             operation: "save service",
-            project_id: 7,
+            project_id: Some(7),
             ..
         }
     ));
@@ -468,7 +485,7 @@ async fn grants_missing_resources_and_storage_failures_explain_the_operation() {
     let s = service(db().append_query_results([Vec::<services::Model>::new()]));
     assert!(
         matches!(s.request_grant(7, "sbx_test", 1, false, grant_request()).await,
-        Err(AccessError::NotFound { kind: "service", project_id: 7, id }) if id == "svc_test")
+        Err(AccessError::NotFound { kind: "service", project_id: Some(7), id }) if id == "svc_test")
     );
     let s = service(db().append_query_errors([DbErr::Custom("read error".into())]));
     assert!(matches!(
@@ -544,7 +561,7 @@ fn corrupted_policy_is_a_contextual_error_instead_of_an_empty_scope() {
     let mut service = row();
     service.policy = serde_json::json!({"unexpected": true});
     assert!(
-        matches!(service_response(service), Err(AccessError::StoredPolicy { project_id: 7, id, .. }) if id == "svc_test")
+        matches!(service_response(service), Err(AccessError::StoredPolicy { project_id: Some(7), id, .. }) if id == "svc_test")
     );
 }
 
@@ -566,7 +583,7 @@ async fn single_service_read_scopes_query_and_handles_storage_errors() {
             .append_query_results([Vec::<services::Model>::new()]),
     );
     assert!(
-        matches!(svc.get_service(7, "missing").await, Err(AccessError::NotFound { id, project_id: 7, .. }) if id == "missing")
+        matches!(svc.get_service(7, "missing").await, Err(AccessError::NotFound { id, project_id: Some(7), .. }) if id == "missing")
     );
     let svc = service(
         db().append_query_results([vec![project_row()]])
@@ -586,7 +603,8 @@ async fn stored_bearer_cannot_follow_an_origin_change() {
     let mut old = row();
     old.credential_encrypted = Some(encryption().encrypt_string("original-test-secret").unwrap());
     let s = service(
-        db().append_query_results([vec![project_row()]])
+        service_write_db()
+            .append_query_results([vec![project_row()]])
             .append_query_results([vec![old]]),
     );
     let mut req = request();
@@ -607,6 +625,99 @@ async fn stored_bearer_cannot_follow_an_origin_change() {
         !log.contains(" SET "),
         "an unsafe edit must roll back before writing"
     );
+}
+
+#[tokio::test]
+async fn stored_credential_cannot_follow_a_credential_format_change() {
+    use crate::types::{CredentialDelivery, CredentialFormat};
+    let mut old = row();
+    old.credential_encrypted = Some(encryption().encrypt_string("original-test-secret").unwrap());
+    let s = service(
+        service_write_db()
+            .append_query_results([vec![project_row()]])
+            .append_query_results([vec![old]]),
+    );
+    let mut req = request();
+    req.expected_version = Some(1);
+    req.policy.delivery = Some(CredentialDelivery {
+        format: CredentialFormat::Header {
+            name: "x-api-key".into(),
+            prefix: None,
+        },
+        headers: Vec::new(),
+    });
+    assert!(matches!(
+        s.save_service(7, Some("svc_test".into()), req).await,
+        Err(AccessError::Validation {
+            field: "credential",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn credential_shape_follows_the_selected_format() {
+    use crate::types::{CredentialDelivery, CredentialFormat};
+    let mut req = request();
+    req.policy.delivery = Some(CredentialDelivery {
+        format: CredentialFormat::Basic,
+        headers: Vec::new(),
+    });
+    req.credential = Some(temps_core::secret_string::SecretString::new(
+        "token-without-a-password",
+    ));
+    assert!(matches!(
+        validate_service(&mut req),
+        Err(AccessError::Validation {
+            field: "credential",
+            ..
+        })
+    ));
+    req.credential = Some(temps_core::secret_string::SecretString::new(
+        "account:secret",
+    ));
+    validate_service(&mut req).unwrap();
+}
+
+#[test]
+fn basic_passwords_may_hold_spaces_and_non_ascii_but_tokens_may_not() {
+    use crate::types::{CredentialDelivery, CredentialFormat};
+    let secret = |value: &str| Some(temps_core::secret_string::SecretString::new(value));
+    let rejected = |req: &mut SaveAccessService| {
+        matches!(
+            validate_service(req),
+            Err(AccessError::Validation {
+                field: "credential",
+                ..
+            })
+        )
+    };
+
+    let mut req = request();
+    req.policy.delivery = Some(CredentialDelivery {
+        format: CredentialFormat::Basic,
+        headers: Vec::new(),
+    });
+    req.credential = secret("account:correct horse battery staple");
+    validate_service(&mut req).unwrap();
+    req.credential = secret("account:contraseña-segura");
+    validate_service(&mut req).unwrap();
+    req.credential = secret("account:pasted\nwith a newline");
+    assert!(rejected(&mut req), "a control character is still refused");
+
+    let mut req = request();
+    req.policy.delivery = Some(CredentialDelivery {
+        format: CredentialFormat::BasicToken {
+            username: "api".into(),
+        },
+        headers: Vec::new(),
+    });
+    req.credential = secret("pass phrase with spaces ü");
+    validate_service(&mut req).unwrap();
+
+    let mut req = request();
+    req.credential = secret("bearer token with spaces");
+    assert!(rejected(&mut req), "a bearer token stays header-safe ASCII");
 }
 
 #[tokio::test]

@@ -21,6 +21,71 @@ pub struct SandboxAccessPolicy {
     /// Use the selected GitHub connection on the host. No provider token is returned.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github_repository: Option<GithubRepositoryAccess>,
+    /// How the stored credential reaches the destination. Omitted means a
+    /// bearer token in `Authorization`, the shape every older policy has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<CredentialDelivery>,
+}
+
+/// How a stored credential is presented to the destination, plus any fixed
+/// headers the API requires. Changing it changes the policy, so consent given
+/// for the previous delivery does not carry over.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialDelivery {
+    #[serde(default)]
+    pub format: CredentialFormat,
+    /// Fixed, non-secret headers sent with every request, such as an API
+    /// version. At most 16; values are printable ASCII and never templates.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<RequestHeader>,
+}
+
+/// The credential is one stored secret. Formats differ only in how it is sent.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "method", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CredentialFormat {
+    /// `Authorization: Bearer <credential>`.
+    #[default]
+    Bearer,
+    /// `<name>: <prefix><credential>`, for example `x-api-key`.
+    Header {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prefix: Option<String>,
+    },
+    /// `Authorization: Basic base64(<username>:<credential>)` with a fixed username.
+    BasicToken { username: String },
+    /// `Authorization: Basic base64(<credential>)`; the stored credential is
+    /// `username:password`.
+    Basic,
+}
+
+/// What the catalog knows about a saved service's destination: how to show it
+/// and where its credential is created, so a key can be rotated from the edit page.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CatalogReference {
+    pub id: String,
+    pub name: String,
+    pub logo: String,
+    /// One label for a single credential, or two (username, password).
+    pub credential_labels: Vec<String>,
+    pub credential_help: CredentialHelp,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct CredentialHelp {
+    /// HTTPS page where this service's key or token is created.
+    pub url: Option<String>,
+    /// Notes the service's template gives for its credential fields.
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RequestHeader {
+    pub name: String,
+    pub value: String,
 }
 
 /// Immutable reference to an explicitly selected GitHub connection and synced repository.
@@ -79,12 +144,16 @@ pub struct SaveAccessService {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AccessServiceResponse {
     pub id: String,
-    pub project_id: i32,
+    pub project_id: Option<i32>,
     pub name: String,
     pub policy: SandboxAccessPolicy,
     pub max_ttl_seconds: i32,
     pub enabled: bool,
     pub has_credential: bool,
+    /// The catalog service this origin belongs to, when it is one. Derived on
+    /// read from the origin; never stored in the policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog: Option<CatalogReference>,
     pub version: i32,
     #[schema(value_type = String, format = DateTime)]
     pub created_at: DateTime<Utc>,

@@ -4108,6 +4108,10 @@ mod tests {
                             updated_at: now,
                         }]])
                         .append_query_results([Vec::<dns_managed_domains::Model>::new()])
+                        // One-label names other owners hold (ADR-105 D7): none.
+                        .append_query_results([Vec::<
+                            std::collections::BTreeMap<String, sea_orm::Value>,
+                        >::new()])
                         .append_query_results([vec![environment_domains::Model {
                             id: 1,
                             environment_id: 1,

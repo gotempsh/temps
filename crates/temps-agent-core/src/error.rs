@@ -133,6 +133,14 @@ pub enum AgentError {
         reason: String,
     },
 
+    /// This sandbox cannot host service access (the credential-free proxy
+    /// mount): the control plane has no shared Unix-socket root with the
+    /// Docker daemon, or the sandbox was created without the mount. Kept apart
+    /// from [`AgentError::SandboxExecFailed`] because it is a setup limit the
+    /// operator can act on (a 409 with the fix), not a provider fault.
+    #[error("Service access is not available for sandbox {sandbox_id}: {reason}")]
+    ServiceAccessUnavailable { sandbox_id: String, reason: String },
+
     #[error(
         "Sandbox snapshot for {sandbox_id} exceeded the {max_size_bytes} byte limit while {stage}"
     )]
@@ -608,6 +616,11 @@ impl From<AgentError> for Problem {
                     .with_title("Sandbox Exec Failed")
                     .with_detail(error.to_string())
             }
+            AgentError::ServiceAccessUnavailable { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Service Access Unavailable For This Sandbox")
+                    .with_detail(error.to_string())
+            }
             AgentError::SandboxTerminalTimeout { .. } => {
                 problemdetails::new(StatusCode::GATEWAY_TIMEOUT)
                     .with_title("Terminal Attach Timed Out")
@@ -694,6 +707,19 @@ mod problem_tests {
             image: "registry.example.test/sandbox@sha256:abc".into(),
         });
         assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn service_access_unavailable_is_a_conflict_carrying_the_fix() {
+        let problem = Problem::from(AgentError::ServiceAccessUnavailable {
+            sandbox_id: "sbx_test".into(),
+            reason: "needs a Linux Docker host".into(),
+        });
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        let body = serde_json::to_value(&problem.body).unwrap();
+        let detail = body["detail"].as_str().unwrap();
+        assert!(detail.contains("sbx_test"), "{detail}");
+        assert!(detail.contains("needs a Linux Docker host"), "{detail}");
     }
 
     #[test]

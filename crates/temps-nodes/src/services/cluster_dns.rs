@@ -345,11 +345,24 @@ pub fn internal_proxy_state(capacity: &serde_json::Value) -> InternalProxyState 
     }
 }
 
-/// Why the internal-proxy alarm should be open on a worker, if it should:
+/// Why the internal-proxy alarm should be open on a node, if it should:
 /// cluster DNS on (else no name points there), the node active, and the
 /// proxy reported not listening on two evaluations in a row, so a bind
 /// retry in progress pages nobody.
 pub fn internal_proxy_alert(
+    cluster_dns_enabled: bool,
+    node_status: &str,
+    proxy: &InternalProxyState,
+    down_streak: u32,
+) -> Option<String> {
+    internal_proxy_alert_for(false, cluster_dns_enabled, node_status, proxy, down_streak)
+}
+
+/// [`internal_proxy_alert`], worded for the node it is about. The control
+/// plane withdraws its containers' names while its proxy is down (ADR-104
+/// D3), so there the calls fail because the names are gone.
+pub fn internal_proxy_alert_for(
+    is_control_plane: bool,
     cluster_dns_enabled: bool,
     node_status: &str,
     proxy: &InternalProxyState,
@@ -361,11 +374,21 @@ pub fn internal_proxy_alert(
     if proxy.listening != Some(false) || down_streak < 2 {
         return None;
     }
+    let error = proxy.error.as_deref().unwrap_or("no error reported");
+    if is_control_plane {
+        let address = proxy
+            .address
+            .as_deref()
+            .unwrap_or("its app network gateway");
+        return Some(format!(
+            "Internal routing is down on the control plane: its containers' `*.temps.local` \
+             names are withdrawn until its internal proxy can serve {address}: {error}"
+        ));
+    }
     let address = proxy.address.as_deref().unwrap_or("its bridge address");
     Some(format!(
         "Internal routing is down: `*.temps.local` names resolve on this node but nothing serves \
-         the HTTP calls to them on {address}: {}",
-        proxy.error.as_deref().unwrap_or("no error reported")
+         the HTTP calls to them on {address}: {error}"
     ))
 }
 
@@ -378,18 +401,71 @@ pub struct DnsNode {
     pub node_status: String,
     /// The heartbeat's view of the resolver, for an agent too old to report.
     pub heartbeat_running: Option<bool>,
-    /// `None` for the control plane, whose main proxy routes internal HTTP.
+    /// How the node serves HTTP calls to `*.temps.local`. For the control
+    /// plane, what it stored with its DNS report (ADR-104 D4); `None` when it
+    /// reported nothing, so the console falls back to "main proxy".
     pub internal_proxy: Option<InternalProxyState>,
 }
 
+/// The control plane's internal routing, from node 0's DNS report: the same
+/// document a worker sends as `capacity.internal_proxy`, stored on its own
+/// (ADR-104 D4). `None` when the control plane does not serve local
+/// containers itself (cluster DNS off, its resolver down, or a release older
+/// than ADR-104).
+/// One evaluation of a node's internal routing alarm: advances `down_streak`
+/// and returns why the alarm should be open, or `None` to resolve it.
+///
+/// A node that reports no internal routing has nothing down: the alarm is
+/// resolved and the streak starts over. That is the control plane once its
+/// routing stops (cluster DNS turned off, or a worker joined and serves the
+/// names), so an alarm opened while it was down does not stay open after it
+/// stopped serving them.
+pub fn internal_proxy_alarm(
+    is_control_plane: bool,
+    cluster_dns_enabled: bool,
+    node_status: &str,
+    proxy: Option<&InternalProxyState>,
+    down_streak: &mut u32,
+) -> Option<String> {
+    let Some(proxy) = proxy else {
+        *down_streak = 0;
+        return None;
+    };
+    *down_streak = if proxy.listening == Some(false) {
+        down_streak.saturating_add(1)
+    } else {
+        0
+    };
+    internal_proxy_alert_for(
+        is_control_plane,
+        cluster_dns_enabled,
+        node_status,
+        proxy,
+        *down_streak,
+    )
+}
+
+pub fn control_plane_proxy_state(
+    report: Option<&dns_resolver_reports::Model>,
+) -> Option<InternalProxyState> {
+    let document = report?.internal_proxy.as_ref()?;
+    document
+        .is_object()
+        .then(|| internal_proxy_state(&serde_json::json!({ "internal_proxy": document })))
+}
+
 /// The control plane, then each worker in `workers` (node 0 rows skipped).
-pub fn dns_nodes(control_plane_name: &str, workers: Vec<nodes::Model>) -> Vec<DnsNode> {
+pub fn dns_nodes(
+    control_plane_name: &str,
+    control_plane_proxy: Option<InternalProxyState>,
+    workers: Vec<nodes::Model>,
+) -> Vec<DnsNode> {
     let mut rows = vec![DnsNode {
         node_id: CONTROL_PLANE_NODE_ID,
         node_name: control_plane_name.to_string(),
         node_status: "active".to_string(),
         heartbeat_running: None,
-        internal_proxy: None,
+        internal_proxy: control_plane_proxy,
     }];
     rows.extend(workers.into_iter().filter(|n| n.id > 0).map(|n| DnsNode {
         internal_proxy: Some(internal_proxy_state(&n.capacity)),
@@ -502,6 +578,11 @@ pub enum ClusterDnsError {
     NoProjectContainer { project_id: i32, node_id: i32 },
     #[error("Invalid test resolution: {reason}")]
     Invalid { reason: String },
+    #[error(
+        "Sandbox {sandbox_id} not found among your sandboxes, or it has been destroyed; a test \
+         resolution can only be asked as a sandbox you own"
+    )]
+    SandboxNotFound { sandbox_id: String },
     #[error("The resolver on node {node_id} is not running: {reason}")]
     ResolverNotRunning { node_id: i32, reason: String },
     #[error("The agent on node {node_id} predates test resolution (HTTP {status}); upgrade it")]
@@ -533,6 +614,49 @@ pub struct TestResolution {
     /// For an internal route asked as a project: who owns it, and whether
     /// that project lets the asking one call it (ADR 101 D7).
     pub internal_access: Option<super::internal_access_check::InternalAccessVerdict>,
+}
+
+/// Whom a test resolution is asked as.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TestResolutionCaller {
+    /// The node's resolver itself.
+    Node,
+    /// One of the project's containers on that node.
+    Project(i32),
+    /// One of the asking user's sandboxes (ADR 105).
+    Sandbox { sandbox_id: String, user_id: i32 },
+}
+
+/// How a sandbox reaches `name`, said next to a test resolution asked as it.
+pub(crate) fn sandbox_resolution_note(
+    sandbox: &super::internal_access_check::AskingSandbox,
+    node_id: i32,
+    name: &str,
+    internal_route: bool,
+) -> String {
+    let runs_on = sandbox.node_id.unwrap_or(CONTROL_PLANE_NODE_ID);
+    let mut note = if internal_route {
+        format!(
+            "Sandbox {} does not look this name up: its egress proxy sends http://{name}/ to the \
+             internal proxy of the node it runs on, which admits it only with an internal access \
+             grant naming the sandbox.",
+            sandbox.public_id
+        )
+    } else {
+        format!(
+            "Sandbox {} reaches only public addresses and the internal addresses \
+             <environment>.<project>.temps.local and <environment subdomain>.temps.local; any \
+             other private name is refused by its egress proxy.",
+            sandbox.public_id
+        )
+    };
+    if runs_on != node_id {
+        note.push_str(&format!(
+            " The sandbox runs on node {runs_on}, not node {node_id}: that node's internal proxy \
+             decides its calls."
+        ));
+    }
+    note
 }
 
 #[derive(Debug, FromQueryResult)]
@@ -749,8 +873,21 @@ impl ClusterDnsService {
         node_id: i32,
         name: &str,
         record_type: &str,
-        project_id: Option<i32>,
+        asked_as: TestResolutionCaller,
     ) -> Result<TestResolution, ClusterDnsError> {
+        let project_id = match &asked_as {
+            TestResolutionCaller::Project(project_id) => Some(*project_id),
+            TestResolutionCaller::Sandbox { .. } | TestResolutionCaller::Node => None,
+        };
+        if let TestResolutionCaller::Sandbox {
+            sandbox_id,
+            user_id,
+        } = &asked_as
+        {
+            return self
+                .resolve_as_sandbox(node_id, name, record_type, sandbox_id, *user_id)
+                .await;
+        }
         let mut resolution = self
             .resolve_answer(node_id, name, record_type, project_id)
             .await?;
@@ -766,6 +903,51 @@ impl ClusterDnsService {
                 source,
             })?;
         }
+        Ok(resolution)
+    }
+
+    /// A test resolution asked as sandbox `sandbox_id` (ADR 105). The
+    /// sandbox never looks internal names up: its egress proxy sends the
+    /// request by name to the internal proxy of the sandbox's node. So the
+    /// answer is the node's own, and the verdict says whether a sandbox grant
+    /// admits it.
+    async fn resolve_as_sandbox(
+        &self,
+        node_id: i32,
+        name: &str,
+        record_type: &str,
+        sandbox_id: &str,
+        user_id: i32,
+    ) -> Result<TestResolution, ClusterDnsError> {
+        let sandbox =
+            super::internal_access_check::owned_sandbox(self.db.as_ref(), sandbox_id, user_id)
+                .await
+                .map_err(|source| ClusterDnsError::Database {
+                    operation: "reading the sandbox a test resolution is asked as",
+                    source,
+                })?
+                .ok_or_else(|| ClusterDnsError::SandboxNotFound {
+                    sandbox_id: sandbox_id.to_string(),
+                })?;
+        let mut resolution = self
+            .resolve_answer(node_id, name, record_type, None)
+            .await?;
+        resolution.internal_access = super::internal_access_check::sandbox_internal_access_verdict(
+            self.db.as_ref(),
+            &resolution.name,
+            &sandbox,
+        )
+        .await
+        .map_err(|source| ClusterDnsError::Database {
+            operation: "checking a sandbox's internal access for a test resolution",
+            source,
+        })?;
+        resolution.note = Some(sandbox_resolution_note(
+            &sandbox,
+            node_id,
+            &resolution.name,
+            resolution.internal_access.is_some(),
+        ));
         Ok(resolution)
     }
 
@@ -922,6 +1104,7 @@ impl ClusterDnsService {
                 reason: e.to_string(),
             }
         })?;
+        let note = join_notes(control_plane_gateway_note(&answer, address.ip()), note);
         Ok(TestResolution {
             node_id,
             name: shown_name,
@@ -931,6 +1114,31 @@ impl ClusterDnsService {
             note,
             internal_access: None,
         })
+    }
+}
+
+/// Where an internal name answered by the control plane points, when it
+/// points at the control plane itself (ADR-104 D3): with no worker nodes,
+/// `<environment>.<project>.temps.local` resolves to the app network's
+/// gateway, where the control plane's internal proxy serves the call.
+pub fn control_plane_gateway_note(answer: &ResolveAnswer, gateway: IpAddr) -> Option<String> {
+    let gateway_text = gateway.to_string();
+    let points_here = answer.authoritative
+        && answer
+            .answers
+            .iter()
+            .any(|record| record.record_type == "A" && record.data == gateway_text);
+    points_here.then(|| {
+        format!(
+            "This name points at the control plane's app network gateway ({gateway_text}): with no worker nodes, the control plane's internal proxy serves HTTP calls to it on port 80, routes them by Host and applies internal access."
+        )
+    })
+}
+
+fn join_notes(first: Option<String>, second: Option<String>) -> Option<String> {
+    match (first, second) {
+        (Some(a), Some(b)) => Some(format!("{a} {b}")),
+        (a, b) => a.or(b),
     }
 }
 
@@ -1118,7 +1326,11 @@ impl ClusterDnsCollector {
             }
         }
 
-        let nodes = dns_nodes("control plane", workers);
+        let nodes = dns_nodes(
+            "control plane",
+            control_plane_proxy_state(reports.get(&CONTROL_PLANE_NODE_ID)),
+            workers,
+        );
         let interval = i64::try_from(interval_secs).unwrap_or(i64::MAX);
         let seen: HashSet<i32> = nodes.iter().map(|n| n.node_id).collect();
         state.down_streak.retain(|id, _| seen.contains(id));
@@ -1174,17 +1386,15 @@ impl ClusterDnsCollector {
                 decision.query_failures,
             )
             .await;
-            if let Some(proxy) = proxy {
-                let streak = state.proxy_down_streak.entry(node_id).or_default();
-                *streak = if proxy.listening == Some(false) {
-                    streak.saturating_add(1)
-                } else {
-                    0
-                };
-                let reason = internal_proxy_alert(enabled, &status, &proxy, *streak);
-                self.apply(node_id, &node_name, AlarmType::DnsInternalProxyDown, reason)
-                    .await;
-            }
+            let reason = internal_proxy_alarm(
+                node_id == CONTROL_PLANE_NODE_ID,
+                enabled,
+                &status,
+                proxy.as_ref(),
+                state.proxy_down_streak.entry(node_id).or_default(),
+            );
+            self.apply(node_id, &node_name, AlarmType::DnsInternalProxyDown, reason)
+                .await;
         }
         Ok(())
     }
@@ -1270,6 +1480,33 @@ impl ClusterDnsCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_resolution_asked_as_a_sandbox_says_how_the_sandbox_reaches_the_name() {
+        let sandbox = |node_id| super::super::internal_access_check::AskingSandbox {
+            id: 5,
+            public_id: "sbx_alpha".to_string(),
+            node_id,
+        };
+        let note =
+            sandbox_resolution_note(&sandbox(None), 0, "production.orders.temps.local", true);
+        assert!(
+            note.contains("http://production.orders.temps.local/"),
+            "{note}"
+        );
+        assert!(
+            note.contains("internal access grant naming the sandbox"),
+            "{note}"
+        );
+        assert!(!note.contains("runs on node"), "{note}");
+
+        let note =
+            sandbox_resolution_note(&sandbox(Some(3)), 0, "production.orders.temps.local", true);
+        assert!(note.contains("runs on node 3, not node 0"), "{note}");
+
+        let note = sandbox_resolution_note(&sandbox(None), 0, "db.internal.example", false);
+        assert!(note.contains("any other private name is refused"), "{note}");
+    }
 
     /// What an agent from before ADR-098 reports when port 80 is held.
     fn held_proxy() -> InternalProxyState {
@@ -1446,9 +1683,139 @@ mod tests {
             last_error: None,
             query_cursor: Some(9),
             dropped_log_entries: 0,
+            internal_proxy: None,
             created_at: at,
             updated_at: at,
         }
+    }
+
+    #[test]
+    fn a_name_on_the_control_plane_gateway_says_what_serves_it() {
+        let gateway: IpAddr = "172.20.0.1".parse().unwrap();
+        let answer = |authoritative: bool, data: &str| ResolveAnswer {
+            rcode: "NOERROR".into(),
+            outcome: temps_node_dns::observe::QueryOutcome::Noerror,
+            authoritative,
+            answers: vec![temps_node_dns::resolve::ResolvedRecord {
+                name: "production.api.temps.local".into(),
+                record_type: "A".into(),
+                ttl: 5,
+                data: data.into(),
+            }],
+            latency_us: 100,
+        };
+        let note = control_plane_gateway_note(&answer(true, "172.20.0.1"), gateway)
+            .expect("points at the gateway");
+        assert!(note.contains("172.20.0.1"), "{note}");
+        assert!(note.contains("internal access"), "{note}");
+        assert!(
+            !note.contains("  "),
+            "one sentence, no wrapped whitespace: {note}"
+        );
+        // A worker's bridge, or an upstream answer, is not the control plane.
+        assert_eq!(
+            control_plane_gateway_note(&answer(true, "10.205.0.1"), gateway),
+            None
+        );
+        assert_eq!(
+            control_plane_gateway_note(&answer(false, "172.20.0.1"), gateway),
+            None
+        );
+        assert_eq!(
+            join_notes(Some("a".into()), Some("b".into())).as_deref(),
+            Some("a b")
+        );
+        assert_eq!(join_notes(None, Some("b".into())).as_deref(), Some("b"));
+        assert_eq!(join_notes(None, None), None);
+    }
+
+    #[test]
+    fn the_control_plane_row_carries_its_stored_internal_routing() {
+        let now = Utc::now();
+        let mut cp = report("ok", now);
+        cp.node_id = CONTROL_PLANE_NODE_ID;
+        // Not reported: the console shows the main proxy, as before ADR-104.
+        assert_eq!(control_plane_proxy_state(Some(&cp)), None);
+        assert_eq!(control_plane_proxy_state(None), None);
+        assert_eq!(dns_nodes("cp", None, Vec::new())[0].internal_proxy, None);
+
+        cp.internal_proxy = Some(serde_json::json!({
+            "address": "172.20.0.1:80",
+            "listening": true,
+            "mode": "redirect",
+            "proxy_address": "172.20.0.1:591",
+            "redirect": "installed",
+        }));
+        let state = control_plane_proxy_state(Some(&cp)).expect("reported");
+        assert_eq!(state.listening, Some(true));
+        assert_eq!(state.address.as_deref(), Some("172.20.0.1:80"));
+        assert_eq!(state.mode, Some(InternalRoutingMode::Redirect));
+        assert_eq!(state.redirect, Some(InternalRedirectState::Installed));
+        let rows = dns_nodes("cp", Some(state.clone()), Vec::new());
+        assert_eq!(rows[0].node_id, CONTROL_PLANE_NODE_ID);
+        assert_eq!(rows[0].internal_proxy, Some(state));
+
+        // A port held by something else reads as down, and alarms like a
+        // worker's once it persists.
+        cp.internal_proxy = Some(serde_json::json!({
+            "address": "172.20.0.1:80",
+            "listening": false,
+            "mode": "down",
+            "error": "172.20.0.1:80 is in use by another program",
+        }));
+        let down = control_plane_proxy_state(Some(&cp)).expect("reported");
+        let reason = internal_proxy_alert_for(true, true, "active", &down, 2).expect("alarm");
+        assert!(reason.contains("172.20.0.1:80"), "{reason}");
+        assert!(reason.contains("withdrawn"), "{reason}");
+        assert_eq!(
+            internal_proxy_alert_for(true, true, "active", &down, 1),
+            None
+        );
+
+        // Anything but an object is unknown, not "down".
+        cp.internal_proxy = Some(serde_json::json!("yes"));
+        assert_eq!(control_plane_proxy_state(Some(&cp)), None);
+    }
+
+    /// The control plane's routing alarm opens after two down passes and is
+    /// resolved, with its streak reset, once the control plane reports no
+    /// routing at all (a worker joined, or cluster DNS was turned off).
+    #[test]
+    fn the_control_plane_routing_alarm_resolves_once_it_reports_nothing() {
+        let down = InternalProxyState {
+            listening: Some(false),
+            address: Some("172.20.0.1:80".into()),
+            error: Some("172.20.0.1:80 is in use by another program".into()),
+            ..Default::default()
+        };
+        let mut streak = 0;
+        assert_eq!(
+            internal_proxy_alarm(true, true, "active", Some(&down), &mut streak),
+            None
+        );
+        assert!(internal_proxy_alarm(true, true, "active", Some(&down), &mut streak).is_some());
+        // Routing stopped: nothing is reported, so nothing is down.
+        assert_eq!(
+            internal_proxy_alarm(true, true, "active", None, &mut streak),
+            None
+        );
+        assert_eq!(streak, 0);
+        // Down again later starts a new streak: one pass pages nobody.
+        assert_eq!(
+            internal_proxy_alarm(true, true, "active", Some(&down), &mut streak),
+            None
+        );
+        assert_eq!(streak, 1);
+        // Listening resets it as before.
+        let up = InternalProxyState {
+            listening: Some(true),
+            ..down.clone()
+        };
+        assert_eq!(
+            internal_proxy_alarm(true, true, "active", Some(&up), &mut streak),
+            None
+        );
+        assert_eq!(streak, 0);
     }
 
     fn health(
