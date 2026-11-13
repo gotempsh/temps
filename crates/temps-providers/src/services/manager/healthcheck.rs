@@ -571,7 +571,8 @@ impl ExternalServiceManager {
 
     /// Publish a service's overrides again under its container's current
     /// name, after a rename: the engines look them up by container name, so
-    /// the old name would keep them and the new one would not.
+    /// the old name would keep them and the new one would not. Also used by
+    /// [`Self::claim_healthcheck_container`] for a new service.
     pub(crate) async fn republish_healthcheck_overrides(
         &self,
         service_id: i32,
@@ -586,6 +587,22 @@ impl ExternalServiceManager {
         });
         self.notify_healthcheck_change(service_id).await;
         Ok(())
+    }
+
+    /// Publish a new service's container name before its first container:
+    /// a service that held the name and was deleted, maybe by another
+    /// process, must not lend it its overrides, here or in the other
+    /// processes. Best-effort; creation goes on if it fails.
+    pub(crate) async fn claim_healthcheck_container(&self, service_id: i32) {
+        if let Err(error) = self.republish_healthcheck_overrides(service_id).await {
+            warn!(
+                service_id,
+                %error,
+                "Could not publish the container name of new external service {} to the \
+                 healthcheck registry",
+                service_id
+            );
+        }
     }
 
     /// The engine whose container Apply now recreates, or why it may not:
@@ -1026,6 +1043,37 @@ mod tests {
         registry::clear_service(before.id);
         assert_eq!(on_new.interval_secs, Some(60));
         assert!(on_old.is_empty(), "{on_old:?}");
+    }
+
+    #[tokio::test]
+    async fn a_new_service_does_not_inherit_the_overrides_of_one_that_held_its_name() {
+        let _registry = HEALTHCHECK_REGISTRY_TEST_LOCK.lock().await;
+        use crate::services::test_support::encrypted_service_model;
+        // Ids and names no other test uses: the table is process-wide.
+        let created = external_services::Model {
+            name: "hc-reused-name".to_string(),
+            ..encrypted_service_model(990_201, serde_json::json!({}))
+        };
+        let manager = manager_over(vec![created.clone()]);
+        let container = manager
+            .healthcheck_target(&created)
+            .unwrap()
+            .container_name
+            .unwrap();
+        // Deleted by another process before this one heard of it.
+        registry::set_service(registry::ServiceHealthcheckEntry {
+            service_id: 990_200,
+            container_name: Some(container.clone()),
+            overrides: HealthcheckOverrides {
+                interval_secs: Some(60),
+                ..Default::default()
+            },
+        });
+
+        manager.claim_healthcheck_container(created.id).await;
+        let inherited = registry::for_container(&container);
+        registry::clear_service(990_200);
+        assert!(inherited.is_empty(), "{inherited:?}");
     }
 
     #[tokio::test]

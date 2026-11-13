@@ -361,6 +361,8 @@ impl ExternalServiceManager {
             let init_result = async {
                 self.ensure_new_local_service_resources_unused(&service)
                     .await?;
+                // Before its first container, which looks the name up.
+                self.claim_healthcheck_container(service.id).await;
                 self.initialize_service(service.id).await
             }
             .await;
