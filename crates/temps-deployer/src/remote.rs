@@ -552,11 +552,14 @@ pub const REMOVE_IMAGES_PATH: &str = "/agent/images/remove";
 const REMOVE_IMAGES_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Wire body for `POST /agent/images/owned`: list the images on the node
-/// that the Temps install `owner` built.
+/// that the Temps install `owner` built for its project `project_id`.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ListOwnedImagesRequest {
     /// The value of the install's [`crate::IMAGE_OWNER_LABEL`].
     pub owner: String,
+    /// The value of [`crate::IMAGE_PROJECT_LABEL`]: one project's images
+    /// are listed at a time, so the daemon's answer stays that size.
+    pub project_id: i32,
     /// Where the previous page ended. Optional on the wire: an agent that
     /// predates it always starts at the oldest image.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1701,12 +1704,14 @@ impl ContainerDeployer for RemoteNodeDeployer {
     async fn list_owned_images(
         &self,
         owner: &str,
+        project_id: i32,
         after: Option<&crate::ListCursor>,
     ) -> Result<crate::LabelledImages, DeployerError> {
         self.agent_image_call(
             LIST_OWNED_IMAGES_PATH,
             &ListOwnedImagesRequest {
                 owner: owner.to_string(),
+                project_id,
                 after: after.cloned(),
             },
             MAX_OWNED_IMAGES_RESPONSE_BYTES,
@@ -3764,6 +3769,7 @@ mod tests {
         let listed = test_remote(address)
             .list_owned_images(
                 "install-a.marker-b",
+                7,
                 Some(&crate::ListCursor {
                     created: 9,
                     image_id: "sha256:99".to_string(),
@@ -3781,6 +3787,7 @@ mod tests {
             request.contains(r#""owner":"install-a.marker-b""#),
             "{request}"
         );
+        assert!(request.contains(r#""project_id":7"#), "{request}");
         assert!(
             request.contains(r#""after":{"created":9,"image_id":"sha256:99"}"#),
             "{request}"

@@ -462,14 +462,19 @@ fn next_cursor(images: &[LabelledImage], unlisted: usize) -> Option<ListCursor> 
         })
 }
 
-/// Images labelled `key=value` after `after`, oldest first and bounded by
-/// [`MAX_LABELLED_IMAGES`] (see [`page_labelled_images`]), keeping only their
-/// labels under `keep_prefix`. With `check_usage`, each kept image is also
-/// checked for a container created from it (one query per image).
+/// Images carrying every `key=value` of `labels` after `after`, oldest
+/// first and bounded by [`MAX_LABELLED_IMAGES`] (see
+/// [`page_labelled_images`]), keeping only their labels under `keep_prefix`.
+/// With `check_usage`, each kept image is also checked for a container
+/// created from it (one query per image).
+///
+/// Docker cannot page or limit an image listing, so its whole answer is
+/// read: callers narrow it with the labels (the orphan sweep asks for one
+/// deleted project's images of one install), and the page bounds what is
+/// built and returned from it.
 pub async fn list_labelled_images(
     docker: &Docker,
-    key: &str,
-    value: &str,
+    labels: &[(&str, &str)],
     keep_prefix: &str,
     check_usage: bool,
     after: Option<&ListCursor>,
@@ -479,7 +484,10 @@ pub async fn list_labelled_images(
             all: false,
             filters: Some(HashMap::from([(
                 "label".to_string(),
-                vec![format!("{key}={value}")],
+                labels
+                    .iter()
+                    .map(|(key, value)| format!("{key}={value}"))
+                    .collect(),
             )])),
             ..Default::default()
         }))
@@ -488,10 +496,8 @@ pub async fn list_labelled_images(
             operation: "list labelled images",
             source,
         })?;
-    // Docker cannot page an image listing, so the reply holds every image
-    // carrying this label (this owner's images on this daemon). Narrow it
-    // to the page before converting anything, so what is built and handed
-    // on is bounded by MAX_LABELLED_IMAGES.
+    // Narrow the answer to the page before converting anything, so what is
+    // built and handed on is bounded by MAX_LABELLED_IMAGES.
     let (images, unlisted) = select_page(images, after, MAX_LABELLED_IMAGES, |image| {
         (image.created, image.id.as_str())
     });
@@ -578,26 +584,78 @@ fn guard_needing_shared_host<'a>(
     })
 }
 
-/// Whether the daemon holds any image carrying `label` with a value other
-/// than `owner`. A listing that fails counts as yes: unlabelled images are
-/// then kept, the safe direction.
+/// Containers one page of [`another_owner_present`] reads.
+const OWNER_PROBE_PAGE: usize = 64;
+/// Pages [`another_owner_present`] reads before giving up and answering yes.
+const MAX_OWNER_PROBE_PAGES: usize = 64;
+
+/// Whether another owner uses this daemon: a container, running or stopped,
+/// created from an image carrying `label` with a value other than `owner`
+/// (a container inherits its image's labels).
+///
+/// Docker can limit and page a container listing, never an image listing,
+/// so this reads the labelled containers a page of [`OWNER_PROBE_PAGE`] at a
+/// time, newest first, and stops at the first one of another owner: what it
+/// holds never grows with the daemon. An owner that built images here but
+/// runs no container from any of them is not seen; see the known limits of
+/// unlabelled images. A listing that fails, or more of this owner's own
+/// containers than [`MAX_OWNER_PROBE_PAGES`] pages, counts as yes:
+/// unlabelled images are then kept, the safe direction.
 pub async fn another_owner_present(docker: &Docker, label: &str, owner: Option<&str>) -> bool {
-    let listed = docker
-        .list_images(Some(bollard::query_parameters::ListImagesOptions {
-            all: false,
-            filters: Some(HashMap::from([(
-                "label".to_string(),
-                vec![label.to_string()],
-            )])),
-            ..Default::default()
-        }))
-        .await;
-    match listed {
-        Ok(images) => images
-            .iter()
-            .any(|image| image.labels.get(label).map(String::as_str) != owner),
-        Err(_) => true,
+    probe_other_owner(
+        docker,
+        label,
+        owner,
+        OWNER_PROBE_PAGE,
+        MAX_OWNER_PROBE_PAGES,
+    )
+    .await
+}
+
+async fn probe_other_owner(
+    docker: &Docker,
+    label: &str,
+    owner: Option<&str>,
+    page_size: usize,
+    max_pages: usize,
+) -> bool {
+    let mut before: Option<String> = None;
+    for _ in 0..max_pages {
+        let mut filters = HashMap::from([("label".to_string(), vec![label.to_string()])]);
+        if let Some(before) = &before {
+            filters.insert("before".to_string(), vec![before.clone()]);
+        }
+        let Ok(page) = docker
+            .list_containers(Some(ListContainersOptions {
+                all: true,
+                limit: Some(i32::try_from(page_size).unwrap_or(i32::MAX)),
+                filters: Some(filters),
+                ..Default::default()
+            }))
+            .await
+        else {
+            return true;
+        };
+        let foreign = page.iter().any(|container| {
+            container
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get(label))
+                .map(String::as_str)
+                != owner
+        });
+        if foreign {
+            return true;
+        }
+        if page.len() < page_size {
+            return false;
+        }
+        match page.last().and_then(|container| container.id.clone()) {
+            Some(id) => before = Some(id),
+            None => return true,
+        }
     }
+    true
 }
 
 async fn remove_one(
@@ -1300,8 +1358,7 @@ mod tests {
             Some(
                 list_labelled_images(
                     &docker,
-                    "sh.temps.test.owner",
-                    &owner,
+                    &[("sh.temps.test.owner", owner.as_str())],
                     "sh.temps.",
                     true,
                     None,
@@ -1376,19 +1433,75 @@ mod tests {
                 keep_unlabelled_when_shared: true,
             });
 
+        let ours = format!("{}:latest", crate::test_support::unique_name("shared-ours"));
+        let their_container = crate::test_support::unique_name("shared-their-container");
+        let our_container = crate::test_support::unique_name("shared-our-container");
+        let create = |name: String, image: String| {
+            let docker = docker.clone();
+            async move {
+                docker
+                    .create_container(
+                        Some(
+                            bollard::query_parameters::CreateContainerOptionsBuilder::new()
+                                .name(&name)
+                                .build(),
+                        ),
+                        bollard::models::ContainerCreateBody {
+                            image: Some(image),
+                            cmd: Some(vec!["true".to_string()]),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .map(|_| ())
+            }
+        };
+        let remove_container = |name: String| {
+            let docker = docker.clone();
+            async move {
+                let _ = docker
+                    .remove_container(
+                        &name,
+                        Some(bollard::query_parameters::RemoveContainerOptions {
+                            force: true,
+                            ..Default::default()
+                        }),
+                    )
+                    .await;
+            }
+        };
+
+        // Only this install's own container: the daemon is not shared.
         let prepared = async {
+            build_labelled_unique_image(&docker, &ours, &label, "this-install").await?;
+            create(our_container.clone(), ours.clone()).await?;
             build_labelled_unique_image(&docker, &theirs, &label, "another-install").await?;
             build_unique_image(&docker, &unlabelled).await?;
             Ok::<(), Box<dyn std::error::Error>>(())
         }
         .await;
+        let alone_with_ours = if prepared.is_ok() {
+            Some(another_owner_present(&docker, &label, Some("this-install")).await)
+        } else {
+            None
+        };
+        // Another install runs a container from its image: shared.
+        let prepared = match prepared {
+            Ok(()) => create(their_container.clone(), theirs.clone())
+                .await
+                .map_err(Into::into),
+            Err(error) => Err(error),
+        };
         let while_shared = if prepared.is_ok() {
             Some(remove_unused_images(&docker, std::slice::from_ref(&request)).await)
         } else {
             None
         };
         let kept = docker.inspect_image(&unlabelled).await.is_ok();
+        remove_container(their_container).await;
+        remove_container(our_container).await;
         force_remove_image(&docker, &theirs).await;
+        force_remove_image(&docker, &ours).await;
         let once_alone = if prepared.is_ok() {
             Some(remove_unused_images(&docker, std::slice::from_ref(&request)).await)
         } else {
@@ -1400,6 +1513,11 @@ mod tests {
         if let Err(error) = prepared {
             panic!("preparing the shared-host test failed: {error}");
         }
+        assert_eq!(
+            alone_with_ours,
+            Some(false),
+            "this install's own containers do not make the daemon shared"
+        );
         let while_shared = while_shared.expect("ran").expect("within the batch limit");
         assert!(
             matches!(
@@ -1418,6 +1536,107 @@ mod tests {
         assert!(
             removed,
             "with no other owner present it is judged on the records"
+        );
+    }
+
+    /// The owner probe pages past this owner's own containers, newest first,
+    /// to an older container of another owner, and answers yes when it runs
+    /// out of pages before it could rule one out.
+    #[tokio::test]
+    async fn the_owner_probe_pages_past_this_owners_containers() {
+        use crate::pull::{pull_image, PullSpec};
+
+        let Some(docker) = crate::test_support::docker_or_skip(
+            "the_owner_probe_pages_past_this_owners_containers",
+        )
+        .await
+        else {
+            return;
+        };
+        if let Err(error) =
+            pull_image(&docker, PullSpec::new(crate::test_support::TEST_IMAGE)).await
+        {
+            println!("Could not pull the test image, skipping: {error}");
+            return;
+        }
+        let label = format!("sh.temps.test.owner.{}", uuid::Uuid::new_v4().simple());
+        let names: Vec<String> = ["theirs", "ours-1", "ours-2"]
+            .iter()
+            .map(|name| crate::test_support::unique_name(&format!("probe-{name}")))
+            .collect();
+        let mut prepared: Result<(), String> = Ok(());
+        // Created oldest first: another owner's, then two of ours.
+        for (name, owner) in names
+            .iter()
+            .zip(["another-install", "this-install", "this-install"])
+        {
+            let created = docker
+                .create_container(
+                    Some(
+                        bollard::query_parameters::CreateContainerOptionsBuilder::new()
+                            .name(name)
+                            .build(),
+                    ),
+                    bollard::models::ContainerCreateBody {
+                        image: Some(crate::test_support::TEST_IMAGE.to_string()),
+                        cmd: Some(vec!["true".to_string()]),
+                        labels: Some(HashMap::from([(label.clone(), owner.to_string())])),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            if let Err(error) = created {
+                prepared = Err(format!("create {name}: {error}"));
+                break;
+            }
+        }
+        let paged = probe_other_owner(&docker, &label, Some("this-install"), 1, 8).await;
+        let gave_up = probe_other_owner(&docker, &label, Some("this-install"), 1, 2).await;
+        let theirs_only = probe_other_owner(&docker, &label, Some("another-install"), 1, 8).await;
+        // With only ours left, the answer needs every page read through:
+        // a `before` filter the daemon rejected would answer yes.
+        let _ = docker
+            .remove_container(
+                &names[0],
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+        let ours_only = probe_other_owner(&docker, &label, Some("this-install"), 1, 8).await;
+        for name in &names {
+            let _ = docker
+                .remove_container(
+                    name,
+                    Some(bollard::query_parameters::RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await;
+        }
+        let none_left = probe_other_owner(&docker, &label, Some("this-install"), 1, 8).await;
+
+        if let Err(error) = prepared {
+            panic!("preparing the owner probe test failed: {error}");
+        }
+        assert!(
+            paged,
+            "another owner's older container is found a page at a time"
+        );
+        assert!(gave_up, "running out of pages keeps unlabelled images");
+        assert!(
+            theirs_only,
+            "for the other install, ours are the foreign ones"
+        );
+        assert!(
+            !ours_only,
+            "paging through only our own containers finds no other owner"
+        );
+        assert!(
+            !none_left,
+            "with no labelled container the daemon is not shared"
         );
     }
 }

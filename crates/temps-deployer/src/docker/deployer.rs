@@ -1365,13 +1365,17 @@ impl ContainerDeployer for DockerRuntime {
     async fn list_owned_images(
         &self,
         owner: &str,
+        project_id: i32,
         after: Option<&crate::ListCursor>,
     ) -> Result<crate::LabelledImages, DeployerError> {
         let docker = self.require_docker()?;
+        let project = project_id.to_string();
         temps_docker_util::list_labelled_images(
             &docker,
-            crate::IMAGE_OWNER_LABEL,
-            owner,
+            &[
+                (crate::IMAGE_OWNER_LABEL, owner),
+                (crate::IMAGE_PROJECT_LABEL, project.as_str()),
+            ],
             crate::build_protocol::IMAGE_LABEL_PREFIX,
             true,
             after,

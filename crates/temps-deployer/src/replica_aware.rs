@@ -193,9 +193,10 @@ impl ContainerDeployer for ReplicaAwareDeployer {
     async fn list_owned_images(
         &self,
         owner: &str,
+        project_id: i32,
         after: Option<&crate::ListCursor>,
     ) -> Result<crate::LabelledImages, DeployerError> {
-        self.local.list_owned_images(owner, after).await
+        self.local.list_owned_images(owner, project_id, after).await
     }
 }
 

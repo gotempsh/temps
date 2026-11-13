@@ -5,30 +5,43 @@
 //!
 //! Deleting a project removes the images its builds recorded (see
 //! `ProjectImageCleaner` in `temps-core`), but that is best-effort: a daemon
-//! that was unreachable, or a removal Docker refused, leaves the image behind
-//! after the `deployment_jobs` rows that named it are gone, so the
-//! row-based retention pass can never pick it again. This sweep finds those
-//! by their build labels instead (see [`super::image_ownership`]):
+//! that was unreachable, a removal Docker refused, or a build that finished
+//! during the deletion leaves an image behind after the `deployment_jobs`
+//! rows that named it are gone, so the row-based retention pass can never
+//! pick it again. This sweep finds those by their build labels instead (see
+//! [`super::image_ownership`]).
 //!
-//! - only images labelled with **this install's** ID, so another Temps
+//! It works from the deleted projects, not from the daemon: a trigger on
+//! `projects` records each deleted project's ID in `deleted_project_images`
+//! in the same transaction as the delete. Each run takes the least recently
+//! checked of those records and asks each runtime for **one deleted
+//! project's** images at a time, labelled with this install's ID and that
+//! project's ID. Docker cannot limit or page an image listing, so what it
+//! answers is never more than one deleted project's leftovers, and a run
+//! with no deleted projects asks no daemon anything. A record is removed
+//! once no runtime holds an image labelled with the project, and kept
+//! (checked again on a later night) while one does or a runtime could not
+//! be asked.
+//!
+//! An image is removed only:
+//!
+//! - when it is labelled with **this install's** ID, so another Temps
 //!   install sharing the host is never touched, and images built before the
 //!   labels existed are never touched either;
-//! - only when the labelled project has **no row** in this database, checked
-//!   for the whole set of labelled projects in one query;
-//! - only when **no other project** still names the image's tag or ID in a
-//!   deployment or build (a promotion, an identical build), checked for the
-//!   whole set of orphans in one query;
-//! - only when its tags are exactly the one its build gave it (recorded as
+//! - when its project has **no row** in this database (a record whose
+//!   project ID has a row again, after a restored backup, is dropped);
+//! - when **no other project** still deploys the image's tag or ID, checked
+//!   for each project's images in one query;
+//! - when its tags are exactly the one its build gave it (recorded as
 //!   `sh.temps.image.tag`), so an image someone retagged for themselves
 //!   stays;
-//! - only when **no container**, running or stopped, was created from the
-//!   image, judged by image ID; removed by that ID and never forced.
+//! - when **no container**, running or stopped, was created from the image,
+//!   judged by image ID; removed by that ID and never forced.
 //!
-//! It never selects by tag text (#1373). Its cost grows with the number of
-//! labelled images on this daemon, not with the size of the database, and it
-//! removes at most a configured number of images per run, oldest first.
+//! It never selects by tag text (#1373), and it removes at most a
+//! configured number of images per runtime and run, oldest first.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 use temps_docker_util::image_removal::{
@@ -36,11 +49,17 @@ use temps_docker_util::image_removal::{
     MAX_IMAGE_REMOVAL_BATCH,
 };
 
-use super::image_ownership::{self, ImageOwnershipError, IMAGE_INSTANCE_LABEL};
+use super::image_ownership::{
+    self, ImageOwnershipError, IMAGE_INSTANCE_LABEL, IMAGE_PROJECT_LABEL,
+};
+use super::image_references;
 
 /// Only these labels of a listed image are kept.
 const IMAGE_LABEL_PREFIX: &str = "sh.temps.image.";
-use super::image_references;
+
+/// Most deleted projects one run checks. The rest wait for later runs, least
+/// recently checked first.
+pub const MAX_PROJECTS_PER_RUN: usize = 50;
 
 /// An image on a daemon labelled as built by this install, with its
 /// `sh.temps.image.*` labels. A worker's listing also says whether a
@@ -54,25 +73,32 @@ pub enum OrphanSweepError {
     Ownership(#[from] ImageOwnershipError),
 
     #[error(
-        "Failed to connect to the Docker daemon to list images labelled {label}={owner}: {source}"
+        "Failed to connect to the Docker daemon to list the images install {owner} built for \
+         deleted project {project_id}: {source}"
     )]
     Connect {
-        label: &'static str,
         owner: String,
+        project_id: i32,
         #[source]
         source: bollard::errors::Error,
     },
 
-    #[error("Failed to list images labelled {label}={owner}: {source}")]
+    #[error("Failed to list the images install {owner} built for deleted project {project_id}: {source}")]
     ListImages {
-        label: &'static str,
         owner: String,
+        project_id: i32,
         /// Boxed: the Docker error is large and this variant is rare.
         #[source]
         source: Box<temps_docker_util::DockerUtilError>,
     },
 
-    #[error("Failed to check which of {count} labelled projects still exist: {source}")]
+    #[error("Failed to read the deleted projects whose images to sweep: {source}")]
+    DeletedProjects {
+        #[source]
+        source: sea_orm::DbErr,
+    },
+
+    #[error("Failed to check which of {count} deleted projects have a row again: {source}")]
     ProjectLookup {
         count: usize,
         #[source]
@@ -86,14 +112,18 @@ pub enum OrphanSweepError {
         source: bollard::errors::Error,
     },
 
-    #[error("Failed to check which of {count} orphaned image references other projects still name: {source}")]
+    #[error(
+        "Failed to check which of {count} image references of deleted project {project_id} \
+         other projects still name: {source}"
+    )]
     ReferenceLookup {
+        project_id: i32,
         count: usize,
         #[source]
         source: sea_orm::DbErr,
     },
 
-    #[error("Failed to remove {count} orphaned images: {source}")]
+    #[error("Failed to remove {count} images of deleted projects: {source}")]
     Removal {
         count: usize,
         /// Boxed: the Docker error is large and this variant is rare.
@@ -118,24 +148,43 @@ pub enum OrphanSweepError {
     },
 }
 
-/// What one sweep did.
+/// What one run did on one runtime, over the deleted projects it checked.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OrphanSweepReport {
-    /// Images labelled with this install's owner ID.
-    pub labelled: usize,
-    /// Of those, images whose project no longer exists.
-    pub orphaned: usize,
+    /// Deleted projects whose images were looked for.
+    pub projects: usize,
+    /// Images of those projects listed.
+    pub listed: usize,
     pub removed: usize,
     /// Kept: another project still names the image, its tags are not just
     /// the one its build gave it, a container uses it, or Docker refused.
     pub kept: usize,
     pub failed: usize,
-    /// Orphans left for the next run by the per-run limit.
+    /// Images, and deleted projects not looked at, left for a later run by
+    /// the per-run limit.
     pub deferred: usize,
-    /// Where the next run's listing starts: after this page when it was
-    /// handled whole and more images follow; at the same page when the
-    /// per-run limit deferred orphans on it and this run removed some (so
-    /// retrying makes progress); `None` to start over at the oldest.
+}
+
+/// What one runtime held for one deleted project, and what the sweep did
+/// with it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProjectSweep {
+    pub listed: usize,
+    pub removed: usize,
+    pub kept: usize,
+    pub failed: usize,
+    /// Images the per-run limit left for a later run.
+    pub deferred: usize,
+    /// Removals asked of the daemon, whatever it answered: what counts
+    /// against the per-run limit.
+    pub attempted: usize,
+    /// The project's images still on the runtime after this run: listed or
+    /// past the page, less those removed. Zero means none is left there.
+    pub remaining: usize,
+    /// Where the next run's listing of this project starts: after this page
+    /// when it was handled whole and more images follow; at the same page
+    /// when the limit deferred images on it and this run removed some (so
+    /// retrying makes progress); `None` to start at the oldest.
     pub next: Option<ListCursor>,
 }
 
@@ -143,13 +192,15 @@ pub struct OrphanSweepReport {
 /// node's through its agent. Mockable in tests.
 #[async_trait::async_trait]
 pub trait OwnedImageDaemon: Send + Sync {
-    /// Images labelled `sh.temps.image.instance=<owner>` after `after`,
-    /// oldest first and bounded by
+    /// Images labelled `sh.temps.image.instance=<owner>` and
+    /// `sh.temps.image.project_id=<project_id>` after `after`, oldest first
+    /// and bounded by
     /// [`temps_docker_util::image_removal::MAX_LABELLED_IMAGES`], with where
     /// the next page starts.
-    async fn list_instance_images(
+    async fn list_project_images(
         &self,
         owner: &str,
+        project_id: i32,
         after: Option<&ListCursor>,
     ) -> Result<LabelledImages, OrphanSweepError>;
 
@@ -174,49 +225,65 @@ pub struct WorkerImageDaemon {
     pub daemon: std::sync::Arc<dyn OwnedImageDaemon>,
 }
 
+/// The worker nodes one run covers, and those it could not.
+#[derive(Default)]
+pub struct WorkerImageDaemonSet {
+    pub reachable: Vec<WorkerImageDaemon>,
+    /// Worker nodes that may hold images but cannot be asked now (offline,
+    /// or failing to connect). A deleted project's record is kept until
+    /// every node has been checked, so their images are swept once they are
+    /// back.
+    pub unreachable: Vec<i32>,
+}
+
 /// The worker nodes the nightly sweep covers, implemented where nodes are
 /// known (`temps-deployments`). A worker's own housekeeping has no database,
 /// so it cannot tell which projects still exist: the control plane does it.
 #[async_trait::async_trait]
 pub trait WorkerImageDaemons: Send + Sync {
-    /// The reachable worker nodes. A node that cannot be reached is left out
-    /// (and logged); its images are swept on a later night.
-    async fn worker_image_daemons(&self) -> Result<Vec<WorkerImageDaemon>, OrphanSweepError>;
+    /// The worker nodes, split into those that can be asked now and those
+    /// that cannot (each logged).
+    async fn worker_image_daemons(&self) -> Result<WorkerImageDaemonSet, OrphanSweepError>;
 }
 
 #[async_trait::async_trait]
 impl OwnedImageDaemon for super::DefaultDockerClient {
-    async fn list_instance_images(
+    async fn list_project_images(
         &self,
         owner: &str,
+        project_id: i32,
         after: Option<&ListCursor>,
     ) -> Result<LabelledImages, OrphanSweepError> {
         let docker = bollard::Docker::connect_with_unix_defaults().map_err(|source| {
             OrphanSweepError::Connect {
-                label: IMAGE_INSTANCE_LABEL,
                 owner: owner.to_string(),
+                project_id,
                 source,
             }
         })?;
+        let project = project_id.to_string();
         let listing = temps_docker_util::list_labelled_images(
             &docker,
-            IMAGE_INSTANCE_LABEL,
-            owner,
+            &[
+                (IMAGE_INSTANCE_LABEL, owner),
+                (IMAGE_PROJECT_LABEL, project.as_str()),
+            ],
             IMAGE_LABEL_PREFIX,
             false,
             after,
         )
         .await
         .map_err(|source| OrphanSweepError::ListImages {
-            label: IMAGE_INSTANCE_LABEL,
             owner: owner.to_string(),
+            project_id,
             source: Box::new(source),
         })?;
         if listing.unlisted > 0 {
             tracing::info!(
+                project_id,
                 listed = listing.images.len(),
                 unlisted = listing.unlisted,
-                "More of this install's images than one sweep lists; the next run continues after these"
+                "More images of a deleted project than one sweep lists; the next run continues after these"
             );
         }
         Ok(listing)
@@ -256,29 +323,42 @@ impl OwnedImageDaemon for super::DefaultDockerClient {
     }
 }
 
-/// The orphans among `images`: labelled with a project `existing` does not
-/// contain, oldest first. An image whose project label is missing or
-/// malformed is never an orphan: it cannot be tied to a project at all.
-pub fn select_orphans<'a>(
-    images: &'a [OwnedImage],
-    existing_projects: &HashSet<i32>,
-) -> Vec<&'a OwnedImage> {
-    let mut orphans: Vec<&OwnedImage> = images
-        .iter()
-        .filter(|image| {
-            image_ownership::labelled_project_id(&image.labels)
-                .is_some_and(|project_id| !existing_projects.contains(&project_id))
-        })
-        .collect();
-    orphans.sort_by(|a, b| {
-        a.created
-            .cmp(&b.created)
-            .then_with(|| a.image_id.cmp(&b.image_id))
-    });
-    orphans
+/// A deleted project waiting for its images to be swept.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeletedProject {
+    pub project_id: i32,
+    /// When the row was deleted: a record is only removed or touched while
+    /// it still names this deletion, so a project ID deleted again during a
+    /// run keeps its fresh record.
+    pub deleted_at: chrono::DateTime<chrono::Utc>,
 }
 
-/// Which of `project_ids` still have a row, in one query by primary key.
+/// Up to `limit` deleted projects, least recently checked first.
+async fn deleted_projects<C: ConnectionTrait>(
+    db: &C,
+    limit: usize,
+) -> Result<Vec<DeletedProject>, OrphanSweepError> {
+    let read_error = |source| OrphanSweepError::DeletedProjects { source };
+    let rows = db
+        .query_all(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT project_id, deleted_at FROM deleted_project_images \
+             ORDER BY checked_at ASC NULLS FIRST, project_id LIMIT $1",
+            [i64::try_from(limit).unwrap_or(i64::MAX).into()],
+        ))
+        .await
+        .map_err(read_error)?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(DeletedProject {
+                project_id: row.try_get("", "project_id").map_err(read_error)?,
+                deleted_at: row.try_get("", "deleted_at").map_err(read_error)?,
+            })
+        })
+        .collect()
+}
+
+/// Which of `project_ids` have a row, in one query by primary key.
 async fn existing_project_ids<C: ConnectionTrait>(
     db: &C,
     project_ids: &BTreeSet<i32>,
@@ -299,6 +379,33 @@ async fn existing_project_ids<C: ConnectionTrait>(
     rows.into_iter()
         .map(|row| row.try_get::<i32>("", "id").map_err(lookup_error))
         .collect()
+}
+
+/// Remove `project`'s record (`retire`), or note it was checked so other
+/// records go first next run. A failure is logged: the record is then
+/// checked again, which is harmless.
+async fn settle_record<C: ConnectionTrait>(db: &C, project: &DeletedProject, retire: bool) {
+    let sql = if retire {
+        "DELETE FROM deleted_project_images WHERE project_id = $1 AND deleted_at = $2"
+    } else {
+        "UPDATE deleted_project_images SET checked_at = now() \
+         WHERE project_id = $1 AND deleted_at = $2"
+    };
+    if let Err(error) = db
+        .execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            sql,
+            [project.project_id.into(), project.deleted_at.into()],
+        ))
+        .await
+    {
+        tracing::warn!(
+            project_id = project.project_id,
+            retire,
+            %error,
+            "Could not update the record of a deleted project's images; it is checked again next run"
+        );
+    }
 }
 
 /// The removal request for an orphan: by its one tag, expecting its ID, or
@@ -340,50 +447,50 @@ fn log_kept(image: &OwnedImage, reason: &str) {
     );
 }
 
-/// Remove up to `max_per_run` images this install built for projects that
-/// no longer exist. See the module documentation for the safety rules.
+/// Remove up to `max_removals` of the images this install built for the
+/// deleted project `project_id` on one runtime, oldest first. See the
+/// module documentation for the safety rules; the caller has checked that
+/// the project has no row.
 ///
 /// Images that must stay (named by another project, retagged, used by a
 /// container) are set aside **before** the limit is applied, so a backlog
-/// of held images can never fill every night's batch and starve newer
-/// orphans that could go.
-///
-/// Each run lists one page of this install's images, starting after
-/// `after`; the report says where the next run starts, so a host with more
-/// labelled images than one page is swept through in turn rather than the
-/// same oldest page every night.
-pub async fn sweep_orphaned_project_images<C: ConnectionTrait>(
+/// of held images can never fill every night's batch and starve images
+/// that could go.
+pub async fn sweep_deleted_project_images<C: ConnectionTrait>(
     db: &C,
     daemon: &dyn OwnedImageDaemon,
     owner: &str,
+    project_id: i32,
     after: Option<&ListCursor>,
-    max_per_run: usize,
-) -> Result<OrphanSweepReport, OrphanSweepError> {
-    let listing = daemon.list_instance_images(owner, after).await?;
-    let images = listing.images;
-    let mut report = OrphanSweepReport {
-        labelled: images.len(),
-        next: listing.next,
+    max_removals: usize,
+) -> Result<ProjectSweep, OrphanSweepError> {
+    let listing = daemon.list_project_images(owner, project_id, after).await?;
+    // The daemon filtered by the labels; this only guards against one that
+    // did not.
+    let mut images: Vec<&OwnedImage> = listing
+        .images
+        .iter()
+        .filter(|image| image_ownership::labelled_project_id(&image.labels) == Some(project_id))
+        .collect();
+    images.sort_by(|a, b| {
+        a.created
+            .cmp(&b.created)
+            .then_with(|| a.image_id.cmp(&b.image_id))
+    });
+    let mut sweep = ProjectSweep {
+        listed: images.len(),
+        remaining: images.len() + listing.unlisted,
+        next: listing.next.clone(),
         ..Default::default()
     };
-    let project_ids: BTreeSet<i32> = images
-        .iter()
-        .filter_map(|image| image_ownership::labelled_project_id(&image.labels))
-        .collect();
-    if project_ids.is_empty() {
-        return Ok(report);
-    }
-    let existing = existing_project_ids(db, &project_ids).await?;
-    let orphans = select_orphans(&images, &existing);
-    report.orphaned = orphans.len();
-    if orphans.is_empty() {
-        return Ok(report);
+    if images.is_empty() {
+        return Ok(sweep);
     }
 
-    // The project is gone, but another project may still deploy or have
-    // built the same image: any row naming its tags or ID keeps it.
+    // The project is gone, but another project may still deploy the same
+    // image: any deployment naming its tags or ID keeps it.
     let mut candidates = Vec::new();
-    for image in &orphans {
+    for image in &images {
         for tag in &image.tags {
             candidates.extend(image_references::tag_spellings(tag));
         }
@@ -392,15 +499,16 @@ pub async fn sweep_orphaned_project_images<C: ConnectionTrait>(
     let named = image_references::referenced_images(db, &candidates, None)
         .await
         .map_err(|source| OrphanSweepError::ReferenceLookup {
+            project_id,
             count: candidates.len(),
             source,
         })?;
 
-    let limit = max_per_run.min(MAX_IMAGE_REMOVAL_BATCH);
+    let limit = max_removals.min(MAX_IMAGE_REMOVAL_BATCH);
     let mut selected: Vec<(&OwnedImage, ImageRemovalRequest)> = Vec::new();
-    for (index, image) in orphans.iter().enumerate() {
+    for (index, image) in images.iter().enumerate() {
         if selected.len() == limit {
-            report.deferred = orphans.len() - index;
+            sweep.deferred = images.len() - index;
             break;
         }
         let named_elsewhere = image
@@ -409,72 +517,74 @@ pub async fn sweep_orphaned_project_images<C: ConnectionTrait>(
             .any(|tag| image_references::names_tag(&named, tag))
             || image_references::names_image_id(&named, &image.image_id);
         if named_elsewhere {
-            report.kept += 1;
-            log_kept(image, "another project's deployment or build names it");
+            sweep.kept += 1;
+            log_kept(image, "another project's deployment names it");
             continue;
         }
         let Some(request) = removal_request(image, owner) else {
-            report.kept += 1;
+            sweep.kept += 1;
             log_kept(image, "its tags are not just the one its build gave it");
             continue;
         };
         match daemon.container_using_image(image).await {
             Ok(None) => selected.push((image, request)),
             Ok(Some(container_id)) => {
-                report.kept += 1;
+                sweep.kept += 1;
                 log_kept(
                     image,
                     &format!("container {container_id} was created from it"),
                 );
             }
             Err(error) => {
-                report.failed += 1;
+                sweep.failed += 1;
                 log_kept(image, &error.to_string());
             }
         }
     }
     if selected.is_empty() {
-        return Ok(report);
+        return Ok(sweep);
     }
 
     let requests: Vec<ImageRemovalRequest> = selected
         .iter()
         .map(|(_, request)| request.clone())
         .collect();
+    sweep.attempted = requests.len();
     let outcomes = daemon.remove_unused_images(&requests).await?;
     for (outcome, (image, _)) in outcomes.iter().zip(selected.iter()) {
         if outcome.status.is_removed() {
-            report.removed += 1;
+            sweep.removed += 1;
             tracing::info!(
                 image_id = %image.image_id,
                 tags = ?image.tags,
-                project_id = ?image_ownership::labelled_project_id(&image.labels),
+                project_id,
                 "Removed image built for a project that no longer exists"
             );
         } else if let Some(reason) = outcome.status.reason() {
             if outcome.status.is_failed() {
-                report.failed += 1;
+                sweep.failed += 1;
             } else {
-                report.kept += 1;
+                sweep.kept += 1;
             }
             log_kept(image, &reason);
         }
     }
-    // Orphans the limit deferred on this page are retried next run, by
-    // listing this page again rather than moving on (they would otherwise
-    // wait until the listing wraps around). Only when this run removed
-    // something: each retry then shrinks the page, while a batch the daemon
-    // refuses every time (dependent child images, a failing node) must not
-    // pin the cursor to this page for good; the listing then moves on and
-    // comes back to the page after wrapping around.
-    if report.deferred > 0 && report.removed > 0 {
-        report.next = after.cloned();
+    sweep.remaining = sweep.remaining.saturating_sub(sweep.removed);
+    // Images the limit deferred on this page are retried next run, by
+    // listing this page again rather than moving on. Only when this run
+    // removed something: each retry then shrinks the page, while a batch the
+    // daemon refuses every time (dependent child images, a failing node)
+    // must not pin the listing to this page for good; it then moves on and
+    // comes back after reaching the newest image.
+    if sweep.deferred > 0 && sweep.removed > 0 {
+        sweep.next = after.cloned();
     }
-    Ok(report)
+    Ok(sweep)
 }
 
 /// Runs the sweep on this host's daemon and on every reachable worker node,
-/// with this install's owner ID. Each runtime is swept on its own: one that
+/// with this install's owner ID, for the deleted projects recorded in
+/// `deleted_project_images`. Each runtime is swept on its own: one that
 /// fails is logged and the others still run.
 pub struct OrphanImageSweeper {
     db: std::sync::Arc<temps_database::DbConnection>,
@@ -485,19 +595,25 @@ pub struct OrphanImageSweeper {
     /// Without it nothing is swept: no image could be proved ours.
     data_dir: Option<std::path::PathBuf>,
     max_per_run: usize,
-    /// Where each runtime's next listing starts (`None` is this host). Kept
-    /// in memory: after a restart a runtime is paged through from the oldest
-    /// image again, which only costs one more pass.
-    cursors: std::sync::Mutex<std::collections::HashMap<Option<i32>, ListCursor>>,
+    /// Where the next listing of a deleted project starts on a runtime
+    /// (`None` is this host). Only set while a project has more images there
+    /// than one page; kept in memory: after a restart the listing starts at
+    /// the oldest again, which only costs one more pass.
+    cursors: std::sync::Mutex<HashMap<(Option<i32>, i32), ListCursor>>,
 }
 
-/// What one run of [`OrphanImageSweeper`] did, per runtime.
+/// What one run of [`OrphanImageSweeper`] did.
 #[derive(Debug, Default)]
 pub struct OrphanSweepSummary {
-    /// `None` is this host, `Some(node_id)` a worker node.
+    /// Per runtime: `None` is this host, `Some(node_id)` a worker node.
     pub swept: Vec<(Option<i32>, OrphanSweepReport)>,
-    /// Runtimes whose sweep failed; nothing was removed on them.
+    /// Runtimes whose sweep failed, and failures that stopped the run.
     pub failed: Vec<(Option<i32>, String)>,
+    /// Deleted projects no runtime holds an image of any more: their
+    /// records were removed.
+    pub finished: Vec<i32>,
+    /// Deleted projects checked again on a later run.
+    pub pending: Vec<i32>,
 }
 
 impl OrphanImageSweeper {
@@ -513,9 +629,7 @@ impl OrphanImageSweeper {
         }
     }
 
-    fn cursors(
-        &self,
-    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<Option<i32>, ListCursor>> {
+    fn cursors(&self) -> std::sync::MutexGuard<'_, HashMap<(Option<i32>, i32), ListCursor>> {
         // A plain map replaced entry by entry: a poisoned lock still holds a
         // usable one.
         self.cursors
@@ -546,7 +660,7 @@ impl OrphanImageSweeper {
         self
     }
 
-    /// Sweep every runtime once.
+    /// Sweep the recorded deleted projects on every runtime once.
     pub async fn run(&self) -> OrphanSweepSummary {
         let mut summary = OrphanSweepSummary::default();
         let Some(data_dir) = &self.data_dir else {
@@ -568,108 +682,207 @@ impl OrphanImageSweeper {
                 return summary;
             }
         };
-        if let Some(local) = &self.local {
-            self.sweep_one(None, "this host", local.as_ref(), &owner, &mut summary)
-                .await;
-        }
-        let Some(workers) = &self.workers else {
-            return summary;
+        let records = match deleted_projects(self.db.as_ref(), MAX_PROJECTS_PER_RUN).await {
+            Ok(records) => records,
+            Err(error) => {
+                tracing::error!(%error, "Could not read the deleted projects; not sweeping their images");
+                summary.failed.push((None, error.to_string()));
+                return summary;
+            }
         };
-        match workers.worker_image_daemons().await {
-            Ok(nodes) => {
-                for node in nodes {
-                    let name = format!("worker node {} ({})", node.node_name, node.node_id);
-                    self.sweep_one(
-                        Some(node.node_id),
-                        &name,
-                        node.daemon.as_ref(),
-                        &owner,
-                        &mut summary,
-                    )
-                    .await;
+        if records.is_empty() {
+            tracing::debug!("No deleted projects whose images to sweep");
+            return summary;
+        }
+        // A project ID with a row again (a restored backup) is a live
+        // project: its images are not orphans, and its record goes.
+        let ids: BTreeSet<i32> = records.iter().map(|record| record.project_id).collect();
+        let existing = match existing_project_ids(self.db.as_ref(), &ids).await {
+            Ok(existing) => existing,
+            Err(error) => {
+                tracing::error!(%error, "Could not check the deleted projects; not sweeping their images");
+                summary.failed.push((None, error.to_string()));
+                return summary;
+            }
+        };
+        let mut pending = Vec::with_capacity(records.len());
+        for record in records {
+            if existing.contains(&record.project_id) {
+                settle_record(self.db.as_ref(), &record, true).await;
+            } else {
+                pending.push(record);
+            }
+        }
+        if pending.is_empty() {
+            return summary;
+        }
+
+        // A record is removed only when every runtime that may hold the
+        // project's images was asked and holds none.
+        let mut every_runtime_asked = true;
+        let mut runtimes: Vec<(Option<i32>, String, std::sync::Arc<dyn OwnedImageDaemon>)> =
+            Vec::new();
+        if let Some(local) = &self.local {
+            runtimes.push((None, "this host".to_string(), local.clone()));
+        }
+        if let Some(workers) = &self.workers {
+            match workers.worker_image_daemons().await {
+                Ok(set) => {
+                    if !set.unreachable.is_empty() {
+                        every_runtime_asked = false;
+                        tracing::info!(
+                            nodes = ?set.unreachable,
+                            "Worker nodes cannot be asked now; deleted projects stay recorded until they are"
+                        );
+                    }
+                    for node in set.reachable {
+                        let name = format!("worker node {} ({})", node.node_name, node.node_id);
+                        runtimes.push((Some(node.node_id), name, node.daemon));
+                    }
+                }
+                Err(error) => {
+                    every_runtime_asked = false;
+                    tracing::error!(%error, "Could not read the worker nodes to sweep; their images wait for a later run");
+                    summary.failed.push((None, error.to_string()));
                 }
             }
-            Err(error) => {
-                tracing::error!(%error, "Could not read the worker nodes to sweep; their images wait for a later run");
-                summary.failed.push((None, error.to_string()));
+        }
+
+        let mut clean: HashMap<i32, bool> = pending
+            .iter()
+            .map(|record| (record.project_id, true))
+            .collect();
+        for (node_id, name, daemon) in &runtimes {
+            self.sweep_runtime(
+                *node_id,
+                name,
+                daemon.as_ref(),
+                &owner,
+                &pending,
+                &mut clean,
+                &mut summary,
+            )
+            .await;
+        }
+
+        for record in &pending {
+            let finished = every_runtime_asked && clean.get(&record.project_id) == Some(&true);
+            settle_record(self.db.as_ref(), record, finished).await;
+            if finished {
+                self.cursors()
+                    .retain(|(_, project_id), _| *project_id != record.project_id);
+                summary.finished.push(record.project_id);
+            } else {
+                summary.pending.push(record.project_id);
             }
         }
         summary
     }
 
-    async fn sweep_one(
+    /// Sweep `projects` on one runtime, marking in `clean` each project it
+    /// still holds images of (or could not be asked about).
+    #[allow(clippy::too_many_arguments, reason = "one runtime's share of a run")]
+    async fn sweep_runtime(
         &self,
         node_id: Option<i32>,
         name: &str,
         daemon: &dyn OwnedImageDaemon,
         owner: &str,
+        projects: &[DeletedProject],
+        clean: &mut HashMap<i32, bool>,
         summary: &mut OrphanSweepSummary,
     ) {
-        let after = self.cursors().get(&node_id).cloned();
-        match sweep_orphaned_project_images(
-            self.db.as_ref(),
-            daemon,
-            owner,
-            after.as_ref(),
-            self.max_per_run,
-        )
-        .await
-        {
-            Ok(report) => {
-                match &report.next {
-                    Some(next) => {
-                        self.cursors().insert(node_id, next.clone());
-                    }
-                    None => {
-                        self.cursors().remove(&node_id);
-                    }
+        let mut report = OrphanSweepReport::default();
+        let mut budget = self.max_per_run;
+        for (index, project) in projects.iter().enumerate() {
+            let project_id = project.project_id;
+            if budget == 0 {
+                // Left for a later run, like the images the limit defers.
+                report.deferred += projects.len() - index;
+                for later in &projects[index..] {
+                    clean.insert(later.project_id, false);
                 }
-                if report.orphaned == 0 {
-                    tracing::debug!(
-                        runtime = name,
-                        labelled = report.labelled,
-                        "No images of deleted projects to remove"
-                    );
-                } else {
-                    tracing::info!(
-                        runtime = name,
-                        labelled = report.labelled,
-                        orphaned = report.orphaned,
-                        removed = report.removed,
-                        kept = report.kept,
-                        failed = report.failed,
-                        deferred = report.deferred,
-                        "Swept images built for deleted projects"
-                    );
-                }
-                summary.swept.push((node_id, report));
+                break;
             }
-            Err(error) => {
-                tracing::error!(
-                    runtime = name,
-                    %error,
-                    "Could not sweep images built for deleted projects; nothing was removed there, retrying next run"
-                );
-                summary.failed.push((node_id, error.to_string()));
+            let after = self.cursors().get(&(node_id, project_id)).cloned();
+            match sweep_deleted_project_images(
+                self.db.as_ref(),
+                daemon,
+                owner,
+                project_id,
+                after.as_ref(),
+                budget,
+            )
+            .await
+            {
+                Ok(sweep) => {
+                    report.projects += 1;
+                    report.listed += sweep.listed;
+                    report.removed += sweep.removed;
+                    report.kept += sweep.kept;
+                    report.failed += sweep.failed;
+                    report.deferred += sweep.deferred;
+                    budget = budget.saturating_sub(sweep.attempted);
+                    if sweep.remaining > 0 {
+                        clean.insert(project_id, false);
+                    }
+                    match sweep.next {
+                        Some(next) => {
+                            self.cursors().insert((node_id, project_id), next);
+                        }
+                        None => {
+                            self.cursors().remove(&(node_id, project_id));
+                        }
+                    }
+                }
+                Err(error) => {
+                    for later in &projects[index..] {
+                        clean.insert(later.project_id, false);
+                    }
+                    tracing::error!(
+                        runtime = name,
+                        project_id,
+                        removed = report.removed,
+                        %error,
+                        "Could not sweep images built for deleted projects; the rest of this runtime waits for the next run"
+                    );
+                    summary.failed.push((node_id, error.to_string()));
+                    return;
+                }
             }
         }
+        if report.listed == 0 {
+            tracing::debug!(
+                runtime = name,
+                projects = report.projects,
+                "No images of deleted projects to remove"
+            );
+        } else {
+            tracing::info!(
+                runtime = name,
+                projects = report.projects,
+                listed = report.listed,
+                removed = report.removed,
+                kept = report.kept,
+                failed = report.failed,
+                deferred = report.deferred,
+                "Swept images built for deleted projects"
+            );
+        }
+        summary.swept.push((node_id, report));
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
     use temps_docker_util::image_removal::ImageRemovalStatus;
 
     fn image(id: &str, project: Option<&str>, created: i64) -> OwnedImage {
         let mut labels =
             HashMap::from([(IMAGE_INSTANCE_LABEL.to_string(), "install-a".to_string())]);
         if let Some(project) = project {
-            labels.insert(
-                image_ownership::IMAGE_PROJECT_LABEL.to_string(),
-                project.to_string(),
-            );
+            labels.insert(IMAGE_PROJECT_LABEL.to_string(), project.to_string());
         }
         labels.insert(
             image_ownership::IMAGE_TAG_LABEL.to_string(),
@@ -684,31 +897,16 @@ mod tests {
         }
     }
 
-    #[test]
-    fn only_images_of_projects_without_a_row_are_orphans_oldest_first() {
-        let images = vec![
-            image("live", Some("1"), 10),
-            image("gone-new", Some("2"), 30),
-            image("gone-old", Some("3"), 20),
-            image("unlabelled", None, 5),
-            image("garbled", Some("seven"), 5),
-        ];
-        let existing = HashSet::from([1]);
-        let orphans: Vec<&str> = select_orphans(&images, &existing)
-            .into_iter()
-            .map(|image| image.image_id.as_str())
-            .collect();
-        assert_eq!(orphans, vec!["gone-old", "gone-new"]);
-    }
-
-    /// A scripted daemon: lists `images`, reports `held` as used by a
-    /// container, records what it was asked to remove, and answers `answer`.
+    /// A scripted daemon: lists the `images` labelled with the project asked
+    /// for, reports `held` as used by a container, records what it was asked
+    /// to remove, and answers `answer`.
     struct ScriptedDaemon {
         images: Vec<OwnedImage>,
         held: Vec<&'static str>,
         answer: fn(&ImageRemovalRequest) -> ImageRemovalStatus,
         asked: std::sync::Mutex<Vec<String>>,
-        listed_for: std::sync::Mutex<Vec<String>>,
+        /// The owner and project each listing asked for.
+        listed_for: std::sync::Mutex<Vec<(String, i32)>>,
         /// The cursor each listing was given.
         listed_after: std::sync::Mutex<Vec<Option<ListCursor>>>,
         /// The cursor each listing answers with, in turn (then `None`).
@@ -733,19 +931,24 @@ mod tests {
         fn asked(&self) -> Vec<String> {
             self.asked.lock().expect("asked mutex").clone()
         }
+
+        fn listed_for(&self) -> Vec<(String, i32)> {
+            self.listed_for.lock().expect("listed mutex").clone()
+        }
     }
 
     #[async_trait::async_trait]
     impl OwnedImageDaemon for ScriptedDaemon {
-        async fn list_instance_images(
+        async fn list_project_images(
             &self,
-            instance_id: &str,
+            owner: &str,
+            project_id: i32,
             after: Option<&ListCursor>,
         ) -> Result<LabelledImages, OrphanSweepError> {
             self.listed_for
                 .lock()
                 .expect("listed mutex")
-                .push(instance_id.to_string());
+                .push((owner.to_string(), project_id));
             self.listed_after
                 .lock()
                 .expect("after mutex")
@@ -756,8 +959,14 @@ mod tests {
             } else {
                 pages.remove(0)
             };
+            let project = project_id.to_string();
             Ok(LabelledImages {
-                images: self.images.clone(),
+                images: self
+                    .images
+                    .iter()
+                    .filter(|image| image.labels.get(IMAGE_PROJECT_LABEL) == Some(&project))
+                    .cloned()
+                    .collect(),
                 unlisted: usize::from(next.is_some()),
                 next,
             })
@@ -802,31 +1011,25 @@ mod tests {
             .collect()
     }
 
-    /// The projects that exist, then the references other projects still
-    /// hold.
-    fn mock_db(existing_projects: &[i32], named_elsewhere: &[&str]) -> sea_orm::DatabaseConnection {
+    /// The references other projects still hold, for one project's images.
+    fn references_db(named_elsewhere: &[&str]) -> sea_orm::DatabaseConnection {
         use sea_orm::{MockDatabase, Value};
-        let projects: Vec<Value> = existing_projects
-            .iter()
-            .map(|id| Value::from(*id))
-            .collect();
         let named: Vec<Value> = named_elsewhere
             .iter()
             .map(|reference| Value::from(reference.to_string()))
             .collect();
         MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results([rows("id", &projects)])
             .append_query_results([rows("reference", &named)])
             .into_connection()
     }
 
     #[tokio::test]
-    async fn a_sweep_removes_orphans_within_the_limit_and_counts_what_it_kept() {
+    async fn a_sweep_removes_a_deleted_project_s_images_within_the_limit() {
         let mut daemon = ScriptedDaemon::new(vec![
             image("live", Some("1"), 10),
-            image("gone-a", Some("2"), 20),
             image("gone-b", Some("2"), 30),
-            image("gone-c", Some("3"), 40),
+            image("gone-a", Some("2"), 20),
+            image("gone-c", Some("2"), 40),
         ]);
         daemon.answer = |request| {
             if request.reference == "gone-b:latest" {
@@ -840,40 +1043,41 @@ mod tests {
                 }
             }
         };
-        let db = mock_db(&[1], &[]);
+        let db = references_db(&[]);
 
-        let report = sweep_orphaned_project_images(&db, &daemon, "install-a", None, 2)
+        let sweep = sweep_deleted_project_images(&db, &daemon, "install-a", 2, None, 2)
             .await
             .expect("sweep");
 
         assert_eq!(
-            daemon.listed_for.lock().expect("listed").as_slice(),
-            ["install-a"],
-            "only this install's images are listed"
+            daemon.listed_for(),
+            [("install-a".to_string(), 2)],
+            "only this install's images of the deleted project are listed"
         );
         assert_eq!(
             daemon.asked(),
             ["gone-a:latest", "gone-b:latest"],
-            "oldest orphans first, by their one tag, bounded by the limit; the live project's image is never asked"
+            "oldest first, by their one tag, bounded by the limit"
         );
         assert_eq!(
-            report,
-            OrphanSweepReport {
-                labelled: 4,
-                orphaned: 3,
+            sweep,
+            ProjectSweep {
+                listed: 3,
                 removed: 1,
                 kept: 1,
                 failed: 0,
                 deferred: 1,
+                attempted: 2,
+                remaining: 2,
                 next: None,
             }
         );
     }
 
     /// Images that must stay never take a slot in the batch: a backlog of
-    /// them cannot starve a newer orphan that could go.
+    /// them cannot starve a newer image that could go.
     #[tokio::test]
-    async fn held_shared_and_retagged_orphans_do_not_use_up_the_limit() {
+    async fn held_shared_and_retagged_images_do_not_use_up_the_limit() {
         let mut retagged = image("gone-retagged", Some("2"), 25);
         retagged.tags.push("operator-backup:keep".to_string());
         // The operator retagged it and removed the build's tag.
@@ -892,42 +1096,134 @@ mod tests {
         daemon.held = vec!["gone-held"];
         // Another project still deploys the shared image, naming it without
         // its implicit `:latest`.
-        let db = mock_db(&[], &["gone-shared"]);
+        let db = references_db(&["gone-shared"]);
 
-        let report = sweep_orphaned_project_images(&db, &daemon, "install-a", None, 1)
+        let sweep = sweep_deleted_project_images(&db, &daemon, "install-a", 2, None, 1)
             .await
             .expect("sweep");
 
         assert_eq!(daemon.asked(), ["gone-free:latest"]);
         assert_eq!(
-            report,
-            OrphanSweepReport {
-                labelled: 6,
-                orphaned: 6,
+            sweep,
+            ProjectSweep {
+                listed: 6,
                 removed: 1,
                 kept: 5,
-                failed: 0,
-                deferred: 0,
-                next: None,
+                attempted: 1,
+                remaining: 5,
+                ..Default::default()
             }
         );
     }
 
-    /// A worker node listed as the [`WorkerImageDaemons`] say.
-    struct ScriptedWorkers(Result<Vec<(i32, std::sync::Arc<ScriptedDaemon>)>, &'static str>);
+    /// A project with more images than one page: images the limit deferred
+    /// are retried on the same page when the run made progress; a page whose
+    /// batch is refused every time (dependent child images, a failing node)
+    /// moves on instead of pinning the listing there for good.
+    #[tokio::test]
+    async fn a_page_is_retried_only_while_its_removals_make_progress() {
+        let page_start = ListCursor {
+            created: 7,
+            image_id: "sha256:07".to_string(),
+        };
+        let page_end = ListCursor {
+            created: 99,
+            image_id: "sha256:99".to_string(),
+        };
+        let pages = || {
+            vec![
+                image("gone-a", Some("2"), 10),
+                image("gone-b", Some("2"), 20),
+                image("gone-c", Some("2"), 30),
+            ]
+        };
+
+        let progressing = ScriptedDaemon::new(pages());
+        *progressing.pages.lock().expect("pages") = vec![Some(page_end.clone())];
+        let sweep = sweep_deleted_project_images(
+            &references_db(&[]),
+            &progressing,
+            "install-a",
+            2,
+            Some(&page_start),
+            2,
+        )
+        .await
+        .expect("sweep");
+        assert_eq!((sweep.removed, sweep.deferred), (2, 1));
+        assert_eq!(sweep.next, Some(page_start.clone()), "the same page again");
+        assert_eq!(sweep.remaining, 2, "one deferred, one past the page");
+
+        for answer in [
+            (|request: &ImageRemovalRequest| ImageRemovalStatus::Refused {
+                image_id: request.reference.clone(),
+                reason: "image has dependent child images".to_string(),
+            }) as fn(&ImageRemovalRequest) -> ImageRemovalStatus,
+            |_| ImageRemovalStatus::Failed {
+                reason: "agent unreachable".to_string(),
+            },
+        ] {
+            let mut stuck = ScriptedDaemon::new(pages());
+            stuck.answer = answer;
+            *stuck.pages.lock().expect("pages") = vec![Some(page_end.clone())];
+            let sweep = sweep_deleted_project_images(
+                &references_db(&[]),
+                &stuck,
+                "install-a",
+                2,
+                Some(&page_start),
+                2,
+            )
+            .await
+            .expect("sweep");
+            assert_eq!((sweep.removed, sweep.deferred), (0, 1));
+            assert_eq!(
+                sweep.next,
+                Some(page_end.clone()),
+                "no progress on this page: the listing moves on"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_reference_lookup_removes_nothing() {
+        let daemon = ScriptedDaemon::new(vec![image("gone", Some("2"), 1)]);
+        let db = sea_orm::MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors([sea_orm::DbErr::Custom("connection reset".to_string())])
+            .into_connection();
+        let result = sweep_deleted_project_images(&db, &daemon, "install-a", 2, None, 10).await;
+        assert!(
+            matches!(
+                result,
+                Err(OrphanSweepError::ReferenceLookup { project_id: 2, .. })
+            ),
+            "{result:?}"
+        );
+        assert!(daemon.asked().is_empty());
+    }
+
+    /// Reachable nodes with their daemons, and the IDs of unreachable ones.
+    type ScriptedNodes = (Vec<(i32, std::sync::Arc<ScriptedDaemon>)>, Vec<i32>);
+
+    /// Worker nodes as the [`WorkerImageDaemons`] say: reachable ones, and
+    /// the IDs of those that cannot be asked.
+    struct ScriptedWorkers(Result<ScriptedNodes, &'static str>);
 
     #[async_trait::async_trait]
     impl WorkerImageDaemons for ScriptedWorkers {
-        async fn worker_image_daemons(&self) -> Result<Vec<WorkerImageDaemon>, OrphanSweepError> {
+        async fn worker_image_daemons(&self) -> Result<WorkerImageDaemonSet, OrphanSweepError> {
             match &self.0 {
-                Ok(nodes) => Ok(nodes
-                    .iter()
-                    .map(|(node_id, daemon)| WorkerImageDaemon {
-                        node_id: *node_id,
-                        node_name: format!("worker-{node_id}"),
-                        daemon: daemon.clone(),
-                    })
-                    .collect()),
+                Ok((nodes, unreachable)) => Ok(WorkerImageDaemonSet {
+                    reachable: nodes
+                        .iter()
+                        .map(|(node_id, daemon)| WorkerImageDaemon {
+                            node_id: *node_id,
+                            node_name: format!("worker-{node_id}"),
+                            daemon: daemon.clone(),
+                        })
+                        .collect(),
+                    unreachable: unreachable.clone(),
+                }),
                 Err(reason) => Err(OrphanSweepError::Workers {
                     source: (*reason).into(),
                 }),
@@ -935,71 +1231,200 @@ mod tests {
         }
     }
 
-    /// The identity row the owner ID is read from, then for each runtime
-    /// swept the projects that exist and the references still held.
-    fn sweeper_db(runtimes: usize) -> std::sync::Arc<sea_orm::DatabaseConnection> {
-        use sea_orm::{MockDatabase, Value};
+    /// A mock database for one run: the identity row, the recorded deleted
+    /// projects, those with a row again, then one reference lookup per
+    /// listing that found images, and an answer for each record settled.
+    fn run_db(
+        deleted: &[i32],
+        restored: &[i32],
+        reference_lookups: usize,
+    ) -> std::sync::Arc<sea_orm::DatabaseConnection> {
+        use sea_orm::{MockDatabase, MockExecResult, Value};
+        let deleted_at = chrono::Utc::now();
+        let records: Vec<std::collections::BTreeMap<String, Value>> = deleted
+            .iter()
+            .map(|id| {
+                std::collections::BTreeMap::from([
+                    ("project_id".to_string(), Value::from(*id)),
+                    ("deleted_at".to_string(), Value::from(deleted_at)),
+                ])
+            })
+            .collect();
+        let restored: Vec<Value> = restored.iter().map(|id| Value::from(*id)).collect();
         let mut db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results([rows("instance_id", &[Value::from("install-a".to_string())])]);
-        for _ in 0..runtimes {
-            db = db
-                .append_query_results([rows("id", &[])])
-                .append_query_results([rows("reference", &[])]);
+            .append_query_results([rows("instance_id", &[Value::from("install-a".to_string())])])
+            .append_query_results([records])
+            .append_query_results([rows("id", &restored)]);
+        for _ in 0..reference_lookups {
+            db = db.append_query_results([rows("reference", &[])]);
         }
-        std::sync::Arc::new(db.into_connection())
+        let settled = (0..deleted.len()).map(|_| MockExecResult {
+            last_insert_id: 0,
+            rows_affected: 1,
+        });
+        std::sync::Arc::new(db.append_exec_results(settled).into_connection())
     }
 
-    /// The sweep covers the worker nodes with this install's owner ID, the
-    /// database ID joined with the data directory's marker. A process that
-    /// runs no workloads sweeps its workers only.
-    #[tokio::test]
-    async fn the_sweeper_covers_worker_nodes_with_the_install_owner_id() {
+    async fn marked_dir() -> (tempfile::TempDir, String) {
         let dir = tempfile::tempdir().expect("temp dir");
         let marker = image_ownership::install_marker(dir.path(), true)
             .await
             .expect("marker")
             .expect("created");
-        let worker = std::sync::Arc::new(ScriptedDaemon::new(vec![image("gone", Some("2"), 1)]));
-        let sweeper = OrphanImageSweeper::new(sweeper_db(1))
+        (dir, marker)
+    }
+
+    /// The sweep asks each runtime for each deleted project's images, with
+    /// this install's owner ID (the database ID joined with the data
+    /// directory's marker), and removes a project's record once no runtime
+    /// holds any. A process that runs no workloads sweeps its workers only.
+    #[tokio::test]
+    async fn the_sweeper_asks_every_worker_for_each_deleted_project() {
+        let (dir, marker) = marked_dir().await;
+        let worker = std::sync::Arc::new(ScriptedDaemon::new(vec![
+            image("gone", Some("2"), 1),
+            image("live", Some("1"), 1),
+        ]));
+        let sweeper = OrphanImageSweeper::new(run_db(&[2, 3], &[], 1))
             .with_local_daemon(None)
-            .with_worker_daemons(std::sync::Arc::new(ScriptedWorkers(Ok(vec![(
-                7,
-                worker.clone(),
-            )]))))
+            .with_worker_daemons(std::sync::Arc::new(ScriptedWorkers(Ok((
+                vec![(7, worker.clone())],
+                Vec::new(),
+            )))))
             .with_data_dir(dir.path().to_path_buf());
 
         let summary = sweeper.run().await;
 
-        assert_eq!(
-            worker.listed_for.lock().expect("listed").as_slice(),
-            [format!("install-a.{marker}")]
-        );
+        let owner = format!("install-a.{marker}");
+        assert_eq!(worker.listed_for(), [(owner.clone(), 2), (owner, 3)]);
         assert_eq!(worker.asked(), ["gone:latest"]);
         assert_eq!(summary.swept.len(), 1);
         assert_eq!(summary.swept[0].0, Some(7));
-        assert_eq!(summary.swept[0].1.removed, 1);
-        assert!(summary.failed.is_empty(), "{summary:?}");
+        assert_eq!(
+            summary.swept[0].1,
+            OrphanSweepReport {
+                projects: 2,
+                listed: 1,
+                removed: 1,
+                ..Default::default()
+            }
+        );
+        assert_eq!(summary.finished, [2, 3]);
+        assert!(
+            summary.pending.is_empty() && summary.failed.is_empty(),
+            "{summary:?}"
+        );
     }
 
-    /// A runtime with more labelled images than one page is paged through:
-    /// the next run starts where the last one stopped, and the end of the
-    /// list starts over. Without this, images of live projects older than an
-    /// orphan would fill the same page every night and hide it for good.
+    /// With no deleted project recorded, no daemon is asked anything: the
+    /// sweep's work follows deletions, not the images on the hosts.
     #[tokio::test]
-    async fn each_run_resumes_the_listing_where_the_last_one_stopped() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        image_ownership::install_marker(dir.path(), true)
-            .await
-            .expect("marker");
+    async fn with_no_deleted_projects_no_daemon_is_asked() {
+        let (dir, _) = marked_dir().await;
+        let local = std::sync::Arc::new(ScriptedDaemon::new(vec![image("gone", Some("2"), 1)]));
+        let worker = std::sync::Arc::new(ScriptedDaemon::new(Vec::new()));
+        let sweeper = OrphanImageSweeper::new(run_db(&[], &[], 0))
+            .with_local_daemon(Some(local.clone()))
+            .with_worker_daemons(std::sync::Arc::new(ScriptedWorkers(Ok((
+                vec![(7, worker.clone())],
+                Vec::new(),
+            )))))
+            .with_data_dir(dir.path().to_path_buf());
+
+        let summary = sweeper.run().await;
+
+        assert!(local.listed_for().is_empty() && worker.listed_for().is_empty());
+        assert!(
+            summary.swept.is_empty() && summary.failed.is_empty(),
+            "{summary:?}"
+        );
+    }
+
+    /// A record stays while the project's images cannot all be accounted
+    /// for: a node that cannot be asked, or an image that must stay. It is
+    /// checked again on a later run.
+    #[tokio::test]
+    async fn a_record_stays_while_a_node_is_unreachable_or_an_image_stays() {
+        let (dir, _) = marked_dir().await;
+        let local = std::sync::Arc::new(ScriptedDaemon::new(vec![image("gone", Some("2"), 1)]));
+        let sweeper = OrphanImageSweeper::new(run_db(&[2], &[], 1))
+            .with_local_daemon(Some(local.clone()))
+            .with_worker_daemons(std::sync::Arc::new(ScriptedWorkers(Ok((
+                Vec::new(),
+                vec![9],
+            )))))
+            .with_data_dir(dir.path().to_path_buf());
+        let summary = sweeper.run().await;
+        assert_eq!(
+            local.asked(),
+            ["gone:latest"],
+            "the reachable host is swept"
+        );
+        assert!(summary.finished.is_empty());
+        assert_eq!(summary.pending, [2], "node 9 still has to be checked");
+
+        let mut holding = ScriptedDaemon::new(vec![image("gone", Some("2"), 1)]);
+        holding.held = vec!["gone"];
+        let holding = std::sync::Arc::new(holding);
+        let sweeper = OrphanImageSweeper::new(run_db(&[2], &[], 1))
+            .with_local_daemon(Some(holding.clone()))
+            .with_data_dir(dir.path().to_path_buf());
+        let summary = sweeper.run().await;
+        assert!(holding.asked().is_empty());
+        assert_eq!(summary.pending, [2], "a container still uses its image");
+    }
+
+    /// A deleted project's ID that has a row again (a restored backup) is a
+    /// live project: its record is dropped and its images are not touched.
+    #[tokio::test]
+    async fn a_restored_project_s_record_is_dropped_without_listing() {
+        let (dir, _) = marked_dir().await;
+        let local = std::sync::Arc::new(ScriptedDaemon::new(vec![image("back", Some("2"), 1)]));
+        let sweeper = OrphanImageSweeper::new(run_db(&[2], &[2], 0))
+            .with_local_daemon(Some(local.clone()))
+            .with_data_dir(dir.path().to_path_buf());
+        let summary = sweeper.run().await;
+        assert!(local.listed_for().is_empty());
+        assert!(summary.finished.is_empty() && summary.pending.is_empty());
+    }
+
+    /// The per-run limit spans the deleted projects on a runtime: once it is
+    /// used up, the remaining projects wait for a later run.
+    #[tokio::test]
+    async fn the_limit_defers_the_remaining_projects() {
+        let (dir, _) = marked_dir().await;
+        let local = std::sync::Arc::new(ScriptedDaemon::new(vec![
+            image("gone-2", Some("2"), 1),
+            image("gone-3", Some("3"), 1),
+        ]));
+        let sweeper = OrphanImageSweeper::new(run_db(&[2, 3], &[], 1))
+            .with_local_daemon(Some(local.clone()))
+            .with_data_dir(dir.path().to_path_buf())
+            .with_max_per_run(1);
+        let summary = sweeper.run().await;
+        assert_eq!(local.asked(), ["gone-2:latest"]);
+        assert_eq!(local.listed_for().len(), 1, "project 3 is not listed");
+        assert_eq!(summary.swept[0].1.deferred, 1);
+        assert_eq!((summary.finished, summary.pending), (vec![2], vec![3]));
+    }
+
+    /// A project with more images on a runtime than one page is paged
+    /// through: the next run starts where the last one stopped, and the
+    /// end of its list starts over.
+    #[tokio::test]
+    async fn each_run_resumes_a_project_s_listing_where_the_last_one_stopped() {
+        let (dir, _) = marked_dir().await;
         let page_end = ListCursor {
             created: 42,
             image_id: "sha256:42".to_string(),
         };
-        let local = std::sync::Arc::new(ScriptedDaemon::new(vec![image("gone", Some("2"), 1)]));
+        let mut local = ScriptedDaemon::new(vec![image("gone", Some("2"), 1)]);
+        // Each listing's image is held, so the project stays recorded.
+        local.held = vec!["gone"];
         *local.pages.lock().expect("pages") = vec![Some(page_end.clone()), None];
-        // Each run reads the owner ID, then the projects and references.
+        let local = std::sync::Arc::new(local);
         let db = {
-            use sea_orm::{MockDatabase, Value};
+            use sea_orm::{MockDatabase, MockExecResult, Value};
             let mut db = MockDatabase::new(DatabaseBackend::Postgres);
             for _ in 0..3 {
                 db = db
@@ -1007,8 +1432,16 @@ mod tests {
                         "instance_id",
                         &[Value::from("install-a".to_string())],
                     )])
+                    .append_query_results([vec![std::collections::BTreeMap::from([
+                        ("project_id".to_string(), Value::from(2)),
+                        ("deleted_at".to_string(), Value::from(chrono::Utc::now())),
+                    ])]])
                     .append_query_results([rows("id", &[])])
-                    .append_query_results([rows("reference", &[])]);
+                    .append_query_results([rows("reference", &[])])
+                    .append_exec_results([MockExecResult {
+                        last_insert_id: 0,
+                        rows_affected: 1,
+                    }]);
             }
             std::sync::Arc::new(db.into_connection())
         };
@@ -1027,109 +1460,13 @@ mod tests {
         );
     }
 
-    /// A batch the daemon refuses every time (an image with dependent child
-    /// images, a node that fails each removal) must not pin the cursor: the
-    /// listing moves on to the next page instead of retrying the same page
-    /// every night and never reaching the rest.
-    #[tokio::test]
-    async fn a_page_whose_batch_is_all_refused_does_not_pin_the_cursor() {
-        let page_start = ListCursor {
-            created: 7,
-            image_id: "sha256:07".to_string(),
-        };
-        let page_end = ListCursor {
-            created: 99,
-            image_id: "sha256:99".to_string(),
-        };
-        for answer in [
-            (|request: &ImageRemovalRequest| ImageRemovalStatus::Refused {
-                image_id: request.reference.clone(),
-                reason: "image has dependent child images".to_string(),
-            }) as fn(&ImageRemovalRequest) -> ImageRemovalStatus,
-            |_| ImageRemovalStatus::Failed {
-                reason: "agent unreachable".to_string(),
-            },
-        ] {
-            let mut daemon = ScriptedDaemon::new(vec![
-                image("gone-a", Some("2"), 10),
-                image("gone-b", Some("2"), 20),
-                image("gone-c", Some("2"), 30),
-            ]);
-            daemon.answer = answer;
-            *daemon.pages.lock().expect("pages") = vec![Some(page_end.clone())];
-
-            let report = sweep_orphaned_project_images(
-                &mock_db(&[], &[]),
-                &daemon,
-                "install-a",
-                Some(&page_start),
-                2,
-            )
-            .await
-            .expect("sweep");
-
-            assert_eq!(report.removed, 0);
-            assert_eq!(report.deferred, 1);
-            assert_eq!(
-                report.next,
-                Some(page_end.clone()),
-                "no progress on this page: the listing moves on"
-            );
-        }
-    }
-
-    /// Orphans the per-run limit deferred are retried on the next run: the
-    /// cursor stays at the page they are on instead of moving past it.
-    #[tokio::test]
-    async fn a_page_with_deferred_orphans_is_listed_again_next_run() {
-        let page_start = ListCursor {
-            created: 7,
-            image_id: "sha256:07".to_string(),
-        };
-        let page_end = ListCursor {
-            created: 99,
-            image_id: "sha256:99".to_string(),
-        };
-        let daemon = ScriptedDaemon::new(vec![
-            image("gone-a", Some("2"), 10),
-            image("gone-b", Some("2"), 20),
-            image("gone-c", Some("2"), 30),
-        ]);
-        *daemon.pages.lock().expect("pages") = vec![Some(page_end.clone())];
-        let db = mock_db(&[], &[]);
-
-        let report = sweep_orphaned_project_images(&db, &daemon, "install-a", Some(&page_start), 2)
-            .await
-            .expect("sweep");
-
-        assert_eq!(report.deferred, 1);
-        assert_eq!(
-            report.next,
-            Some(page_start),
-            "the next run lists the same page, where an orphan waits"
-        );
-
-        // A page handled whole moves the cursor on.
-        let whole = ScriptedDaemon::new(vec![image("gone-a", Some("2"), 10)]);
-        *whole.pages.lock().expect("pages") = vec![Some(page_end.clone())];
-        let report =
-            sweep_orphaned_project_images(&mock_db(&[], &[]), &whole, "install-a", None, 2)
-                .await
-                .expect("sweep");
-        assert_eq!(report.deferred, 0);
-        assert_eq!(report.next, Some(page_end));
-    }
-
-    /// If the worker nodes cannot be read, this host is still swept, and
-    /// the failure is reported rather than hidden.
+    /// If the worker nodes cannot be read, this host is still swept, the
+    /// failure is reported rather than hidden, and the record stays.
     #[tokio::test]
     async fn an_unreadable_worker_list_does_not_stop_this_host_s_sweep() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        image_ownership::install_marker(dir.path(), true)
-            .await
-            .expect("marker");
+        let (dir, _) = marked_dir().await;
         let local = std::sync::Arc::new(ScriptedDaemon::new(vec![image("gone", Some("2"), 1)]));
-        let sweeper = OrphanImageSweeper::new(sweeper_db(1))
+        let sweeper = OrphanImageSweeper::new(run_db(&[2], &[], 1))
             .with_local_daemon(Some(local.clone()))
             .with_worker_daemons(std::sync::Arc::new(ScriptedWorkers(Err(
                 "nodes table unreadable",
@@ -1144,6 +1481,7 @@ mod tests {
             summary.failed[0].1.contains("nodes table unreadable"),
             "{summary:?}"
         );
+        assert_eq!(summary.pending, [2]);
     }
 
     /// Without the data directory's marker, no image can carry this
@@ -1153,7 +1491,15 @@ mod tests {
     async fn without_the_install_marker_nothing_is_listed_or_removed() {
         let dir = tempfile::tempdir().expect("temp dir");
         let local = std::sync::Arc::new(ScriptedDaemon::new(vec![image("gone", Some("2"), 1)]));
-        let sweeper = OrphanImageSweeper::new(sweeper_db(0))
+        let identity_only = std::sync::Arc::new(
+            sea_orm::MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([rows(
+                    "instance_id",
+                    &[sea_orm::Value::from("install-a".to_string())],
+                )])
+                .into_connection(),
+        );
+        let sweeper = OrphanImageSweeper::new(identity_only)
             .with_local_daemon(Some(local.clone()))
             .with_data_dir(dir.path().to_path_buf());
         let summary = sweeper.run().await;
@@ -1161,7 +1507,7 @@ mod tests {
             summary.swept.is_empty() && summary.failed.is_empty(),
             "{summary:?}"
         );
-        assert!(local.listed_for.lock().expect("listed").is_empty());
+        assert!(local.listed_for().is_empty());
 
         // Without a data directory at all, not even the database is read.
         let unconfigured = OrphanImageSweeper::new(std::sync::Arc::new(
@@ -1170,39 +1516,32 @@ mod tests {
         .with_local_daemon(Some(local.clone()));
         let summary = unconfigured.run().await;
         assert!(summary.swept.is_empty() && summary.failed.is_empty());
-        assert!(local.listed_for.lock().expect("listed").is_empty());
+        assert!(local.listed_for().is_empty());
     }
 
     #[tokio::test]
-    async fn a_failed_project_lookup_removes_nothing() {
-        let daemon = ScriptedDaemon::new(vec![image("gone", Some("2"), 1)]);
-        let db = sea_orm::MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_errors([sea_orm::DbErr::Custom("connection reset".to_string())])
-            .into_connection();
-        let result = sweep_orphaned_project_images(&db, &daemon, "install-a", None, 10).await;
-        assert!(
-            matches!(
-                result,
-                Err(OrphanSweepError::ProjectLookup { count: 1, .. })
-            ),
-            "{result:?}"
+    async fn a_failed_record_read_asks_no_daemon() {
+        let (dir, _) = marked_dir().await;
+        let local = std::sync::Arc::new(ScriptedDaemon::new(vec![image("gone", Some("2"), 1)]));
+        let db = std::sync::Arc::new(
+            sea_orm::MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([rows(
+                    "instance_id",
+                    &[sea_orm::Value::from("install-a".to_string())],
+                )])
+                .append_query_errors([sea_orm::DbErr::Custom("connection reset".to_string())])
+                .into_connection(),
         );
-        assert!(daemon.asked().is_empty());
-    }
-
-    #[tokio::test]
-    async fn a_failed_reference_lookup_removes_nothing() {
-        let daemon = ScriptedDaemon::new(vec![image("gone", Some("2"), 1)]);
-        let db = sea_orm::MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results([rows("id", &[])])
-            .append_query_errors([sea_orm::DbErr::Custom("connection reset".to_string())])
-            .into_connection();
-        let result = sweep_orphaned_project_images(&db, &daemon, "install-a", None, 10).await;
+        let sweeper = OrphanImageSweeper::new(db)
+            .with_local_daemon(Some(local.clone()))
+            .with_data_dir(dir.path().to_path_buf());
+        let summary = sweeper.run().await;
+        assert!(local.listed_for().is_empty());
+        assert_eq!(summary.failed.len(), 1, "{summary:?}");
         assert!(
-            matches!(result, Err(OrphanSweepError::ReferenceLookup { .. })),
-            "{result:?}"
+            summary.failed[0].1.contains("deleted projects"),
+            "{summary:?}"
         );
-        assert!(daemon.asked().is_empty());
     }
 
     async fn build_labelled_image(
@@ -1259,11 +1598,12 @@ mod tests {
         .await
     }
 
-    /// Against a real daemon and database: after a project's row is gone,
-    /// its labelled image is removed, while an image of that project a
-    /// container was created from, an image of a live project, an image
-    /// another install labelled, and an unlabelled image all survive. Skips
-    /// when Docker or Postgres is unavailable.
+    /// Against a real daemon and database: deleting a project's row records
+    /// it, and the sweep then removes its unused labelled image, while an
+    /// image of that project a container was created from, an image of a
+    /// live project, an image another install labelled, and an unlabelled
+    /// image all survive. The record stays while the held image does, and
+    /// goes once it is gone. Skips when Docker or Postgres is unavailable.
     #[tokio::test]
     async fn the_sweep_removes_only_unused_images_of_deleted_projects_on_a_real_daemon(
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1369,26 +1709,19 @@ mod tests {
                 .map(|_| ())
                 .map_err(|error| format!("create holder: {error}"));
         }
+        let sweeper = OrphanImageSweeper::new(db.clone())
+            .with_data_dir(data_dir.path().to_path_buf())
+            .with_max_per_run(10);
         // Every step's error is kept, not returned, so the Docker resources
         // below are removed whatever fails.
-        let mut swept = None;
+        let mut first = None;
+        let mut second = None;
         if prepared.is_ok() {
             match temps_entities::projects::Entity::delete_by_id(doomed.id)
                 .exec(db.as_ref())
                 .await
             {
-                Ok(_) => {
-                    swept = Some(
-                        sweep_orphaned_project_images(
-                            db.as_ref(),
-                            &super::super::DefaultDockerClient,
-                            &instance,
-                            None,
-                            10,
-                        )
-                        .await,
-                    );
-                }
+                Ok(_) => first = Some(sweeper.run().await),
                 Err(error) => prepared = Err(format!("delete project {}: {error}", doomed.id)),
             }
         }
@@ -1402,7 +1735,8 @@ mod tests {
         let foreign_left = present(foreign.clone()).await;
         let unlabelled_left = present(unlabelled.clone()).await;
 
-        // Remove only what this test created, before asserting.
+        // Once the container is gone, the next run removes the held image
+        // and the record with it.
         let _ = docker
             .remove_container(
                 &holder,
@@ -1412,6 +1746,12 @@ mod tests {
                 }),
             )
             .await;
+        if prepared.is_ok() {
+            second = Some(sweeper.run().await);
+        }
+        let held_left_after = present(held.clone()).await;
+
+        // Remove only what this test created, before asserting.
         for (image_tag, _) in &images {
             let _ = docker
                 .remove_image(
@@ -1430,14 +1770,19 @@ mod tests {
         if let Err(reason) = prepared {
             return Err(format!("preparing the sweep test failed: {reason}").into());
         }
-        let report = swept.expect("the sweep ran").expect("the sweep succeeds");
+        let first = first.expect("the first run");
+        assert!(first.failed.is_empty(), "{first:?}");
+        let report = &first.swept[0].1;
         assert_eq!(
-            report.labelled, 3,
-            "only this install's images are listed: {report:?}"
+            report.listed, 2,
+            "only this install's images of the deleted project are listed: {report:?}"
         );
-        assert_eq!(report.orphaned, 2, "{report:?}");
-        assert_eq!(report.removed, 1, "{report:?}");
-        assert_eq!(report.kept, 1, "{report:?}");
+        assert_eq!((report.removed, report.kept), (1, 1), "{report:?}");
+        assert_eq!(
+            first.pending,
+            [doomed.id],
+            "the held image keeps the record"
+        );
         assert!(
             !orphan_left,
             "the unused image of the deleted project must be gone"
@@ -1446,6 +1791,17 @@ mod tests {
         assert!(live_left, "an image of a live project must stay");
         assert!(foreign_left, "another install's image must stay");
         assert!(unlabelled_left, "an image without Temps labels must stay");
+
+        let second = second.expect("the second run");
+        assert!(!held_left_after, "{second:?}");
+        assert_eq!(second.finished, [doomed.id], "{second:?}");
+        let remaining = temps_entities::deleted_project_images::Entity::find_by_id(doomed.id)
+            .one(db.as_ref())
+            .await?;
+        assert!(
+            remaining.is_none(),
+            "the record is gone once nothing is left"
+        );
         Ok(())
     }
 }

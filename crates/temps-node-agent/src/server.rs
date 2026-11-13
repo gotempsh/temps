@@ -2515,7 +2515,7 @@ pub(crate) mod tests {
         assert!(AgentApiDoc::openapi().paths.paths.contains_key(route));
 
         let listing = temps_deployer::remote::LIST_OWNED_IMAGES_PATH;
-        let owner = br#"{"owner":"install-a.marker-b"}"#.to_vec();
+        let owner = br#"{"owner":"install-a.marker-b","project_id":7}"#.to_vec();
         for token in [None, Some("wrong")] {
             let response = app
                 .clone()
@@ -2530,11 +2530,21 @@ pub(crate) mod tests {
             .oneshot(post_json(
                 listing,
                 Some("secret"),
-                br#"{"owner":"x\" OR label=anything"}"#.to_vec(),
+                br#"{"owner":"x\" OR label=anything","project_id":7}"#.to_vec(),
             ))
             .await
             .unwrap();
         assert_eq!(response.status().as_u16(), 400);
+        // So is the project ID: one project's images, never every project's.
+        for project in ["0", "-3"] {
+            let body = format!(r#"{{"owner":"install-a.marker-b","project_id":{project}}}"#);
+            let response = app
+                .clone()
+                .oneshot(post_json(listing, Some("secret"), body.into_bytes()))
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), 400, "project {project}");
+        }
         let response = app
             .clone()
             .oneshot(post_json(listing, Some("secret"), owner))

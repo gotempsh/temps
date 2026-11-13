@@ -2177,10 +2177,11 @@ fn is_valid_image_owner(owner: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_'))
 }
 
-/// The images on this node's daemon that one Temps install built, so its
-/// control plane can sweep the ones whose project it deleted.
+/// The images on this node's daemon that one Temps install built for one
+/// of its projects, so its control plane can sweep a project it deleted.
 ///
-/// Lists only images labelled with that install's ownership ID, oldest first
+/// Lists only images labelled with that install's ownership ID and that
+/// project's ID, oldest first
 /// and bounded by [`temps_deployer::MAX_LABELLED_IMAGES`], keeping only
 /// their `sh.temps.image.*` labels, each with a container created from it if
 /// any. Removal goes through `POST /agent/images/remove`, which checks again.
@@ -2191,7 +2192,7 @@ fn is_valid_image_owner(owner: &str) -> bool {
     request_body = temps_deployer::remote::ListOwnedImagesRequest,
     responses(
         (status = 200, description = "This install's images on the node, oldest first, with any container using each"),
-        (status = 400, description = "The owner is not a valid image ownership ID"),
+        (status = 400, description = "The owner is not a valid image ownership ID, or the project ID is not positive"),
         (status = 401, description = "Unauthorized — invalid or missing bearer token"),
         (status = 503, description = "Docker unavailable on this node"),
         (status = 500, description = "The node's images could not be listed")
@@ -2209,9 +2210,19 @@ pub async fn list_owned_images(
         )
         .into_response();
     }
+    if request.project_id <= 0 {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "The project ID must be positive, got {}",
+                request.project_id
+            ),
+        )
+        .into_response();
+    }
     match state
         .container_deployer
-        .list_owned_images(&request.owner, request.after.as_ref())
+        .list_owned_images(&request.owner, request.project_id, request.after.as_ref())
         .await
     {
         Ok(listing) => {

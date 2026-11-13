@@ -70,6 +70,7 @@ pub mod cloudflare_access_providers;
 pub mod cron_executions;
 pub mod crons;
 pub mod custom_routes;
+pub mod deleted_project_images;
 pub mod delivery_profiles;
 pub mod deployment_config;
 pub mod deployment_container_logs;
