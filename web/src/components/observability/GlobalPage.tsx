@@ -246,7 +246,7 @@ export function GlobalPagination({
       pageSize={OBSERVABILITY_PAGE_SIZE}
       total={total}
       totalPages={Math.max(1, Math.ceil(total / OBSERVABILITY_PAGE_SIZE))}
-      onPageChange={view.setPage}
+      onPageChange={(page) => view.setPage(page)}
     />
   )
 }

@@ -2,8 +2,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { useEffect, useMemo, useState } from 'react'
+import { usePageInRange } from './usePageInRange'
 import { useComposedSearchParams } from '@temps-sdk/ds'
 import {
+  OBSERVABILITY_PAGE_SIZE,
   patchObservationFilters,
   positiveInteger,
   readObservationWindow,
@@ -59,13 +61,14 @@ export function useGlobalView() {
      * included, as it is (a Refresh). A custom window does not move.
      */
     advance: () => setNow(Date.now()),
-    setPage: (page: number) =>
+    /** `replace` corrects the page in place, without a history entry. */
+    setPage: (page: number, { replace = false }: { replace?: boolean } = {}) =>
       updateParams(
         (next) => {
           next.set('page', String(page))
           return next
         },
-        { replace: false }
+        { replace }
       ),
     setCursor: (cursor?: string) =>
       updateParams(
@@ -87,3 +90,24 @@ export function useGlobalView() {
   }
 }
 export type GlobalView = ReturnType<typeof useGlobalView>
+
+/**
+ * Refresh keeps a global page's `page` while it moves the window to now; if
+ * the moved window holds fewer items, go back to the last page that exists.
+ * `loaded` is this page's own answer: rows on it and the list's total.
+ */
+export function useGlobalPageInRange(
+  view: GlobalView,
+  loaded: { rows: number; total: number } | undefined
+) {
+  usePageInRange(
+    view.page,
+    loaded
+      ? {
+          rows: loaded.rows,
+          totalPages: Math.ceil(loaded.total / OBSERVABILITY_PAGE_SIZE),
+        }
+      : undefined,
+    (page) => view.setPage(page, { replace: true })
+  )
+}

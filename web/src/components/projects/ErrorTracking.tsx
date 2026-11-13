@@ -87,6 +87,7 @@ import { TimeAgo } from '../utils/TimeAgo'
 import { errorGroupSortQuery, EVENT_COUNT_SORT } from './error-group-sort'
 import { errorRowText } from './error-row-text'
 import { useWindowQuery } from '@/hooks/useWindowQuery'
+import { usePageInRange } from '@/hooks/usePageInRange'
 
 interface ErrorTrackingProps {
   project: ProjectResponse
@@ -241,22 +242,36 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
   }
 
   // Fetch error groups for the project (only if we have errors)
-  const { data: errorGroupsResponse, isLoading: isLoadingGroups } =
-    useWindowQuery({
-      ...listErrorGroupsOptions({
-        path: { project_id: project.id },
-        query: {
-          page,
-          page_size: pageSize,
-          status: statusFilter === 'all' ? null : statusFilter,
-          start_date: timeRange.startTime,
-          end_date: timeRange.endTime,
-          environment_id: environmentFilter,
-          ...errorGroupSortQuery(groupSort),
-        },
-      }),
-      enabled: hasErrors,
-    })
+  const {
+    data: errorGroupsResponse,
+    isLoading: isLoadingGroups,
+    isPlaceholderData: groupsArePlaceholder,
+  } = useWindowQuery({
+    ...listErrorGroupsOptions({
+      path: { project_id: project.id },
+      query: {
+        page,
+        page_size: pageSize,
+        status: statusFilter === 'all' ? null : statusFilter,
+        start_date: timeRange.startTime,
+        end_date: timeRange.endTime,
+        environment_id: environmentFilter,
+        ...errorGroupSortQuery(groupSort),
+      },
+    }),
+    enabled: hasErrors,
+  })
+  // Refresh keeps the page; a moved window can hold fewer groups.
+  usePageInRange(
+    page,
+    errorGroupsResponse && !groupsArePlaceholder
+      ? {
+          rows: errorGroupsResponse.data.length,
+          totalPages: errorGroupsResponse.pagination.total_pages,
+        }
+      : undefined,
+    setPage
+  )
 
   // Fetch error dashboard statistics (only if we have errors)
   const { data: dashboardStats, isLoading: isLoadingDashboardStats } =

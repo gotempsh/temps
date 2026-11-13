@@ -32,6 +32,7 @@ import type { AnalyticsFacet } from '@/api/client/types.gen'
 import { EmptyState } from '@/components/ui/empty-state'
 import { BarChart3 } from 'lucide-react'
 import { Link } from 'react-router'
+import { useGlobalPageInRange } from '@/hooks/useGlobalView'
 import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 function Breakdown({
@@ -65,6 +66,13 @@ function Breakdown({
       },
     }),
   })
+  // Only the expanded breakdown pages; the others always show page 1.
+  useGlobalPageInRange(
+    view,
+    expanded && query.data && !query.isPlaceholderData
+      ? { rows: query.data.rows.length, total: query.data.total }
+      : undefined
+  )
   return (
     <DataSection
       title={title}

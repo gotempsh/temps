@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { afterEach, expect, test } from 'bun:test'
-import { act, cleanup, renderHook } from '@testing-library/react'
+import { act, cleanup, renderHook, waitFor } from '@testing-library/react'
 import type { ReactNode } from 'react'
 import { MemoryRouter } from 'react-router'
 import { installBrowserWindow } from '@/test/dom'
-import { useGlobalView } from './useGlobalView'
+import { useGlobalPageInRange, useGlobalView } from './useGlobalView'
 
 installBrowserWindow()
 afterEach(cleanup)
@@ -45,4 +45,26 @@ test('advance leaves a custom window where it is', () => {
   expect(result.current.from).toBe(from)
   expect(result.current.to).toBe(to)
   expect(result.current.page).toBe(2)
+})
+
+test('a page past the end of the moved window goes to the last page', async () => {
+  const { result, rerender } = renderHook(
+    ({ loaded }: { loaded?: { rows: number; total: number } }) => {
+      const view = useGlobalView()
+      useGlobalPageInRange(view, loaded)
+      return view
+    },
+    {
+      wrapper: at('/errors?range=1d&page=3&q=checkout'),
+      initialProps: {},
+    }
+  )
+  expect(result.current.page).toBe(3)
+
+  // 41 groups became 38 after Refresh: page 3 (25 a page) came back empty.
+  rerender({ loaded: { rows: 0, total: 38 } })
+
+  await waitFor(() => expect(result.current.page).toBe(2))
+  expect(result.current.search).toBe('checkout')
+  expect(result.current.range).toBe('1d')
 })

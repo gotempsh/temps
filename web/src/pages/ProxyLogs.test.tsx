@@ -134,3 +134,43 @@ test('the rows stay on screen while a refresh is in flight', async () => {
   release()
   await screen.findByText('/checkout/2')
 })
+
+test('a refresh that leaves the page past the end goes to the last page, not an empty table', async () => {
+  const pages: string[] = []
+  mockApi({
+    'GET /proxy-logs': (request) => {
+      const page = new URL(request.url).searchParams.get('page')!
+      pages.push(page)
+      // Older requests aged out of the moved window: two pages left.
+      const shrunk = pages.length > 1
+      const total = shrunk ? 38 : 41
+      return jsonResponse({
+        logs: shrunk && page === '3' ? [] : [log(pages.length)],
+        page: Number(page),
+        page_size: 20,
+        total,
+        total_pages: Math.ceil(total / 20),
+      })
+    },
+  })
+  render(
+    <QueryClientProvider
+      client={
+        new QueryClient({ defaultOptions: { queries: { retry: false } } })
+      }
+    >
+      <BreadcrumbProvider>
+        <MemoryRouter initialEntries={['/proxy-logs?page=3&time_range=1h']}>
+          <ProxyLogs />
+        </MemoryRouter>
+      </BreadcrumbProvider>
+    </QueryClientProvider>
+  )
+  await screen.findByText('/checkout/1')
+
+  fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
+
+  await screen.findByText('/checkout/3')
+  expect(pages).toEqual(['3', '3', '2'])
+  expect(screen.queryByText('No proxy logs found')).toBeNull()
+})

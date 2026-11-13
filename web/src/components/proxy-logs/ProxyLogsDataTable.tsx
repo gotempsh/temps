@@ -58,6 +58,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useSearchParams } from 'react-router'
 import { IpLink } from '@/components/data-display/IpLink'
 import { useWindowQuery } from '@/hooks/useWindowQuery'
+import { usePageInRange } from '@/hooks/usePageInRange'
 
 interface ProxyLogsDataTableProps {
   projectId?: number
@@ -450,7 +451,7 @@ export function ProxyLogsDataTable({
     return { start: timeRangeToStartDate(timeRange), end: null }
   }, [timeRange, filters.start_date, filters.end_date, refreshedAt])
 
-  const { data, isLoading, error } = useWindowQuery({
+  const { data, isLoading, error, isPlaceholderData } = useWindowQuery({
     ...getProxyLogsOptions({
       query: {
         project_id: scopedProjectId ?? null,
@@ -512,6 +513,14 @@ export function ProxyLogsDataTable({
     // (and their count) on screen until the next ones arrive instead of
     // collapsing the table into a spinner.
   })
+  // A moved window can hold fewer pages than the one on screen.
+  usePageInRange(
+    page,
+    data && !isPlaceholderData
+      ? { rows: data.logs.length, totalPages: data.total_pages }
+      : undefined,
+    setPage
+  )
 
   const handleSort = (column: string) => {
     if (sortBy === column) {

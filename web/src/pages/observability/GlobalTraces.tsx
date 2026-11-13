@@ -46,6 +46,7 @@ import { Badge } from '@/components/ui/badge'
 import { SortableTableHead } from '@/components/ui/sortable-table-head'
 import { TimeAgo } from '@/components/utils/TimeAgo'
 import { OBSERVABILITY_PAGE_SIZE } from '@/lib/global-observability'
+import { useGlobalPageInRange } from '@/hooks/useGlobalView'
 import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 export default function GlobalTraces() {
@@ -129,6 +130,12 @@ export default function GlobalTraces() {
     <ServiceIcon service={{ id, name }} size="sm" />
   )
   const traces = query.data?.data ?? []
+  useGlobalPageInRange(
+    view,
+    query.data && !query.isPlaceholderData
+      ? { rows: traces.length, total: query.data.total }
+      : undefined
+  )
   // Bars compare traces on this page, so the slowest one fills its track.
   const slowestMs = Math.max(0, ...traces.map((trace) => trace.duration_ms))
   return (

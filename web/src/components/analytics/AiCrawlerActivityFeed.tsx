@@ -29,6 +29,7 @@ import { Bot, ExternalLink } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { Link, useSearchParams } from 'react-router'
 import { useWindowQuery } from '@/hooks/useWindowQuery'
+import { usePageInRange } from '@/hooks/usePageInRange'
 
 const ALL = '__all__'
 const PAGE_SIZE_OPTIONS = [25, 50, 100] as const
@@ -116,7 +117,7 @@ export function AiCrawlerActivityFeed({
     setSearchParams(next, { replace: true })
   }
 
-  const { data, isLoading, error } = useWindowQuery({
+  const { data, isLoading, error, isPlaceholderData } = useWindowQuery({
     ...getProxyLogsOptions({
       query: {
         project_id: projectId || null,
@@ -150,6 +151,12 @@ export function AiCrawlerActivityFeed({
   const logs = data?.logs ?? []
   const totalPages = data?.total_pages ?? 0
   const total = data?.total ?? 0
+  // A moved window can hold fewer pages than the one on screen.
+  usePageInRange(
+    page,
+    data && !isPlaceholderData ? { rows: logs.length, totalPages } : undefined,
+    (inRange) => setParam('page', inRange > 1 ? String(inRange) : null)
+  )
 
   const hasActiveFilters = Boolean(provider || agent || path)
 

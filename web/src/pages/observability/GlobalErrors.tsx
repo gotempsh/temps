@@ -28,6 +28,7 @@ import { TimeAgo } from '@/components/utils/TimeAgo'
 import { OBSERVABILITY_PAGE_SIZE } from '@/lib/global-observability'
 import { FixErrorWithAgentButton } from '@/components/ai/FixErrorWithAgentButton'
 import { offersFixInList } from '@/components/ai/fix-error-with-agent'
+import { useGlobalPageInRange } from '@/hooks/useGlobalView'
 import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 export default function GlobalErrors() {
@@ -51,6 +52,15 @@ export default function GlobalErrors() {
     }),
     retry: false,
   })
+  useGlobalPageInRange(
+    view,
+    query.data && !query.isPlaceholderData
+      ? {
+          rows: query.data.data.length,
+          total: query.data.pagination.total_count,
+        }
+      : undefined
+  )
   return (
     <GlobalPage
       title="Errors"
