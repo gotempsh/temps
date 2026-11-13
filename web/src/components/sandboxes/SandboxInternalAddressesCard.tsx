@@ -6,7 +6,8 @@
  * with the `curl` line to run inside it, by `<env>.<project>.temps.local`
  * and, when it has one, by `<environment subdomain>.temps.local`. A project allows a sandbox under
  * its Settings > Protection > Internal access; without that, the call gets
- * a 403 that says the same.
+ * a 403 that says the same. The projects listed below the addresses can be
+ * allowed from here too, in one click each.
  */
 import { useQuery } from '@tanstack/react-query'
 import { Waypoints } from 'lucide-react'
@@ -19,6 +20,7 @@ import { CopyButton } from '@/components/ui/copy-button'
 import { ResponsivePagination } from '@/components/ui/responsive-pagination'
 import { Skeleton } from '@/components/ui/skeleton'
 import { ErrorAlert } from '@/components/utils/ErrorAlert'
+import { SandboxProjectAccess } from './SandboxProjectAccess'
 import { problemDetail } from '@/lib/api-problem'
 
 export const INTERNAL_ADDRESSES_PAGE_SIZE = 20
@@ -30,9 +32,12 @@ export function internalAccessSettingsPath(projectSlug: string): string {
 
 export function SandboxInternalAddressesCard({
   sandboxId,
+  sandboxName,
   disabled,
 }: {
   sandboxId: string
+  /** The name its owner gave it, for the toasts; the id when it has none. */
+  sandboxName?: string
   /** A destroyed sandbox calls nothing. */
   disabled?: boolean
 }) {
@@ -76,24 +81,13 @@ export function SandboxInternalAddressesCard({
             <Skeleton className="h-12 w-full" />
           </div>
         ) : data.total === 0 ? (
-          <div className="rounded-md border border-dashed p-4 text-sm">
-            <p className="font-medium">No project lets this sandbox call it.</p>
-            <p className="mt-1 text-muted-foreground [overflow-wrap:anywhere]">
-              A call such as{' '}
-              <code className="text-xs">
-                curl -sS http://production.orders.temps.local/
-              </code>{' '}
-              gets a 403. Open the project&apos;s Settings &gt; Protection &gt;
-              Internal access and add sandbox{' '}
-              <code className="text-xs">{sandboxId}</code> as a caller.
-            </p>
-            <Link
-              to="/projects"
-              className="mt-2 inline-block font-medium underline underline-offset-4"
-            >
-              Choose a project
-            </Link>
-          </div>
+          <p className="rounded-md border border-dashed p-3 text-sm text-muted-foreground [overflow-wrap:anywhere]">
+            No project lets this sandbox call it yet: a call such as{' '}
+            <code className="text-xs">
+              curl -sS http://production.orders.temps.local/
+            </code>{' '}
+            gets a 403. Allow a project below.
+          </p>
         ) : (
           <>
             <ul
@@ -118,6 +112,12 @@ export function SandboxInternalAddressesCard({
               />
             )}
           </>
+        )}
+        {disabled ? null : (
+          <SandboxProjectAccess
+            sandboxId={sandboxId}
+            sandboxName={sandboxName?.trim() || sandboxId}
+          />
         )}
       </CardContent>
     </Card>

@@ -2,390 +2,248 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 /**
- * Sandbox callers on the Internal access card (ADR 105): which of the
- * user's sandboxes may call this project's `*.temps.local` addresses. A
- * sandbox calls them with plain `http://` through its egress proxy, in
- * every egress mode; without a grant it gets a 403 naming this card.
+ * Sandbox callers on the Internal access card (ADR 105): the user's
+ * sandboxes, running ones first, each allowed in one click to call this
+ * project's `*.temps.local` addresses. A sandbox calls them with plain
+ * `http://` through its egress proxy, in every egress mode; without a grant
+ * it gets a 403 naming this card.
+ *
+ * `listSandboxes` has no search or status order, so the list asks for the
+ * user's newest sandboxes in one request (its limit) and searches, orders
+ * and pages them here; past that limit it says so.
  */
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { Box } from 'lucide-react'
+import { useState } from 'react'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import {
   createInternalAccessSandboxGrant,
   deleteInternalAccessSandboxGrant,
-  listInternalAccessSandboxGrants,
 } from '@/api/client'
-import { listInternalAccessSandboxGrantsQueryKey } from '@/api/client/@tanstack/react-query.gen'
 import type {
-  EnvironmentResponse,
-  InternalAccessSandboxGrantListResponse,
+  CreateInternalAccessSandboxGrantRequest,
   InternalAccessSandboxGrantResponse,
+  SandboxInner,
 } from '@/api/client/types.gen'
-import { SandboxSelect } from '@/components/sandboxes/SandboxSelect'
-import { Badge } from '@/components/ui/badge'
-import { Button } from '@/components/ui/button'
-import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import {
-  Form,
-  FormControl,
-  FormField,
-  FormItem,
-  FormLabel,
-  FormMessage,
-} from '@/components/ui/form'
-import { Input } from '@/components/ui/input'
-import { ResponsivePagination } from '@/components/ui/responsive-pagination'
+  AllowListPager,
+  AllowListRows,
+  AllowListSection,
+  AllowRow,
+  GrantLimitsPopover,
+  LookupNotice,
+} from './InternalAccessAllowList'
 import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select'
-import { Skeleton } from '@/components/ui/skeleton'
-import { ErrorAlert } from '@/components/utils/ErrorAlert'
-import { problemDetail } from '@/lib/api-problem'
-import { zodResolver } from '@hookform/resolvers/zod'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Box, Trash2 } from 'lucide-react'
-import { useState } from 'react'
-import { useForm } from 'react-hook-form'
-import { Link } from 'react-router'
-import { toast } from 'sonner'
-import {
+  SANDBOX_LOOKUP_LIMIT,
+  callerState,
   clampGrantsPage,
   GRANTS_PAGE_SIZE,
-  MAX_GRANT_DESCRIPTION_LENGTH,
-  emptySandboxGrantForm,
-  isSandboxGrantInherited,
-  sandboxCallerLabel,
-  sandboxCurl,
-  sandboxGrantFormSchema,
-  sandboxTargetLabel,
-  toCreateSandboxRequest,
-  type SandboxGrantFormValues,
+  limitedSandboxGrant,
+  namedSandbox,
+  oneClickSandboxGrant,
+  pageOf,
+  sandboxesForAllowList,
 } from './internal-access'
-
-const ALL = 'all'
+import { removalFeedback, useAllowGrant } from './internal-access-hooks'
+import {
+  isSandboxGrantsQuery,
+  lookupOf,
+  sandboxGrantsOptions,
+  userSandboxesOptions,
+  type GrantsLookup,
+} from './internal-access-queries'
 
 export function InternalAccessSandboxGrants({
   projectId,
-  projectName,
-  projectSlug,
+  targetName,
   environmentId,
-  environmentName,
-  environmentSlug,
-  ownEnvironments,
+  blockReason,
 }: {
   projectId: number
-  projectName: string
-  projectSlug: string
+  targetName: string
   environmentId?: number
-  environmentName?: string
-  environmentSlug?: string
-  /** This project's environments, for the project card's target choice. */
-  ownEnvironments: EnvironmentResponse[] | undefined
+  blockReason: string | null
 }) {
   const queryClient = useQueryClient()
-  const isEnvironment = environmentId !== undefined
+  const [search, setSearch] = useState('')
   const [page, setPage] = useState(1)
-  const [removing, setRemoving] =
-    useState<InternalAccessSandboxGrantResponse | null>(null)
-
-  const listOptions = {
-    path: { project_id: projectId },
-    query: { environment_id: environmentId, page, page_size: GRANTS_PAGE_SIZE },
-  }
-  const grantsQuery = useQuery({
-    queryKey: listInternalAccessSandboxGrantsQueryKey(listOptions),
-    queryFn: async (): Promise<InternalAccessSandboxGrantListResponse> => {
-      const result = await listInternalAccessSandboxGrants({
-        ...listOptions,
-        throwOnError: true,
-      })
-      return result.data
-    },
-  })
-  const invalidate = () =>
-    queryClient.invalidateQueries({
-      predicate: (query) => {
-        const key = query.queryKey[0] as
-          { _id?: string; path?: { project_id?: number } } | undefined
-        return (
-          key?._id === 'listInternalAccessSandboxGrants' &&
-          key.path?.project_id === projectId
-        )
-      },
+  const sandboxes = useQuery(userSandboxesOptions())
+  const grants = useQuery(sandboxGrantsOptions(projectId, environmentId))
+  const lookup = lookupOf(grants)
+  const listed = sandboxesForAllowList(sandboxes.data?.sandboxes ?? [], search)
+  const shownPage = clampGrantsPage(page, listed.length, GRANTS_PAGE_SIZE)
+  const truncated =
+    (sandboxes.data?.pagination.count ?? 0) > SANDBOX_LOOKUP_LIMIT
+  const onChanged = () =>
+    void queryClient.invalidateQueries({
+      predicate: isSandboxGrantsQuery(projectId),
     })
 
-  const form = useForm<SandboxGrantFormValues>({
-    resolver: zodResolver(sandboxGrantFormSchema),
-    defaultValues: emptySandboxGrantForm(environmentId),
-  })
-
-  const create = useMutation({
-    mutationFn: async (values: SandboxGrantFormValues) => {
-      const body = toCreateSandboxRequest(values)
-      if (body === null) throw new Error('Choose the sandbox first')
-      const result = await createInternalAccessSandboxGrant({
-        path: { project_id: projectId },
-        body,
-        throwOnError: true,
-      })
-      return result.data
-    },
-    onSuccess: (grant) => {
-      form.reset(emptySandboxGrantForm(environmentId))
-      setPage(1)
-      invalidate()
-      toast.success(`${sandboxCallerLabel(grant)} can now call ${projectName}`)
-    },
-    onError: (error) => {
-      toast.error(problemDetail(error, 'Failed to allow the sandbox'))
-    },
-  })
-
-  const remove = useMutation({
-    mutationFn: async (grant: InternalAccessSandboxGrantResponse) => {
-      await deleteInternalAccessSandboxGrant({
-        path: { project_id: projectId, grant_id: grant.id },
-        throwOnError: true,
-      })
-      return grant
-    },
-    onSuccess: (grant) => {
-      setRemoving(null)
-      const listed = grantsQuery.data
-      if (listed) {
-        setPage(clampGrantsPage(page, listed.total - 1, listed.page_size))
-      }
-      invalidate()
-      toast.success(
-        `${sandboxCallerLabel(grant)} can no longer call ${projectName}`
-      )
-    },
-    onError: (error) => {
-      setRemoving(null)
-      toast.error(problemDetail(error, 'Failed to remove the sandbox'))
-    },
-  })
-
-  const grants = grantsQuery.data
-  const totalPages = grants ? Math.ceil(grants.total / grants.page_size) : 0
-  const curl = sandboxCurl(projectSlug, environmentSlug)
-
   return (
-    <section className="space-y-3" aria-label="Sandbox callers">
-      <h3 className="flex items-center gap-2 text-sm font-medium">
-        <Box className="h-4 w-4" aria-hidden />
-        Sandboxes
-      </h3>
-      {grantsQuery.isError ? (
-        <ErrorAlert
-          title="Could not load sandbox callers"
-          description={problemDetail(
-            grantsQuery.error,
-            'The sandbox grants could not be loaded.'
-          )}
-          retry={() => grantsQuery.refetch()}
-          retrying={grantsQuery.isFetching}
-        />
-      ) : grants === undefined ? (
-        <div className="space-y-2" aria-busy="true">
-          <Skeleton className="h-12 w-full" />
-        </div>
-      ) : grants.total === 0 ? (
-        <div className="rounded-md border border-dashed p-4 text-sm">
-          <p className="font-medium">No sandbox may call it.</p>
-          <p className="mt-1 text-muted-foreground [overflow-wrap:anywhere]">
-            A sandbox running <code className="text-xs">{curl}</code> gets a
-            403. Add one of your sandboxes below; its page then lists this
-            address.
-          </p>
-        </div>
-      ) : (
-        <div className="space-y-2">
-          <ul
-            className="divide-y rounded-md border"
-            aria-label="Sandbox grants"
-          >
-            {grants.items.map((grant) => (
-              <SandboxGrantRow
-                key={grant.id}
-                grant={grant}
-                inherited={isSandboxGrantInherited(grant, environmentId)}
-                onRemove={() => setRemoving(grant)}
-              />
-            ))}
-          </ul>
-          {totalPages > 1 && (
-            <ResponsivePagination
-              page={page}
-              pageSize={grants.page_size}
-              total={grants.total}
-              totalPages={totalPages}
-              onPageChange={setPage}
-              ariaLabel="Sandbox caller pages"
-            />
-          )}
-        </div>
-      )}
-
-      <Form {...form}>
-        <form
-          onSubmit={form.handleSubmit((values) => create.mutate(values))}
-          className="space-y-4 rounded-md border p-4"
-          noValidate
-          aria-label="Allow a sandbox"
-        >
-          <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-            <FormField
-              control={form.control}
-              name="sandboxId"
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>Calling sandbox</FormLabel>
-                  <SandboxSelect
-                    ariaLabel="Calling sandbox"
-                    value={field.value === '' ? null : field.value}
-                    onValueChange={(next) => field.onChange(next ?? '')}
-                    className="w-full"
-                  />
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
-            {!isEnvironment && (
-              <FormField
-                control={form.control}
-                name="targetEnvironmentId"
-                render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>May call</FormLabel>
-                    <Select
-                      value={field.value === null ? ALL : String(field.value)}
-                      onValueChange={(value) =>
-                        field.onChange(value === ALL ? null : Number(value))
-                      }
-                    >
-                      <FormControl>
-                        <SelectTrigger
-                          className="w-full"
-                          aria-label="Sandbox may call"
-                        >
-                          <SelectValue />
-                        </SelectTrigger>
-                      </FormControl>
-                      <SelectContent>
-                        <SelectItem value={ALL}>
-                          Every environment of {projectName}
-                        </SelectItem>
-                        {ownEnvironments?.map((environment) => (
-                          <SelectItem
-                            key={environment.id}
-                            value={String(environment.id)}
-                          >
-                            {environment.name} only
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                    <FormMessage />
-                  </FormItem>
-                )}
-              />
-            )}
-            <FormField
-              control={form.control}
-              name="description"
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>Reason (optional)</FormLabel>
-                  <FormControl>
-                    <Input
-                      {...field}
-                      maxLength={MAX_GRANT_DESCRIPTION_LENGTH}
-                      placeholder="e.g. the agent tests the orders API"
-                    />
-                  </FormControl>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
-          </div>
-          <div className="flex flex-wrap items-center gap-3">
-            <Button type="submit" disabled={create.isPending}>
-              {create.isPending
-                ? 'Allowing…'
-                : `Allow the sandbox to call ${
-                    isEnvironment
-                      ? `${projectName} ${environmentName ?? 'this environment'}`
-                      : projectName
-                  }`}
-            </Button>
-            <Link
-              to="/sandboxes"
-              className="text-sm text-muted-foreground underline underline-offset-4"
-            >
-              Your sandboxes
-            </Link>
-          </div>
-        </form>
-      </Form>
-
-      <ConfirmDeleteDialog
-        open={removing !== null}
-        onOpenChange={(open) => {
-          if (!open) setRemoving(null)
-        }}
-        resourceType="sandbox access"
-        resourceName={removing ? sandboxCallerLabel(removing) : ''}
-        verb="Remove"
-        irreversible={false}
-        consequences={`Calls from it to ${projectName} get 403 again within seconds.`}
-        isPending={remove.isPending}
-        onConfirm={() => {
-          if (removing) remove.mutate(removing)
-        }}
+    <AllowListSection
+      title="Sandboxes"
+      icon={Box}
+      search={search}
+      onSearchChange={(value) => {
+        setSearch(value)
+        setPage(1)
+      }}
+      searchLabel="Search your sandboxes"
+      note={
+        truncated
+          ? `Your ${SANDBOX_LOOKUP_LIMIT} newest sandboxes, running ones first; search covers only these.`
+          : 'Your sandboxes, running ones first.'
+      }
+    >
+      <LookupNotice lookup={lookup} plural="sandboxes" />
+      <AllowListRows
+        isPending={sandboxes.isPending}
+        isError={sandboxes.isError}
+        error={sandboxes.error}
+        retry={() => void sandboxes.refetch()}
+        retrying={sandboxes.isFetching}
+        plural="Sandboxes"
+        empty={
+          listed.length > 0
+            ? null
+            : search.trim() === ''
+              ? 'You have no sandboxes.'
+              : `No sandbox matches “${search.trim()}”.`
+        }
+      >
+        {pageOf(listed, shownPage).map((sandbox) => (
+          <SandboxCallerRow
+            key={sandbox.id}
+            sandbox={sandbox}
+            projectId={projectId}
+            targetName={targetName}
+            environmentId={environmentId}
+            grants={grants.data?.items ?? []}
+            lookup={lookup}
+            blockReason={blockReason}
+            onChanged={onChanged}
+          />
+        ))}
+      </AllowListRows>
+      <AllowListPager
+        page={shownPage}
+        total={listed.length}
+        onPageChange={setPage}
+        ariaLabel="Sandbox pages"
       />
-    </section>
+    </AllowListSection>
   )
 }
 
-function SandboxGrantRow({
-  grant,
-  inherited,
-  onRemove,
+/** "e2e-alias-caller", or the id when it has no other name. */
+function sandboxName(sandbox: SandboxInner): string {
+  return sandbox.name.trim() === '' ? sandbox.id : sandbox.name
+}
+
+function SandboxCallerRow({
+  sandbox,
+  projectId,
+  targetName,
+  environmentId,
+  grants,
+  lookup,
+  blockReason,
+  onChanged,
 }: {
-  grant: InternalAccessSandboxGrantResponse
-  inherited: boolean
-  onRemove: () => void
+  sandbox: SandboxInner
+  projectId: number
+  targetName: string
+  environmentId?: number
+  grants: InternalAccessSandboxGrantResponse[]
+  lookup: GrantsLookup
+  blockReason: string | null
+  onChanged: () => void
 }) {
+  const name = sandboxName(sandbox)
+  const state = callerState(
+    grants,
+    (grant) => grant.sandbox_id === sandbox.id,
+    environmentId
+  )
+  const allowMutation = useAllowGrant({
+    allow: async (body: CreateInternalAccessSandboxGrantRequest) =>
+      createInternalAccessSandboxGrant({
+        path: { project_id: projectId },
+        body,
+        throwOnError: true,
+      }),
+    onChanged,
+    allowed: `Sandbox ${name} can now call ${targetName}`,
+  })
+  const [confirming, setConfirming] = useState(false)
+  const removeMutation = useMutation({
+    mutationFn: async () => {
+      for (const grant of state.removable) {
+        await deleteInternalAccessSandboxGrant({
+          path: { project_id: projectId, grant_id: grant.id },
+          throwOnError: true,
+        })
+      }
+    },
+    ...removalFeedback(
+      onChanged,
+      `Sandbox ${name} can no longer call ${targetName}`
+    ),
+  })
+  const detail =
+    namedSandbox(sandbox.name, sandbox.id) === sandbox.id
+      ? sandbox.status
+      : `${sandbox.id} · ${sandbox.status}`
   return (
-    <li className="flex items-start justify-between gap-3 p-3">
-      <div className="min-w-0 space-y-1">
-        <p className="text-sm font-medium [overflow-wrap:anywhere]">
-          {sandboxCallerLabel(grant)}
-        </p>
-        <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-          <span>May call: {sandboxTargetLabel(grant)}</span>
-          {inherited && <Badge variant="secondary">Project-wide</Badge>}
-        </div>
-        {grant.description && (
-          <p className="text-xs text-muted-foreground [overflow-wrap:anywhere]">
-            {grant.description}
-          </p>
-        )}
-      </div>
-      {!inherited && (
-        <Button
-          type="button"
-          variant="ghost"
-          size="sm"
-          onClick={onRemove}
-          aria-label={`Remove internal access for ${sandboxCallerLabel(grant)}`}
-        >
-          <Trash2 className="h-4 w-4" />
-          <span className="max-sm:sr-only">Remove</span>
-        </Button>
-      )}
-    </li>
+    <>
+      <AllowRow
+        icon={<Box className="h-5 w-5 text-muted-foreground" aria-hidden />}
+        name={name}
+        detail={detail}
+        state={state}
+        lookup={lookup}
+        blockReason={blockReason}
+        allowing={allowMutation.isPending}
+        removing={removeMutation.isPending}
+        error={
+          allowMutation.isError
+            ? allowMutation.error
+            : removeMutation.isError
+              ? removeMutation.error
+              : null
+        }
+        onAllow={() =>
+          allowMutation.mutate(oneClickSandboxGrant(sandbox.id, environmentId))
+        }
+        onRemove={() => setConfirming(true)}
+        limits={
+          <GrantLimitsPopover
+            name={name}
+            targetProjectId={projectId}
+            targetName={targetName}
+            fixedTargetEnvironmentId={environmentId}
+            disabled={lookup.state !== 'ready' || allowMutation.isPending}
+            pending={allowMutation.isPending}
+            onSubmit={(limits) =>
+              allowMutation.mutateAsync(limitedSandboxGrant(sandbox.id, limits))
+            }
+          />
+        }
+      />
+      <ConfirmDeleteDialog
+        open={confirming}
+        onOpenChange={setConfirming}
+        resourceType="internal access"
+        resourceName={name}
+        verb="Remove"
+        irreversible={false}
+        consequences={`Calls from sandbox ${name} to ${targetName} get 403 again within seconds.`}
+        isPending={removeMutation.isPending}
+        onConfirm={() => {
+          setConfirming(false)
+          removeMutation.mutate()
+        }}
+      />
+    </>
   )
 }

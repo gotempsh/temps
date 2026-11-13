@@ -8,24 +8,27 @@ import type {
   InternalAccessSandboxGrantResponse,
 } from '@/api/client/types.gen'
 import {
-  allowLabel,
   callerLabel,
+  callerState,
   clampGrantsPage,
-  emptyGrantForm,
-  emptySandboxGrantForm,
+  defaultGrantLimits,
   exampleAddress,
+  grantLimitsSchema,
+  grantsLookupComplete,
   internalAccessDiagnostic,
-  internalAccessFormSchema,
+  internalAccessWriteBlock,
   isInherited,
-  isSandboxGrantInherited,
+  limitedProjectGrant,
+  limitedSandboxGrant,
+  oneClickProjectGrant,
+  oneClickSandboxGrant,
+  pageOf,
   sandboxAccessDiagnostic,
   sandboxCallerLabel,
   sandboxCurl,
-  sandboxGrantFormSchema,
-  sandboxTargetLabel,
-  targetLabel,
-  toCreateRequest,
-  toCreateSandboxRequest,
+  sandboxesForAllowList,
+  scopeSummary,
+  scopesSummary,
 } from './internal-access'
 
 const grant: InternalAccessGrantResponse = {
@@ -45,9 +48,9 @@ const grant: InternalAccessGrantResponse = {
   created_at: '2026-11-09T10:00:00Z',
 }
 
-test('labels name both scopes', () => {
+test('labels and scope summaries name both scopes', () => {
   expect(callerLabel(grant)).toBe('Checkout worker, all environments')
-  expect(targetLabel(grant)).toBe('Every environment')
+  expect(scopeSummary(grant)).toBe('all environments')
   const narrow = {
     ...grant,
     caller_environment_id: 20,
@@ -56,7 +59,10 @@ test('labels name both scopes', () => {
     target_environment_name: 'staging',
   }
   expect(callerLabel(narrow)).toBe('Checkout worker, production')
-  expect(targetLabel(narrow)).toBe('staging')
+  expect(scopeSummary(narrow)).toBe('staging only, from production')
+  expect(scopesSummary([grant, narrow, grant])).toBe(
+    'all environments; staging only, from production'
+  )
 })
 
 test('a project-wide grant is inherited on an environment card only', () => {
@@ -65,35 +71,114 @@ test('a project-wide grant is inherited on an environment card only', () => {
   expect(isInherited({ ...grant, target_environment_id: 10 }, 10)).toBe(false)
 })
 
-test('the form needs a calling project and sends nulls for whole scopes', () => {
-  const empty = emptyGrantForm()
-  expect(internalAccessFormSchema.safeParse(empty).success).toBe(false)
-  expect(toCreateRequest(empty)).toBeNull()
-
-  const values = { ...empty, callerProjectId: 2, description: '  why  ' }
-  expect(internalAccessFormSchema.safeParse(values).success).toBe(true)
-  expect(toCreateRequest(values)).toEqual({
+test('one click sends only the caller, plus the environment on its card', () => {
+  expect(oneClickProjectGrant(2)).toEqual({ caller_project_id: 2 })
+  expect(oneClickProjectGrant(2, 10)).toEqual({
     caller_project_id: 2,
-    caller_environment_id: null,
+    target_environment_id: 10,
+  })
+  expect(oneClickSandboxGrant('sbx_alpha')).toEqual({ sandbox_id: 'sbx_alpha' })
+  expect(oneClickSandboxGrant('sbx_alpha', 10)).toEqual({
+    sandbox_id: 'sbx_alpha',
+    target_environment_id: 10,
+  })
+})
+
+test('Limit… sends the narrower scope and a trimmed reason', () => {
+  expect(defaultGrantLimits(10)).toEqual({
+    callerEnvironmentId: null,
+    targetEnvironmentId: 10,
+    description: '',
+  })
+  const limits = {
+    callerEnvironmentId: 20,
+    targetEnvironmentId: null,
+    description: '  why  ',
+  }
+  expect(grantLimitsSchema.safeParse(limits).success).toBe(true)
+  expect(limitedProjectGrant(2, limits)).toEqual({
+    caller_project_id: 2,
+    caller_environment_id: 20,
     target_environment_id: null,
     description: 'why',
   })
-  expect(toCreateRequest({ ...values, description: '   ' })?.description).toBe(
-    null
+  // A sandbox has no environments of its own.
+  expect(
+    limitedSandboxGrant('sbx_alpha', { ...limits, description: '   ' })
+  ).toEqual({
+    sandbox_id: 'sbx_alpha',
+    target_environment_id: null,
+    description: null,
+  })
+  expect(
+    grantLimitsSchema.safeParse({ ...limits, description: 'x'.repeat(201) })
+      .success
+  ).toBe(false)
+})
+
+test('a row is allowed by its own grants; on an environment card a project-wide one is inherited', () => {
+  const other = { ...grant, id: 4, caller_project_id: 5 }
+  const scoped = { ...grant, id: 6, target_environment_id: 10 }
+  const mine = (g: InternalAccessGrantResponse) => g.caller_project_id === 2
+  expect(callerState([grant, other], mine)).toEqual({
+    grants: [grant],
+    removable: [grant],
+    inherited: false,
+  })
+  expect(callerState([grant, other], mine, 10)).toEqual({
+    grants: [grant],
+    removable: [],
+    inherited: true,
+  })
+  expect(callerState([grant, scoped], mine, 10).removable).toEqual([scoped])
+  expect(callerState([other], mine).grants).toEqual([])
+})
+
+test('a lookup decides rows only when it holds every grant', () => {
+  expect(grantsLookupComplete(undefined)).toBe(false)
+  expect(grantsLookupComplete({ items: [], total: 0 })).toBe(true)
+  expect(grantsLookupComplete({ items: [grant], total: 1 })).toBe(true)
+  expect(grantsLookupComplete({ items: [grant], total: 101 })).toBe(false)
+})
+
+test('only roles without projects:write are told they cannot change it', () => {
+  expect(internalAccessWriteBlock('admin')).toBeNull()
+  expect(internalAccessWriteBlock('user')).toBeNull()
+  expect(internalAccessWriteBlock('custom')).toBeNull()
+  expect(internalAccessWriteBlock(undefined)).toBeNull()
+  expect(internalAccessWriteBlock('reader')).toBe(
+    'Your role (Reader) cannot change internal access; it needs projects:write.'
   )
+  expect(internalAccessWriteBlock('platform_admin')).toContain('Platform admin')
 })
 
-test('an environment card targets its own environment', () => {
-  expect(emptyGrantForm(10).targetEnvironmentId).toBe(10)
-})
-
-test('a description over the limit is refused', () => {
-  const values = {
-    ...emptyGrantForm(),
-    callerProjectId: 2,
-    description: 'x'.repeat(201),
-  }
-  expect(internalAccessFormSchema.safeParse(values).success).toBe(false)
+test('sandboxes list live ones matching the search, running first', () => {
+  const sandbox = (id: string, name: string, status: string) => ({
+    id,
+    name,
+    status,
+  })
+  const listed = [
+    sandbox('sbx_1', 'old scratch', 'stopped'),
+    sandbox('sbx_2', 'e2e caller', 'running'),
+    sandbox('sbx_3', 'gone', 'destroyed'),
+    sandbox('sbx_4', 'e2e builder', 'paused'),
+    sandbox('sbx_5', 'agent', 'running'),
+  ]
+  expect(sandboxesForAllowList(listed, '').map((s) => s.id)).toEqual([
+    'sbx_2',
+    'sbx_5',
+    'sbx_1',
+    'sbx_4',
+  ])
+  expect(sandboxesForAllowList(listed, ' E2E ').map((s) => s.id)).toEqual([
+    'sbx_2',
+    'sbx_4',
+  ])
+  expect(sandboxesForAllowList(listed, 'sbx_1').map((s) => s.id)).toEqual([
+    'sbx_1',
+  ])
+  expect(pageOf([1, 2, 3, 4, 5], 2, 2)).toEqual([3, 4])
 })
 
 test('the example address is the internal name', () => {
@@ -103,7 +188,6 @@ test('the example address is the internal name', () => {
   expect(exampleAddress('orders-api', 'staging')).toBe(
     'http://staging.orders-api.temps.local'
   )
-  expect(allowLabel('Orders API')).toBe('Allow it to call Orders API')
 })
 
 const access: DnsInternalAccess = {
@@ -183,45 +267,6 @@ test('a sandbox grant names the sandbox, and its state when not running', () => 
   expect(
     sandboxCallerLabel({ ...sandboxGrant, sandbox_name: 'sbx_alpha' })
   ).toBe('Sandbox sbx_alpha')
-  expect(sandboxTargetLabel(sandboxGrant)).toBe('Every environment')
-  expect(
-    sandboxTargetLabel({
-      ...sandboxGrant,
-      target_environment_id: 4,
-      target_environment_name: 'staging',
-    })
-  ).toBe('staging')
-  expect(isSandboxGrantInherited(sandboxGrant, 4)).toBe(true)
-  expect(isSandboxGrantInherited(sandboxGrant)).toBe(false)
-})
-
-test('the sandbox form needs a sandbox and sends a trimmed reason', () => {
-  const empty = emptySandboxGrantForm(7)
-  expect(empty).toEqual({
-    sandboxId: '',
-    targetEnvironmentId: 7,
-    description: '',
-  })
-  expect(sandboxGrantFormSchema.safeParse(empty).success).toBe(false)
-  expect(toCreateSandboxRequest(empty)).toBeNull()
-  expect(
-    toCreateSandboxRequest({
-      sandboxId: 'sbx_alpha',
-      targetEnvironmentId: null,
-      description: '  agent tests the API ',
-    })
-  ).toEqual({
-    sandbox_id: 'sbx_alpha',
-    target_environment_id: null,
-    description: 'agent tests the API',
-  })
-  expect(
-    toCreateSandboxRequest({
-      sandboxId: 'sbx_alpha',
-      targetEnvironmentId: 3,
-      description: '   ',
-    })?.description
-  ).toBeNull()
 })
 
 test('the sandbox curl line is plain http on the internal name', () => {

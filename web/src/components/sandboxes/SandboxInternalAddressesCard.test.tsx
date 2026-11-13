@@ -97,22 +97,23 @@ test('each address shows the exact curl lines to run in the sandbox, by both nam
   )
 })
 
-test('without grants it says where a project allows this sandbox', () => {
+test('without grants it says the call gets a 403 and lists projects to allow', () => {
   const markup = render({
     items: [],
     total: 0,
     page: 1,
     page_size: INTERNAL_ADDRESSES_PAGE_SIZE,
   })
-  expect(markup).toContain('No project lets this sandbox call it.')
-  expect(markup).toContain('gets a 403')
-  expect(markup).toContain('Internal access and add sandbox')
-  expect(markup).toContain('sbx_alpha')
-  expect(markup).toContain('href="/projects"')
+  expect(markup).toContain('No project lets this sandbox call it yet')
+  expect(markup).toContain('gets a 403. Allow a project below.')
+  // The reverse direction: projects, searchable, one click each.
+  expect(markup).toContain('aria-label="Search projects"')
 })
 
-test('a destroyed sandbox says it calls nothing', () => {
-  expect(render(undefined, true)).toContain('A destroyed sandbox calls nothing')
+test('a destroyed sandbox says it calls nothing, and offers no projects', () => {
+  const markup = render(undefined, true)
+  expect(markup).toContain('A destroyed sandbox calls nothing')
+  expect(markup).not.toContain('aria-label="Search projects"')
 })
 
 test('the settings path is the project Protection page anchor', () => {

@@ -1035,6 +1035,7 @@ export default function SandboxDetail() {
                     />
                     <SandboxInternalAddressesCard
                       sandboxId={sandbox.id}
+                      sandboxName={sandbox.name}
                       disabled={destroyed}
                     />
                   </>
