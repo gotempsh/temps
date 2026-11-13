@@ -38,6 +38,8 @@ const STATE_LABEL: Record<ArchivingState, string> = {
   failing: 'Failing',
   waiting: 'No WAL archived yet',
   discarding: 'Not storing WAL: archive_command does nothing',
+  no_command:
+    'Not archiving: archive_command is empty, so pg_wal keeps growing',
 }
 
 const STATE_CLASS: Record<ArchivingState, string> = {
@@ -45,6 +47,7 @@ const STATE_CLASS: Record<ArchivingState, string> = {
   failing: 'text-destructive',
   waiting: 'text-muted-foreground',
   discarding: 'text-amber-700 dark:text-amber-400',
+  no_command: 'text-amber-700 dark:text-amber-400',
 }
 
 interface Props {
@@ -52,7 +55,15 @@ interface Props {
   snapshot: PostgresWalHealth
 }
 
-export function WalArchivingStatus({ serviceId, snapshot }: Props) {
+/**
+ * Keyed by service: the page stays mounted when only its `:id` changes, and
+ * a check's result (or one still running) belongs to the service it ran on.
+ */
+export function WalArchivingStatus(props: Props) {
+  return <WalArchivingStatusForService key={props.serviceId} {...props} />
+}
+
+function WalArchivingStatusForService({ serviceId, snapshot }: Props) {
   const location = useLocation()
   const coverage = useQuery({
     ...getNotificationDeliveryCoverageOptions({
@@ -95,6 +106,22 @@ export function WalArchivingStatus({ serviceId, snapshot }: Props) {
       }
       onTest={() => test.mutate({ path: { id: serviceId } })}
     />
+  )
+}
+
+function WaitingSegments({ snapshot }: { snapshot: PostgresWalHealth }) {
+  if (snapshot.archive_status_unreadable)
+    return <>Unknown: the database role may not list archive_status</>
+  return (
+    <>
+      {snapshot.archive_backlog}{' '}
+      {snapshot.archive_backlog === 1 ? 'segment' : 'segments'}
+      {snapshot.archive_oldest_ready_age_secs ? (
+        <>
+          , oldest {Math.round(snapshot.archive_oldest_ready_age_secs / 60)} min
+        </>
+      ) : null}
+    </>
   )
 }
 
@@ -155,14 +182,7 @@ export function WalArchivingStatusView({
           </span>
         </Fact>
         <Fact label="Waiting to archive">
-          {snapshot.archive_backlog}{' '}
-          {snapshot.archive_backlog === 1 ? 'segment' : 'segments'}
-          {snapshot.archive_oldest_ready_age_secs ? (
-            <>
-              , oldest {Math.round(snapshot.archive_oldest_ready_age_secs / 60)}{' '}
-              min
-            </>
-          ) : null}
+          <WaitingSegments snapshot={snapshot} />
         </Fact>
         <Fact label="pg_wal">
           {formatBytes(snapshot.pg_wal_bytes)} of{' '}

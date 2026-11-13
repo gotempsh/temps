@@ -889,6 +889,8 @@ mod tests {
                 archive_mode,
                 archive_command: None,
                 archive_backlog: 0,
+                archive_library: None,
+                archive_status_unreadable: false,
                 archiver_failed_count: None,
                 archiver_last_failed_at: None,
                 archiver_archived_count: None,

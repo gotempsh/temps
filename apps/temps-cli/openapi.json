@@ -6111,7 +6111,7 @@
             "type": "string"
           },
           "ok": {
-            "description": "Whether WAL-G could write, read back and delete a probe object.",
+            "description": "Whether WAL-G could write a probe object to the archive target, which\nis what `archive_command` needs. The object is never read back, and\nits removal afterwards is best effort: `ok` says nothing about read\nor delete permission.",
             "type": "boolean"
           },
           "path_style_reason": {
@@ -52631,12 +52631,19 @@
       "PostgresWalHealth": {
         "properties": {
           "archive_backlog": {
-            "description": "Number of `archive_status/*.ready` files — un-shipped WAL segments.",
+            "description": "Number of `archive_status/*.ready` files — un-shipped WAL segments.\n0 when `archive_status_unreadable` is set.",
             "format": "int64",
             "type": "integer"
           },
           "archive_command": {
             "description": "The literal `archive_command` setting. May be empty or `/bin/true`\nwhen archiving is effectively disabled despite `archive_mode = on`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "archive_library": {
+            "description": "The `archive_library` setting (PostgreSQL 15+), when one archives WAL\ninstead of `archive_command`.",
             "type": [
               "string",
               "null"
@@ -52652,6 +52659,10 @@
               "integer",
               "null"
             ]
+          },
+          "archive_status_unreadable": {
+            "description": "The role may not list `archive_status`: the backlog, the oldest\nwaiting segment's age and stall detection are unknown.",
+            "type": "boolean"
           },
           "archiver_archived_count": {
             "description": "Segments archived since the statistics were last reset.",
@@ -81913,11 +81924,26 @@
             "type": "object"
           },
           {
-            "description": "`archive_mode = on` but `archive_command` is empty / `/bin/true`.\nWAL accumulates forever waiting for a destination that never accepts.",
+            "description": "`archive_mode = on` and nothing stores WAL, with no `archive_library`\neither. With an empty `archive_command`, PostgreSQL keeps every\nsegment waiting for a command and `pg_wal` grows; with a no-op such as\n`/bin/true`, every segment is counted as archived and recycled, and\nnothing is stored. `archive_command` on the snapshot tells them apart.",
             "properties": {
               "kind": {
                 "enum": [
                   "archive_mode_without_command"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Archiving is on, but the monitoring role may not list\n`archive_status` (`pg_ls_archive_statusdir()` needs superuser or\n`pg_monitor`), so a stalled archiver that has reported no failure\nyet cannot be detected, and the waiting-segment count reads 0.",
+            "properties": {
+              "kind": {
+                "enum": [
+                  "archive_stall_check_unavailable"
                 ],
                 "type": "string"
               }
@@ -112040,7 +112066,7 @@
                 }
               }
             },
-            "description": "Archiving is not set up, its S3 source is gone, or the service runs on a worker node"
+            "description": "Archiving is not set up, its S3 source is gone, the service runs on a worker node, it is a cluster (no continuous archiving), or local workloads are disabled"
           },
           "500": {
             "content": {

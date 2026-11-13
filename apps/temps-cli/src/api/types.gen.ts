@@ -2876,7 +2876,10 @@ export type ArchiveTargetTestResponse = {
      */
     message: string;
     /**
-     * Whether WAL-G could write, read back and delete a probe object.
+     * Whether WAL-G could write a probe object to the archive target, which
+     * is what `archive_command` needs. The object is never read back, and
+     * its removal afterwards is best effort: `ok` says nothing about read
+     * or delete permission.
      */
     ok: boolean;
     /**
@@ -24380,6 +24383,7 @@ export type PortMapping = {
 export type PostgresWalHealth = {
     /**
      * Number of `archive_status*.ready` files — un-shipped WAL segments.
+     * 0 when `archive_status_unreadable` is set.
      */
     archive_backlog: number;
     /**
@@ -24387,12 +24391,22 @@ export type PostgresWalHealth = {
      * when archiving is effectively disabled despite `archive_mode = on`.
      */
     archive_command?: string | null;
+    /**
+     * The `archive_library` setting (PostgreSQL 15+), when one archives WAL
+     * instead of `archive_command`.
+     */
+    archive_library?: string | null;
     archive_mode: ArchiveMode;
     /**
      * Age of the oldest `archive_status*.ready` file (seconds), `None`
      * when no segment is waiting.
      */
     archive_oldest_ready_age_secs?: number | null;
+    /**
+     * The role may not list `archive_status`: the backlog, the oldest
+     * waiting segment's age and stall detection are unknown.
+     */
+    archive_status_unreadable?: boolean;
     /**
      * Segments archived since the statistics were last reset.
      */
@@ -37811,6 +37825,8 @@ export type WalWarning = {
     ready_count: number;
 } | {
     kind: 'archive_mode_without_command';
+} | {
+    kind: 'archive_stall_check_unavailable';
 } | {
     kind: 'archive_failing';
     last_archived_at?: string | null;
@@ -55788,7 +55804,7 @@ export type TestWalArchiveTargetErrors = {
      */
     404: ProblemDetails;
     /**
-     * Archiving is not set up, its S3 source is gone, or the service runs on a worker node
+     * Archiving is not set up, its S3 source is gone, the service runs on a worker node, it is a cluster (no continuous archiving), or local workloads are disabled
      */
     409: ProblemDetails;
     /**

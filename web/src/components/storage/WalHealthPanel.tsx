@@ -112,8 +112,8 @@ export function WalHealthPanel({
               {notChecked.reason}
             </p>
             <p className="mt-1 text-xs text-muted-foreground">
-              Until it is, this page cannot warn you when WAL fills the disk
-              or archiving stops.
+              Until it is, this page cannot warn you when WAL fills the disk or
+              archiving stops.
             </p>
           </AlertDescription>
         </Alert>
@@ -341,6 +341,11 @@ function describeWarning(
             : w.last_archived_at
               ? 'archive_command has failed since the last segment it archived. PostgreSQL keeps every WAL segment until archiving succeeds, so pg_wal grows until the disk is full. Test the archive target below to see why.'
               : 'archive_command has never archived a segment. PostgreSQL keeps every WAL segment until archiving succeeds, so pg_wal grows until the disk is full. Test the archive target below to see why.',
+      }
+    case 'archive_stall_check_unavailable':
+      return {
+        title: 'Stalled WAL archiving cannot be detected',
+        body: 'The database role Temps monitors with may not list pg_wal/archive_status (that needs superuser or pg_monitor), so an archive_command that hangs without reporting an error goes unnoticed and the waiting-segment count reads 0. Failures it reports are still caught. Grant pg_monitor to that role to detect stalls.',
       }
     case 'wal_not_recycled':
       return {

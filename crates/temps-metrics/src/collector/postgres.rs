@@ -1042,6 +1042,11 @@ pub const ARCHIVE_STALL_SECS: f64 = 300.0;
 /// [`ARCHIVE_STALL_SECS`] to be archived. Archiving catching up resets it
 /// to 0, which is what resolves the alarm.
 pub const PG_ARCHIVER_FAILING: &str = "pg.archiver_failing";
+/// `pg.archiver_stall_check_available`: 1 when the role may list
+/// `archive_status` (superuser or `pg_monitor`), so `pg.archiver_failing`
+/// also covers an archiver that stalls without failing; 0 when it may not,
+/// and only recorded failures count.
+pub const PG_ARCHIVER_STALL_CHECK_AVAILABLE: &str = "pg.archiver_stall_check_available";
 /// `pg_wal`'s size as a multiple of `max_wal_size`. Healthy servers stay
 /// near or below 1; a stalled archiver or a stale slot drives it up.
 pub const PG_WAL_DIR_TO_MAX_WAL_SIZE_RATIO: &str = "pg.wal_dir_to_max_wal_size_ratio";
@@ -1093,6 +1098,18 @@ pub(crate) fn archiver_points(stats: &ArchiverStats) -> Vec<(&'static str, f64, 
             MetricKind::Gauge,
         ));
     }
+    // Without the `archive_status` listing a stall that has reported no
+    // failure cannot be seen, so `pg.archiver_failing` only reflects
+    // failures. Reported rather than left to look like healthy archiving.
+    points.push((
+        PG_ARCHIVER_STALL_CHECK_AVAILABLE,
+        if stats.ready_count.is_some() {
+            1.0
+        } else {
+            0.0
+        },
+        MetricKind::Gauge,
+    ));
     if let Some(count) = stats.ready_count {
         points.push((
             "pg.archiver_ready_segments",
@@ -1200,7 +1217,8 @@ mod tests {
             Some(0.0)
         );
 
-        // Not permitted to list archive_status: no ready metrics, no guess.
+        // Not permitted to list archive_status: no ready metrics, no guess,
+        // and the stall check says it could not run.
         let unreadable = ArchiverStats {
             ready_count: None,
             oldest_ready_age_secs: None,
@@ -1209,6 +1227,11 @@ mod tests {
         let points = archiver_points(&unreadable);
         assert_eq!(value(&points, PG_ARCHIVER_FAILING), Some(0.0));
         assert_eq!(value(&points, "pg.archiver_ready_segments"), None);
+        assert_eq!(value(&points, PG_ARCHIVER_STALL_CHECK_AVAILABLE), Some(0.0));
+        assert_eq!(
+            value(&archiver_points(&busy), PG_ARCHIVER_STALL_CHECK_AVAILABLE),
+            Some(1.0)
+        );
     }
 
     #[test]

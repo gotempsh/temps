@@ -10,7 +10,10 @@ import type {
   PostgresWalHealth,
 } from '@/api/client/types.gen'
 import { archivingState } from '@/lib/wal-health'
-import { WalArchivingStatusView } from './WalArchivingStatus'
+import {
+  WalArchivingStatus,
+  WalArchivingStatusView,
+} from './WalArchivingStatus'
 
 const snapshot: PostgresWalHealth = {
   probed_at: '2026-01-01T02:00:00Z',
@@ -69,6 +72,29 @@ describe('archivingState', () => {
     expect(html).not.toContain('>Archiving<')
   })
 
+  test('an empty archive_command keeps WAL rather than discarding it', () => {
+    const empty: PostgresWalHealth = {
+      ...snapshot,
+      archive_command: null,
+      warnings: [{ kind: 'archive_mode_without_command' }],
+    }
+    expect(archivingState(empty)).toBe('no_command')
+    const html = render({ snapshot: empty })
+    expect(html).toContain('archive_command is empty, so pg_wal keeps growing')
+    expect(html).not.toContain('Not storing WAL')
+  })
+
+  test('archiving through archive_library is not flagged as a missing command', () => {
+    expect(
+      archivingState({
+        ...snapshot,
+        archive_command: null,
+        archive_library: 'basic_archive',
+        archiver_last_archived_at: '2026-01-01T01:00:00Z',
+      })
+    ).toBe('archiving')
+  })
+
   test('a success after the last failure is archiving again', () => {
     expect(
       archivingState({
@@ -109,6 +135,14 @@ describe('archivingState', () => {
 
   test('nothing archived and nothing failed is waiting', () => {
     expect(archivingState(snapshot)).toBe('waiting')
+  })
+})
+
+describe('WalArchivingStatus', () => {
+  test('is keyed by service, so a check never outlives the page it ran on', () => {
+    const element = WalArchivingStatus({ serviceId: 7, snapshot })
+    expect(element.key).toBe('7')
+    expect(WalArchivingStatus({ serviceId: 8, snapshot }).key).toBe('8')
   })
 })
 

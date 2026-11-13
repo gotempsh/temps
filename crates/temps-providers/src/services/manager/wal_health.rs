@@ -34,6 +34,10 @@ pub struct WalHealthUnchecked {
 
 /// The outcome of one WAL check.
 #[derive(Debug, Clone)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "one transient value per check, consumed at once; boxing the snapshot buys nothing"
+)]
 pub enum WalProbeOutcome {
     Snapshot(PostgresWalHealth),
     /// The check could not run or produced nothing; says why.
@@ -205,6 +209,8 @@ mod tests {
             archive_mode: ArchiveMode::On,
             archive_command: Some("wal-g wal-push %p".to_string()),
             archive_backlog: 0,
+            archive_library: None,
+            archive_status_unreadable: false,
             archiver_failed_count: None,
             archiver_last_failed_at: None,
             archiver_archived_count: None,

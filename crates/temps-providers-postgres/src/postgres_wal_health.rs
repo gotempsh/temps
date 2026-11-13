@@ -101,9 +101,17 @@ pub enum WalWarning {
     /// `archive_status/*.ready` count exceeds threshold — `archive_command`
     /// is either failing or running slower than WAL generation.
     ArchiveBacklog { ready_count: i64 },
-    /// `archive_mode = on` but `archive_command` is empty / `/bin/true`.
-    /// WAL accumulates forever waiting for a destination that never accepts.
+    /// `archive_mode = on` and nothing stores WAL, with no `archive_library`
+    /// either. With an empty `archive_command`, PostgreSQL keeps every
+    /// segment waiting for a command and `pg_wal` grows; with a no-op such as
+    /// `/bin/true`, every segment is counted as archived and recycled, and
+    /// nothing is stored. `archive_command` on the snapshot tells them apart.
     ArchiveModeWithoutCommand,
+    /// Archiving is on, but the monitoring role may not list
+    /// `archive_status` (`pg_ls_archive_statusdir()` needs superuser or
+    /// `pg_monitor`), so a stalled archiver that has reported no failure
+    /// yet cannot be detected, and the waiting-segment count reads 0.
+    ArchiveStallCheckUnavailable,
     /// `archive_command`'s most recent attempt failed and nothing has
     /// archived since: PostgreSQL keeps every segment from here on.
     ArchiveFailing {
@@ -134,6 +142,7 @@ impl WalWarning {
             Self::ArchiveBacklog { .. } => WalWarningSeverity::Warning,
             Self::ArchiveFailing { .. } => WalWarningSeverity::Critical,
             Self::ArchiveModeWithoutCommand => WalWarningSeverity::Warning,
+            Self::ArchiveStallCheckUnavailable => WalWarningSeverity::Warning,
             Self::WalNotRecycled { .. } => WalWarningSeverity::Warning,
         }
     }
@@ -159,8 +168,17 @@ pub struct PostgresWalHealth {
     /// The literal `archive_command` setting. May be empty or `/bin/true`
     /// when archiving is effectively disabled despite `archive_mode = on`.
     pub archive_command: Option<String>,
+    /// The `archive_library` setting (PostgreSQL 15+), when one archives WAL
+    /// instead of `archive_command`.
+    #[serde(default)]
+    pub archive_library: Option<String>,
     /// Number of `archive_status/*.ready` files — un-shipped WAL segments.
+    /// 0 when `archive_status_unreadable` is set.
     pub archive_backlog: i64,
+    /// The role may not list `archive_status`: the backlog, the oldest
+    /// waiting segment's age and stall detection are unknown.
+    #[serde(default)]
+    pub archive_status_unreadable: bool,
     pub archiver_failed_count: Option<i64>,
     #[schema(value_type = Option<String>, format = DateTime)]
     pub archiver_last_failed_at: Option<DateTime<Utc>>,
@@ -253,13 +271,15 @@ pub async fn probe_wal_health(conn_str: &str) -> Option<PostgresWalHealth> {
 async fn collect_snapshot(
     client: &tokio_postgres::Client,
 ) -> Result<PostgresWalHealth, tokio_postgres::Error> {
-    let (archive_mode, archive_command, max_wal_size_bytes) = fetch_settings(client).await?;
+    let (archive_mode, archive_command, archive_library, max_wal_size_bytes) =
+        fetch_settings(client).await?;
     let pg_wal_bytes = fetch_pg_wal_bytes(client).await.unwrap_or(0);
     let stale_slots = fetch_stale_slots(client, max_wal_size_bytes)
         .await
         .unwrap_or_default();
-    let (archive_backlog, archive_oldest_ready_age_secs) =
-        fetch_archive_backlog(client).await.unwrap_or((0, None));
+    let archive_status = fetch_archive_backlog(client).await;
+    let archive_status_unreadable = archive_status.is_err();
+    let (archive_backlog, archive_oldest_ready_age_secs) = archive_status.unwrap_or((0, None));
     let archiver = fetch_archiver_stats(client).await.unwrap_or_default();
     let oldest_wal_age_secs = fetch_oldest_wal_age(client).await.unwrap_or(0);
 
@@ -269,7 +289,9 @@ async fn collect_snapshot(
         max_wal_size_bytes,
         archive_mode,
         archive_command,
+        archive_library,
         archive_backlog,
+        archive_status_unreadable,
         archiver_failed_count: archiver.failed_count,
         archiver_last_failed_at: archiver.last_failed_at,
         archiver_archived_count: archiver.archived_count,
@@ -287,17 +309,18 @@ async fn collect_snapshot(
 
 async fn fetch_settings(
     client: &tokio_postgres::Client,
-) -> Result<(ArchiveMode, Option<String>, i64), tokio_postgres::Error> {
+) -> Result<(ArchiveMode, Option<String>, Option<String>, i64), tokio_postgres::Error> {
     let rows = client
         .query(
             "SELECT name, setting FROM pg_settings \
-             WHERE name IN ('archive_mode', 'archive_command', 'max_wal_size')",
+             WHERE name IN ('archive_mode', 'archive_command', 'archive_library', 'max_wal_size')",
             &[],
         )
         .await?;
 
     let mut archive_mode = ArchiveMode::Unknown;
     let mut archive_command: Option<String> = None;
+    let mut archive_library: Option<String> = None;
     // max_wal_size in pg_settings is reported as an integer count of the unit
     // exposed by `unit` (typically MB on modern Postgres). Falling back to a
     // safe default of 1 GiB keeps the ratio math meaningful when the setting
@@ -322,6 +345,10 @@ async fn fetch_settings(
                         Some(trimmed.to_string())
                     };
             }
+            "archive_library" => {
+                let trimmed = setting.trim();
+                archive_library = (!trimmed.is_empty()).then(|| trimmed.to_string());
+            }
             "max_wal_size" => {
                 // Postgres reports as integer-with-unit-MB on modern versions.
                 if let Ok(mb) = setting.parse::<i64>() {
@@ -332,7 +359,12 @@ async fn fetch_settings(
         }
     }
 
-    Ok((archive_mode, archive_command, max_wal_size_bytes))
+    Ok((
+        archive_mode,
+        archive_command,
+        archive_library,
+        max_wal_size_bytes,
+    ))
 }
 
 async fn fetch_pg_wal_bytes(client: &tokio_postgres::Client) -> Result<i64, tokio_postgres::Error> {
@@ -492,14 +524,29 @@ fn compute_warnings(snapshot: &PostgresWalHealth) -> Vec<WalWarning> {
         .filter(|age| *age >= ARCHIVE_STALL_SECS);
     if archiving_on && (failed_since_last_success || stalled_secs.is_some()) {
         warnings.push(WalWarning::ArchiveFailing {
-            last_failed_wal: snapshot.archiver_last_failed_wal.clone(),
+            // Only an outstanding failure: during a stall after a recovered
+            // failure, the old segment is not what is failing now.
+            last_failed_wal: snapshot
+                .archiver_last_failed_wal
+                .clone()
+                .filter(|_| failed_since_last_success),
             stalled_secs,
             last_failed_at: snapshot.archiver_last_failed_at,
             last_archived_at: snapshot.archiver_last_archived_at,
         });
     }
 
-    if matches!(snapshot.archive_mode, ArchiveMode::On | ArchiveMode::Always) {
+    if archiving_on && snapshot.archive_status_unreadable {
+        warnings.push(WalWarning::ArchiveStallCheckUnavailable);
+    }
+
+    // An `archive_library` archives WAL itself; `archive_command` is then
+    // unused and normally empty.
+    let archives_through_library = snapshot
+        .archive_library
+        .as_deref()
+        .is_some_and(|library| !library.trim().is_empty());
+    if archiving_on && !archives_through_library {
         let cmd_is_noop = match snapshot.archive_command.as_deref() {
             None => true,
             Some(cmd) => {
@@ -598,6 +645,8 @@ mod tests {
             archive_mode: ArchiveMode::Off,
             archive_command: None,
             archive_backlog: 0,
+            archive_library: None,
+            archive_status_unreadable: false,
             archiver_failed_count: None,
             archiver_last_failed_at: None,
             archiver_archived_count: None,
@@ -636,6 +685,74 @@ mod tests {
         assert!(compute_warnings(&s)
             .iter()
             .any(|w| matches!(w, WalWarning::ArchiveFailing { .. })));
+    }
+
+    /// A stall after an earlier, recovered failure names no failed segment:
+    /// the old one is not what is failing now.
+    #[test]
+    fn a_stall_after_a_recovered_failure_names_no_failed_segment() {
+        let mut s = base_snapshot();
+        s.archive_mode = ArchiveMode::On;
+        s.archive_command = Some("wal-g wal-push %p".into());
+        s.archiver_last_failed_at = Some(Utc::now() - chrono::Duration::hours(3));
+        s.archiver_last_failed_wal = Some("000000010000000000000007".into());
+        s.archiver_last_archived_at = Some(Utc::now() - chrono::Duration::hours(1));
+        s.archive_oldest_ready_age_secs = Some(ARCHIVE_STALL_SECS + 60);
+        let warnings = compute_warnings(&s);
+        assert!(
+            warnings.iter().any(|w| matches!(
+                w,
+                WalWarning::ArchiveFailing {
+                    last_failed_wal: None,
+                    stalled_secs: Some(_),
+                    ..
+                }
+            )),
+            "{warnings:?}"
+        );
+    }
+
+    /// A role that may not list `archive_status` cannot see a stall: that
+    /// is reported, never read as healthy archiving.
+    #[test]
+    fn an_unreadable_archive_status_says_stalls_cannot_be_seen() {
+        let mut s = base_snapshot();
+        s.archive_mode = ArchiveMode::On;
+        s.archive_command = Some("wal-g wal-push %p".into());
+        s.archive_status_unreadable = true;
+        let warnings = compute_warnings(&s);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| matches!(w, WalWarning::ArchiveStallCheckUnavailable)),
+            "{warnings:?}"
+        );
+        assert_eq!(
+            WalWarning::ArchiveStallCheckUnavailable.severity(),
+            WalWarningSeverity::Warning
+        );
+        // With archiving off there is nothing to stall.
+        s.archive_mode = ArchiveMode::Off;
+        assert!(!compute_warnings(&s)
+            .iter()
+            .any(|w| matches!(w, WalWarning::ArchiveStallCheckUnavailable)));
+    }
+
+    /// An `archive_library` archives WAL with `archive_command` empty: that
+    /// is archiving, not a missing command.
+    #[test]
+    fn an_archive_library_is_not_a_missing_command() {
+        let mut s = base_snapshot();
+        s.archive_mode = ArchiveMode::On;
+        s.archive_command = None;
+        s.archive_library = Some("basic_archive".into());
+        assert!(!compute_warnings(&s)
+            .iter()
+            .any(|w| matches!(w, WalWarning::ArchiveModeWithoutCommand)));
+        s.archive_library = None;
+        assert!(compute_warnings(&s)
+            .iter()
+            .any(|w| matches!(w, WalWarning::ArchiveModeWithoutCommand)));
     }
 
     /// WAL-G retrying an endpoint it cannot reach never records a failure;

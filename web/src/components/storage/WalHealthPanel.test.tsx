@@ -156,6 +156,21 @@ describe('continuous archiving status', () => {
     expect(markup).toContain('5 segments')
   })
 
+  test('a role that cannot list archive_status says stalls are invisible', () => {
+    const markup = renderPanel({
+      archive_command: 'wal-g wal-push %p',
+      archiver_last_archived_at: '2026-01-01T00:00:00Z',
+      archive_status_unreadable: true,
+      warnings: [{ kind: 'archive_stall_check_unavailable' }],
+    })
+    expect(markup).toContain('Stalled WAL archiving cannot be detected')
+    expect(markup).toContain('Grant pg_monitor')
+    expect(markup).toContain(
+      'Unknown: the database role may not list archive_status'
+    )
+    expect(markup).not.toContain('0 segments')
+  })
+
   test('archiving off shows no archiving status', () => {
     const markup = renderPanel({ archive_mode: 'off', warnings: [] })
     expect(markup).not.toContain('Test archive target')
