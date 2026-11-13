@@ -6,7 +6,7 @@ import { cleanup, render, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router'
 import { client } from '@/api/client/client.gen'
-import { restoreClientConfig } from '@/test/client-config'
+import { restoreApiClient } from '@/test/api-client'
 import { installBrowserWindow } from '@/test/dom'
 import { DockBody } from './AiAssistantDock'
 import {
@@ -49,7 +49,7 @@ beforeEach(() => localStorage.clear())
 
 afterEach(() => {
   cleanup()
-  restoreClientConfig(client, originalConfig)
+  restoreApiClient(originalConfig)
 })
 
 /** Answers the chat list; everything else stays pending. */

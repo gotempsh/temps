@@ -31,6 +31,13 @@ manager is `bun`.
   hand-built initial or a media lookup of a page's own. Pages don't explain
   themselves: no paragraph under a page or section title; at most one short
   line the user needs to act (`DESIGN.md` "Pages don't explain themselves").
+- **Interactions**: minimise interactions to reach a goal. A primary action
+  does the whole job in one click, inline, and shows its result in place;
+  never turn a primary button into a "review"/"continue" link or send the user
+  to a configuration page to finish what the button promised. Ask only for
+  input that can't be inferred, inline. Advanced configuration stays reachable
+  as a secondary link. Reference: the reachability banner's Add domain
+  (`web/src/components/reachability/ReachabilityWarningBanner.tsx`).
 - **Mobile**: nothing scrolls sideways at any width. Tables show columns by
   priority with container queries (`hidden @xl:table-cell`), keep the name,
   state and actions, and move what a hidden column says that is needed to act

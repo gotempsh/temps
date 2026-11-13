@@ -6,7 +6,7 @@ import { cleanup, fireEvent, render, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router'
 import { client } from '@/api/client/client.gen'
-import { restoreClientConfig } from '@/test/client-config'
+import { restoreApiClient } from '@/test/api-client'
 import { installBrowserWindow } from '@/test/dom'
 import { DockBody } from './AiAssistantDock'
 import {
@@ -48,13 +48,11 @@ const chat = (publicId: string, contextType: string, title: string | null) => ({
 })
 
 const originalConfig = client.getConfig()
-// The dock reopens the chat it last remembered (`temps.ai.activeChat` in
-// localStorage), and storage outlives a test file: start from none.
-beforeEach(() => localStorage.clear())
-
+// A chat another test opened is remembered and would open instead of the list.
+beforeEach(() => window.localStorage.clear())
 afterEach(() => {
   cleanup()
-  restoreClientConfig(client, originalConfig)
+  restoreApiClient(originalConfig)
 })
 
 /** Answers the chat list and the one chat; everything else stays pending. */

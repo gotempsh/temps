@@ -2008,6 +2008,14 @@ impl ReachabilityService {
             tunnel: None,
             new_tunnel: None,
             route_confirmed: option.confirmation.is_some() && request.confirmed,
+            // The fingerprint above proved the choices are as planned.
+            planned_choice: Some(PreviousChoice::from_choice(
+                facts
+                    .choices
+                    .iter()
+                    .find(|(host, _)| *host == address)
+                    .map(|(_, choice)| *choice),
+            )),
             token: None,
             direct: None,
             dns_before: PlannedRecord::Absent,
@@ -3732,18 +3740,16 @@ impl RunOps for LiveOps {
             .map_err(text)
     }
 
-    async fn route_hostname(&self, host: &str, connector_id: i32) -> Result<(), String> {
+    async fn route_hostname(
+        &self,
+        host: &str,
+        connector_id: i32,
+        expected: Option<Option<i32>>,
+    ) -> Result<(), String> {
         self.deps
             .connectors
-            .set_hostname_choice(
-                host,
-                SetHostnameChoiceRequest {
-                    mode: HostnameMode::Tunnel,
-                    connector_id: Some(connector_id),
-                },
-            )
+            .choose_tunnel_if_unchanged(host, connector_id, expected)
             .await
-            .map(|_| ())
             .map_err(text)
     }
 

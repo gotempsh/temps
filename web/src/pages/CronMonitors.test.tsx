@@ -13,9 +13,9 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router'
 import { installBrowserWindow } from '@/test/dom'
 import { client as apiClient } from '@/api/client/client.gen'
+import { restoreApiClient } from '@/test/api-client'
 import { getEnvironmentsOptions } from '@/api/client/@tanstack/react-query.gen'
 import type { ProjectResponse } from '@/api/client'
-import { restoreClientConfig } from '@/test/client-config'
 import {
   ProjectEnvironmentContext,
   type ProjectEnvironmentContextValue,
@@ -27,7 +27,7 @@ installBrowserWindow()
 const original = apiClient.getConfig()
 afterEach(() => {
   cleanup()
-  restoreClientConfig(apiClient, original)
+  restoreApiClient(original)
 })
 
 test('cron limits validate before transport; a native API error preserves inputs for retry', async () => {

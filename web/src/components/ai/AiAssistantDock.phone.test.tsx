@@ -14,7 +14,7 @@ import {
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router'
 import { client } from '@/api/client/client.gen'
-import { restoreClientConfig } from '@/test/client-config'
+import { restoreApiClient } from '@/test/api-client'
 import { installBrowserWindow } from '@/test/dom'
 import { DockBody } from './AiAssistantDock'
 import {
@@ -106,10 +106,12 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup()
-  restoreClientConfig(client, originalConfig)
+  restoreApiClient(originalConfig)
   happyDOM()?.setViewport({ width: DESKTOP })
   window.matchMedia = originalMatchMedia
   mediaListeners.clear()
+  // Opening a chat remembers it; a later dock would reopen it, not the list.
+  window.localStorage.clear()
 })
 
 function setViewport(width: number) {

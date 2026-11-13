@@ -3,11 +3,11 @@
 
 import { afterEach, expect, test } from 'bun:test'
 import { client } from './client/client.gen'
-import { restoreClientConfig } from '@/test/client-config'
+import { restoreApiClient } from '@/test/api-client'
 import { updateMonitorPath } from './monitors'
 
 const originalConfig = client.getConfig()
-afterEach(() => restoreClientConfig(client, originalConfig))
+afterEach(() => restoreApiClient(originalConfig))
 
 test('PATCH changes an existing monitor path and returns its preserved identity', async () => {
   let request: Request | undefined

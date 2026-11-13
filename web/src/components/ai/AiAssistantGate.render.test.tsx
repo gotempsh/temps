@@ -12,7 +12,7 @@ import {
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router'
 import { client } from '@/api/client/client.gen'
-import { restoreClientConfig } from '@/test/client-config'
+import { restoreApiClient } from '@/test/api-client'
 import { installBrowserWindow } from '@/test/dom'
 import { AiAssistantGate } from './AiAssistantGate'
 
@@ -22,7 +22,7 @@ const originalConfig = client.getConfig()
 
 afterEach(() => {
   cleanup()
-  restoreClientConfig(client, originalConfig)
+  restoreApiClient(originalConfig)
 })
 
 const activeKey = {
