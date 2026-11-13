@@ -372,8 +372,10 @@ impl ConnectorDriver for ProcessDriver {
         for (key, value) in &process.env {
             command.env(key, render(value, *edge_addr, metrics, &secret_dir)?);
         }
-        let mut child = command
-            .spawn()
+        // Tied to the agent: the unit's `KillMode=process` leaves the agent's
+        // children running when it stops, so the kernel must end them.
+        let mut child = super::child::spawn_tied_to_agent(command)
+            .await
             .map_err(|e| format!("could not start {}: {e}", binary.display()))?;
 
         let log_tail = Arc::new(Mutex::new(VecDeque::with_capacity(20)));

@@ -85,7 +85,7 @@ pub enum TlsMode {
 pub struct SetupCommand {
     /// Database connection URL. Prefer TEMPS_DATABASE_URL (or TEMPS_DATABASE_URL_FILE / the systemd credential temps_database_url): the flag form puts the password in the process command line
     #[arg(long, env = "TEMPS_DATABASE_URL", hide_env_values = true)]
-    pub database_url: String,
+    pub database_url: Option<String>,
 
     /// Data directory for storing configuration and runtime files
     #[arg(long, env = "TEMPS_DATA_DIR")]
@@ -1687,6 +1687,12 @@ impl SetupCommand {
     }
 
     pub fn execute(mut self) -> anyhow::Result<()> {
+        // Setup provisions the database it is given, never a discovered one.
+        let database_url = crate::database_url_source::resolve_database_url(
+            self.database_url.as_deref(),
+            crate::database_url_source::UrlDiscovery::ThisProcess,
+        )?
+        .into_url();
         self.resolve_installation_inputs()?;
         print_header();
 
@@ -1773,7 +1779,7 @@ impl SetupCommand {
         print_section("Database Setup");
         print_substep("Checking database connectivity...");
 
-        let db = match rt.block_on(temps_schema::establish_connection(&self.database_url)) {
+        let db = match rt.block_on(temps_schema::establish_connection(&database_url)) {
             Ok(db) => {
                 print_substep(&format!("{} Database reachable", "✓".bright_green()));
                 print_substep("Running migrations...");
