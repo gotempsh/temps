@@ -516,10 +516,35 @@ mod target_check_tests {
     #[test]
     fn the_exit_marker_is_split_from_walg_output() {
         let (output, code) =
-            super::super::split_check_exit("ERROR: refused\n__TEMPS_WALG_CHECK_EXIT__=1\n");
+            super::super::split_check_exit("ERROR: refused\n__TEMPS_WALG_CHECK_EXIT__=1\n")
+                .unwrap();
         assert_eq!(output, "ERROR: refused\n");
-        assert_eq!(code, Some(1));
-        assert_eq!(super::super::split_check_exit("no marker").1, None);
+        assert_eq!(code, 1);
+    }
+
+    /// A failed read of walg.env keeps what failed and drops what the
+    /// command printed, which is the file and its credentials.
+    #[test]
+    fn a_reader_error_never_carries_the_file() {
+        let error = "Container exec failed in pg-1: docker inspect_exec failed for abc in \
+                     container pg-1: timeout. output captured (60 bytes):\n\
+                     __TEMPS_WALG_ENV_RAW__\nexport AWS_SECRET_ACCESS_KEY='hunter2'\n";
+        let kept = super::super::exec_error_without_output(error);
+        assert!(kept.contains("docker inspect_exec failed"), "{kept}");
+        assert!(!kept.contains("hunter2"), "{kept}");
+        assert!(!kept.contains("AWS_SECRET_ACCESS_KEY"), "{kept}");
+    }
+
+    /// The script always exits 0, so output cut short before its marker
+    /// (or with a damaged one) must never read as a passed check.
+    #[test]
+    fn output_without_a_readable_exit_marker_is_no_result() {
+        assert_eq!(
+            super::super::split_check_exit("uploading"),
+            Err("uploading".to_string())
+        );
+        assert!(super::super::split_check_exit("__TEMPS_WALG_CHECK_EXIT__=").is_err());
+        assert!(super::super::split_check_exit("__TEMPS_WALG_CHECK_EXIT__=0x").is_err());
     }
 
     #[test]
@@ -563,7 +588,10 @@ mod target_check_tests {
 }
 
 mod repair_tests {
-    use super::super::{patch_walg_env_file, repair_walg_env_lines, walg_env_drift};
+    use super::super::{
+        patch_walg_env_file, repair_walg_env_lines, walg_env_drift, WalgEnvRepairProbe,
+    };
+    use temps_core::s3_endpoint::S3Scheme;
 
     #[test]
     fn the_repair_keeps_every_line_it_does_not_fix() {
@@ -580,7 +608,7 @@ mod repair_tests {
             "AWS_S3_FORCE_PATH_STYLE=false",
             "AWS_ENDPOINT_SUFFIX=kept",
         ]);
-        let repaired = repair_walg_env_lines(&evaluated).unwrap();
+        let repaired = repair_walg_env_lines(&evaluated, Some(S3Scheme::Http)).unwrap();
         let patched = patch_walg_env_file(raw, &repaired);
         assert_eq!(
             patched,
@@ -600,10 +628,13 @@ mod repair_tests {
     fn a_scheme_only_repair_leaves_the_path_style_line_alone() {
         let raw = "export AWS_ENDPOINT='minio.internal.example:9000'\n\
                    export AWS_S3_FORCE_PATH_STYLE='true'\n";
-        let repaired = repair_walg_env_lines(&lines(&[
-            "AWS_ENDPOINT=minio.internal.example:9000",
-            "AWS_S3_FORCE_PATH_STYLE=true",
-        ]))
+        let repaired = repair_walg_env_lines(
+            &lines(&[
+                "AWS_ENDPOINT=minio.internal.example:9000",
+                "AWS_S3_FORCE_PATH_STYLE=true",
+            ]),
+            Some(S3Scheme::Http),
+        )
         .unwrap();
         assert_eq!(
             patch_walg_env_file(raw, &repaired),
@@ -653,6 +684,17 @@ mod repair_tests {
         assert!(drift.contains("Run a backup"), "{drift}");
     }
 
+    /// A legacy bare endpoint on another host: the start-time repair would
+    /// add a scheme but keep the old host, so a restart cannot fix it.
+    #[test]
+    fn a_legacy_file_pointing_elsewhere_is_not_fixed_by_a_restart() {
+        let live = lines(&["AWS_ENDPOINT=old.example:9000"]);
+        let generated = lines(&["AWS_ENDPOINT=http://new.example:9000"]);
+        let drift = walg_env_drift(&live, &generated).expect("they differ");
+        assert!(drift.contains("Run a backup"), "{drift}");
+        assert!(!drift.contains("Restart the service"), "{drift}");
+    }
+
     #[test]
     fn a_live_file_matching_the_settings_is_not_drift() {
         let generated = lines(&[
@@ -676,7 +718,7 @@ mod repair_tests {
             "AWS_SECRET_ACCESS_KEY=test-secret",
             "AWS_ENDPOINT=10.0.0.5:9000",
         ]);
-        let after = repair_walg_env_lines(&before).expect("needs repair");
+        let after = repair_walg_env_lines(&before, Some(S3Scheme::Http)).expect("needs repair");
         assert_eq!(
             after,
             lines(&[
@@ -691,10 +733,13 @@ mod repair_tests {
 
     #[test]
     fn an_explicit_false_path_style_is_replaced_for_an_ip() {
-        let after = repair_walg_env_lines(&lines(&[
-            "AWS_ENDPOINT=http://10.0.0.5:9000",
-            "AWS_S3_FORCE_PATH_STYLE=false",
-        ]))
+        let after = repair_walg_env_lines(
+            &lines(&[
+                "AWS_ENDPOINT=http://10.0.0.5:9000",
+                "AWS_S3_FORCE_PATH_STYLE=false",
+            ]),
+            Some(S3Scheme::Http),
+        )
         .expect("needs repair");
         assert_eq!(
             after,
@@ -707,27 +752,80 @@ mod repair_tests {
 
     #[test]
     fn a_bare_hostname_gets_a_scheme_only() {
-        let after = repair_walg_env_lines(&lines(&["AWS_ENDPOINT=objects.internal:9000"]))
-            .expect("needs repair");
+        let after = repair_walg_env_lines(
+            &lines(&["AWS_ENDPOINT=objects.internal:9000"]),
+            Some(S3Scheme::Http),
+        )
+        .expect("needs repair");
         assert_eq!(after, lines(&["AWS_ENDPOINT=http://objects.internal:9000"]));
+    }
+
+    /// WAL-G dials a scheme-less endpoint over HTTPS. A store it reaches
+    /// that way keeps TLS: the scheme written is the one that worked.
+    #[test]
+    fn a_bare_hostname_reached_over_tls_keeps_tls() {
+        let after = repair_walg_env_lines(
+            &lines(&["AWS_ENDPOINT=objects.example.com"]),
+            Some(S3Scheme::Https),
+        )
+        .expect("needs repair");
+        assert_eq!(after, lines(&["AWS_ENDPOINT=https://objects.example.com"]));
+        assert_eq!(WalgEnvRepairProbe::ORDER[0], S3Scheme::Https);
+    }
+
+    /// When no scheme was found to work, the endpoint is never guessed:
+    /// a hostname is left alone, and an IP endpoint only gets path style.
+    #[test]
+    fn a_bare_endpoint_with_no_reachable_scheme_keeps_its_endpoint() {
+        assert_eq!(
+            repair_walg_env_lines(&lines(&["AWS_ENDPOINT=objects.example.com"]), None),
+            None
+        );
+        assert_eq!(
+            repair_walg_env_lines(&lines(&["AWS_ENDPOINT=10.0.0.5:9000"]), None),
+            Some(lines(&[
+                "AWS_ENDPOINT=10.0.0.5:9000",
+                "AWS_S3_FORCE_PATH_STYLE=true"
+            ]))
+        );
+    }
+
+    /// The probe only lists the archive prefix, bounded, and always
+    /// reports WAL-G's exit code on its marker line.
+    #[test]
+    fn the_scheme_probe_only_lists() {
+        let script = WalgEnvRepairProbe::script();
+        assert!(script.contains("timeout 15 wal-g st ls"), "{script}");
+        assert!(
+            !script.contains("st put") && !script.contains("st rm"),
+            "{script}"
+        );
+        assert!(
+            script.contains("__TEMPS_WALG_CHECK_EXIT__=$code"),
+            "{script}"
+        );
     }
 
     #[test]
     fn a_current_file_is_left_alone() {
+        let http = Some(S3Scheme::Http);
         assert_eq!(
-            repair_walg_env_lines(&lines(&[
-                "AWS_ENDPOINT=http://10.0.0.5:9000",
-                "AWS_S3_FORCE_PATH_STYLE=true",
-            ])),
+            repair_walg_env_lines(
+                &lines(&[
+                    "AWS_ENDPOINT=http://10.0.0.5:9000",
+                    "AWS_S3_FORCE_PATH_STYLE=true",
+                ]),
+                http
+            ),
             None
         );
         assert_eq!(
-            repair_walg_env_lines(&lines(&["AWS_ENDPOINT=https://s3.example.com"])),
+            repair_walg_env_lines(&lines(&["AWS_ENDPOINT=https://s3.example.com"]), http),
             None
         );
         // AWS S3 itself: nothing to repair.
         assert_eq!(
-            repair_walg_env_lines(&lines(&["WALG_S3_PREFIX=s3://a/b"])),
+            repair_walg_env_lines(&lines(&["WALG_S3_PREFIX=s3://a/b"]), http),
             None
         );
     }

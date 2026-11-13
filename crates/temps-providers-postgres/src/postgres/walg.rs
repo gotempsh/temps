@@ -314,16 +314,18 @@ const CHECK_EXIT_MARKER: &str = "__TEMPS_WALG_CHECK_EXIT__=";
 
 /// Split the check script's output into WAL-G's own output and its exit
 /// code.
-fn split_check_exit(output: &str) -> (String, Option<i64>) {
-    match output.rfind(CHECK_EXIT_MARKER) {
-        Some(at) => {
-            let code = output[at + CHECK_EXIT_MARKER.len()..]
-                .trim()
-                .parse::<i64>()
-                .ok();
-            (output[..at].to_string(), code)
-        }
-        None => (output.to_string(), None),
+///
+/// The script always exits 0, so its marker line is the only record of what
+/// WAL-G answered. Output without a readable marker (a stream cut short, an
+/// exec that died) is `Err` with whatever output did arrive: it never counts
+/// as a passed check.
+fn split_check_exit(output: &str) -> std::result::Result<(String, i64), String> {
+    let Some(at) = output.rfind(CHECK_EXIT_MARKER) else {
+        return Err(output.to_string());
+    };
+    match output[at + CHECK_EXIT_MARKER.len()..].trim().parse::<i64>() {
+        Ok(code) => Ok((output[..at].to_string(), code)),
+        Err(_) => Err(output.to_string()),
     }
 }
 
@@ -1390,11 +1392,14 @@ impl PostgresService {
         )
         .await
         .map_err(|error| failure(redact.redact(&format!("could not run the check: {error}"))))?;
-        let (output, exit_code) = split_check_exit(&result.output);
-        let result = crate::externalsvc::exec_util::ExecResult {
-            exit_code: exit_code.unwrap_or(result.exit_code),
-            output,
-        };
+        let (output, exit_code) = split_check_exit(&result.output).map_err(|partial| {
+            failure(format!(
+                "the check ended without reporting WAL-G's result (exec exit code {}): {}",
+                result.exit_code,
+                summarize_walg_output(&redact.redact(&partial))
+            ))
+        })?;
+        let result = crate::externalsvc::exec_util::ExecResult { exit_code, output };
         match result.exit_code {
             0 => {
                 info!(
@@ -1519,6 +1524,29 @@ pub(crate) fn archive_walg_env_lines(
 /// decides where and how WAL-G connects: the endpoint and path style.
 /// Credentials are never compared or named.
 pub(crate) fn walg_env_drift(live: &[String], generated: &[String]) -> Option<String> {
+    let differences = walg_env_differences(live, generated);
+    if differences.is_empty() {
+        return None;
+    }
+    // A restart only helps when its repair, giving a bare endpoint the
+    // scheme the generated settings use, leaves nothing different; a file
+    // pointing at another host keeps that host through the repair.
+    let restart_repairs_it = repair_walg_env_lines(live, walg_env_endpoint_scheme(generated))
+        .is_some_and(|repaired| walg_env_differences(&repaired, generated).is_empty());
+    let fix = if restart_repairs_it {
+        "Restart the service: Temps repairs this walg.env when it starts, without changing \
+         where WAL is archived"
+    } else {
+        "Run a backup of the service to rewrite walg.env from its S3 source"
+    };
+    Some(format!(
+        "The running container's walg.env {}, and PostgreSQL archives with that file. {fix}.",
+        differences.join(" and ")
+    ))
+}
+
+/// The endpoint and path-style differences [`walg_env_drift`] reports.
+fn walg_env_differences(live: &[String], generated: &[String]) -> Vec<String> {
     fn endpoint(lines: &[String]) -> Option<&str> {
         lines
             .iter()
@@ -1561,19 +1589,7 @@ pub(crate) fn walg_env_drift(live: &[String], generated: &[String]) -> Option<St
             on_off(generated_path_style)
         ));
     }
-    if differences.is_empty() {
-        return None;
-    }
-    let fix = if repair_walg_env_lines(live).is_some() {
-        "Restart the service: Temps repairs this walg.env when it starts, without changing \
-         where WAL is archived"
-    } else {
-        "Run a backup of the service to rewrite walg.env from its S3 source"
-    };
-    Some(format!(
-        "The running container's walg.env {}, and PostgreSQL archives with that file. {fix}.",
-        differences.join(" and ")
-    ))
+    differences
 }
 
 /// Signals every process whose command line starts with `wal-g wal-push `
@@ -1588,41 +1604,108 @@ const STALE_WAL_PUSH_SCRIPT: &str = "for p in /proc/[0-9]*; do \
 /// `None` when it already follows it.
 ///
 /// `lines` are the file's `KEY=value` assignments as the shell sees them.
-/// A scheme-less `AWS_ENDPOINT` gets the `http://` the source was validated
-/// with, and an IP-literal endpoint gets `AWS_S3_FORCE_PATH_STYLE=true`.
-/// Credentials, prefix and every other assignment are unchanged: this never
-/// changes which repository WAL is archived to. The file itself is patched
-/// by [`patch_walg_env_file`], which keeps every line it does not repair.
-pub(crate) fn repair_walg_env_lines(lines: &[String]) -> Option<Vec<String>> {
+/// An IP-literal endpoint gets `AWS_S3_FORCE_PATH_STYLE=true`. A scheme-less
+/// `AWS_ENDPOINT` gets `bare_endpoint_scheme`, the scheme WAL-G was found to
+/// reach the store over ([`WalgEnvRepairProbe`]), and is left as it is when
+/// that is `None`: WAL-G dials a scheme-less endpoint over HTTPS, so writing
+/// `http://` without knowing would downgrade a store it already reaches over
+/// TLS. Credentials, prefix and every other assignment are unchanged: this
+/// never changes which repository WAL is archived to. The file itself is
+/// patched by [`patch_walg_env_file`], which keeps every line it does not
+/// repair.
+pub(crate) fn repair_walg_env_lines(
+    lines: &[String],
+    bare_endpoint_scheme: Option<temps_core::s3_endpoint::S3Scheme>,
+) -> Option<Vec<String>> {
     let endpoint = lines
         .iter()
         .find_map(|line| line.strip_prefix("AWS_ENDPOINT="))?;
-    let normalized = temps_core::s3_endpoint::endpoint_url(endpoint);
-    let needs_scheme = normalized != endpoint;
+    let with_scheme = if endpoint.contains("://") {
+        None
+    } else {
+        bare_endpoint_scheme.and_then(|scheme| {
+            temps_core::s3_endpoint::S3Endpoint::parse(
+                endpoint,
+                Some(scheme == temps_core::s3_endpoint::S3Scheme::Https),
+            )
+            .ok()
+            .map(|parsed| parsed.url())
+        })
+    };
     let has_path_style = lines.iter().any(|line| {
         line.strip_prefix("AWS_S3_FORCE_PATH_STYLE=")
             .is_some_and(|value| value.eq_ignore_ascii_case("true"))
     });
     let needs_path_style =
         !has_path_style && temps_core::s3_endpoint::endpoint_host_is_ip_literal(endpoint);
-    if !needs_scheme && !needs_path_style {
+    if with_scheme.is_none() && !needs_path_style {
         return None;
     }
     let mut repaired: Vec<String> = lines
         .iter()
         .filter(|line| !(needs_path_style && line.starts_with("AWS_S3_FORCE_PATH_STYLE=")))
-        .map(|line| {
-            if line.starts_with("AWS_ENDPOINT=") {
-                format!("AWS_ENDPOINT={normalized}")
-            } else {
-                line.clone()
-            }
-        })
+        .map(
+            |line| match (&with_scheme, line.starts_with("AWS_ENDPOINT=")) {
+                (Some(url), true) => format!("AWS_ENDPOINT={url}"),
+                _ => line.clone(),
+            },
+        )
         .collect();
     if needs_path_style {
         repaired.push("AWS_S3_FORCE_PATH_STYLE=true".to_string());
     }
     Some(repaired)
+}
+
+/// An exec error from reading `walg.env`, without the output it captured.
+///
+/// `run_exec` appends whatever the command printed after its first line, and
+/// the reader prints the file: credentials included. Only the first line
+/// (what failed, where, and the command, which holds no secret) is kept for
+/// the logs.
+pub(crate) fn exec_error_without_output(error: &str) -> String {
+    let first = error.lines().next().unwrap_or_default().trim_end();
+    format!("{first} (the command's output is not shown: it holds walg.env)")
+}
+
+/// The scheme of a `walg.env`'s `AWS_ENDPOINT`, or `None` when it has none.
+fn walg_env_endpoint_scheme(lines: &[String]) -> Option<temps_core::s3_endpoint::S3Scheme> {
+    let endpoint = lines
+        .iter()
+        .find_map(|line| line.strip_prefix("AWS_ENDPOINT="))?;
+    if !endpoint.contains("://") {
+        return None;
+    }
+    temps_core::s3_endpoint::S3Endpoint::parse(endpoint, None)
+        .ok()
+        .map(|parsed| parsed.scheme())
+}
+
+/// How the start-time repair learns which scheme a scheme-less endpoint is
+/// reached over: a read-only `wal-g st ls` of the archive prefix, HTTPS
+/// first (what WAL-G already uses for it), then plain HTTP.
+pub(crate) struct WalgEnvRepairProbe;
+
+impl WalgEnvRepairProbe {
+    /// Bound on each listing; one retry at most, so an unreachable store
+    /// delays the start by seconds, not WAL-G's own long retry loop.
+    pub(crate) const TIMEOUT_SECS: u64 = 15;
+
+    /// The order schemes are tried in: a store WAL-G reaches over TLS keeps
+    /// TLS, and plain HTTP is written only when TLS fails and HTTP works.
+    pub(crate) const ORDER: [temps_core::s3_endpoint::S3Scheme; 2] = [
+        temps_core::s3_endpoint::S3Scheme::Https,
+        temps_core::s3_endpoint::S3Scheme::Http,
+    ];
+
+    pub(crate) fn script() -> String {
+        format!(
+            "if command -v wal-g >/dev/null 2>&1; then \
+             timeout {} wal-g st ls >/dev/null 2>&1; code=$?; \
+             else code=127; fi; echo \"{CHECK_EXIT_MARKER}$code\"; exit 0",
+            Self::TIMEOUT_SECS
+        )
+    }
 }
 
 /// The two settings the start-time repair rewrites.
@@ -1748,7 +1831,7 @@ impl PostgresService {
             Duration::from_secs(15),
         )
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| exec_error_without_output(&error.to_string()))?;
         if result.exit_code != 0 {
             return Err(format!("reading walg.env exited with {}", result.exit_code));
         }
@@ -1785,6 +1868,74 @@ impl PostgresService {
         walg_env_drift(&live, &generated)
     }
 
+    /// The scheme WAL-G reaches a `walg.env`'s scheme-less `AWS_ENDPOINT`
+    /// over, or `None` when the endpoint has a scheme or neither works.
+    ///
+    /// Each scheme is tried with a read-only listing of the archive prefix
+    /// ([`WalgEnvRepairProbe`]), with the file's own settings and its
+    /// path-style repair applied, so an IP endpoint is not misread as
+    /// unreachable because of `<bucket>.<ip>` addressing. Nothing is written
+    /// to the store.
+    async fn reachable_bare_endpoint_scheme(
+        &self,
+        container_name: &str,
+        evaluated: &[String],
+    ) -> Option<temps_core::s3_endpoint::S3Scheme> {
+        let endpoint = evaluated
+            .iter()
+            .find_map(|line| line.strip_prefix("AWS_ENDPOINT="))?;
+        if endpoint.contains("://") {
+            return None;
+        }
+        let base = repair_walg_env_lines(evaluated, None).unwrap_or_else(|| evaluated.to_vec());
+        for scheme in WalgEnvRepairProbe::ORDER {
+            let Some(probe_env) = repair_walg_env_lines(&base, Some(scheme)) else {
+                continue;
+            };
+            let mut env: Vec<String> = probe_env
+                .into_iter()
+                .filter(|line| line.starts_with("WALG_") || line.starts_with("AWS_"))
+                .collect();
+            env.push("S3_MAX_RETRIES=1".to_string());
+            let result = crate::externalsvc::exec_util::run_exec(
+                &self.docker,
+                container_name,
+                vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    WalgEnvRepairProbe::script(),
+                ],
+                Some(env),
+                Duration::from_secs(WalgEnvRepairProbe::TIMEOUT_SECS + 15),
+            )
+            .await;
+            match result.map(|result| split_check_exit(&result.output)) {
+                Ok(Ok((_, 0))) => return Some(scheme),
+                Ok(Ok((_, code))) => debug!(
+                    service = %self.name,
+                    container = container_name,
+                    scheme = scheme.as_str(),
+                    exit_code = code,
+                    "WAL-G could not list the archive over this scheme"
+                ),
+                Ok(Err(_)) | Err(_) => debug!(
+                    service = %self.name,
+                    container = container_name,
+                    scheme = scheme.as_str(),
+                    "The archive listing returned no result"
+                ),
+            }
+        }
+        warn!(
+            service = %self.name,
+            container = container_name,
+            "walg.env has an AWS_ENDPOINT without a scheme and WAL-G reached the store over \
+             neither https nor http; leaving the scheme unchanged. Run Test archive target, \
+             or a backup, which rewrites walg.env from the S3 source"
+        );
+        None
+    }
+
     /// Repair the `walg.env` an existing service carries, on start.
     ///
     /// Installs that predate explicit endpoint schemes have a `walg.env`
@@ -1811,7 +1962,11 @@ impl PostgresService {
                 return;
             }
         };
-        let Some(repaired) = repair_walg_env_lines(&snapshot.evaluated) else {
+        let bare_endpoint_scheme = self
+            .reachable_bare_endpoint_scheme(container_name, &snapshot.evaluated)
+            .await;
+        let Some(repaired) = repair_walg_env_lines(&snapshot.evaluated, bare_endpoint_scheme)
+        else {
             return;
         };
         // Patched, not regenerated, so nothing else in the file is lost; and
@@ -1830,9 +1985,10 @@ impl PostgresService {
                 info!(
                     service = %self.name,
                     container = container_name,
-                    "Repaired walg.env: AWS_ENDPOINT now carries an explicit scheme and path \
-                     style is forced for an IP endpoint; WAL archiving uses it from the next \
-                     attempt"
+                    scheme = bare_endpoint_scheme.map(|scheme| scheme.as_str()),
+                    "Repaired walg.env: AWS_ENDPOINT carries the scheme WAL-G reaches the \
+                     store over and path style is forced for an IP endpoint; WAL archiving \
+                     uses it from the next attempt"
                 );
                 self.end_stale_wal_pushes(container_name).await;
             }

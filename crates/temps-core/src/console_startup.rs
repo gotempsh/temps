@@ -261,8 +261,10 @@ fn redact_key_values(text: &str) -> String {
             break;
         };
         let key_end = key_start + key.len();
-        // Must be a whole word, not e.g. "tokenizer".
-        let starts_word = key_start == 0 || !is_word_byte(bytes[key_start - 1]);
+        // Must be a whole word, not e.g. "tokenizer", or the last segment of
+        // an underscore-separated name such as `AWS_SECRET_ACCESS_KEY`.
+        let starts_word =
+            key_start == 0 || !is_word_byte(bytes[key_start - 1]) || bytes[key_start - 1] == b'_';
         let mut value_start = key_end;
         // JSON/debug output may quote the key as well as the value.
         if key_start > 0
@@ -440,6 +442,21 @@ mod tests {
             redact_secrets(r#"token="escaped \" secret" retrying"#),
             r#"token="***" retrying"#
         );
+    }
+
+    /// Environment-style names end in the secret word: a `walg.env` or a
+    /// container environment printed into an error.
+    #[test]
+    fn redacts_prefixed_environment_names() {
+        assert_eq!(
+            redact_secrets(
+                "export AWS_SECRET_ACCESS_KEY='hidden'\nAWS_SESSION_TOKEN=also-hidden\n\
+                 AWS_ACCESS_KEY_ID=AKIDEXAMPLE AWS_REGION=us-east-1"
+            ),
+            "export AWS_SECRET_ACCESS_KEY='***'\nAWS_SESSION_TOKEN=***\n\
+             AWS_ACCESS_KEY_ID=AKIDEXAMPLE AWS_REGION=us-east-1"
+        );
+        assert_eq!(redact_secrets("DB_PASSWORD=x"), "DB_PASSWORD=***");
     }
 
     #[test]
