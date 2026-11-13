@@ -59,7 +59,9 @@ impl RunStatus {
     }
 
     pub fn parse(value: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|status| status.as_str() == value)
+        Self::ALL
+            .into_iter()
+            .find(|status| status.as_str() == value)
     }
 
     /// No further invocation happens without an operator action.
@@ -134,9 +136,13 @@ impl StepStatus {
     }
 
     pub fn parse(value: &str) -> Option<Self> {
-        [StepStatus::Pending, StepStatus::Completed, StepStatus::Failed]
-            .into_iter()
-            .find(|status| status.as_str() == value)
+        [
+            StepStatus::Pending,
+            StepStatus::Completed,
+            StepStatus::Failed,
+        ]
+        .into_iter()
+        .find(|status| status.as_str() == value)
     }
 
     pub fn is_final(self) -> bool {
@@ -220,9 +226,19 @@ impl WorkflowSettings {
             3600,
         )?;
         range("lease_secs", self.lease_secs.into(), 15, 900)?;
-        range("max_concurrent_runs", self.max_concurrent_runs.into(), 1, 10_000)?;
+        range(
+            "max_concurrent_runs",
+            self.max_concurrent_runs.into(),
+            1,
+            10_000,
+        )?;
         range("max_active_runs", self.max_active_runs.into(), 1, 1_000_000)?;
-        range("max_steps_per_run", self.max_steps_per_run.into(), 1, 100_000)?;
+        range(
+            "max_steps_per_run",
+            self.max_steps_per_run.into(),
+            1,
+            100_000,
+        )?;
         range(
             "max_journal_bytes_per_run",
             self.max_journal_bytes_per_run,
@@ -248,7 +264,12 @@ impl WorkflowSettings {
             });
         }
         range("retention_days", self.retention_days.into(), 1, 3650)?;
-        range("stuck_after_failures", self.stuck_after_failures.into(), 1, 100)?;
+        range(
+            "stuck_after_failures",
+            self.stuck_after_failures.into(),
+            1,
+            100,
+        )?;
         Ok(())
     }
 }

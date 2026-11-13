@@ -82,8 +82,12 @@ pub enum WorkflowError {
     #[error("Workflow credential rejected: {reason}")]
     InvalidCredential { reason: &'static str },
 
-    #[error("Run {run_id} was not started by workflow credential {credential_id}")]
-    NotStartedByCredential { run_id: Uuid, credential_id: i32 },
+    #[error("The workflow executor of environment {environment_id} in project {project_id} is unavailable: {reason}")]
+    ExecutorUnavailable {
+        project_id: i32,
+        environment_id: i32,
+        reason: String,
+    },
 
     #[error("Could not {operation} the {field} payload of workflow run {run_id}: {source}")]
     Encryption {

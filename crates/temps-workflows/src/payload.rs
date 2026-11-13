@@ -34,7 +34,10 @@ pub enum PayloadField {
     StepResult(i32),
     StepError(i32),
     /// An event's payload, bound to its name and key.
-    Event { name: String, key: String },
+    Event {
+        name: String,
+        key: String,
+    },
 }
 
 impl PayloadField {
@@ -298,14 +301,24 @@ pub(crate) mod tests {
 
     #[async_trait::async_trait]
     impl PayloadBlobStore for MemoryBlobs {
-        async fn put(&self, project_id: i32, key: &str, body: Bytes) -> Result<(), PayloadBlobError> {
+        async fn put(
+            &self,
+            project_id: i32,
+            key: &str,
+            body: Bytes,
+        ) -> Result<(), PayloadBlobError> {
             self.objects
                 .lock()
                 .unwrap()
                 .insert((project_id, key.to_string()), body);
             Ok(())
         }
-        async fn get(&self, project_id: i32, key: &str, _max: usize) -> Result<Bytes, PayloadBlobError> {
+        async fn get(
+            &self,
+            project_id: i32,
+            key: &str,
+            _max: usize,
+        ) -> Result<Bytes, PayloadBlobError> {
             self.objects
                 .lock()
                 .unwrap()
@@ -316,7 +329,11 @@ pub(crate) mod tests {
                     key: key.to_string(),
                 })
         }
-        async fn delete_prefix(&self, project_id: i32, prefix: &str) -> Result<u64, PayloadBlobError> {
+        async fn delete_prefix(
+            &self,
+            project_id: i32,
+            prefix: &str,
+        ) -> Result<u64, PayloadBlobError> {
             let mut objects = self.objects.lock().unwrap();
             let before = objects.len();
             objects.retain(|(p, k), _| !(*p == project_id && k.starts_with(prefix)));
@@ -350,7 +367,10 @@ pub(crate) mod tests {
             .unwrap();
         let inline = stored.encrypted.clone().unwrap();
         assert!(!inline.contains(SECRET));
-        assert!(!format!("{stored:?}").contains(&inline), "Debug never prints ciphertext");
+        assert!(
+            !format!("{stored:?}").contains(&inline),
+            "Debug never prints ciphertext"
+        );
         assert_eq!(
             codec
                 .open(&scope, &PayloadField::StepResult(0), &stored, &settings)
@@ -390,7 +410,13 @@ pub(crate) mod tests {
             .unwrap();
         let key = stored.blob_key.clone().unwrap();
         assert!(key.starts_with(&scope.run_blob_prefix()));
-        let object = blobs.objects.lock().unwrap().get(&(1, key)).cloned().unwrap();
+        let object = blobs
+            .objects
+            .lock()
+            .unwrap()
+            .get(&(1, key))
+            .cloned()
+            .unwrap();
         assert!(!String::from_utf8_lossy(&object).contains(SECRET));
         assert_eq!(
             codec
@@ -450,7 +476,13 @@ pub(crate) mod tests {
         let scope = scope();
         let settings = WorkflowSettings::default();
         let stored = codec
-            .seal(&scope, &PayloadField::RunOutput, &serde_json::json!(SECRET), 1, &settings)
+            .seal(
+                &scope,
+                &PayloadField::RunOutput,
+                &serde_json::json!(SECRET),
+                1,
+                &settings,
+            )
             .await
             .unwrap();
         let error = codec

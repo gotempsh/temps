@@ -25,45 +25,13 @@ struct Fixture {
 }
 
 async fn fixture(test: &str) -> Option<Fixture> {
-    let db = match TestDatabase::with_migrations().await {
-        Ok(db) => db,
-        Err(error) => {
-            eprintln!("TestDatabase unavailable; skipping {test}: {error}");
-            return None;
-        }
-    };
-    let conn = db.connection_arc();
-    conn.execute_unprepared(
-        "INSERT INTO projects \
-         (name, repo_name, repo_owner, directory, main_branch, preset, created_at, updated_at, slug) \
-         VALUES ('Workflows', '', '', '.', 'main', 'dockerfile', now(), now(), 'workflows-store')",
-    )
-    .await
-    .expect("insert project");
-    conn.execute_unprepared(
-        "INSERT INTO environments (name, slug, subdomain, host, upstreams, created_at, updated_at, project_id) \
-         SELECT 'production', 'production', 'workflows-store-production', 'workflows.test', '[]', now(), now(), id \
-         FROM projects WHERE slug = 'workflows-store'",
-    )
-    .await
-    .expect("insert environment");
-    let row = conn
-        .query_one(sea_orm::Statement::from_string(
-            sea_orm::DbBackend::Postgres,
-            "SELECT e.id AS eid, e.project_id AS pid FROM environments e \
-             JOIN projects p ON p.id = e.project_id WHERE p.slug = 'workflows-store'",
-        ))
-        .await
-        .expect("query environment")
-        .expect("environment row");
-    let environment_id: i32 = row.try_get("", "eid").expect("eid");
-    let project_id: i32 = row.try_get("", "pid").expect("pid");
+    let env = crate::test_support::test_environment(test).await?;
     Some(Fixture {
-        store: PgWorkflowStore::new(conn.clone()),
-        conn,
-        _db: db,
-        project_id,
-        environment_id,
+        store: PgWorkflowStore::new(env.conn.clone()),
+        conn: env.conn,
+        _db: env.db,
+        project_id: env.project_id,
+        environment_id: env.environment_id,
     })
 }
 
@@ -100,14 +68,7 @@ impl Fixture {
     }
 
     async fn make_due(&self, run_id: Uuid) {
-        self.conn
-            .execute(sea_orm::Statement::from_sql_and_values(
-                sea_orm::DbBackend::Postgres,
-                "UPDATE workflow_runs SET due_at = now() - interval '1 second' WHERE id = $1",
-                vec![run_id.into()],
-            ))
-            .await
-            .expect("make due");
+        crate::test_support::make_due(&self.conn, run_id).await;
     }
 
     async fn set_concurrency(&self, max_concurrent_runs: i32, stuck_after_failures: i32) {
@@ -281,7 +242,10 @@ async fn concurrent_claims_never_exceed_the_environment_limit() {
     for task in tasks {
         total += task.await.unwrap();
     }
-    assert_eq!(total, 3, "claims from parallel callers over-filled the limit");
+    assert_eq!(
+        total, 3,
+        "claims from parallel callers over-filled the limit"
+    );
 }
 
 #[tokio::test]
@@ -308,7 +272,13 @@ async fn journal_writes_are_fenced_ordered_and_bounded() {
         .await
         .unwrap_err();
     assert!(
-        matches!(error, WorkflowError::Validation { field: "sequence", .. }),
+        matches!(
+            error,
+            WorkflowError::Validation {
+                field: "sequence",
+                ..
+            }
+        ),
         "{error}"
     );
 
@@ -488,7 +458,10 @@ async fn blocked_claims_return_the_run_without_spending_an_attempt() {
     let blocked = f.store.get_run(run.id).await.unwrap().unwrap();
     assert_eq!(blocked.status, "queued");
     assert_eq!(blocked.attempt, 0);
-    assert_eq!(blocked.blocked_reason.as_deref(), Some("No healthy replica"));
+    assert_eq!(
+        blocked.blocked_reason.as_deref(),
+        Some("No healthy replica")
+    );
     assert!(blocked.lease_expires_at.is_none());
 }
 
@@ -782,16 +755,33 @@ async fn credentials_rotate_atomically_and_authenticate_by_hash() {
         .is_none());
     let first = f
         .store
-        .rotate_credential(f.project_id, f.environment_id, "hash-1", "twf_aaaaaaaa", None)
+        .rotate_credential(
+            f.project_id,
+            f.environment_id,
+            "hash-1",
+            "twf_aaaaaaaa",
+            None,
+        )
         .await
         .unwrap();
     let second = f
         .store
-        .rotate_credential(f.project_id, f.environment_id, "hash-2", "twf_bbbbbbbb", None)
+        .rotate_credential(
+            f.project_id,
+            f.environment_id,
+            "hash-2",
+            "twf_bbbbbbbb",
+            None,
+        )
         .await
         .unwrap();
     assert_ne!(first.id, second.id);
-    assert!(f.store.credential_by_hash("hash-1").await.unwrap().is_none());
+    assert!(f
+        .store
+        .credential_by_hash("hash-1")
+        .await
+        .unwrap()
+        .is_none());
     let found = f.store.credential_by_hash("hash-2").await.unwrap().unwrap();
     assert_eq!(found.id, second.id);
     assert!(found.last_used_at.is_some());
@@ -806,7 +796,12 @@ async fn credentials_rotate_atomically_and_authenticate_by_hash() {
     );
     assert!(f.store.revoke_credential(f.environment_id).await.unwrap());
     assert!(!f.store.revoke_credential(f.environment_id).await.unwrap());
-    assert!(f.store.credential_by_hash("hash-2").await.unwrap().is_none());
+    assert!(f
+        .store
+        .credential_by_hash("hash-2")
+        .await
+        .unwrap()
+        .is_none());
 }
 
 #[tokio::test]
@@ -890,9 +885,7 @@ async fn retention_deletes_only_finished_runs_past_their_window() {
         .unwrap();
     assert_eq!(f.store.delete_expired_events(10).await.unwrap(), 0);
     f.conn
-        .execute_unprepared(
-            "UPDATE workflow_events SET created_at = now() - interval '31 days'",
-        )
+        .execute_unprepared("UPDATE workflow_events SET created_at = now() - interval '31 days'")
         .await
         .unwrap();
     assert_eq!(f.store.delete_expired_events(10).await.unwrap(), 1);
