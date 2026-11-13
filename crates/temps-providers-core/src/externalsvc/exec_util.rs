@@ -67,6 +67,23 @@ pub async fn run_exec(
     env: Option<Vec<String>>,
     timeout: Duration,
 ) -> Result<ExecResult> {
+    run_exec_as(docker, container, cmd, env, timeout, None).await
+}
+
+/// [`run_exec`] as `user` inside the container (`None`: the image's default
+/// user, often root).
+///
+/// Use it whenever the command reads or runs something a less privileged
+/// user can write: sourcing a file the `postgres` user owns as root would
+/// run whatever that user put in it as root.
+pub async fn run_exec_as(
+    docker: &Docker,
+    container: &str,
+    cmd: Vec<String>,
+    env: Option<Vec<String>>,
+    timeout: Duration,
+    user: Option<&str>,
+) -> Result<ExecResult> {
     let api_timeout = docker_api_timeout(timeout);
 
     let exec = tokio::time::timeout(
@@ -78,6 +95,7 @@ pub async fn run_exec(
                 env: env.as_ref().map(|e| e.iter().map(|s| s.as_str()).collect()),
                 attach_stdout: Some(true),
                 attach_stderr: Some(true),
+                user,
                 ..Default::default()
             },
         ),

@@ -97,6 +97,10 @@ pub(crate) struct WalgEnvSnapshot {
     pub(crate) evaluated: Vec<String>,
 }
 
+/// The user that owns and writes `walg.env`, and the only one that may
+/// source it.
+pub(crate) const WALG_ENV_OWNER: &str = "postgres";
+
 const SNAPSHOT_NO_FILE: &str = "__TEMPS_NO_WALG_ENV__";
 const SNAPSHOT_CKSUM: &str = "__TEMPS_WALG_ENV_CKSUM__";
 const SNAPSHOT_RAW: &str = "__TEMPS_WALG_ENV_RAW__";
@@ -619,7 +623,7 @@ impl PostgresService {
                     cmd: Some(vec!["sh", "-c", &write_cmd]),
                     attach_stdout: Some(false),
                     attach_stderr: Some(false),
-                    user: Some("postgres"),
+                    user: Some(WALG_ENV_OWNER),
                     ..Default::default()
                 },
             )
@@ -1813,7 +1817,10 @@ impl PostgresService {
         &self,
         container_name: &str,
     ) -> std::result::Result<Option<WalgEnvSnapshot>, String> {
-        let result = crate::externalsvc::exec_util::run_exec(
+        // As `postgres`, never the image's default (root in the official
+        // images): the snapshot sources the file, which `postgres` owns and
+        // can write, so as root it would run whatever was put in it as root.
+        let result = crate::externalsvc::exec_util::run_exec_as(
             &self.docker,
             container_name,
             vec![
@@ -1823,6 +1830,7 @@ impl PostgresService {
             ],
             None,
             Duration::from_secs(15),
+            Some(WALG_ENV_OWNER),
         )
         .await
         .map_err(|error| exec_error_without_output(&error.to_string()))?;

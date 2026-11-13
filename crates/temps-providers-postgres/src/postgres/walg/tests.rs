@@ -285,6 +285,11 @@ mod plain_http_ip_archive_docker_tests {
         exec("echo '# kept: operator note' >> /var/lib/postgresql/walg.env")
             .await
             .map_err(|e| format!("append to walg.env: {e}"))?;
+        // Records who sources the file when Temps reads it: the image's
+        // default exec user is root, and the file is the postgres user's.
+        exec("echo 'export AWS_TEMPS_READER_UID=\"$(id -u)\"' >> /var/lib/postgresql/walg.env")
+            .await
+            .map_err(|e| format!("append to walg.env: {e}"))?;
         exec(
             "head -c 16777216 /dev/zero > /tmp/pg_wal/000000010000000000000002; \
              . /var/lib/postgresql/walg.env && \
@@ -323,6 +328,14 @@ mod plain_http_ip_archive_docker_tests {
             .await
             .map_err(|e| format!("read repaired walg.env: {e}"))?
             .ok_or("walg.env is gone after the repair")?;
+        let reader_uid = snapshot
+            .evaluated
+            .iter()
+            .find_map(|line| line.strip_prefix("AWS_TEMPS_READER_UID="))
+            .ok_or("the reader-uid line was not evaluated")?;
+        if reader_uid == "0" {
+            return Err("walg.env was sourced as root when Temps read it".to_string());
+        }
         let raw = snapshot.raw.clone();
         if !raw.contains("# kept: operator note") {
             return Err(format!("the repair dropped a line it does not fix: {raw}"));
