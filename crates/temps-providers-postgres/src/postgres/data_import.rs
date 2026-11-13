@@ -82,10 +82,51 @@ const COUNT_USER_RELATIONS_SQL: &str = "SELECT count(*) FROM pg_catalog.pg_class
                          AND d.objid = c.oid AND d.deptype = 'e')";
 
 /// `BEGIN`, the dump, and `COMMIT` only if the dump succeeded.
-const PRODUCER: &str = "printf 'BEGIN;\\n' && \
-     pg_dump --no-owner --no-privileges --no-publications --no-subscriptions --no-password \
-     --dbname=\"$TEMPS_IMPORT_SOURCE\" && \
+///
+/// The dump streams through [`DUMP_FILTER_AWK`] (in `TEMPS_IMPORT_DUMP_FILTER`),
+/// which strips the `pg_attver` column option only when the target first
+/// refused it in a rolled-back probe: PostgreSQL 16.16 gives every column
+/// that option, `pg_dump` copies it, and an older 18.x target rejects it
+/// (`unrecognized parameter "pg_attver"`), failing the whole import. A target
+/// that accepts it keeps it. A probe that fails for another reason (the
+/// target cannot be reached) strips it too; the import then reports that
+/// failure itself. `COMMIT` is written only if both `pg_dump` and the filter
+/// succeeded: `pg_dump`'s own status goes through a file, since a pipeline's
+/// status is only its last command's.
+const PRODUCER: &str = "dump_status=\"${TMPDIR:-/tmp}/temps-import-dump.$$\"; \
+     rm -f \"$dump_status\"; \
+     if psql --no-psqlrc --quiet --no-password --set ON_ERROR_STOP=1 \
+        --dbname=\"$TEMPS_IMPORT_TARGET\" \
+        --command=\"BEGIN; CREATE TEMP TABLE temps_import_option_probe (c int); \
+        ALTER TABLE temps_import_option_probe ALTER COLUMN c SET (pg_attver = 1); ROLLBACK;\" \
+        >/dev/null 2>&1; then strip=0; else strip=1; fi; \
+     printf 'BEGIN;\\n' && \
+     { pg_dump --no-owner --no-privileges --no-publications --no-subscriptions --no-password \
+       --dbname=\"$TEMPS_IMPORT_SOURCE\"; echo $? > \"$dump_status\"; } \
+     | awk -v strip=\"$strip\" \"$TEMPS_IMPORT_DUMP_FILTER\" && \
+     [ \"$(cat \"$dump_status\" 2>/dev/null)\" = 0 ] && \
      printf 'COMMIT;\\n'";
+
+/// Strips the `pg_attver` column option from a plain-text dump when `strip`
+/// is 1, and passes everything else through, `COPY` data untouched whatever
+/// it contains. A statement left with no option at all is dropped; one that
+/// also sets other options keeps them. It contains no single quote, so it is
+/// passed through the environment and quoted as a whole.
+const DUMP_FILTER_AWK: &str = r#"!strip { print; next }
+copy && /^\\\.$/ { copy = 0; print; next }
+copy { print; next }
+/^COPY .* FROM stdin;$/ { copy = 1; print; next }
+/^ALTER TABLE .* ALTER COLUMN .* SET \(.*pg_attver=[0-9]+.*\);$/ {
+  line = $0
+  gsub(/pg_attver=[0-9]+, /, "", line)
+  gsub(/, pg_attver=[0-9]+/, "", line)
+  gsub(/pg_attver=[0-9]+/, "", line)
+  if (line ~ / SET \(\);$/) next
+  print line
+  next
+}
+{ print }
+"#;
 
 /// Stops at the first error; output other than errors is discarded.
 const CONSUMER: &str = "psql --no-psqlrc --quiet --no-password --set ON_ERROR_STOP=1 \
@@ -383,6 +424,7 @@ impl DataImportEngine for PostgresService {
                 TransferEnv::secret("TEMPS_IMPORT_SOURCE", source.raw()),
                 TransferEnv::secret("TEMPS_IMPORT_TARGET", target_url),
                 TransferEnv::secret("TEMPS_IMPORT_TARGET_PASSWORD", pg.password),
+                TransferEnv::plain("TEMPS_IMPORT_DUMP_FILTER", DUMP_FILTER_AWK),
             ],
         })
     }
@@ -555,6 +597,72 @@ mod tests {
         assert!(PRODUCER.contains("--no-owner"));
         assert!(!CONSUMER.contains("--single-transaction"));
         assert!(CONSUMER.contains("ON_ERROR_STOP=1"));
+    }
+
+    /// Run [`DUMP_FILTER_AWK`] over `input` with `strip`, as the producer does.
+    fn filter(input: &str, strip: &str) -> String {
+        use std::io::Write as _;
+        let mut child = std::process::Command::new("awk")
+            .args(["-v", &format!("strip={strip}"), DUMP_FILTER_AWK])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("awk");
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(input.as_bytes())
+            .expect("write");
+        let output = child.wait_with_output().expect("awk ran");
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).expect("utf-8")
+    }
+
+    /// A PostgreSQL 16.16 source gives every column `pg_attver`, which an
+    /// older 18.x target rejects: it is stripped (other options kept), and
+    /// nothing inside COPY data is touched.
+    #[test]
+    fn the_dump_filter_strips_the_column_option_an_older_target_rejects() {
+        let dump = "\
+CREATE TABLE public.items (id integer, name text);
+ALTER TABLE ONLY public.items ALTER COLUMN id SET (pg_attver=22075400);
+ALTER TABLE ONLY public.items ALTER COLUMN name SET (n_distinct=5, pg_attver=22075400);
+ALTER TABLE ONLY public.items ALTER COLUMN name SET (pg_attver=22075400, n_distinct_inherited=3);
+COPY public.items (id, name) FROM stdin;
+1\tALTER TABLE ONLY x ALTER COLUMN y SET (pg_attver=1);
+\\N
+ALTER TABLE ONLY x ALTER COLUMN y SET (pg_attver=2);
+\\.
+SELECT 1;
+";
+        let stripped = filter(dump, "1");
+        assert_eq!(
+            stripped,
+            "\
+CREATE TABLE public.items (id integer, name text);
+ALTER TABLE ONLY public.items ALTER COLUMN name SET (n_distinct=5);
+ALTER TABLE ONLY public.items ALTER COLUMN name SET (n_distinct_inherited=3);
+COPY public.items (id, name) FROM stdin;
+1\tALTER TABLE ONLY x ALTER COLUMN y SET (pg_attver=1);
+\\N
+ALTER TABLE ONLY x ALTER COLUMN y SET (pg_attver=2);
+\\.
+SELECT 1;
+"
+        );
+        // A target that accepts the option gets the dump as it is.
+        assert_eq!(filter(dump, "0"), dump);
+    }
+
+    #[test]
+    fn the_producer_probes_the_target_and_commits_only_after_dump_and_filter() {
+        let probe = PRODUCER.find("pg_attver = 1").expect("probe");
+        let begin = PRODUCER.find("BEGIN;\\n").expect("begin");
+        let filtered = PRODUCER.find("TEMPS_IMPORT_DUMP_FILTER").expect("filter");
+        let status = PRODUCER.find("= 0 ]").expect("dump status checked");
+        let commit = PRODUCER.find("COMMIT;\\n").expect("commit");
+        assert!(probe < begin && begin < filtered && filtered < status && status < commit);
     }
 
     #[test]
