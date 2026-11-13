@@ -605,6 +605,11 @@ mod tests {
     use crate::data_import::{plan_target_preparation, TargetPreparation};
 
     const TARGET_IMAGE: &str = "gotempsh/postgres-walg:18-bookworm";
+    /// Pinned: PostgreSQL 16.16 and later mark columns with a `pg_attver`
+    /// option that only pg_dump 18.7 and later leave out, and the target
+    /// image above runs an older 18.x whose server rejects it. Move this
+    /// forward once the target image is rebuilt on 18.7 or later.
+    const SOURCE_IMAGE: &str = "postgres:16.15-bookworm";
     const TARGET_PASSWORD: &str = "t@rget:pa/ss";
 
     async fn count_items(docker: &TestDocker, target: &str) -> String {
@@ -669,7 +674,7 @@ mod tests {
 
     async fn postgres_scenario(docker: &mut TestDocker) {
         if !docker
-            .ensure_images(&["postgres:16-bookworm", TARGET_IMAGE])
+            .ensure_images(&[SOURCE_IMAGE, TARGET_IMAGE])
             .await
         {
             return;
@@ -677,7 +682,7 @@ mod tests {
         let source = docker
             .run(
                 "pg-source",
-                "postgres:16-bookworm",
+                SOURCE_IMAGE,
                 vec!["POSTGRES_PASSWORD=source-pass".to_string()],
                 None,
             )
