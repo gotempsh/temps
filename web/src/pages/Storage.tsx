@@ -145,25 +145,34 @@ export function Storage() {
       )
     }
 
+    // Shown over an empty list too: the latest read failing says nothing
+    // about whether there are services now.
+    const refreshFailed = error ? (
+      <Callout tone="error" title="Couldn't refresh services">
+        Showing the last loaded services.{' '}
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => void refetch()}
+          disabled={isFetching}
+        >
+          Retry services
+        </Button>
+      </Callout>
+    ) : null
+
     if (!services?.length) {
-      return <EmptyStateStorage />
+      return (
+        <div className="space-y-4">
+          {refreshFailed}
+          <EmptyStateStorage />
+        </div>
+      )
     }
 
     return (
       <div className="space-y-4">
-        {error ? (
-          <Callout tone="error" title="Couldn't refresh services">
-            Showing the last loaded services.{' '}
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => void refetch()}
-              disabled={isFetching}
-            >
-              Retry services
-            </Button>
-          </Callout>
-        ) : null}
+        {refreshFailed}
         <ServicesCardGrid
           services={services}
           healthMap={healthMap}

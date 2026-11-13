@@ -117,3 +117,20 @@ test('a failed Refresh keeps the service cards and says the list may be stale', 
   expect(view.getByText('orders-db')).toBeTruthy()
   expect(view.queryByText('Failed to load services')).toBeNull()
 })
+
+test('a failed Refresh over an empty list says so, not only that there are no services', async () => {
+  let calls = 0
+  const view = renderPage('/storage', {
+    'GET /external-services': () =>
+      ++calls === 1
+        ? jsonResponse([])
+        : jsonResponse({ title: 'Internal Server Error', status: 500 }, 500),
+  })
+  await waitFor(() => expect(calls).toBe(1))
+  await new Promise((resolve) => setTimeout(resolve, 5))
+
+  fireEvent.click(view.getByRole('button', { name: 'Refresh' }))
+
+  await view.findByText("Couldn't refresh services")
+  expect(view.queryByText('Failed to load services')).toBeNull()
+})
