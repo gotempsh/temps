@@ -117,6 +117,12 @@ pub struct RouteEntryDto {
     /// the default; an empty list means the same, so it is not sent.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_callers: Vec<temps_core::internal_access::InternalAccessCaller>,
+    /// Sandboxes on this snapshot's node this internal route admits (ADR
+    /// 105). A separate list so an agent that predates sandbox grants, which
+    /// reads `allowed_callers` as project callers, parses the snapshot and
+    /// ignores this one: it then admits no sandbox, which fails closed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_sandboxes: Vec<temps_core::internal_access::InternalAccessSandboxCaller>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1078,22 +1084,17 @@ pub(crate) async fn build_snapshot(
         tailnet_identity,
         runs_shield,
     } = capabilities;
-    let raw = state.peer_table.snapshot_internal_routes();
-    let mut routes = Vec::with_capacity(raw.len());
-    for (host, info) in raw {
-        if let Some(entry) = entry_from_route(host, &info) {
-            routes.push(entry);
-        }
-    }
-    // ADR 101 D5: who from other projects each internal route admits.
-    let grants = crate::internal_access_grants::load_live_grants(state.db.as_ref())
-        .await
-        .map_err(|source| SnapshotBuildError::Database {
-            node_id: node.id,
-            operation: "load internal access grants",
-            source,
-        })?;
-    crate::internal_access_grants::attach_allowed_callers(&mut routes, &grants);
+    let routes = internal_route_entries(
+        &state.peer_table,
+        state.db.as_ref(),
+        crate::internal_access_grants::SnapshotNode::Worker(node.id),
+    )
+    .await
+    .map_err(|source| SnapshotBuildError::Database {
+        node_id: node.id,
+        operation: "load internal access grants",
+        source,
+    })?;
     // A node running an ingress connector (ADR 058) serves public routes on
     // its loopback tunnel origin even without a public listener.
     let runs_connector = {
@@ -1540,6 +1541,33 @@ fn certificate_has_single_exact_dns_identity(certificate_pem: &str, expected: &s
         })
 }
 
+/// The internal routes an internal proxy serves: every `*.temps.local` route
+/// of `peer_table`, each with the callers from other projects its grants
+/// admit (ADR 101 D5).
+///
+/// One function for both consumers, so they cannot drift: the worker
+/// snapshot (`build_snapshot`) and the control plane's own internal proxy on
+/// a single-server install (ADR-104 D2), which applies the result to the same
+/// `RouteStore` a worker does.
+pub async fn internal_route_entries<C: sea_orm::ConnectionTrait>(
+    peer_table: &CachedPeerTable,
+    db: &C,
+    node: crate::internal_access_grants::SnapshotNode,
+) -> Result<Vec<RouteEntryDto>, sea_orm::DbErr> {
+    let raw = peer_table.snapshot_internal_routes();
+    let mut routes = Vec::with_capacity(raw.len());
+    for (host, info) in raw {
+        if let Some(entry) = entry_from_route(host, &info) {
+            routes.push(entry);
+        }
+    }
+    let grants = crate::internal_access_grants::load_live_grants(db).await?;
+    crate::internal_access_grants::attach_allowed_callers(&mut routes, &grants);
+    let sandbox_grants = crate::internal_access_grants::load_live_sandbox_grants(db, node).await?;
+    crate::internal_access_grants::attach_allowed_sandboxes(&mut routes, &sandbox_grants);
+    Ok(routes)
+}
+
 fn entry_from_route(host: String, info: &RouteInfo) -> Option<RouteEntryDto> {
     // Internal zone is always proxied to live containers; static-dir
     // routes don't make sense here and are skipped.
@@ -1563,6 +1591,7 @@ fn entry_from_route(host: String, info: &RouteInfo) -> Option<RouteEntryDto> {
         gate: None,
         shield: None,
         allowed_callers: Vec::new(),
+        allowed_sandboxes: Vec::new(),
     })
 }
 
@@ -1694,6 +1723,7 @@ pub(crate) mod tests {
             gate: None,
             shield: None,
             allowed_callers: Vec::new(),
+            allowed_sandboxes: Vec::new(),
         }
     }
 
@@ -2454,6 +2484,7 @@ mod gate_hold_back_tests {
             }),
             shield: None,
             allowed_callers: Vec::new(),
+            allowed_sandboxes: Vec::new(),
         }
     }
 

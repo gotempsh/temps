@@ -111,6 +111,11 @@ pub enum OwnerKind {
     /// a deployment, so the name and its claim survive every redeploy
     /// (ADR-055 §10).
     Environment,
+    /// `owner_id` is `environments.id` — the environment's subdomain alias
+    /// (`<environment subdomain>.temps.local`, ADR-105 D7). The weakest claim
+    /// in the zone: any other owner that publishes the same name takes it
+    /// over, and the alias is refused (and reported) until the name is free.
+    EnvironmentSubdomain,
 }
 
 impl OwnerKind {
@@ -122,6 +127,9 @@ impl OwnerKind {
             OwnerKind::Static => "static",
             OwnerKind::Deployment => "deployment",
             OwnerKind::Environment => "environment",
+            OwnerKind::EnvironmentSubdomain => {
+                temps_core::internal_access::ENVIRONMENT_ALIAS_OWNER_KIND
+            }
         }
     }
 }
@@ -136,6 +144,9 @@ impl FromStr for OwnerKind {
             "static" => Ok(OwnerKind::Static),
             "deployment" => Ok(OwnerKind::Deployment),
             "environment" => Ok(OwnerKind::Environment),
+            temps_core::internal_access::ENVIRONMENT_ALIAS_OWNER_KIND => {
+                Ok(OwnerKind::EnvironmentSubdomain)
+            }
             other => Err(DnsRegistryError::Validation {
                 message: format!("unknown owner_kind {:?}", other),
             }),
@@ -709,12 +720,13 @@ impl DnsRegistry {
             ))
             .await?;
 
-        // Environment records (ADR-055 §10) whose environment was deleted.
+        // Environment records (ADR-055 §10) and subdomain aliases (ADR-105
+        // D7) whose environment was deleted.
         let environments = txn
             .execute(Statement::from_string(
                 sea_orm::DatabaseBackend::Postgres,
                 "DELETE FROM service_endpoints \
-                 WHERE owner_kind = 'environment' \
+                 WHERE owner_kind IN ('environment', 'environment_subdomain') \
                  AND NOT EXISTS ( \
                      SELECT 1 FROM environments \
                      WHERE id = service_endpoints.owner_id AND deleted_at IS NULL \
@@ -739,7 +751,7 @@ impl DnsRegistry {
                          (SELECT 1 FROM service_members WHERE id = t.{id})) \
                      OR (t.{kind} = 'service_role' AND NOT EXISTS \
                          (SELECT 1 FROM external_services WHERE id = t.{id})) \
-                     OR (t.{kind} = 'environment' AND NOT EXISTS \
+                     OR (t.{kind} IN ('environment', 'environment_subdomain') AND NOT EXISTS \
                          (SELECT 1 FROM environments WHERE id = t.{id} AND deleted_at IS NULL))"
                 ),
             ))
@@ -1164,6 +1176,18 @@ async fn claim_names(
     if names.is_empty() {
         return Ok(None);
     }
+    // An environment's subdomain alias yields to every other owner (ADR-105
+    // D7): a managed service, node or static name publishing the same name
+    // takes its claim. The alias's records under the name are then leftovers
+    // of an owner without the claim, which the publish removes, and its next
+    // publish is refused and reported as a conflict.
+    if owner_kind != OwnerKind::EnvironmentSubdomain {
+        dns_name_claims::Entity::delete_many()
+            .filter(dns_name_claims::Column::Fqdn.is_in(names.iter().cloned()))
+            .filter(dns_name_claims::Column::OwnerKind.eq(OwnerKind::EnvironmentSubdomain.as_str()))
+            .exec(txn)
+            .await?;
+    }
     let now = chrono::Utc::now();
     let rows = names.iter().map(|fqdn| dns_name_claims::ActiveModel {
         fqdn: Set(fqdn.clone()),
@@ -1236,6 +1260,7 @@ mod tests {
             "static",
             "deployment",
             "environment",
+            "environment_subdomain",
         ] {
             assert_eq!(OwnerKind::from_str(s).unwrap().as_str(), s);
         }
@@ -1472,6 +1497,139 @@ mod tests {
             (claim.owner_kind.as_str(), claim.owner_id),
             ("environment", 41)
         );
+    }
+
+    /// ADR-105 D7: an environment's subdomain alias is the weakest claim.
+    /// A managed service named like it takes the name over whichever came
+    /// first; the alias is then refused and reported, and the environment's
+    /// own two-label name is never touched by any of it.
+    #[tokio::test]
+    async fn test_a_managed_service_wins_a_name_over_an_environment_alias() {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(_) => {
+                println!("Docker/DB not available, skipping test");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let registry = DnsRegistry::new(db.clone());
+        let alias = |env: i64, fqdn: &str| EndpointDraft {
+            owner_kind: OwnerKind::EnvironmentSubdomain,
+            owner_id: env,
+            ..env_draft(env, fqdn, "172.20.0.1")
+        };
+        let service = |id: i64, fqdn: &str| EndpointDraft {
+            owner_kind: OwnerKind::ServiceRole,
+            owner_id: id,
+            ..env_draft(0, fqdn, "10.0.0.9")
+        };
+        let owners = |rows: Vec<service_endpoints::Model>| -> Vec<(String, i64)> {
+            rows.into_iter()
+                .map(|r| (r.owner_kind, r.owner_id))
+                .collect()
+        };
+
+        // The environment's own name and its alias, published separately.
+        registry
+            .replace_endpoints_for_owner(
+                OwnerKind::Environment,
+                7,
+                &[env_draft(7, "production.orders.temps.local", "172.20.0.1")],
+            )
+            .await
+            .unwrap();
+
+        // 1. The alias came first; a service named like it is created later.
+        registry
+            .replace_endpoints_for_owner(
+                OwnerKind::EnvironmentSubdomain,
+                7,
+                &[alias(7, "orders-db.temps.local")],
+            )
+            .await
+            .unwrap();
+        registry
+            .replace_endpoints_for_owner(
+                OwnerKind::ServiceRole,
+                3,
+                &[service(3, "orders-db.temps.local")],
+            )
+            .await
+            .expect("a service takes the name from an alias");
+        assert_eq!(
+            owners(rows_named(db.as_ref(), "orders-db.temps.local").await),
+            [("service_role".to_string(), 3)],
+            "the alias's record is gone with its claim"
+        );
+        let refused = registry
+            .replace_endpoints_for_owner(
+                OwnerKind::EnvironmentSubdomain,
+                7,
+                &[alias(7, "orders-db.temps.local")],
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(refused, DnsRegistryError::NameClaimed { .. }),
+            "{refused}"
+        );
+
+        // 2. The service held the name first: the alias is refused outright.
+        registry
+            .replace_endpoints_for_owner(
+                OwnerKind::ServiceRole,
+                4,
+                &[service(4, "billing-db.temps.local")],
+            )
+            .await
+            .unwrap();
+        assert!(registry
+            .replace_endpoints_for_owner(
+                OwnerKind::EnvironmentSubdomain,
+                8,
+                &[alias(8, "billing-db.temps.local")],
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            owners(rows_named(db.as_ref(), "billing-db.temps.local").await),
+            [("service_role".to_string(), 4)]
+        );
+
+        // Both losers are reported; the two-label name kept its owner.
+        let conflicts = registry.list_name_conflicts().await.unwrap();
+        for (fqdn, env) in [("orders-db.temps.local", 7), ("billing-db.temps.local", 8)] {
+            assert!(
+                conflicts.iter().any(|c| c.fqdn == fqdn
+                    && c.owner_kind == "environment_subdomain"
+                    && c.owner_id == env),
+                "{fqdn}: {conflicts:?}"
+            );
+        }
+        assert_eq!(
+            owners(rows_named(db.as_ref(), "production.orders.temps.local").await),
+            [("environment".to_string(), 7)]
+        );
+
+        // An alias never takes a name from another alias's environment
+        // either: first come, first served among aliases.
+        registry
+            .replace_endpoints_for_owner(
+                OwnerKind::EnvironmentSubdomain,
+                9,
+                &[alias(9, "shop-production.temps.local")],
+            )
+            .await
+            .unwrap();
+        assert!(registry
+            .replace_endpoints_for_owner(
+                OwnerKind::EnvironmentSubdomain,
+                10,
+                &[alias(10, "shop-production.temps.local")],
+            )
+            .await
+            .is_err());
     }
 
     #[tokio::test]

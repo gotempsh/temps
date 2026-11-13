@@ -206,10 +206,14 @@ fn data_safety_problem(error: &crate::services::ExternalServiceError) -> Option<
         | E::ControlPlaneMemberUnreachable { .. }
         | E::ClusterPortsUnavailable { .. }
         | E::ClusterMemberLimitExceeded { .. }
+        | E::InvalidHealthcheck { .. }
+        | E::HealthcheckUnsupported { .. }
+        | E::HealthcheckDefaultConflictsWithService { .. }
         | E::ClusterMemberProvisioning { .. }
         | E::ClusterNotSettled { .. }
         | E::ClusterBusy { .. }
         | E::LockTimeout { .. }
+        | E::HealthcheckSettingsBusy { .. }
         | E::Engine { .. } => None,
     }
 }
@@ -269,10 +273,14 @@ fn service_name_problem(error: &crate::services::ExternalServiceError) -> Option
         | E::ControlPlaneMemberUnreachable { .. }
         | E::ClusterPortsUnavailable { .. }
         | E::ClusterMemberLimitExceeded { .. }
+        | E::InvalidHealthcheck { .. }
+        | E::HealthcheckUnsupported { .. }
+        | E::HealthcheckDefaultConflictsWithService { .. }
         | E::ClusterMemberProvisioning { .. }
         | E::ClusterNotSettled { .. }
         | E::ClusterBusy { .. }
         | E::LockTimeout { .. }
+        | E::HealthcheckSettingsBusy { .. }
         | E::Engine { .. }
         | E::NoSandboxAccessEngine { .. }
         | E::SandboxAccessUnsupported { .. }
@@ -299,6 +307,7 @@ fn cluster_placement_problem(error: &crate::services::ExternalServiceError) -> O
         E::ClusterNotSettled { .. } => "Cluster Not Ready",
         E::ClusterBusy { .. } => "Cluster Busy",
         E::LockTimeout { .. } => "Service Busy",
+        E::HealthcheckSettingsBusy { .. } => "Healthcheck Settings Busy",
         // A worker node at its limit of backups and restores: retry once
         // one finishes.
         E::NodeBusy { .. } => "Node Busy",
@@ -356,6 +365,9 @@ fn cluster_placement_problem(error: &crate::services::ExternalServiceError) -> O
         | E::AgentUnanswered { .. }
         | E::DockerUnavailable(_)
         | E::LocalWorkloadsDisabled { .. }
+        | E::InvalidHealthcheck { .. }
+        | E::HealthcheckUnsupported { .. }
+        | E::HealthcheckDefaultConflictsWithService { .. }
         | E::Engine { .. } => return None,
     };
     Some(conflict().title(title).detail(error.to_string()).build())
@@ -4297,6 +4309,11 @@ mod tests {
             workload_mode: Default::default(),
             log_ingest_lines_per_sec: None,
             log_ingest_kib_per_sec: None,
+            healthcheck_interval_secs: None,
+            healthcheck_start_interval_secs: None,
+            healthcheck_start_period_secs: None,
+            healthcheck_timeout_secs: None,
+            healthcheck_retries: None,
         };
         let linked_service = project_services::Model {
             id: 1,
@@ -4411,6 +4428,11 @@ mod tests {
             continuous_archive_pinned_at: None,
             log_ingest_lines_per_sec: None,
             log_ingest_kib_per_sec: None,
+            healthcheck_interval_secs: None,
+            healthcheck_start_interval_secs: None,
+            healthcheck_start_period_secs: None,
+            healthcheck_timeout_secs: None,
+            healthcheck_retries: None,
             workload_mode: Default::default(),
         };
         let linked_service = project_services::Model {
@@ -5167,6 +5189,11 @@ mod tests {
             workload_mode: Default::default(),
             log_ingest_lines_per_sec: None,
             log_ingest_kib_per_sec: None,
+            healthcheck_interval_secs: None,
+            healthcheck_start_interval_secs: None,
+            healthcheck_start_period_secs: None,
+            healthcheck_timeout_secs: None,
+            healthcheck_retries: None,
         };
         let db = Arc::new(
             MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
@@ -5339,6 +5366,11 @@ mod tests {
             workload_mode: Default::default(),
             log_ingest_lines_per_sec: None,
             log_ingest_kib_per_sec: None,
+            healthcheck_interval_secs: None,
+            healthcheck_start_interval_secs: None,
+            healthcheck_start_period_secs: None,
+            healthcheck_timeout_secs: None,
+            healthcheck_retries: None,
         };
         let link = project_services::Model {
             id: 1,

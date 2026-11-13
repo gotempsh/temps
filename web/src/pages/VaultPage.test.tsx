@@ -16,23 +16,64 @@ import { MemoryRouter, Route, Routes, useNavigate } from 'react-router'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { BreadcrumbProvider } from '@/contexts/BreadcrumbContext'
 import {
-  accessCapabilityOptions,
-  listAccessVaultsOptions,
+  generalAccessCapabilityOptions,
+  listAccessVaultsGeneralOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import VaultPage from './VaultPage'
 import type { AccessVaultList } from '@/api/client'
 import { jsonResponse, mockApi } from '@/test/fetch-mock'
+
+test('failed capability checks explain the error and retry before listing vaults', async () => {
+  let attempts = 0
+  const api = mockApi({
+    'GET /service-access/capability': () =>
+      ++attempts === 1
+        ? jsonResponse({ detail: 'Capability temporarily unavailable' }, 503)
+        : jsonResponse({ can_manage_services: true }),
+    'GET /access-vaults': () =>
+      jsonResponse({ items: [], total: 0, page: 1, page_size: 20 }),
+  })
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  try {
+    mount(
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          <BreadcrumbProvider>
+            <VaultPage />
+          </BreadcrumbProvider>
+        </MemoryRouter>
+      </QueryClientProvider>
+    )
+    const ui = within(document.body)
+    await waitFor(() =>
+      expect(ui.getByText('Capability temporarily unavailable')).toBeTruthy()
+    )
+    expect(api.called('GET', '/access-vaults')).toBe(false)
+    fireEvent.click(ui.getByRole('button', { name: 'Retry' }))
+    await waitFor(() => expect(api.called('GET', '/access-vaults')).toBe(true))
+    await waitFor(() =>
+      expect(ui.queryByText('Capability temporarily unavailable')).toBeNull()
+    )
+    expect(attempts).toBe(2)
+  } finally {
+    cleanup()
+    client.clear()
+    api.restore()
+  }
+})
 
 test('vault creation freezes the name while pending and preserves it after failure', async () => {
   const names: string[] = []
   let finish: ((response: Response) => void) | undefined
   const api = mockApi({
     'GET /projects/7': () => jsonResponse({ id: 7, name: 'Example project' }),
-    'GET /projects/7/access-vaults': () =>
+    'GET /access-vaults': () =>
       jsonResponse({ items: [], total: 0, page: 1, page_size: 20 }),
-    'GET /projects/7/service-access/capability': () =>
+    'GET /service-access/capability': () =>
       jsonResponse({ can_manage_services: true }),
-    'POST /projects/7/access-vaults': async (request) => {
+    'POST /access-vaults': async (request) => {
       names.push((await request.json()).name)
       return new Promise<Response>((resolve) => {
         finish = resolve
@@ -45,15 +86,12 @@ test('vault creation freezes the name while pending and preserves it after failu
   try {
     const view = mount(
       <QueryClientProvider client={client}>
-        <MemoryRouter initialEntries={['/vault/projects/7']}>
+        <MemoryRouter initialEntries={['/vault']}>
           <BreadcrumbProvider>
             <Routes>
+              <Route path="/vault" element={<VaultPage />} />
               <Route
-                path="/vault/projects/:projectId"
-                element={<VaultPage />}
-              />
-              <Route
-                path="/vault/projects/:projectId/vaults/:vaultId"
+                path="/vault/vaults/:vaultId"
                 element={<h1>Created vault</h1>}
               />
             </Routes>
@@ -136,11 +174,11 @@ test('leaving during vault creation keeps the new location and still invalidates
   }
   const api = mockApi({
     'GET /projects/7': () => jsonResponse({ id: 7, name: 'Example project' }),
-    'GET /projects/7/access-vaults': () =>
+    'GET /access-vaults': () =>
       jsonResponse({ items: [], total: 0, page: 1, page_size: 20 }),
-    'GET /projects/7/service-access/capability': () =>
+    'GET /service-access/capability': () =>
       jsonResponse({ can_manage_services: true }),
-    'POST /projects/7/access-vaults': () =>
+    'POST /access-vaults': () =>
       new Promise<Response>((resolve) => {
         finish = resolve
       }),
@@ -152,19 +190,16 @@ test('leaving during vault creation keeps the new location and still invalidates
     const view = mount(
       <QueryClientProvider client={client}>
         <MemoryRouter
-          initialEntries={['/elsewhere', '/vault/projects/7']}
+          initialEntries={['/elsewhere', '/vault']}
           initialIndex={1}
         >
           <BreadcrumbProvider>
             <Navigation />
             <Routes>
-              <Route
-                path="/vault/projects/:projectId"
-                element={<VaultPage />}
-              />
+              <Route path="/vault" element={<VaultPage />} />
               <Route path="/elsewhere" element={<h1>Other work</h1>} />
               <Route
-                path="/vault/projects/:projectId/vaults/:vaultId"
+                path="/vault/vaults/:vaultId"
                 element={<h1>Created vault</h1>}
               />
             </Routes>
@@ -206,8 +241,7 @@ test('leaving during vault creation keeps the new location and still invalidates
     ).toBeTruthy()
     expect(
       client.getQueryState(
-        listAccessVaultsOptions({
-          path: { project_id: 7 },
+        listAccessVaultsGeneralOptions({
           query: { page: 1, page_size: 20 },
         }).queryKey
       )?.isInvalidated
@@ -223,31 +257,27 @@ function render(vaults: AccessVaultList, write = true) {
   const client = new QueryClient({
     defaultOptions: { queries: { staleTime: Infinity, retry: false } },
   })
+  client.setQueryData(generalAccessCapabilityOptions().queryKey, {
+    can_manage_services: write,
+    can_manage_requests: write,
+    can_save_requests: true,
+    can_use_project_github: false,
+    configured: true,
+    state: 'available',
+    reason: 'Available',
+  })
   client.setQueryData(
-    accessCapabilityOptions({ path: { project_id: 7 } }).queryKey,
-    {
-      can_manage_services: write,
-      can_manage_requests: write,
-      can_save_requests: true,
-      can_use_project_github: false,
-      configured: true,
-      state: 'available',
-      reason: 'Available',
-    }
-  )
-  client.setQueryData(
-    listAccessVaultsOptions({
-      path: { project_id: 7 },
+    listAccessVaultsGeneralOptions({
       query: { page: 1, page_size: 20 },
     }).queryKey,
     vaults
   )
   return renderToStaticMarkup(
     <QueryClientProvider client={client}>
-      <MemoryRouter initialEntries={['/vault/projects/7']}>
+      <MemoryRouter initialEntries={['/vault']}>
         <BreadcrumbProvider>
           <Routes>
-            <Route path="/vault/projects/:projectId" element={<VaultPage />} />
+            <Route path="/vault" element={<VaultPage />} />
           </Routes>
         </BreadcrumbProvider>
       </MemoryRouter>
@@ -298,7 +328,7 @@ test('vault cards link to named vaults and show their services', () => {
     page: 1,
     page_size: 20,
   })
-  expect(html).toContain('/vault/projects/7/vaults/vault_test')
+  expect(html).toContain('/vault/vaults/vault_test')
   expect(html).toContain('Development')
   expect(html).toContain('Repository API')
   expect(html).toContain('alt="GitHub"')
@@ -306,12 +336,10 @@ test('vault cards link to named vaults and show their services', () => {
 test('readers cannot create vaults', () => {
   const html = render({ items: [], total: 0, page: 1, page_size: 20 }, false)
   expect(html).toContain('disabled=""')
-  expect(html).toContain('Project write permission is required')
+  expect(html).toContain('Instance administrator permission is required')
 })
 
-test('empty later project pages return to page one', async () => {
-  const { getProjectsOptions } =
-    await import('@/api/client/@tanstack/react-query.gen')
+test('empty later vault pages return to page one', async () => {
   const { useLocation } = await import('react-router')
   function Location() {
     const location = useLocation()
@@ -326,13 +354,24 @@ test('empty later project pages return to page one', async () => {
     defaultOptions: { queries: { staleTime: Infinity, retry: false } },
   })
   client.setQueryData(
-    getProjectsOptions({ query: { page: 2, per_page: 20 } }).queryKey,
-    { projects: [], total: 1, page: 2, per_page: 20 }
+    listAccessVaultsGeneralOptions({ query: { page: 2, page_size: 20 } })
+      .queryKey,
+    { items: [], total: 1, page: 2, page_size: 20 }
   )
   client.setQueryData(
-    getProjectsOptions({ query: { page: 1, per_page: 20 } }).queryKey,
-    { projects: [], total: 0, page: 1, per_page: 20 }
+    listAccessVaultsGeneralOptions({ query: { page: 1, page_size: 20 } })
+      .queryKey,
+    { items: [], total: 0, page: 1, page_size: 20 }
   )
+  client.setQueryData(generalAccessCapabilityOptions().queryKey, {
+    can_manage_services: true,
+    can_manage_requests: true,
+    can_save_requests: true,
+    can_use_project_github: false,
+    configured: true,
+    state: 'available',
+    reason: 'Available',
+  })
   try {
     const view = mount(
       <QueryClientProvider client={client}>
@@ -349,6 +388,27 @@ test('empty later project pages return to page one', async () => {
     )
   } finally {
     cleanup()
+    client.clear()
+  }
+})
+
+test('cold capability requests show the vault skeleton layout', () => {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  try {
+    const html = renderToStaticMarkup(
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          <BreadcrumbProvider>
+            <VaultPage />
+          </BreadcrumbProvider>
+        </MemoryRouter>
+      </QueryClientProvider>
+    )
+    expect(html).toContain('h-44 rounded-lg')
+    expect(html).not.toContain('Create your first vault')
+  } finally {
     client.clear()
   }
 })

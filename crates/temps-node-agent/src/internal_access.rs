@@ -10,9 +10,15 @@
 //! `allowed_callers` (internal access grants on the route's project) names
 //! its project, and its environment if the grant names one. Either way Docker
 //! must then confirm the container is still running at that address.
+//!
+//! A sandbox reaches this proxy only through its egress proxy, so a request
+//! whose source is a sandbox's egress proxy is that sandbox's (ADR 105). It is
+//! admitted only when the route's `allowed_sandboxes` names it; project
+//! grants and the same-project rule never apply to it.
 
 use std::collections::HashSet;
 use std::future::Future;
+use std::sync::Arc;
 
 use crate::route_store::{RouteEntry, RouteStore, WorkloadIdentity};
 
@@ -24,9 +30,28 @@ pub(crate) const CROSS_PROJECT_DENIED: &str =
      Settings > Protection > Internal access and allow the calling project (or one of its \
      environments)";
 
+/// The 403 body for a sandbox no grant admits. Like
+/// [`CROSS_PROJECT_DENIED`] it names no project; it names the sandbox, which
+/// is what the owner of the address adds.
+///
+/// `container` is the sandbox's container name. The console and API know a
+/// sandbox by its public id, and a refused sandbox is in no snapshot to look
+/// that up from, so the id is read off the name: a sandbox created through
+/// the sandboxes API runs as `temps-sandbox-<hex>` with public id
+/// `sbx_<hex>`. Any other name (an agent run's) is shown as it is.
+pub(crate) fn sandbox_denied(container: &str) -> String {
+    let sandbox = temps_core::internal_access::sandbox_public_id_for_container(container)
+        .unwrap_or_else(|| container.to_string());
+    format!(
+        "internal route is not accessible from sandbox {sandbox}. A sandbox needs an internal \
+         access grant on the project that owns this address: open that project's Settings > \
+         Protection > Internal access and add sandbox {sandbox} as a caller"
+    )
+}
+
 /// Why a caller was refused, for the log line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DenyReason {
+pub enum DenyReason {
     /// The route carries no project (a legacy or malformed snapshot).
     RouteWithoutProject,
     /// No container owns the source address, or the snapshot does not know
@@ -34,17 +59,20 @@ pub(crate) enum DenyReason {
     UnknownCaller,
     /// The caller serves another project, and no grant on the route admits it.
     NotGranted,
+    /// The caller is a sandbox, and no sandbox grant on the route admits it.
+    SandboxNotGranted,
     /// Docker no longer confirms the container at that address, or the
     /// inspection budget is exhausted.
     StaleCaller,
 }
 
 impl DenyReason {
-    pub(crate) fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             DenyReason::RouteWithoutProject => "route_without_project",
             DenyReason::UnknownCaller => "unknown_caller",
             DenyReason::NotGranted => "not_granted",
+            DenyReason::SandboxNotGranted => "sandbox_not_granted",
             DenyReason::StaleCaller => "stale_caller",
         }
     }
@@ -52,7 +80,7 @@ impl DenyReason {
 
 /// The outcome for one request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AccessDecision {
+pub enum AccessDecision {
     SameProject {
         caller_project_id: i32,
     },
@@ -60,7 +88,17 @@ pub(crate) enum AccessDecision {
         caller_project_id: i32,
         caller_environment_id: Option<i32>,
     },
+    /// A sandbox a sandbox grant on the route admits (ADR 105).
+    SandboxGranted,
     Denied(DenyReason),
+}
+
+/// Whose inspection budget the Docker re-check of an admitted caller is
+/// charged to: the caller's own, never the target's.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum Recheck {
+    Project(i32),
+    Sandbox(Arc<str>),
 }
 
 impl AccessDecision {
@@ -72,7 +110,7 @@ impl AccessDecision {
             | AccessDecision::Granted {
                 caller_project_id, ..
             } => Some(caller_project_id),
-            AccessDecision::Denied(_) => None,
+            AccessDecision::SandboxGranted | AccessDecision::Denied(_) => None,
         }
     }
 }
@@ -80,7 +118,10 @@ impl AccessDecision {
 /// The in-memory decision: no I/O. Same project first, then grants, each
 /// over the caller's identities in a fixed order so the budget a request is
 /// charged to does not depend on hash order.
-pub(crate) fn decide(
+///
+/// Public so the control plane, which serves its own containers with this
+/// proxy (ADR-104), tests its routes against the same decision.
+pub fn decide(
     route: &RouteEntry,
     identities: Option<&HashSet<WorkloadIdentity>>,
 ) -> AccessDecision {
@@ -118,30 +159,61 @@ pub(crate) fn decide(
         .unwrap_or(AccessDecision::Denied(DenyReason::NotGranted))
 }
 
+/// The in-memory decision for a request from sandbox `sandbox` (the
+/// container name its egress proxy is named after): only the route's sandbox
+/// grants apply.
+pub fn decide_sandbox(route: &RouteEntry, sandbox: &str) -> AccessDecision {
+    if route.project_id.is_none() {
+        return AccessDecision::Denied(DenyReason::RouteWithoutProject);
+    }
+    match temps_core::internal_access::admitted_sandbox(&route.allowed_sandboxes, sandbox) {
+        Some(_) => AccessDecision::SandboxGranted,
+        None => AccessDecision::Denied(DenyReason::SandboxNotGranted),
+    }
+}
+
 /// The whole check for one request: the in-memory decision, then
-/// `revalidate(container_id, caller_project_id)` (Docker inspection behind
-/// the caller project's token bucket) for an allow. A refused caller never
-/// reaches `revalidate`, so it cannot spend Docker capacity.
+/// `revalidate` (Docker inspection behind the caller's own token bucket) for
+/// an allow. A refused caller never reaches `revalidate`, so it cannot spend
+/// Docker capacity.
+///
+/// `sandbox` is the sandbox whose egress proxy owns the source address, when
+/// it is one; such a caller is decided by [`decide_sandbox`] alone.
 pub(crate) async fn authorize<F, Fut>(
     store: &RouteStore,
     container_id: Option<&str>,
+    sandbox: Option<&Arc<str>>,
     route: &RouteEntry,
     revalidate: F,
 ) -> AccessDecision
 where
-    F: FnOnce(i32) -> Fut,
+    F: FnOnce(Recheck) -> Fut,
     Fut: Future<Output = bool>,
 {
-    let decision = match container_id {
-        Some(container_id) => store
-            .with_container_identities(container_id, |identities| decide(route, Some(identities)))
-            .unwrap_or_else(|| decide(route, None)),
-        None => decide(route, None),
+    let (decision, recheck) = match (sandbox, container_id) {
+        (Some(sandbox), Some(_)) => {
+            let decision = decide_sandbox(route, sandbox);
+            let recheck = matches!(decision, AccessDecision::SandboxGranted)
+                .then(|| Recheck::Sandbox(Arc::clone(sandbox)));
+            (decision, recheck)
+        }
+        (_, container_id) => {
+            let decision = match container_id {
+                Some(container_id) => store
+                    .with_container_identities(container_id, |identities| {
+                        decide(route, Some(identities))
+                    })
+                    .unwrap_or_else(|| decide(route, None)),
+                None => decide(route, None),
+            };
+            let recheck = decision.caller_project_id().map(Recheck::Project);
+            (decision, recheck)
+        }
     };
-    let Some(caller_project_id) = decision.caller_project_id() else {
+    let Some(recheck) = recheck else {
         return decision;
     };
-    if revalidate(caller_project_id).await {
+    if revalidate(recheck).await {
         decision
     } else {
         AccessDecision::Denied(DenyReason::StaleCaller)
@@ -182,6 +254,7 @@ mod tests {
             gate: None,
             shield: None,
             allowed_callers,
+            allowed_sandboxes: Vec::new(),
         }
     }
 
@@ -233,7 +306,7 @@ mod tests {
 
     async fn check(store: &RouteStore, container_id: Option<&str>, host: &str) -> AccessDecision {
         let route = store.lookup(host).expect("the route is in the store");
-        authorize(store, container_id, &route, |_| async { true }).await
+        authorize(store, container_id, None, &route, |_| async { true }).await
     }
 
     fn project_wide(project_id: i32) -> InternalAccessCaller {
@@ -390,6 +463,7 @@ mod tests {
         let decision = authorize(
             &store,
             Some("container-caller-production"),
+            None,
             &route,
             |_| async { false },
         )
@@ -400,6 +474,7 @@ mod tests {
         let decision = authorize(
             &store,
             Some("container-target-staging"),
+            None,
             &route,
             |_| async { false },
         )
@@ -417,9 +492,12 @@ mod tests {
         authorize(
             &store,
             Some("container-caller-production"),
+            None,
             &route,
-            |project| {
-                charged.store(project, Ordering::SeqCst);
+            |recheck| {
+                if let Recheck::Project(project) = recheck {
+                    charged.store(project, Ordering::SeqCst);
+                }
                 async { true }
             },
         )
@@ -431,6 +509,7 @@ mod tests {
         let decision = authorize(
             &store,
             Some("container-caller-production"),
+            None,
             &refused,
             |_| {
                 calls.fetch_add(1, Ordering::SeqCst);
@@ -486,5 +565,174 @@ mod tests {
         assert!(CROSS_PROJECT_DENIED.contains("internal access grant"));
         assert!(CROSS_PROJECT_DENIED.contains("Internal access"));
         assert!(!CROSS_PROJECT_DENIED.chars().any(|c| c.is_ascii_digit()));
+    }
+
+    const SANDBOX: &str = "temps-sandbox-alpha";
+
+    fn sandbox_grant(name: &str) -> temps_core::internal_access::InternalAccessSandboxCaller {
+        temps_core::internal_access::InternalAccessSandboxCaller {
+            name: name.to_string(),
+            public_id: format!("sbx_{name}"),
+        }
+    }
+
+    fn with_sandboxes(names: &[&str]) -> RouteEntry {
+        let mut route = target(Vec::new());
+        route.allowed_sandboxes = names.iter().map(|name| sandbox_grant(name)).collect();
+        route
+    }
+
+    async fn check_sandbox(
+        store: &RouteStore,
+        route: &RouteEntry,
+        sandbox: &str,
+        current: bool,
+    ) -> AccessDecision {
+        let sandbox: Arc<str> = Arc::from(sandbox);
+        authorize(
+            store,
+            Some("container-egress-proxy"),
+            Some(&sandbox),
+            route,
+            |_| async move { current },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_sandbox_without_a_grant_is_refused() {
+        let (_dir, store) = store_with(target(vec![project_wide(CALLER_PROJECT)]));
+        assert_eq!(
+            check_sandbox(
+                &store,
+                &target(vec![project_wide(CALLER_PROJECT)]),
+                SANDBOX,
+                true
+            )
+            .await,
+            AccessDecision::Denied(DenyReason::SandboxNotGranted),
+            "a project grant does not admit a sandbox"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_granted_sandbox_is_admitted_and_rechecked_on_its_own_budget() {
+        let (_dir, store) = store_with(with_sandboxes(&[SANDBOX]));
+        let route = with_sandboxes(&[SANDBOX]);
+        let charged = std::sync::Mutex::new(None);
+        let sandbox: Arc<str> = Arc::from(SANDBOX);
+        let decision = authorize(
+            &store,
+            Some("container-egress-proxy"),
+            Some(&sandbox),
+            &route,
+            |recheck| {
+                *charged.lock().expect("not poisoned") = Some(recheck);
+                async { true }
+            },
+        )
+        .await;
+        assert_eq!(decision, AccessDecision::SandboxGranted);
+        assert_eq!(
+            charged.into_inner().expect("not poisoned"),
+            Some(Recheck::Sandbox(Arc::from(SANDBOX)))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_grant_for_another_sandbox_admits_nobody_else() {
+        let (_dir, store) = store_with(with_sandboxes(&["temps-sandbox-beta"]));
+        assert_eq!(
+            check_sandbox(
+                &store,
+                &with_sandboxes(&["temps-sandbox-beta"]),
+                SANDBOX,
+                true
+            )
+            .await,
+            AccessDecision::Denied(DenyReason::SandboxNotGranted)
+        );
+    }
+
+    /// A revoked grant, or a destroyed sandbox, leaves the next snapshot's
+    /// list, and the next request is refused.
+    #[tokio::test]
+    async fn a_revoked_or_destroyed_sandbox_is_refused_on_the_next_snapshot() {
+        let (_dir, store) = store_with(with_sandboxes(&[SANDBOX]));
+        let host = "production.api.temps.local";
+        let granted = store.lookup(host).expect("the route is in the store");
+        assert_eq!(
+            check_sandbox(&store, &granted, SANDBOX, true).await,
+            AccessDecision::SandboxGranted
+        );
+        let mut routes = caller_routes();
+        routes.push(with_sandboxes(&[]));
+        store.apply_snapshot(2, routes);
+        let revoked = store.lookup(host).expect("the route is in the store");
+        assert_eq!(
+            check_sandbox(&store, &revoked, SANDBOX, true).await,
+            AccessDecision::Denied(DenyReason::SandboxNotGranted)
+        );
+    }
+
+    /// A granted sandbox whose egress proxy Docker no longer confirms (gone,
+    /// replaced, or its address reused) is refused.
+    #[tokio::test]
+    async fn a_granted_sandbox_whose_proxy_is_not_current_is_refused() {
+        let (_dir, store) = store_with(with_sandboxes(&[SANDBOX]));
+        assert_eq!(
+            check_sandbox(&store, &with_sandboxes(&[SANDBOX]), SANDBOX, false).await,
+            AccessDecision::Denied(DenyReason::StaleCaller)
+        );
+    }
+
+    /// The sandbox path never falls back to project identities: an egress
+    /// proxy container that a route also lists as a backend of the target
+    /// project is still only its sandbox.
+    #[tokio::test]
+    async fn a_sandbox_never_passes_as_the_routes_own_project() {
+        let mut target_route = with_sandboxes(&[]);
+        target_route.backends[0].container_id = Some("container-egress-proxy".into());
+        let (_dir, store) = store_with(target_route.clone());
+        assert_eq!(
+            check_sandbox(&store, &target_route, SANDBOX, true).await,
+            AccessDecision::Denied(DenyReason::SandboxNotGranted)
+        );
+    }
+
+    #[test]
+    fn a_sandbox_refusal_names_the_sandbox_and_where_to_add_it() {
+        let body = sandbox_denied(SANDBOX);
+        assert!(body.contains(SANDBOX));
+        assert!(body.contains("Internal access"));
+        assert!(body.contains("internal access grant"));
+    }
+
+    /// The console's sandbox picker lists public ids, so a sandbox from the
+    /// sandboxes API is named by its id, not its container.
+    #[test]
+    fn a_sandbox_refusal_names_the_public_id_the_console_lists() {
+        let body = sandbox_denied("temps-sandbox-0a1b2c3d4e5f6789");
+        assert!(
+            body.contains("add sandbox sbx_0a1b2c3d4e5f6789 as a caller"),
+            "{body}"
+        );
+        assert!(!body.contains("temps-sandbox-"), "{body}");
+
+        // An agent run's container, or anything not shaped like a public id,
+        // is shown as it is rather than as an id that does not exist.
+        for container in [
+            "temps-sandbox-1000000",
+            "temps-sandbox-0A1B2C3D4E5F6789",
+            "temps-sandbox-0a1b2c3d4e5f67890",
+            "other-0a1b2c3d4e5f6789",
+        ] {
+            let body = sandbox_denied(container);
+            assert!(
+                body.contains(&format!("add sandbox {container} as a caller")),
+                "{body}"
+            );
+            assert!(!body.contains("sbx_"), "{body}");
+        }
     }
 }

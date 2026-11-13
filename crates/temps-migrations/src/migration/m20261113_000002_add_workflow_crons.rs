@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Cron schedules that start a durable workflow (ADR-103 §9, M2).
+//! Cron schedules that start a durable workflow (ADR-106 §9, M2).
 //!
 //! A `.temps.yaml` cron with `workflow:` becomes a `crons` row in mode
 //! `workflow`: `workflow_name` is the workflow it starts and

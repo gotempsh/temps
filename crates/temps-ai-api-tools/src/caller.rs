@@ -114,6 +114,18 @@ pub struct ApiToolResponse {
     pub truncated: bool,
 }
 
+/// Who approved a staged write, as far as the server can prove it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteApproval {
+    /// The action's owner confirmed it in the Temps console, a step the model
+    /// cannot take itself (the confirm endpoint refuses assistant callers).
+    OwnerInApp,
+    /// A proposal token returned to the caller, for example an MCP client's
+    /// `confirm_action`. The model that received the token can replay it, so
+    /// this approves ordinary writes but never counts as human consent.
+    ProposalToken,
+}
+
 /// A validated, structured write proposal produced by
 /// [`InternalApiCaller::prepare_write_cli`].
 ///
@@ -1080,12 +1092,20 @@ impl InternalApiCaller {
 
     /// Execute only the plugin declaration that was recorded with the approval.
     /// Any lifecycle/consent publication (including restart) requires a fresh proposal.
+    ///
+    /// `approval` says who approved the write. Only [`WriteApproval::OwnerInApp`]
+    /// marks the request [`temps_core::ai_tool_call::ConfirmedAiWrite`], which the
+    /// vault session, link and bundle handlers and the internal access grant
+    /// handlers require before an assistant may grant access
+    /// ([`temps_core::ai_tool_call::HUMAN_CONSENT_OPERATIONS`]); a relayed
+    /// proposal token is not evidence of human consent.
     pub async fn execute_approved_write(
         &self,
         operation_id: &str,
         params: Value,
         scope: &ApiCallScope,
         plugin_revision: Option<&str>,
+        approval: WriteApproval,
     ) -> Result<ApiToolResponse, ApiToolError> {
         if let Some(plugin) = operation_id
             .strip_prefix("plugin.")
@@ -1098,6 +1118,11 @@ impl InternalApiCaller {
             if plugin_revision.is_none() || plugin_revision != current.as_deref() {
                 return Err(ApiToolError::PluginOperation {plugin:plugin.into(),operation_id:operation_id.into(),reason:"Plugin declaration changed since approval was requested; propose the operation again".into()});
             }
+        }
+        if approval == WriteApproval::OwnerInApp
+            && temps_core::ai_tool_call::requires_human_consent(operation_id)
+        {
+            return self.call_inner(operation_id, params, scope, true).await;
         }
         self.execute_write(operation_id, params, scope).await
     }
@@ -1177,7 +1202,7 @@ impl InternalApiCaller {
             }
             let result = match tokio::time::timeout_at(
                 deadline,
-                self.call_inner(operation_id, params, scope),
+                self.call_inner(operation_id, params, scope, false),
             )
             .await
             {
@@ -1199,7 +1224,7 @@ impl InternalApiCaller {
             }
             return result;
         }
-        self.call_inner(operation_id, params, scope).await
+        self.call_inner(operation_id, params, scope, false).await
     }
 
     fn validate_plugin_route(
@@ -1232,6 +1257,7 @@ impl InternalApiCaller {
         operation_id: &str,
         params: Value,
         scope: &ApiCallScope,
+        human_confirmed: bool,
     ) -> Result<ApiToolResponse, ApiToolError> {
         // Step 1: look up the operation.
         let op = self
@@ -1317,6 +1343,10 @@ impl InternalApiCaller {
         // rows it read, since those reach a third-party AI provider.
         req.extensions_mut()
             .insert(temps_core::ai_tool_call::AiToolCall);
+        if human_confirmed {
+            req.extensions_mut()
+                .insert(temps_core::ai_tool_call::ConfirmedAiWrite);
+        }
         if let Some(origin) = &scope.origin {
             req.extensions_mut().insert(origin.clone());
         }
@@ -3267,13 +3297,19 @@ mod tests {
             WritePrepareOutcome::Invalid(_)
         ));
         assert!(matches!(caller.execute_approved_write(
-            &prepared.operation_id, prepared.params.clone(), &scope, None
+            &prepared.operation_id, prepared.params.clone(), &scope, None, WriteApproval::OwnerInApp
         ).await, Err(ApiToolError::SecretsUnavailable { operation_id, field })
             if operation_id == "create_source" && field == "/secret_key"));
         assert_eq!(writes.load(std::sync::atomic::Ordering::SeqCst), 0);
         scope.secrets = Some(std::sync::Arc::new(Resolver));
         caller
-            .execute_approved_write(&prepared.operation_id, prepared.params, &scope, None)
+            .execute_approved_write(
+                &prepared.operation_id,
+                prepared.params,
+                &scope,
+                None,
+                WriteApproval::OwnerInApp,
+            )
             .await
             .unwrap();
         assert_eq!(writes.load(std::sync::atomic::Ordering::SeqCst), 1);

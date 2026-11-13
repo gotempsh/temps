@@ -14,6 +14,8 @@ use temps_entities::deployment_tokens::DeploymentTokenPermission;
 use temps_entities::users;
 use tower::ServiceExt;
 
+use temps_core::ai_tool_call::{AiToolCall, ConfirmedAiWrite};
+
 use super::*;
 
 const TARGET: i32 = 1;
@@ -120,18 +122,32 @@ fn create_request() -> CreateInternalAccessGrantRequest {
 }
 
 async fn create_status(auth: AuthContext, state: Arc<InternalAccessAppState>) -> StatusCode {
-    match create_internal_access_grant(
+    match create_as(auth, state, None, None).await {
+        Ok(status) => status,
+        Err(problem) => problem.status_code,
+    }
+}
+
+/// Create a grant the way the assistant's replayed request reaches the
+/// handler: `ai_call` marks it as the assistant's, `confirmed` as the owner's
+/// confirmation of that exact pending action.
+async fn create_as(
+    auth: AuthContext,
+    state: Arc<InternalAccessAppState>,
+    ai_call: Option<AiToolCall>,
+    confirmed: Option<ConfirmedAiWrite>,
+) -> Result<StatusCode, Problem> {
+    create_internal_access_grant(
         RequireAuth(auth),
         State(state),
         Extension(metadata()),
+        ai_call.map(Extension),
+        confirmed.map(Extension),
         Path(TARGET),
         Json(create_request()),
     )
     .await
-    {
-        Ok(response) => response.into_response().status(),
-        Err(problem) => problem.status_code,
-    }
+    .map(|response| response.into_response().status())
 }
 
 async fn delete_status(auth: AuthContext, state: Arc<InternalAccessAppState>) -> StatusCode {
@@ -427,4 +443,62 @@ async fn errors_are_problem_details_with_the_ids() {
     ] {
         assert_eq!(Problem::from(error).status_code, status);
     }
+}
+
+#[tokio::test]
+async fn the_assistant_cannot_grant_without_the_owners_confirmation() {
+    // Auto-approve, an MCP confirm_action or a prompt-injected agent all reach
+    // the handler without `ConfirmedAiWrite`: refused before the database.
+    let (state, audit) = state(untouched(), Some(&[TARGET, CALLER]));
+    let problem = create_as(
+        AuthContext::new_session(user(), Role::User),
+        state,
+        Some(AiToolCall),
+        None,
+    )
+    .await
+    .expect_err("an unconfirmed assistant grant must be refused");
+    assert_eq!(problem.status_code, StatusCode::FORBIDDEN);
+    assert_eq!(
+        problem.body.get("error_code").and_then(|v| v.as_str()),
+        Some("HUMAN_CALLER_REQUIRED")
+    );
+    assert_eq!(
+        problem.body.get("operation").and_then(|v| v.as_str()),
+        Some("create_internal_access_grant")
+    );
+    assert!(audit.operations.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_confirmed_assistant_grant_is_made_and_audited_as_the_user() {
+    let (state, audit) = state(create_succeeds(), Some(&[TARGET, CALLER]));
+    let status = create_as(
+        AuthContext::new_session(user(), Role::User),
+        state,
+        Some(AiToolCall),
+        Some(ConfirmedAiWrite),
+    )
+    .await
+    .expect("the owner's confirmation lets the grant through");
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(
+        *audit.operations.lock().unwrap(),
+        vec![GRANT_CREATED.to_string()]
+    );
+}
+
+#[tokio::test]
+async fn a_confirmation_does_not_lift_the_permission_check() {
+    let (state, audit) = state(untouched(), None);
+    let problem = create_as(
+        AuthContext::new_session(user(), Role::Reader),
+        state,
+        Some(AiToolCall),
+        Some(ConfirmedAiWrite),
+    )
+    .await
+    .expect_err("a reader cannot grant, confirmed or not");
+    assert_eq!(problem.status_code, StatusCode::FORBIDDEN);
+    assert!(audit.operations.lock().unwrap().is_empty());
 }

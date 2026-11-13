@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The workflows HTTP API (ADR-103 §10, §11).
+//! The workflows HTTP API (ADR-106 §10, §11).
 //!
 //! - **Management** (session or API key, `permission_guard`ed and narrowed
 //!   to the project): under

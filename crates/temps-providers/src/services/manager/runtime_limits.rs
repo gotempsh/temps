@@ -12,6 +12,26 @@ use std::collections::HashMap;
 use temps_entities::{external_services, service_members};
 use tracing::info;
 
+/// Why a service's container is being recreated, for its messages.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ContainerRecreate {
+    /// What is applied ("the new shm size"), for refusals.
+    pub(super) what: &'static str,
+    /// The recreate guard's operation ("applying a new /dev/shm size").
+    pub(super) operation: &'static str,
+}
+
+impl ContainerRecreate {
+    pub(super) const SHM_SIZE: Self = Self {
+        what: "the new shm size",
+        operation: "applying a new /dev/shm size",
+    };
+    pub(super) const HEALTHCHECK: Self = Self {
+        what: "the new healthcheck",
+        operation: "applying new healthcheck settings",
+    };
+}
+
 /// One container behind a service, and the node whose Docker runs it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct MemberContainer {
@@ -582,6 +602,28 @@ impl ExternalServiceManager {
         &self,
         service: &external_services::Model,
     ) -> Result<(), ExternalServiceError> {
+        self.recreate_service_container_preserving_data(
+            service,
+            ContainerRecreate::SHM_SIZE,
+            |_| Ok(()),
+        )
+        .await
+    }
+
+    /// Delete and recreate a standalone, control-plane service's container
+    /// through the recreate guard, keeping its volumes and configuration, so
+    /// a create-time-only setting (`what`) takes effect. See
+    /// [`Self::recreate_service_container_for_shm`] for the steps.
+    ///
+    /// `still_applies` is checked on the service as it is once the service's
+    /// lock is held, so a start or stop that finished meanwhile is seen (both
+    /// take the lock) and nothing changes it until the recreate is done.
+    pub(super) async fn recreate_service_container_preserving_data(
+        &self,
+        service: &external_services::Model,
+        purpose: ContainerRecreate,
+        still_applies: impl FnOnce(&external_services::Model) -> Result<(), ExternalServiceError>,
+    ) -> Result<(), ExternalServiceError> {
         // Remote-node containers live on a worker's Docker daemon, not on
         // `self.docker`. Removing here would target the wrong daemon. The
         // worker's create path already honors shm; the operator must
@@ -589,8 +631,8 @@ impl ExternalServiceManager {
         if service.node_id.is_some() {
             return Err(ExternalServiceError::InternalError {
                 reason: format!(
-                    "Service {} runs on a remote node; recreate it on that node to apply the new shm size",
-                    service.id
+                    "Service {} runs on a remote node; recreate it on that node to apply {}",
+                    service.id, purpose.what
                 ),
             });
         }
@@ -601,11 +643,17 @@ impl ExternalServiceManager {
         if service.topology == "cluster" {
             return Err(ExternalServiceError::InternalError {
                 reason: format!(
-                    "Service {} is a cluster; recreate its members to apply the new shm size",
-                    service.id
+                    "Service {} is a cluster; recreate its members to apply {}",
+                    service.id, purpose.what
                 ),
             });
         }
+
+        // The TLS lock before the container's: a TLS mode change takes them
+        // in that order, and the recreate reads the TLS mode (ADR 093).
+        let tls_lock = self.service_tls_locks.for_service(service.id).await;
+        let held = tls_lock.lock().await;
+        still_applies(&self.get_service(service.id).await?)?;
 
         let service_type = ServiceType::from_str(&service.service_type).map_err(|_| {
             ExternalServiceError::InvalidServiceType {
@@ -651,15 +699,11 @@ impl ExternalServiceManager {
                 service_id: service.id,
                 name: service.name.clone(),
                 reason: format!(
-                    "its {} container '{}' cannot be recreated safely by Temps (imported, or an engine without a known storage layout), so the new /dev/shm size was saved but not applied. Recreate the container by hand with the same mounts",
-                    service.service_type, container_name
+                    "its {} container '{}' cannot be recreated safely by Temps (imported, or an engine without a known storage layout), so {} was saved but not applied. Recreate the container by hand with the same mounts",
+                    service.service_type, container_name, purpose.what
                 ),
             }
         })?;
-        // The TLS lock before the container's: a TLS mode change takes them
-        // in that order, and the recreate reads the TLS mode (ADR 093).
-        let tls_lock = self.service_tls_locks.for_service(service.id).await;
-        let held = tls_lock.lock().await;
         let report = crate::externalsvc::recreate_guard::recreate_preserving_data(
             crate::externalsvc::recreate_guard::RecreateRequest {
                 docker: docker.as_ref(),
@@ -667,7 +711,7 @@ impl ExternalServiceManager {
                 service_name: &service.name,
                 container_name: &container_name,
                 replacement,
-                operation: "applying a new /dev/shm size",
+                operation: purpose.operation,
             },
             || self.initialize_service_holding(service.id, &held),
         )
@@ -689,7 +733,8 @@ impl ExternalServiceManager {
             service_id = service.id,
             container = %container_name,
             replaced = report.replaced,
-            "Recreated container to apply new /dev/shm size; data verified"
+            operation = purpose.operation,
+            "Recreated container; data verified"
         );
         Ok(())
     }

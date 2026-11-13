@@ -832,3 +832,74 @@ macro_rules! impl_node_alert_rule_audit {
 
 impl_node_alert_rule_audit!(NodeAlertRuleCreatedAudit, "NODE_ALERT_RULE_CREATED");
 impl_node_alert_rule_audit!(NodeAlertRuleDeletedAudit, "NODE_ALERT_RULE_DELETED");
+
+macro_rules! healthcheck_audit_operation {
+    ($audit:ty, $operation:literal) => {
+        impl AuditOperation for $audit {
+            fn operation_type(&self) -> String {
+                $operation.to_string()
+            }
+
+            fn user_id(&self) -> Option<i32> {
+                Some(self.context.user_id)
+            }
+
+            fn ip_address(&self) -> Option<String> {
+                self.context.ip_address.clone()
+            }
+
+            fn user_agent(&self) -> &str {
+                &self.context.user_agent
+            }
+
+            fn serialize(&self) -> temps_core::AuditResult<String> {
+                temps_core::serialize_audit_operation(self)
+            }
+        }
+    };
+}
+
+/// Operator changed a managed service's Docker healthcheck overrides. Both
+/// ends are recorded (null = inherit). Nothing running changed.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExternalServiceHealthcheckUpdatedAudit {
+    pub context: AuditContext,
+    pub service_id: i32,
+    pub service_name: String,
+    pub previous: temps_providers_core::healthcheck::HealthcheckOverrides,
+    pub current: temps_providers_core::healthcheck::HealthcheckOverrides,
+}
+
+healthcheck_audit_operation!(
+    ExternalServiceHealthcheckUpdatedAudit,
+    "EXTERNAL_SERVICE_HEALTHCHECK_UPDATED"
+);
+
+/// Operator recreated a managed service's container to apply its
+/// healthcheck, which restarts the service briefly.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExternalServiceHealthcheckAppliedAudit {
+    pub context: AuditContext,
+    pub service_id: i32,
+    pub service_name: String,
+    pub applied: temps_providers_core::healthcheck::HealthcheckTimings,
+}
+
+healthcheck_audit_operation!(
+    ExternalServiceHealthcheckAppliedAudit,
+    "EXTERNAL_SERVICE_HEALTHCHECK_APPLIED"
+);
+
+/// Admin changed the instance-wide default healthcheck of managed service
+/// containers. Both ends are recorded (null = built-in).
+#[derive(Debug, Clone, Serialize)]
+pub struct ManagedServiceHealthcheckDefaultsUpdatedAudit {
+    pub context: AuditContext,
+    pub previous: temps_providers_core::healthcheck::HealthcheckOverrides,
+    pub current: temps_providers_core::healthcheck::HealthcheckOverrides,
+}
+
+healthcheck_audit_operation!(
+    ManagedServiceHealthcheckDefaultsUpdatedAudit,
+    "MANAGED_SERVICE_HEALTHCHECK_DEFAULTS_UPDATED"
+);

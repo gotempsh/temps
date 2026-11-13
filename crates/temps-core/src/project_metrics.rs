@@ -5,7 +5,7 @@
 //!
 //! Project alarm rules (`metric_alert_rules`) are evaluated over the OTEL
 //! metrics store, keyed by project. A feature that wants its own metrics to be
-//! alertable with ordinary rules (ADR-103 §10) writes them through this sink;
+//! alertable with ordinary rules (ADR-106 §10) writes them through this sink;
 //! `temps-otel` implements it. The producer aggregates in memory and calls
 //! [`ProjectMetricsSink::record`] on an interval, never per operation.
 

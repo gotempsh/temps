@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! One journal entry of a workflow run (ADR-103 §3, §5, §9).
+//! One journal entry of a workflow run (ADR-106 §3, §5, §9).
 //!
 //! Keyed `(run_id, sequence)`: recording the same entry twice returns the
 //! first recording, which is what makes results recorded exactly once.

@@ -96,7 +96,7 @@ pub(super) async fn register_core_services(
     });
     service_context.register_service(local_workload_policy.clone());
     // Host or container: how a deployment container's internal address is
-    // reached from this process (workflow executors, ADR-103).
+    // reached from this process (workflow executors, ADR-106).
     service_context.register_service(runtime_context);
     // Pre-registered here (rather than left solely to AuthPlugin, which also
     // registers an equivalent instance) because TeamsPlugin, GitPlugin,

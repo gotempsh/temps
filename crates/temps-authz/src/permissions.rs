@@ -265,7 +265,7 @@ pub enum Permission {
     EdgeRulesRead,
     EdgeRulesWrite,
 
-    // Durable workflow permissions (ADR-103). Runs, their steps and events
+    // Durable workflow permissions (ADR-106). Runs, their steps and events
     // are separate from deployments; reading decrypted payloads is its own
     // permission, held by admins only.
     WorkflowsRead,

@@ -69,7 +69,7 @@ function ServiceAccessPanel({
   const openEditor = (serviceId?: string) => {
     const suffix = serviceId ? `${encodeURIComponent(serviceId)}/edit` : 'new'
     const query = new URLSearchParams(sandboxId ? { sandbox: sandboxId } : {})
-    navigate(`/projects/${projectId}/access-services/${suffix}?${query}`)
+    navigate(`/access-services/${suffix}?${query}`)
   }
   const [grantMode, setGrantMode] = useState<'request' | 'approve'>('request')
   const [requesting, setRequesting] = useState<AccessServiceResponse>()

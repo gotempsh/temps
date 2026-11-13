@@ -9,7 +9,8 @@ use sea_orm::entity::prelude::*;
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: String,
-    pub project_id: i32,
+    pub project_id: Option<i32>,
+    pub retired_at: Option<chrono::DateTime<chrono::Utc>>,
     pub name: String,
     pub policy: Json,
     pub max_ttl_seconds: i32,
@@ -57,8 +58,9 @@ mod tests {
     fn debug_reports_credential_presence_without_exposing_ciphertext() {
         let now = chrono::Utc::now();
         let mut service = Model {
+            retired_at: None,
             id: "svc_test".into(),
-            project_id: 7,
+            project_id: Some(7),
             name: "API".into(),
             policy: serde_json::json!({}),
             max_ttl_seconds: 900,

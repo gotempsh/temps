@@ -935,7 +935,8 @@ mod tests {
                 "plugin.reports.create",
                 json!({}),
                 &scope,
-                prepared.plugin_revision.as_deref()
+                prepared.plugin_revision.as_deref(),
+                crate::WriteApproval::OwnerInApp,
             )
             .await
             .is_err());
@@ -1223,9 +1224,87 @@ mod tests {
                 prepared.params,
                 &scope,
                 prepared.plugin_revision.as_deref(),
+                crate::WriteApproval::OwnerInApp,
             )
             .await
             .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn session_consent_marker_is_only_injected_by_approved_execution() {
+        use temps_core::ai_tool_call::{require_human_confirmation, AiToolCall, ConfirmedAiWrite};
+        let handler = |req: Request| async move {
+            match require_human_confirmation(
+                req.extensions().get::<AiToolCall>(),
+                req.extensions().get::<ConfirmedAiWrite>(),
+                "create_access_session_general",
+            ) {
+                Ok(()) => StatusCode::ACCEPTED.into_response(),
+                Err(error) => error.into_response(),
+            }
+        };
+        let router = Router::new().route("/session", axum::routing::post(handler));
+        let spec = OpenApiBuilder::new()
+            .info(utoipa::openapi::Info::new("Fixture", "1"))
+            .paths(
+                PathsBuilder::new()
+                    .path(
+                        "/session",
+                        PathItem::new(
+                            utoipa::openapi::path::HttpMethod::Post,
+                            OperationBuilder::new()
+                                .operation_id(Some("create_access_session_general"))
+                                .build(),
+                        ),
+                    )
+                    .build(),
+            )
+            .build();
+        let caller = InternalApiCaller::new_write_allowlisted(
+            router,
+            &spec,
+            vec!["create_access_session_general".into()],
+        );
+        let scope = ApiCallScope {
+            auth: auth_with_role(7, Role::Admin),
+            project_scope: ProjectSelectorScope::Unrestricted,
+            origin: None,
+            secrets: None,
+        };
+        let ordinary = caller
+            .execute_write("create_access_session_general", json!({}), &scope)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            ordinary,
+            crate::ApiToolError::Upstream { status: 403, .. }
+        ));
+        // A relayed proposal token (an MCP client's confirm_action) is
+        // something the model itself can replay, so it is not consent.
+        let relayed = caller
+            .execute_approved_write(
+                "create_access_session_general",
+                json!({}),
+                &scope,
+                None,
+                crate::WriteApproval::ProposalToken,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            relayed,
+            crate::ApiToolError::Upstream { status: 403, .. }
+        ));
+        let confirmed = caller
+            .execute_approved_write(
+                "create_access_session_general",
+                json!({}),
+                &scope,
+                None,
+                crate::WriteApproval::OwnerInApp,
+            )
+            .await
+            .unwrap();
+        assert_eq!(confirmed.status, 202);
     }
 }

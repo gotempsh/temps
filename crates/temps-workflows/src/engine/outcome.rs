@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Applying how an invocation ended (ADR-103 §4): every outcome releases the
+//! Applying how an invocation ended (ADR-106 §4): every outcome releases the
 //! lease with a write fenced by it, so an outcome reported by an invocation
 //! that already lost its lease changes nothing.
 

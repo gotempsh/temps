@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! The workflows service: the operations behind the management API and the
-//! app-facing API (ADR-103 §10, §11). Every method is scoped to a project and
+//! app-facing API (ADR-106 §10, §11). Every method is scoped to a project and
 //! environment and checks that the environment belongs to the project, and
 //! that a run belongs to the environment, before anything else.
 

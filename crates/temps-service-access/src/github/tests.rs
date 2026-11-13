@@ -28,6 +28,7 @@ pub(crate) fn policy(protocol: GithubAccessProtocol) -> SandboxAccessPolicy {
             repository: "repo".into(),
             protocol,
         }),
+        delivery: None,
     }
 }
 

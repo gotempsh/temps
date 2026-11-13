@@ -62,12 +62,51 @@ fn cluster_dns_wanted(read: Option<bool>, previous: bool) -> bool {
     read.unwrap_or(previous)
 }
 
+/// What the control plane needs to serve `*.temps.local` HTTP calls to its
+/// own containers next to its resolver (ADR-104): the route table it serves
+/// from and where the routes snapshot is kept. `None` in a standalone
+/// `temps proxy`, whose console process deploys the containers and so never
+/// points them at this process's resolver.
+pub(crate) struct LocalRouting {
+    pub peer_table: Arc<temps_proxy::CachedPeerTable>,
+    pub data_dir: std::path::PathBuf,
+    /// Where the deployment DNS publisher points the names when no worker
+    /// can serve them: the gateway, only while the internal proxy serves its
+    /// port 80 (ADR-104 D3). Never set while it does not, so a call to a
+    /// name cannot reach whatever else holds that port.
+    pub names_slot: temps_dns::OverlayDnsSlot,
+}
+
+/// Reload the route table once, so the deployment DNS publisher runs and
+/// points the names at the gateway now served, or withdraws them (ADR-104
+/// D3). In the background: a reload reads the database and must not delay
+/// the resolver loop.
+fn republish_names(
+    peer_table: &Arc<temps_proxy::CachedPeerTable>,
+    served: Option<std::net::IpAddr>,
+) {
+    let peer_table = peer_table.clone();
+    tokio::spawn(async move {
+        if let Err(error) = peer_table.load_routes().await {
+            warn!(
+                error = %error,
+                served_gateway = ?served,
+                "Could not reload routes after the control plane's DNS gateway changed; internal names follow on the next route reload"
+            );
+        }
+    });
+}
+
 /// Runs the control-plane cluster resolver while cluster DNS is enabled.
 ///
 /// The setting is read on every pass, so turning it on or off in the
 /// console takes effect within one pass, without restarting `temps serve`.
 /// While it is off the resolver is stopped and the slot is empty, and new
 /// containers keep Docker's embedded DNS.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each input is a distinct process-wide handle the loop owns; a struct would only rename them"
+)]
 pub(crate) fn spawn_control_plane_dns_bootstrap(
     runtime: &tokio::runtime::Handle,
     db: Arc<DbConnection>,
@@ -76,8 +115,19 @@ pub(crate) fn spawn_control_plane_dns_bootstrap(
     overlay_dns_slot: temps_dns::OverlayDnsSlot,
     dns_policy: Option<temps_dns::DnsPolicySlot>,
     config_service: Arc<temps_config::ConfigService>,
+    local_routing: Option<LocalRouting>,
 ) {
     runtime.spawn(async move {
+        let routing_docker = (*docker).clone();
+        // ADR-104: the internal proxy that answers the names this resolver
+        // gives local containers, on the same gateway, while it serves.
+        let mut routing: Option<super::internal_routing::ControlPlaneRouting> = None;
+        // The gateway the names were last published for, so they are
+        // republished only when it changes.
+        let mut published: Option<std::net::IpAddr> = None;
+        // Whether no worker has a bridge; kept as it was when the nodes
+        // cannot be read.
+        let mut single_server = false;
         let docker_runtime = temps_deployer::docker::DockerRuntime::new(
             docker,
             true,
@@ -124,15 +174,27 @@ pub(crate) fn spawn_control_plane_dns_bootstrap(
             if !enabled {
                 last_error = None;
             }
+            let routing_report = routing
+                .as_ref()
+                .and_then(|_| super::internal_routing::ControlPlaneRouting::report());
             reporter
-                .maybe_report(active.as_ref(), last_error.as_deref())
+                .maybe_report(active.as_ref(), last_error.as_deref(), routing_report)
                 .await;
             if !enabled {
                 if let Err(error) = publish_dns_gateway(&overlay_dns_slot, None) {
                     warn!(error = %error, "Could not clear the cluster DNS slot");
                 }
+                if let Some(running) = routing.take() {
+                    running.stop().await;
+                }
                 if let Some(resolver) = active.take() {
                     resolver.shutdown().await;
+                }
+                if published.take().is_some() {
+                    if let Some(local) = local_routing.as_ref() {
+                        let _ = publish_dns_gateway(&local.names_slot, None);
+                        republish_names(&local.peer_table, None);
+                    }
                 }
                 failures = 0;
                 tokio::time::sleep(DNS_RETRY_INTERVAL).await;
@@ -150,6 +212,7 @@ pub(crate) fn spawn_control_plane_dns_bootstrap(
             .await
             .unwrap_or(Err(ProxyDnsBootstrapError::NetworkTimeout));
 
+            let served = gateway.as_ref().ok().copied();
             let attempt = match gateway {
                 Ok(gateway) => {
                     let healthy = if active.as_ref().is_some_and(|resolver| resolver.gateway() == gateway) {
@@ -182,6 +245,52 @@ pub(crate) fn spawn_control_plane_dns_bootstrap(
                 Err(error) => Err(error),
             };
             last_error = attempt.as_ref().err().map(ToString::to_string);
+            let now_served = attempt.as_ref().ok().and(served);
+            // The proxy follows the resolver: same gateway, and only while it
+            // answers there and no worker has a bridge, which is when the
+            // names point here (ADR-104 D1). With workers it stays off, so it
+            // never competes for the redirect table with an agent that runs
+            // on this host.
+            if local_routing.is_some() && now_served.is_some() {
+                match temps_dns::services::deployment_publisher::worker_bridge_gateways(db.as_ref()).await {
+                    Ok(bridges) => single_server = bridges.is_empty(),
+                    Err(error) => warn!(
+                        error = %error,
+                        single_server,
+                        "Could not list worker nodes; the control plane's internal routing stays as it is"
+                    ),
+                }
+            }
+            let route_on = now_served.filter(|_| single_server);
+            let names_on = route_on.filter(|gateway| {
+                routing.as_ref().is_some_and(|running| running.gateway() == *gateway)
+                    && temps_node_agent::internal_routing::current_status().is_some_and(|status| {
+                        status.listening && status.address.ip() == *gateway
+                    })
+            });
+            if routing.as_ref().map(|r| r.gateway()) != route_on {
+                if let Some(running) = routing.take() {
+                    running.stop().await;
+                }
+                if let (Some(gateway), Some(local)) = (route_on, local_routing.as_ref()) {
+                    routing = Some(super::internal_routing::ControlPlaneRouting::start(
+                        gateway,
+                        local.peer_table.clone(),
+                        db.clone(),
+                        routing_docker.clone(),
+                        &local.data_dir,
+                    ));
+                }
+            }
+            if published != names_on {
+                published = names_on;
+                if let Some(local) = local_routing.as_ref() {
+                    if let Err(error) = publish_dns_gateway(&local.names_slot, names_on) {
+                        warn!(error = %error, "Could not update the control plane's internal names slot");
+                    }
+                    republish_names(&local.peer_table, names_on);
+                }
+            }
             match attempt {
                 Ok(()) => failures = 0,
                 Err(error) => {
@@ -215,6 +324,7 @@ pub(crate) fn spawn_control_plane_dns_bootstrap_with_docker_discovery(
     overlay_dns_slot: temps_dns::OverlayDnsSlot,
     dns_policy: Option<temps_dns::DnsPolicySlot>,
     config_service: Arc<temps_config::ConfigService>,
+    local_routing: Option<LocalRouting>,
 ) {
     let runtime_handle = runtime.clone();
     runtime.spawn(async move {
@@ -247,6 +357,7 @@ pub(crate) fn spawn_control_plane_dns_bootstrap_with_docker_discovery(
                         overlay_dns_slot,
                         dns_policy,
                         config_service,
+                        local_routing,
                     );
                     return;
                 }
@@ -372,6 +483,7 @@ pub fn start_proxy_server(
     project_ip_gate: Arc<dyn temps_core::ProjectIpGate>,
     request_policy_gate: Arc<dyn temps_core::RequestPolicyGate>,
     overlay_dns_slot: temps_dns::OverlayDnsSlot,
+    internal_names_slot: temps_dns::OverlayDnsSlot,
     dns_policy: Option<temps_dns::DnsPolicySlot>,
     docker: Option<Arc<bollard::Docker>>,
     local_workloads_enabled: bool,
@@ -444,6 +556,13 @@ pub fn start_proxy_server(
     };
     // The resolver loop follows the setting itself; see
     // `spawn_control_plane_dns_bootstrap`.
+    // ADR-104: this process deploys the local containers and owns the route
+    // table, so it also answers their `*.temps.local` calls.
+    let local_routing = || LocalRouting {
+        peer_table: route_table.clone(),
+        data_dir: config.data_dir.clone(),
+        names_slot: internal_names_slot.clone(),
+    };
     if let Some(docker) = docker {
         spawn_control_plane_dns_bootstrap(
             rt.handle(),
@@ -453,6 +572,7 @@ pub fn start_proxy_server(
             overlay_dns_slot.clone(),
             dns_policy.clone(),
             config_service.clone(),
+            Some(local_routing()),
         );
     } else if local_workloads_enabled {
         spawn_control_plane_dns_bootstrap_with_docker_discovery(
@@ -462,6 +582,7 @@ pub fn start_proxy_server(
             overlay_dns_slot.clone(),
             dns_policy.clone(),
             config_service.clone(),
+            Some(local_routing()),
         );
     }
 

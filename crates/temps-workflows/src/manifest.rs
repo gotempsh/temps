@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! The workflow manifest of each environment, read from its executor and
-//! cached in memory, never stored (ADR-103 §3).
+//! cached in memory, never stored (ADR-106 §3).
 //!
 //! An entry is keyed on the environment's current deployment, so a new
 //! deployment is read afresh; it otherwise lives [`MANIFEST_TTL`]. The cache

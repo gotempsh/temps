@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Child workflows (ADR-103 §4, M2).
+//! Child workflows (ADR-106 §4, M2).
 //!
 //! A `child` journal entry starts a run of another workflow in the same
 //! environment. The child is started exactly once: its idempotency key is

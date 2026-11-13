@@ -4,7 +4,7 @@
 //! [`ProjectMetricsSink`] over the OTEL metrics store.
 //!
 //! Metrics the control plane produces for a project (durable workflows,
-//! ADR-103 §10) land in the same store as the project's OTLP metrics, so
+//! ADR-106 §10) land in the same store as the project's OTLP metrics, so
 //! ordinary metric alert rules and dashboards read them. Samples arrive in
 //! batches from an interval flush, never per operation; they are attributed
 //! to the `temps` service so they never mix with an application's own.

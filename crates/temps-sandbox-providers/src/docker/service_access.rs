@@ -12,6 +12,9 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
 pub(super) const MOUNT_LABEL: &str = "sh.temps.sandbox.service-access.mount";
+/// Why a control plane without a local Unix mount root cannot host service
+/// access. Shown to the operator as the fix, so it names what to change.
+pub(super) const SERVICE_ACCESS_HOST_UNSUPPORTED: &str = "this control plane cannot share Unix sockets with the Docker daemon (service access needs a Linux host running Docker locally; macOS and Docker Desktop are not supported)";
 pub(super) const GUEST_DIRECTORY: &str = "/run/temps-service-access";
 
 pub use crate::service_access::ServiceAccessTarget;
@@ -329,12 +332,9 @@ impl AccessMounts {
         info: &bollard::models::ContainerInspectResponse,
     ) -> Result<ServiceAccessTarget, AgentError> {
         let (id, _) = running_identity(info)?;
-        let mount_id = mount_id(info).ok_or_else(|| {
-            failure(
-                &id,
-                "recover proxy mount",
-                "host proxy mount unavailable: use a compatible sandbox image and a worker sharing the Docker daemon filesystem",
-            )
+        let mount_id = mount_id(info).ok_or_else(|| AgentError::ServiceAccessUnavailable {
+            sandbox_id: id.clone(),
+            reason: "this sandbox was created without the service access proxy mount; recreate it with a sandbox image labelled sh.temps.service-access.protocol=1 on a Linux Docker host".into(),
         })?;
         let permit = Arc::clone(&self.permits)
             .try_acquire_owned()
@@ -576,13 +576,13 @@ impl DockerSandboxProvider {
         &self,
         handle: &SandboxHandle,
     ) -> Result<ServiceAccessTarget, AgentError> {
-        let mounts = self.service_access.as_ref().ok_or_else(|| {
-            failure(
-                &handle.sandbox_id,
-                "resolve proxy",
-                "this host has no local Unix mount transport",
-            )
-        })?;
+        let mounts =
+            self.service_access
+                .as_ref()
+                .ok_or_else(|| AgentError::ServiceAccessUnavailable {
+                    sandbox_id: handle.sandbox_id.clone(),
+                    reason: SERVICE_ACCESS_HOST_UNSUPPORTED.into(),
+                })?;
         let _operation = mounts.operation(&handle.sandbox_id)?;
         let info = self.inspect_handle_policy(handle).await?;
         match mounts.target(&info) {

@@ -4,27 +4,31 @@
 import { useEffect, useState } from 'react'
 import { useNavigate, useParams, useSearchParams } from 'react-router'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { Callout, PageContainer, PageState } from '@temps-sdk/ds'
+import { Callout, PageContainer, PageHeader, PageState } from '@temps-sdk/ds'
 import { Button, Skeleton } from '@temps-sdk/ui'
 import { PlugZap } from 'lucide-react'
-import type { AccessServiceResponse } from '@/api/client'
+import type { AccessServiceResponse, ServiceCatalogEntry } from '@/api/client'
 import {
-  accessCapabilityOptions,
-  getAccessServiceOptions,
+  generalAccessCapabilityOptions,
+  getAccessServiceGeneralOptions,
+  serviceCatalogOptions,
 } from '@/api/client/@tanstack/react-query.gen'
+import { ServiceCatalogPicker } from '@/components/service-access/ServiceCatalogPicker'
 import { AccessServiceEditor } from '@/components/service-access/AccessServiceEditor'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { problemDetail } from '@/lib/api-problem'
 
 function Editor({
-  projectId,
   vaultId,
+  catalogEntry,
+  onChangeService,
   service,
   canUseProjectGithub,
   onClose,
   onSaved,
 }: {
-  projectId: number
+  catalogEntry?: ServiceCatalogEntry
+  onChangeService?: () => void
   vaultId?: string
   service?: AccessServiceResponse
   canUseProjectGithub: boolean
@@ -36,7 +40,8 @@ function Editor({
   const [initialService] = useState(service)
   return (
     <AccessServiceEditor
-      projectId={projectId}
+      catalogEntry={catalogEntry}
+      onChangeService={onChangeService}
       vaultId={vaultId}
       service={initialService}
       canUseProjectGithub={canUseProjectGithub}
@@ -47,28 +52,50 @@ function Editor({
 }
 
 export default function AccessServicePage() {
-  const { projectId: rawProjectId, serviceId } = useParams()
-  const [params] = useSearchParams()
+  const { serviceId } = useParams()
+  const [params, setParams] = useSearchParams()
+  const providerId = params.get('provider') ?? ''
+  const configure =
+    !serviceId && params.get('step') === 'configure' && !!providerId
+  const selected = useQuery({
+    ...serviceCatalogOptions({ query: { id: providerId } }),
+    enabled: !serviceId && !!providerId && providerId !== 'custom',
+  })
+  const entry: ServiceCatalogEntry | undefined =
+    providerId === 'custom'
+      ? {
+          id: 'custom',
+          name: 'Custom HTTP service',
+          description: '',
+          category: 'Custom',
+          supported: true,
+          logo: 'custom',
+          popular: false,
+          credential_labels: [],
+          credential_help: { notes: [] },
+        }
+      : selected.data?.items.find((item) => item.id === providerId)
+  const catalogStep = () => {
+    const next = new URLSearchParams(params)
+    next.set('step', 'select')
+    setParams(next)
+  }
   const navigate = useNavigate()
   const client = useQueryClient()
   const { setBreadcrumbs } = useBreadcrumbs()
-  const projectId = Number(rawProjectId)
-  const valid =
-    Number.isInteger(projectId) && projectId > 0 && projectId <= 2147483647
   const capability = useQuery({
-    ...accessCapabilityOptions({ path: { project_id: projectId } }),
-    enabled: valid,
+    ...generalAccessCapabilityOptions(),
     retry: false,
   })
   const service = useQuery({
-    ...getAccessServiceOptions({
-      path: { project_id: projectId, service_id: serviceId ?? '' },
+    ...getAccessServiceGeneralOptions({
+      path: { service_id: serviceId ?? '' },
     }),
-    enabled: valid && !!serviceId,
+    enabled: !!serviceId,
     retry: false,
     refetchOnMount: 'always',
   })
-  const editorKey = `${projectId}:${serviceId ?? 'new'}`
+  const editorKey = `${serviceId ?? 'new'}`
   const [loadedEditorKey, setLoadedEditorKey] = useState<string>()
   const hasLoadedService = loadedEditorKey === editorKey
   // Latch the first successful read for this route. Later refetch failures must
@@ -84,14 +111,6 @@ export default function AccessServicePage() {
   useEffect(() => {
     setBreadcrumbs([
       { label: 'Vault', href: '/vault' },
-      ...(valid
-        ? [
-            {
-              label: `Project ${projectId}`,
-              href: `/vault/projects/${projectId}`,
-            },
-          ]
-        : []),
       {
         label: serviceId
           ? (service.data?.name ?? 'Edit service')
@@ -99,46 +118,46 @@ export default function AccessServicePage() {
       },
     ])
     return () => setBreadcrumbs([])
-  }, [projectId, valid, serviceId, service.data?.name, setBreadcrumbs])
+  }, [serviceId, service.data?.name, setBreadcrumbs])
   const back = () => {
     const vault = params.get('vault')
     const sandbox = params.get('sandbox')
     navigate(
-      valid
-        ? `/vault/projects/${projectId}${vault ? `/vaults/${encodeURIComponent(vault)}` : ''}${sandbox ? `?sandbox=${encodeURIComponent(sandbox)}` : ''}`
-        : '/vault'
+      `/vault${vault ? `/vaults/${encodeURIComponent(vault)}` : ''}${sandbox ? `?sandbox=${encodeURIComponent(sandbox)}` : ''}`
     )
   }
   const saved = () => {
-    void client.invalidateQueries({ queryKey: [{ _id: 'listAccessVaults' }] })
-    void client.invalidateQueries({ queryKey: [{ _id: 'getAccessVault' }] })
-    void client.invalidateQueries({ queryKey: [{ _id: 'listAccessServices' }] })
+    void client.invalidateQueries({
+      queryKey: [{ _id: 'listAccessVaultsGeneral' }],
+    })
+    void client.invalidateQueries({
+      queryKey: [{ _id: 'getAccessVaultGeneral' }],
+    })
+    void client.invalidateQueries({
+      queryKey: [{ _id: 'listAccessServicesGeneral' }],
+    })
     void client.invalidateQueries({ queryKey: [{ _id: 'listServiceGrants' }] })
-    void client.invalidateQueries({ queryKey: [{ _id: 'getAccessService' }] })
+    void client.invalidateQueries({
+      queryKey: [{ _id: 'getAccessServiceGeneral' }],
+    })
   }
   return (
-    <PageContainer width="form">
-      {!valid || (serviceId && service.isError && !hasLoadedService) ? (
+    <PageContainer width={!serviceId && !configure ? 'full' : 'form'}>
+      {serviceId && service.isError && !hasLoadedService ? (
         <PageState
           variant="failed"
           icon={PlugZap}
           title="Could not load service"
-          description={
-            !valid
-              ? 'The project ID in this link is invalid.'
-              : problemDetail(
-                  service.error,
-                  'Check project access or return to Vault to select a service.'
-                )
-          }
+          description={problemDetail(
+            service.error,
+            'Check access or return to Vault to select a service.'
+          )}
           action={
             <div className="flex gap-2">
               <Button variant="outline" onClick={back}>
                 Back to Vault
               </Button>
-              {valid && (
-                <Button onClick={() => void service.refetch()}>Retry</Button>
-              )}
+              <Button onClick={() => void service.refetch()}>Retry</Button>
             </div>
           }
         />
@@ -147,7 +166,7 @@ export default function AccessServicePage() {
           variant="failed"
           icon={PlugZap}
           title="Could not check service permissions"
-          description="Retry to verify project write permission before editing."
+          description="Retry to verify administrator permission before editing."
           action={
             <Button onClick={() => void capability.refetch()}>Retry</Button>
           }
@@ -163,7 +182,7 @@ export default function AccessServicePage() {
           variant="failed"
           icon={PlugZap}
           title="Service policies are read-only"
-          description="Editing services requires project write permission. Ask a project administrator for access."
+          description="Editing services requires an instance administrator."
           action={
             <Button variant="outline" onClick={back}>
               Back to Vault
@@ -183,18 +202,92 @@ export default function AccessServicePage() {
               </Button>
             </Callout>
           )}
-          <fieldset disabled={capability.isError} className="min-w-0">
-            <Editor
-              key={editorKey}
-              projectId={projectId}
-              vaultId={params.get('vault') ?? undefined}
-              service={service.data}
-              canUseProjectGithub={
-                capability.data?.can_use_project_github === true
+          {!serviceId && (!configure || !entry?.supported) && (
+            <PageHeader
+              title={
+                configure
+                  ? (entry?.name ?? 'Configure service')
+                  : 'Choose a service'
               }
-              onClose={back}
-              onSaved={saved}
+              actions={
+                <Button
+                  variant="outline"
+                  onClick={configure ? catalogStep : back}
+                >
+                  {configure ? 'Change service' : 'Cancel'}
+                </Button>
+              }
             />
+          )}
+          {!serviceId && !configure && (
+            <ServiceCatalogPicker
+              selectedId={providerId}
+              disabled={capability.isError}
+              searchValue={params.get('q') ?? ''}
+              pageValue={Math.min(
+                1_000_000,
+                Math.max(1, Math.floor(Number(params.get('page')) || 1))
+              )}
+              onSearchChange={(q) => {
+                const next = new URLSearchParams(params)
+                next.set('q', q)
+                next.delete('page')
+                setParams(next, { replace: true })
+              }}
+              onPageChange={(page) => {
+                const next = new URLSearchParams(params)
+                next.set('page', String(page))
+                setParams(next)
+              }}
+              onSelect={(item) => {
+                const next = new URLSearchParams(params)
+                next.set('provider', item.id)
+                next.set('step', 'configure')
+                setParams(next)
+                window.scrollTo({ top: 0 })
+              }}
+            />
+          )}
+          {!serviceId &&
+            configure &&
+            !entry &&
+            (selected.isPending ? (
+              <Skeleton className="h-48" />
+            ) : (
+              <Callout tone="error" title="Could not load selected service">
+                <Button onClick={catalogStep}>Choose a service</Button>
+                <Button
+                  variant="outline"
+                  onClick={() => void selected.refetch()}
+                >
+                  Retry
+                </Button>
+              </Callout>
+            ))}
+          {!serviceId && configure && entry && !entry.supported && (
+            <Callout title="This service is not supported yet">
+              {entry.reason}
+            </Callout>
+          )}
+          <fieldset
+            hidden={!serviceId && (!configure || !entry?.supported)}
+            disabled={capability.isError}
+            className="min-w-0"
+          >
+            {(serviceId || entry?.supported) && (
+              <Editor
+                key={`${editorKey}:${providerId}`}
+                catalogEntry={entry}
+                onChangeService={!serviceId ? catalogStep : undefined}
+                vaultId={params.get('vault') ?? undefined}
+                service={service.data}
+                canUseProjectGithub={
+                  capability.data?.can_use_project_github === true
+                }
+                onClose={back}
+                onSaved={saved}
+              />
+            )}
           </fieldset>
         </>
       )}

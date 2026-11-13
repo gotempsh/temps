@@ -73,31 +73,33 @@ async fn list_audit_logs(
     let from_date = query.from.map(Into::into);
     let to_date = query.to.map(Into::into);
 
-    match app_state
+    let logs = app_state
         .audit_service
-        .filter_audit_logs(
-            query.operation_type.as_deref(),
-            query.user_id,
-            from_date,
-            to_date,
-            query.limit.unwrap_or(100),
-            query.offset.unwrap_or(0),
-        )
-        .await
-    {
-        Ok(logs) => {
-            let responses: Vec<AuditLogResponse> = logs.into_iter().map(Into::into).collect();
-            Ok(Json(responses))
-        }
-        Err(e) => {
-            error!("Failed to list audit logs: {}", e);
-            Err(
+        .filter_audit_logs(crate::services::AuditLogFilter {
+            action: query.operation_type.as_deref(),
+            resource_id: query.resource_id.as_deref(),
+            user_id: query.user_id,
+            from: from_date,
+            to: to_date,
+            limit: query.limit.unwrap_or(20),
+            offset: query.offset.unwrap_or(0),
+        })
+        .await?;
+    let responses: Vec<AuditLogResponse> = logs.into_iter().map(Into::into).collect();
+    Ok(Json(responses))
+}
+
+impl From<crate::services::AuditQueryError> for temps_core::problemdetails::Problem {
+    fn from(error: crate::services::AuditQueryError) -> Self {
+        match error {
+            error @ crate::services::AuditQueryError::Read { .. } => {
+                error!(error = %error, "Failed to list audit logs");
                 temps_core::error_builder::ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .type_("https://temps.sh/probs/audit-error")
                     .title("Audit Log Error")
-                    .detail(format!("Failed to list audit logs: {}", e))
-                    .build(),
-            )
+                    .detail("Could not list audit logs; see the server logs")
+                    .build()
+            }
         }
     }
 }
@@ -205,6 +207,7 @@ mod tests {
     fn empty_query() -> ListAuditLogsQuery {
         ListAuditLogsQuery {
             operation_type: None,
+            resource_id: None,
             user_id: None,
             from: None,
             to: None,
@@ -227,6 +230,62 @@ mod tests {
             .await
             .err()
             .map(|p| p.status_code)
+    }
+
+    #[tokio::test]
+    async fn resource_filter_returns_an_empty_success_and_contextual_problem() {
+        use axum::response::IntoResponse;
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([
+                    // Vault audit attribution is complete.
+                    vec![std::collections::BTreeMap::from([(
+                        "ready".to_owned(),
+                        sea_orm::Value::Bool(Some(true)),
+                    )])],
+                    Vec::<std::collections::BTreeMap<String, sea_orm::Value>>::new(),
+                ])
+                .into_connection(),
+        );
+        let geoip = Arc::new(GeoIpService::Mock(MockGeoIpService::new()));
+        let service = Arc::new(AuditService::new(
+            db.clone(),
+            Arc::new(IpAddressService::new(db, geoip)),
+        ));
+        let query = ListAuditLogsQuery {
+            resource_id: Some("vault_fixture".into()),
+            ..empty_query()
+        };
+        let response = list_audit_logs(
+            State(Arc::new(AppState {
+                audit_service: service,
+            })),
+            RequireAuth(AuthContext::new_session(test_user(), Role::Admin)),
+            Query(query.clone()),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(bytes.as_ref(), b"[]");
+        let problem = list_audit_logs(
+            State(app_state()),
+            RequireAuth(AuthContext::new_session(test_user(), Role::Admin)),
+            Query(query),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(serde_json::to_string(&problem.body)
+            .unwrap()
+            .contains("Could not list audit logs; see the server logs"));
+        assert!(!serde_json::to_string(&problem.body)
+            .unwrap()
+            .contains("vault_fixture"));
     }
 
     /// The response is a bare array, so a capped limit would look like the end of

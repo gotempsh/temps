@@ -31,6 +31,7 @@ async fn failed_delivery_cannot_retire_a_newer_approval() {
                     origin: "https://api.example.com".into(),
                     path_prefixes: vec!["/".into()],
                     methods: vec![AccessMethod::Get],
+                    delivery: None,
                 },
                 max_ttl_seconds: 300,
                 enabled: true,

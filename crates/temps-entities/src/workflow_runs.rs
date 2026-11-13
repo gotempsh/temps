@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! One durable workflow run (ADR-103 §3, §5).
+//! One durable workflow run (ADR-106 §3, §5).
 //!
 //! Scheduling state and plaintext metadata live here; the input, output and
 //! error are ciphertext (`*_encrypted`, or offloaded to `*_blob_key`) bound

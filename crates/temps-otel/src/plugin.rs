@@ -1473,7 +1473,7 @@ impl TempsPlugin for OtelPlugin {
                 None => storage,
             };
             context.register_service(storage.clone());
-            // Control-plane metrics of a project (durable workflows, ADR-103)
+            // Control-plane metrics of a project (durable workflows, ADR-106)
             // go to the same store, so ordinary alert rules read them.
             context.register_service(Arc::new(
                 crate::project_metrics_sink::OtelProjectMetricsSink::new(storage.clone()),

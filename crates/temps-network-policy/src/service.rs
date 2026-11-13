@@ -187,11 +187,15 @@ impl NameRow {
     /// may resolve the names of what its rules allow. A standalone service
     /// publishes as `service_role` (owner: the service), a cluster member as
     /// `service_member` (owner: the member row, joined to its service), an
-    /// environment as `environment`. Node and static names belong to no
-    /// workload.
+    /// environment as `environment` and its subdomain alias as
+    /// `environment_subdomain`. Node and static names belong to no workload.
     fn named_workload(self) -> Option<NamedWorkload> {
         let owner = match (self.owner_kind.as_str(), self.service_id) {
-            ("environment", _) => WorkloadRef::new(WorkloadKind::Deployment, self.owner_id),
+            // An environment's subdomain alias (ADR-105 D7) names the same
+            // workload as its `<env>.<project>` name.
+            ("environment" | temps_core::internal_access::ENVIRONMENT_ALIAS_OWNER_KIND, _) => {
+                WorkloadRef::new(WorkloadKind::Deployment, self.owner_id)
+            }
             ("service_role", _) => WorkloadRef::new(WorkloadKind::Service, self.owner_id),
             ("service_member", Some(service_id)) => {
                 WorkloadRef::new(WorkloadKind::Service, i64::from(service_id))
@@ -1472,6 +1476,19 @@ mod tests {
                 "production.alpha.temps.local".into(),
                 WorkloadRef::new(WorkloadKind::Deployment, 1)
             ))
+        );
+        assert_eq!(
+            owner(name_row(
+                "alpha-production.temps.local",
+                "environment_subdomain",
+                1,
+                None
+            )),
+            Some((
+                "alpha-production.temps.local".into(),
+                WorkloadRef::new(WorkloadKind::Deployment, 1)
+            )),
+            "an environment's subdomain alias names the same workload as its name"
         );
         assert_eq!(owner(name_row("w1.temps.local", "node", 3, None)), None);
         assert_eq!(

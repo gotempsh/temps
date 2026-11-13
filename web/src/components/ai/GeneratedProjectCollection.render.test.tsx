@@ -45,6 +45,21 @@ function render(project: Partial<ProjectResponse> | null) {
   )
 }
 
+describe('GeneratedProjectCollection labels', () => {
+  test('calls projects projects, so Vault services are not confused with them', () => {
+    const markup = render({
+      id: 2,
+      name: 'example-web',
+      slug: 'example-web',
+      preset: 'nextjs',
+      source_type: 'git',
+    })
+    expect(markup).toContain('Projects')
+    expect(markup).toContain('1 project')
+    expect(markup).not.toMatch(/service/i)
+  })
+})
+
 describe('GeneratedProjectCollection icons', () => {
   test('shows the preset logo and the project initial, not two letters of the name', () => {
     const markup = render({

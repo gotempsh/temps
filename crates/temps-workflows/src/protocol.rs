@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The executor protocol, version 1 (ADR-103 §3, §12).
+//! The executor protocol, version 1 (ADR-106 §3, §12).
 //!
 //! The normative description is `docs/reference/workflows-executor-protocol.md`;
 //! these types are its wire format. Temps sends [`InvokeRequest`] to the SDK's

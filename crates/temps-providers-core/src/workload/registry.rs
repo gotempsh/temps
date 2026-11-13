@@ -150,10 +150,15 @@ async fn create_enforced(
     let (plan, process, node) = enforced_plan(database, container_name, body)?;
     let values = process.secret_values();
     let instance = database_instance(&plan, SecretValues::Resolved(&values), &node)?;
+    // Adjusted for this host's daemon (`crate::healthcheck`).
+    let probes = crate::healthcheck::probes_for_daemon(
+        &instance.probes,
+        crate::healthcheck::start_interval_support(docker).await,
+    );
     let handle = DockerDriver::new(docker.clone())
         .create_data_with_binds(
             &instance.spec,
-            &instance.probes,
+            &probes,
             &instance.extras,
             &instance.attach,
             Vec::new(),

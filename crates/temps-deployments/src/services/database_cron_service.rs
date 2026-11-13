@@ -127,7 +127,7 @@ pub struct DatabaseCronConfigService {
     /// every plugin has registered. Unset means `job` crons are recorded
     /// as failed with that reason; `http` crons never use it.
     plane: OnceLock<Arc<WorkloadPlane>>,
-    /// Starts the runs of `workflow` crons (ADR-103 §9). Late-bound: set
+    /// Starts the runs of `workflow` crons (ADR-106 §9). Late-bound: set
     /// from `initialize_plugin_services` when the workflows plugin is
     /// loaded. Unset means `workflow` crons are recorded as failed with
     /// that reason.

@@ -40,6 +40,7 @@ describe('command navigation catalog', () => {
     for (const url of [
       '/settings/version',
       '/settings/request-timeouts',
+      '/settings/service-healthchecks',
       '/settings/traefik-discovery',
       '/settings/mcp-server',
       '/settings/otel-pipeline',

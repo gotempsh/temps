@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! What the rest of Temps may ask of the durable workflows engine
-//! (ADR-103 §9, M2/M3).
+//! (ADR-106 §9, M2/M3).
 //!
 //! `temps-workflows` implements [`WorkflowControl`]; the deployments crate
 //! reads it to start a run on a cron schedule, to follow the runs a cron

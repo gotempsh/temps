@@ -28,15 +28,15 @@
         "3306/tcp": {}
       },
       "Healthcheck": {
-        "Interval": 1000000000,
-        "Retries": 5,
-        "StartInterval": 1000000000,
-        "StartPeriod": 30000000000,
+        "Interval": 30000000000,
+        "Retries": 3,
+        "StartInterval": 2000000000,
+        "StartPeriod": 120000000000,
         "Test": [
           "CMD-SHELL",
           "mariadb-admin ping -h 127.0.0.1 -uroot -p\"$MARIADB_ROOT_PASSWORD\" --silent"
         ],
-        "Timeout": 3000000000
+        "Timeout": 5000000000
       },
       "HostConfig": {
         "Init": true,

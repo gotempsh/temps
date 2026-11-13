@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Event delivery (ADR-103 §8).
+//! Event delivery (ADR-106 §8).
 //!
 //! An event is stored first, then delivered to every run of the environment
 //! waiting on its name and key: the payload is re-encrypted under each run's

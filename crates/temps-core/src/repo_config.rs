@@ -107,7 +107,7 @@ pub struct SourceContextConfig {
 ///     concurrency_policy: forbid
 ///     retry_limit: 2
 ///     timeout_seconds: 1800
-///   - workflow: send-digest            # workflow (ADR-103)
+///   - workflow: send-digest            # workflow (ADR-106)
 ///     input: { "period": "weekly" }
 ///     schedule: "0 8 * * 1"
 /// ```

@@ -63,7 +63,7 @@
       "anyhow_in_library": 1
     },
     "temps-audit": {
-      "anyhow_in_library": 6
+      "anyhow_in_library": 4
     },
     "temps-auth": {
       "lazy_error_variants": 28,

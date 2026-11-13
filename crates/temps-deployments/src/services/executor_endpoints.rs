@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The invokable replicas of an environment's current deployment (ADR-103).
+//! The invokable replicas of an environment's current deployment (ADR-106).
 //!
 //! Implements [`ExecutorEndpoints`] for the durable workflows engine: which
 //! containers of the current deployment can take an invocation, and the

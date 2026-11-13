@@ -10,12 +10,18 @@ import {
   waitFor,
   within,
 } from '@testing-library/react'
-import { MemoryRouter, Route, Routes } from 'react-router'
+import {
+  MemoryRouter,
+  Route,
+  Routes,
+  useLocation,
+  useNavigate,
+} from 'react-router'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import type { AccessServiceResponse } from '@/api/client'
 import {
-  accessCapabilityOptions,
-  getAccessServiceOptions,
+  generalAccessCapabilityOptions,
+  getAccessServiceGeneralOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { installBrowserWindow } from '@/test/dom'
 import { jsonResponse, mockApi } from '@/test/fetch-mock'
@@ -45,6 +51,17 @@ const service: AccessServiceResponse = {
   updated_at: '2026-01-01T00:00:00Z',
 }
 
+function WizardProbe() {
+  const location = useLocation()
+  const navigate = useNavigate()
+  return (
+    <>
+      <output aria-label="URL">{location.search}</output>
+      <button onClick={() => navigate(-1)}>Browser back</button>
+    </>
+  )
+}
+
 function BreadcrumbProbe() {
   const { breadcrumbs } = useBreadcrumbs()
   return (
@@ -64,47 +81,41 @@ function mount(
   })
   if (cachedService) {
     client.setQueryData(
-      getAccessServiceOptions({
-        path: { project_id: 7, service_id: cachedService.id },
+      getAccessServiceGeneralOptions({
+        path: { service_id: cachedService.id },
       }).queryKey,
       cachedService
     )
   }
-  client.setQueryData(
-    accessCapabilityOptions({ path: { project_id: 7 } }).queryKey,
-    {
-      configured: false,
-      can_save_requests: true,
-      can_manage_services: canManage,
-      can_use_project_github: false,
-      can_manage_requests: canManage,
-      state: 'integration_unavailable',
-      reason: 'Integration unavailable.',
-      setup_path: null,
-    }
-  )
-  client.setQueryDefaults(
-    accessCapabilityOptions({ path: { project_id: 7 } }).queryKey,
-    { staleTime: Infinity }
-  )
+  client.setQueryData(generalAccessCapabilityOptions().queryKey, {
+    configured: false,
+    can_save_requests: true,
+    can_manage_services: canManage,
+    can_use_project_github: false,
+    can_manage_requests: canManage,
+    state: 'integration_unavailable',
+    reason: 'Integration unavailable.',
+    setup_path: null,
+  })
+  client.setQueryDefaults(generalAccessCapabilityOptions().queryKey, {
+    staleTime: Infinity,
+  })
   render(
     <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={[entry]}>
         <BreadcrumbProvider>
           <BreadcrumbProbe />
+          <WizardProbe />
           <Routes>
             <Route
-              path="/projects/:projectId/access-services/new"
+              path="/access-services/new"
               element={<AccessServicePage />}
             />
             <Route
-              path="/projects/:projectId/access-services/:serviceId/edit"
+              path="/access-services/:serviceId/edit"
               element={<AccessServicePage />}
             />
-            <Route
-              path="/vault/projects/:projectId"
-              element={<div>Returned to Vault</div>}
-            />
+            <Route path="/vault" element={<div>Returned to Vault</div>} />
           </Routes>
         </BreadcrumbProvider>
       </MemoryRouter>
@@ -119,17 +130,15 @@ test('direct editor URL loads masked service and preserves edits and version acr
     | undefined
   let reads = 0
   const api = mockApi({
-    'GET /projects/7/access-services/svc_test': () =>
+    'GET /access-services/svc_test': () =>
       jsonResponse({ ...service, version: ++reads === 1 ? 4 : 5 }),
-    'PUT /projects/7/access-services/svc_test': async (request) => {
+    'PUT /access-services/svc_test': async (request) => {
       submitted = await request.json()
       return jsonResponse({ ...service, version: 5 })
     },
   })
   try {
-    const client = mount(
-      '/projects/7/access-services/svc_test/edit?sandbox=sbx_test'
-    )
+    const client = mount('/access-services/svc_test/edit?sandbox=sbx_test')
     await waitFor(() =>
       expect(within(document.body).getByLabelText('Name')).toBeTruthy()
     )
@@ -141,7 +150,7 @@ test('direct editor URL loads masked service and preserves edits and version acr
     )
     await act(async () => {
       await client.invalidateQueries({
-        queryKey: [{ _id: 'getAccessService' }],
+        queryKey: [{ _id: 'getAccessServiceGeneral' }],
       })
     })
     expect(reads).toBe(2)
@@ -166,12 +175,14 @@ test('direct editor URL loads masked service and preserves edits and version acr
 })
 
 test('new service has a direct routed form without reading an existing service', () => {
-  const client = mount('/projects/7/access-services/new?sandbox=sbx_test')
+  const client = mount(
+    '/access-services/new?sandbox=sbx_test&step=configure&provider=custom'
+  )
   expect(
     within(document.body).getByLabelText('Shared breadcrumbs').textContent
   ).toContain('Add service')
   expect(
-    within(document.body).getByRole('heading', { name: 'Add service' })
+    within(document.body).getByRole('heading', { name: 'Custom HTTP service' })
   ).toBeTruthy()
   expect(within(document.body).queryByRole('dialog')).toBeNull()
   expect(
@@ -182,11 +193,11 @@ test('new service has a direct routed form without reading an existing service',
 
 test('failed deep-link read shows error and retry instead of a blank creation form', async () => {
   const api = mockApi({
-    'GET /projects/7/access-services/svc_test': () =>
+    'GET /access-services/svc_test': () =>
       jsonResponse({ detail: 'Project access denied' }, 403),
   })
   try {
-    const client = mount('/projects/7/access-services/svc_test/edit')
+    const client = mount('/access-services/svc_test/edit')
     await waitFor(() =>
       expect(document.body.textContent).toContain('Project access denied')
     )
@@ -200,17 +211,15 @@ test('failed deep-link read shows error and retry instead of a blank creation fo
   }
 })
 
-test('invalid project URL is explained before any editor is displayed', () => {
-  const client = mount('/projects/invalid/access-services/new')
-  expect(document.body.textContent).toContain(
-    'project ID in this link is invalid'
-  )
-  expect(within(document.body).queryByLabelText('Name')).toBeNull()
+test('new services are independent of a project', () => {
+  const client = mount('/access-services/new?step=configure&provider=custom')
+  expect(within(document.body).getByLabelText('Name')).toBeTruthy()
+  expect(document.body.textContent).not.toContain('Project 7')
   client.clear()
 })
 
 test('a read-only caller cannot open the creation editor by URL', () => {
-  const client = mount('/projects/7/access-services/new', false)
+  const client = mount('/access-services/new', false)
   expect(document.body.textContent).toContain('Service policies are read-only')
   expect(within(document.body).queryByLabelText('Name')).toBeNull()
   expect(
@@ -222,8 +231,8 @@ test('a read-only caller cannot open the creation editor by URL', () => {
 test('a failed capability refresh preserves edits through retry', async () => {
   let unavailable = true
   const api = mockApi({
-    'GET /projects/7/access-services/svc_test': () => jsonResponse(service),
-    'GET /projects/7/service-access/capability': () =>
+    'GET /access-services/svc_test': () => jsonResponse(service),
+    'GET /service-access/capability': () =>
       unavailable
         ? jsonResponse({ detail: 'Permissions temporarily unavailable' }, 503)
         : jsonResponse({
@@ -238,7 +247,7 @@ test('a failed capability refresh preserves edits through retry', async () => {
           }),
   })
   try {
-    const client = mount('/projects/7/access-services/svc_test/edit')
+    const client = mount('/access-services/svc_test/edit')
     await waitFor(() =>
       expect(within(document.body).getByLabelText('Name')).toBeTruthy()
     )
@@ -250,7 +259,7 @@ test('a failed capability refresh preserves edits through retry', async () => {
     )
     await act(async () => {
       await client.invalidateQueries({
-        queryKey: [{ _id: 'accessCapability' }],
+        queryKey: [{ _id: 'generalAccessCapability' }],
       })
     })
     await waitFor(() =>
@@ -283,12 +292,10 @@ test('a failed capability refresh preserves edits through retry', async () => {
 
 test('service editor routes populate and clear the shared breadcrumb trail', async () => {
   const api = mockApi({
-    'GET /projects/7/access-services/svc_test': () => jsonResponse(service),
+    'GET /access-services/svc_test': () => jsonResponse(service),
   })
   try {
-    const client = mount(
-      '/projects/7/access-services/svc_test/edit?sandbox=sbx_test'
-    )
+    const client = mount('/access-services/svc_test/edit?sandbox=sbx_test')
     await waitFor(() =>
       expect(
         within(document.body).getByLabelText('Shared breadcrumbs').textContent
@@ -299,11 +306,7 @@ test('service editor routes populate and clear the shared breadcrumb trail', asy
         within(document.body).getByLabelText('Shared breadcrumbs')
           .textContent ?? '[]'
       )
-    ).toEqual([
-      { label: 'Vault', href: '/vault' },
-      { label: 'Project 7', href: '/vault/projects/7' },
-      { label: 'API' },
-    ])
+    ).toEqual([{ label: 'Vault', href: '/vault' }, { label: 'API' }])
     await act(async () =>
       fireEvent.click(
         within(document.body).getByRole('button', { name: 'Cancel' })
@@ -322,11 +325,11 @@ test('reopening a cached service waits for a fresh version before editing', asyn
   let finishRead: ((response: Response) => void) | undefined
   let submittedVersion: number | undefined
   const api = mockApi({
-    'GET /projects/7/access-services/svc_test': () =>
+    'GET /access-services/svc_test': () =>
       new Promise<Response>((resolve) => {
         finishRead = resolve
       }),
-    'PUT /projects/7/access-services/svc_test': async (request) => {
+    'PUT /access-services/svc_test': async (request) => {
       const body = await request.json()
       submittedVersion = body.expected_version
       return jsonResponse({ ...service, version: 6 })
@@ -334,7 +337,7 @@ test('reopening a cached service waits for a fresh version before editing', asyn
   })
   try {
     const client = mount(
-      '/projects/7/access-services/svc_test/edit?sandbox=sbx_test',
+      '/access-services/svc_test/edit?sandbox=sbx_test',
       true,
       service
     )
@@ -369,19 +372,92 @@ test('reopening a cached service waits for a fresh version before editing', asyn
 
 test('an initial refresh failure cannot open an obsolete cached policy', async () => {
   const api = mockApi({
-    'GET /projects/7/access-services/svc_test': () =>
+    'GET /access-services/svc_test': () =>
       jsonResponse({ detail: 'Read unavailable' }, 503),
   })
   try {
-    const client = mount(
-      '/projects/7/access-services/svc_test/edit',
-      true,
-      service
-    )
+    const client = mount('/access-services/svc_test/edit', true, service)
     await waitFor(() =>
       expect(document.body.textContent).toContain('Read unavailable')
     )
     expect(within(document.body).queryByLabelText('Name')).toBeNull()
+    client.clear()
+  } finally {
+    api.restore()
+  }
+})
+
+test('catalog wizard preserves URL search and selection, hides form until selected, and restores draft on Back', async () => {
+  const entry = {
+    id: 'deepseek',
+    name: 'DeepSeek',
+    category: 'AI models',
+    description: '',
+    origin: 'https://api.example.com',
+    supported: true,
+    logo: 'deepseek',
+    popular: true,
+  }
+  const api = mockApi({
+    'GET /service-access/catalog': () =>
+      jsonResponse({ items: [entry], total: 1, page: 1, page_size: 20 }),
+  })
+  try {
+    const client = mount('/access-services/new?vault=vault_test&q=deep')
+    const ui = within(document.body)
+    expect(ui.queryByLabelText('Name')).toBeNull()
+    expect(ui.queryByRole('button', { name: 'Save service' })).toBeNull()
+    fireEvent.click(await ui.findByRole('button', { name: /DeepSeek/ }))
+    await waitFor(() => expect(ui.getByLabelText('Name')).toBeTruthy())
+    expect(document.querySelectorAll('h1')).toHaveLength(1)
+    expect(ui.getByLabelText('URL').textContent).toContain('step=configure')
+    expect(ui.getByLabelText('URL').textContent).toContain('provider=deepseek')
+    expect(ui.getByLabelText('URL').textContent).toContain('vault=vault_test')
+    fireEvent.change(ui.getByLabelText('Name'), {
+      target: { value: 'Draft service' },
+    })
+    fireEvent.click(ui.getByRole('button', { name: 'Change service' }))
+    expect(ui.getByRole('textbox', { name: 'Search services' })).toBeTruthy()
+    expect(ui.queryByRole('button', { name: 'Save service' })).toBeNull()
+    fireEvent.click(ui.getByRole('button', { name: 'Browser back' }))
+    expect((ui.getByLabelText('Name') as HTMLInputElement).value).toBe(
+      'Draft service'
+    )
+    client.clear()
+  } finally {
+    api.restore()
+  }
+})
+
+test('unsupported provider deep link explains capability without a save form', async () => {
+  const api = mockApi({
+    'GET /service-access/catalog': () =>
+      jsonResponse({
+        items: [
+          {
+            id: 'anthropic',
+            name: 'Anthropic',
+            supported: false,
+            reason: 'Requires a custom credential header',
+          },
+        ],
+        total: 1,
+        page: 1,
+        page_size: 20,
+      }),
+  })
+  try {
+    const client = mount(
+      '/access-services/new?step=configure&provider=anthropic'
+    )
+    await waitFor(() =>
+      expect(document.body.textContent).toContain(
+        'Requires a custom credential header'
+      )
+    )
+    expect(
+      within(document.body).queryByRole('button', { name: 'Save service' })
+    ).toBeNull()
     client.clear()
   } finally {
     api.restore()

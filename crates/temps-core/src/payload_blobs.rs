@@ -3,7 +3,7 @@
 
 //! Object storage for payloads too large to keep inline in a row.
 //!
-//! ADR-103 §5 keeps workflow payloads up to an inline cap in Postgres and
+//! ADR-106 §5 keeps workflow payloads up to an inline cap in Postgres and
 //! offloads larger ones. `temps-blob` implements this over its project-scoped
 //! bucket; callers store only ciphertext. The store is optional: a binary
 //! without blob storage has none, and the caller then rejects an oversize

@@ -44,6 +44,12 @@ pub struct Model {
     /// Log entries the resolver dropped (its channel was full), cumulative
     /// for `instance_id`.
     pub dropped_log_entries: i64,
+    /// How the control plane serves `*.temps.local` HTTP calls to its own
+    /// containers (ADR-104 D4): the document a worker sends as the
+    /// heartbeat's `capacity.internal_proxy`. Only node 0's row sets it;
+    /// `None` means not reported.
+    #[sea_orm(column_type = "JsonBinary", nullable)]
+    pub internal_proxy: Option<Json>,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
 }

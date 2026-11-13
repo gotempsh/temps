@@ -16,7 +16,8 @@ use crate::{
     transport::{StoredTarget, TransportError, WorkerTransport},
 };
 use sea_orm::{
-    ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QuerySelect, TransactionTrait,
+    ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QuerySelect, QueryTrait,
+    TransactionTrait,
 };
 use std::sync::Arc;
 use temps_core::{AuditLogger, AuditOperation, EncryptionService, ProjectAccessChecker};
@@ -142,7 +143,7 @@ impl ServiceAccessCoordinator {
             .ok_or_else(|| AccessError::NotFound {
                 kind: "sandbox",
                 id: consent.sandbox_id.clone(),
-                project_id: consent.project_id,
+                project_id: Some(consent.project_id),
             })?;
         let observed = self.transport.inspect(&sandbox).await?;
         self.authority
@@ -157,18 +158,21 @@ impl ServiceAccessCoordinator {
     /// observation. The service commits every selected grant atomically.
     pub async fn connect_session(
         &self,
-        project_id: i32,
+        project_id: impl Into<Option<i32>>,
         vault_id: &str,
         user_id: i32,
         admin: bool,
         request: crate::session_types::CreateAccessSession,
     ) -> Result<crate::session_types::AccessSessionResponse, CoordinatorError> {
+        let project_id = project_id.into();
         crate::service::sessions::validate(&request)?;
         let sandbox_id = request.consumer.sandbox_id();
         let _permit = self.admit(sandbox_id)?;
         let mut query = sandboxes::Entity::find()
             .filter(sandboxes::Column::PublicId.eq(sandbox_id))
-            .filter(sandboxes::Column::ProjectId.eq(project_id));
+            .apply_if(project_id, |q, id| {
+                q.filter(sandboxes::Column::ProjectId.eq(id))
+            });
         if !admin {
             query = query.filter(sandboxes::Column::UserId.eq(user_id));
         }

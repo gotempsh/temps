@@ -756,6 +756,11 @@ impl ExternalServiceManager {
                 .await?;
             return self.get_service_info(service_id).await;
         }
+        // Held until the row says stopped: a start or a recreate (Apply now,
+        // a new shm size) holds the same lock, so one waits for the other and
+        // a recreate that re-reads the status afterwards sees this stop.
+        let lock = self.service_tls_locks.for_service(service_id).await;
+        let _held = lock.lock().await;
         let service_type_enum = ServiceType::from_str(&service.service_type).map_err(|_| {
             ExternalServiceError::InvalidServiceType {
                 id: service_id,
@@ -1085,6 +1090,44 @@ mod tests {
 
         // Cleanup
         let _ = manager.delete_service(service_id).await;
+    }
+
+    #[tokio::test]
+    async fn a_stop_waits_for_a_start_or_recreate_holding_the_service_lock() {
+        let row = encrypted_service_model(7, serde_json::json!({}));
+        let db = std::sync::Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                // The service, no other service by its name, then the
+                // service again for each later read.
+                .append_query_results([vec![row.clone()], vec![]])
+                .append_query_results(vec![vec![row]; 6])
+                .into_connection(),
+        );
+        let manager = std::sync::Arc::new(control_plane_manager_with_db(db));
+        // As Apply now (or a start) holds it while it recreates the container.
+        let lock = manager.service_tls_locks.for_service(7).await;
+        let held = lock.lock().await;
+
+        let stopping = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.stop_service(7).await }
+        });
+        let mut stopping = std::pin::pin!(stopping);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), &mut stopping)
+                .await
+                .is_err(),
+            "the stop ran while the service's lock was held"
+        );
+
+        drop(held);
+        // Finishes once the lock is free; how it ends (no Docker here) is
+        // not what this checks.
+        tokio::time::timeout(std::time::Duration::from_secs(10), stopping)
+            .await
+            .expect("the stop goes on once the lock is released")
+            .expect("the stop task does not panic")
+            .ok();
     }
 
     #[tokio::test]

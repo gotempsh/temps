@@ -462,16 +462,26 @@ pub(super) enum SandboxChannel {
 }
 
 impl SandboxChannel {
-    /// Read the channel from `TEMPS_SANDBOX_CHANNEL`. Default is stable —
-    /// only an explicit `=beta` opts the host into the beta stream.
+    /// Channel for images no release manifest pinned (builds from source).
+    /// Reads `TEMPS_SANDBOX_CHANNEL`; the default is beta, because a stable
+    /// tag only exists once a release publishes it and a host that cached an
+    /// older stable `:<version>` would keep running a sandbox image that
+    /// predates the code (no service access mount, no proxy-aware terminal).
+    /// Release builds never reach this: their manifest pins the image.
+    /// `TEMPS_SANDBOX_CHANNEL=stable` opts a source build back into the
+    /// canonical tag.
     #[allow(
         clippy::disallowed_methods,
         reason = "legacy runtime env config; follow-up: move to a DB-backed setting (P0.7 follow-up). TEMPS_SANDBOX_CHANNEL"
     )]
     fn from_env() -> Self {
-        match std::env::var("TEMPS_SANDBOX_CHANNEL").as_deref() {
-            Ok("beta") => Self::Beta,
-            _ => Self::Stable,
+        Self::from_setting(std::env::var("TEMPS_SANDBOX_CHANNEL").ok().as_deref())
+    }
+
+    pub(super) fn from_setting(value: Option<&str>) -> Self {
+        match value {
+            Some("stable") => Self::Stable,
+            _ => Self::Beta,
         }
     }
 

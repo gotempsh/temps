@@ -24,7 +24,7 @@ pub mod dns_report;
 mod exec_timeout;
 pub mod gate;
 pub mod handlers;
-mod internal_access;
+pub mod internal_access;
 pub mod internal_proxy;
 pub mod internal_redirect;
 pub mod internal_routing;

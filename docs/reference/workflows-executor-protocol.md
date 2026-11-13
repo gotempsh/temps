@@ -7,7 +7,7 @@ SPDX-License-Identifier: MIT OR Apache-2.0
 
 The wire contract between Temps (the orchestrator) and a workflow SDK running
 inside a deployment (the executor). Decision record:
-[ADR-103](../adr/103-durable-workflows.md). Rust types:
+[ADR-106](../adr/106-durable-workflows.md). Rust types:
 `crates/temps-workflows/src/protocol.rs`. Reference SDK:
 `sdks/node/packages/workflows`.
 

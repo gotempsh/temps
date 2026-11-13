@@ -6,7 +6,7 @@
 //! No variant ever carries a payload (input, output, step result, event
 //! payload or error message written by the app): only IDs, names, sizes and
 //! the operation. That keeps payloads out of logs and Problem responses by
-//! construction (ADR-103 §5); `payload_never_reaches_an_error_message` in
+//! construction (ADR-106 §5); `payload_never_reaches_an_error_message` in
 //! `payload.rs` asserts it.
 
 use sea_orm::DbErr;

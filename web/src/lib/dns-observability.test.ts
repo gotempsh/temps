@@ -287,6 +287,48 @@ describe('internal routing with its own port (ADR-098)', () => {
   })
 })
 
+describe('a single-server control plane serving its own containers (ADR-104)', () => {
+  const controlPlane = (internal_proxy: DnsResolverEntry['internal_proxy']) =>
+    resolver({ listen_address: '172.20.0.1:53', internal_proxy })
+
+  test("its routing shows like a worker's, on the app network gateway", () => {
+    const serving = controlPlane({
+      listening: true,
+      address: '172.20.0.1:80',
+      mode: 'redirect',
+      redirect: 'installed',
+      proxy_address: '172.20.0.1:591',
+    })
+    expect(nodeDnsHealth(serving, true)).toMatchObject({
+      tone: 'ok',
+      routing: { tone: 'ok', label: 'Redirected' },
+    })
+    expect(routingAddress(serving.internal_proxy)).toBe(
+      '172.20.0.1:80 → 172.20.0.1:591'
+    )
+    expect(dnsSummary([serving], true)).toMatchObject({
+      tone: 'ok',
+      label: 'Working on all nodes',
+    })
+  })
+
+  test('a held port is down, explained for the control plane', () => {
+    const health = nodeDnsHealth(
+      controlPlane({ listening: false, mode: 'down' }),
+      true
+    )
+    expect(health.tone).toBe('error')
+    expect(health.problem?.why).toContain('its app network gateway')
+    expect(health.problem?.why).toContain('withdrawn')
+    expect(health.problem?.why).toContain('The control plane keeps retrying')
+    expect(health.problem?.why).not.toContain('agent')
+  })
+
+  test('without a report the main proxy routes, as before', () => {
+    expect(nodeDnsHealth(controlPlane(undefined), true).routing).toBeNull()
+  })
+})
+
 describe('dnsSummary', () => {
   test('says Cluster DNS is off before judging nodes', () => {
     expect(dnsSummary([resolver({ health: 'down' })], false)).toMatchObject({
@@ -416,10 +458,17 @@ describe('tabs and links', () => {
       record_type: 'AAAA',
       node_id: 4,
       project_id: 3,
+      sandbox_id: null,
     })
     // Nothing in the URL: an empty name, A, the first node that answers.
     expect(testValuesFromUrl(() => null, [hostedControlPlane, master])).toEqual(
-      { name: '', record_type: 'A', node_id: 4, project_id: null }
+      {
+        name: '',
+        record_type: 'A',
+        node_id: 4,
+        project_id: null,
+        sandbox_id: null,
+      }
     )
     // An unknown node or type is not trusted.
     params.set('from', '99')
@@ -428,6 +477,19 @@ describe('tabs and links', () => {
       record_type: 'A',
       node_id: 0,
     })
+  })
+
+  test('a Test link can ask as a sandbox, never as a sandbox and a project', () => {
+    const params = new URLSearchParams(
+      'name=production.shop.temps.local&from=4&project=3&sandbox=sbx_alpha'
+    )
+    expect(
+      testValuesFromUrl((key) => params.get(key), [hostedControlPlane, master])
+    ).toMatchObject({ project_id: null, sandbox_id: 'sbx_alpha' })
+    params.set('sandbox', '  ')
+    expect(
+      testValuesFromUrl((key) => params.get(key), [hostedControlPlane, master])
+    ).toMatchObject({ project_id: 3, sandbox_id: null })
   })
 
   test('the default node skips resolvers that cannot answer', () => {

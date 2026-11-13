@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Workflows plugin registration (ADR-103).
+//! Workflows plugin registration (ADR-106).
 //!
 //! Registers the store, engine, service and scheduler, starts the scheduler
 //! once every plugin has registered, and mounts the management routes and the

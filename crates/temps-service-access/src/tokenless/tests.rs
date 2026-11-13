@@ -11,13 +11,14 @@ fn policy(prefix: &str) -> SandboxAccessPolicy {
         origin: "https://api.example.com".into(),
         path_prefixes: vec![prefix.into()],
         methods: vec![AccessMethod::Get],
+        delivery: None,
     }
 }
 
 fn request(now: DateTime<Utc>) -> PrepareSession {
     PrepareSession {
         target: BindingTarget {
-            project_id: 1,
+            project_id: Some(1),
             sandbox_id: 42,
             incarnation_id: Uuid::new_v4(),
             node_id: Uuid::new_v4(),
@@ -181,7 +182,7 @@ fn prepared_claims_bind_project_node_incarnation_grant_and_service_version() {
         claims.aud
     );
     let mut other_project = input;
-    other_project.target.project_id = 2;
+    other_project.target.project_id = Some(2);
     assert_ne!(
         PreparedSession::prepare(other_project, now)
             .unwrap()
@@ -223,7 +224,7 @@ fn preparation_rejects_missing_identity_invalid_caps_and_policy() {
     for index in 0..7 {
         let mut input = valid.clone();
         match index {
-            0 => input.target.project_id = 0,
+            0 => input.target.project_id = Some(0),
             1 => input.service_version = 0,
             2 => input.target.sandbox_id = 0,
             3 => input.target.incarnation_id = Uuid::nil(),
@@ -300,11 +301,25 @@ fn binding_rejects_duplicates_limits_and_identity_mixing() {
         let mut b = a.clone();
         b.grant_id = format!("grant_{}", Uuid::new_v4().simple());
         match index {
-            0 => b.target.project_id += 1,
+            0 => b.target.project_id = Some(2),
             1 => b.target.sandbox_id += 1,
             2 => b.target.node_id = Uuid::new_v4(),
             _ => b.target.incarnation_id = Uuid::new_v4(),
         }
         assert!(PreparedBinding::prepare(vec![a.clone(), b], 1, now).is_err());
     }
+}
+
+#[test]
+fn projectless_binding_uses_an_isolated_sandbox_scope() {
+    let now = Utc::now();
+    let mut input = request(now);
+    let project = PreparedSession::prepare(input.clone(), now).unwrap();
+    input.target.project_id = None;
+    let sandbox = PreparedSession::prepare(input.clone(), now).unwrap();
+    assert_ne!(project.claims().scope, sandbox.claims().scope);
+    input.target.sandbox_id += 1;
+    let other = PreparedSession::prepare(input, now).unwrap();
+    assert_ne!(sandbox.claims().scope, other.claims().scope);
+    assert_eq!(sandbox.claims().exp, project.claims().exp);
 }

@@ -95,7 +95,7 @@ fn state_with_db(db: Arc<sea_orm::DatabaseConnection>, audit: Arc<Audit>) -> Arc
     })
 }
 fn routes() -> Vec<(&'static str, &'static str, &'static str)> {
-    vec![
+    let mut routes = vec![
         ("GET", "/projects/7/service-access/capability", ""),
         ("GET", "/projects/7/access-services", ""),
         (
@@ -176,7 +176,35 @@ fn routes() -> Vec<(&'static str, &'static str, &'static str)> {
             "/projects/7/sandboxes/sbx_test/services/access_test/revoke",
             r#"{"expected_version":1}"#,
         ),
-    ]
+    ];
+    let global: Vec<_> = routes
+        .iter()
+        .filter(|(_, path, _)| path.starts_with("/projects/7/access-"))
+        .map(|(method, path, body)| (*method, &path[11..], *body))
+        .collect();
+    routes.extend(global);
+    routes.extend([
+        ("GET", "/service-access/catalog", ""),
+        ("GET", "/service-access/capability", ""),
+        ("GET", "/access-vaults/vault_test/consumers/sbx_test", ""),
+        ("DELETE", "/access-services/svc_test", ""),
+        ("GET", "/sandboxes/sbx_test/access-vaults", ""),
+        ("GET", "/projects/7/linked-vaults", ""),
+        ("GET", "/access-vaults/vault_test/links", ""),
+        (
+            "POST",
+            "/access-vaults/vault_test/links",
+            r#"{"sandbox_id":"sbx_test"}"#,
+        ),
+        ("DELETE", "/access-vaults/vault_test/links/link_test", ""),
+        ("DELETE", "/access-vaults/vault_test", ""),
+        (
+            "DELETE",
+            "/access-vaults/vault_test/bundles/bundle_test",
+            "",
+        ),
+    ]);
+    routes
 }
 async fn send(
     method: &str,
@@ -313,11 +341,11 @@ async fn problem_mapping_never_leaks_database_sources() {
     for error in [
         AccessError::Database {
             operation: "save service",
-            project_id: 7,
+            project_id: Some(7),
             source: sea_orm::DbErr::Custom("secret-driver-payload".into()),
         },
         AccessError::Delivery {
-            project_id: 7,
+            project_id: Some(7),
             sandbox_id: "sbx_test".into(),
             source: Box::new(crate::delivery::DeliveryError::Database {
                 operation: "enqueue policy",
@@ -344,8 +372,9 @@ async fn create_returns_masked_service_and_audits_only_metadata() {
     use std::collections::BTreeMap;
     let now = chrono::Utc::now();
     let model = temps_entities::sandbox_access_services::Model {
+        retired_at: None,
         id: "svc_test".into(),
-        project_id: 7,
+        project_id: Some(7),
         name: "API".into(),
         policy: serde_json::json!({"origin":"https://api.example.com","path_prefixes":["/"],"methods":["GET"]}),
         max_ttl_seconds: 900,
@@ -356,6 +385,10 @@ async fn create_returns_masked_service_and_audits_only_metadata() {
         updated_at: now,
     };
     let db = MockDatabase::new(DatabaseBackend::Postgres)
+        .append_exec_results((0..2).map(|_| sea_orm::MockExecResult {
+            last_insert_id: 0,
+            rows_affected: 0,
+        }))
         .append_query_results([vec![BTreeMap::from([(
             "id".to_string(),
             sea_orm::Value::Int(Some(7)),
@@ -395,12 +428,14 @@ fn policy() -> SandboxAccessPolicy {
         origin: "https://api.example.com".into(),
         path_prefixes: vec!["/v1".into()],
         methods: vec![AccessMethod::Get],
+        delivery: None,
     }
 }
 fn row() -> services::Model {
     services::Model {
+        retired_at: None,
         id: "svc_test".into(),
-        project_id: 7,
+        project_id: Some(7),
         name: "API".into(),
         policy: serde_json::to_value(policy()).unwrap(),
         max_ttl_seconds: 900,
@@ -416,7 +451,7 @@ fn grant() -> grants::Model {
     grants::Model {
         assignment_id: None,
         id: "grant_test".into(),
-        project_id: 7,
+        project_id: Some(7),
         service_id: "svc_test".into(),
         sandbox_id: 42,
         service_version: 1,
@@ -478,6 +513,10 @@ async fn management_routes_return_typed_success_and_audit_each_write() {
         (
             3,
             MockDatabase::new(DatabaseBackend::Postgres)
+                .append_exec_results((0..2).map(|_| sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 0,
+                }))
                 .append_query_results([vec![project()]])
                 .append_query_results([vec![row()], vec![updated]]),
             200,
@@ -579,7 +618,7 @@ async fn grant_routes_honor_project_permission_narrowing_and_checker_failures() 
     ] {
         for (method, path, body) in routes()
             .into_iter()
-            .filter(|(_, path, _)| path.contains("/sandboxes/"))
+            .filter(|(_, path, _)| path.starts_with("/projects/") && path.contains("/sandboxes/"))
         {
             let audit = Arc::new(Audit::default());
             let mut state = state(
@@ -660,7 +699,7 @@ async fn single_service_read_is_masked_and_missing_is_a_problem() {
 async fn capability_reports_effective_write_permissions() {
     for (role, manage_services, manage_requests) in [
         (Role::Reader, false, false),
-        (Role::User, true, true),
+        (Role::User, false, true),
         (Role::PlatformAdmin, false, false),
         (Role::Admin, true, true),
     ] {
@@ -706,7 +745,7 @@ async fn capability_reports_effective_write_permissions() {
             let cap: AccessCapability =
                 serde_json::from_slice(&to_bytes(response.into_body(), 8192).await.unwrap())
                     .unwrap();
-            assert!(cap.can_manage_services);
+            assert!(!cap.can_manage_services);
             assert_eq!(cap.can_manage_requests, sandbox_access);
         }
     }
@@ -814,7 +853,7 @@ async fn coordinator_problem_mapping_preserves_context_and_redacts_driver_source
             CoordinatorError::Access(AccessError::NotFound {
                 kind: "sandbox",
                 id: "sbx_test".into(),
-                project_id: 7,
+                project_id: Some(7),
             }),
             StatusCode::NOT_FOUND,
         ),
@@ -863,6 +902,7 @@ async fn postgres_approval_route_is_fresh_scoped_idempotent_and_audited() {
                     origin: "https://api.example.com".into(),
                     path_prefixes: vec!["/user".into()],
                     methods: vec![AccessMethod::Get],
+                    delivery: None,
                 },
                 max_ttl_seconds: 900,
                 enabled: true,
@@ -1190,8 +1230,12 @@ async fn approval_permissions_are_fenced_to_the_exact_reviewed_policy() {
                     db = db
                         .append_query_results([vec![project]])
                         .append_query_results([vec![access_vaults::Model {
+                            legacy_approval_before: None,
+                            legacy_service_ids: None,
+                            legacy_removed_service_ids: vec![],
+                            retired_at: None,
                             id: "vault_test".into(),
-                            project_id: 7,
+                            project_id: Some(7),
                             name: "Test vault".into(),
                             service_ids: vec!["svc_test".into()],
                             version: 1,
@@ -1245,4 +1289,243 @@ async fn approval_permissions_are_fenced_to_the_exact_reviewed_policy() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn project_members_cannot_manage_general_vaults_or_links() {
+    for (method, path, body) in routes().into_iter().filter(|(method, path, _)| {
+        *method != "GET"
+            && (path.contains("/access-services") || path.contains("/access-vaults"))
+            && !path.ends_with("/sessions")
+    }) {
+        let response = send(
+            method,
+            path,
+            body,
+            Some(AuthContext::new_session(test_user(), Role::User)),
+            state(
+                MockDatabase::new(DatabaseBackend::Postgres),
+                Arc::new(Audit::default()),
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {path}");
+    }
+}
+
+#[tokio::test]
+async fn general_management_http_contracts_mask_secrets_and_audit_resource_ids() {
+    use sea_orm::ConnectionTrait;
+    if !temps_test_utils::external_database_configured()
+        && !temps_test_utils::docker_available().await
+    {
+        eprintln!("Skipping general management HTTP contracts: database unavailable");
+        return;
+    }
+    let mut test = temps_test_utils::TestDatabase::with_migrations()
+        .await
+        .unwrap();
+    let db = test.connection_arc();
+    db.execute_unprepared(
+        "INSERT INTO users(id,name,email) VALUES(1,'Fixture','management-fixture@example.com')",
+    )
+    .await
+    .unwrap();
+    let audit = Arc::new(Audit::default());
+    let state = state_with_db(db.clone(), audit.clone());
+    async fn call(
+        state: &Arc<AccessAppState>,
+        method: &str,
+        path: &str,
+        body: serde_json::Value,
+        status: StatusCode,
+    ) -> serde_json::Value {
+        let response = send(
+            method,
+            path,
+            &body.to_string(),
+            Some(AuthContext::new_session(test_user(), Role::Admin)),
+            state.clone(),
+        )
+        .await;
+        let actual = response.status();
+        if status.is_client_error() {
+            assert_eq!(
+                response.headers()["content-type"],
+                "application/problem+json"
+            );
+        }
+        let raw = to_bytes(response.into_body(), 32768).await.unwrap();
+        assert_eq!(
+            actual,
+            status,
+            "{method} {path}: {}",
+            String::from_utf8_lossy(&raw)
+        );
+        assert!(!String::from_utf8_lossy(&raw).contains("fixture-bearer-secret"));
+        serde_json::from_slice(&raw).unwrap()
+    }
+    let vault = call(
+        &state,
+        "POST",
+        "/access-vaults",
+        serde_json::json!({"name":"Shared APIs","service_ids":[]}),
+        StatusCode::CREATED,
+    )
+    .await;
+    let vault_id = vault["id"].as_str().unwrap();
+    let vault_path = format!("/access-vaults/{vault_id}");
+    assert!(vault["project_id"].is_null());
+    let mut definition = serde_json::json!({"vault_id":vault_id,"name":"API","policy":{"origin":"https://api.example.com","path_prefixes":["/"],"methods":["GET"]},"max_ttl_seconds":900,"enabled":true,"credential":"fixture-bearer-secret"});
+    let service = call(
+        &state,
+        "POST",
+        "/access-services",
+        definition.clone(),
+        StatusCode::CREATED,
+    )
+    .await;
+    let service_id = service["id"].as_str().unwrap();
+    let service_path = format!("/access-services/{service_id}");
+    assert!(service["project_id"].is_null());
+    assert_eq!(service["has_credential"], true);
+    // A migrated bearer keeps provenance even while project deletion is fenced.
+    db.execute_unprepared("INSERT INTO projects(id,name,repo_name,repo_owner,directory,main_branch,preset,slug,is_deleted,created_at,updated_at) VALUES(9917,'Former project','repo','owner','/','main','nodejs','former-project',true,now(),now())").await.unwrap();
+    db.execute(sea_orm::Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "UPDATE sandbox_access_services SET project_id=9917 WHERE id=$1",
+        [service_id.into()],
+    ))
+    .await
+    .unwrap();
+    definition.as_object_mut().unwrap().remove("vault_id");
+    definition["expected_version"] = serde_json::json!(1);
+    definition["name"] = serde_json::json!("Updated API");
+    let updated = call(&state, "PUT", &service_path, definition, StatusCode::OK).await;
+    assert_eq!(updated["version"], 2);
+    assert_eq!(updated["project_id"], 9917);
+    let detail = call(
+        &state,
+        "GET",
+        &vault_path,
+        serde_json::json!({}),
+        StatusCode::OK,
+    )
+    .await;
+    let updated_vault = call(&state, "PUT", &vault_path, serde_json::json!({"name":"Updated vault","service_ids":[service_id],"expected_version":detail["vault"]["version"]}), StatusCode::OK).await;
+    assert_eq!(updated_vault["name"], "Updated vault");
+    let bundle_path = format!("{vault_path}/bundles");
+    let bundle = call(
+        &state,
+        "POST",
+        &bundle_path,
+        serde_json::json!({"name":"Read APIs","service_ids":[service_id],"ttl_seconds":900}),
+        StatusCode::CREATED,
+    )
+    .await;
+    let bundle_id = bundle["id"].as_str().unwrap();
+    let updated_bundle = call(&state, "PUT", &format!("{bundle_path}/{bundle_id}"), serde_json::json!({"name":"Updated bundle","service_ids":[service_id],"ttl_seconds":600,"expected_version":1}), StatusCode::OK).await;
+    assert_eq!(updated_bundle["version"], 2);
+    assert_eq!(updated_bundle["ttl_seconds"], 600);
+    for path in ["/access-vaults", "/access-services", &bundle_path] {
+        let list = call(&state, "GET", path, serde_json::json!({}), StatusCode::OK).await;
+        assert_eq!(list["total"], 1);
+        assert_eq!(list["items"].as_array().unwrap().len(), 1);
+        assert_eq!(list["page_size"], 20);
+    }
+    let read = call(
+        &state,
+        "GET",
+        &service_path,
+        serde_json::json!({}),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(read["id"], service_id);
+    assert_eq!(read["has_credential"], true);
+    for path in [
+        "/access-services/svc_missing",
+        "/access-vaults/vault_missing",
+        "/access-vaults/vault_missing/bundles",
+    ] {
+        let problem = call(
+            &state,
+            "GET",
+            path,
+            serde_json::json!({}),
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+        assert_eq!(problem["title"], "Service access resource not found");
+        assert!(problem["detail"].as_str().unwrap().contains("missing"));
+    }
+    let invalid = call(
+        &state,
+        "POST",
+        "/access-vaults",
+        serde_json::json!({"name":"","service_ids":[]}),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    assert_eq!(invalid["title"], "Invalid service access request");
+    let stale = call(&state, "PUT", &format!("{bundle_path}/{bundle_id}"), serde_json::json!({"name":"Stale","service_ids":[service_id],"ttl_seconds":600,"expected_version":1}), StatusCode::CONFLICT).await;
+    assert!(stale["detail"].as_str().unwrap().contains(bundle_id));
+    {
+        let events = audit.0.lock().unwrap();
+        assert_eq!(events.len(), 6);
+        for (operation, id) in [
+            ("CREATE_ACCESS_VAULT", vault_id),
+            ("UPDATE_ACCESS_VAULT", vault_id),
+            ("CREATE_ACCESS_SERVICE", service_id),
+            ("UPDATE_ACCESS_SERVICE", service_id),
+            ("CREATE_ACCESS_BUNDLE", bundle_id),
+            ("UPDATE_ACCESS_BUNDLE", bundle_id),
+        ] {
+            assert!(events
+                .iter()
+                .map(|event| serde_json::from_str::<serde_json::Value>(event).unwrap())
+                .any(|event| event["operation"] == operation
+                    && event["resource_id"] == id
+                    && event["context"]["user_id"] == 1));
+        }
+        assert!(events
+            .iter()
+            .all(|event| !event.contains("fixture-bearer-secret")));
+        for (operation, version) in [("CREATE_ACCESS_SERVICE", 1), ("UPDATE_ACCESS_SERVICE", 2)] {
+            assert!(events
+                .iter()
+                .map(|event| serde_json::from_str::<serde_json::Value>(event).unwrap())
+                .any(|event| event["operation"] == operation
+                    && event["service_scope_key"] == format!("{service_id}:{version}")));
+        }
+    }
+    drop(state);
+    drop(db);
+    test.cleanup().await;
+}
+
+#[tokio::test]
+async fn service_catalog_returns_sdk_entries_without_credentials() {
+    let response = send(
+        "GET",
+        "/service-access/catalog?search=deepseek",
+        "",
+        Some(AuthContext::new_session(test_user(), Role::Admin)),
+        state(
+            MockDatabase::new(DatabaseBackend::Postgres),
+            Arc::new(Audit::default()),
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), 65536)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|row| row["id"] == "deepseek" && row["supported"] == true));
+    assert!(!body.to_string().contains("credential_encrypted"));
 }

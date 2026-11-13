@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The executor's callbacks (ADR-103 §3, §11): read the journal, record an
+//! The executor's callbacks (ADR-106 §3, §11): read the journal, record an
 //! entry, heartbeat, report an outcome. Each is authorized by the invocation
 //! token Temps signed for this run and lease, and fenced by that lease.
 

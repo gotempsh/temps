@@ -174,7 +174,7 @@ Control-plane features: a service layer plus HTTP handlers for one product area.
 | [`temps-traefik-discovery`](../../crates/temps-traefik-discovery) | Discovery of routes from Traefik labels: operator controls for discovered routes, certificate import validation and their HTTP handlers | **1**: deployments |  |
 | [`temps-vulnerability-scanner`](../../crates/temps-vulnerability-scanner) | Container image vulnerability scanning with Trivy: scan service, daily scheduled scans, node reports and HTTP handlers | **3**: cli, deployments, node-agent |  |
 | [`temps-webhooks`](../../crates/temps-webhooks) | Outgoing webhooks: per-project configuration, event delivery with retries and delivery history | **1**: cli |  |
-| [`temps-workflows`](../../crates/temps-workflows) | Durable workflows orchestrated by the control plane: run state, the step journal, waits, leases, the scheduler and invoker, and the workflows API (ADR-103) | **1**: cli |  |
+| [`temps-workflows`](../../crates/temps-workflows) | Durable workflows orchestrated by the control plane: run state, the step journal, waits, leases, the scheduler and invoker, and the workflows API (ADR-106) | **1**: cli |  |
 
 ## observability
 

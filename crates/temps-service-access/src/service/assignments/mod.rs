@@ -222,6 +222,7 @@ impl ServiceAccessService {
             .begin()
             .await
             .map_err(|e| AccessError::database("begin durable approval", project_id, e))?;
+        self.lock_vault_management(&tx).await?;
         self.project(&tx, project_id).await?;
         let sandbox = self
             .sandbox(&tx, project_id, sandbox_id, user_id, admin)
@@ -245,6 +246,7 @@ impl ServiceAccessService {
             .await
             .map_err(|e| AccessError::database("read approved policy", project_id, e))?
             .ok_or_else(|| not_found("service", row.service_id.clone(), project_id))?;
+        self.require_standalone_service(&tx, &service.id).await?;
         if service.version != request.service_version {
             return Err(AccessError::Conflict {
                 id: service.id,
@@ -424,7 +426,7 @@ fn assignment_response(
         policy: serde_json::from_value(service.policy.clone()).map_err(|source| {
             AccessError::StoredPolicy {
                 id: service.id.clone(),
-                project_id: row.project_id,
+                project_id: Some(row.project_id),
                 source,
             }
         })?,

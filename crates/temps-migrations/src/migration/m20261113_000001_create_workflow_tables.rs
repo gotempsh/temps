@@ -1,12 +1,12 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Durable workflows (ADR-103): run state, the journal, events, the
+//! Durable workflows (ADR-106): run state, the journal, events, the
 //! per-environment settings row and the app credential.
 //!
 //! New tables only, so the previous binary keeps working on this schema. The
 //! tables live in the default schema with a `workflow_` prefix rather than in a
-//! separate Postgres schema (ADR-103, "Verified against the code", item 13).
+//! separate Postgres schema (ADR-106, "Verified against the code", item 13).
 //! `workflow_steps` is a plain table, not a hypertable (item 12): it is updated
 //! in place, keyed `(run_id, sequence)` for idempotent journal writes, and lives
 //! exactly as long as its run.

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The scheduler (ADR-103 §6): claims due runs and hands them to a
+//! The scheduler (ADR-106 §6): claims due runs and hands them to a
 //! fixed-size invoker pool; reaps expired leases; reconciles interrupted
 //! event deliveries; flushes metrics; applies retention.
 //!

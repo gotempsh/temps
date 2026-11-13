@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Storage of workflow state (ADR-103 §5).
+//! Storage of workflow state (ADR-106 §5).
 //!
 //! [`WorkflowStore`] has two parts. The **scheduling** part (runs, leases,
 //! claims, waits, events, settings) always lives in the control-plane

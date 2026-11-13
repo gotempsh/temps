@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::vault_types::*;
+use sea_orm::sea_query::Expr;
 use std::collections::{BTreeMap, BTreeSet};
 use temps_entities::{access_bundles as bundles, access_vaults as vaults};
 
@@ -47,11 +48,19 @@ impl ServiceAccessService {
     pub(super) async fn vault<C: ConnectionTrait>(
         &self,
         db: &C,
-        project_id: i32,
+        project_id: impl Into<Option<i32>>,
         id: &str,
         lock: bool,
     ) -> Result<vaults::Model, AccessError> {
-        let query = vaults::Entity::find_by_id(id).filter(vaults::Column::ProjectId.eq(project_id));
+        let project_id = project_id.into();
+        let query = vaults::Entity::find_by_id(id)
+            .filter(vaults::Column::RetiredAt.is_null())
+            .apply_if(project_id, |q, id| {
+                q.filter(vaults::Column::ProjectId.eq(id)).filter(Expr::cust_with_values(
+                    "EXISTS (SELECT 1 FROM access_vault_links l WHERE l.vault_id=access_vaults.id AND l.project_id=$1 AND l.revoked_at IS NULL)",
+                    [id],
+                ))
+            });
         let query = if lock { query.lock_exclusive() } else { query };
         query
             .one(db)
@@ -62,14 +71,17 @@ impl ServiceAccessService {
     async fn selected_services<C: ConnectionTrait>(
         &self,
         db: &C,
-        project_id: i32,
+        project_id: impl Into<Option<i32>>,
         ids: &[String],
     ) -> Result<Vec<AccessServiceResponse>, AccessError> {
+        let project_id = project_id.into();
         if ids.is_empty() {
             return Ok(Vec::new());
         }
         let rows = services::Entity::find()
-            .filter(services::Column::ProjectId.eq(project_id))
+            .filter(services::Column::RetiredAt.is_null())
+            // Vault authorization has already established the consumer scope.
+            // Service membership is general, including in migrated vaults.
             .filter(services::Column::Id.is_in(ids.to_vec()))
             .order_by_desc(services::Column::CreatedAt)
             .order_by_desc(services::Column::Id)
@@ -83,13 +95,20 @@ impl ServiceAccessService {
     }
     pub async fn list_vaults(
         &self,
-        project_id: i32,
+        project_id: impl Into<Option<i32>>,
         query: AccessPageQuery,
     ) -> Result<AccessVaultList, AccessError> {
+        let project_id = project_id.into();
         self.project(self.db.as_ref(), project_id).await?;
         let (page, page_size) = query.normalized();
         let pages = vaults::Entity::find()
-            .filter(vaults::Column::ProjectId.eq(project_id))
+            .filter(vaults::Column::RetiredAt.is_null())
+            .apply_if(project_id, |q, id| {
+                q.filter(vaults::Column::ProjectId.eq(id)).filter(Expr::cust_with_values(
+                    "EXISTS (SELECT 1 FROM access_vault_links l WHERE l.vault_id=access_vaults.id AND l.project_id=$1 AND l.revoked_at IS NULL)",
+                    [id],
+                ))
+            })
             .order_by_desc(vaults::Column::CreatedAt)
             .order_by_desc(vaults::Column::Id)
             .paginate(self.db.as_ref(), page_size);
@@ -133,11 +152,65 @@ impl ServiceAccessService {
             page_size,
         })
     }
+    pub async fn list_consumer_vaults(
+        &self,
+        project_id: Option<i32>,
+        sandbox_id: Option<i32>,
+        query: AccessPageQuery,
+    ) -> Result<AccessVaultList, AccessError> {
+        let (page, page_size) = query.normalized();
+        let pages = vaults::Entity::find().filter(vaults::Column::RetiredAt.is_null())
+            .filter(sea_orm::sea_query::Expr::cust_with_values(
+                "EXISTS (SELECT 1 FROM access_vault_links l WHERE l.vault_id=access_vaults.id AND l.revoked_at IS NULL AND (l.project_id=$1 OR l.sandbox_id=$2))", [sea_orm::Value::from(project_id),sea_orm::Value::from(sandbox_id)]))
+            .order_by_desc(vaults::Column::CreatedAt)
+            .order_by_desc(vaults::Column::Id)
+            .paginate(self.db.as_ref(), page_size);
+        let total = pages
+            .num_items()
+            .await
+            .map_err(|e| AccessError::database("count vaults", project_id, e))?;
+        let rows = pages
+            .fetch_page(page - 1)
+            .await
+            .map_err(|e| AccessError::database("list vaults", project_id, e))?;
+        // One bounded batch for every card, never a query per vault.
+        let ids: Vec<_> = rows
+            .iter()
+            .flat_map(|row| row.service_ids.iter().take(4).cloned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let previews: BTreeMap<_, _> = self
+            .selected_services(self.db.as_ref(), None, &ids)
+            .await?
+            .into_iter()
+            .map(|v| (v.id.clone(), v))
+            .collect();
+        let items = rows
+            .into_iter()
+            .map(|row| AccessVaultOverview {
+                services: row
+                    .service_ids
+                    .iter()
+                    .take(4)
+                    .filter_map(|id| previews.get(id).cloned())
+                    .collect(),
+                vault: row.into(),
+            })
+            .collect();
+        Ok(AccessVaultList {
+            items,
+            total,
+            page,
+            page_size,
+        })
+    }
     pub async fn get_vault(
         &self,
-        project_id: i32,
+        project_id: impl Into<Option<i32>>,
         id: &str,
     ) -> Result<AccessVaultDetail, AccessError> {
+        let project_id = project_id.into();
         self.project(self.db.as_ref(), project_id).await?;
         let vault = self.vault(self.db.as_ref(), project_id, id, false).await?;
         let services = self
@@ -150,10 +223,11 @@ impl ServiceAccessService {
     }
     pub async fn save_vault(
         &self,
-        project_id: i32,
+        project_id: impl Into<Option<i32>>,
         id: Option<String>,
         mut request: SaveAccessVault,
     ) -> Result<AccessVaultResponse, AccessError> {
+        let project_id = project_id.into();
         validate_selection(&mut request.name, &request.service_ids, 0)?;
         if id.is_some() != request.expected_version.is_some() {
             return Err(invalid("expected_version", "required only for updates"));
@@ -163,6 +237,7 @@ impl ServiceAccessService {
             .begin()
             .await
             .map_err(|e| AccessError::database("begin vault save", project_id, e))?;
+        self.lock_vault_management(&tx).await?;
         self.project(&tx, project_id).await?;
         let updating = id.is_some();
         let mut model = if let Some(id) = id {
@@ -174,7 +249,7 @@ impl ServiceAccessService {
             // conflicting ID is read, regardless of the number of bundles.
             use sea_orm::sea_query::Expr;
             let conflict = bundles::Entity::find()
-                .filter(bundles::Column::ProjectId.eq(project_id))
+                .filter(bundles::Column::RetiredAt.is_null())
                 .filter(bundles::Column::VaultId.eq(&id))
                 .filter(Expr::cust_with_values(
                     "NOT (service_ids <@ $1::text[])",
@@ -217,6 +292,25 @@ impl ServiceAccessService {
             model.insert(&tx).await
         }
         .map_err(|e| AccessError::database("save vault", project_id, e))?;
+        if !updating {
+            if let Some(project_id) = project_id {
+                temps_entities::access_vault_links::ActiveModel {
+                    id: Set(format!("link_{}", uuid::Uuid::new_v4().simple())),
+                    vault_id: Set(row.id.clone()),
+                    project_id: Set(Some(project_id)),
+                    sandbox_id: Set(None),
+                    created_at: Set(Utc::now()),
+                    revoked_at: Set(None),
+                }
+                .insert(&tx)
+                .await
+                .map_err(|e| {
+                    AccessError::database("link legacy vault to project", project_id, e)
+                })?;
+            }
+        }
+        self.validate_linked_sources(&tx, Some(&row.id), None)
+            .await?;
         tx.commit()
             .await
             .map_err(|e| AccessError::database("commit vault save", project_id, e))?;
@@ -224,16 +318,17 @@ impl ServiceAccessService {
     }
     pub async fn list_bundles(
         &self,
-        project_id: i32,
+        project_id: impl Into<Option<i32>>,
         vault_id: &str,
         query: AccessPageQuery,
     ) -> Result<AccessBundleList, AccessError> {
+        let project_id = project_id.into();
         self.project(self.db.as_ref(), project_id).await?;
         self.vault(self.db.as_ref(), project_id, vault_id, false)
             .await?;
         let (page, page_size) = query.normalized();
         let pages = bundles::Entity::find()
-            .filter(bundles::Column::ProjectId.eq(project_id))
+            .filter(bundles::Column::RetiredAt.is_null())
             .filter(bundles::Column::VaultId.eq(vault_id))
             .order_by_desc(bundles::Column::CreatedAt)
             .order_by_desc(bundles::Column::Id)
@@ -258,11 +353,12 @@ impl ServiceAccessService {
     }
     pub async fn save_bundle(
         &self,
-        project_id: i32,
+        project_id: impl Into<Option<i32>>,
         vault_id: &str,
         id: Option<String>,
         mut request: SaveAccessBundle,
     ) -> Result<AccessBundleResponse, AccessError> {
+        let project_id = project_id.into();
         validate_selection(&mut request.name, &request.service_ids, 1)?;
         if !(60..=86400).contains(&request.ttl_seconds) {
             return Err(invalid("ttl_seconds", "must be between 60 and 86400"));
@@ -275,6 +371,7 @@ impl ServiceAccessService {
             .begin()
             .await
             .map_err(|e| AccessError::database("begin bundle save", project_id, e))?;
+        self.lock_vault_management(&tx).await?;
         self.project(&tx, project_id).await?;
         let vault = self.vault(&tx, project_id, vault_id, true).await?;
         if request
@@ -302,7 +399,7 @@ impl ServiceAccessService {
         let updating = id.is_some();
         let mut model = if let Some(id) = id {
             let current = bundles::Entity::find_by_id(&id)
-                .filter(bundles::Column::ProjectId.eq(project_id))
+                .filter(bundles::Column::RetiredAt.is_null())
                 .filter(bundles::Column::VaultId.eq(vault_id))
                 .lock_exclusive()
                 .one(&tx)
@@ -415,6 +512,7 @@ mod database_tests {
                         path_prefixes: vec!["/v1".into()],
                         methods: vec![AccessMethod::Get],
                         github_repository: None,
+                        delivery: None,
                     },
                     max_ttl_seconds: 900,
                     enabled: true,
@@ -425,9 +523,35 @@ mod database_tests {
             )
             .await
             .unwrap();
+        let general = service
+            .save_service(
+                None,
+                None,
+                SaveAccessService {
+                    vault_id: Some(vault.id.clone()),
+                    name: "General API".into(),
+                    policy: SandboxAccessPolicy {
+                        provider: None,
+                        origin: "https://api.example.com".into(),
+                        path_prefixes: vec!["/v1".into()],
+                        methods: vec![AccessMethod::Get],
+                        github_repository: None,
+                        delivery: None,
+                    },
+                    max_ttl_seconds: 900,
+                    enabled: true,
+                    credential: None,
+                    clear_credential: false,
+                    expected_version: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(general.project_id.is_none());
         let detail = service.get_vault(9602, &vault.id).await.unwrap();
-        assert_eq!(detail.vault.version, 2);
-        assert_eq!(detail.services.len(), 1);
+        assert_eq!(detail.vault.version, 3);
+        assert_eq!(detail.services.len(), 2);
+        assert!(detail.services.iter().any(|s| s.id == general.id));
         assert!(service.get_vault(9603, &vault.id).await.is_err());
         assert!(service
             .save_vault(
@@ -460,16 +584,35 @@ mod database_tests {
             )
             .await
             .is_err());
+        // General bundles can be created inside a migrated project vault.
+        // Legacy edits must validate their membership too.
         let bundle = service
             .save_bundle(
-                9602,
+                None,
                 &vault.id,
                 None,
-                make(vec![definition.id.clone()], 900),
+                make(vec![definition.id.clone(), general.id.clone()], 900),
             )
             .await
             .unwrap();
-        assert_eq!(bundle.service_ids, vec![definition.id.clone()]);
+        assert_eq!(bundle.service_ids.len(), 2);
+        assert!(bundle.service_ids.contains(&general.id));
+        assert!(bundle.project_id.is_none());
+        let updated = service
+            .save_bundle(
+                9602,
+                &vault.id,
+                Some(bundle.id.clone()),
+                SaveAccessBundle {
+                    name: "Updated APIs".into(),
+                    service_ids: bundle.service_ids.clone(),
+                    ttl_seconds: 900,
+                    expected_version: Some(bundle.version),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.version, 2);
         assert!(service
             .save_vault(
                 9602,
@@ -477,7 +620,7 @@ mod database_tests {
                 SaveAccessVault {
                     name: "Work".into(),
                     service_ids: vec![],
-                    expected_version: Some(2)
+                    expected_version: Some(3)
                 }
             )
             .await
@@ -496,7 +639,7 @@ mod database_tests {
                 .items[0]
                 .services
                 .len(),
-            1
+            2
         );
         assert_eq!(
             service
@@ -521,6 +664,71 @@ mod database_tests {
                 .unwrap(),
             0
         );
+        let links = service
+            .list_vault_links(
+                &vault.id,
+                AccessPageQuery {
+                    page: None,
+                    page_size: None,
+                },
+            )
+            .await
+            .unwrap();
+        service
+            .unlink_vault(&vault.id, &links.items[0].id)
+            .await
+            .unwrap();
+        assert_eq!(
+            service
+                .list_vaults(
+                    9602,
+                    AccessPageQuery {
+                        page: None,
+                        page_size: None
+                    }
+                )
+                .await
+                .unwrap()
+                .total,
+            0
+        );
+        for error in [
+            service.get_vault(9602, &vault.id).await.unwrap_err(),
+            service
+                .list_bundles(
+                    9602,
+                    &vault.id,
+                    AccessPageQuery {
+                        page: None,
+                        page_size: None,
+                    },
+                )
+                .await
+                .unwrap_err(),
+        ] {
+            assert!(
+                matches!(error, AccessError::NotFound { id, project_id: Some(9602), .. } if id == vault.id)
+            );
+        }
+        assert!(matches!(service.get_service(9602, &definition.id).await,
+            Err(AccessError::NotFound { id, project_id:Some(9602), .. }) if id == definition.id));
+        assert_eq!(
+            service
+                .list_services(
+                    9602,
+                    AccessPageQuery {
+                        page: None,
+                        page_size: None
+                    }
+                )
+                .await
+                .unwrap()
+                .total,
+            0
+        );
+        // The manager can still inspect the general resource; only the former
+        // project's read authority was removed.
+        assert!(service.get_vault(None, &vault.id).await.is_ok());
         test.cleanup().await;
     }
 }

@@ -38,7 +38,7 @@ pub struct Model {
     /// How long a finished run's container is kept. NULL takes the plane's
     /// default for jobs.
     pub ttl_seconds_after_finished: Option<i32>,
-    /// The workflow a `workflow` cron starts (ADR-103 §9). NULL otherwise.
+    /// The workflow a `workflow` cron starts (ADR-106 §9). NULL otherwise.
     pub workflow_name: Option<String>,
     /// The input of each run a `workflow` cron starts, as written in
     /// `.temps.yaml`. NULL: no input.

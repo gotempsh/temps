@@ -405,7 +405,7 @@ impl TempsPlugin for DeploymentsPlugin {
             context.register_service(project_image_cleaner);
 
             // Where the durable workflows engine invokes an environment's code
-            // (ADR-103): the current deployment's healthy replicas. Absent in
+            // (ADR-106): the current deployment's healthy replicas. Absent in
             // embeddings that never register a runtime context, which keeps
             // the historical host behaviour, as for `LocalWorkloadPolicy`.
             let runtime_context = context
@@ -1054,7 +1054,7 @@ impl TempsPlugin for DeploymentsPlugin {
                 ),
             }
 
-            // `workflow` crons start durable workflow runs (ADR-103 §9).
+            // `workflow` crons start durable workflow runs (ADR-106 §9).
             // The workflows plugin may register after this one, so its
             // control is only resolvable here.
             match (

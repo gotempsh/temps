@@ -22,6 +22,7 @@ struct Provider {
     recoveries: Mutex<Vec<(Option<i32>, String)>>,
     hang: AtomicBool,
     fail: AtomicBool,
+    unsupported: AtomicBool,
     capacity: Semaphore,
     delay: Duration,
 }
@@ -44,6 +45,12 @@ impl SandboxProvider for Provider {
         tokio::time::sleep(self.delay).await;
         if self.hang.load(Ordering::Relaxed) {
             std::future::pending::<()>().await;
+        }
+        if self.unsupported.load(Ordering::Relaxed) {
+            return Err(AgentError::ServiceAccessUnavailable {
+                sandbox_id: handle.sandbox_id.clone(),
+                reason: "needs a Linux Docker host".into(),
+            });
         }
         if self.fail.load(Ordering::Relaxed) {
             return Err(AgentError::SandboxExecFailed {
@@ -184,6 +191,7 @@ fn provider(target: &StoredTarget) -> Arc<Provider> {
         recoveries: Mutex::new(vec![]),
         hang: AtomicBool::new(false),
         fail: AtomicBool::new(false),
+        unsupported: AtomicBool::new(false),
         capacity: Semaphore::new(2),
         delay: Duration::ZERO,
     })
@@ -307,6 +315,21 @@ async fn inspection_rejects_wrong_worker_receipts_and_masks_provider_errors() {
     assert!(error.to_string().contains("sbx_test"));
     assert!(!error.to_string().contains("sensitive-provider-detail"));
     assert!(std::error::Error::source(&error).is_some());
+}
+#[tokio::test]
+async fn an_unsupported_sandbox_reports_the_provider_fix_instead_of_a_masked_failure() {
+    let target = target();
+    let provider = provider(&target);
+    let transport = WorkerTransport::new(provider.clone());
+    provider.unsupported.store(true, Ordering::Relaxed);
+    let error = transport.inspect(&sandbox()).await.unwrap_err();
+    assert!(
+        matches!(error, TransportError::Unsupported { .. }),
+        "{error:?}"
+    );
+    let message = error.to_string();
+    assert!(message.contains("sbx_test"), "{message}");
+    assert!(message.contains("needs a Linux Docker host"), "{message}");
 }
 #[tokio::test]
 async fn apply_requires_exact_target_snapshot_and_binding_receipt() {

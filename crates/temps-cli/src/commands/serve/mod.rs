@@ -5,6 +5,7 @@ pub(crate) mod admin_gate;
 mod admin_gate_handler;
 pub(crate) mod admin_gate_service;
 pub mod console;
+mod internal_routing;
 mod node_api;
 pub(crate) mod on_demand_cert;
 pub(crate) mod proxy;
@@ -856,15 +857,26 @@ impl ServeCommand {
                 .then(|| traefik_discovery_config.network.clone()),
         );
 
+        // The control-plane resolver's gateway, published by the DNS
+        // bootstrap loop and read by the deployer (ADR-024).
+        let overlay_dns_slot: temps_dns::OverlayDnsSlot = Arc::new(std::sync::RwLock::new(None));
+        // The same gateway, set only while the control plane's internal
+        // proxy serves its port 80 and no worker can: where the deployment
+        // DNS publisher points the internal names (ADR-104 D3).
+        let internal_names_slot: temps_dns::OverlayDnsSlot = Arc::new(std::sync::RwLock::new(None));
+
         // ADR-012-lite: every successful route_table reload also
         // reconciles internal `<env>.<project>.temps.local` A records,
         // so the L7 routes and the internal DNS zone share one trigger
         // and one source of truth.
         {
-            let publisher = Arc::new(temps_dns::DeploymentDnsPublisher::new(
-                db.clone(),
-                Arc::new(temps_dns::DnsRegistry::new(db.clone())),
-            ));
+            let publisher = Arc::new(
+                temps_dns::DeploymentDnsPublisher::new(
+                    db.clone(),
+                    Arc::new(temps_dns::DnsRegistry::new(db.clone())),
+                )
+                .with_control_plane_gateway(internal_names_slot.clone()),
+            );
             route_table.set_on_reload_callback(Arc::new(move || {
                 let publisher = publisher.clone();
                 Box::pin(async move {
@@ -937,6 +949,38 @@ impl ServeCommand {
                                 "Post-migration index build failed; retrying in {:?}: {}",
                                 retry_delay,
                                 e
+                            );
+                            tokio::time::sleep(retry_delay).await;
+                            retry_delay = next_post_migration_index_retry(retry_delay);
+                        }
+                    }
+                }
+            });
+
+            // Pre-migration audit events are attributed to their vaults in
+            // committed batches. Vault audit pages keep the slower read-time
+            // enumeration until it completes, so it is retried until then.
+            let attribution_db = db.clone();
+            rt.spawn(async move {
+                let mut retry_delay = POST_MIGRATION_INDEX_INITIAL_RETRY;
+                loop {
+                    match temps_schema::run_vault_audit_backfill(attribution_db.as_ref()).await {
+                        Ok(summary) => {
+                            if summary.batches > 0 {
+                                tracing::info!(
+                                    batches = summary.batches,
+                                    attributed = summary.attributed,
+                                    "Attributed pre-migration audit events to their access vaults"
+                                );
+                            }
+                            break;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                retry_in = ?retry_delay,
+                                error = %e,
+                                "Vault audit attribution backfill failed; vault audit pages \
+                                 use the read-time enumeration until it completes"
                             );
                             tokio::time::sleep(retry_delay).await;
                             retry_delay = next_post_migration_index_retry(retry_delay);
@@ -1318,7 +1362,6 @@ impl ServeCommand {
         // review as an explicit exception rather than a second precedent.
         let project_ip_gate_slot = Arc::new(temps_core::ProjectIpGateSlot::new_default());
         let request_policy_gate_slot = Arc::new(temps_core::RequestPolicyGateSlot::new_default());
-        let overlay_dns_slot: temps_dns::OverlayDnsSlot = Arc::new(std::sync::RwLock::new(None));
         // Node 0's network policy view: the enforcer (NetworkPolicyPlugin)
         // writes it, the proxy-owned resolver answers restricted workloads
         // from it. Both run in this process.
@@ -1537,6 +1580,7 @@ impl ServeCommand {
             project_ip_gate_slot as Arc<dyn temps_core::ProjectIpGate>,
             request_policy_gate_slot as Arc<dyn temps_core::RequestPolicyGate>,
             overlay_dns_slot,
+            internal_names_slot,
             Some(dns_policy_slot),
             docker_handle,
             self.profile.local_workloads_enabled(),

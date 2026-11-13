@@ -353,7 +353,7 @@ async fn register_builtin_plugins<R: PluginRegistrar>(
         // both. Must be registered BEFORE the background loops that consume the
         // registered AlarmService.
         || Box::new(MonitoringPlugin::new()),
-        // Durable workflows (ADR-103). After DeploymentsPlugin (executor
+        // Durable workflows (ADR-106). After DeploymentsPlugin (executor
         // endpoints), BlobPlugin (payload offload), OtelPlugin (project
         // metrics) and AuditPlugin, whose services it resolves.
         || Box::new(temps_workflows::WorkflowsPlugin::new()),

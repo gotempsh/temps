@@ -44,7 +44,7 @@
           }
         ]
       },
-      "Image": "ghcr.io/gotempsh/temps-sandbox-node:0.1.0",
+      "Image": "ghcr.io/gotempsh/temps-sandbox-node:0.1.0-beta",
       "Labels": {
         "sh.temps.sandbox-egress-policy": "1",
         "sh.temps.sandbox-egress-rules": "646dda6332c53afa53971b633f4ea1d6fc7ea34944523fa5d155317691eec3e0",

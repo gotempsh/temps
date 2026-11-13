@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Invocation tokens and workflow credentials (ADR-103 §11).
+//! Invocation tokens and workflow credentials (ADR-106 §11).
 //!
 //! **Invocation token.** Temps signs every request it sends to an executor
 //! (`invoke`, `manifest`) with an Ed25519 key, and the same token authorizes

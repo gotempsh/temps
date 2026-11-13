@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Durable workflows orchestrated by the control plane (ADR-103).
+//! Durable workflows orchestrated by the control plane (ADR-106).
 //!
 //! Temps keeps the state of every run (its status, lease, wait and the journal
 //! of completed steps) and pushes invocations to the user's own deployed

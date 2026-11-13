@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! The workflow engine: invokes claimed runs, applies their outcomes,
-//! delivers events and serves the executor's journal API (ADR-103 §3–§9).
+//! delivers events and serves the executor's journal API (ADR-106 §3–§9).
 //!
 //! It holds no state of its own beyond caches: every decision is a fenced
 //! write to the [`WorkflowStore`], so any number of control-plane processes

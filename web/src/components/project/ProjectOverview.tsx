@@ -38,6 +38,7 @@ import { ThresholdLineChart } from '@/components/charts/threshold-line-chart'
 import { VisitorSparkline } from '@/components/dashboard/VisitorSparkline'
 import { LastDeployment } from '@/components/deployments/LastDeployment'
 import { RecentDeployments } from '@/components/deployments/RecentDeployments'
+import { ProjectVaultAccess } from '@/components/service-access/ProjectVaultAccess'
 import { ProjectFailureBanner } from '@/components/project/ProjectFailureBanner'
 import { ClusterDnsStaleBanner } from '@/components/settings/ClusterDnsCoverage'
 import { Badge } from '@/components/ui/badge'
@@ -265,6 +266,7 @@ export function ProjectOverview({
         }
       />
       <ProjectFailureBanner project={project} lastDeployment={lastDeployment} />
+      <ProjectVaultAccess projectId={project.id} />
       <ClusterDnsStaleBanner projectId={project.id} />
       <div className="@container/overview">
         <div className="grid grid-cols-1 gap-4 @5xl/overview:grid-cols-5">

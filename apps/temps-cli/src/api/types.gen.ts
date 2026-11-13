@@ -28,7 +28,7 @@ export type AccessBundleResponse = {
     created_at: string;
     id: string;
     name: string;
-    project_id: number;
+    project_id?: number | null;
     service_ids: Array<string>;
     ttl_seconds: number;
     updated_at: string;
@@ -113,6 +113,7 @@ export type AccessServiceList = {
 export type AccessServiceProvider = 'github' | 'gitlab' | 'openai' | 'anthropic' | 'stripe' | 'resend' | 'sendgrid' | 'vercel' | 'netlify' | 'mistral' | 'groq';
 
 export type AccessServiceResponse = {
+    catalog?: CatalogReference | null;
     created_at: string;
     enabled: boolean;
     has_credential: boolean;
@@ -120,7 +121,7 @@ export type AccessServiceResponse = {
     max_ttl_seconds: number;
     name: string;
     policy: SandboxAccessPolicy;
-    project_id: number;
+    project_id?: number | null;
     updated_at: string;
     version: number;
 };
@@ -154,7 +155,7 @@ export type AccessSessionResponse = {
     created_by?: number | null;
     expires_at: string;
     id: string;
-    project_id: number;
+    project_id?: number | null;
     revoked_at?: string | null;
     service_count: number;
     /**
@@ -233,7 +234,7 @@ export type AccessVaultResponse = {
     created_at: string;
     id: string;
     name: string;
-    project_id: number;
+    project_id?: number | null;
     service_ids: Array<string>;
     updated_at: string;
     version: number;
@@ -2274,6 +2275,13 @@ export type AppSettings = {
      */
     loopback_ja4_header?: string | null;
     /**
+     * Instance-wide defaults for the Docker healthcheck of managed service
+     * containers. Owned by `PUT /external-services/healthcheck-defaults`,
+     * which validates and audits them; the generic settings update
+     * preserves the stored value. Unset values use Temps' built-in timings.
+     */
+    managed_service_healthchecks?: ManagedServiceHealthcheckSettings;
+    /**
      * MCP server settings (ADR-039). Off by default — enable via the Settings
      * UI to expose the MCP endpoint to the Temps CLI wizard.
      */
@@ -2850,6 +2858,19 @@ export type ApplyRequest = {
      * The plan this acts on, from `POST …/reachability/plan`.
      */
     plan_id: string;
+};
+
+/**
+ * After `apply`: the container was recreated with these timings.
+ */
+export type ApplyServiceHealthcheckResponse = {
+    /**
+     * As this host's Docker got them: below API 1.44 the interval is the
+     * start interval.
+     */
+    applied: HealthcheckTimings;
+    healthcheck?: ServiceHealthcheck | null;
+    service_id: number;
 };
 
 export type ApproveSandboxService = {
@@ -4368,6 +4389,21 @@ export type Candidate = {
     description: string;
     evidence: DetectionEvidence;
     id: string;
+};
+
+/**
+ * What the catalog knows about a saved service's destination: how to show it
+ * and where its credential is created, so a key can be rotated from the edit page.
+ */
+export type CatalogReference = {
+    credential_help: CredentialHelp;
+    /**
+     * One label for a single credential, or two (username, password).
+     */
+    credential_labels: Array<string>;
+    id: string;
+    logo: string;
+    name: string;
 };
 
 /**
@@ -8468,6 +8504,22 @@ export type CreateInternalAccessGrantRequest = {
     target_environment_id?: number | null;
 };
 
+export type CreateInternalAccessSandboxGrantRequest = {
+    /**
+     * Why the grant exists, up to 200 characters.
+     */
+    description?: string | null;
+    /**
+     * Public id of one of your sandboxes.
+     */
+    sandbox_id: string;
+    /**
+     * The environment of this project that may be called; omit for every
+     * environment, present and future.
+     */
+    target_environment_id?: number | null;
+};
+
 /**
  * Request to create an IP access control rule
  */
@@ -9356,6 +9408,11 @@ export type CreateUserRequest = {
     username: string;
 };
 
+export type CreateVaultLink = {
+    project_id?: number | null;
+    sandbox_id?: string | null;
+};
+
 export type CreateWebhookProviderRequest = {
     config: WebhookConfig;
     enabled?: boolean | null;
@@ -9424,6 +9481,47 @@ export type CreatedShieldTokenResponse = ShieldTokenResponse & {
      * Send it in `X-Temps-Shield-Token`.
      */
     secret: string;
+};
+
+/**
+ * How a stored credential is presented to the destination, plus any fixed
+ * headers the API requires. Changing it changes the policy, so consent given
+ * for the previous delivery does not carry over.
+ */
+export type CredentialDelivery = {
+    format?: CredentialFormat;
+    /**
+     * Fixed, non-secret headers sent with every request, such as an API
+     * version. At most 16; values are printable ASCII and never templates.
+     */
+    headers?: Array<RequestHeader>;
+};
+
+/**
+ * The credential is one stored secret. Formats differ only in how it is sent.
+ */
+export type CredentialFormat = {
+    method: 'bearer';
+} | {
+    method: 'header';
+    name: string;
+    prefix?: string | null;
+} | {
+    method: 'basic_token';
+    username: string;
+} | {
+    method: 'basic';
+};
+
+export type CredentialHelp = {
+    /**
+     * Notes the service's template gives for its credential fields.
+     */
+    notes: Array<string>;
+    /**
+     * HTTPS page where this service's key or token is created.
+     */
+    url?: string | null;
 };
 
 export type CronExecutionInfo = {
@@ -11942,6 +12040,11 @@ export type DnsResolveRequest = {
      * `A` (default), `AAAA`, `CNAME`, `SRV` or `TXT`.
      */
     record_type?: string | null;
+    /**
+     * Ask as one of your sandboxes (its public id): whether an internal
+     * access grant lets it call the name. Not with `project_id`.
+     */
+    sandbox_id?: string | null;
 };
 
 export type DnsResolveResponse = {
@@ -13240,6 +13343,26 @@ export type EndpointDto = {
     target_ip?: string | null;
     target_port?: number | null;
     ttl: number;
+};
+
+/**
+ * What a service of one engine inherits.
+ */
+export type EngineHealthcheckDefault = {
+    /**
+     * Temps' own timings for the engine.
+     */
+    builtin: HealthcheckTimings;
+    /**
+     * What a service without overrides gets, and where each value comes from.
+     */
+    effective: ResolvedHealthcheck;
+    engine: ManagedEngine;
+    /**
+     * How long Temps waits for a new container of this engine to become
+     * healthy; a check has to land inside it.
+     */
+    readiness_wait_secs: number;
 };
 
 /**
@@ -17314,6 +17437,112 @@ export type HealthSummary = {
     uptime_pct: number;
 };
 
+/**
+ * Whether Temps can give this service's container a healthcheck, and
+ * whether it can recreate it from here to apply one now.
+ */
+export type HealthcheckCapability = {
+    /**
+     * Why not, when `can_apply_now` is false.
+     */
+    apply_now_reason?: string | null;
+    /**
+     * Temps can recreate the container from here to apply the settings.
+     */
+    can_apply_now: boolean;
+    /**
+     * The container has a Docker healthcheck Temps builds, so overrides
+     * apply to it.
+     */
+    configurable: boolean;
+    /**
+     * Why not, when `configurable` is false.
+     */
+    reason?: string | null;
+};
+
+/**
+ * The instance default and what it gives each engine.
+ */
+export type HealthcheckDefaults = {
+    engines: Array<EngineHealthcheckDefault>;
+    /**
+     * The instance default (null = the engine's built-in value).
+     */
+    overrides: HealthcheckOverrides;
+};
+
+/**
+ * Overrides of some or all of the five healthcheck values. `None` inherits.
+ */
+export type HealthcheckOverrides = {
+    /**
+     * Seconds between checks once healthy (5–3600).
+     */
+    interval_secs?: number | null;
+    /**
+     * Consecutive failures that make the container unhealthy (1–10).
+     */
+    retries?: number | null;
+    /**
+     * Seconds between checks while starting (1–60).
+     */
+    start_interval_secs?: number | null;
+    /**
+     * Seconds after start during which failures do not count (0–600).
+     */
+    start_period_secs?: number | null;
+    /**
+     * Seconds one check may run (1–60, and shorter than the interval).
+     */
+    timeout_secs?: number | null;
+};
+
+/**
+ * Where an effective healthcheck value comes from.
+ */
+export type HealthcheckSource = 'builtin' | 'instance_default' | 'service';
+
+/**
+ * The source of each of the five values.
+ */
+export type HealthcheckSources = {
+    interval_secs: HealthcheckSource;
+    retries: HealthcheckSource;
+    start_interval_secs: HealthcheckSource;
+    start_period_secs: HealthcheckSource;
+    timeout_secs: HealthcheckSource;
+};
+
+/**
+ * The five numbers of a Docker healthcheck, in whole seconds (retries is a
+ * count).
+ */
+export type HealthcheckTimings = {
+    /**
+     * Seconds between checks once the container is healthy.
+     */
+    interval_secs: number;
+    /**
+     * Consecutive failed checks that make the container unhealthy.
+     */
+    retries: number;
+    /**
+     * Seconds between checks while the container is starting, within
+     * `start_period_secs`.
+     */
+    start_interval_secs: number;
+    /**
+     * Seconds after start during which failed checks do not count and
+     * checks run every `start_interval_secs`.
+     */
+    start_period_secs: number;
+    /**
+     * Seconds one check may run before it counts as failed.
+     */
+    timeout_secs: number;
+};
+
 export type HeartbeatApiRequest = {
     /**
      * Container platform of this node's Docker daemon (`linux/amd64`,
@@ -18803,6 +19032,43 @@ export type InternalAccessGrantResponse = {
     target_project_slug: string;
 };
 
+export type InternalAccessSandboxGrantListResponse = {
+    items: Array<InternalAccessSandboxGrantResponse>;
+    page: number;
+    page_size: number;
+    total: number;
+};
+
+/**
+ * One sandbox allowed to call this project (or one environment of it).
+ */
+export type InternalAccessSandboxGrantResponse = {
+    created_at: string;
+    created_by?: number | null;
+    description?: string | null;
+    id: number;
+    /**
+     * The sandbox's public id.
+     */
+    sandbox_id: string;
+    /**
+     * The name the user gave the sandbox.
+     */
+    sandbox_name: string;
+    /**
+     * `running` or `stopped`; a destroyed sandbox's grants are removed.
+     */
+    sandbox_status: string;
+    /**
+     * `null`: every environment of the target project.
+     */
+    target_environment_id?: number | null;
+    target_environment_name?: string | null;
+    target_project_id: number;
+    target_project_name: string;
+    target_project_slug: string;
+};
+
 /**
  * A worker's internal routing, from its heartbeat's
  * `capacity.internal_proxy`. Every `<env>.<project>.temps.local` name
@@ -19391,6 +19657,10 @@ export type ListAuditLogsQuery = {
      * Filter logs by operation type (omit for all)
      */
     operation_type?: string | null;
+    /**
+     * Resource ID, including child events for a vault (omit for all resources).
+     */
+    resource_id?: string | null;
     /**
      * End timestamp, ISO 8601 (e.g. "2024-01-15T14:30:00Z")
      */
@@ -20143,6 +20413,11 @@ export type ManagedDomainResponse = {
     zone_id?: string | null;
 };
 
+/**
+ * Engines whose containers Temps manages and may need to replace.
+ */
+export type ManagedEngine = 'postgres' | 'redis' | 'mariadb' | 'mongodb' | 'rustfs' | 'minio';
+
 export type ManagedEnvironmentVariable = {
     description: string;
     is_secret: boolean;
@@ -20156,6 +20431,36 @@ export type ManagedEnvironmentVariable = {
 };
 
 export type ManagedEnvironmentVariableSource = 'error_tracking' | 'open_telemetry' | 'temps';
+
+/**
+ * Instance-wide defaults for the Docker healthcheck every managed database
+ * and storage container is created with. `None` inherits Temps' built-in
+ * value for the engine; a service can override each value again. Bounds and
+ * validation live with the healthcheck builder
+ * (`temps_providers_core::healthcheck`).
+ */
+export type ManagedServiceHealthcheckSettings = {
+    /**
+     * Seconds between checks once a container is healthy (5–3600).
+     */
+    interval_secs?: number | null;
+    /**
+     * Consecutive failed checks that make a container unhealthy (1–10).
+     */
+    retries?: number | null;
+    /**
+     * Seconds between checks while a container is starting (1–60).
+     */
+    start_interval_secs?: number | null;
+    /**
+     * Seconds after start during which failed checks do not count (0–600).
+     */
+    start_period_secs?: number | null;
+    /**
+     * Seconds one check may run before it counts as failed (1–60).
+     */
+    timeout_secs?: number | null;
+};
 
 /**
  * A manual action the user must perform outside of the automated migration
@@ -27859,6 +28164,11 @@ export type RequestDiscoveredRouteCertRequest = {
     challenge_type: string;
 };
 
+export type RequestHeader = {
+    name: string;
+    value: string;
+};
+
 export type RequestRow = {
     client_ip?: string | null;
     country?: string | null;
@@ -28075,6 +28385,14 @@ export type ResolvedEnvVarSource = {
 } | {
     service: EnvVarIntegrationInfo;
     type: 'integration';
+};
+
+/**
+ * The values a container would be created with, and where each comes from.
+ */
+export type ResolvedHealthcheck = {
+    sources: HealthcheckSources;
+    timings: HealthcheckTimings;
 };
 
 /**
@@ -29116,6 +29434,7 @@ export type S3SourceResponse = {
  * against its supported protocols before installing a policy.
  */
 export type SandboxAccessPolicy = {
+    delivery?: CredentialDelivery | null;
     github_repository?: GithubRepositoryAccess | null;
     methods: Array<AccessMethod>;
     /**
@@ -29397,6 +29716,39 @@ export type SandboxInner = {
     timeout: number;
     updatedAt: number;
     vcpus: number;
+};
+
+export type SandboxInternalAddressListResponse = {
+    items: Array<SandboxInternalAddressResponse>;
+    page: number;
+    page_size: number;
+    total: number;
+};
+
+/**
+ * One internal address the sandbox may call, with the command that calls it.
+ */
+export type SandboxInternalAddressResponse = {
+    alias_curl_command?: string | null;
+    /**
+     * The same environment by its subdomain, `<subdomain>.temps.local`
+     * (ADR-105 D7). Absent when the subdomain is not one DNS label, or a
+     * managed service or another owner holds that name.
+     */
+    alias_hostname?: string | null;
+    /**
+     * Run inside the sandbox: its egress proxy sends it to this host's
+     * internal proxy.
+     */
+    curl_command: string;
+    environment_id: number;
+    environment_name: string;
+    grant_id: number;
+    hostname: string;
+    project_id: number;
+    project_name: string;
+    project_slug: string;
+    url: string;
 };
 
 /**
@@ -30642,6 +30994,37 @@ export type ServiceBackupListResponse = {
     total: number;
 };
 
+export type ServiceCatalog = {
+    items: Array<ServiceCatalogEntry>;
+    page: number;
+    page_size: number;
+    total: number;
+};
+
+export type ServiceCatalogEntry = {
+    category: string;
+    /**
+     * Where to create the credential: a page when Temps knows one, and the
+     * template's own notes about each field. Both may be absent.
+     */
+    credential_help: CredentialHelp;
+    /**
+     * One label for a single credential, or two (username, password) when the
+     * service signs in with a pair that is stored as `username:password`.
+     */
+    credential_labels: Array<string>;
+    delivery?: CredentialDelivery | null;
+    description: string;
+    id: string;
+    logo: string;
+    name: string;
+    origin?: string | null;
+    popular: boolean;
+    provider?: AccessServiceProvider | null;
+    reason?: string | null;
+    supported: boolean;
+};
+
 /**
  * Request body for creating an alert rule on an external service.
  *
@@ -30799,6 +31182,47 @@ export type ServiceHealthStatusEntryResponse = {
      * been probed yet.
      */
     status?: string | null;
+};
+
+/**
+ * A service's healthcheck as the console shows it.
+ */
+export type ServiceHealthcheck = {
+    capability: HealthcheckCapability;
+    effective?: ResolvedHealthcheck | null;
+    engine?: ManagedEngine | null;
+    inherited?: ResolvedHealthcheck | null;
+    /**
+     * This service's own overrides (null = inherit).
+     */
+    overrides: HealthcheckOverrides;
+    /**
+     * Why this service's overrides are set aside: they no longer combine
+     * with the instance default, so `effective` is what the container gets
+     * without them. Change or clear them to use them again.
+     */
+    overrides_ignored_reason?: string | null;
+    /**
+     * The running container differs from `effective` (as this host's
+     * Docker would store it) until it is recreated. `false` when either is
+     * unknown.
+     */
+    pending_recreate: boolean;
+    /**
+     * How long Temps waits for a new container of this engine to become
+     * healthy; a check has to land inside it.
+     */
+    readiness_wait_secs?: number | null;
+    running?: HealthcheckTimings | null;
+    service_id: number;
+    service_name: string;
+    service_type: string;
+    /**
+     * `false`: this host's Docker ignores the start interval, so the
+     * steady-state interval stays at the start interval. Absent when not
+     * known yet.
+     */
+    start_interval_supported?: boolean | null;
 };
 
 /**
@@ -37510,6 +37934,23 @@ export type VariableHistoryList = {
     total: number;
 };
 
+export type VaultLinkList = {
+    items: Array<VaultLinkResponse>;
+    page: number;
+    page_size: number;
+    total: number;
+};
+
+export type VaultLinkResponse = {
+    consumer_name?: string | null;
+    created_at: string;
+    id: string;
+    project_id?: number | null;
+    revoked_at?: string | null;
+    sandbox_id?: string | null;
+    vault_id: string;
+};
+
 /**
  * How ownership of a hostname is proven.
  */
@@ -38713,7 +39154,7 @@ export type WorkflowRunResponse = {
 };
 
 /**
- * Where a run is in its lifecycle (ADR-103 §3).
+ * Where a run is in its lifecycle (ADR-106 §3).
  */
 export type WorkflowRunStatus = 'queued' | 'running' | 'sleeping' | 'waiting' | 'retrying' | 'completed' | 'failed' | 'cancelled' | 'stuck';
 
@@ -39267,6 +39708,13 @@ export type AppSettingsWritable = {
      * Set through [`normalize_loopback_ja4_header`].
      */
     loopback_ja4_header?: string | null;
+    /**
+     * Instance-wide defaults for the Docker healthcheck of managed service
+     * containers. Owned by `PUT /external-services/healthcheck-defaults`,
+     * which validates and audits them; the generic settings update
+     * preserves the stored value. Unset values use Temps' built-in timings.
+     */
+    managed_service_healthchecks?: ManagedServiceHealthcheckSettings;
     /**
      * MCP server settings (ADR-039). Off by default — enable via the Settings
      * UI to expose the MCP endpoint to the Temps CLI wizard.
@@ -40121,6 +40569,786 @@ export type UpdateSpeedMetricsResponses = {
 };
 
 export type UpdateSpeedMetricsResponse = UpdateSpeedMetricsResponses[keyof UpdateSpeedMetricsResponses];
+
+export type ListAccessServicesGeneralData = {
+    body?: never;
+    path?: never;
+    query?: {
+        page?: number | null;
+        page_size?: number | null;
+    };
+    url: '/access-services';
+};
+
+export type ListAccessServicesGeneralErrors = {
+    401: unknown;
+    403: unknown;
+    500: unknown;
+};
+
+export type ListAccessServicesGeneralResponses = {
+    200: AccessServiceList;
+};
+
+export type ListAccessServicesGeneralResponse = ListAccessServicesGeneralResponses[keyof ListAccessServicesGeneralResponses];
+
+export type CreateAccessServiceGeneralData = {
+    body: SaveAccessServiceWritable;
+    path?: never;
+    query?: {
+        source_project_id?: number | null;
+    };
+    url: '/access-services';
+};
+
+export type CreateAccessServiceGeneralErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    409: unknown;
+    500: unknown;
+};
+
+export type CreateAccessServiceGeneralResponses = {
+    201: AccessServiceResponse;
+};
+
+export type CreateAccessServiceGeneralResponse = CreateAccessServiceGeneralResponses[keyof CreateAccessServiceGeneralResponses];
+
+export type DeleteAccessServiceGeneralData = {
+    body?: never;
+    path: {
+        service_id: string;
+    };
+    query?: never;
+    url: '/access-services/{service_id}';
+};
+
+export type DeleteAccessServiceGeneralErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    500: unknown;
+};
+
+export type DeleteAccessServiceGeneralResponses = {
+    204: void;
+};
+
+export type DeleteAccessServiceGeneralResponse = DeleteAccessServiceGeneralResponses[keyof DeleteAccessServiceGeneralResponses];
+
+export type GetAccessServiceGeneralData = {
+    body?: never;
+    path: {
+        service_id: string;
+    };
+    query?: never;
+    url: '/access-services/{service_id}';
+};
+
+export type GetAccessServiceGeneralErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    500: unknown;
+};
+
+export type GetAccessServiceGeneralResponses = {
+    200: AccessServiceResponse;
+};
+
+export type GetAccessServiceGeneralResponse = GetAccessServiceGeneralResponses[keyof GetAccessServiceGeneralResponses];
+
+export type UpdateAccessServiceGeneralData = {
+    body: SaveAccessServiceWritable;
+    path: {
+        service_id: string;
+    };
+    query?: never;
+    url: '/access-services/{service_id}';
+};
+
+export type UpdateAccessServiceGeneralErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    409: unknown;
+    500: unknown;
+};
+
+export type UpdateAccessServiceGeneralResponses = {
+    200: AccessServiceResponse;
+};
+
+export type UpdateAccessServiceGeneralResponse = UpdateAccessServiceGeneralResponses[keyof UpdateAccessServiceGeneralResponses];
+
+export type ListAccessSessionsGeneralData = {
+    body?: never;
+    path?: never;
+    query?: {
+        page?: number | null;
+        page_size?: number | null;
+        vault_id?: string | null;
+        /**
+         * Filter by the sandbox's public ID; ownership still applies.
+         */
+        sandbox_id?: string | null;
+    };
+    url: '/access-sessions';
+};
+
+export type ListAccessSessionsGeneralErrors = {
+    /**
+     * Invalid session
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Scoped resource not found
+     */
+    404: unknown;
+    /**
+     * Policy changed
+     */
+    409: unknown;
+    /**
+     * Session storage failed
+     */
+    500: unknown;
+    /**
+     * Worker unavailable
+     */
+    503: unknown;
+};
+
+export type ListAccessSessionsGeneralResponses = {
+    /**
+     * Session authorizations
+     */
+    200: AccessSessionList;
+};
+
+export type ListAccessSessionsGeneralResponse = ListAccessSessionsGeneralResponses[keyof ListAccessSessionsGeneralResponses];
+
+export type GetAccessSessionGeneralData = {
+    body?: never;
+    path: {
+        session_id: string;
+    };
+    query?: never;
+    url: '/access-sessions/{session_id}';
+};
+
+export type GetAccessSessionGeneralErrors = {
+    /**
+     * Invalid session
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Scoped resource not found
+     */
+    404: unknown;
+    /**
+     * Policy changed
+     */
+    409: unknown;
+    /**
+     * Session storage failed
+     */
+    500: unknown;
+    /**
+     * Worker unavailable
+     */
+    503: unknown;
+};
+
+export type GetAccessSessionGeneralResponses = {
+    /**
+     * Session policies and worker receipts
+     */
+    200: AccessSessionDetail;
+};
+
+export type GetAccessSessionGeneralResponse = GetAccessSessionGeneralResponses[keyof GetAccessSessionGeneralResponses];
+
+export type RevokeAccessSessionGeneralData = {
+    body?: never;
+    path: {
+        session_id: string;
+    };
+    query?: never;
+    url: '/access-sessions/{session_id}/revoke';
+};
+
+export type RevokeAccessSessionGeneralErrors = {
+    /**
+     * Invalid session
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Scoped resource not found
+     */
+    404: unknown;
+    /**
+     * Policy changed
+     */
+    409: unknown;
+    /**
+     * Session storage failed
+     */
+    500: unknown;
+    /**
+     * Worker unavailable
+     */
+    503: unknown;
+};
+
+export type RevokeAccessSessionGeneralResponses = {
+    /**
+     * Revocation requested; inspect worker receipts
+     */
+    202: AccessSessionResponse;
+};
+
+export type RevokeAccessSessionGeneralResponse = RevokeAccessSessionGeneralResponses[keyof RevokeAccessSessionGeneralResponses];
+
+export type ListAccessVaultsGeneralData = {
+    body?: never;
+    path?: never;
+    query?: {
+        page?: number | null;
+        page_size?: number | null;
+    };
+    url: '/access-vaults';
+};
+
+export type ListAccessVaultsGeneralErrors = {
+    /**
+     * Invalid selection
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Resource not found
+     */
+    404: unknown;
+    /**
+     * Version conflict
+     */
+    409: unknown;
+    /**
+     * Storage failure
+     */
+    500: unknown;
+};
+
+export type ListAccessVaultsGeneralResponses = {
+    /**
+     * Success
+     */
+    200: AccessVaultList;
+};
+
+export type ListAccessVaultsGeneralResponse = ListAccessVaultsGeneralResponses[keyof ListAccessVaultsGeneralResponses];
+
+export type CreateAccessVaultGeneralData = {
+    body: SaveAccessVault;
+    path?: never;
+    query?: never;
+    url: '/access-vaults';
+};
+
+export type CreateAccessVaultGeneralErrors = {
+    /**
+     * Invalid selection
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Resource not found
+     */
+    404: unknown;
+    /**
+     * Version conflict
+     */
+    409: unknown;
+    /**
+     * Storage failure
+     */
+    500: unknown;
+};
+
+export type CreateAccessVaultGeneralResponses = {
+    /**
+     * Success
+     */
+    201: AccessVaultResponse;
+};
+
+export type CreateAccessVaultGeneralResponse = CreateAccessVaultGeneralResponses[keyof CreateAccessVaultGeneralResponses];
+
+export type DeleteAccessVaultGeneralData = {
+    body?: never;
+    path: {
+        vault_id: string;
+    };
+    query?: never;
+    url: '/access-vaults/{vault_id}';
+};
+
+export type DeleteAccessVaultGeneralErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    500: unknown;
+};
+
+export type DeleteAccessVaultGeneralResponses = {
+    204: void;
+};
+
+export type DeleteAccessVaultGeneralResponse = DeleteAccessVaultGeneralResponses[keyof DeleteAccessVaultGeneralResponses];
+
+export type GetAccessVaultGeneralData = {
+    body?: never;
+    path: {
+        vault_id: string;
+    };
+    query?: {
+        sandbox_id?: string | null;
+    };
+    url: '/access-vaults/{vault_id}';
+};
+
+export type GetAccessVaultGeneralErrors = {
+    /**
+     * Invalid selection
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Resource not found
+     */
+    404: unknown;
+    /**
+     * Version conflict
+     */
+    409: unknown;
+    /**
+     * Storage failure
+     */
+    500: unknown;
+};
+
+export type GetAccessVaultGeneralResponses = {
+    /**
+     * Success
+     */
+    200: AccessVaultDetail;
+};
+
+export type GetAccessVaultGeneralResponse = GetAccessVaultGeneralResponses[keyof GetAccessVaultGeneralResponses];
+
+export type UpdateAccessVaultGeneralData = {
+    body: SaveAccessVault;
+    path: {
+        vault_id: string;
+    };
+    query?: never;
+    url: '/access-vaults/{vault_id}';
+};
+
+export type UpdateAccessVaultGeneralErrors = {
+    /**
+     * Invalid selection
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Resource not found
+     */
+    404: unknown;
+    /**
+     * Version conflict
+     */
+    409: unknown;
+    /**
+     * Storage failure
+     */
+    500: unknown;
+};
+
+export type UpdateAccessVaultGeneralResponses = {
+    /**
+     * Success
+     */
+    200: AccessVaultResponse;
+};
+
+export type UpdateAccessVaultGeneralResponse = UpdateAccessVaultGeneralResponses[keyof UpdateAccessVaultGeneralResponses];
+
+export type ListAccessBundlesGeneralData = {
+    body?: never;
+    path: {
+        vault_id: string;
+    };
+    query?: {
+        page?: number | null;
+        page_size?: number | null;
+        sandbox_id?: string | null;
+    };
+    url: '/access-vaults/{vault_id}/bundles';
+};
+
+export type ListAccessBundlesGeneralErrors = {
+    /**
+     * Invalid selection
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Resource not found
+     */
+    404: unknown;
+    /**
+     * Version conflict
+     */
+    409: unknown;
+    /**
+     * Storage failure
+     */
+    500: unknown;
+};
+
+export type ListAccessBundlesGeneralResponses = {
+    /**
+     * Success
+     */
+    200: AccessBundleList;
+};
+
+export type ListAccessBundlesGeneralResponse = ListAccessBundlesGeneralResponses[keyof ListAccessBundlesGeneralResponses];
+
+export type CreateAccessBundleGeneralData = {
+    body: SaveAccessBundle;
+    path: {
+        vault_id: string;
+    };
+    query?: never;
+    url: '/access-vaults/{vault_id}/bundles';
+};
+
+export type CreateAccessBundleGeneralErrors = {
+    /**
+     * Invalid selection
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Resource not found
+     */
+    404: unknown;
+    /**
+     * Version conflict
+     */
+    409: unknown;
+    /**
+     * Storage failure
+     */
+    500: unknown;
+};
+
+export type CreateAccessBundleGeneralResponses = {
+    /**
+     * Success
+     */
+    201: AccessBundleResponse;
+};
+
+export type CreateAccessBundleGeneralResponse = CreateAccessBundleGeneralResponses[keyof CreateAccessBundleGeneralResponses];
+
+export type DeleteAccessBundleGeneralData = {
+    body?: never;
+    path: {
+        vault_id: string;
+        bundle_id: string;
+    };
+    query?: never;
+    url: '/access-vaults/{vault_id}/bundles/{bundle_id}';
+};
+
+export type DeleteAccessBundleGeneralErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    500: unknown;
+};
+
+export type DeleteAccessBundleGeneralResponses = {
+    204: void;
+};
+
+export type DeleteAccessBundleGeneralResponse = DeleteAccessBundleGeneralResponses[keyof DeleteAccessBundleGeneralResponses];
+
+export type UpdateAccessBundleGeneralData = {
+    body: SaveAccessBundle;
+    path: {
+        vault_id: string;
+        bundle_id: string;
+    };
+    query?: never;
+    url: '/access-vaults/{vault_id}/bundles/{bundle_id}';
+};
+
+export type UpdateAccessBundleGeneralErrors = {
+    /**
+     * Invalid selection
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Resource not found
+     */
+    404: unknown;
+    /**
+     * Version conflict
+     */
+    409: unknown;
+    /**
+     * Storage failure
+     */
+    500: unknown;
+};
+
+export type UpdateAccessBundleGeneralResponses = {
+    /**
+     * Success
+     */
+    200: AccessBundleResponse;
+};
+
+export type UpdateAccessBundleGeneralResponse = UpdateAccessBundleGeneralResponses[keyof UpdateAccessBundleGeneralResponses];
+
+export type GetVaultEligibilityData = {
+    body?: never;
+    path: {
+        vault_id: string;
+        sandbox_id: string;
+    };
+    query?: never;
+    url: '/access-vaults/{vault_id}/consumers/{sandbox_id}';
+};
+
+export type GetVaultEligibilityErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    500: unknown;
+};
+
+export type GetVaultEligibilityResponses = {
+    200: VaultLinkResponse;
+};
+
+export type GetVaultEligibilityResponse = GetVaultEligibilityResponses[keyof GetVaultEligibilityResponses];
+
+export type ListVaultLinksData = {
+    body?: never;
+    path: {
+        vault_id: string;
+    };
+    query?: {
+        page?: number | null;
+        page_size?: number | null;
+        project_ids?: string | null;
+        sandbox_ids?: string | null;
+    };
+    url: '/access-vaults/{vault_id}/links';
+};
+
+export type ListVaultLinksErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    500: unknown;
+};
+
+export type ListVaultLinksResponses = {
+    200: VaultLinkList;
+};
+
+export type ListVaultLinksResponse = ListVaultLinksResponses[keyof ListVaultLinksResponses];
+
+export type CreateVaultLinkData = {
+    body: CreateVaultLink;
+    path: {
+        vault_id: string;
+    };
+    query?: never;
+    url: '/access-vaults/{vault_id}/links';
+};
+
+export type CreateVaultLinkErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    409: unknown;
+    500: unknown;
+};
+
+export type CreateVaultLinkResponses = {
+    201: VaultLinkResponse;
+};
+
+export type CreateVaultLinkResponse = CreateVaultLinkResponses[keyof CreateVaultLinkResponses];
+
+export type DeleteVaultLinkData = {
+    body?: never;
+    path: {
+        vault_id: string;
+        link_id: string;
+    };
+    query?: never;
+    url: '/access-vaults/{vault_id}/links/{link_id}';
+};
+
+export type DeleteVaultLinkErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    500: unknown;
+};
+
+export type DeleteVaultLinkResponses = {
+    204: void;
+};
+
+export type DeleteVaultLinkResponse = DeleteVaultLinkResponses[keyof DeleteVaultLinkResponses];
+
+export type CreateAccessSessionGeneralData = {
+    body: CreateAccessSession;
+    path: {
+        vault_id: string;
+    };
+    query?: never;
+    url: '/access-vaults/{vault_id}/sessions';
+};
+
+export type CreateAccessSessionGeneralErrors = {
+    /**
+     * Invalid session
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Scoped resource not found
+     */
+    404: unknown;
+    /**
+     * Policy changed
+     */
+    409: unknown;
+    /**
+     * Session storage failed
+     */
+    500: unknown;
+    /**
+     * Worker unavailable
+     */
+    503: unknown;
+};
+
+export type CreateAccessSessionGeneralResponses = {
+    /**
+     * Session issued; worker enforcement is asynchronous
+     */
+    202: AccessSessionResponse;
+};
+
+export type CreateAccessSessionGeneralResponse = CreateAccessSessionGeneralResponses[keyof CreateAccessSessionGeneralResponses];
 
 export type GetAdminGateData = {
     body?: never;
@@ -47287,6 +48515,10 @@ export type ListAuditLogsData = {
     path?: never;
     query?: {
         /**
+         * Resource ID, including child events for a vault (omit for all resources).
+         */
+        resource_id?: string;
+        /**
          * Filter logs by operation type (omit for all)
          */
         operation_type?: string;
@@ -53962,6 +55194,80 @@ export type ListServiceHealthStatusesResponses = {
 
 export type ListServiceHealthStatusesResponse = ListServiceHealthStatusesResponses[keyof ListServiceHealthStatusesResponses];
 
+export type GetHealthcheckDefaultsData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/external-services/healthcheck-defaults';
+};
+
+export type GetHealthcheckDefaultsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetHealthcheckDefaultsError = GetHealthcheckDefaultsErrors[keyof GetHealthcheckDefaultsErrors];
+
+export type GetHealthcheckDefaultsResponses = {
+    /**
+     * The instance default
+     */
+    200: HealthcheckDefaults;
+};
+
+export type GetHealthcheckDefaultsResponse = GetHealthcheckDefaultsResponses[keyof GetHealthcheckDefaultsResponses];
+
+export type UpdateHealthcheckDefaultsData = {
+    body: HealthcheckOverrides;
+    path?: never;
+    query?: never;
+    url: '/external-services/healthcheck-defaults';
+};
+
+export type UpdateHealthcheckDefaultsErrors = {
+    /**
+     * A value is out of range, the timeout is not shorter than the interval, or no check would land inside an engine's readiness wait
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * The default would make a service's existing overrides invalid
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type UpdateHealthcheckDefaultsError = UpdateHealthcheckDefaultsErrors[keyof UpdateHealthcheckDefaultsErrors];
+
+export type UpdateHealthcheckDefaultsResponses = {
+    /**
+     * Saved
+     */
+    200: HealthcheckDefaults;
+};
+
+export type UpdateHealthcheckDefaultsResponse = UpdateHealthcheckDefaultsResponses[keyof UpdateHealthcheckDefaultsResponses];
+
 export type ImportExternalServiceData = {
     body: ImportExternalServiceRequest;
     path?: never;
@@ -54747,6 +56053,144 @@ export type GetServiceHealthStatusResponses = {
 };
 
 export type GetServiceHealthStatusResponse = GetServiceHealthStatusResponses[keyof GetServiceHealthStatusResponses];
+
+export type GetServiceHealthcheckData = {
+    body?: never;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/healthcheck';
+};
+
+export type GetServiceHealthcheckErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Service not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetServiceHealthcheckError = GetServiceHealthcheckErrors[keyof GetServiceHealthcheckErrors];
+
+export type GetServiceHealthcheckResponses = {
+    /**
+     * The service's healthcheck
+     */
+    200: ServiceHealthcheck;
+};
+
+export type GetServiceHealthcheckResponse = GetServiceHealthcheckResponses[keyof GetServiceHealthcheckResponses];
+
+export type UpdateServiceHealthcheckData = {
+    body: HealthcheckOverrides;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/healthcheck';
+};
+
+export type UpdateServiceHealthcheckErrors = {
+    /**
+     * A value is out of range, the timeout is not shorter than the interval, or no check would land inside the engine's readiness wait
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Service not found
+     */
+    404: ProblemDetails;
+    /**
+     * The service's container has no healthcheck Temps builds
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type UpdateServiceHealthcheckError = UpdateServiceHealthcheckErrors[keyof UpdateServiceHealthcheckErrors];
+
+export type UpdateServiceHealthcheckResponses = {
+    /**
+     * Saved; applies when the container is recreated
+     */
+    200: ServiceHealthcheck;
+};
+
+export type UpdateServiceHealthcheckResponse = UpdateServiceHealthcheckResponses[keyof UpdateServiceHealthcheckResponses];
+
+export type ApplyServiceHealthcheckData = {
+    body?: never;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/healthcheck/apply';
+};
+
+export type ApplyServiceHealthcheckErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Service not found
+     */
+    404: ProblemDetails;
+    /**
+     * Temps will not recreate this container from here (not running, local workloads disabled, a cluster, worker or imported container), or the recreate was refused to protect its data
+     */
+    409: ProblemDetails;
+    /**
+     * The recreate failed; the original container was kept
+     */
+    500: ProblemDetails;
+};
+
+export type ApplyServiceHealthcheckError = ApplyServiceHealthcheckErrors[keyof ApplyServiceHealthcheckErrors];
+
+export type ApplyServiceHealthcheckResponses = {
+    /**
+     * The container was recreated
+     */
+    200: ApplyServiceHealthcheckResponse;
+};
+
+export type ApplyServiceHealthcheckResponse2 = ApplyServiceHealthcheckResponses[keyof ApplyServiceHealthcheckResponses];
 
 export type GetServiceLogIngestionData = {
     body?: never;
@@ -84472,6 +85916,158 @@ export type CreateInternalAccessGrantResponses = {
 
 export type CreateInternalAccessGrantResponse = CreateInternalAccessGrantResponses[keyof CreateInternalAccessGrantResponses];
 
+export type ListInternalAccessSandboxGrantsData = {
+    body?: never;
+    path: {
+        /**
+         * The project being called
+         */
+        project_id: number;
+    };
+    query?: {
+        /**
+         * Only grants that cover this environment of the project: its own and
+         * the project-wide ones.
+         */
+        environment_id?: number | null;
+        /**
+         * 1-based page, default 1.
+         */
+        page?: number | null;
+        /**
+         * Default 20, at most 100.
+         */
+        page_size?: number | null;
+    };
+    url: '/projects/{project_id}/internal-access/sandboxes';
+};
+
+export type ListInternalAccessSandboxGrantsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project or environment not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type ListInternalAccessSandboxGrantsError = ListInternalAccessSandboxGrantsErrors[keyof ListInternalAccessSandboxGrantsErrors];
+
+export type ListInternalAccessSandboxGrantsResponses = {
+    /**
+     * Sandbox grants on the project
+     */
+    200: InternalAccessSandboxGrantListResponse;
+};
+
+export type ListInternalAccessSandboxGrantsResponse = ListInternalAccessSandboxGrantsResponses[keyof ListInternalAccessSandboxGrantsResponses];
+
+export type CreateInternalAccessSandboxGrantData = {
+    body: CreateInternalAccessSandboxGrantRequest;
+    path: {
+        /**
+         * The project being called
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/internal-access/sandboxes';
+};
+
+export type CreateInternalAccessSandboxGrantErrors = {
+    /**
+     * Invalid grant
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions on the project
+     */
+    403: ProblemDetails;
+    /**
+     * Project, environment or sandbox not found
+     */
+    404: ProblemDetails;
+    /**
+     * Already granted, or too many grants
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type CreateInternalAccessSandboxGrantError = CreateInternalAccessSandboxGrantErrors[keyof CreateInternalAccessSandboxGrantErrors];
+
+export type CreateInternalAccessSandboxGrantResponses = {
+    /**
+     * Grant created
+     */
+    201: InternalAccessSandboxGrantResponse;
+};
+
+export type CreateInternalAccessSandboxGrantResponse = CreateInternalAccessSandboxGrantResponses[keyof CreateInternalAccessSandboxGrantResponses];
+
+export type DeleteInternalAccessSandboxGrantData = {
+    body?: never;
+    path: {
+        /**
+         * The project being called
+         */
+        project_id: number;
+        /**
+         * Sandbox grant ID
+         */
+        grant_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/internal-access/sandboxes/{grant_id}';
+};
+
+export type DeleteInternalAccessSandboxGrantErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Grant not found on this project
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type DeleteInternalAccessSandboxGrantError = DeleteInternalAccessSandboxGrantErrors[keyof DeleteInternalAccessSandboxGrantErrors];
+
+export type DeleteInternalAccessSandboxGrantResponses = {
+    /**
+     * Grant removed
+     */
+    204: void;
+};
+
+export type DeleteInternalAccessSandboxGrantResponse = DeleteInternalAccessSandboxGrantResponses[keyof DeleteInternalAccessSandboxGrantResponses];
+
 export type DeleteInternalAccessGrantData = {
     body?: never;
     path: {
@@ -84697,6 +86293,31 @@ export type TestProjectIpAccessResponses = {
 };
 
 export type TestProjectIpAccessResponse2 = TestProjectIpAccessResponses[keyof TestProjectIpAccessResponses];
+
+export type ProjectAccessVaultsData = {
+    body?: never;
+    path: {
+        project_id: number;
+    };
+    query?: {
+        page?: number | null;
+        page_size?: number | null;
+    };
+    url: '/projects/{project_id}/linked-vaults';
+};
+
+export type ProjectAccessVaultsErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    500: unknown;
+};
+
+export type ProjectAccessVaultsResponses = {
+    200: AccessVaultList;
+};
+
+export type ProjectAccessVaultsResponse = ProjectAccessVaultsResponses[keyof ProjectAccessVaultsResponses];
 
 export type PurgeProjectLogsData = {
     body: PurgeLogsRequest;
@@ -89846,6 +91467,124 @@ export type RevenueListProvidersResponses = {
 };
 
 export type RevenueListProvidersResponse = RevenueListProvidersResponses[keyof RevenueListProvidersResponses];
+
+export type SandboxAccessVaultsData = {
+    body?: never;
+    path: {
+        sandbox_id: string;
+    };
+    query?: {
+        page?: number | null;
+        page_size?: number | null;
+    };
+    url: '/sandboxes/{sandbox_id}/access-vaults';
+};
+
+export type SandboxAccessVaultsErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    500: unknown;
+};
+
+export type SandboxAccessVaultsResponses = {
+    200: AccessVaultList;
+};
+
+export type SandboxAccessVaultsResponse = SandboxAccessVaultsResponses[keyof SandboxAccessVaultsResponses];
+
+export type ListSandboxInternalAddressesData = {
+    body?: never;
+    path: {
+        /**
+         * Public id of one of your sandboxes
+         */
+        sandbox_id: string;
+    };
+    query?: {
+        /**
+         * 1-based page, default 1.
+         */
+        page?: number | null;
+        /**
+         * Default 20, at most 100.
+         */
+        page_size?: number | null;
+    };
+    url: '/sandboxes/{sandbox_id}/internal-addresses';
+};
+
+export type ListSandboxInternalAddressesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Sandbox not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type ListSandboxInternalAddressesError = ListSandboxInternalAddressesErrors[keyof ListSandboxInternalAddressesErrors];
+
+export type ListSandboxInternalAddressesResponses = {
+    /**
+     * Addresses the sandbox may call
+     */
+    200: SandboxInternalAddressListResponse;
+};
+
+export type ListSandboxInternalAddressesResponse = ListSandboxInternalAddressesResponses[keyof ListSandboxInternalAddressesResponses];
+
+export type GeneralAccessCapabilityData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/service-access/capability';
+};
+
+export type GeneralAccessCapabilityErrors = {
+    401: unknown;
+    403: unknown;
+};
+
+export type GeneralAccessCapabilityResponses = {
+    200: AccessCapability;
+};
+
+export type GeneralAccessCapabilityResponse = GeneralAccessCapabilityResponses[keyof GeneralAccessCapabilityResponses];
+
+export type ServiceCatalogData = {
+    body?: never;
+    path?: never;
+    query?: {
+        page?: number | null;
+        page_size?: number | null;
+        search?: string | null;
+        id?: string | null;
+    };
+    url: '/service-access/catalog';
+};
+
+export type ServiceCatalogErrors = {
+    401: unknown;
+    403: unknown;
+    500: unknown;
+};
+
+export type ServiceCatalogResponses = {
+    200: ServiceCatalog;
+};
+
+export type ServiceCatalogResponse = ServiceCatalogResponses[keyof ServiceCatalogResponses];
 
 export type GetProjectSessionReplaysData = {
     body?: never;

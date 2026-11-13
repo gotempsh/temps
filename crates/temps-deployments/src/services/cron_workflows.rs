@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Cron `workflow` mode (ADR-103 §9, M2).
+//! Cron `workflow` mode (ADR-106 §9, M2).
 //!
 //! A `workflow` cron starts a run of a durable workflow at each occurrence,
 //! through [`WorkflowControl`]; nothing runs in the cron scheduler itself.

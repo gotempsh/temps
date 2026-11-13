@@ -20,10 +20,13 @@ impl PolicyPlanner {
         })?;
         let mut projects_by_user: BTreeMap<i32, BTreeSet<i32>> = BTreeMap::new();
         for grant in grants.iter().filter(|g| !g.admin) {
+            let Some(project_id) = grant.project_id else {
+                continue;
+            };
             projects_by_user
                 .entry(grant.approved_by)
                 .or_default()
-                .insert(grant.project_id);
+                .insert(project_id);
         }
         let mut allowed = BTreeMap::new();
         // Same instance role ceiling as current_session_role. A scoped project

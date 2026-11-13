@@ -81,7 +81,7 @@ impl DeliveryQueue {
         // at delivery time; they need neither another version nor another row.
         let queued = tx.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,
             r#"WITH changed AS (
-                UPDATE sandbox_access_runtimes r SET desired_version=desired_version+1,updated_at=now()
+                UPDATE sandbox_access_runtime_records r SET desired_version=desired_version+1,updated_at=now()
                 WHERE authority_id=$1 AND r.id=ANY($2::uuid[]) AND closed_at IS NULL AND desired_version=applied_version AND desired_version<9223372036854775807
                   AND NOT EXISTS (SELECT 1 FROM sandbox_access_delivery d WHERE d.runtime_id=r.id AND d.desired_version=r.desired_version AND d.completed_at IS NULL)
                 RETURNING id,node_id,desired_version,authority_id,provider_identity,provider_backend,provider_name
@@ -89,7 +89,7 @@ impl DeliveryQueue {
                 SELECT id,node_id,desired_version,'reconcile',authority_id,provider_identity,provider_backend,provider_name FROM changed"#,
             [id.into(), runtime_ids.into()])).await.map_err(|e| database("queue worker renewal", id, e))?;
         tx.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,
-            "UPDATE sandbox_access_authorities SET next_reconcile_at=CASE WHEN EXISTS (SELECT 1 FROM sandbox_access_runtimes r WHERE r.authority_id=$1 AND r.closed_at IS NULL) THEN now()+interval '10 seconds' ELSE NULL END WHERE id=$1", [id.into()]))
+            "UPDATE sandbox_access_authorities SET next_reconcile_at=CASE WHEN EXISTS (SELECT 1 FROM sandbox_access_runtime_records r WHERE r.authority_id=$1 AND r.closed_at IS NULL) THEN now()+interval '10 seconds' ELSE NULL END WHERE id=$1", [id.into()]))
             .await.map_err(|e| database("persist next recheck", id, e))?;
         tx.commit()
             .await

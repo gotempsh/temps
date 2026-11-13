@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Run and step states, the effective per-environment settings, and the
-//! validation of names and keys (plaintext metadata, ADR-103 §5).
+//! validation of names and keys (plaintext metadata, ADR-106 §5).
 
 use serde::{Deserialize, Serialize};
 use temps_entities::workflow_environment_settings;
@@ -10,7 +10,7 @@ use utoipa::ToSchema;
 
 use crate::error::{WorkflowError, WorkflowResult};
 
-/// Where a run is in its lifecycle (ADR-103 §3).
+/// Where a run is in its lifecycle (ADR-106 §3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 #[schema(as = WorkflowRunStatus)]

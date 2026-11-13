@@ -90,6 +90,8 @@ export const testResolutionSchema = z.object({
     ),
   record_type: z.enum(DNS_TEST_RECORD_TYPES),
   project_id: z.number().int().positive().nullable(),
+  /** One of your sandboxes (ADR 105); never together with `project_id`. */
+  sandbox_id: z.string().min(1).nullable(),
 })
 export type TestResolutionValues = z.infer<typeof testResolutionSchema>
 
@@ -220,6 +222,7 @@ export const DNS_PARAMS = {
   testType: 'type',
   testNode: 'from',
   testProject: 'project',
+  testSandbox: 'sandbox',
 } as const
 export type DnsParam = (typeof DNS_PARAMS)[keyof typeof DNS_PARAMS]
 
@@ -312,7 +315,11 @@ export function recordTestParams(
   }
 }
 
-/** The form's values from the URL (`name`, `type`, `from`, `project`). */
+/**
+ * The form's values from the URL (`name`, `type`, `from`, `project`,
+ * `sandbox`). A link naming both a project and a sandbox asks as the
+ * sandbox: the server refuses both at once.
+ */
 export function testValuesFromUrl(
   get: (key: DnsParam) => string | null,
   resolvers: DnsResolverEntry[]
@@ -320,6 +327,7 @@ export function testValuesFromUrl(
   const type = get(DNS_PARAMS.testType)
   const from = parseIntParam(get(DNS_PARAMS.testNode))
   const project = parseIntParam(get(DNS_PARAMS.testProject))
+  const sandbox = get(DNS_PARAMS.testSandbox)?.trim() || null
   return {
     name: get(DNS_PARAMS.testName) ?? '',
     record_type: (DNS_TEST_RECORD_TYPES as readonly string[]).includes(
@@ -333,7 +341,9 @@ export function testValuesFromUrl(
       from !== undefined && resolvers.some((r) => r.node_id === from)
         ? from
         : defaultResolverNode(resolvers),
-    project_id: project !== undefined && project > 0 ? project : null,
+    project_id:
+      sandbox === null && project !== undefined && project > 0 ? project : null,
+    sandbox_id: sandbox,
   }
 }
 
@@ -424,7 +434,6 @@ function lookupsFacet(resolver: DnsResolverEntry): DnsFacet {
   }
 }
 
-/** Internal routing: the worker's proxy behind its `*.temps.local` names. */
 /**
  * Served, but through the agent's fallback on port 80 because the port-80
  * redirect to the internal proxy is missing (ADR-098): the agent holds port
@@ -441,8 +450,9 @@ export function redirectMissing(
 }
 
 /**
- * Where a worker's internal routing listens: its bridge address, and where a
- * port-80 redirect sends it (ADR-098).
+ * Where a node's internal routing listens: a worker's bridge address or the
+ * control plane's app network gateway (ADR-104), and where a port-80
+ * redirect sends it (ADR-098).
  */
 export function routingAddress(
   proxy: InternalProxyState | null | undefined
@@ -453,6 +463,25 @@ export function routingAddress(
     : proxy.address
 }
 
+/**
+ * Where a node's `*.temps.local` names point: a worker's bridge address, or,
+ * with no worker nodes, the control plane's app network gateway (ADR-104).
+ */
+function servedOn(resolver: DnsResolverEntry): string {
+  return resolver.is_control_plane
+    ? 'its app network gateway'
+    : 'its bridge address'
+}
+
+/** Who serves the calls: a worker's agent, or the control plane itself. */
+function server(resolver: DnsResolverEntry): string {
+  return resolver.is_control_plane ? 'the control plane' : 'its agent'
+}
+
+/**
+ * Internal routing: the proxy behind a node's `*.temps.local` names. `null`
+ * for a control plane that does not report one: its main proxy routes.
+ */
 function routingFacet(resolver: DnsResolverEntry): DnsFacet | null {
   const proxy = resolver.internal_proxy
   if (!proxy) return null
@@ -460,12 +489,12 @@ function routingFacet(resolver: DnsResolverEntry): DnsFacet | null {
   if (resolver.node_status !== 'active' && resolver.node_status !== 'draining')
     return { tone: 'idle', label: 'Not checked', reason: null, why: null }
   if (redirectMissing(proxy)) {
-    const address = proxy.address ?? 'its bridge address'
+    const address = proxy.address ?? servedOn(resolver)
     return {
       tone: 'warn',
       label: 'Direct on port 80',
       reason: proxy.redirect_error ?? 'No reason reported',
-      why: `Calls to *.temps.local names work, but ${resolver.node_name} redirects nothing: its agent serves them on ${address} itself, so it holds port 80 of its bridge address. Once the redirect can be installed, the agent moves to its own port and releases port 80.`,
+      why: `Calls to *.temps.local names work, but ${resolver.node_name} redirects nothing: ${server(resolver)} serves them on ${address} itself, so it holds port 80 of ${servedOn(resolver)}. Once the redirect can be installed, it moves to its own port and releases port 80.`,
     }
   }
   if (proxy.listening === true && proxy.mode === 'redirect')
@@ -474,19 +503,23 @@ function routingFacet(resolver: DnsResolverEntry): DnsFacet | null {
   if (proxy.listening === true)
     return { tone: 'ok', label: 'Working', reason: null, why: null }
   if (proxy.listening === false) {
-    const address = proxy.address ?? 'its bridge address'
+    const address = proxy.address ?? servedOn(resolver)
     return {
       tone: 'error',
       label: 'Down',
       reason: proxy.error ?? 'No reason reported',
-      why: `Names resolve on ${resolver.node_name}, but every HTTP call to them fails until its internal routing proxy can listen on ${address}. The agent keeps retrying, so this clears by itself once the cause is gone.`,
+      why: resolver.is_control_plane
+        ? `The control plane's containers cannot call *.temps.local names: their names are withdrawn until its internal routing proxy can listen on ${address}. The control plane keeps retrying, so this clears by itself once the cause is gone.`
+        : `Names resolve on ${resolver.node_name}, but every HTTP call to them fails until its internal routing proxy can listen on ${address}. The agent keeps retrying, so this clears by itself once the cause is gone.`,
     }
   }
   return {
     tone: 'idle',
     label: 'Not reported',
     reason: null,
-    why: 'Older agents, and a node with no overlay network yet, do not report internal routing.',
+    why: resolver.is_control_plane
+      ? 'The control plane has not reported its internal routing yet.'
+      : 'Older agents, and a node with no overlay network yet, do not report internal routing.',
   }
 }
 

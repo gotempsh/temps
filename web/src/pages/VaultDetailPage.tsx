@@ -6,6 +6,9 @@ import { useQuery } from '@tanstack/react-query'
 import { serviceProviderName } from '@/components/service-access/service-provider-registry'
 import {
   Clock3,
+  Pencil,
+  ScrollText,
+  Link2,
   Plus,
   PlugZap,
   Layers,
@@ -27,9 +30,11 @@ import {
   ResponsivePagination,
 } from '@temps-sdk/ds'
 import {
+  getAccessVaultGeneralOptions,
   getAccessVaultOptions,
   listAccessBundlesOptions,
-  accessCapabilityOptions,
+  listAccessBundlesGeneralOptions,
+  generalAccessCapabilityOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import type { AccessVaultResponse } from '@/api/client'
 import {
@@ -43,74 +48,98 @@ import {
   ServiceLogoStrip,
 } from '@/components/service-access/service-providers'
 import { AccessSessionsList } from '@/components/service-access/AccessSessionsList'
+import { VaultLinks } from '@/components/service-access/VaultLinks'
 import { VaultEditor } from '@/components/service-access/VaultEditor'
+import { AuditLogView } from './AuditLogs-components'
+import { useCanViewAuditLogs } from '@/hooks/useAuditAccess'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 
 export default function VaultDetailPage() {
-  const { projectId: rawId, vaultId = '' } = useParams()
-  const projectId = Number(rawId)
+  const { vaultId = '', projectId } = useParams()
   return (
     <VaultDetail
       key={`${projectId}:${vaultId}`}
-      projectId={projectId}
       vaultId={vaultId}
+      projectId={projectId === undefined ? undefined : Number(projectId)}
     />
   )
 }
 function VaultDetail({
-  projectId,
   vaultId,
+  projectId,
 }: {
-  projectId: number
   vaultId: string
+  projectId?: number
 }) {
   const navigate = useNavigate()
   const [params, setParams] = useSearchParams()
   const valid =
-    Number.isInteger(projectId) &&
-    projectId > 0 &&
-    projectId <= 2147483647 &&
-    !!vaultId
-  const tab =
-    params.get('tab') === 'sessions'
-      ? 'sessions'
-      : params.get('tab') === 'bundles'
-        ? 'bundles'
-        : 'services'
+    !!vaultId &&
+    (projectId === undefined ||
+      (Number.isSafeInteger(projectId) && projectId > 0))
+  const base = `/vault${projectId === undefined ? '' : `/projects/${projectId}`}/vaults/${encodeURIComponent(vaultId)}`
+  const requestedTab = params.get('tab') ?? 'services'
+  const canViewAuditLogs = useCanViewAuditLogs()
   const page = Math.max(
     1,
     Math.min(1000000, Math.floor(Number(params.get('page')) || 1))
   )
-  const path = { project_id: projectId, vault_id: vaultId }
-  const vault = useQuery({ ...getAccessVaultOptions({ path }), enabled: valid })
+  const sandboxId = params.get('sandbox') ?? undefined
+  const consumerQuery = sandboxId
+    ? `?sandbox=${encodeURIComponent(sandboxId)}`
+    : ''
+  const path = { vault_id: vaultId }
+  const projectVault = useQuery({
+    ...getAccessVaultOptions({ path: { ...path, project_id: projectId ?? 0 } }),
+    enabled: valid && projectId !== undefined,
+  })
+  const generalVault = useQuery({
+    ...getAccessVaultGeneralOptions({
+      path,
+      query: sandboxId ? { sandbox_id: sandboxId } : undefined,
+    }),
+    enabled: valid && projectId === undefined,
+  })
+  const vault = projectId === undefined ? generalVault : projectVault
   const capability = useQuery({
-    ...accessCapabilityOptions({ path: { project_id: projectId } }),
+    ...generalAccessCapabilityOptions(),
     enabled: valid,
   })
-  const bundles = useQuery({
+  const projectBundles = useQuery({
     ...listAccessBundlesOptions({
-      path,
-      query: {
-        page,
-        page_size: 20,
-      },
+      path: { ...path, project_id: projectId ?? 0 },
+      query: { page, page_size: 20 },
     }),
-    enabled: valid && tab === 'bundles',
+    enabled: valid && projectId !== undefined && requestedTab === 'bundles',
   })
+  const generalBundles = useQuery({
+    ...listAccessBundlesGeneralOptions({
+      path,
+      query: { page, page_size: 20, sandbox_id: sandboxId },
+    }),
+    enabled: valid && projectId === undefined && requestedTab === 'bundles',
+  })
+  const bundles = projectId === undefined ? generalBundles : projectBundles
   const { setBreadcrumbs } = useBreadcrumbs()
   useEffect(() => {
     setBreadcrumbs([
-      { label: 'Vault', href: '/vault' },
-      { label: 'Vaults', href: `/vault/projects/${projectId}` },
+      { label: 'Vaults', href: `/vault` },
       { label: vault.data?.vault.name ?? 'Vault' },
     ])
     return () => setBreadcrumbs([])
-  }, [projectId, vault.data?.vault.name, setBreadcrumbs])
+  }, [vault.data?.vault.name, setBreadcrumbs])
   const [editingVault, setEditingVault] = useState<AccessVaultResponse>()
   const [editorOpen, setEditorOpen] = useState(false)
   const rows = vault.data?.services ?? []
   const canWrite =
     capability.data?.can_manage_services === true && !capability.isError
+  const tab =
+    requestedTab === 'bundles' ||
+    requestedTab === 'sessions' ||
+    (requestedTab === 'links' && canWrite) ||
+    (requestedTab === 'audit' && canViewAuditLogs)
+      ? requestedTab
+      : 'services'
   const changeTab = (next: string) =>
     setParams((current) => {
       const p = new URLSearchParams(current)
@@ -119,30 +148,30 @@ function VaultDetail({
       return p
     })
   return (
-    <PageContainer width="full">
+    <PageContainer width="full" innerClassName="space-y-4">
       <PageHeader
-        title={vault.data?.vault.name ?? 'Vault'}
-        actions={
-          <div className="flex flex-wrap gap-2">
-            <Button variant="outline" asChild>
-              <Link to="/audit-logs?range=all">Audit logs</Link>
-            </Button>
-            <Button
-              variant="outline"
-              disabled={
-                !canWrite || !vault.data || vault.isFetching || vault.isError
-              }
-              onClick={() => {
-                setEditingVault((selected) => selected ?? vault.data?.vault)
-                setEditorOpen(true)
-              }}
-            >
-              Edit vault
-            </Button>
-            <Button variant="outline" asChild>
-              <Link to={`/vault/projects/${projectId}`}>All vaults</Link>
-            </Button>
-          </div>
+        title={
+          <span className="inline-flex max-w-full items-center gap-2">
+            <span className="min-w-0 [overflow-wrap:anywhere]">
+              {vault.data?.vault.name ?? 'Vault'}
+            </span>
+            {canWrite && (
+              <Button
+                variant="ghost"
+                size="icon"
+                className="size-8 shrink-0 text-muted-foreground"
+                aria-label="Edit vault"
+                title="Edit vault"
+                disabled={!vault.data || vault.isFetching || vault.isError}
+                onClick={() => {
+                  setEditingVault((selected) => selected ?? vault.data?.vault)
+                  setEditorOpen(true)
+                }}
+              >
+                <Pencil className="size-4" />
+              </Button>
+            )}
+          </span>
         }
       />
       {editingVault && (
@@ -161,7 +190,7 @@ function VaultDetail({
       )}
       {!valid && (
         <Callout tone="error" title="Invalid vault link">
-          Return to Vault to choose a project.
+          Return to Vault to choose a vault.
         </Callout>
       )}
       {vault.isPending ? (
@@ -182,19 +211,39 @@ function VaultDetail({
             <TabsTrigger value="sessions" icon={Clock3}>
               Sessions
             </TabsTrigger>
+            {canWrite && (
+              <TabsTrigger value="links" icon={Link2}>
+                Linked to
+              </TabsTrigger>
+            )}
+            {canViewAuditLogs && (
+              <TabsTrigger value="audit" icon={ScrollText}>
+                Audit logs
+              </TabsTrigger>
+            )}
           </TabsList>
+          {canWrite && (
+            <TabsContent value="links" forceMount hidden={tab !== 'links'}>
+              <VaultLinks vaultId={vaultId} active={tab === 'links'} />
+            </TabsContent>
+          )}
+          {canViewAuditLogs && (
+            <TabsContent value="audit" forceMount hidden={tab !== 'audit'}>
+              <AuditLogView resourceId={vaultId} active={tab === 'audit'} />
+            </TabsContent>
+          )}
           <TabsContent value="services" className="space-y-4">
             <div className="flex justify-end">
               <Button disabled={!canWrite} asChild={canWrite}>
                 {canWrite ? (
                   <Link
-                    to={`/projects/${projectId}/access-services/new?vault=${encodeURIComponent(vaultId)}`}
+                    to={`/access-services/new?vault=${encodeURIComponent(vaultId)}`}
                   >
                     <Plus className="size-4" />
                     Add service
                   </Link>
                 ) : (
-                  <span title="Project write permission is required">
+                  <span title="Instance administrator permission is required">
                     Add service
                   </span>
                 )}
@@ -220,12 +269,18 @@ function VaultDetail({
                       <div className="flex min-w-0 items-center gap-3">
                         <ServiceProviderLogo service={r} />
                         <div className="min-w-0">
-                          <RecordLink
-                            className="font-medium break-words"
-                            to={`/projects/${projectId}/access-services/${encodeURIComponent(r.id)}/edit?vault=${encodeURIComponent(vaultId)}`}
-                          >
-                            {r.name}
-                          </RecordLink>
+                          {canWrite ? (
+                            <RecordLink
+                              className="font-medium break-words"
+                              to={`/access-services/${encodeURIComponent(r.id)}/edit?vault=${encodeURIComponent(vaultId)}`}
+                            >
+                              {r.name}
+                            </RecordLink>
+                          ) : (
+                            <span className="font-medium break-words">
+                              {r.name}
+                            </span>
+                          )}
                           <p className="text-xs text-muted-foreground">
                             {serviceProviderName(r)} · v{r.version}
                           </p>
@@ -297,8 +352,9 @@ function VaultDetail({
             {valid && (
               <AccessSessionsList
                 key={vaultId}
-                projectId={projectId}
                 vaultId={vaultId}
+                projectId={projectId}
+                sandboxId={sandboxId}
                 active={tab === 'sessions'}
               />
             )}
@@ -308,9 +364,7 @@ function VaultDetail({
               <Button
                 disabled={!canWrite}
                 onClick={() => {
-                  navigate(
-                    `/vault/projects/${projectId}/vaults/${encodeURIComponent(vaultId)}/bundles/new`
-                  )
+                  navigate(`${base}/bundles/new`)
                 }}
               >
                 <Plus className="size-4" />
@@ -342,7 +396,7 @@ function VaultDetail({
                       <div className="flex items-center justify-between gap-2">
                         <h2 className="min-w-0 break-words font-semibold">
                           <Link
-                            to={`/vault/projects/${projectId}/vaults/${encodeURIComponent(vaultId)}/bundles/${encodeURIComponent(b.id)}`}
+                            to={`${base}/bundles/${encodeURIComponent(b.id)}${consumerQuery}`}
                             className="after:absolute after:inset-0 focus:outline-none"
                           >
                             {b.name}
@@ -368,7 +422,7 @@ function VaultDetail({
                               }
                               onSelect={() => {
                                 navigate(
-                                  `/vault/projects/${projectId}/vaults/${encodeURIComponent(vaultId)}/bundles/${encodeURIComponent(b.id)}/edit`
+                                  `${base}/bundles/${encodeURIComponent(b.id)}/edit`
                                 )
                               }}
                             >
@@ -403,7 +457,12 @@ function VaultDetail({
                 total={bundles.data?.total ?? 0}
                 totalPages={Math.ceil((bundles.data?.total ?? 0) / 20)}
                 onPageChange={(p) =>
-                  setParams({ tab: 'bundles', page: String(p) })
+                  setParams((current) => {
+                    const next = new URLSearchParams(current)
+                    next.set('tab', 'bundles')
+                    next.set('page', String(p))
+                    return next
+                  })
                 }
               />
             )}

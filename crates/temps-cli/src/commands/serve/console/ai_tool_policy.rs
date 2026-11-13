@@ -21,19 +21,14 @@ use super::{ai_read_allowlist, ai_read_safe_posts, ai_write_allowlist};
 /// Operations withheld from the assistant, grouped by the reason they are.
 pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
     (
-        "vault, bundle and session administration is console-only; assistants use the scoped sandbox service operations",
+        "vault configuration is managed by instance administrators; general sessions have a separate human confirmation path",
         &[
-            "create_access_bundle",
-            "create_access_session",
-            "create_access_vault",
-            "get_access_session",
-            "get_access_vault",
-            "list_access_bundles",
-            "list_access_sessions",
-            "list_access_vaults",
-            "revoke_access_session",
-            "update_access_bundle",
-            "update_access_vault",
+            "create_access_bundle", "create_access_vault_general",
+            "update_access_bundle_general", "update_access_vault_general",
+            "delete_access_vault_general", "delete_access_bundle_general", "delete_access_service_general",
+            "create_access_service_general", "update_access_service_general",
+            "create_access_session", "create_access_vault", "get_access_session", "get_access_vault",
+            "list_access_bundles", "list_access_sessions", "list_access_vaults", "revoke_access_session", "update_access_bundle", "update_access_vault",
         ],
     ),
     (
@@ -60,13 +55,6 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
         &["put_plugin_ai_tools"],
     ),
     (
-        "decides which projects may call another project's internal addresses (ADR 101), a network boundary between projects; the owner of the project being called sets it in the console, and revoking one cuts off a caller that depends on it",
-        &[
-            "create_internal_access_grant",
-            "delete_internal_access_grant",
-        ],
-    ),
-    (
         "durable workflow operations that run the app's code with a caller-chosen payload, decrypt a stored payload, delete a run's history, or issue or revoke the app's workflow credential; the operator does these in the console",
         &[
             "start_workflow_run",
@@ -85,7 +73,7 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
         ],
     ),
     (
-        "the workflow executor and app protocol (ADR-103): called by the SDK inside a deployment with an invocation token or the environment's workflow credential, never by a user or the assistant",
+        "the workflow executor and app protocol (ADR-106): called by the SDK inside a deployment with an invocation token or the environment's workflow credential, never by a user or the assistant",
         &[
             "get_invocation_key",
             "get_run_journal",
@@ -118,6 +106,10 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "decide_reachability_conflict",
             "resume_reachability_run",
             "undo_reachability_run",
+            // Recreates a managed database's container to apply new
+            // healthcheck timings; it restarts briefly, and the console
+            // confirms first.
+            "apply_service_healthcheck",
             "blob_disable",
             "cancel_data_import",
             "cancel_pg_upgrade",

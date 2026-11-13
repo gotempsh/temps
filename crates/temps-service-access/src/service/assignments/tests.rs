@@ -45,6 +45,7 @@ async fn durable_approvals_renew_only_after_explicit_consent_and_revocation_wins
                     path_prefixes: vec!["/v1".into()],
                     methods: vec![AccessMethod::Get],
                     github_repository: None,
+                    delivery: None,
                 },
                 max_ttl_seconds: 60,
                 enabled: true,
@@ -346,6 +347,18 @@ async fn durable_approvals_renew_only_after_explicit_consent_and_revocation_wins
         )
         .await
         .unwrap();
+    let awakened = assignments::Entity::find_by_id(&fixed.id)
+        .one(db.as_ref())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        awakened.next_reconcile_at.is_some(),
+        "reapproval must wake terminal work"
+    );
+    // Test scheduling separately from equality between the signing host and
+    // database clocks: the wakeup is persisted, then made explicitly due.
+    db.execute_unprepared(&format!("UPDATE sandbox_service_assignments SET next_reconcile_at=now()-interval '1 minute' WHERE id='{}'", fixed.id)).await.unwrap();
     assert_eq!(
         service.due_assignments().await.unwrap().assignments.len(),
         1
@@ -413,6 +426,7 @@ async fn replacement_waits_for_runtime_before_touching_authority() {
                     path_prefixes: vec!["/v1".into()],
                     methods: vec![AccessMethod::Get],
                     github_repository: None,
+                    delivery: None,
                 },
                 max_ttl_seconds: 60,
                 enabled: true,
@@ -513,7 +527,7 @@ async fn replacement_waits_for_runtime_before_touching_authority() {
     .unwrap();
     let lock = db.begin().await.unwrap();
     lock.execute_unprepared(&format!(
-        "SELECT id FROM sandbox_access_runtimes WHERE id='{}' FOR UPDATE",
+        "SELECT id FROM sandbox_access_runtime_records WHERE id='{}' FOR UPDATE",
         observed.incarnation
     ))
     .await
@@ -574,6 +588,7 @@ async fn historical_declarations_release_capacity_but_reapproval_cannot_overfill
                     path_prefixes: vec!["/v1".into()],
                     methods: vec![AccessMethod::Get],
                     github_repository: None,
+                    delivery: None,
                 },
                 max_ttl_seconds: 60,
                 enabled: true,
@@ -629,6 +644,463 @@ async fn historical_declarations_release_capacity_but_reapproval_cannot_overfill
             .await
             .unwrap(),
         17
+    );
+    test.cleanup().await;
+}
+
+#[tokio::test]
+async fn vault_membership_stops_existing_durable_approval_and_worker_binding() {
+    vault_approval_transition(false, "unlink", false).await;
+}
+
+#[tokio::test]
+async fn upgrade_preserves_standalone_approval_until_original_link_is_revoked() {
+    vault_approval_transition(true, "unlink", false).await;
+}
+
+#[tokio::test]
+async fn legacy_one_shot_link_deletion_fences_prepared_policy() {
+    vault_approval_transition(true, "delete", true).await;
+}
+
+#[tokio::test]
+async fn legacy_vault_retirement_fences_prepared_policy() {
+    vault_approval_transition(true, "retire", false).await;
+}
+
+#[tokio::test]
+async fn legacy_membership_removal_fences_prepared_policy() {
+    vault_approval_transition(true, "remove", true).await;
+}
+
+#[tokio::test]
+async fn adding_standalone_service_to_existing_vault_fences_prepared_policy() {
+    vault_approval_transition(false, "add", false).await;
+}
+
+async fn vault_approval_transition(upgrade: bool, revoke_mode: &str, one_shot: bool) {
+    if !temps_test_utils::external_database_configured()
+        && !temps_test_utils::docker_available().await
+    {
+        eprintln!("Skipping durable approvals: database unavailable");
+        return;
+    }
+    let mut test = temps_test_utils::TestDatabase::with_migrations()
+        .await
+        .unwrap();
+    let db = test.connection_arc();
+    db.execute_unprepared("INSERT INTO users(id,name,email) VALUES(9751,'Access user','access@example.com'); INSERT INTO projects(id,name,repo_name,repo_owner,directory,main_branch,preset,slug,created_at,updated_at) VALUES(9751,'Access test','repo','owner','/','main','nodejs','access-test',now(),now()); INSERT INTO sandboxes(id,public_id,name,user_id,project_id,status,backend) VALUES(9751,'sbx_durable','durable',9751,9751,'running','docker')").await.unwrap();
+    let encryption = crate::service::tests::encryption();
+    let service = ServiceAccessService::new(
+        db.clone(),
+        encryption.clone(),
+        Arc::new(crate::broker::UnavailableTokenlessBroker),
+    );
+    let svc = service
+        .save_service(
+            9751,
+            None,
+            SaveAccessService {
+                vault_id: None,
+                name: "Example API".into(),
+                policy: SandboxAccessPolicy {
+                    provider: None,
+                    origin: "https://api.example.com".into(),
+                    path_prefixes: vec!["/v1".into()],
+                    methods: vec![AccessMethod::Get],
+                    github_repository: None,
+                    delivery: None,
+                },
+                max_ttl_seconds: 60,
+                enabled: true,
+                credential: Some(temps_core::secret_string::SecretString::new(
+                    "test-only-token",
+                )),
+                clear_credential: false,
+                expected_version: None,
+            },
+        )
+        .await
+        .unwrap();
+    let request = || RequestSandboxService {
+        service_id: svc.id.clone(),
+        service_version: svc.version,
+    };
+    let pending = service
+        .request_sandbox_service(9751, "sbx_durable", 9751, false, request())
+        .await
+        .unwrap();
+    assert_eq!(pending.status, SandboxServiceStatus::PendingApproval);
+    assert!(service
+        .due_assignments()
+        .await
+        .unwrap()
+        .assignments
+        .is_empty());
+    assert_eq!(
+        service
+            .request_sandbox_service(9751, "sbx_durable", 9751, false, request())
+            .await
+            .unwrap()
+            .id,
+        pending.id
+    );
+    assert!(service
+        .approve_sandbox_service(
+            9751,
+            "sbx_durable",
+            &pending.id,
+            9752,
+            false,
+            ApproveSandboxService {
+                expected_version: 1,
+                service_version: 1,
+                expires_at: None
+            }
+        )
+        .await
+        .is_err());
+    let approved = service
+        .approve_sandbox_service(
+            9751,
+            "sbx_durable",
+            &pending.id,
+            9751,
+            false,
+            ApproveSandboxService {
+                expected_version: 1,
+                service_version: 1,
+                expires_at: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(approved.status, SandboxServiceStatus::Approved);
+    assert!(!approved.connected);
+    assert!(approved.expires_at.is_none());
+    let worker = temps_service_access_runtime::WorkerControl::new(Arc::new(
+        temps_service_access_runtime::HostAudit,
+    ));
+    crate::authority::AuthorityStore::new(
+        db.clone(),
+        encryption,
+        Arc::new(temps_core::NoopAuditLogger),
+    )
+    .register(None, &worker.identity())
+    .await
+    .unwrap();
+    let observed = HostObservation {
+        worker: worker.identity(),
+        incarnation: uuid::Uuid::new_v4(),
+        node_id: None,
+        container_id: "durable-container".into(),
+        container_name: "temps-sandbox-durable".into(),
+        backend: "docker".into(),
+    };
+    let grant = service
+        .renew_assignment(&approved.id, 9751, 9751, observed.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    let planner = crate::planner::PolicyPlanner::new(
+        db.clone(),
+        crate::service::tests::encryption(),
+        None,
+        Arc::new(crate::github::NoGithub),
+    );
+    let before_membership = planner.prepare(worker.identity().boot_id).await.unwrap();
+    assert_eq!(before_membership.bindings.len(), 1);
+    if upgrade {
+        use temps_migrations::{MigrationTrait, SchemaManager, VaultMembershipFenceMigration};
+        VaultMembershipFenceMigration
+            .down(&SchemaManager::new(db.as_ref()))
+            .await
+            .unwrap();
+    }
+    let before = grants::Entity::find_by_id(&grant)
+        .one(db.as_ref())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut vault = service
+        .save_vault(
+            None,
+            None,
+            crate::vault_types::SaveAccessVault {
+                name: "Scoped vault".into(),
+                service_ids: if revoke_mode == "add" {
+                    vec![]
+                } else {
+                    vec![svc.id.clone()]
+                },
+                expected_version: None,
+            },
+        )
+        .await
+        .unwrap();
+    if revoke_mode == "add" {
+        vault = service
+            .save_vault(
+                None,
+                Some(vault.id.clone()),
+                crate::vault_types::SaveAccessVault {
+                    name: vault.name.clone(),
+                    service_ids: vec![svc.id.clone()],
+                    expected_version: Some(vault.version),
+                },
+            )
+            .await
+            .unwrap();
+    }
+    if !upgrade {
+        let store = crate::authority::AuthorityStore::new(
+            db.clone(),
+            crate::service::tests::encryption(),
+            Arc::new(temps_core::NoopAuditLogger),
+        );
+        assert!(
+            store
+                .issue(
+                    before_membership.node_id,
+                    &before_membership.worker,
+                    before_membership.expected_revision,
+                    before_membership.bindings
+                )
+                .await
+                .is_err(),
+            "new vault membership must fence an already prepared standalone policy"
+        );
+    }
+    let link = service
+        .link_vault(&vault.id, Some(9751), None)
+        .await
+        .unwrap();
+    let link_id = if upgrade {
+        use temps_migrations::{
+            LegacyStandaloneVaultCoverageMigration, LegacyVaultRevocationFenceMigration,
+            MigrationTrait, SchemaManager, VaultMembershipFenceMigration,
+        };
+        // Reproduce the pre-upgrade persisted state, then apply the real additive
+        // migration. The old version permitted membership alongside approval.
+        let manager = SchemaManager::new(db.as_ref());
+        LegacyVaultRevocationFenceMigration
+            .down(&manager)
+            .await
+            .unwrap();
+        LegacyStandaloneVaultCoverageMigration
+            .down(&manager)
+            .await
+            .unwrap();
+        db.execute_unprepared(&format!(
+            "UPDATE access_vaults SET project_id=9751 WHERE id='{}'; UPDATE access_vault_links SET id='link_legacy_{}' WHERE id='{}'",
+            vault.id, vault.id, link.id
+        )).await.unwrap();
+        LegacyStandaloneVaultCoverageMigration
+            .up(&manager)
+            .await
+            .unwrap();
+        assert_eq!(
+            planner
+                .prepare(worker.identity().boot_id)
+                .await
+                .unwrap()
+                .bindings
+                .len(),
+            1
+        );
+        // The same pre-upgrade grant is also eligible without a durable
+        // assignment: one-shot consent uses its immutable creation timestamp.
+        db.execute_unprepared(&format!(
+            "UPDATE sandbox_service_grants SET assignment_id=NULL WHERE id='{grant}'"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            planner
+                .prepare(worker.identity().boot_id)
+                .await
+                .unwrap()
+                .bindings
+                .len(),
+            1
+        );
+        db.execute_unprepared(&format!(
+            "UPDATE sandbox_service_grants SET assignment_id='{}' WHERE id='{grant}'",
+            approved.id
+        ))
+        .await
+        .unwrap();
+        // Reconcile without permanently revoking the saved approval.
+        assert!(service
+            .renew_assignment(&approved.id, 9751, 9751, observed.clone())
+            .await
+            .unwrap()
+            .is_none());
+        assert!(assignments::Entity::find_by_id(&approved.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap()
+            .revoked_at
+            .is_none());
+        if !one_shot {
+            // Rotation keeps the original consent date, not the new grant's date.
+            let mut restarted = observed.clone();
+            restarted.incarnation = uuid::Uuid::new_v4();
+            assert!(service
+                .renew_assignment(&approved.id, 9751, 9751, restarted)
+                .await
+                .unwrap()
+                .is_some());
+            assert_eq!(
+                planner
+                    .prepare(worker.identity().boot_id)
+                    .await
+                    .unwrap()
+                    .bindings
+                    .len(),
+                1
+            );
+        }
+        // Install the fence over existing consent, including rotated durable grants.
+        LegacyVaultRevocationFenceMigration
+            .up(&manager)
+            .await
+            .unwrap();
+        VaultMembershipFenceMigration.up(&manager).await.unwrap();
+        // An unchanged selection must retain pre-upgrade consent and its revision.
+        service
+            .save_vault(
+                None,
+                Some(vault.id.clone()),
+                crate::vault_types::SaveAccessVault {
+                    name: vault.name.clone(),
+                    service_ids: vec![svc.id.clone()],
+                    expected_version: Some(vault.version),
+                },
+            )
+            .await
+            .unwrap();
+        format!("link_legacy_{}", vault.id)
+    } else {
+        // Post-upgrade membership requires fresh vault consent even with a link.
+        let plan = planner.prepare(worker.identity().boot_id).await.unwrap();
+        assert!(plan.bindings.is_empty());
+        assert_eq!(plan.retire.len(), 1);
+        link.id.clone()
+    };
+    if one_shot {
+        db.execute_unprepared(
+            "UPDATE sandbox_service_grants SET assignment_id=NULL WHERE revoked_at IS NULL",
+        )
+        .await
+        .unwrap();
+    }
+    let stale = planner.prepare(worker.identity().boot_id).await.unwrap();
+    if upgrade {
+        assert_eq!(stale.bindings.len(), 1);
+    }
+    match revoke_mode {
+        "remove" => {
+            service
+                .save_vault(
+                    None,
+                    Some(vault.id.clone()),
+                    crate::vault_types::SaveAccessVault {
+                        name: vault.name.clone(),
+                        service_ids: vec![],
+                        expected_version: Some(vault.version + 1),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        "delete" => {
+            db.execute_unprepared(&format!(
+                "DELETE FROM access_vault_links WHERE id='{link_id}'"
+            ))
+            .await
+            .unwrap();
+        }
+        "retire" => service
+            .retire_vault_resource(&vault.id, None)
+            .await
+            .unwrap(),
+        _ => service.unlink_vault(&vault.id, &link_id).await.unwrap(),
+    }
+    if upgrade {
+        let store = crate::authority::AuthorityStore::new(
+            db.clone(),
+            crate::service::tests::encryption(),
+            Arc::new(temps_core::NoopAuditLogger),
+        );
+        assert!(
+            store
+                .issue(
+                    stale.node_id,
+                    &stale.worker,
+                    stale.expected_revision,
+                    stale.bindings
+                )
+                .await
+                .is_err(),
+            "revocation must reject signing a plan read before it committed"
+        );
+        assert_eq!(
+            grants::Entity::find()
+                .filter(grants::Column::RevokedAt.is_null())
+                .count(db.as_ref())
+                .await
+                .unwrap(),
+            0
+        );
+    }
+    assert!(planner
+        .prepare(worker.identity().boot_id)
+        .await
+        .unwrap()
+        .bindings
+        .is_empty());
+    assert!(service
+        .renew_assignment(&approved.id, 9751, 9751, observed.clone())
+        .await
+        .unwrap()
+        .is_none());
+    let retired = assignments::Entity::find_by_id(&approved.id)
+        .one(db.as_ref())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(retired.revoked_at.is_some());
+    assert!(retired.next_reconcile_at.is_none());
+    assert_eq!(retired.version, approved.version + 1);
+    let after = grants::Entity::find_by_id(&grant)
+        .one(db.as_ref())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(before.expires_at, after.expires_at);
+    // A fresh incarnation must not turn the old durable approval into a new grant.
+    let mut restarted = observed;
+    restarted.incarnation = uuid::Uuid::new_v4();
+    assert!(service
+        .renew_assignment(&approved.id, 9751, 9751, restarted)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        grants::Entity::find()
+            .filter(grants::Column::AssignmentId.eq(&approved.id))
+            .count(db.as_ref())
+            .await
+            .unwrap(),
+        if one_shot {
+            0
+        } else if upgrade {
+            2
+        } else {
+            1
+        }
     );
     test.cleanup().await;
 }

@@ -3,6 +3,7 @@
 
 import { SandboxDetailTabs } from '@/components/sandboxes/SandboxDetailTabs'
 import { SandboxVaultAccess } from '@/components/service-access/SandboxVaultAccess'
+import { SandboxInternalAddressesCard } from '@/components/sandboxes/SandboxInternalAddressesCard'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useParams } from 'react-router'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
@@ -1030,6 +1031,11 @@ export default function SandboxDetail() {
                       sandboxId={sandbox.id}
                       policy={sandbox.egress_policy}
                       backend={sandbox.backend}
+                      disabled={destroyed}
+                    />
+                    <SandboxInternalAddressesCard
+                      sandboxId={sandbox.id}
+                      sandboxName={sandbox.name}
                       disabled={destroyed}
                     />
                   </>

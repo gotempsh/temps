@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 import type { AccessServiceResponse } from '@/api/client'
-export const serviceProviders = [
+// Presentation names for persisted policies, including historical providers.
+// New choices come from the Tokenless-backed service catalog API.
+const legacyProviders = [
   { id: 'github', name: 'GitHub', origin: 'https://api.github.com' },
   { id: 'gitlab', name: 'GitLab', origin: 'https://gitlab.com' },
   { id: 'openai', name: 'OpenAI', origin: 'https://api.openai.com' },
@@ -20,7 +22,7 @@ export function serviceProviderName(
 ) {
   if (service.policy.github_repository) return 'GitHub'
   return (
-    serviceProviders.find((p) => p.id === service.policy.provider)?.name ??
+    legacyProviders.find((p) => p.id === service.policy.provider)?.name ??
     'Custom HTTP service'
   )
 }

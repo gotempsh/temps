@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Payload encryption and storage (ADR-103 §5, Layer 1).
+//! Payload encryption and storage (ADR-106 §5, Layer 1).
 //!
 //! Every payload (run input, output and error, step results and errors, event
 //! payloads) is AES-256-GCM encrypted by `EncryptionService` under associated

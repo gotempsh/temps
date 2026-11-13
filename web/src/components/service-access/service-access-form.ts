@@ -5,6 +5,8 @@ import { z } from 'zod'
 import type {
   AccessServiceResponse,
   CreateAccessServiceData,
+  CredentialDelivery,
+  ServiceCatalogEntry,
   ServiceGrantStatus,
 } from '@/api/client'
 
@@ -18,6 +20,7 @@ function pathPrefixes(value: string): string[] {
 export const accessServiceSchema = z
   .object({
     name: z.string().trim().min(1).max(80),
+    catalogId: z.string().optional(),
     provider: z.enum([
       'custom',
       'github',
@@ -85,6 +88,10 @@ export const accessServiceSchema = z
     maxTtl: z.number().int().min(60).max(86400),
     enabled: z.boolean(),
     credential: z.string().max(16384),
+    /** Account name for services that sign in with a username and password. */
+    loginUsername: z.string().max(256),
+    /** How the credential is sent and which fixed headers go with it. */
+    delivery: z.custom<CredentialDelivery>().optional(),
     clearCredential: z.boolean(),
     githubRepository: z
       .object({
@@ -129,6 +136,26 @@ export function serviceEditorSchema(
         message: 'Provide a bearer credential or disable access requests',
       })
     }
+    const headers = values.delivery?.headers ?? []
+    if (headers.some((header) => !/^[\x20-\x7e]{1,256}$/.test(header.value))) {
+      context.addIssue({
+        code: 'custom',
+        path: ['delivery'],
+        message: `Enter a value for ${headers
+          .filter((header) => !/^[\x20-\x7e]{1,256}$/.test(header.value))
+          .map((header) => header.name)
+          .join(', ')}`,
+      })
+    }
+    if (isLogin(values.delivery) && values.credential) {
+      if (!values.loginUsername || values.loginUsername.includes(':')) {
+        context.addIssue({
+          code: 'custom',
+          path: ['loginUsername'],
+          message: 'Enter the username, without a colon',
+        })
+      }
+    }
     if (source === 'bearer' && values.origin === 'https://github.com') {
       context.addIssue({
         code: 'custom',
@@ -140,8 +167,14 @@ export function serviceEditorSchema(
   })
 }
 
+/** True when the stored credential is a username and password pair. */
+export function isLogin(delivery?: CredentialDelivery): boolean {
+  return delivery?.format?.method === 'basic'
+}
+
 export function serviceDefaults(
-  service?: AccessServiceResponse
+  service?: AccessServiceResponse,
+  catalogEntry?: ServiceCatalogEntry
 ): AccessServiceValues {
   return {
     name: service?.name ?? '',
@@ -154,6 +187,10 @@ export function serviceDefaults(
     maxTtl: service?.max_ttl_seconds ?? 900,
     enabled: service?.enabled ?? true,
     credential: '',
+    loginUsername: '',
+    delivery: service
+      ? (service.policy.delivery ?? undefined)
+      : (catalogEntry?.delivery ?? undefined),
     clearCredential: false,
     githubRepository: service?.policy.github_repository ?? undefined,
   }
@@ -170,10 +207,15 @@ export function serviceBody(
       path_prefixes: pathPrefixes(values.paths),
       methods: values.methods,
       github_repository: values.githubRepository,
+      delivery: values.githubRepository ? undefined : values.delivery,
     },
     max_ttl_seconds: values.maxTtl,
     enabled: values.enabled,
-    credential: values.credential || undefined,
+    credential: values.credential
+      ? isLogin(values.delivery)
+        ? `${values.loginUsername}:${values.credential}`
+        : values.credential
+      : undefined,
     clear_credential: values.clearCredential,
     expected_version: version,
   }

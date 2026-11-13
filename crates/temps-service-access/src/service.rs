@@ -2,7 +2,14 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 pub(crate) mod assignments;
+mod audit_scope;
+use audit_scope::capture_service_audit_scope;
+pub(crate) use audit_scope::service_audit_scope_key;
+mod catalog;
+mod credential_links;
+pub use catalog::{ServiceCatalog, ServiceCatalogEntry, ServiceCatalogQuery};
 mod consent;
+mod links;
 pub(crate) mod sessions;
 mod status;
 mod vaults;
@@ -16,7 +23,7 @@ use crate::{
 use chrono::{Duration, Utc};
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseConnection,
-    EntityTrait, IntoActiveModel, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect,
+    EntityTrait, IntoActiveModel, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, QueryTrait,
     TransactionTrait,
 };
 use std::sync::Arc;
@@ -49,8 +56,12 @@ impl ServiceAccessService {
     async fn project<C: ConnectionTrait>(
         &self,
         db: &C,
-        project_id: i32,
+        project_id: impl Into<Option<i32>>,
     ) -> Result<(), AccessError> {
+        let project_id = project_id.into();
+        let Some(project_id) = project_id else {
+            return Ok(());
+        };
         if projects::Entity::find_by_id(project_id)
             .filter(projects::Column::IsDeleted.eq(false))
             .select_only()
@@ -68,12 +79,19 @@ impl ServiceAccessService {
 
     pub async fn get_service(
         &self,
-        project_id: i32,
+        project_id: impl Into<Option<i32>>,
         service_id: &str,
     ) -> Result<AccessServiceResponse, AccessError> {
+        let project_id = project_id.into();
         self.project(self.db.as_ref(), project_id).await?;
         let model = services::Entity::find_by_id(service_id)
-            .filter(services::Column::ProjectId.eq(project_id))
+            .filter(services::Column::RetiredAt.is_null())
+            .apply_if(project_id, |q, id| {
+                q.filter(services::Column::ProjectId.eq(id)).filter(sea_orm::sea_query::Expr::cust_with_values(
+                    "(NOT EXISTS (SELECT 1 FROM access_vaults v WHERE v.retired_at IS NULL AND v.service_ids @> ARRAY[sandbox_access_services.id]) OR EXISTS (SELECT 1 FROM access_vaults v JOIN access_vault_links l ON l.vault_id=v.id WHERE v.retired_at IS NULL AND v.service_ids @> ARRAY[sandbox_access_services.id] AND l.project_id=$1 AND l.revoked_at IS NULL))",
+                    [id],
+                ))
+            })
             .one(self.db.as_ref())
             .await
             .map_err(|e| AccessError::database("read service", project_id, e))?
@@ -83,13 +101,20 @@ impl ServiceAccessService {
 
     pub async fn list_services(
         &self,
-        project_id: i32,
+        project_id: impl Into<Option<i32>>,
         query: AccessPageQuery,
     ) -> Result<AccessServiceList, AccessError> {
+        let project_id = project_id.into();
         self.project(self.db.as_ref(), project_id).await?;
         let (page, page_size) = query.normalized();
         let pages = services::Entity::find()
-            .filter(services::Column::ProjectId.eq(project_id))
+            .filter(services::Column::RetiredAt.is_null())
+            .apply_if(project_id, |q, id| {
+                q.filter(services::Column::ProjectId.eq(id)).filter(sea_orm::sea_query::Expr::cust_with_values(
+                    "(NOT EXISTS (SELECT 1 FROM access_vaults v WHERE v.retired_at IS NULL AND v.service_ids @> ARRAY[sandbox_access_services.id]) OR EXISTS (SELECT 1 FROM access_vaults v JOIN access_vault_links l ON l.vault_id=v.id WHERE v.retired_at IS NULL AND v.service_ids @> ARRAY[sandbox_access_services.id] AND l.project_id=$1 AND l.revoked_at IS NULL))",
+                    [id],
+                ))
+            })
             .order_by_desc(services::Column::CreatedAt)
             .order_by_desc(services::Column::Id)
             .paginate(self.db.as_ref(), page_size);
@@ -114,10 +139,11 @@ impl ServiceAccessService {
 
     pub async fn save_service(
         &self,
-        project_id: i32,
+        project_id: impl Into<Option<i32>>,
         id: Option<String>,
         mut request: SaveAccessService,
     ) -> Result<AccessServiceResponse, AccessError> {
+        let project_id = project_id.into();
         validate_service(&mut request)?;
         if id.is_some() && request.vault_id.is_some() {
             return Err(invalid("vault_id", "only accepted when creating a service"));
@@ -143,12 +169,22 @@ impl ServiceAccessService {
             .begin()
             .await
             .map_err(|e| AccessError::database("begin service save", project_id, e))?;
+        let validate_links = request.policy.github_repository.is_some();
+        // Serialize membership changes through the same lock so the audit scope
+        // describes this write even if another manager moves the service.
+        self.lock_vault_management(&tx).await?;
         self.project(&tx, project_id).await?;
         if let Some(source) = &request.policy.github_repository {
-            crate::github::validate_binding(&tx, project_id, source).await?;
+            let source_project = project_id.ok_or_else(|| {
+                invalid(
+                    "github_repository",
+                    "a GitHub credential source project is required",
+                )
+            })?;
+            crate::github::validate_binding(&tx, source_project, source).await?;
         }
         let vault = if let Some(vault_id) = &request.vault_id {
-            let vault = self.vault(&tx, project_id, vault_id, true).await?;
+            let vault = self.vault(&tx, None, vault_id, true).await?;
             if vault.service_ids.len() >= 100 || vault.version == i32::MAX {
                 return Err(invalid(
                     "vault_id",
@@ -163,7 +199,10 @@ impl ServiceAccessService {
         let updating = id.is_some();
         let mut model = if let Some(id) = id {
             let current = services::Entity::find_by_id(&id)
-                .filter(services::Column::ProjectId.eq(project_id))
+                .filter(services::Column::RetiredAt.is_null())
+                .apply_if(project_id, |q, id| {
+                    q.filter(services::Column::ProjectId.eq(id))
+                })
                 .lock_exclusive()
                 .one(&tx)
                 .await
@@ -187,6 +226,18 @@ impl ServiceAccessService {
                 let (previous, _) = crate::tokenless::compile_policy(&previous)?;
                 if previous.origin != request.policy.origin {
                     return Err(invalid("credential", "changing the HTTPS origin requires a replacement credential or explicit credential clearing"));
+                }
+                // The stored secret was entered for one format (a token, or a
+                // username:password pair); a different format needs a new one.
+                let format = |policy: &SandboxAccessPolicy| {
+                    policy
+                        .delivery
+                        .as_ref()
+                        .map(|delivery| delivery.format.clone())
+                        .unwrap_or_default()
+                };
+                if format(&previous) != format(&request.policy) {
+                    return Err(invalid("credential", "changing the credential format requires a replacement credential or explicit credential clearing"));
                 }
             }
             let mut model = current.into_active_model();
@@ -241,6 +292,11 @@ impl ServiceAccessService {
                 .await
                 .map_err(|e| AccessError::database("attach service to vault", project_id, e))?;
         }
+        if validate_links {
+            self.validate_linked_sources(&tx, None, Some(&result.id))
+                .await?;
+        }
+        capture_service_audit_scope(&tx, &result.id, result.version).await?;
         tx.commit()
             .await
             .map_err(|e| AccessError::database("commit service save", project_id, e))?;
@@ -250,14 +306,17 @@ impl ServiceAccessService {
     async fn sandbox<C: ConnectionTrait>(
         &self,
         db: &C,
-        project_id: i32,
+        project_id: impl Into<Option<i32>>,
         sandbox_id: &str,
         user_id: i32,
         admin: bool,
     ) -> Result<sandboxes::Model, AccessError> {
+        let project_id = project_id.into();
         let mut query = sandboxes::Entity::find()
             .filter(sandboxes::Column::PublicId.eq(sandbox_id))
-            .filter(sandboxes::Column::ProjectId.eq(project_id));
+            .apply_if(project_id, |q, id| {
+                q.filter(sandboxes::Column::ProjectId.eq(id))
+            });
         if !admin {
             query = query.filter(sandboxes::Column::UserId.eq(user_id));
         }
@@ -365,7 +424,7 @@ impl ServiceAccessService {
         let grant = grants::ActiveModel {
             assignment_id: Set(None),
             id: Set(format!("grant_{}", uuid::Uuid::new_v4().simple())),
-            project_id: Set(project_id),
+            project_id: Set(Some(project_id)),
             service_id: Set(service.id.clone()),
             sandbox_id: Set(sandbox.id),
             service_version: Set(service.version),
@@ -457,11 +516,11 @@ impl ServiceAccessService {
 fn invalid(field: &'static str, reason: &'static str) -> AccessError {
     AccessError::Validation { field, reason }
 }
-fn not_found(kind: &'static str, id: String, project_id: i32) -> AccessError {
+fn not_found(kind: &'static str, id: String, project_id: impl Into<Option<i32>>) -> AccessError {
     AccessError::NotFound {
         kind,
         id,
-        project_id,
+        project_id: project_id.into(),
     }
 }
 
@@ -487,17 +546,34 @@ pub fn validate_service(request: &mut SaveAccessService) -> Result<(), AccessErr
             "cannot set and clear a credential together",
         ));
     }
-    if let Some(secret) = &request.credential {
-        let secret = secret.expose();
-        if secret.is_empty()
-            || secret.len() > 16384
-            || !secret.bytes().all(|c| (33..=126).contains(&c))
-        {
-            return Err(invalid("credential", "must be a nonempty bearer value of at most 16384 printable ASCII bytes, without whitespace"));
-        }
-    }
     let (policy, _) = crate::tokenless::compile_policy(&request.policy)?;
     request.policy = policy;
+    if let Some(secret) = &request.credential {
+        // A Basic credential is base64 encoded before it reaches a header, so
+        // a password may contain spaces or non-ASCII letters; only control
+        // characters (a stray newline from a paste) are refused. A token is
+        // placed in the header as is, so it must be header-safe ASCII. The
+        // planner and the authority apply the same rule to the stored value.
+        let delivery = request.policy.delivery.as_ref();
+        if !crate::tokenless::delivery::credential_text_is_sendable(delivery, secret.expose()) {
+            return Err(
+                if crate::tokenless::delivery::credential_is_encoded(delivery) {
+                    invalid(
+                        "credential",
+                        "must be nonempty and contain no control characters such as line breaks",
+                    )
+                } else {
+                    invalid("credential", "must be a nonempty value of at most 16384 printable ASCII bytes, without whitespace")
+                },
+            );
+        }
+    }
+    if let Some(secret) = &request.credential {
+        crate::tokenless::delivery::validate_credential_shape(
+            request.policy.delivery.as_ref(),
+            secret.expose(),
+        )?;
+    }
     Ok(())
 }
 
@@ -513,6 +589,7 @@ fn service_response(model: services::Model) -> Result<AccessServiceResponse, Acc
         project_id: model.project_id,
         name: model.name,
         has_credential: model.credential_encrypted.is_some() || policy.github_repository.is_some(),
+        catalog: catalog::reference_for_origin(&policy.origin),
         policy,
         max_ttl_seconds: model.max_ttl_seconds,
         enabled: model.enabled,

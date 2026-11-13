@@ -1367,6 +1367,11 @@ async fn test_restore_pitr_rejects_legacy_backup_without_docker_work() {
         workload_mode: Default::default(),
         log_ingest_lines_per_sec: None,
         log_ingest_kib_per_sec: None,
+        healthcheck_interval_secs: None,
+        healthcheck_start_interval_secs: None,
+        healthcheck_start_period_secs: None,
+        healthcheck_timeout_secs: None,
+        healthcheck_retries: None,
     };
     // Build a MockDatabase for the `pool` slot — restore_pitr for
     // Postgres doesn't touch it in the legacy-reject path.

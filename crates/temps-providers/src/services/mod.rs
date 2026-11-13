@@ -19,6 +19,7 @@ use temps_core::EncryptionService;
 mod cluster_state;
 mod cluster_topology;
 mod engine_selection;
+mod healthcheck_defaults;
 mod manager;
 pub use manager::{
     cpu_utilization_percent, ContainerStatsBaseline, CpuLimit, PolledContainerStats,
@@ -34,9 +35,16 @@ mod types;
 pub use cluster_state::*;
 pub(crate) use cluster_topology::*;
 use engine_selection::{EngineKind, EngineSelection};
+pub use healthcheck_defaults::*;
 pub(crate) use manager::record_wal_outcome;
+pub use manager::{
+    service_overrides, HealthcheckApplied, HealthcheckCapability, ServiceHealthcheck,
+    ServiceHealthcheckUpdate,
+};
 pub use manager::{ArchiveTargetTestError, ArchiveTargetTestOutcome};
 pub use manager::{WalHealthReading, WalHealthUnchecked, WalProbeOutcome};
+#[cfg(test)]
+pub(crate) use manager::{HEALTHCHECK_CHANNEL, HEALTHCHECK_REGISTRY_TEST_LOCK};
 pub use schema::*;
 pub use temps_providers_core::service_errors::*;
 pub use transactions::*;
@@ -468,11 +476,20 @@ impl ExternalServiceManager {
         service_id_val: i32,
     ) -> Result<HashMap<String, serde_json::Value>, ExternalServiceError> {
         let service = self.get_service(service_id_val).await?;
+        self.parameters_of(&service)
+    }
 
+    /// The decrypted parameters of a service row already read.
+    pub(crate) fn parameters_of(
+        &self,
+        service: &external_services::Model,
+    ) -> Result<HashMap<String, serde_json::Value>, ExternalServiceError> {
+        let service_id_val = service.id;
         // Get encrypted config from service record
         let encrypted_config =
             service
                 .config
+                .as_deref()
                 .ok_or_else(|| ExternalServiceError::InternalError {
                     reason: format!("Service {} has no config", service_id_val),
                 })?;
@@ -480,7 +497,7 @@ impl ExternalServiceManager {
         // Decrypt config
         let config_json = self
             .encryption_service
-            .decrypt_string(&encrypted_config)
+            .decrypt_string(encrypted_config)
             .map_err(|e| ExternalServiceError::InternalError {
                 reason: format!(
                     "Failed to decrypt config for service {}: {}",

@@ -42,7 +42,7 @@ fn input(node: Uuid, incarnation: Uuid, origins: &[&str]) -> AuthorizedBinding {
         .enumerate()
         .map(|(index, origin)| PrepareSession {
             target: BindingTarget {
-                project_id: 1,
+                project_id: Some(1),
                 sandbox_id: 1,
                 incarnation_id: incarnation,
                 node_id: node,
@@ -59,6 +59,7 @@ fn input(node: Uuid, incarnation: Uuid, origins: &[&str]) -> AuthorizedBinding {
                     origin: (*origin).into(),
                     path_prefixes: vec!["/v1".into()],
                     methods: vec![AccessMethod::Get],
+                    delivery: None,
                 }
             },
             expires_at: now + chrono::Duration::seconds(30 + index as i64),
@@ -263,14 +264,26 @@ async fn signed_policy_seals_credentials_and_preserves_independent_scope_and_dea
             .iter()
             .find(|header| header.name == "authorization")
             .unwrap();
+        // The worker redacts the credential, in every form these list, from
+        // whatever the upstream sends back to the sandbox.
+        assert!(!authorization.fixed);
+        let secrets: Vec<&str> = headers.secrets.iter().map(|s| s.expose()).collect();
         if rule.allow.git.is_some() {
             let value = authorization.value.strip_prefix("Basic ").unwrap();
             assert_eq!(
                 STANDARD.decode(value).unwrap(),
                 b"x-access-token:upstream-test-secret"
             );
+            assert_eq!(
+                secrets,
+                [
+                    "upstream-test-secret",
+                    "x-access-token:upstream-test-secret"
+                ]
+            );
         } else {
             assert_eq!(authorization.value, "Bearer upstream-test-secret");
+            assert_eq!(secrets, ["upstream-test-secret"]);
         }
         let (_, other) = self::identity();
         assert!(open(&other, &rule.headers, &aad).is_err());
@@ -463,6 +476,56 @@ async fn postgres_registration_races_restart_versions_and_real_worker_binding() 
     test.cleanup().await;
 }
 
+/// Issuance applies the rule the service was saved under: a Basic password
+/// may hold spaces or non-ASCII letters, a verbatim token may not.
+#[test]
+fn issuance_accepts_basic_passwords_that_a_bearer_token_may_not_hold() {
+    let (identity, _) = identity();
+    let basic = |secret: &str| {
+        let mut binding = input(Uuid::new_v4(), Uuid::new_v4(), &["https://api.example.com"]);
+        let request = PrepareSession {
+            target: binding.plan.target().clone(),
+            grant_id: format!("grant_{}", Uuid::new_v4().simple()),
+            service_id: format!("svc_{}", Uuid::new_v4().simple()),
+            service_version: 1,
+            policy: SandboxAccessPolicy {
+                provider: None,
+                github_repository: None,
+                origin: "https://registry.example.com".into(),
+                path_prefixes: vec!["/v2".into()],
+                methods: vec![AccessMethod::Get],
+                delivery: Some(crate::types::CredentialDelivery {
+                    format: crate::types::CredentialFormat::Basic,
+                    headers: vec![],
+                }),
+            },
+            expires_at: Utc::now() + chrono::Duration::seconds(30),
+            max_ttl_seconds: 60,
+        };
+        binding.credentials =
+            BTreeMap::from([(request.grant_id.clone(), SecretString::new(secret))]);
+        binding.plan = PreparedBinding::prepare(vec![request], 1, Utc::now()).unwrap();
+        binding
+    };
+    for secret in [
+        "account:correct horse battery staple",
+        "account:contraseña-ñandú",
+    ] {
+        issue::validate_bindings(identity.boot_id, &[basic(secret)], Utc::now()).unwrap();
+        let mut bearer = input(Uuid::new_v4(), Uuid::new_v4(), &["https://api.example.com"]);
+        *bearer.credentials.values_mut().next().unwrap() = SecretString::new(secret);
+        assert!(issue::validate_bindings(identity.boot_id, &[bearer], Utc::now()).is_err());
+    }
+    assert!(issue::validate_bindings(
+        identity.boot_id,
+        &[basic("account:line\nbreak")],
+        Utc::now()
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("control characters"));
+}
+
 #[tokio::test]
 async fn issuance_rejects_wrong_node_expiry_duplicates_and_limits() {
     let (identity, _) = identity();
@@ -598,4 +661,179 @@ async fn oversized_worker_additions_do_not_block_healthy_binding_renewal() {
         2 + admitted * 16,
         "bindings are admitted atomically"
     );
+}
+
+#[tokio::test]
+async fn credential_formats_and_fixed_headers_are_sealed_and_stripped_from_the_sandbox() {
+    use crate::types::{CredentialDelivery, CredentialFormat, RequestHeader};
+    let (identity, secret) = identity();
+    let row = empty_store().generate(None, &identity).unwrap();
+    let incarnation = Uuid::new_v4();
+    let now = Utc::now();
+    let header = |name: &str, value: &str| RequestHeader {
+        name: name.into(),
+        value: value.into(),
+    };
+    let cases = [
+        (
+            "https://api-header.example.com",
+            CredentialDelivery {
+                format: CredentialFormat::Header {
+                    name: "x-api-key".into(),
+                    prefix: None,
+                },
+                headers: vec![header("anthropic-version", "2023-06-01")],
+            },
+            "upstream-test-secret",
+        ),
+        (
+            "https://api-prefix.example.com",
+            CredentialDelivery {
+                format: CredentialFormat::Header {
+                    name: "x-token".into(),
+                    prefix: Some("Token ".into()),
+                },
+                headers: Vec::new(),
+            },
+            "upstream-test-secret",
+        ),
+        (
+            "https://api-basic.example.com",
+            CredentialDelivery {
+                format: CredentialFormat::Basic,
+                headers: Vec::new(),
+            },
+            "account:upstream-test-secret",
+        ),
+        (
+            "https://api-bearer.example.com",
+            CredentialDelivery {
+                format: CredentialFormat::Bearer,
+                headers: vec![header("notion-version", "2022-06-28")],
+            },
+            "upstream-test-secret",
+        ),
+    ];
+    let requests: Vec<_> = cases
+        .iter()
+        .enumerate()
+        .map(|(index, (origin, delivery, _))| PrepareSession {
+            target: BindingTarget {
+                project_id: Some(1),
+                sandbox_id: 1,
+                incarnation_id: incarnation,
+                node_id: row.sdk_node_id,
+            },
+            grant_id: format!("grant_{}", Uuid::new_v4().simple()),
+            service_id: format!("svc_{}", Uuid::new_v4().simple()),
+            service_version: 1,
+            policy: SandboxAccessPolicy {
+                provider: None,
+                github_repository: None,
+                origin: (*origin).into(),
+                path_prefixes: vec!["/v1".into()],
+                methods: vec![AccessMethod::Get],
+                delivery: Some(delivery.clone()),
+            },
+            expires_at: now + chrono::Duration::seconds(30 + index as i64),
+            max_ttl_seconds: 60,
+        })
+        .collect();
+    let credentials = requests
+        .iter()
+        .zip(&cases)
+        .map(|(request, (_, _, secret))| (request.grant_id.clone(), SecretString::new(*secret)))
+        .collect();
+    let binding = AuthorizedBinding {
+        plan: PreparedBinding::prepare(requests, 1, now).unwrap(),
+        credentials,
+    };
+    let store = store(
+        MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![row.clone()]])
+            .into_connection(),
+    );
+    let issued = store
+        .issue(None, &identity, 0, vec![binding])
+        .await
+        .unwrap();
+    let key = empty_store()
+        .signing_key(row.id, &row.snapshot_key_encrypted)
+        .unwrap();
+    let body = issued
+        .delivery(incarnation)
+        .unwrap()
+        .policy
+        .into_snapshot()
+        .unwrap()
+        .verify(&key.verifying_key())
+        .unwrap();
+    assert_eq!(body.rules.len(), 4);
+    let mut by_host = BTreeMap::new();
+    let mut fixed_by_host = BTreeMap::new();
+    for rule in &body.rules {
+        let aad = rule_aad(&body.node_id, &rule.rule_id, &rule.credential_id);
+        let headers: tokenless_core::injection::InjectedHeaders =
+            serde_json::from_slice(&open(&secret, &rule.headers, &aad).unwrap()).unwrap();
+        let injected: BTreeMap<_, _> = headers
+            .headers
+            .iter()
+            .map(|header| (header.name.clone(), header.value.clone()))
+            .collect();
+        // The sandbox may never send a header the broker injects.
+        for name in injected.keys() {
+            assert!(
+                rule.strip_headers.contains(name),
+                "{name} must be stripped from sandbox requests"
+            );
+        }
+        assert!(rule.strip_headers.contains(&"authorization".to_string()));
+        // Fixed headers are configuration and stay unredacted in responses;
+        // the credential header and its raw secret are redacted.
+        let fixed: BTreeMap<_, _> = headers
+            .headers
+            .iter()
+            .map(|header| (header.name.clone(), header.fixed))
+            .collect();
+        let secrets: Vec<String> = headers
+            .secrets
+            .iter()
+            .map(|s| s.expose().to_string())
+            .collect();
+        assert!(
+            secrets.iter().any(|s| s == "upstream-test-secret"),
+            "{secrets:?}"
+        );
+        fixed_by_host.insert(rule.allow.hosts[0].to_string(), (fixed, secrets));
+        by_host.insert(rule.allow.hosts[0].to_string(), injected);
+    }
+    let fixed = |host: &str, name: &str| fixed_by_host[host].0[name];
+    assert!(fixed("api-header.example.com", "anthropic-version"));
+    assert!(!fixed("api-header.example.com", "x-api-key"));
+    assert!(!fixed("api-prefix.example.com", "x-token"));
+    assert!(!fixed("api-basic.example.com", "authorization"));
+    assert!(fixed("api-bearer.example.com", "notion-version"));
+    assert!(!fixed("api-bearer.example.com", "authorization"));
+    assert_eq!(
+        fixed_by_host["api-basic.example.com"].1,
+        ["upstream-test-secret", "account:upstream-test-secret"]
+    );
+    let header_rule = &by_host["api-header.example.com"];
+    assert_eq!(header_rule["x-api-key"], "upstream-test-secret");
+    assert_eq!(header_rule["anthropic-version"], "2023-06-01");
+    assert!(!header_rule.contains_key("authorization"));
+    assert_eq!(
+        by_host["api-prefix.example.com"]["x-token"],
+        "Token upstream-test-secret"
+    );
+    let basic = by_host["api-basic.example.com"]["authorization"]
+        .strip_prefix("Basic ")
+        .unwrap();
+    assert_eq!(
+        STANDARD.decode(basic).unwrap(),
+        b"account:upstream-test-secret"
+    );
+    let bearer_rule = &by_host["api-bearer.example.com"];
+    assert_eq!(bearer_rule["authorization"], "Bearer upstream-test-secret");
+    assert_eq!(bearer_rule["notion-version"], "2022-06-28");
 }

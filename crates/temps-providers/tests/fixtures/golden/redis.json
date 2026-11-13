@@ -15,15 +15,15 @@
         "6379/tcp": {}
       },
       "Healthcheck": {
-        "Interval": 1000000000,
+        "Interval": 30000000000,
         "Retries": 3,
-        "StartInterval": 1000000000,
-        "StartPeriod": 5000000000,
+        "StartInterval": 2000000000,
+        "StartPeriod": 90000000000,
         "Test": [
           "CMD-SHELL",
           "redis-cli ping"
         ],
-        "Timeout": 3000000000
+        "Timeout": 5000000000
       },
       "HostConfig": {
         "Init": true,

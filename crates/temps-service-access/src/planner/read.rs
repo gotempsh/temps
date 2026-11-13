@@ -50,17 +50,23 @@ impl PolicyPlanner {
         // sandboxes and changed service policies. EXISTS mirrors current session
         // role resolution (admin role, otherwise User), without a query per row.
         let grants = Candidate::find_by_statement(Statement::from_sql_and_values(DatabaseBackend::Postgres,
-            r#"SELECT r.id AS runtime_id, a.project_id, a.approved_by,
+            r#"SELECT r.id AS runtime_id,
+               CASE WHEN direct.allowed THEN NULL ELSE a.project_id END AS project_id, a.approved_by,
                EXISTS(SELECT 1 FROM user_roles ur JOIN roles role ON role.id=ur.role_id
                       WHERE ur.user_id=a.approved_by AND role.name='admin') AS admin,
                g.id AS grant_id, g.service_id, g.service_version, g.policy_snapshot AS policy,
                s.max_ttl_seconds, g.expires_at, s.credential_encrypted
             FROM sandbox_access_authorizations a
-            JOIN sandbox_service_grants g ON g.id=a.grant_id AND g.project_id=a.project_id AND g.sandbox_id=a.sandbox_id
-            JOIN sandbox_access_services s ON s.id=g.service_id AND s.project_id=g.project_id
-            JOIN sandbox_access_runtimes r ON r.id=a.runtime_id AND r.project_id=a.project_id AND r.sandbox_id=a.sandbox_id
-            JOIN sandboxes b ON b.id=r.sandbox_id AND b.project_id=r.project_id
-            JOIN projects p ON p.id=a.project_id
+            JOIN sandbox_service_grants g ON g.id=a.grant_id AND g.sandbox_id=a.sandbox_id
+            JOIN sandbox_access_services s ON s.id=g.service_id
+            JOIN sandbox_access_runtime_records r ON r.id=a.runtime_id AND r.sandbox_id=a.sandbox_id
+            JOIN sandboxes b ON b.id=r.sandbox_id
+            CROSS JOIN LATERAL (SELECT (s.policy->'github_repository' IS NULL AND EXISTS (
+                   SELECT 1 FROM access_sessions session JOIN access_vault_links link ON link.id=COALESCE(session.link_id,CASE WHEN session.legacy_project_link THEN 'link_legacy_' || session.vault_id END)
+                   WHERE session.grant_ids @> ARRAY[g.id] AND link.sandbox_id=b.id
+                     AND link.revoked_at IS NULL AND session.revoked_at IS NULL
+               )) AS allowed OFFSET 0) direct
+            LEFT JOIN projects p ON p.id=a.project_id
             JOIN users u ON u.id=a.approved_by
             LEFT JOIN git_provider_connections c ON to_jsonb(c.id)=s.policy->'github_repository'->'connection_id'
             LEFT JOIN git_providers v ON v.id=c.provider_id
@@ -71,7 +77,11 @@ impl PolicyPlanner {
                   CASE WHEN b.agent_run_id IS NOT NULL THEN b.agent_run_id::text
                        WHEN left(b.public_id,4)='sbx_' THEN substring(b.public_id FROM 5)
                        ELSE b.public_id END
-              AND NOT p.is_deleted AND p.deleted_at IS NULL AND u.deleted_at IS NULL
+              AND (direct.allowed OR (g.project_id IS NOT DISTINCT FROM a.project_id
+                AND r.project_id IS NOT DISTINCT FROM a.project_id
+                AND b.project_id IS NOT DISTINCT FROM r.project_id
+                AND (a.project_id IS NULL OR (NOT p.is_deleted AND p.deleted_at IS NULL))))
+              AND u.deleted_at IS NULL
               AND (b.user_id=a.approved_by OR EXISTS(
                   SELECT 1 FROM user_roles ur JOIN roles role ON role.id=ur.role_id
                   WHERE ur.user_id=a.approved_by AND role.name='admin'))
@@ -82,7 +92,7 @@ impl PolicyPlanner {
                  AND EXISTS (SELECT 1 FROM repositories repo WHERE repo.git_provider_connection_id=c.id
                      AND lower(repo.owner)=lower(s.policy->'github_repository'->>'owner')
                      AND lower(repo.name)=lower(s.policy->'github_repository'->>'repository'))
-                 AND c.is_active AND NOT c.is_expired AND v.is_active AND v.provider_type='github'
+                 AND s.project_id=a.project_id AND c.is_active AND NOT c.is_expired AND v.is_active AND v.provider_type='github'
                  AND (v.base_url IS NULL OR v.base_url IN ('https://github.com','https://github.com/'))
                  AND (v.api_url IS NULL OR v.api_url IN ('https://api.github.com','https://api.github.com/'))))
               AND (g.assignment_id IS NULL OR EXISTS (
@@ -92,6 +102,14 @@ impl PolicyPlanner {
                   AND d.approved_by=a.approved_by AND d.approved_at IS NOT NULL
                   AND d.revoked_at IS NULL AND (d.expires_at IS NULL OR d.expires_at>now()+interval '1 second')
                   AND d.grant_id=g.id))
+              AND ((NOT EXISTS (SELECT 1 FROM access_sessions session WHERE session.grant_ids @> ARRAY[g.id])
+                AND temps_standalone_vault_coverage(g.service_id, g.project_id,
+                  CASE WHEN g.assignment_id IS NULL THEN g.created_at ELSE
+                    (SELECT d.approved_at FROM sandbox_service_assignments d WHERE d.id=g.assignment_id) END)) OR EXISTS (
+                SELECT 1 FROM access_sessions session JOIN access_vault_links link ON link.id=COALESCE(session.link_id,CASE WHEN session.legacy_project_link THEN 'link_legacy_' || session.vault_id END)
+                WHERE session.grant_ids @> ARRAY[g.id] AND session.revoked_at IS NULL AND session.expires_at>now()
+                  AND link.revoked_at IS NULL AND link.vault_id=session.vault_id
+                  AND (link.sandbox_id=b.id OR link.project_id=b.project_id)))
               AND s.version=g.service_version AND s.policy=g.policy_snapshot
             ORDER BY r.id,g.id LIMIT $3"#,
             [boot_id.into(), authority.node_id.into(), ((MAX_GRANTS + 1) as i64).into(), runtime_ids.into()]))

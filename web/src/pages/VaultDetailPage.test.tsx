@@ -11,13 +11,19 @@ import {
 } from '@testing-library/react'
 import { MemoryRouter, Route, Routes } from 'react-router'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { BreadcrumbProvider } from '@/contexts/BreadcrumbContext'
+import {
+  BreadcrumbProvider,
+  useBreadcrumbs,
+} from '@/contexts/BreadcrumbContext'
+import { AuthProvider } from '@/contexts/AuthContext'
 import { installBrowserWindow } from '@/test/dom'
 import { jsonResponse, mockApi } from '@/test/fetch-mock'
 import {
-  accessCapabilityOptions,
+  generalAccessCapabilityOptions,
+  getCurrentUserOptions,
+  getAccessVaultGeneralOptions,
   getAccessVaultOptions,
-  listAccessBundlesOptions,
+  listAccessBundlesGeneralOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import type { AccessServiceResponse, AccessVaultResponse } from '@/api/client'
 import VaultDetailPage from './VaultDetailPage'
@@ -58,6 +64,14 @@ const service: AccessServiceResponse = {
   created_at: date,
   updated_at: date,
 }
+function BreadcrumbProbe() {
+  const { breadcrumbs } = useBreadcrumbs()
+  return (
+    <output aria-label="Breadcrumb trail">
+      {breadcrumbs.map((item) => item.label).join(' → ')}
+    </output>
+  )
+}
 function mount(tab = 'services', write = true, entry?: string) {
   const client = new QueryClient({
     defaultOptions: {
@@ -65,26 +79,30 @@ function mount(tab = 'services', write = true, entry?: string) {
       mutations: { retry: false },
     },
   })
+  client.setQueryData(getCurrentUserOptions({}).queryKey, {
+    id: 1,
+    name: 'Fixture',
+    username: 'fixture',
+    avatar_url: '',
+    mfa_enabled: false,
+    role: write ? 'admin' : 'user',
+  })
+  client.setQueryData(generalAccessCapabilityOptions().queryKey, {
+    can_manage_services: write,
+    can_manage_requests: write,
+    can_save_requests: true,
+    can_use_project_github: false,
+    reason: 'Available',
+    state: 'available',
+    configured: true,
+  })
   client.setQueryData(
-    accessCapabilityOptions({ path: { project_id: 7 } }).queryKey,
-    {
-      can_manage_services: write,
-      can_manage_requests: write,
-      can_save_requests: true,
-      can_use_project_github: false,
-      reason: 'Available',
-      state: 'available',
-      configured: true,
-    }
-  )
-  client.setQueryData(
-    getAccessVaultOptions({ path: { project_id: 7, vault_id: vault.id } })
-      .queryKey,
+    getAccessVaultGeneralOptions({ path: { vault_id: vault.id } }).queryKey,
     { vault, services: [service] }
   )
   client.setQueryData(
-    listAccessBundlesOptions({
-      path: { project_id: 7, vault_id: vault.id },
+    listAccessBundlesGeneralOptions({
+      path: { vault_id: vault.id },
       query: { page: 1, page_size: 20 },
     }).queryKey,
     { items: [], total: 0, page: 1, page_size: 20 }
@@ -92,34 +110,43 @@ function mount(tab = 'services', write = true, entry?: string) {
   render(
     <QueryClientProvider client={client}>
       <MemoryRouter
-        initialEntries={[
-          entry ?? `/vault/projects/7/vaults/vault_test?tab=${tab}`,
-        ]}
+        initialEntries={[entry ?? `/vault/vaults/vault_test?tab=${tab}`]}
       >
-        <BreadcrumbProvider>
-          <Routes>
-            <Route
-              path="/projects/:projectId/access-services/:serviceId/edit"
-              element={<h1>Service details destination</h1>}
-            />
-            <Route
-              path="/vault/projects/:projectId/vaults/:vaultId/bundles/:bundleId"
-              element={<AccessBundleDetailPage />}
-            />
-            <Route
-              path="/vault/projects/:projectId/vaults/:vaultId/bundles/new"
-              element={<AccessBundlePage />}
-            />
-            <Route
-              path="/vault/projects/:projectId/vaults/:vaultId/bundles/:bundleId/edit"
-              element={<AccessBundlePage />}
-            />
-            <Route
-              path="/vault/projects/:projectId/vaults/:vaultId"
-              element={<VaultDetailPage />}
-            />
-          </Routes>
-        </BreadcrumbProvider>
+        <AuthProvider>
+          <BreadcrumbProvider>
+            <BreadcrumbProbe />
+            <Routes>
+              <Route
+                path="/vault/projects/:projectId/vaults/:vaultId"
+                element={<VaultDetailPage />}
+              />
+              <Route
+                path="/vault/projects/:projectId/vaults/:vaultId/bundles/:bundleId"
+                element={<AccessBundleDetailPage />}
+              />
+              <Route
+                path="/access-services/:serviceId/edit"
+                element={<h1>Service details destination</h1>}
+              />
+              <Route
+                path="/vault/vaults/:vaultId/bundles/:bundleId"
+                element={<AccessBundleDetailPage />}
+              />
+              <Route
+                path="/vault/vaults/:vaultId/bundles/new"
+                element={<AccessBundlePage />}
+              />
+              <Route
+                path="/vault/vaults/:vaultId/bundles/:bundleId/edit"
+                element={<AccessBundlePage />}
+              />
+              <Route
+                path="/vault/vaults/:vaultId"
+                element={<VaultDetailPage />}
+              />
+            </Routes>
+          </BreadcrumbProvider>
+        </AuthProvider>
       </MemoryRouter>
     </QueryClientProvider>
   )
@@ -128,7 +155,7 @@ function mount(tab = 'services', write = true, entry?: string) {
 test('session pagination survives switching vault tabs without fetching hidden sessions', async () => {
   const pages: number[] = []
   const api = mockApi({
-    'GET /projects/7/access-sessions': (request) => {
+    'GET /access-sessions': (request) => {
       const page = Number(new URL(request.url).searchParams.get('page'))
       pages.push(page)
       return jsonResponse({
@@ -192,7 +219,7 @@ test('session pagination survives switching vault tabs without fetching hidden s
       const before = pages.length
       await act(async () => {
         await client.invalidateQueries({
-          queryKey: [{ _id: 'listAccessSessions' }],
+          queryKey: [{ _id: 'listAccessSessionsGeneral' }],
         })
       })
       expect(pages.length).toBe(before)
@@ -212,9 +239,13 @@ test('session pagination survives switching vault tabs without fetching hidden s
   }
 })
 
-test('vault services show provider logos and readers have no add-service navigation', () => {
+test('vault services show provider logos and readers have no service-editor navigation', () => {
   mount('services', false)
   expect(within(document.body).getAllByAltText('GitHub')).toBeTruthy()
+  expect(within(document.body).getByText('Repository API')).toBeTruthy()
+  expect(
+    within(document.body).queryByRole('link', { name: 'Repository API' })
+  ).toBeNull()
   const add = within(document.body).getByRole('button', {
     name: 'Add service',
   }) as HTMLButtonElement
@@ -223,23 +254,19 @@ test('vault services show provider logos and readers have no add-service navigat
     within(document.body).queryByRole('link', { name: 'Add service' })
   ).toBeNull()
   expect(
-    (
-      within(document.body).getByRole('button', {
-        name: 'Edit vault',
-      }) as HTMLButtonElement
-    ).disabled
-  ).toBe(true)
+    within(document.body).queryByRole('button', { name: 'Edit vault' })
+  ).toBeNull()
 })
 test('bundle save selects services and lifetime without creating a grant', async () => {
   let submitted: unknown
   const api = mockApi({
-    'GET /projects/7/access-vaults/vault_test': () =>
+    'GET /access-vaults/vault_test': () =>
       jsonResponse({ vault, services: [service] }),
-    'POST /projects/7/access-vaults/vault_test/bundles': async (request) => {
+    'POST /access-vaults/vault_test/bundles': async (request) => {
       submitted = await request.json()
       return jsonResponse({ id: 'bundle_test' })
     },
-    'GET /projects/7/access-vaults/vault_test/bundles': () =>
+    'GET /access-vaults/vault_test/bundles': () =>
       jsonResponse({ items: [], total: 0, page: 1, page_size: 20 }),
   })
   try {
@@ -292,9 +319,9 @@ test('bundle save selects services and lifetime without creating a grant', async
 })
 test('failed bundle save and a vault refetch retain the draft', async () => {
   const api = mockApi({
-    'POST /projects/7/access-vaults/vault_test/bundles': () =>
+    'POST /access-vaults/vault_test/bundles': () =>
       jsonResponse({ detail: 'Lifetime exceeds the service limit' }, 400),
-    'GET /projects/7/access-vaults/vault_test': () =>
+    'GET /access-vaults/vault_test': () =>
       jsonResponse({ vault: { ...vault, version: 4 }, services: [service] }),
   })
   try {
@@ -334,7 +361,9 @@ test('failed bundle save and a vault refetch retain the draft', async () => {
       ).toBeTruthy()
     )
     await act(async () => {
-      await client.invalidateQueries({ queryKey: [{ _id: 'getAccessVault' }] })
+      await client.invalidateQueries({
+        queryKey: [{ _id: 'getAccessVaultGeneral' }],
+      })
       await new Promise((resolve) => setTimeout(resolve, 20))
     })
     expect(
@@ -351,15 +380,15 @@ test('failed bundle save and a vault refetch retain the draft', async () => {
 
 test('a failed bundle refresh cannot pin an obsolete cached edit', async () => {
   const api = mockApi({
-    'GET /projects/7/access-vaults/vault_test/bundles': () =>
+    'GET /access-vaults/vault_test/bundles': () =>
       jsonResponse({ detail: 'Temporarily unavailable' }, 503),
   })
   try {
     const client = mount('bundles')
     await act(async () => {
       client.setQueryData(
-        listAccessBundlesOptions({
-          path: { project_id: 7, vault_id: vault.id },
+        listAccessBundlesGeneralOptions({
+          path: { vault_id: vault.id },
           query: { page: 1, page_size: 20 },
         }).queryKey,
         {
@@ -382,7 +411,7 @@ test('a failed bundle refresh cannot pin an obsolete cached edit', async () => {
         }
       )
       await client.invalidateQueries({
-        queryKey: [{ _id: 'listAccessBundles' }],
+        queryKey: [{ _id: 'listAccessBundlesGeneral' }],
       })
       await new Promise((resolve) => setTimeout(resolve, 20))
     })
@@ -420,23 +449,17 @@ test('direct bundle edit loads a fresh version and saves back to the list', asyn
     updated_at: date,
   }
   const api = mockApi({
-    'GET /projects/7/access-vaults/vault_test': () =>
+    'GET /access-vaults/vault_test': () =>
       jsonResponse({ vault, services: [service] }),
-    'GET /projects/7/access-vaults/vault_test/bundles': () =>
+    'GET /access-vaults/vault_test/bundles': () =>
       jsonResponse({ items: [existing], total: 1, page: 1, page_size: 100 }),
-    'PUT /projects/7/access-vaults/vault_test/bundles/bundle_test': async (
-      request
-    ) => {
+    'PUT /access-vaults/vault_test/bundles/bundle_test': async (request) => {
       submitted = await request.json()
       return jsonResponse({ ...existing, version: 6 })
     },
   })
   try {
-    mount(
-      'bundles',
-      true,
-      '/vault/projects/7/vaults/vault_test/bundles/bundle_test/edit'
-    )
+    mount('bundles', true, '/vault/vaults/vault_test/bundles/bundle_test/edit')
     await waitFor(() =>
       expect(
         within(document.body).getByRole('heading', {
@@ -489,15 +512,15 @@ test('bundle card opens read-only details and vault has no sandbox grant tab', a
     updated_at: date,
   }
   const api = mockApi({
-    'GET /projects/7/access-vaults/vault_test/bundles': () =>
+    'GET /access-vaults/vault_test/bundles': () =>
       jsonResponse({ items: [existing], total: 1, page: 1, page_size: 100 }),
   })
   try {
     const client = mount('bundles', false)
     await act(async () => {
       client.setQueryData(
-        listAccessBundlesOptions({
-          path: { project_id: 7, vault_id: vault.id },
+        listAccessBundlesGeneralOptions({
+          path: { vault_id: vault.id },
           query: { page: 1, page_size: 20 },
         }).queryKey,
         { items: [existing], total: 1, page: 1, page_size: 20 }
@@ -511,7 +534,7 @@ test('bundle card opens read-only details and vault has no sandbox grant tab', a
       name: 'Repository access',
     })
     expect(card.getAttribute('href')).toBe(
-      '/vault/projects/7/vaults/vault_test/bundles/bundle_test'
+      '/vault/vaults/vault_test/bundles/bundle_test'
     )
     await act(async () => fireEvent.click(card))
     await waitFor(() =>
@@ -538,109 +561,136 @@ test('bundle card opens read-only details and vault has no sandbox grant tab', a
   }
 })
 
-test('vault draft survives dismissal and refetch, and successful saves advance its version', async () => {
-  let saved = vault
-  const submissions: Array<{
-    name: string
-    service_ids: string[]
-    expected_version: number
-  }> = []
-  const api = mockApi({
-    'GET /projects/7/access-services': () =>
-      jsonResponse({ items: [service], total: 1, page: 1, page_size: 20 }),
-    'GET /projects/7/access-vaults/vault_test': () =>
-      jsonResponse({ vault: saved, services: [service] }),
-    'PUT /projects/7/access-vaults/vault_test': async (request) => {
-      const body = (await request.json()) as (typeof submissions)[number]
-      submissions.push(body)
-      saved = {
-        ...saved,
-        name: body.name,
-        service_ids: body.service_ids,
-        version: saved.version + 1,
-      }
-      return jsonResponse(saved)
-    },
-  })
-  let client: QueryClient | undefined
-  const open = async () => {
-    await act(async () =>
-      fireEvent.click(
-        within(document.body).getByRole('button', { name: 'Edit vault' })
-      )
-    )
-    await waitFor(() =>
-      expect(within(document.body).getByRole('checkbox')).toBeTruthy()
-    )
-  }
-  try {
-    client = mount()
-    await open()
-    await act(async () => {
-      fireEvent.change(within(document.body).getByLabelText('Vault name'), {
-        target: { value: 'Staging draft' },
-      })
-      fireEvent.click(within(document.body).getByRole('checkbox'))
-    })
-    await act(async () =>
-      fireEvent.keyDown(within(document.body).getByRole('dialog'), {
-        key: 'Escape',
-        code: 'Escape',
-        keyCode: 27,
-      })
-    )
-    await waitFor(() =>
-      expect(within(document.body).queryByRole('dialog')).toBeNull()
-    )
-    await act(async () => {
-      client!.setQueryData(
-        getAccessVaultOptions({ path: { project_id: 7, vault_id: vault.id } })
-          .queryKey,
-        {
-          vault: { ...vault, name: 'Refetched name', version: 9 },
-          services: [service],
+test.each([false, true])(
+  'vault saves refresh the active detail and preserve drafts (legacy route: %s)',
+  async (legacy) => {
+    let saved = vault
+    const submissions: Array<{
+      name: string
+      service_ids: string[]
+      expected_version: number
+    }> = []
+    const api = mockApi({
+      'GET /access-services': () =>
+        jsonResponse({ items: [service], total: 1, page: 1, page_size: 20 }),
+      [legacy
+        ? 'GET /projects/7/access-vaults/vault_test'
+        : 'GET /access-vaults/vault_test']: () =>
+        jsonResponse({ vault: saved, services: [service] }),
+      'PUT /access-vaults/vault_test': async (request) => {
+        const body = (await request.json()) as (typeof submissions)[number]
+        submissions.push(body)
+        saved = {
+          ...saved,
+          name: body.name,
+          service_ids: body.service_ids,
+          version: saved.version + 1,
         }
-      )
+        return jsonResponse(saved)
+      },
     })
-    await open()
-    expect(
-      (within(document.body).getByLabelText('Vault name') as HTMLInputElement)
-        .value
-    ).toBe('Staging draft')
-    expect(
-      within(document.body).getByRole('checkbox').getAttribute('data-state')
-    ).toBe('unchecked')
-    await act(async () =>
-      fireEvent.click(
-        within(document.body).getByRole('button', { name: 'Save vault' })
+    let client: QueryClient | undefined
+    const open = async () => {
+      await act(async () =>
+        fireEvent.click(
+          within(document.body).getByRole('button', { name: 'Edit vault' })
+        )
       )
-    )
-    await waitFor(() =>
-      expect(within(document.body).queryByRole('dialog')).toBeNull()
-    )
-    expect(submissions[0]).toEqual({
-      name: 'Staging draft',
-      service_ids: [],
-      expected_version: 3,
-    })
-    await open()
-    expect(
-      (within(document.body).getByLabelText('Vault name') as HTMLInputElement)
-        .value
-    ).toBe('Staging draft')
-    await act(async () =>
-      fireEvent.click(
-        within(document.body).getByRole('button', { name: 'Save vault' })
+      await waitFor(() =>
+        expect(within(document.body).getByRole('checkbox')).toBeTruthy()
       )
-    )
-    await waitFor(() => expect(submissions.length).toBe(2))
-    expect(submissions[1].expected_version).toBe(4)
-  } finally {
-    await act(async () => cleanup())
-    client?.clear()
-    api.restore()
+    }
+    try {
+      client = mount(
+        'services',
+        true,
+        legacy ? '/vault/projects/7/vaults/vault_test' : undefined
+      )
+      await waitFor(() =>
+        expect(
+          (
+            within(document.body).getByRole('button', {
+              name: 'Edit vault',
+            }) as HTMLButtonElement
+          ).disabled
+        ).toBe(false)
+      )
+      await open()
+      await act(async () => {
+        fireEvent.change(within(document.body).getByLabelText('Vault name'), {
+          target: { value: 'Staging draft' },
+        })
+        fireEvent.click(within(document.body).getByRole('checkbox'))
+      })
+      await act(async () =>
+        fireEvent.keyDown(within(document.body).getByRole('dialog'), {
+          key: 'Escape',
+          code: 'Escape',
+          keyCode: 27,
+        })
+      )
+      await waitFor(() =>
+        expect(within(document.body).queryByRole('dialog')).toBeNull()
+      )
+      await act(async () => {
+        client!.setQueryData(
+          legacy
+            ? getAccessVaultOptions({
+                path: { project_id: 7, vault_id: vault.id },
+              }).queryKey
+            : getAccessVaultGeneralOptions({ path: { vault_id: vault.id } })
+                .queryKey,
+          {
+            vault: { ...vault, name: 'Refetched name', version: 9 },
+            services: [service],
+          }
+        )
+      })
+      await open()
+      expect(
+        (within(document.body).getByLabelText('Vault name') as HTMLInputElement)
+          .value
+      ).toBe('Staging draft')
+      expect(
+        within(document.body).getByRole('checkbox').getAttribute('data-state')
+      ).toBe('unchecked')
+      await act(async () =>
+        fireEvent.click(
+          within(document.body).getByRole('button', { name: 'Save vault' })
+        )
+      )
+      await waitFor(() =>
+        expect(within(document.body).queryByRole('dialog')).toBeNull()
+      )
+      await waitFor(() =>
+        expect(
+          within(document.body).getByRole('heading', { name: 'Staging draft' })
+        ).toBeTruthy()
+      )
+      expect(submissions[0]).toEqual({
+        name: 'Staging draft',
+        service_ids: [],
+        expected_version: 3,
+      })
+      await open()
+      expect(
+        (within(document.body).getByLabelText('Vault name') as HTMLInputElement)
+          .value
+      ).toBe('Staging draft')
+      await act(async () =>
+        fireEvent.click(
+          within(document.body).getByRole('button', { name: 'Save vault' })
+        )
+      )
+      await waitFor(() => expect(submissions.length).toBe(2))
+      expect(submissions[1].expected_version).toBe(4)
+    } finally {
+      await act(async () => cleanup())
+      client?.clear()
+      api.restore()
+    }
   }
-})
+)
 
 test('clicking service row outside its name opens the service', async () => {
   const client = mount()
@@ -650,7 +700,7 @@ test('clicking service row outside its name opens the service', async () => {
     })
     const link = within(table).getByRole('link', { name: 'Repository API' })
     expect(link.getAttribute('href')).toBe(
-      '/projects/7/access-services/svc_test/edit?vault=vault_test'
+      '/access-services/svc_test/edit?vault=vault_test'
     )
     await act(async () => fireEvent.click(within(table).getByText('Allowed')))
     await waitFor(() =>
@@ -665,3 +715,277 @@ test('clicking service row outside its name opens the service', async () => {
     client.clear()
   }
 })
+
+test('bundle pagination retains the authorized sandbox consumer', async () => {
+  const seen: string[] = []
+  const api = mockApi({
+    'GET /access-vaults/vault_test': () =>
+      jsonResponse({ vault, services: [service] }),
+    'GET /access-vaults/vault_test/bundles': (request) => {
+      const params = new URL(request.url).searchParams
+      seen.push(`${params.get('page')}:${params.get('sandbox_id')}`)
+      return jsonResponse({
+        items: [],
+        total: 21,
+        page: Number(params.get('page')),
+        page_size: 20,
+      })
+    },
+  })
+  const client = mount(
+    'bundles',
+    false,
+    '/vault/vaults/vault_test?tab=bundles&sandbox=sbx_fixture'
+  )
+  try {
+    await waitFor(() => expect(seen).toContain('1:sbx_fixture'))
+    await act(async () =>
+      fireEvent.click(
+        within(document.body).getByRole('button', { name: 'Go to next page' })
+      )
+    )
+    await waitFor(() => expect(seen).toContain('2:sbx_fixture'))
+  } finally {
+    api.restore()
+    client.clear()
+  }
+})
+
+test('compact vault header has one ancestor and only the name and edit icon', () => {
+  const client = mount()
+  try {
+    const ui = within(document.body)
+    const heading = ui.getByRole('heading', { level: 1 })
+    expect(
+      within(heading)
+        .getByRole('button', { name: 'Edit vault' })
+        .querySelector('svg')
+    ).toBeTruthy()
+    expect(ui.getByLabelText('Breadcrumb trail').textContent).toBe(
+      'Vaults → Development'
+    )
+    expect(ui.queryByRole('link', { name: 'All vaults' })).toBeNull()
+    expect(ui.queryByRole('link', { name: /Audit logs/ })).toBeNull()
+    expect(ui.queryByRole('region', { name: 'Link a consumer' })).toBeNull()
+    for (const name of ['Linked to', 'Audit logs']) {
+      expect(ui.getByRole('tab', { name }).querySelector('svg')).toBeTruthy()
+    }
+  } finally {
+    client.clear()
+  }
+})
+
+test('vault tabs render links and resource-filtered audit rows without changing the header', async () => {
+  const requests: string[] = []
+  const api = mockApi({
+    'GET /users': () => jsonResponse([]),
+    'GET /access-vaults/vault_test/links': () => {
+      requests.push('links')
+      return jsonResponse({ items: [], total: 0, page: 1, page_size: 20 })
+    },
+    'GET /audit/logs': (request) => {
+      const url = new URL(request.url)
+      requests.push(
+        `audit:${url.searchParams.get('resource_id')}:${url.searchParams.get('offset')}`
+      )
+      return jsonResponse(
+        Array.from({ length: 20 }, (_, i) => ({
+          id: i + 1,
+          operation_type: 'CREATE_ACCESS_VAULT',
+          audit_date: Date.parse(date),
+          user: null,
+          ip_address: null,
+          data: { resource_id: vault.id },
+        }))
+      )
+    },
+  })
+  const client = mount()
+  const ui = within(document.body)
+  const selectTab = async (name: string) => {
+    fireEvent.mouseDown(ui.getByRole('tab', { name }), {
+      button: 0,
+      ctrlKey: false,
+    })
+    await waitFor(() =>
+      expect(ui.getByRole('tab', { name }).getAttribute('aria-selected')).toBe(
+        'true'
+      )
+    )
+  }
+  try {
+    expect(requests).toEqual([])
+    await selectTab('Linked to')
+    await waitFor(() => expect(requests).toContain('links'))
+    expect(ui.getByRole('region', { name: 'Link a consumer' })).toBeTruthy()
+    await selectTab('Audit logs')
+    await waitFor(() =>
+      expect(ui.getByRole('table', { name: 'Audit logs' })).toBeTruthy()
+    )
+    expect(requests).toContain('audit:vault_test:0')
+    expect(ui.queryByRole('button', { name: 'Show all resources' })).toBeNull()
+    fireEvent.click(ui.getByRole('button', { name: 'Next' }))
+    await waitFor(() => expect(requests).toContain('audit:vault_test:20'))
+    fireEvent.click(ui.getByRole('button', { name: 'Choose time range' }))
+    await waitFor(() =>
+      expect(ui.getByRole('button', { name: 'Reset filters' })).toBeTruthy()
+    )
+    fireEvent.click(ui.getByRole('button', { name: 'Reset filters' }))
+    await waitFor(() =>
+      expect(
+        ui
+          .getByRole('button', { name: 'All time' })
+          .getAttribute('aria-pressed')
+      ).toBe('true')
+    )
+    expect(
+      requests
+        .filter((r) => r.startsWith('audit:'))
+        .every((r) => r.startsWith('audit:vault_test:'))
+    ).toBe(true)
+    expect(ui.getByLabelText('Breadcrumb trail').textContent).toBe(
+      'Vaults → Development'
+    )
+    expect(ui.getAllByRole('heading', { level: 1 })).toHaveLength(1)
+  } finally {
+    cleanup()
+    api.restore()
+    client.clear()
+  }
+})
+
+test('non-admin vault readers do not see management or audit tabs', () => {
+  const client = mount('services', false)
+  try {
+    const ui = within(document.body)
+    expect(ui.queryByRole('tab', { name: 'Linked to' })).toBeNull()
+    expect(ui.queryByRole('tab', { name: 'Audit logs' })).toBeNull()
+  } finally {
+    client.clear()
+  }
+})
+
+test('legacy project vault and bundle navigation use project-scoped APIs without a sandbox', async () => {
+  const reads: string[] = []
+  const api = mockApi({
+    'GET /projects/7/access-vaults/vault_test': () => {
+      reads.push('vault')
+      return jsonResponse({ vault, services: [service] })
+    },
+    'GET /projects/7/access-vaults/vault_test/bundles': () => {
+      reads.push('bundles')
+      return jsonResponse({
+        items: [
+          {
+            id: 'bundle_legacy',
+            name: 'Legacy bundle',
+            service_ids: [service.id],
+            ttl_seconds: 300,
+            version: 1,
+          },
+        ],
+        total: 1,
+        page: 1,
+        page_size: 20,
+      })
+    },
+    'GET /access-vaults/vault_test': () =>
+      jsonResponse({ detail: 'Sandbox required' }, 403),
+    'GET /access-vaults/vault_test/bundles': () =>
+      jsonResponse({ detail: 'Sandbox required' }, 403),
+  })
+  const client = mount(
+    'bundles',
+    false,
+    '/vault/projects/7/vaults/vault_test?tab=bundles'
+  )
+  try {
+    const ui = within(document.body)
+    const link = await ui.findByRole('link', { name: 'Legacy bundle' })
+    expect(link.getAttribute('href')).toBe(
+      '/vault/projects/7/vaults/vault_test/bundles/bundle_legacy'
+    )
+    fireEvent.click(link)
+    await waitFor(() =>
+      expect(ui.getByRole('heading', { name: 'Legacy bundle' })).toBeTruthy()
+    )
+    expect(ui.queryByText('Could not load access bundle')).toBeNull()
+    expect(
+      ui
+        .getAllByRole('link', { name: 'All access bundles' })[0]
+        .getAttribute('href')
+    ).toBe('/vault/projects/7/vaults/vault_test?tab=bundles')
+    expect(reads).toContain('vault')
+    expect(reads.filter((x) => x === 'bundles').length).toBeGreaterThanOrEqual(
+      2
+    )
+  } finally {
+    cleanup()
+    client.clear()
+    api.restore()
+  }
+})
+
+test('legacy project vault session lists retain project scope', async () => {
+  let scopedReads = 0
+  let generalReads = 0
+  const api = mockApi({
+    'GET /projects/7/access-vaults/vault_test': () =>
+      jsonResponse({ vault, services: [service] }),
+    'GET /projects/7/access-sessions': (request) => {
+      const query = new URL(request.url).searchParams
+      expect(query.get('vault_id')).toBe(vault.id)
+      expect(query.get('page_size')).toBe('20')
+      scopedReads++
+      return jsonResponse({ items: [], total: 0, page: 1, page_size: 20 })
+    },
+    'GET /access-sessions': () => {
+      generalReads++
+      return jsonResponse({ detail: 'Sandbox required' }, 403)
+    },
+  })
+  const client = mount(
+    'sessions',
+    false,
+    '/vault/projects/7/vaults/vault_test?tab=sessions'
+  )
+  try {
+    await within(document.body).findByText('No sessions')
+    expect(scopedReads).toBe(1)
+    expect(generalReads).toBe(0)
+  } finally {
+    cleanup()
+    client.clear()
+    api.restore()
+  }
+})
+
+test.each([
+  '/vault/projects/7/vaults/vault_test',
+  '/vault/projects/7/vaults/vault_test/bundles/bundle_legacy',
+])(
+  'denied legacy project read does not fall back to cached general data: %s',
+  async (entry) => {
+    const api = mockApi({
+      'GET /projects/7/access-vaults/vault_test': () =>
+        jsonResponse({ detail: 'Project access denied' }, 403),
+      'GET /projects/7/access-vaults/vault_test/bundles': () =>
+        jsonResponse({ detail: 'Project access denied' }, 403),
+    })
+    const client = mount('services', false, entry)
+    try {
+      const ui = within(document.body)
+      await ui.findByText(
+        entry.includes('/bundles/')
+          ? 'Could not load access bundle'
+          : 'Could not load vault'
+      )
+      expect(ui.queryByRole('heading', { name: vault.name })).toBeNull()
+      expect(ui.queryByText(service.name)).toBeNull()
+    } finally {
+      cleanup()
+      client.clear()
+      api.restore()
+    }
+  }
+)

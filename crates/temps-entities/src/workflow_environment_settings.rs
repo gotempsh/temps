@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Per-environment durable workflow settings (ADR-103 §2, §5).
+//! Per-environment durable workflow settings (ADR-106 §2, §5).
 //!
 //! One optional row per environment; an environment without one uses the
 //! column defaults (mirrored by `WorkflowSettings::default()` in
@@ -46,7 +46,7 @@ pub struct Model {
     /// Consecutive invocation failures or lease expiries before a run is
     /// marked `stuck`. Default 8.
     pub stuck_after_failures: i32,
-    /// Reserved for the opt-in managed Postgres journal (ADR-103 §5, M3).
+    /// Reserved for the opt-in managed Postgres journal (ADR-106 §5, M3).
     pub managed_store_service_id: Option<i32>,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,

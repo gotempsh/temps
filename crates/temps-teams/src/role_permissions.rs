@@ -61,7 +61,7 @@ const DEPLOYER_ADDITIONS: &[Permission] = &[
     Permission::PipelinesWrite,
     Permission::PipelinesExecute,
     Permission::StacksWrite,
-    // Durable workflows (ADR-103): start, operate and signal runs.
+    // Durable workflows (ADR-106): start, operate and signal runs.
     Permission::WorkflowRunsCreate,
     Permission::WorkflowRunsWrite,
     Permission::WorkflowEventsCreate,
@@ -114,7 +114,7 @@ const ADMIN_ADDITIONS: &[Permission] = &[
     // and IP rules: project configuration, not something a deploy needs.
     Permission::EdgeRulesWrite,
     // Workflow settings, credentials, run deletion and reading decrypted
-    // payloads (ADR-103) are project administration.
+    // payloads (ADR-106) are project administration.
     Permission::WorkflowsWrite,
     Permission::WorkflowRunsDelete,
     Permission::WorkflowPayloadsRead,

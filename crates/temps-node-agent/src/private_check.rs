@@ -298,6 +298,7 @@ mod tests {
                 gate: None,
                 shield: None,
                 allowed_callers: Vec::new(),
+                allowed_sandboxes: Vec::new(),
             },
             address_id: "custom:7".into(),
             range: "127.0.0.0/8".into(),

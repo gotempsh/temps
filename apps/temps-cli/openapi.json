@@ -68,7 +68,10 @@
           },
           "project_id": {
             "format": "int32",
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "service_ids": {
             "items": {
@@ -94,7 +97,6 @@
         },
         "required": [
           "id",
-          "project_id",
           "vault_id",
           "name",
           "service_ids",
@@ -305,6 +307,17 @@
       },
       "AccessServiceResponse": {
         "properties": {
+          "catalog": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/CatalogReference",
+                "description": "The catalog service this origin belongs to, when it is one. Derived on\nread from the origin; never stored in the policy."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "created_at": {
             "format": "date-time",
             "type": "string"
@@ -330,7 +343,10 @@
           },
           "project_id": {
             "format": "int32",
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "updated_at": {
             "format": "date-time",
@@ -343,7 +359,6 @@
         },
         "required": [
           "id",
-          "project_id",
           "name",
           "policy",
           "max_ttl_seconds",
@@ -463,7 +478,10 @@
           },
           "project_id": {
             "format": "int32",
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "revoked_at": {
             "format": "date-time",
@@ -486,7 +504,6 @@
         },
         "required": [
           "id",
-          "project_id",
           "vault_id",
           "bundle_id",
           "bundle_name",
@@ -656,7 +673,10 @@
           },
           "project_id": {
             "format": "int32",
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "service_ids": {
             "items": {
@@ -675,7 +695,6 @@
         },
         "required": [
           "id",
-          "project_id",
           "name",
           "service_ids",
           "version",
@@ -4855,6 +4874,17 @@
               "null"
             ]
           },
+          "managed_service_healthchecks": {
+            "$ref": "#/components/schemas/ManagedServiceHealthcheckSettings",
+            "default": {
+              "interval_secs": null,
+              "retries": null,
+              "start_interval_secs": null,
+              "start_period_secs": null,
+              "timeout_secs": null
+            },
+            "description": "Instance-wide defaults for the Docker healthcheck of managed service\ncontainers. Owned by `PUT /external-services/healthcheck-defaults`,\nwhich validates and audits them; the generic settings update\npreserves the stored value. Unset values use Temps' built-in timings."
+          },
           "mcp_server": {
             "$ref": "#/components/schemas/McpServerSettings",
             "default": {
@@ -6066,6 +6096,35 @@
         "required": [
           "plan_id",
           "option"
+        ],
+        "type": "object"
+      },
+      "ApplyServiceHealthcheckResponse": {
+        "description": "After `apply`: the container was recreated with these timings.",
+        "properties": {
+          "applied": {
+            "$ref": "#/components/schemas/HealthcheckTimings",
+            "description": "As this host's Docker got them: below API 1.44 the interval is the\nstart interval."
+          },
+          "healthcheck": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ServiceHealthcheck",
+                "description": "The service's healthcheck as it is now. `null` when it could not be\nread back; the recreate still succeeded, so read it again rather than\napplying again."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "service_id": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "service_id",
+          "applied"
         ],
         "type": "object"
       },
@@ -9310,6 +9369,38 @@
           "id",
           "description",
           "evidence"
+        ],
+        "type": "object"
+      },
+      "CatalogReference": {
+        "description": "What the catalog knows about a saved service's destination: how to show it\nand where its credential is created, so a key can be rotated from the edit page.",
+        "properties": {
+          "credential_help": {
+            "$ref": "#/components/schemas/CredentialHelp"
+          },
+          "credential_labels": {
+            "description": "One label for a single credential, or two (username, password).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "id": {
+            "type": "string"
+          },
+          "logo": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "logo",
+          "credential_labels",
+          "credential_help"
         ],
         "type": "object"
       },
@@ -17655,6 +17746,35 @@
         ],
         "type": "object"
       },
+      "CreateInternalAccessSandboxGrantRequest": {
+        "properties": {
+          "description": {
+            "description": "Why the grant exists, up to 200 characters.",
+            "example": "The coding agent calls the orders API",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sandbox_id": {
+            "description": "Public id of one of your sandboxes.",
+            "example": "sbx_a1b2c3d4e5f6",
+            "type": "string"
+          },
+          "target_environment_id": {
+            "description": "The environment of this project that may be called; omit for every\nenvironment, present and future.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "sandbox_id"
+        ],
+        "type": "object"
+      },
       "CreateIpAccessControlRequest": {
         "description": "Request to create an IP access control rule",
         "properties": {
@@ -19279,6 +19399,25 @@
         ],
         "type": "object"
       },
+      "CreateVaultLink": {
+        "additionalProperties": false,
+        "properties": {
+          "project_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "sandbox_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "CreateWebhookProviderRequest": {
         "properties": {
           "config": {
@@ -19449,6 +19588,124 @@
           }
         ],
         "description": "A new bypass token. `secret` is shown this once and never again."
+      },
+      "CredentialDelivery": {
+        "additionalProperties": false,
+        "description": "How a stored credential is presented to the destination, plus any fixed\nheaders the API requires. Changing it changes the policy, so consent given\nfor the previous delivery does not carry over.",
+        "properties": {
+          "format": {
+            "$ref": "#/components/schemas/CredentialFormat"
+          },
+          "headers": {
+            "description": "Fixed, non-secret headers sent with every request, such as an API\nversion. At most 16; values are printable ASCII and never templates.",
+            "items": {
+              "$ref": "#/components/schemas/RequestHeader"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      },
+      "CredentialFormat": {
+        "description": "The credential is one stored secret. Formats differ only in how it is sent.",
+        "oneOf": [
+          {
+            "description": "`Authorization: Bearer <credential>`.",
+            "properties": {
+              "method": {
+                "enum": [
+                  "bearer"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "method"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "`<name>: <prefix><credential>`, for example `x-api-key`.",
+            "properties": {
+              "method": {
+                "enum": [
+                  "header"
+                ],
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "prefix": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "name",
+              "method"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "`Authorization: Basic base64(<username>:<credential>)` with a fixed username.",
+            "properties": {
+              "method": {
+                "enum": [
+                  "basic_token"
+                ],
+                "type": "string"
+              },
+              "username": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "username",
+              "method"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "`Authorization: Basic base64(<credential>)`; the stored credential is\n`username:password`.",
+            "properties": {
+              "method": {
+                "enum": [
+                  "basic"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "method"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "CredentialHelp": {
+        "properties": {
+          "notes": {
+            "description": "Notes the service's template gives for its credential fields.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "url": {
+            "description": "HTTPS page where this service's key or token is created.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "notes"
+        ],
+        "type": "object"
       },
       "CronExecutionInfo": {
         "properties": {
@@ -24958,6 +25215,14 @@
               "string",
               "null"
             ]
+          },
+          "sandbox_id": {
+            "description": "Ask as one of your sandboxes (its public id): whether an internal\naccess grant lets it call the name. Not with `project_id`.",
+            "example": "sbx_a1b2c3d4e5f6",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -24989,7 +25254,7 @@
             "oneOf": [
               {
                 "$ref": "#/components/schemas/DnsInternalAccess",
-                "description": "Asked as a project, for an internal route: who owns it and whether\nthat project lets the asking one call it. The internal proxy answers\n`403` when `reach` is `not_granted`."
+                "description": "Asked as a project or a sandbox, for an internal route: who owns it\nand whether that project lets the asker call it. The internal proxy\nanswers `403` when `reach` is `not_granted`."
               },
               {
                 "type": "null"
@@ -28052,6 +28317,35 @@
           "owner_kind",
           "owner_id",
           "generation"
+        ],
+        "type": "object"
+      },
+      "EngineHealthcheckDefault": {
+        "description": "What a service of one engine inherits.",
+        "properties": {
+          "builtin": {
+            "$ref": "#/components/schemas/HealthcheckTimings",
+            "description": "Temps' own timings for the engine."
+          },
+          "effective": {
+            "$ref": "#/components/schemas/ResolvedHealthcheck",
+            "description": "What a service without overrides gets, and where each value comes from."
+          },
+          "engine": {
+            "$ref": "#/components/schemas/ManagedEngine"
+          },
+          "readiness_wait_secs": {
+            "description": "How long Temps waits for a new container of this engine to become\nhealthy; a check has to land inside it.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "engine",
+          "builtin",
+          "effective",
+          "readiness_wait_secs"
         ],
         "type": "object"
       },
@@ -37186,6 +37480,209 @@
         ],
         "type": "object"
       },
+      "HealthcheckCapability": {
+        "description": "Whether Temps can give this service's container a healthcheck, and\nwhether it can recreate it from here to apply one now.",
+        "properties": {
+          "apply_now_reason": {
+            "description": "Why not, when `can_apply_now` is false.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "can_apply_now": {
+            "description": "Temps can recreate the container from here to apply the settings.",
+            "type": "boolean"
+          },
+          "configurable": {
+            "description": "The container has a Docker healthcheck Temps builds, so overrides\napply to it.",
+            "type": "boolean"
+          },
+          "reason": {
+            "description": "Why not, when `configurable` is false.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "configurable",
+          "can_apply_now"
+        ],
+        "type": "object"
+      },
+      "HealthcheckDefaults": {
+        "description": "The instance default and what it gives each engine.",
+        "properties": {
+          "engines": {
+            "items": {
+              "$ref": "#/components/schemas/EngineHealthcheckDefault"
+            },
+            "type": "array"
+          },
+          "overrides": {
+            "$ref": "#/components/schemas/HealthcheckOverrides",
+            "description": "The instance default (null = the engine's built-in value)."
+          }
+        },
+        "required": [
+          "overrides",
+          "engines"
+        ],
+        "type": "object"
+      },
+      "HealthcheckOverrides": {
+        "description": "Overrides of some or all of the five healthcheck values. `None` inherits.",
+        "properties": {
+          "interval_secs": {
+            "default": null,
+            "description": "Seconds between checks once healthy (5–3600).",
+            "example": 60,
+            "format": "int32",
+            "maximum": 3600,
+            "minimum": 5,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "retries": {
+            "default": null,
+            "description": "Consecutive failures that make the container unhealthy (1–10).",
+            "example": 3,
+            "format": "int32",
+            "maximum": 10,
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "start_interval_secs": {
+            "default": null,
+            "description": "Seconds between checks while starting (1–60).",
+            "example": 2,
+            "format": "int32",
+            "maximum": 60,
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "start_period_secs": {
+            "default": null,
+            "description": "Seconds after start during which failures do not count (0–600).",
+            "example": 90,
+            "format": "int32",
+            "maximum": 600,
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "timeout_secs": {
+            "default": null,
+            "description": "Seconds one check may run (1–60, and shorter than the interval).",
+            "example": 5,
+            "format": "int32",
+            "maximum": 60,
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "HealthcheckSource": {
+        "description": "Where an effective healthcheck value comes from.",
+        "enum": [
+          "builtin",
+          "instance_default",
+          "service"
+        ],
+        "type": "string"
+      },
+      "HealthcheckSources": {
+        "description": "The source of each of the five values.",
+        "properties": {
+          "interval_secs": {
+            "$ref": "#/components/schemas/HealthcheckSource"
+          },
+          "retries": {
+            "$ref": "#/components/schemas/HealthcheckSource"
+          },
+          "start_interval_secs": {
+            "$ref": "#/components/schemas/HealthcheckSource"
+          },
+          "start_period_secs": {
+            "$ref": "#/components/schemas/HealthcheckSource"
+          },
+          "timeout_secs": {
+            "$ref": "#/components/schemas/HealthcheckSource"
+          }
+        },
+        "required": [
+          "interval_secs",
+          "start_interval_secs",
+          "start_period_secs",
+          "timeout_secs",
+          "retries"
+        ],
+        "type": "object"
+      },
+      "HealthcheckTimings": {
+        "description": "The five numbers of a Docker healthcheck, in whole seconds (retries is a\ncount).",
+        "properties": {
+          "interval_secs": {
+            "description": "Seconds between checks once the container is healthy.",
+            "example": 30,
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "retries": {
+            "description": "Consecutive failed checks that make the container unhealthy.",
+            "example": 3,
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "start_interval_secs": {
+            "description": "Seconds between checks while the container is starting, within\n`start_period_secs`.",
+            "example": 2,
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "start_period_secs": {
+            "description": "Seconds after start during which failed checks do not count and\nchecks run every `start_interval_secs`.",
+            "example": 90,
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "timeout_secs": {
+            "description": "Seconds one check may run before it counts as failed.",
+            "example": 5,
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "interval_secs",
+          "start_interval_secs",
+          "start_period_secs",
+          "timeout_secs",
+          "retries"
+        ],
+        "type": "object"
+      },
       "HeartbeatApiRequest": {
         "properties": {
           "architecture": {
@@ -40563,6 +41060,112 @@
         ],
         "type": "object"
       },
+      "InternalAccessSandboxGrantListResponse": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/InternalAccessSandboxGrantResponse"
+            },
+            "type": "array"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "total",
+          "page",
+          "page_size"
+        ],
+        "type": "object"
+      },
+      "InternalAccessSandboxGrantResponse": {
+        "description": "One sandbox allowed to call this project (or one environment of it).",
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "created_by": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "sandbox_id": {
+            "description": "The sandbox's public id.",
+            "example": "sbx_a1b2c3d4e5f6",
+            "type": "string"
+          },
+          "sandbox_name": {
+            "description": "The name the user gave the sandbox.",
+            "type": "string"
+          },
+          "sandbox_status": {
+            "description": "`running` or `stopped`; a destroyed sandbox's grants are removed.",
+            "type": "string"
+          },
+          "target_environment_id": {
+            "description": "`null`: every environment of the target project.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "target_environment_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "target_project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "target_project_name": {
+            "type": "string"
+          },
+          "target_project_slug": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "target_project_id",
+          "target_project_name",
+          "target_project_slug",
+          "sandbox_id",
+          "sandbox_name",
+          "sandbox_status",
+          "created_at"
+        ],
+        "type": "object"
+      },
       "InternalProxyState": {
         "description": "A worker's internal routing, from its heartbeat's\n`capacity.internal_proxy`. Every `<env>.<project>.temps.local` name\npoints at the node's bridge, port 80: the resolver can be healthy while\nnothing serves those calls, and then the names resolve and every call to\nthem fails.",
         "properties": {
@@ -41676,6 +42279,13 @@
           },
           "operation_type": {
             "description": "Filter logs by operation type (omit for all)",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "resource_id": {
+            "description": "Resource ID, including child events for a vault (omit for all resources).",
             "type": [
               "string",
               "null"
@@ -43511,6 +44121,18 @@
         ],
         "type": "object"
       },
+      "ManagedEngine": {
+        "description": "Engines whose containers Temps manages and may need to replace.",
+        "enum": [
+          "postgres",
+          "redis",
+          "mariadb",
+          "mongodb",
+          "rustfs",
+          "minio"
+        ],
+        "type": "string"
+      },
       "ManagedEnvironmentVariable": {
         "properties": {
           "description": {
@@ -43546,6 +44168,69 @@
           "temps"
         ],
         "type": "string"
+      },
+      "ManagedServiceHealthcheckSettings": {
+        "description": "Instance-wide defaults for the Docker healthcheck every managed database\nand storage container is created with. `None` inherits Temps' built-in\nvalue for the engine; a service can override each value again. Bounds and\nvalidation live with the healthcheck builder\n(`temps_providers_core::healthcheck`).",
+        "properties": {
+          "interval_secs": {
+            "default": null,
+            "description": "Seconds between checks once a container is healthy (5–3600).",
+            "example": 60,
+            "format": "int32",
+            "maximum": 3600,
+            "minimum": 5,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "retries": {
+            "default": null,
+            "description": "Consecutive failed checks that make a container unhealthy (1–10).",
+            "format": "int32",
+            "maximum": 10,
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "start_interval_secs": {
+            "default": null,
+            "description": "Seconds between checks while a container is starting (1–60).",
+            "example": 2,
+            "format": "int32",
+            "maximum": 60,
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "start_period_secs": {
+            "default": null,
+            "description": "Seconds after start during which failed checks do not count (0–600).",
+            "format": "int32",
+            "maximum": 600,
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "timeout_secs": {
+            "default": null,
+            "description": "Seconds one check may run before it counts as failed (1–60).",
+            "format": "int32",
+            "maximum": 60,
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
       },
       "ManualAction": {
         "description": "A manual action the user must perform outside of the automated migration",
@@ -59790,6 +60475,22 @@
         ],
         "type": "object"
       },
+      "RequestHeader": {
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "value": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "value"
+        ],
+        "type": "object"
+      },
       "RequestRow": {
         "properties": {
           "client_ip": {
@@ -60219,6 +60920,22 @@
             "type": "object"
           }
         ]
+      },
+      "ResolvedHealthcheck": {
+        "description": "The values a container would be created with, and where each comes from.",
+        "properties": {
+          "sources": {
+            "$ref": "#/components/schemas/HealthcheckSources"
+          },
+          "timings": {
+            "$ref": "#/components/schemas/HealthcheckTimings"
+          }
+        },
+        "required": [
+          "timings",
+          "sources"
+        ],
+        "type": "object"
       },
       "ResolverCoverageHost": {
         "description": "Where a stale deployment runs: the control plane or a worker.",
@@ -62876,6 +63593,17 @@
         "additionalProperties": false,
         "description": "Exact destination and request scope. The broker must validate this again\nagainst its supported protocols before installing a policy.",
         "properties": {
+          "delivery": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/CredentialDelivery",
+                "description": "How the stored credential reaches the destination. Omitted means a\nbearer token in `Authorization`, the shape every older policy has."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "github_repository": {
             "oneOf": [
               {
@@ -63377,6 +64105,104 @@
           "lifecycle",
           "node_name",
           "egress_policy"
+        ],
+        "type": "object"
+      },
+      "SandboxInternalAddressListResponse": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/SandboxInternalAddressResponse"
+            },
+            "type": "array"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "total",
+          "page",
+          "page_size"
+        ],
+        "type": "object"
+      },
+      "SandboxInternalAddressResponse": {
+        "description": "One internal address the sandbox may call, with the command that calls it.",
+        "properties": {
+          "alias_curl_command": {
+            "example": "curl -sS http://orders-production.temps.local/",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "alias_hostname": {
+            "description": "The same environment by its subdomain, `<subdomain>.temps.local`\n(ADR-105 D7). Absent when the subdomain is not one DNS label, or a\nmanaged service or another owner holds that name.",
+            "example": "orders-production.temps.local",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "curl_command": {
+            "description": "Run inside the sandbox: its egress proxy sends it to this host's\ninternal proxy.",
+            "example": "curl -sS http://production.orders.temps.local/",
+            "type": "string"
+          },
+          "environment_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "environment_name": {
+            "type": "string"
+          },
+          "grant_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "hostname": {
+            "example": "production.orders.temps.local",
+            "type": "string"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "project_name": {
+            "type": "string"
+          },
+          "project_slug": {
+            "type": "string"
+          },
+          "url": {
+            "example": "http://production.orders.temps.local/",
+            "type": "string"
+          }
+        },
+        "required": [
+          "grant_id",
+          "project_id",
+          "project_name",
+          "project_slug",
+          "environment_id",
+          "environment_name",
+          "hostname",
+          "url",
+          "curl_command"
         ],
         "type": "object"
       },
@@ -65862,6 +66688,120 @@
         ],
         "type": "object"
       },
+      "ServiceCatalog": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/ServiceCatalogEntry"
+            },
+            "type": "array"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "total",
+          "page",
+          "page_size"
+        ],
+        "type": "object"
+      },
+      "ServiceCatalogEntry": {
+        "properties": {
+          "category": {
+            "type": "string"
+          },
+          "credential_help": {
+            "$ref": "#/components/schemas/CredentialHelp",
+            "description": "Where to create the credential: a page when Temps knows one, and the\ntemplate's own notes about each field. Both may be absent."
+          },
+          "credential_labels": {
+            "description": "One label for a single credential, or two (username, password) when the\nservice signs in with a pair that is stored as `username:password`.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "delivery": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/CredentialDelivery",
+                "description": "How this service takes its credential and which fixed headers it needs.\nPresent when it differs from a plain bearer token; the console sends it\nback as the policy's `delivery`."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "description": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "logo": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "origin": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "popular": {
+            "type": "boolean"
+          },
+          "provider": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/AccessServiceProvider",
+                "description": "Existing presentation identity, when known. New catalog selections use\nthe ordinary custom-HTTP policy shape for older-reader compatibility."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "supported": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "description",
+          "category",
+          "logo",
+          "popular",
+          "supported",
+          "credential_labels",
+          "credential_help"
+        ],
+        "type": "object"
+      },
       "ServiceCreateAlertRuleRequest": {
         "description": "Request body for creating an alert rule on an external service.\n\nDomain-prefixed schema name — see [`AlertRuleResponse`] for why.",
         "properties": {
@@ -66242,6 +67182,108 @@
         "required": [
           "service_id",
           "consecutive_failures"
+        ],
+        "type": "object"
+      },
+      "ServiceHealthcheck": {
+        "description": "A service's healthcheck as the console shows it.",
+        "properties": {
+          "capability": {
+            "$ref": "#/components/schemas/HealthcheckCapability"
+          },
+          "effective": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ResolvedHealthcheck",
+                "description": "What a new or recreated container gets, and where each value comes\nfrom."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "engine": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ManagedEngine",
+                "description": "The engine whose built-in timings apply. Absent for a service whose\ncontainer has no healthcheck Temps builds."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "inherited": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ResolvedHealthcheck",
+                "description": "What the container would get without this service's overrides: what\na cleared field falls back to."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "overrides": {
+            "$ref": "#/components/schemas/HealthcheckOverrides",
+            "description": "This service's own overrides (null = inherit)."
+          },
+          "overrides_ignored_reason": {
+            "description": "Why this service's overrides are set aside: they no longer combine\nwith the instance default, so `effective` is what the container gets\nwithout them. Change or clear them to use them again.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pending_recreate": {
+            "description": "The running container differs from `effective` (as this host's\nDocker would store it) until it is recreated. `false` when either is\nunknown.",
+            "type": "boolean"
+          },
+          "readiness_wait_secs": {
+            "description": "How long Temps waits for a new container of this engine to become\nhealthy; a check has to land inside it.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "running": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/HealthcheckTimings",
+                "description": "The running container's healthcheck, when it could be read."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "service_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "service_name": {
+            "type": "string"
+          },
+          "service_type": {
+            "type": "string"
+          },
+          "start_interval_supported": {
+            "description": "`false`: this host's Docker ignores the start interval, so the\nsteady-state interval stays at the start interval. Absent when not\nknown yet.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "service_id",
+          "service_name",
+          "service_type",
+          "capability",
+          "overrides",
+          "pending_recreate"
         ],
         "type": "object"
       },
@@ -80777,6 +81819,84 @@
         ],
         "type": "object"
       },
+      "VaultLinkList": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/VaultLinkResponse"
+            },
+            "type": "array"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "total",
+          "page",
+          "page_size"
+        ],
+        "type": "object"
+      },
+      "VaultLinkResponse": {
+        "properties": {
+          "consumer_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "revoked_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sandbox_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "vault_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "vault_id",
+          "created_at"
+        ],
+        "type": "object"
+      },
       "VerificationMethod": {
         "description": "How ownership of a hostname is proven.",
         "enum": [
@@ -84115,7 +85235,7 @@
         "type": "object"
       },
       "WorkflowRunStatus": {
-        "description": "Where a run is in its lifecycle (ADR-103 §3).",
+        "description": "Where a run is in its lifecycle (ADR-106 §3).",
         "enum": [
           "queued",
           "running",
@@ -85859,6 +86979,1254 @@
         "summary": "Update late performance metrics",
         "tags": [
           "Performance"
+        ]
+      }
+    },
+    "/access-services": {
+      "get": {
+        "operationId": "list_access_services_general",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessServiceList"
+                }
+              }
+            }
+          },
+          "401": {},
+          "403": {},
+          "500": {}
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Vault"
+        ]
+      },
+      "post": {
+        "operationId": "create_access_service_general",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "source_project_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SaveAccessService"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessServiceResponse"
+                }
+              }
+            }
+          },
+          "400": {},
+          "401": {},
+          "403": {},
+          "404": {},
+          "409": {},
+          "500": {}
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Vault"
+        ]
+      }
+    },
+    "/access-services/{service_id}": {
+      "delete": {
+        "operationId": "delete_access_service_general",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "service_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {},
+          "401": {},
+          "403": {},
+          "404": {},
+          "500": {}
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Vault"
+        ]
+      },
+      "get": {
+        "operationId": "get_access_service_general",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "service_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessServiceResponse"
+                }
+              }
+            }
+          },
+          "401": {},
+          "403": {},
+          "404": {},
+          "500": {}
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Vault"
+        ]
+      },
+      "put": {
+        "operationId": "update_access_service_general",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "service_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SaveAccessService"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessServiceResponse"
+                }
+              }
+            }
+          },
+          "400": {},
+          "401": {},
+          "403": {},
+          "404": {},
+          "409": {},
+          "500": {}
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Vault"
+        ]
+      }
+    },
+    "/access-sessions": {
+      "get": {
+        "operationId": "list_access_sessions_general",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "vault_id",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Filter by the sandbox's public ID; ownership still applies.",
+            "in": "query",
+            "name": "sandbox_id",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessSessionList"
+                }
+              }
+            },
+            "description": "Session authorizations"
+          },
+          "400": {
+            "description": "Invalid session"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Scoped resource not found"
+          },
+          "409": {
+            "description": "Policy changed"
+          },
+          "500": {
+            "description": "Session storage failed"
+          },
+          "503": {
+            "description": "Worker unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Vault sessions"
+        ]
+      }
+    },
+    "/access-sessions/{session_id}": {
+      "get": {
+        "operationId": "get_access_session_general",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessSessionDetail"
+                }
+              }
+            },
+            "description": "Session policies and worker receipts"
+          },
+          "400": {
+            "description": "Invalid session"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Scoped resource not found"
+          },
+          "409": {
+            "description": "Policy changed"
+          },
+          "500": {
+            "description": "Session storage failed"
+          },
+          "503": {
+            "description": "Worker unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Vault sessions"
+        ]
+      }
+    },
+    "/access-sessions/{session_id}/revoke": {
+      "post": {
+        "operationId": "revoke_access_session_general",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessSessionResponse"
+                }
+              }
+            },
+            "description": "Revocation requested; inspect worker receipts"
+          },
+          "400": {
+            "description": "Invalid session"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Scoped resource not found"
+          },
+          "409": {
+            "description": "Policy changed"
+          },
+          "500": {
+            "description": "Session storage failed"
+          },
+          "503": {
+            "description": "Worker unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Vault sessions"
+        ]
+      }
+    },
+    "/access-vaults": {
+      "get": {
+        "operationId": "list_access_vaults_general",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessVaultList"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "description": "Invalid selection"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Resource not found"
+          },
+          "409": {
+            "description": "Version conflict"
+          },
+          "500": {
+            "description": "Storage failure"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Vault"
+        ]
+      },
+      "post": {
+        "operationId": "create_access_vault_general",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SaveAccessVault"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessVaultResponse"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "description": "Invalid selection"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Resource not found"
+          },
+          "409": {
+            "description": "Version conflict"
+          },
+          "500": {
+            "description": "Storage failure"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Vault"
+        ]
+      }
+    },
+    "/access-vaults/{vault_id}": {
+      "delete": {
+        "operationId": "delete_access_vault_general",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "vault_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {},
+          "401": {},
+          "403": {},
+          "404": {},
+          "500": {}
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Vault"
+        ]
+      },
+      "get": {
+        "operationId": "get_access_vault_general",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "vault_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "sandbox_id",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessVaultDetail"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "description": "Invalid selection"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Resource not found"
+          },
+          "409": {
+            "description": "Version conflict"
+          },
+          "500": {
+            "description": "Storage failure"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Vault"
+        ]
+      },
+      "put": {
+        "operationId": "update_access_vault_general",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "vault_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SaveAccessVault"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessVaultResponse"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "description": "Invalid selection"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Resource not found"
+          },
+          "409": {
+            "description": "Version conflict"
+          },
+          "500": {
+            "description": "Storage failure"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Vault"
+        ]
+      }
+    },
+    "/access-vaults/{vault_id}/bundles": {
+      "get": {
+        "operationId": "list_access_bundles_general",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "vault_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "sandbox_id",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessBundleList"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "description": "Invalid selection"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Resource not found"
+          },
+          "409": {
+            "description": "Version conflict"
+          },
+          "500": {
+            "description": "Storage failure"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Vault"
+        ]
+      },
+      "post": {
+        "operationId": "create_access_bundle_general",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "vault_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SaveAccessBundle"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessBundleResponse"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "description": "Invalid selection"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Resource not found"
+          },
+          "409": {
+            "description": "Version conflict"
+          },
+          "500": {
+            "description": "Storage failure"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Vault"
+        ]
+      }
+    },
+    "/access-vaults/{vault_id}/bundles/{bundle_id}": {
+      "delete": {
+        "operationId": "delete_access_bundle_general",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "vault_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "bundle_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {},
+          "401": {},
+          "403": {},
+          "404": {},
+          "500": {}
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Vault"
+        ]
+      },
+      "put": {
+        "operationId": "update_access_bundle_general",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "vault_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "bundle_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SaveAccessBundle"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessBundleResponse"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "description": "Invalid selection"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Resource not found"
+          },
+          "409": {
+            "description": "Version conflict"
+          },
+          "500": {
+            "description": "Storage failure"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Vault"
+        ]
+      }
+    },
+    "/access-vaults/{vault_id}/consumers/{sandbox_id}": {
+      "get": {
+        "operationId": "get_vault_eligibility",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "vault_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "sandbox_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VaultLinkResponse"
+                }
+              }
+            }
+          },
+          "401": {},
+          "403": {},
+          "404": {},
+          "500": {}
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Vault"
+        ]
+      }
+    },
+    "/access-vaults/{vault_id}/links": {
+      "get": {
+        "operationId": "list_vault_links",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "vault_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "project_ids",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "sandbox_ids",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VaultLinkList"
+                }
+              }
+            }
+          },
+          "400": {},
+          "401": {},
+          "403": {},
+          "404": {},
+          "500": {}
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Vault"
+        ]
+      },
+      "post": {
+        "operationId": "create_vault_link",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "vault_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateVaultLink"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VaultLinkResponse"
+                }
+              }
+            }
+          },
+          "400": {},
+          "401": {},
+          "403": {},
+          "404": {},
+          "409": {},
+          "500": {}
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Vault"
+        ]
+      }
+    },
+    "/access-vaults/{vault_id}/links/{link_id}": {
+      "delete": {
+        "operationId": "delete_vault_link",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "vault_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "link_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {},
+          "401": {},
+          "403": {},
+          "404": {},
+          "500": {}
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Vault"
+        ]
+      }
+    },
+    "/access-vaults/{vault_id}/sessions": {
+      "post": {
+        "operationId": "create_access_session_general",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "vault_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateAccessSession"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessSessionResponse"
+                }
+              }
+            },
+            "description": "Session issued; worker enforcement is asynchronous"
+          },
+          "400": {
+            "description": "Invalid session"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Scoped resource not found"
+          },
+          "409": {
+            "description": "Policy changed"
+          },
+          "500": {
+            "description": "Session storage failed"
+          },
+          "503": {
+            "description": "Worker unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Vault sessions"
         ]
       }
     },
@@ -99422,6 +101790,15 @@
         "operationId": "list_audit_logs",
         "parameters": [
           {
+            "description": "Resource ID, including child events for a vault (omit for all resources).",
+            "in": "query",
+            "name": "resource_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
             "description": "Filter logs by operation type (omit for all)",
             "example": "user.login",
             "in": "query",
@@ -110045,6 +112422,148 @@
         ]
       }
     },
+    "/external-services/healthcheck-defaults": {
+      "get": {
+        "description": "Null values use each engine's built-in timing. `engines` lists what a\nservice of each engine inherits.",
+        "operationId": "get_healthcheck_defaults",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthcheckDefaults"
+                }
+              }
+            },
+            "description": "The instance default"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Get the instance-wide default healthcheck of managed service containers",
+        "tags": [
+          "External Services"
+        ]
+      },
+      "put": {
+        "description": "Applies to containers created or recreated afterwards; nothing running\nchanges. Send null for a value to use each engine's built-in timing.",
+        "operationId": "update_healthcheck_defaults",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HealthcheckOverrides"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthcheckDefaults"
+                }
+              }
+            },
+            "description": "Saved"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "A value is out of range, the timeout is not shorter than the interval, or no check would land inside an engine's readiness wait"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The default would make a service's existing overrides invalid"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Replace the instance-wide default healthcheck of managed service containers",
+        "tags": [
+          "External Services"
+        ]
+      }
+    },
     "/external-services/import": {
       "post": {
         "operationId": "import_external_service",
@@ -111240,6 +113759,281 @@
           }
         },
         "summary": "Persisted health status for an external service",
+        "tags": [
+          "External Services"
+        ]
+      }
+    },
+    "/external-services/{id}/healthcheck": {
+      "get": {
+        "description": "Its own overrides, what a new or recreated container gets (with where\neach value comes from), and what the running container has.",
+        "operationId": "get_service_healthcheck",
+        "parameters": [
+          {
+            "description": "External service ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceHealthcheck"
+                }
+              }
+            },
+            "description": "The service's healthcheck"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Service not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Get a managed service's healthcheck",
+        "tags": [
+          "External Services"
+        ]
+      },
+      "put": {
+        "description": "Send null for a value to inherit the instance default. Applies when the\ncontainer is next recreated; nothing running changes.",
+        "operationId": "update_service_healthcheck",
+        "parameters": [
+          {
+            "description": "External service ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HealthcheckOverrides"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceHealthcheck"
+                }
+              }
+            },
+            "description": "Saved; applies when the container is recreated"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "A value is out of range, the timeout is not shorter than the interval, or no check would land inside the engine's readiness wait"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Service not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The service's container has no healthcheck Temps builds"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Replace a managed service's healthcheck overrides",
+        "tags": [
+          "External Services"
+        ]
+      }
+    },
+    "/external-services/{id}/healthcheck/apply": {
+      "post": {
+        "description": "The service restarts briefly. Its volumes and configuration are kept: the\noriginal container is kept until the replacement holds the same data,\nand put back otherwise. Only for a running standalone service on a\nprocess that runs local containers: recreating starts the container, so\na stopped service is left alone. Not available for clusters, worker\ndatabases or imported containers.",
+        "operationId": "apply_service_healthcheck",
+        "parameters": [
+          {
+            "description": "External service ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplyServiceHealthcheckResponse"
+                }
+              }
+            },
+            "description": "The container was recreated"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Service not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Temps will not recreate this container from here (not running, local workloads disabled, a cluster, worker or imported container), or the recreate was refused to protect its data"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The recreate failed; the original container was kept"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Recreate a managed service's container to apply its healthcheck now",
         "tags": [
           "External Services"
         ]
@@ -159685,6 +162479,315 @@
         ]
       }
     },
+    "/projects/{project_id}/internal-access/sandboxes": {
+      "get": {
+        "description": "Newest first. With `environment_id`, only the grants that cover that\nenvironment (its own and the project-wide ones).",
+        "operationId": "list_internal_access_sandbox_grants",
+        "parameters": [
+          {
+            "description": "The project being called",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Only grants that cover this environment of the project: its own and\nthe project-wide ones.",
+            "in": "query",
+            "name": "environment_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "1-based page, default 1.",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Default 20, at most 100.",
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InternalAccessSandboxGrantListResponse"
+                }
+              }
+            },
+            "description": "Sandbox grants on the project"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project or environment not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "List the sandboxes allowed to call this project's internal addresses",
+        "tags": [
+          "Internal Access"
+        ]
+      },
+      "post": {
+        "description": "The sandbox may then call this project's `<environment>.<project>.temps.local`\naddresses (or one environment's) with plain `http://`, through its egress\nproxy, in every egress mode. The internal proxy applies it with its next\nroute snapshot, within seconds. Destroying the sandbox removes the grant.",
+        "operationId": "create_internal_access_sandbox_grant",
+        "parameters": [
+          {
+            "description": "The project being called",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateInternalAccessSandboxGrantRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InternalAccessSandboxGrantResponse"
+                }
+              }
+            },
+            "description": "Grant created"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid grant"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions on the project"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project, environment or sandbox not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Already granted, or too many grants"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Allow one of your sandboxes to call this project's internal addresses",
+        "tags": [
+          "Internal Access"
+        ]
+      }
+    },
+    "/projects/{project_id}/internal-access/sandboxes/{grant_id}": {
+      "delete": {
+        "description": "The internal proxy refuses the sandbox again with its next route\nsnapshot, within seconds.",
+        "operationId": "delete_internal_access_sandbox_grant",
+        "parameters": [
+          {
+            "description": "The project being called",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Sandbox grant ID",
+            "in": "path",
+            "name": "grant_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Grant removed"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Grant not found on this project"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Stop a sandbox from calling this project's internal addresses",
+        "tags": [
+          "Internal Access"
+        ]
+      }
+    },
     "/projects/{project_id}/internal-access/{grant_id}": {
       "delete": {
         "description": "Workers refuse the caller again with their next route sync, within\nseconds (ADR 101 D5).",
@@ -160124,6 +163227,71 @@
           "Project IP Access"
         ],
         "x-maturity": "beta"
+      }
+    },
+    "/projects/{project_id}/linked-vaults": {
+      "get": {
+        "operationId": "project_access_vaults",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessVaultList"
+                }
+              }
+            }
+          },
+          "401": {},
+          "403": {},
+          "404": {},
+          "500": {}
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Vault"
+        ]
       }
     },
     "/projects/{project_id}/logs": {
@@ -169069,6 +172237,279 @@
           "Revenue"
         ],
         "x-maturity": "experimental"
+      }
+    },
+    "/sandboxes/{sandbox_id}/access-vaults": {
+      "get": {
+        "operationId": "sandbox_access_vaults",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "sandbox_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessVaultList"
+                }
+              }
+            }
+          },
+          "401": {},
+          "403": {},
+          "404": {},
+          "500": {}
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Vault"
+        ]
+      }
+    },
+    "/sandboxes/{sandbox_id}/internal-addresses": {
+      "get": {
+        "description": "One entry per environment its grants cover, with the `curl` command to\nrun inside the sandbox.",
+        "operationId": "list_sandbox_internal_addresses",
+        "parameters": [
+          {
+            "description": "Public id of one of your sandboxes",
+            "in": "path",
+            "name": "sandbox_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "1-based page, default 1.",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Default 20, at most 100.",
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SandboxInternalAddressListResponse"
+                }
+              }
+            },
+            "description": "Addresses the sandbox may call"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Sandbox not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "List the internal addresses one of your sandboxes may call",
+        "tags": [
+          "Internal Access"
+        ]
+      }
+    },
+    "/service-access/capability": {
+      "get": {
+        "operationId": "general_access_capability",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessCapability"
+                }
+              }
+            }
+          },
+          "401": {},
+          "403": {}
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Vault"
+        ]
+      }
+    },
+    "/service-access/catalog": {
+      "get": {
+        "operationId": "service_catalog",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "search",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "id",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceCatalog"
+                }
+              }
+            }
+          },
+          "401": {},
+          "403": {},
+          "500": {}
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Vault"
+        ]
       }
     },
     "/session-replays": {

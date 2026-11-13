@@ -18,3 +18,11 @@ mod vaults;
 
 mod assignments;
 mod sessions;
+
+mod general_vaults;
+
+mod links;
+
+mod general_sessions;
+
+mod general_services;

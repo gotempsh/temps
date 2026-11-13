@@ -304,6 +304,11 @@ async fn integration_fan_out_skips_control_plane_when_flag_off() {
         workload_mode: Default::default(),
         log_ingest_lines_per_sec: Set(None),
         log_ingest_kib_per_sec: Set(None),
+        healthcheck_interval_secs: Set(None),
+        healthcheck_start_interval_secs: Set(None),
+        healthcheck_start_period_secs: Set(None),
+        healthcheck_timeout_secs: Set(None),
+        healthcheck_retries: Set(None),
         created_at: Set(chrono::Utc::now()),
         updated_at: Set(chrono::Utc::now()),
     }

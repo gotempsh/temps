@@ -1894,10 +1894,20 @@ fn only_current_preset_reference_can_be_materialized_locally() {
 }
 
 #[test]
-fn test_sandbox_channel_default_is_stable() {
-    // Whatever the developer's env happens to be, an unset / non-`beta`
-    // value must always resolve to stable. The matcher only treats the
-    // exact string "beta" as opt-in.
+fn unpinned_sandbox_images_default_to_the_published_beta_channel() {
+    // A source build has no release manifest, and the stable tag only exists
+    // once a release publishes it (a host may cache an older one). Only an
+    // explicit "stable" opts back into the canonical tag.
+    assert_eq!(SandboxChannel::from_setting(None), SandboxChannel::Beta);
+    assert_eq!(SandboxChannel::from_setting(Some("")), SandboxChannel::Beta);
+    assert_eq!(
+        SandboxChannel::from_setting(Some("beta")),
+        SandboxChannel::Beta
+    );
+    assert_eq!(
+        SandboxChannel::from_setting(Some("stable")),
+        SandboxChannel::Stable
+    );
     assert_eq!(SandboxChannel::Stable.tag_suffix(), "");
     assert_eq!(SandboxChannel::Beta.tag_suffix(), "-beta");
 }
@@ -3227,6 +3237,26 @@ fn run_proxy_process(
     policy: &SandboxEgressPolicy,
     requests: &[&str],
 ) -> Option<(Vec<String>, String)> {
+    run_proxy_process_with(policy, requests, "", &[])
+        .map(|run| (run.responses.into_iter().map(|(_, r)| r).collect(), run.log))
+}
+
+/// What [`run_proxy_process_with`] saw: each response with how long it took,
+/// in milliseconds, and the rest of the proxy's output.
+struct ProxyRun {
+    responses: Vec<(u64, String)>,
+    log: String,
+}
+
+/// [`run_proxy_process`] with the sidecar's internal proxy address set to
+/// `internal_proxy` and each `(from, to)` of `replacements` applied to the
+/// script first.
+fn run_proxy_process_with(
+    policy: &SandboxEgressPolicy,
+    requests: &[&str],
+    internal_proxy: &str,
+    replacements: &[(&str, &str)],
+) -> Option<ProxyRun> {
     let listen = "server.listen(3128, \"0.0.0.0\");";
     assert_eq!(SANDBOX_EGRESS_PROXY_SCRIPT.matches(listen).count(), 1);
     let requests_json = serde_json::to_string(requests).expect("requests json");
@@ -3234,20 +3264,25 @@ fn run_proxy_process(
         r#"server.listen(0, "127.0.0.1", async () => {{
   const {{ port }} = server.address();
   for (const raw of {requests_json}) {{
+    const started = Date.now();
     const answer = await new Promise((resolve, reject) => {{
       const socket = net.connect(port, "127.0.0.1", () => socket.write(raw));
       const chunks = [];
       socket.on("data", (chunk) => chunks.push(chunk));
       socket.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
       socket.on("error", reject);
-      socket.setTimeout(5000, () => reject(new Error("proxy did not answer " + raw)));
+      socket.setTimeout(8000, () => reject(new Error("proxy did not answer " + raw)));
     }});
-    process.stdout.write("RESPONSE " + JSON.stringify(answer) + "\n");
+    process.stdout.write("RESPONSE " + (Date.now() - started) + " " + JSON.stringify(answer) + "\n");
   }}
   process.exit(0);
 }});"#
     );
-    let script = SANDBOX_EGRESS_PROXY_SCRIPT.replace(listen, &client);
+    let mut script = SANDBOX_EGRESS_PROXY_SCRIPT.replace(listen, &client);
+    for (from, to) in replacements {
+        assert_eq!(script.matches(from).count(), 1, "{from}");
+        script = script.replace(from, to);
+    }
     let output = match std::process::Command::new("node")
         .args(["-e", &script])
         .env("TEMPS_CONTROL_PLANE_URL", "http://127.0.0.1:9")
@@ -3256,6 +3291,7 @@ fn run_proxy_process(
             "TEMPS_SANDBOX_EGRESS_POLICY",
             serde_json::to_string(policy).expect("policy json"),
         )
+        .env("TEMPS_INTERNAL_PROXY_ADDRESS", internal_proxy)
         .output()
     {
         Ok(output) => output,
@@ -3276,7 +3312,13 @@ fn run_proxy_process(
     let mut log = String::new();
     for line in stdout.lines() {
         match line.strip_prefix("RESPONSE ") {
-            Some(json) => responses.push(serde_json::from_str(json).expect("response json")),
+            Some(rest) => {
+                let (millis, json) = rest.split_once(' ').expect("timed response");
+                responses.push((
+                    millis.parse().expect("milliseconds"),
+                    serde_json::from_str(json).expect("response json"),
+                ));
+            }
             None => {
                 log.push_str(line);
                 log.push('\n');
@@ -3284,7 +3326,289 @@ fn run_proxy_process(
         }
     }
     assert_eq!(responses.len(), requests.len(), "{stdout}");
-    Some((responses, log))
+    Some(ProxyRun { responses, log })
+}
+
+/// A stand-in for the host's internal proxy: answers every request with
+/// `200 ok` and records each request's head.
+fn fake_internal_proxy() -> (
+    std::net::SocketAddr,
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake internal proxy");
+    let address = listener.local_addr().expect("fake internal proxy address");
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = seen.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                match stream.read(&mut byte) {
+                    Ok(1) => head.push(byte[0]),
+                    _ => break,
+                }
+            }
+            recorded
+                .lock()
+                .expect("record")
+                .push(String::from_utf8_lossy(&head).into_owned());
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+        }
+    });
+    (address, seen)
+}
+
+fn plain_get(url: &str, host: &str) -> String {
+    format!("GET {url} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n")
+}
+
+/// ADR 105: in every egress mode, a plain-http request for
+/// `<environment>.<project>.temps.local` or `<environment subdomain>.temps.local`
+/// goes to the host's internal proxy, named exactly as the sandbox named it,
+/// and nothing else private does.
+#[test]
+fn the_proxy_process_sends_internal_names_to_the_internal_proxy_in_every_mode() {
+    let restricted = SandboxEgressPolicy::restricted(vec![temps_workload::EgressRule::host(
+        "api.example.com",
+        &[443],
+    )])
+    .normalized()
+    .expect("valid policy");
+    for (label, policy) in [
+        ("internet", SandboxEgressPolicy::internet()),
+        ("restricted", restricted),
+    ] {
+        let (address, seen) = fake_internal_proxy();
+        let forwarded = plain_get(
+            "http://web.demo.temps.local/orders?page=2",
+            "web.demo.temps.local",
+        );
+        let alias = plain_get(
+            "http://demo-production.temps.local/health",
+            "demo-production.temps.local",
+        );
+        let requests = [
+            forwarded.as_str(),
+            alias.as_str(),
+            &plain_get(
+                "http://web.demo.temps.local:8080/",
+                "web.demo.temps.local:8080",
+            ),
+            "CONNECT web.demo.temps.local:443 HTTP/1.1\r\nHost: web.demo.temps.local:443\r\n\r\n",
+            &plain_get("http://a.web.demo.temps.local/", "a.web.demo.temps.local"),
+            &plain_get("http://printer.local/", "printer.local"),
+            &plain_get("http://localhost/", "localhost"),
+            &plain_get("http://temps.local/", "temps.local"),
+            &plain_get("http://127.0.0.1/", "127.0.0.1"),
+            &plain_get(&format!("http://{address}/"), &address.to_string()),
+            &plain_get(
+                "http://169.254.169.254/latest/meta-data/",
+                "169.254.169.254",
+            ),
+            &plain_get("http://10.0.0.1/", "10.0.0.1"),
+            &plain_get("http://172.17.0.1/", "172.17.0.1"),
+            &plain_get("http://192.168.1.1/", "192.168.1.1"),
+            &plain_get("http://[::1]/", "[::1]"),
+            "CONNECT 10.0.0.1:443 HTTP/1.1\r\nHost: 10.0.0.1:443\r\n\r\n",
+            "CONNECT 127.0.0.1:591 HTTP/1.1\r\nHost: 127.0.0.1:591\r\n\r\n",
+        ];
+        let Some(run) = run_proxy_process_with(&policy, &requests, &address.to_string(), &[])
+        else {
+            return;
+        };
+        for (_, forwarded) in &run.responses[..2] {
+            assert!(
+                forwarded.starts_with("HTTP/1.1 200"),
+                "{label}: {forwarded}"
+            );
+            assert!(forwarded.ends_with("ok"), "{label}: {forwarded}");
+        }
+        for (request, (_, response)) in requests.iter().zip(&run.responses).skip(2) {
+            assert!(
+                response.starts_with("HTTP/1.1 403"),
+                "{label}: {request:?} was not refused: {response}"
+            );
+            assert!(
+                response.contains("sandbox sbx-egress-test: egress to"),
+                "{response}"
+            );
+        }
+        let seen = seen.lock().expect("seen").clone();
+        assert_eq!(
+            seen.len(),
+            2,
+            "{label}: only the internal names are forwarded: {seen:?}"
+        );
+        for (head, path, host) in [
+            (&seen[0], "/orders?page=2", "web.demo.temps.local"),
+            (&seen[1], "/health", "demo-production.temps.local"),
+        ] {
+            assert!(
+                head.starts_with(&format!("GET {path} HTTP/1.1\r\n")),
+                "{head}"
+            );
+            assert!(
+                head.to_ascii_lowercase()
+                    .contains(&format!("\r\nhost: {host}\r\n")),
+                "{head}"
+            );
+        }
+        let reason = |index: usize| run.responses[index].1.clone();
+        assert!(reason(2).contains("port 80 only"), "{}", reason(2));
+        assert!(
+            reason(3).contains("never https or a CONNECT tunnel"),
+            "{}",
+            reason(3)
+        );
+        for index in 4..=7 {
+            assert!(
+                reason(index).contains("names under .local and localhost"),
+                "{}",
+                reason(index)
+            );
+        }
+    }
+}
+
+/// Every refusal answers at once (well under 100 ms), the second identical
+/// request included, for both forms of internal name and for any other
+/// `.local` name. A `.local` name used to be looked up: the lookup went to
+/// multicast DNS and waited out its timeout on one of the four threads every
+/// lookup shares, so a few such calls stalled every later request, refusals
+/// included. Here the resolver never answers at all, and is never asked.
+#[test]
+fn refusals_answer_at_once_even_when_the_resolver_never_answers() {
+    let never = r#"const dns = { lookup: (host) => {
+  process.stdout.write("LOOKUP " + host + "\n");
+  return new Promise(() => {});
+} };"#;
+    let requests = [
+        plain_get("http://web.demo.temps.local/", "web.demo.temps.local"),
+        plain_get("http://web.demo.temps.local/", "web.demo.temps.local"),
+        plain_get("http://printer.local/", "printer.local"),
+        plain_get("http://printer.local/", "printer.local"),
+        "CONNECT web.demo.temps.local:443 HTTP/1.1\r\nHost: web.demo.temps.local:443\r\n\r\n"
+            .to_string(),
+        "CONNECT slow.example.com:443 HTTP/1.1\r\nHost: slow.example.com:443\r\n\r\n".to_string(),
+        plain_get("http://web.demo.temps.local/", "web.demo.temps.local"),
+        plain_get(
+            "http://demo-production.temps.local/",
+            "demo-production.temps.local",
+        ),
+        plain_get(
+            "http://demo-production.temps.local/",
+            "demo-production.temps.local",
+        ),
+        plain_get("http://a.web.demo.temps.local/", "a.web.demo.temps.local"),
+    ];
+    let requests: Vec<&str> = requests.iter().map(String::as_str).collect();
+    // No internal proxy is serving on this host.
+    let Some(run) = run_proxy_process_with(
+        &SandboxEgressPolicy::internet(),
+        &requests,
+        "",
+        &[("const dns = require(\"dns\").promises;", never)],
+    ) else {
+        return;
+    };
+    for (index, (millis, response)) in run.responses.iter().enumerate() {
+        if index == 5 {
+            // The one name that is looked up is refused at the deadline.
+            assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+            assert!(
+                response.contains("did not resolve within 3 seconds"),
+                "{response}"
+            );
+            assert!(
+                (2_900..6_000).contains(millis),
+                "lookup deadline took {millis}ms"
+            );
+            continue;
+        }
+        assert!(*millis < 100, "request {index} took {millis}ms: {response}");
+    }
+    for index in [0, 1, 6, 7, 8] {
+        let response = &run.responses[index].1;
+        assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+        assert!(response.contains("Settings > DNS"), "{response}");
+        assert!(
+            response.contains("internal routing was not serving"),
+            "{response}"
+        );
+    }
+    for index in [2, 3, 9] {
+        let response = &run.responses[index].1;
+        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+        assert!(
+            response.contains("names under .local and localhost"),
+            "{response}"
+        );
+    }
+    let lookups: Vec<&str> = run
+        .log
+        .lines()
+        .filter(|l| l.starts_with("LOOKUP "))
+        .collect();
+    assert_eq!(lookups, ["LOOKUP slow.example.com"], "{}", run.log);
+}
+
+/// An internal proxy that is not there is reported at once, with what to
+/// check, never a hang.
+#[test]
+fn an_internal_proxy_that_does_not_answer_is_reported_at_once() {
+    let closed = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.local_addr().expect("address")
+    };
+    let request = plain_get("http://web.demo.temps.local/", "web.demo.temps.local");
+    let Some(run) = run_proxy_process_with(
+        &SandboxEgressPolicy::internet(),
+        &[request.as_str(), request.as_str()],
+        &closed.to_string(),
+        &[],
+    ) else {
+        return;
+    };
+    for (millis, response) in &run.responses {
+        assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+        assert!(
+            response.contains(&format!("internal proxy at {closed}")),
+            "{response}"
+        );
+        assert!(*millis < 4_000, "took {millis}ms");
+    }
+}
+
+/// A malformed internal proxy address stops the proxy, like a malformed
+/// policy: never a guess at where to send internal requests.
+#[test]
+fn a_malformed_internal_proxy_address_stops_the_proxy() {
+    for bad in [
+        "web.demo.temps.local:80",
+        "10.0.0.1",
+        "10.0.0.1:0",
+        "http://10.0.0.1:591",
+    ] {
+        let output = match std::process::Command::new("node")
+            .args(["-e", SANDBOX_EGRESS_PROXY_SCRIPT])
+            .env("TEMPS_CONTROL_PLANE_URL", "http://127.0.0.1:9")
+            .env("TEMPS_INTERNAL_PROXY_ADDRESS", bad)
+            .output()
+        {
+            Ok(output) => output,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) => panic!("failed to execute Node.js: {error}"),
+        };
+        assert!(!output.status.success(), "accepted {bad}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("TEMPS_INTERNAL_PROXY_ADDRESS"),
+            "{bad}"
+        );
+    }
 }
 
 /// The sidecar process itself, not a fragment of it: a restricted

@@ -5,11 +5,11 @@ SPDX-License-Identifier: MIT OR Apache-2.0
 
 <!-- SCOPE: Temporal/Restate-style durable workflows orchestrated by the Temps control plane and executed by the project's own containers through an SDK; one crate (temps-workflows), one API, a versioned executor protocol and SDKs, reusing auth, audit, encryption, blob storage, OTEL, error tracking, alarms and the workload layer. -->
 
-# ADR-103: Durable workflows orchestrated by Temps
+# ADR-106: Durable workflows orchestrated by Temps
 
 - **Status:** Proposed
 - **Date:** 2026-11-13
-- **Deciders:** David
+- **Deciders:** Temps maintainers
 - **Related:** ADR-034 (feature flags, the reference crate shape), ADR-039 (MCP server), ADR-055 (workload plane), ADR-068 (environment addresses), ADR-076 (keyed ingest), ADR-089 (edge rules, a permission precedent)
 
 ## Context

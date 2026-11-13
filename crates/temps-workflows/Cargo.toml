@@ -5,13 +5,13 @@
 name = "temps-workflows"
 version.workspace = true
 edition.workspace = true
-description = "Durable workflows orchestrated by the control plane: run state, the step journal, waits, leases, the scheduler and invoker, and the workflows API (ADR-103)"
+description = "Durable workflows orchestrated by the control plane: run state, the step journal, waits, leases, the scheduler and invoker, and the workflows API (ADR-106)"
 license.workspace = true
 authors.workspace = true
 
 [dependencies]
 # Internal crates: core traits, entities, authorization. Never deployments,
-# the proxy, analytics or error tracking (ADR-103 §0).
+# the proxy, analytics or error tracking (ADR-106 §0).
 temps-core = { path = "../temps-core" }
 temps-authz = { path = "../temps-authz" }
 temps-entities = { path = "../temps-entities" }

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! An event delivered to an environment's workflows (ADR-103 §4): an
+//! An event delivered to an environment's workflows (ADR-106 §4): an
 //! approval, a webhook, a `sendEvent` from another run. The payload is
 //! ciphertext bound to the event's id.
 

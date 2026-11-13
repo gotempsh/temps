@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Workflow metrics (ADR-103 §14), recorded in memory and flushed in batches
+//! Workflow metrics (ADR-106 §14), recorded in memory and flushed in batches
 //! to the project metrics interface every [`FLUSH_INTERVAL`].
 //!
 //! Labels are bounded: project, environment, workflow name and outcome, never

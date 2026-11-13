@@ -1116,6 +1116,20 @@ export const projectNavItems: NavigationItem[] = [
     keywords: ['shield', 'waf', 'bots', 'firewall', 'block'],
   },
   {
+    title: 'Internal access',
+    url: 'settings/security#internal-access',
+    icon: Network,
+    keywords: [
+      'internal access',
+      'temps.local',
+      'sandbox',
+      'allow',
+      'grant',
+      'project to project',
+      'private network',
+    ],
+  },
+  {
     title: 'Access',
     url: 'settings/access',
     icon: Users,

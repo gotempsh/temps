@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! One invocation of a claimed run (ADR-103 §3, §6): resolve a replica, read
+//! One invocation of a claimed run (ADR-106 §3, §6): resolve a replica, read
 //! the manifest, send the input and journal, apply the outcome.
 //!
 //! A run nothing could be invoked for (no deployment, no healthy replica) is

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Where an environment's code can be invoked (ADR-103 §0, §7).
+//! Where an environment's code can be invoked (ADR-106 §0, §7).
 //!
 //! The durable workflows engine never creates or scales containers: it asks
 //! the workload layer for the healthy replicas of an environment's current

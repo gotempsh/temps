@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The per-environment workflow credential (ADR-103 §11): what an app uses to
+//! The per-environment workflow credential (ADR-106 §11): what an app uses to
 //! start runs, send events and read the runs it started. Stored as a SHA-256
 //! hash; the plaintext is shown once when it is created or rotated.
 

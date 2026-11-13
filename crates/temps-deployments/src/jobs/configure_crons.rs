@@ -43,7 +43,7 @@ pub struct CronConfig {
     pub schedule: String,
     /// Set for a `job` cron (ADR-055 §14); `None` for `http`.
     pub job: Option<JobCronConfig>,
-    /// Set for a `workflow` cron (ADR-103 §9); `None` otherwise.
+    /// Set for a `workflow` cron (ADR-106 §9); `None` otherwise.
     pub workflow: Option<WorkflowCronConfig>,
 }
 

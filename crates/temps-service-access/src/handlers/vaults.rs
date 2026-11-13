@@ -65,6 +65,11 @@ pub async fn create_access_vault(
     Json(request): Json<SaveAccessVault>,
 ) -> Result<impl IntoResponse, Problem> {
     deny_deployment_token!(auth);
+    if !auth.is_admin() {
+        return Err(temps_core::error_builder::forbidden()
+            .detail("Vault management requires an instance administrator")
+            .build());
+    }
     project_scope_guard!(auth, project_id);
     project_permission_guard!(
         auth,
@@ -97,6 +102,11 @@ pub async fn update_access_vault(
     Json(request): Json<SaveAccessVault>,
 ) -> Result<impl IntoResponse, Problem> {
     deny_deployment_token!(auth);
+    if !auth.is_admin() {
+        return Err(temps_core::error_builder::forbidden()
+            .detail("Vault management requires an instance administrator")
+            .build());
+    }
     project_scope_guard!(auth, project_id);
     project_permission_guard!(
         auth,
@@ -155,6 +165,11 @@ pub async fn create_access_bundle(
     Json(request): Json<SaveAccessBundle>,
 ) -> Result<impl IntoResponse, Problem> {
     deny_deployment_token!(auth);
+    if !auth.is_admin() {
+        return Err(temps_core::error_builder::forbidden()
+            .detail("Vault management requires an instance administrator")
+            .build());
+    }
     project_scope_guard!(auth, project_id);
     project_permission_guard!(
         auth,
@@ -171,7 +186,7 @@ pub async fn create_access_bundle(
         &auth,
         metadata,
         project_id,
-        &response.id,
+        (&response.id, &vault_id),
         response.version,
         "CREATE_ACCESS_BUNDLE",
     )
@@ -190,6 +205,11 @@ pub async fn update_access_bundle(
     Json(request): Json<SaveAccessBundle>,
 ) -> Result<impl IntoResponse, Problem> {
     deny_deployment_token!(auth);
+    if !auth.is_admin() {
+        return Err(temps_core::error_builder::forbidden()
+            .detail("Vault management requires an instance administrator")
+            .build());
+    }
     project_scope_guard!(auth, project_id);
     project_permission_guard!(
         auth,
@@ -206,7 +226,7 @@ pub async fn update_access_bundle(
         &auth,
         metadata,
         project_id,
-        &response.id,
+        (&response.id, &vault_id),
         response.version,
         "UPDATE_ACCESS_BUNDLE",
     )

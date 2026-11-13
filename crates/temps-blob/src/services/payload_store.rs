@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! [`PayloadBlobStore`] over the project's blob bucket (ADR-103 §5).
+//! [`PayloadBlobStore`] over the project's blob bucket (ADR-106 §5).
 //!
 //! The durable workflows engine offloads payloads above its inline cap here.
 //! It stores ciphertext only, under its own `.temps/` prefix, so this adapter

@@ -24,13 +24,13 @@ impl DockerSandboxProvider {
         handle: &SandboxHandle,
         command: ServiceAccessCommand,
     ) -> Result<ServiceAccessReply, AgentError> {
-        let mounts = self.service_access.as_ref().ok_or_else(|| {
-            failure(
-                &handle.sandbox_id,
-                "deliver command",
-                "local Unix mount transport is unavailable",
-            )
-        })?;
+        let mounts =
+            self.service_access
+                .as_ref()
+                .ok_or_else(|| AgentError::ServiceAccessUnavailable {
+                    sandbox_id: handle.sandbox_id.clone(),
+                    reason: SERVICE_ACCESS_HOST_UNSUPPORTED.into(),
+                })?;
         if let ServiceAccessCommand::Retire { expected, boot_id } = command {
             if expected.container_id != handle.sandbox_id {
                 return Err(failure(

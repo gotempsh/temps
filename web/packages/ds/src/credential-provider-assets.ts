@@ -3,7 +3,10 @@
 
 // Brand artwork belongs to its respective owners. Transparent SVGs with pinned provenance,
 // retrieved 2026-09-21; embedded unchanged. Do not redraw or rasterize.
+import { catalogProviderAssets } from './catalog-provider-assets'
+
 export const credentialProviderAssets = {
+  ...catalogProviderAssets,
   // Source: https://brand.github.com/GitHub_Logos.zip
   // Light SHA-256: b5e2f4b3f953f075de7016faa952d6ce3ec7492aa7b32408505ec25857962d89
   // Dark SHA-256: ed102562e49ca3ea6e7d79ea10d54360dbecc5beb33de6a60fa578b6c0fac803

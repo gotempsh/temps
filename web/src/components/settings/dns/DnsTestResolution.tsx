@@ -33,7 +33,11 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { ProjectSelect } from '@/components/project/ProjectSelect'
-import { internalAccessDiagnostic } from '@/components/project/settings/internal-access'
+import {
+  internalAccessDiagnostic,
+  sandboxAccessDiagnostic,
+} from '@/components/project/settings/internal-access'
+import { SandboxSelect } from '@/components/sandboxes/SandboxSelect'
 import { problemDetail } from '@/lib/api-problem'
 import {
   DNS_PARAMS,
@@ -51,7 +55,13 @@ import {
   type TestResolutionValues,
 } from '@/lib/dns-observability'
 
-function ResolveResult({ result }: { result: DnsResolveResponse }) {
+function ResolveResult({
+  result,
+  sandboxId,
+}: {
+  result: DnsResolveResponse
+  sandboxId: string | null
+}) {
   return (
     <section
       aria-label="Result"
@@ -109,19 +119,29 @@ function ResolveResult({ result }: { result: DnsResolveResponse }) {
         </p>
       )}
       {result.note ? <Callout tone="info">{result.note}</Callout> : null}
-      <InternalAccessResult result={result} />
+      <InternalAccessResult result={result} sandboxId={sandboxId} />
     </section>
   )
 }
 
 /**
  * A name that resolves is half a working call: another project's internal
- * address answers 403 unless that project allows the caller (ADR 101).
+ * address answers 403 unless that project allows the caller (ADR 101), and
+ * a sandbox's call unless the project allows that sandbox (ADR 105).
  */
-function InternalAccessResult({ result }: { result: DnsResolveResponse }) {
-  const diagnostic = result.internal_access
-    ? internalAccessDiagnostic(result.internal_access, 'the selected project')
-    : null
+function InternalAccessResult({
+  result,
+  sandboxId,
+}: {
+  result: DnsResolveResponse
+  sandboxId: string | null
+}) {
+  const access = result.internal_access
+  const diagnostic = !access
+    ? null
+    : sandboxId
+      ? sandboxAccessDiagnostic(access, sandboxId)
+      : internalAccessDiagnostic(access, 'the selected project')
   if (!diagnostic) return null
   return (
     <Callout tone={diagnostic.tone} title={diagnostic.title}>
@@ -184,6 +204,7 @@ export function DnsTestResolution({
         name: values.name,
         record_type: values.record_type,
         project_id: values.project_id ?? undefined,
+        sandbox_id: values.sandbox_id ?? undefined,
       }),
   })
   const onSubmit = (values: TestResolutionValues) => {
@@ -193,6 +214,7 @@ export function DnsTestResolution({
         values.record_type === 'A' ? undefined : values.record_type,
       [DNS_PARAMS.testNode]: values.node_id,
       [DNS_PARAMS.testProject]: values.project_id ?? undefined,
+      [DNS_PARAMS.testSandbox]: values.sandbox_id ?? undefined,
     })
     resolve.mutate(values)
   }
@@ -202,7 +224,7 @@ export function DnsTestResolution({
       <Form {...form}>
         <form
           onSubmit={form.handleSubmit(onSubmit)}
-          className="grid grid-cols-1 gap-3 md:grid-cols-2 lg:grid-cols-[2fr_1fr_1fr_1fr_auto] lg:items-end"
+          className="grid grid-cols-1 gap-3 md:grid-cols-2 lg:grid-cols-[2fr_1fr_1fr_1fr_1fr_auto] lg:items-end"
         >
           <FormField
             control={form.control}
@@ -285,9 +307,33 @@ export function DnsTestResolution({
                 <ProjectSelect
                   ariaLabel="As project"
                   value={field.value}
-                  onValueChange={field.onChange}
+                  onValueChange={(next) => {
+                    field.onChange(next)
+                    // A test is asked as a project or a sandbox, not both.
+                    if (next !== null) form.setValue('sandbox_id', null)
+                  }}
                   allowAll
                   allLabel="Any (node itself)"
+                  className="w-full"
+                />
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+          <FormField
+            control={form.control}
+            name="sandbox_id"
+            render={({ field }) => (
+              <FormItem className={FIELD_ITEM}>
+                <FormLabel>As sandbox</FormLabel>
+                <SandboxSelect
+                  ariaLabel="As sandbox"
+                  value={field.value}
+                  onValueChange={(next) => {
+                    field.onChange(next)
+                    if (next !== null) form.setValue('project_id', null)
+                  }}
+                  noneLabel="None"
                   className="w-full"
                 />
                 <FormMessage />
@@ -305,7 +351,12 @@ export function DnsTestResolution({
           {problemDetail(resolve.error, 'The resolver did not answer.')}
         </Callout>
       ) : null}
-      {resolve.data ? <ResolveResult result={resolve.data} /> : null}
+      {resolve.data ? (
+        <ResolveResult
+          result={resolve.data}
+          sandboxId={resolve.variables?.sandbox_id ?? null}
+        />
+      ) : null}
     </div>
   )
 }

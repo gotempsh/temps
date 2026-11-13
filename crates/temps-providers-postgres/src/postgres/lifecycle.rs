@@ -502,28 +502,25 @@ impl PostgresService {
                 ..host_config
             }),
             networking_config,
-            healthcheck: Some(bollard::models::HealthConfig {
-                test: Some(vec![
-                    "CMD-SHELL".to_string(),
-                    // Without -d, pg_isready (via libpq) defaults the target
-                    // database to the username being checked. The hardcoded
-                    // "postgres" here was wrong for any service with a
-                    // non-default username/database (e.g. username="appuser",
-                    // database="appdb") — the postmaster would receive a
-                    // connection attempt for a role/database that doesn't
-                    // exist, logging a FATAL every interval (1s) forever.
-                    // pg_isready still reports healthy either way (the
-                    // server did respond), so this was invisible in the UI,
-                    // just a permanent log-spam leak. Use the real
-                    // configured username/database instead.
+            // Without -d, pg_isready (via libpq) defaults the target
+            // database to the username being checked. The hardcoded
+            // "postgres" here was wrong for any service with a non-default
+            // username/database (e.g. username="appuser", database="appdb")
+            // — the postmaster would receive a connection attempt for a
+            // role/database that doesn't exist, logging a FATAL on every
+            // check forever. pg_isready still reports healthy either way
+            // (the server did respond), so this was invisible in the UI,
+            // just a permanent log-spam leak. Use the real configured
+            // username/database instead.
+            healthcheck: Some(
+                temps_providers_core::healthcheck::managed_health_config(
+                    docker,
+                    temps_providers_core::externalsvc::recreate_guard::ManagedEngine::Postgres,
+                    &container_name,
                     postgres_healthcheck_cmd(&config.username, &config.database),
-                ]),
-                interval: Some(1000000000), // 1 second
-                timeout: Some(3000000000),  // 3 seconds
-                retries: Some(3),
-                start_period: Some(30000000000), // 30 seconds - gives PostgreSQL time to initialize
-                start_interval: Some(1000000000), // 1 second
-            }),
+                )
+                .await,
+            ),
             ..Default::default()
         };
 

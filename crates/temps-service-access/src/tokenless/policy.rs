@@ -138,5 +138,12 @@ fn validate_policy(policy: &mut SandboxAccessPolicy) -> Result<(), AccessError> 
     if policy.methods.is_empty() || policy.methods.len() > 6 {
         return Err(invalid("methods", "provide between 1 and 6 HTTP methods"));
     }
+    if policy.github_repository.is_some() && policy.delivery.is_some() {
+        return Err(invalid(
+            "delivery",
+            "GitHub repository services use the project connection; they take no credential format or fixed headers",
+        ));
+    }
+    super::delivery::validate_delivery(&mut policy.delivery)?;
     Ok(())
 }
