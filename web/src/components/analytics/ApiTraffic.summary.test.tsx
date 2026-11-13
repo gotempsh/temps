@@ -34,7 +34,7 @@ afterEach(() => {
 
 const base = '/projects/17/api-analytics'
 
-function mockTraffic() {
+function mockTraffic({ serverSummary = false } = {}) {
   const timeseriesEnds: string[] = []
   const summaryRouteEnds: string[] = []
   const prompts: string[] = []
@@ -79,12 +79,29 @@ function mockTraffic() {
     },
     [`GET ${base}/callers`]: () =>
       jsonResponse({ callers: [], total_callers: 0 }),
+    // The server-authored summary, used when no gateway key can stream one.
+    [`GET ${base}/summary`]: () =>
+      jsonResponse({
+        cached: false,
+        enabled: true,
+        summary: {
+          headline: 'Traffic is steady, says the server',
+          findings: [],
+          anomalies: [],
+          recommendation: null,
+        },
+      }),
   })
   // The structured summary streams from a plain fetch, not the SDK client.
   const sdkFetch = globalThis.fetch
   globalThis.fetch = (async (input: Request | string | URL, init) => {
     const url = String(input instanceof Request ? input.url : input)
     if (url.endsWith('/projects/17/ai/structured-output/stream')) {
+      if (serverSummary)
+        return new Response(JSON.stringify({ detail: 'No gateway key' }), {
+          status: 409,
+          headers: { 'Content-Type': 'application/json' },
+        })
       const body = JSON.parse(String(init?.body))
       prompts.push(body.prompt)
       refreshes.push(body.refresh)
@@ -260,4 +277,26 @@ test('a summary whose traffic read fails says so, and Try again reads it again',
 
   await waitFor(() => expect(traffic.prompts).toHaveLength(2))
   await screen.findByText('Traffic is steady')
+})
+
+test('a failed Refresh summary over a kept server summary says the refresh failed', async () => {
+  const traffic = mockTraffic({ serverSummary: true })
+  renderTab()
+  const generate = await screen.findByRole('button', {
+    name: 'Generate AI traffic summary',
+  })
+  await waitFor(() => expect(generate.hasAttribute('disabled')).toBe(false))
+  fireEvent.click(generate)
+  await screen.findByText('Traffic is steady, says the server')
+
+  traffic.traffic.routesFail = true
+  fireEvent.click(screen.getByRole('button', { name: 'Refresh summary' }))
+
+  await screen.findByText("Couldn't refresh the summary")
+  expect(
+    screen.getByText(
+      /Couldn't read the API traffic to summarize: Route stats are being rebuilt\. Showing the previous summary\./
+    )
+  ).toBeTruthy()
+  expect(screen.getByText('Traffic is steady, says the server')).toBeTruthy()
 })

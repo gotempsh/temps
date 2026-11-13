@@ -57,6 +57,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
+import { Callout } from '@temps-sdk/ds'
 import { problemDetail } from '@/lib/api-problem'
 import { queryKeyPrefix } from '@/lib/refresh'
 import { SortableTableHead } from '@/components/ui/sortable-table-head'
@@ -1789,6 +1790,13 @@ function ApiTrafficSummaryCard({
           </CardHeader>
           <CardContent>
             <div className="space-y-3">
+              {error && data && !isPending ? (
+                // A failed "Refresh summary" keeps the summary it had.
+                <Callout tone="error" title="Couldn't refresh the summary">
+                  {/[.!?]$/.test(error) ? error : `${error}.`} Showing the
+                  previous summary.
+                </Callout>
+              ) : null}
               {data?.headline ? (
                 <p className="font-medium">{data.headline}</p>
               ) : (
