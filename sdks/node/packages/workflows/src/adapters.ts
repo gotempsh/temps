@@ -12,6 +12,7 @@
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import { Readable } from 'node:stream';
 
 import type { FetchHandler } from './handler.js';
 
@@ -19,13 +20,6 @@ export const WORKFLOWS_PREFIX = '/.well-known/temps/workflows/';
 
 type Next = (error?: unknown) => void;
 
-async function readBody(request: IncomingMessage): Promise<Uint8Array> {
-  const chunks: Uint8Array[] = [];
-  for await (const chunk of request) {
-    chunks.push(typeof chunk === 'string' ? new TextEncoder().encode(chunk) : (chunk as Uint8Array));
-  }
-  return Buffer.concat(chunks);
-}
 
 /** A `(req, res, next?)` listener for Node's http server, Express or Connect. */
 export function toNodeListener(handler: FetchHandler) {
@@ -44,11 +38,15 @@ export function toNodeListener(handler: FetchHandler) {
         else if (value !== undefined) headers.set(name, value);
       }
       const method = request.method ?? 'GET';
-      const body = method === 'GET' || method === 'HEAD' ? undefined : await readBody(request);
       const host = request.headers.host ?? 'localhost';
-      const reply = await handler(
-        new Request(`http://${host}${request.url ?? '/'}`, { method, headers, body: body as BodyInit | undefined }),
-      );
+      // Streamed, not buffered: the handler checks the token before reading
+      // the body, and stops reading at its size limit.
+      const init: RequestInit & { duplex?: 'half' } = { method, headers };
+      if (method !== 'GET' && method !== 'HEAD') {
+        init.body = Readable.toWeb(request) as unknown as ReadableStream<Uint8Array>;
+        init.duplex = 'half';
+      }
+      const reply = await handler(new Request(`http://${host}${request.url ?? '/'}`, init));
       response.statusCode = reply.status;
       reply.headers.forEach((value, name) => response.setHeader(name, value));
       response.end(Buffer.from(await reply.arrayBuffer()));

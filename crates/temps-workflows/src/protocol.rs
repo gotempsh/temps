@@ -217,7 +217,30 @@ pub fn wait_result(payload: Option<Value>) -> Value {
     }
 }
 
-/// `GET /workflows/v1/invocation-key` response.
+/// The instance's invocation signing key, as SDKs receive it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvocationKey {
+    /// `ed25519`.
+    pub algorithm: String,
+    /// Base64url (no padding) of the 32-byte public key.
+    pub public_key: String,
+    pub key_id: String,
+}
+
+impl InvocationKey {
+    pub fn of(signer: &crate::token::InvocationSigner) -> Self {
+        Self {
+            algorithm: "ed25519".into(),
+            public_key: signer.public_key(),
+            key_id: signer.key_id(),
+        }
+    }
+}
+
+/// `GET /workflows/v1/invocation-key` response, read with the environment's
+/// workflow credential. The SDK accepts only invocation tokens for this
+/// project and environment: the key alone is instance-wide, so a token
+/// another environment's executor received is still validly signed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[schema(as = WorkflowInvocationKeyResponse)]
 pub struct InvocationKeyResponse {
@@ -226,6 +249,10 @@ pub struct InvocationKeyResponse {
     /// Base64url (no padding) of the 32-byte public key.
     pub public_key: String,
     pub key_id: String,
+    /// The project the credential belongs to; tokens must carry it as `pid`.
+    pub project_id: i32,
+    /// The environment the credential belongs to; tokens must carry it as `eid`.
+    pub environment_id: i32,
 }
 
 #[cfg(test)]

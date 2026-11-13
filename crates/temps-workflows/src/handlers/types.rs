@@ -16,7 +16,7 @@ use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
 use crate::engine::WorkflowEngine;
-use crate::protocol::InvocationKeyResponse;
+use crate::protocol::InvocationKey;
 use crate::service::{ExecutorStatus, Overview, WorkflowInfo, WorkflowService};
 use crate::store::{CredentialRow, RunRow, StepRow};
 use crate::types::{RunStatus, StepKind, StepStatus};
@@ -24,7 +24,7 @@ use crate::types::{RunStatus, StepKind, StepStatus};
 pub struct WorkflowsAppState {
     pub service: Arc<WorkflowService>,
     pub engine: Arc<WorkflowEngine>,
-    pub invocation_key: InvocationKeyResponse,
+    pub invocation_key: InvocationKey,
     pub audit_service: Arc<dyn AuditLogger>,
     pub project_access_checker: Option<Arc<dyn ProjectAccessChecker>>,
 }

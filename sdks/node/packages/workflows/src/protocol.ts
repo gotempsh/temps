@@ -132,6 +132,10 @@ export interface InvocationKey {
   algorithm: string;
   public_key: string;
   key_id: string;
+  /** The project the credential belongs to: tokens must carry it as `pid`. */
+  project_id: number;
+  /** The environment the credential belongs to: tokens must carry it as `eid`. */
+  environment_id: number;
 }
 
 /** Claims of an invocation token. */

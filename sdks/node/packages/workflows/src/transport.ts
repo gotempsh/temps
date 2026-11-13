@@ -30,6 +30,8 @@ export interface TransportOptions {
   attempts?: number;
   /** First backoff in ms, doubled per attempt; default 250. */
   backoffMs?: number;
+  /** Per-attempt timeout in ms; default 30 s. */
+  timeoutMs?: number;
 }
 
 interface Problem {
@@ -44,16 +46,19 @@ export class ExecutorTransport {
   private readonly fetchImpl: FetchLike;
   private readonly attempts: number;
   private readonly backoffMs: number;
+  private readonly timeoutMs: number;
 
   constructor(options: TransportOptions) {
     this.apiUrl = options.apiUrl.replace(/\/+$/, '');
     this.fetchImpl = options.fetch ?? ((input, init) => fetch(input, init));
     this.attempts = Math.max(1, options.attempts ?? 4);
     this.backoffMs = options.backoffMs ?? 250;
+    this.timeoutMs = options.timeoutMs ?? 30_000;
   }
 
-  async invocationKey(): Promise<InvocationKey> {
-    return this.call<InvocationKey>('invocation key', 'GET', '/workflows/v1/invocation-key');
+  /** The invocation key and the environment it binds tokens to, read with the workflow credential. */
+  async invocationKey(credential: string): Promise<InvocationKey> {
+    return this.call<InvocationKey>('invocation key', 'GET', '/workflows/v1/invocation-key', { token: credential });
   }
 
   async journal(token: string, runId: string, from: number): Promise<JournalPage> {
@@ -104,10 +109,13 @@ export class ExecutorTransport {
     for (let attempt = 1; attempt <= this.attempts; attempt += 1) {
       let response: Response;
       try {
+        // Bounded: a Temps that accepts the connection and never answers
+        // must not hold the invocation (and its lease) forever.
         response = await this.fetchImpl(`${this.apiUrl}${path}`, {
           method,
           headers,
           body: options.body === undefined ? undefined : JSON.stringify(options.body),
+          signal: AbortSignal.timeout(this.timeoutMs),
         });
       } catch (error) {
         lastError = error;

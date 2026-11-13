@@ -17,6 +17,22 @@ export class TempsApiError extends Error {
 }
 
 /**
+ * Temps could not be reached, or answered with a server error, while the
+ * invocation read its journal or recorded an entry. Nothing about the run is
+ * wrong: the handler answers 503 so Temps retries the invocation with
+ * backoff, instead of reporting the run failed.
+ */
+export class TempsUnavailableError extends Error {
+  constructor(
+    public readonly runId: string,
+    public readonly cause: TempsApiError,
+  ) {
+    super(`Temps was unavailable during run ${runId}: ${cause.message}`);
+    this.name = 'TempsUnavailableError';
+  }
+}
+
+/**
  * The run was leased to another invocation (a lease expired, an operator
  * cancelled or retried it). This invocation must stop without reporting.
  */

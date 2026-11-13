@@ -28,11 +28,27 @@ type AppState = State<Arc<WorkflowsAppState>>;
     get,
     path = "/workflows/v1/invocation-key",
     responses(
-        (status = 200, description = "The public key SDKs verify invocation tokens with", body = InvocationKeyResponse)
-    )
+        (status = 200, description = "The public key SDKs verify invocation tokens with, and the project and environment the tokens must name", body = InvocationKeyResponse),
+        (status = 401, description = "Missing, unknown or revoked workflow credential")
+    ),
+    security(("bearer_auth" = []))
 )]
-pub async fn get_invocation_key(State(state): AppState) -> impl IntoResponse {
-    Json(state.invocation_key.clone())
+pub async fn get_invocation_key(
+    State(state): AppState,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, Problem> {
+    let credential = state
+        .service
+        .authenticate_credential(bearer(&headers)?)
+        .await?;
+    let key = &state.invocation_key;
+    Ok(Json(InvocationKeyResponse {
+        algorithm: key.algorithm.clone(),
+        public_key: key.public_key.clone(),
+        key_id: key.key_id.clone(),
+        project_id: credential.project_id,
+        environment_id: credential.environment_id,
+    }))
 }
 
 #[utoipa::path(

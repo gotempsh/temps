@@ -118,11 +118,7 @@ fn state_from(
     Arc::new(WorkflowsAppState {
         service,
         engine,
-        invocation_key: crate::protocol::InvocationKeyResponse {
-            algorithm: "ed25519".into(),
-            public_key: signer.public_key(),
-            key_id: signer.key_id(),
-        },
+        invocation_key: crate::protocol::InvocationKey::of(&signer),
         audit_service: audit,
         project_access_checker: None,
     })
@@ -318,6 +314,7 @@ async fn executor_and_app_routes_reject_missing_or_forged_tokens_as_problems() {
             "/workflows/v1/events".to_string(),
             Some(json!({"name": "paid"})),
         ),
+        ("GET", "/workflows/v1/invocation-key".to_string(), None),
     ] {
         let (status, headers, problem) =
             send(offline_app(), method, &uri, body.clone(), None, None).await;
@@ -340,22 +337,6 @@ async fn executor_and_app_routes_reject_missing_or_forged_tokens_as_problems() {
             "{method} {uri}: {problem}"
         );
     }
-}
-
-#[tokio::test]
-async fn the_invocation_key_is_public() {
-    let (status, _, body) = send(
-        offline_app(),
-        "GET",
-        "/workflows/v1/invocation-key",
-        None,
-        None,
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["algorithm"], "ed25519");
-    assert_eq!(body["key_id"].as_str().unwrap().len(), 16);
 }
 
 fn completing() -> Script {
@@ -561,6 +542,23 @@ async fn an_app_uses_its_credential_to_start_read_and_signal_runs() {
     .await;
     assert_eq!(status_body["configured"], true);
     assert!(!status_body.to_string().contains(&token));
+
+    // The SDK reads the key with the credential and learns which project and
+    // environment its invocation tokens must name.
+    let (status, _, key) = send(
+        app.clone(),
+        "GET",
+        "/workflows/v1/invocation-key",
+        None,
+        None,
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{key}");
+    assert_eq!(key["algorithm"], "ed25519");
+    assert_eq!(key["key_id"].as_str().unwrap().len(), 16);
+    assert_eq!(key["project_id"], h.env.project_id);
+    assert_eq!(key["environment_id"], h.env.environment_id);
 
     let (status, _, started) = send(
         app.clone(),

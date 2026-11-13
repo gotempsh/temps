@@ -42,7 +42,7 @@ use crate::engine::WorkflowEngine;
 use crate::handlers::{configure_public_routes, WorkflowsAppState};
 use crate::metrics::WorkflowMetrics;
 use crate::payload::PayloadCodec;
-use crate::protocol::{InvocationKeyResponse, JournalEntry};
+use crate::protocol::JournalEntry;
 use crate::scheduler::{SchedulerConfig, WorkflowScheduler};
 use crate::service::{StartRun, WorkflowService};
 use crate::store::{PgWorkflowStore, RunRow, Starter, WorkflowStore};
@@ -268,11 +268,7 @@ async fn harness(test: &str) -> Option<Harness> {
     let state = Arc::new(WorkflowsAppState {
         service: service.clone(),
         engine: engine.clone(),
-        invocation_key: InvocationKeyResponse {
-            algorithm: "ed25519".into(),
-            public_key: signer.public_key(),
-            key_id: signer.key_id(),
-        },
+        invocation_key: crate::protocol::InvocationKey::of(&signer),
         audit_service: Arc::new(NoAudit),
         project_access_checker: None,
     });

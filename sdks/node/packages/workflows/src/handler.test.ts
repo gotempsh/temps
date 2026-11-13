@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import { createWorkflowHandler } from './handler.js';
 import { INVOKE_PATH, MANIFEST_PATH, type InvocationClaims } from './protocol.js';
-import { FAKE_API_URL, FakeOrchestrator } from './testing/fake-orchestrator.js';
+import { FAKE_API_URL, FAKE_CREDENTIAL, FakeOrchestrator } from './testing/fake-orchestrator.js';
 import { defineWorkflow } from './workflow.js';
 
 let ran = 0;
@@ -146,6 +146,7 @@ describe('workflow handler', () => {
     const handler = createWorkflowHandler({
       workflows: [hello],
       apiUrl: FAKE_API_URL,
+      token: FAKE_CREDENTIAL,
       tracer: false,
       fetch: (input, init) => {
         if (String(input).endsWith('/workflows/v1/invocation-key')) keyReads += 1;
@@ -158,6 +159,83 @@ describe('workflow handler', () => {
     expect(keyReads).toBe(1);
   });
 
+  it('refuses a token Temps signed for another project or environment', async () => {
+    // Another tenant's executor received a valid token for its own run and
+    // forwards it here: the signature is the instance's, the scope is not ours.
+    const { temps, handler } = setup();
+    const body = invokeBody();
+    for (const claims of [claimsFor(body, { eid: 2 }), claimsFor(body, { pid: 2 })]) {
+      const response = await handler(post(temps, body, claims));
+      expect(response.status).toBe(401);
+      expect(await response.json()).toMatchObject({ detail: 'token is for another project or environment' });
+    }
+    const manifest = await handler(
+      new Request(`http://app${MANIFEST_PATH}`, {
+        headers: {
+          authorization: `Bearer ${temps.signToken({ v: 1, typ: 'manifest', pid: 1, eid: 2, exp: Math.floor(Date.now() / 1000) + 60 })}`,
+        },
+      }),
+    );
+    expect(manifest.status).toBe(401);
+    expect(ran).toBe(0);
+  });
+
+  it('explains a missing workflow credential when it has to read the key', async () => {
+    const saved = process.env.TEMPS_WORKFLOWS_TOKEN;
+    delete process.env.TEMPS_WORKFLOWS_TOKEN;
+    try {
+      const temps = new FakeOrchestrator();
+      const handler = createWorkflowHandler({ workflows: [hello], apiUrl: FAKE_API_URL, fetch: temps.fetch, tracer: false });
+      temps.attach(handler);
+      const body = invokeBody();
+      const response = await handler(post(temps, body, claimsFor(body)));
+      expect(response.status).toBe(500);
+      expect((await response.json()).detail).toMatch(/TEMPS_WORKFLOWS_TOKEN is not set/);
+    } finally {
+      if (saved !== undefined) process.env.TEMPS_WORKFLOWS_TOKEN = saved;
+    }
+  });
+
+  it('checks the token before reading any of the body', async () => {
+    const { handler } = setup();
+    let pulled = 0;
+    const endless = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulled += 1;
+        controller.enqueue(new Uint8Array(1024 * 1024));
+      },
+    });
+    const init: RequestInit & { duplex: 'half' } = {
+      method: 'POST',
+      headers: { authorization: 'Bearer twi1.forged.token' },
+      body: endless,
+      duplex: 'half',
+    };
+    const response = await handler(new Request(`http://app${INVOKE_PATH}`, init));
+    expect(response.status).toBe(401);
+    // The stream may prefetch a chunk; it is never drained.
+    expect(pulled).toBeLessThanOrEqual(1);
+  });
+
+  it('answers 503 when Temps is down mid-invocation, so the run is retried instead of failed', async () => {
+    const temps = new FakeOrchestrator();
+    const handler = createWorkflowHandler({
+      workflows: [hello],
+      apiUrl: FAKE_API_URL,
+      invocationKey: temps.invocationKey,
+      tracer: false,
+      fetch: async (input, init) =>
+        String(input).includes('/steps')
+          ? new Response(JSON.stringify({ title: 'Internal Server Error' }), { status: 500 })
+          : temps.fetch(input, init),
+    });
+    temps.attach(handler);
+    const { run } = temps.start('hello', { name: 'ada' });
+    await temps.settle();
+    expect(temps.invocations.map((invocation) => invocation.status)).toEqual([503]);
+    expect(run.status).toBe('retrying');
+  });
+
   it('explains a missing TEMPS_API_URL and refuses duplicate workflows', () => {
     const saved = process.env.TEMPS_API_URL;
     delete process.env.TEMPS_API_URL;
@@ -167,5 +245,12 @@ describe('workflow handler', () => {
       if (saved !== undefined) process.env.TEMPS_API_URL = saved;
     }
     expect(() => createWorkflowHandler({ workflows: [hello, hello], apiUrl: 'http://t' })).toThrow(/defined twice/);
+  });
+
+  it('refuses a concurrency Temps would not accept in the manifest', () => {
+    for (const concurrency of [0, 1.5, 2_147_483_648]) {
+      expect(() => defineWorkflow('limited', async () => null, { concurrency })).toThrow(/concurrency must be an integer from 1 to 1000000/);
+    }
+    expect(() => defineWorkflow('limited', async () => null, { concurrency: 1_000_000 })).not.toThrow();
   });
 });

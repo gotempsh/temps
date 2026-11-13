@@ -60,6 +60,6 @@ describe('invocation tokens', () => {
     expect(bearerToken(null)).toBeUndefined();
     const { publicKey } = generateKeyPairSync('ed25519');
     const x = (publicKey.export({ format: 'jwk' }) as { x: string }).x;
-    expect(() => publicKeyFrom({ algorithm: 'rsa', public_key: x, key_id: 'k' })).toThrow(/unsupported key algorithm/);
+    expect(() => publicKeyFrom({ algorithm: 'rsa', public_key: x, key_id: 'k', project_id: 1, environment_id: 1 })).toThrow(/unsupported key algorithm/);
   });
 });

@@ -61,17 +61,32 @@ base64url has no padding. Claims:
 The executor **must** reject a request, before running any user code, when:
 
 1. the token does not verify against Temps' public key;
-2. `exp` is in the past;
-3. `typ` does not match the endpoint;
-4. for `invoke`, `body` is not the SHA-256 of the received body, or `run` and
+2. `pid` and `eid` are not the executor's own project and environment (the
+   key is the instance's, so a token Temps signed for another environment is
+   validly signed: its executor could forward it);
+3. `exp` is in the past;
+4. `typ` does not match the endpoint;
+5. for `invoke`, `body` is not the SHA-256 of the received body, or `run` and
    `lease` differ from the body's `run_id` and `lease`.
 
-The public key is served unauthenticated at
-`GET {TEMPS_API_URL}/workflows/v1/invocation-key`:
+The executor reads the public key, and the project and environment its
+tokens must name, with the environment's [workflow
+credential](#workflow-credential-the-app--temps) at
+`GET {TEMPS_API_URL}/workflows/v1/invocation-key` (`401` without a valid
+one):
 
 ```json
-{ "algorithm": "ed25519", "public_key": "<base64url, 32 bytes>", "key_id": "<16 hex>" }
+{
+  "algorithm": "ed25519",
+  "public_key": "<base64url, 32 bytes>",
+  "key_id": "<16 hex>",
+  "project_id": 12,
+  "environment_id": 34
+}
 ```
+
+The executor verifies the token, including `pid` and `eid`, before it reads
+the request body.
 
 An executor may cache the key and refetch it when a token fails to verify
 with the cached one (`key_id` changes when the key does). The key is derived
@@ -105,8 +120,8 @@ Token `typ: "manifest"`. Response (at most 1 MiB, within 10 s):
 }
 ```
 
-`concurrency` caps the runs of that workflow executing at once in the
-environment; the environment's `max_concurrent_runs` caps them all. Temps
+`concurrency` (1 to 1,000,000; a manifest outside that range is refused)
+caps the runs of that workflow executing at once in the environment; the environment's `max_concurrent_runs` caps them all. Temps
 caches the manifest per environment and deployment (10 minutes, 30 s after a
 failure) and drops it when a deployment changes or an invocation cannot
 connect.
@@ -140,7 +155,10 @@ Token `typ: "invoke"`. Body:
   rest with `GET {TEMPS_API_URL}/workflow-runs/{run_id}/journal?from=<n>`,
   repeating while the page's `next_sequence` is set.
 - The executor must finish by `deadline_at`, and heartbeat before
-  `lease_expires_at` if it runs that long.
+  `lease_expires_at` if it runs that long. It should stop starting new steps
+  shortly before the deadline (the TypeScript SDK: 30 s, or a quarter of the
+  window when that is shorter) and report `retry` from the next step, so the
+  run continues in a fresh invocation.
 
 The executor answers in one of two ways:
 
@@ -150,7 +168,10 @@ The executor answers in one of two ways:
   `POST /workflow-runs/{run_id}/outcome`, before the deadline.
 
 Any other status, a timeout, a body over the limit or a body that does not
-parse counts as a failed invocation (see [Failures](#failures)). A `404` is
+parse counts as a failed invocation (see [Failures](#failures)). An executor
+that cannot reach Temps during the invocation (its journal read or a step
+write fails with a network error or a `5xx`) answers `503`: the run is
+retried with backoff rather than reported failed. A `404` is
 reported as "is the SDK handler mounted?".
 
 ## Endpoints Temps serves for the executor
@@ -247,6 +268,9 @@ the executor reports as `retry` or `failed`). The run is retried with
 exponential backoff (`min(300, 5 × 2^min(n−1, 6))` seconds after the
 n-th consecutive failure). After `stuck_after_failures` consecutive failures
 (default 8) the run is `stuck` until an operator resumes it.
+
+A run whose workflow is at its `concurrency` limit is given back without
+spending an attempt and is due again 2 s later, with the reason on the run.
 
 When nothing can be invoked (no deployment, no healthy replica, a Compose
 deployment with no `host_service` chosen), the run stays `queued`, is

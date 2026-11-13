@@ -8644,6 +8644,16 @@
           "image_name": {
             "type": "string"
           },
+          "labels": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Labels for the built image, `sh.temps.image.*` keys only: which install,\nproject and deployment built it, so housekeeping can recognise the\nimage once the database rows naming it are gone. Not values a build\nreads. Optional on the wire: an agent that predates it ignores the\nfield and builds an unlabelled image, as before.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
           "platform": {
             "type": [
               "string",
@@ -83193,14 +83203,24 @@
         "type": "object"
       },
       "WorkflowInvocationKeyResponse": {
-        "description": "`GET /workflows/v1/invocation-key` response.",
+        "description": "`GET /workflows/v1/invocation-key` response, read with the environment's\nworkflow credential. The SDK accepts only invocation tokens for this\nproject and environment: the key alone is instance-wide, so a token\nanother environment's executor received is still validly signed.",
         "properties": {
           "algorithm": {
             "description": "`ed25519`.",
             "type": "string"
           },
+          "environment_id": {
+            "description": "The environment the credential belongs to; tokens must carry it as `eid`.",
+            "format": "int32",
+            "type": "integer"
+          },
           "key_id": {
             "type": "string"
+          },
+          "project_id": {
+            "description": "The project the credential belongs to; tokens must carry it as `pid`.",
+            "format": "int32",
+            "type": "integer"
           },
           "public_key": {
             "description": "Base64url (no padding) of the 32-byte public key.",
@@ -83210,7 +83230,9 @@
         "required": [
           "algorithm",
           "public_key",
-          "key_id"
+          "key_id",
+          "project_id",
+          "environment_id"
         ],
         "type": "object"
       },
@@ -178160,9 +178182,17 @@
                 }
               }
             },
-            "description": "The public key SDKs verify invocation tokens with"
+            "description": "The public key SDKs verify invocation tokens with, and the project and environment the tokens must name"
+          },
+          "401": {
+            "description": "Missing, unknown or revoked workflow credential"
           }
         },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
         "tags": [
           "Workflow Executor"
         ]

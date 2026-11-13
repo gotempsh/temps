@@ -114,7 +114,7 @@ export class FakeOrchestrator {
     this.privateKey = privateKey;
     this.publicKey = publicKey;
     const jwk = publicKey.export({ format: 'jwk' }) as { x: string };
-    this.invocationKey = { algorithm: 'ed25519', public_key: jwk.x, key_id: 'fake' };
+    this.invocationKey = { algorithm: 'ed25519', public_key: jwk.x, key_id: 'fake', project_id: 1, environment_id: 1 };
     this.executor = options.executor;
     this.options = {
       journalPageSize: options.journalPageSize ?? 1000,
@@ -466,7 +466,12 @@ export class FakeOrchestrator {
     const body = request.method === 'POST' ? ((await request.json()) as Record<string, unknown>) : {};
     let match: RegExpExecArray | null;
 
-    if (path === '/workflows/v1/invocation-key') return json(200, this.invocationKey);
+    if (path === '/workflows/v1/invocation-key') {
+      if (request.headers.get('authorization') !== `Bearer ${FAKE_CREDENTIAL}`) {
+        throw new HttpError(401, 'Invalid Workflow Credential', 'the invocation key is read with the workflow credential');
+      }
+      return json(200, this.invocationKey);
+    }
 
     if ((match = /^\/workflow-runs\/([^/]+)\/journal$/.exec(path))) {
       const { run, lease } = this.authorize(request, match[1] as string);

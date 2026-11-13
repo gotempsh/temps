@@ -106,14 +106,20 @@ export function checkName(what: string, value: string, max: number): void {
  * });
  * ```
  */
+/** The largest concurrency Temps accepts in a manifest. */
+export const MAX_CONCURRENCY = 1_000_000;
+
 export function defineWorkflow<Input = any, Output = any>(
   name: string,
   run: (ctx: WorkflowContext<Input>) => Promise<Output>,
   options: WorkflowOptions = {},
 ): WorkflowDefinition<Input, Output> {
   checkName('Workflow name', name, 128);
-  if (options.concurrency !== undefined && (!Number.isInteger(options.concurrency) || options.concurrency < 1)) {
-    throw new Error(`Workflow '${name}': concurrency must be a positive integer`);
+  if (
+    options.concurrency !== undefined &&
+    (!Number.isInteger(options.concurrency) || options.concurrency < 1 || options.concurrency > MAX_CONCURRENCY)
+  ) {
+    throw new Error(`Workflow '${name}': concurrency must be an integer from 1 to ${MAX_CONCURRENCY}`);
   }
   return Object.freeze({ name, options: { ...options }, run });
 }

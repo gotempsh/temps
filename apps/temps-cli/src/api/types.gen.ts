@@ -4053,6 +4053,16 @@ export type BuildSpec = {
     cache_namespace?: string | null;
     dockerfile: string;
     image_name: string;
+    /**
+     * Labels for the built image, `sh.temps.image.*` keys only: which install,
+     * project and deployment built it, so housekeeping can recognise the
+     * image once the database rows naming it are gone. Not values a build
+     * reads. Optional on the wire: an agent that predates it ignores the
+     * field and builds an unlabelled image, as before.
+     */
+    labels?: {
+        [key: string]: string;
+    };
     platform?: string | null;
     version: number;
 };
@@ -38393,14 +38403,25 @@ export type WorkflowHeartbeatResponse = {
 };
 
 /**
- * `GET /workflows/v1/invocation-key` response.
+ * `GET /workflows/v1/invocation-key` response, read with the environment's
+ * workflow credential. The SDK accepts only invocation tokens for this
+ * project and environment: the key alone is instance-wide, so a token
+ * another environment's executor received is still validly signed.
  */
 export type WorkflowInvocationKeyResponse = {
     /**
      * `ed25519`.
      */
     algorithm: string;
+    /**
+     * The environment the credential belongs to; tokens must carry it as `eid`.
+     */
+    environment_id: number;
     key_id: string;
+    /**
+     * The project the credential belongs to; tokens must carry it as `pid`.
+     */
+    project_id: number;
     /**
      * Base64url (no padding) of the 32-byte public key.
      */
@@ -96075,9 +96096,16 @@ export type GetInvocationKeyData = {
     url: '/workflows/v1/invocation-key';
 };
 
+export type GetInvocationKeyErrors = {
+    /**
+     * Missing, unknown or revoked workflow credential
+     */
+    401: unknown;
+};
+
 export type GetInvocationKeyResponses = {
     /**
-     * The public key SDKs verify invocation tokens with
+     * The public key SDKs verify invocation tokens with, and the project and environment the tokens must name
      */
     200: WorkflowInvocationKeyResponse;
 };

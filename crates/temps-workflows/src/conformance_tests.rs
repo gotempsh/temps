@@ -34,7 +34,7 @@ use crate::engine::WorkflowEngine;
 use crate::handlers::{configure_public_routes, WorkflowsAppState};
 use crate::metrics::WorkflowMetrics;
 use crate::payload::PayloadCodec;
-use crate::protocol::{InvocationKeyResponse, JournalEntry};
+use crate::protocol::JournalEntry;
 use crate::scheduler::{SchedulerConfig, WorkflowScheduler};
 use crate::service::WorkflowService;
 use crate::store::{PgWorkflowStore, WorkflowStore};
@@ -244,11 +244,7 @@ async fn the_sdk_conforms_against_the_real_engine() {
     let state = Arc::new(WorkflowsAppState {
         service,
         engine: engine.clone(),
-        invocation_key: InvocationKeyResponse {
-            algorithm: "ed25519".into(),
-            public_key: signer.public_key(),
-            key_id: signer.key_id(),
-        },
+        invocation_key: crate::protocol::InvocationKey::of(&signer),
         audit_service: Arc::new(NoAudit),
         project_access_checker: None,
     });

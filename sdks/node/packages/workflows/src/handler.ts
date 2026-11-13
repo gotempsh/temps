@@ -8,7 +8,10 @@
  * server, Express, Next.js or Hono.
  *
  * Every request must carry an invocation token signed by this Temps
- * instance; the handler verifies it before any workflow code runs.
+ * instance for this app's own project and environment; the handler verifies
+ * it before reading the body or running any workflow code. The key, and the
+ * environment it binds tokens to, are read with the environment's workflow
+ * credential (`TEMPS_WORKFLOWS_TOKEN`).
  */
 
 import type { KeyObject } from 'node:crypto';
@@ -37,7 +40,7 @@ import type { WorkflowDefinition } from './workflow.js';
 export const SDK_NAME = '@temps-sdk/workflows/0.1.0';
 
 /** Longest invoke body accepted (the journal travels in it). */
-const MAX_INVOKE_BODY = 64 * 1024 * 1024;
+export const MAX_INVOKE_BODY = 64 * 1024 * 1024;
 /** Refetch the public key at most this often after a failed verification. */
 const KEY_REFRESH_MS = 60_000;
 
@@ -45,7 +48,13 @@ export interface WorkflowHandlerOptions extends TelemetryOptions {
   workflows: WorkflowDefinition[];
   /** Temps' API root; default `process.env.TEMPS_API_URL`. */
   apiUrl?: string;
-  /** Pin the invocation key instead of fetching it (tests, air-gapped setups). */
+  /**
+   * The environment's workflow credential, used to read the invocation key
+   * and the project and environment it accepts tokens for; default
+   * `process.env.TEMPS_WORKFLOWS_TOKEN`.
+   */
+  token?: string;
+  /** Pin the invocation key (and its environment) instead of fetching it (tests, air-gapped setups). */
   invocationKey?: InvocationKey;
   fetch?: FetchLike;
   /** Heartbeat interval override, for tests. */
@@ -68,23 +77,67 @@ function json(status: number, body: unknown): Response {
   });
 }
 
+interface BoundKey {
+  key: KeyObject;
+  projectId: number;
+  environmentId: number;
+}
+
+function bind(key: InvocationKey): BoundKey {
+  return { key: publicKeyFrom(key), projectId: key.project_id, environmentId: key.environment_id };
+}
+
+/** The body, or `undefined` once it passes `limit` bytes (the rest is not read). */
+async function readBounded(request: Request, limit: number): Promise<Uint8Array | undefined> {
+  if (!request.body) return new Uint8Array();
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > limit) {
+      await reader.cancel();
+      return undefined;
+    }
+    chunks.push(value);
+  }
+  const body = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return body;
+}
+
 class KeyCache {
-  private key?: Promise<KeyObject>;
+  private key?: Promise<BoundKey>;
   private refreshedAt = 0;
   private readonly pinned: boolean;
 
   constructor(
     private readonly transport: ExecutorTransport,
+    private readonly credential: string | undefined,
     pinned?: InvocationKey,
   ) {
     this.pinned = pinned !== undefined;
-    if (pinned) this.key = Promise.resolve(publicKeyFrom(pinned));
+    if (pinned) this.key = Promise.resolve(bind(pinned));
   }
 
-  get(): Promise<KeyObject> {
+  get(): Promise<BoundKey> {
     if (!this.key) {
+      const credential = this.credential;
+      if (!credential) {
+        return Promise.reject(
+          new Error(
+            'TEMPS_WORKFLOWS_TOKEN is not set: the handler reads the invocation key with the environment\'s workflow credential. Issue one in the console (environment → Workflows) and set it in the app.',
+          ),
+        );
+      }
       this.refreshedAt = Date.now();
-      this.key = this.transport.invocationKey().then(publicKeyFrom);
+      this.key = this.transport.invocationKey(credential).then(bind);
       this.key.catch(() => {
         this.key = undefined;
       });
@@ -126,7 +179,7 @@ export function createWorkflowHandler(options: WorkflowHandlerOptions): FetchHan
     workflows.set(definition.name, definition);
   }
   const transport = new ExecutorTransport({ apiUrl, fetch: options.fetch });
-  const keys = new KeyCache(transport, options.invocationKey);
+  const keys = new KeyCache(transport, options.token ?? process.env.TEMPS_WORKFLOWS_TOKEN, options.invocationKey);
   const telemetry = new Telemetry(options);
   const manifest: Manifest = {
     protocol_version: PROTOCOL_VERSION,
@@ -138,14 +191,25 @@ export function createWorkflowHandler(options: WorkflowHandlerOptions): FetchHan
     })),
   };
 
+  async function verifiedWith(token: string) {
+    const bound = await keys.get();
+    const claims = verifyToken(token, bound.key);
+    // The key is the instance's: a token Temps signed for another
+    // environment (whose executor could forward it here) is valid too.
+    if (claims.pid !== bound.projectId || claims.eid !== bound.environmentId) {
+      throw new InvalidTokenError('token is for another project or environment');
+    }
+    return claims;
+  }
+
   async function verified(request: Request) {
     const token = bearerToken(request.headers.get('authorization'));
     if (!token) throw new InvalidTokenError('missing bearer token');
     try {
-      return { token, claims: verifyToken(token, await keys.get()) };
+      return { token, claims: await verifiedWith(token) };
     } catch (error) {
       if (error instanceof InvalidTokenError && error.reason === 'bad signature' && keys.refresh()) {
-        return { token, claims: verifyToken(token, await keys.get()) };
+        return { token, claims: await verifiedWith(token) };
       }
       throw error;
     }
@@ -160,11 +224,10 @@ export function createWorkflowHandler(options: WorkflowHandlerOptions): FetchHan
   async function handleInvoke(request: Request): Promise<Response> {
     const length = Number(request.headers.get('content-length') ?? '0');
     if (length > MAX_INVOKE_BODY) return problem(413, 'Payload Too Large', `invoke body over ${MAX_INVOKE_BODY} bytes`);
-    const body = new Uint8Array(await request.arrayBuffer());
-    if (body.byteLength > MAX_INVOKE_BODY) {
-      return problem(413, 'Payload Too Large', `invoke body over ${MAX_INVOKE_BODY} bytes`);
-    }
+    // The token first: nobody but Temps gets this handler to read a body.
     const { token, claims } = await verified(request);
+    const body = await readBounded(request, MAX_INVOKE_BODY);
+    if (!body) return problem(413, 'Payload Too Large', `invoke body over ${MAX_INVOKE_BODY} bytes`);
     let invoke: InvokeRequest;
     try {
       invoke = JSON.parse(new TextDecoder().decode(body)) as InvokeRequest;
@@ -195,6 +258,7 @@ export function createWorkflowHandler(options: WorkflowHandlerOptions): FetchHan
       heartbeatMs: options.heartbeatMs,
     });
     if (result.type === 'stale') return new Response(null, { status: 202 });
+    if (result.type === 'unavailable') return problem(503, 'Temps Unavailable', result.reason);
     return json(200, { outcome: result.outcome });
   }
 

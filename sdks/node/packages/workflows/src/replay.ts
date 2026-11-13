@@ -21,6 +21,8 @@ import {
   RunCancelledError,
   StaleLeaseError,
   StepFailedError,
+  TempsApiError,
+  TempsUnavailableError,
   WorkflowIncompatibleError,
   errorMessage,
 } from './errors.js';
@@ -48,7 +50,11 @@ import {
 } from './workflow.js';
 
 const MAX_STEP_NAME = 200;
-/** Stop starting new steps this long before the invocation deadline. */
+/**
+ * Stop starting new steps this long before the invocation deadline, or a
+ * quarter of the invocation's window when that is shorter, so a short
+ * deadline still leaves room to work.
+ */
 const DEADLINE_MARGIN_MS = 30_000;
 const MAX_ERROR_LENGTH = 16_000;
 
@@ -56,7 +62,9 @@ const MAX_ERROR_LENGTH = 16_000;
 export type InvocationResult =
   | { type: 'outcome'; outcome: Outcome }
   /** The run belongs to another lease now: answer 202, report nothing. */
-  | { type: 'stale' };
+  | { type: 'stale' }
+  /** Temps could not be reached: answer 503, so Temps retries the invocation. */
+  | { type: 'unavailable'; reason: string };
 
 export interface InvocationDeps {
   transport: ExecutorTransport;
@@ -77,8 +85,14 @@ function isControl(error: unknown): boolean {
     error instanceof Suspension ||
     error instanceof StaleLeaseError ||
     error instanceof WorkflowIncompatibleError ||
-    error instanceof RunCancelledError
+    error instanceof RunCancelledError ||
+    error instanceof TempsUnavailableError
   );
+}
+
+/** A call to Temps that failed for Temps' reasons (unreachable, 5xx), not the run's. */
+function isOutage(error: unknown): error is TempsApiError {
+  return error instanceof TempsApiError && (error.status === 0 || error.status >= 500);
 }
 
 function toJson(value: unknown, what: string): JsonValue {
@@ -107,6 +121,7 @@ class Invocation<Input> {
   private readonly startedAt = performance.now();
   private readonly tempsStart: number;
   private readonly deadline: number;
+  private readonly margin: number;
   private cancelled = false;
   private stale = false;
   /**
@@ -117,6 +132,7 @@ class Invocation<Input> {
    */
   private control?: unknown;
   private heartbeat?: ReturnType<typeof setInterval>;
+  private heartbeatInFlight = false;
   /** Hidden from user code: the context is what the workflow sees. */
   readonly context: WorkflowContext<Input>;
 
@@ -128,6 +144,7 @@ class Invocation<Input> {
     for (const entry of request.journal) this.journal.set(entry.sequence, entry);
     this.tempsStart = Date.parse(request.now);
     this.deadline = Date.parse(request.deadline_at);
+    this.margin = Math.min(DEADLINE_MARGIN_MS, Math.max(0, (this.deadline - this.tempsStart) / 4));
     const self = this;
     this.context = {
       runId: request.run_id,
@@ -168,6 +185,7 @@ class Invocation<Input> {
     const error = this.control ?? thrown;
     if (error instanceof Suspension) return { type: 'outcome', outcome: error.outcome };
     if (error instanceof StaleLeaseError) return { type: 'stale' };
+    if (error instanceof TempsUnavailableError) return { type: 'unavailable', reason: error.message };
     if (error instanceof WorkflowIncompatibleError) {
       return {
         type: 'outcome',
@@ -187,7 +205,13 @@ class Invocation<Input> {
   private async loadJournal(): Promise<void> {
     let next = this.request.journal_next_sequence ?? null;
     while (next !== null && next !== undefined) {
-      const page = await this.deps.transport.journal(this.deps.token, this.request.run_id, next);
+      let page;
+      try {
+        page = await this.deps.transport.journal(this.deps.token, this.request.run_id, next);
+      } catch (error) {
+        if (isOutage(error)) this.raise(new TempsUnavailableError(this.request.run_id, error));
+        throw error;
+      }
       for (const entry of page.entries) this.journal.set(entry.sequence, entry);
       next = page.next_sequence ?? null;
     }
@@ -197,14 +221,22 @@ class Invocation<Input> {
     const leaseMs = Date.parse(this.request.lease_expires_at) - this.tempsStart;
     const interval = this.deps.heartbeatMs ?? Math.max(1000, Math.floor(leaseMs / 3));
     this.heartbeat = setInterval(() => {
-      this.deps.transport.heartbeat(this.deps.token, this.request.run_id).then(
-        (reply) => {
-          if (reply.cancelled) this.cancelled = true;
-        },
-        (error: unknown) => {
-          if (error instanceof StaleLeaseError) this.stale = true;
-        },
-      );
+      // One at a time: a slow Temps must not pile heartbeats up.
+      if (this.heartbeatInFlight) return;
+      this.heartbeatInFlight = true;
+      this.deps.transport
+        .heartbeat(this.deps.token, this.request.run_id)
+        .then(
+          (reply) => {
+            if (reply.cancelled) this.cancelled = true;
+          },
+          (error: unknown) => {
+            if (error instanceof StaleLeaseError) this.stale = true;
+          },
+        )
+        .finally(() => {
+          this.heartbeatInFlight = false;
+        });
     }, interval);
     // Never keep the process alive for a heartbeat.
     (this.heartbeat as { unref?: () => void }).unref?.();
@@ -242,7 +274,7 @@ class Invocation<Input> {
 
   /** Before running new work: suspend and continue in a fresh invocation if the deadline is near. */
   private yieldIfLate(sequence: number): void {
-    if (this.clock() >= this.deadline - DEADLINE_MARGIN_MS) {
+    if (this.clock() >= this.deadline - this.margin) {
       this.raise(new Suspension({ type: 'retry', sequence, at: new Date(this.clock()).toISOString() }));
     }
   }
@@ -253,6 +285,7 @@ class Invocation<Input> {
       reply = await this.deps.transport.recordStep(this.deps.token, this.request.run_id, write);
     } catch (error) {
       if (error instanceof StaleLeaseError || error instanceof WorkflowIncompatibleError) this.raise(error);
+      if (isOutage(error)) this.raise(new TempsUnavailableError(this.request.run_id, error));
       throw error;
     }
     this.journal.set(reply.entry.sequence, reply.entry);

@@ -34,6 +34,7 @@ export {
   StaleLeaseError,
   StepFailedError,
   TempsApiError,
+  TempsUnavailableError,
   WorkflowIncompatibleError,
 } from './errors.js';
 export type { ErrorTracker, TelemetryOptions, TracerLike, SpanLike } from './telemetry.js';

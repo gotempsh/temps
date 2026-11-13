@@ -32,7 +32,6 @@ use crate::handlers::{
 };
 use crate::metrics::WorkflowMetrics;
 use crate::payload::PayloadCodec;
-use crate::protocol::InvocationKeyResponse;
 use crate::scheduler::{SchedulerConfig, WorkflowScheduler};
 use crate::service::WorkflowService;
 use crate::store::{PgWorkflowStore, WorkflowStore};
@@ -52,11 +51,7 @@ fn app_state(context: &PluginContext) -> Arc<WorkflowsAppState> {
     Arc::new(WorkflowsAppState {
         service: context.require_service::<WorkflowService>(),
         engine: context.require_service::<WorkflowEngine>(),
-        invocation_key: InvocationKeyResponse {
-            algorithm: "ed25519".into(),
-            public_key: signer.public_key(),
-            key_id: signer.key_id(),
-        },
+        invocation_key: crate::protocol::InvocationKey::of(&signer),
         audit_service: context.require_service::<dyn AuditLogger>(),
         project_access_checker: context.get_service::<dyn temps_core::ProjectAccessChecker>(),
     })

@@ -67,6 +67,19 @@ describe('executor transport', () => {
     expect(calls).toBe(1);
   });
 
+  it('times out an attempt that Temps never answers', async () => {
+    const transport = new ExecutorTransport({
+      apiUrl: 'http://t/api',
+      attempts: 1,
+      timeoutMs: 50,
+      fetch: (_input, init) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => reject(init.signal?.reason));
+        }),
+    });
+    await expect(transport.heartbeat('t', 'r')).rejects.toMatchObject({ status: 0, title: 'Unreachable' });
+  });
+
   it('gives up after its attempts when Temps stays unreachable', async () => {
     const transport = new ExecutorTransport({
       apiUrl: 'http://t/api',
@@ -76,6 +89,6 @@ describe('executor transport', () => {
         throw new TypeError('connection refused');
       },
     });
-    await expect(transport.invocationKey()).rejects.toMatchObject({ status: 0, title: 'Unreachable' });
+    await expect(transport.invocationKey('twf_x')).rejects.toMatchObject({ status: 0, title: 'Unreachable' });
   });
 });
