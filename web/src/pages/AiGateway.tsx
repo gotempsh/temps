@@ -1061,6 +1061,7 @@ export function UsageAnalytics() {
 
   const {
     data: byProvider,
+    isLoading: byProviderLoading,
     isError: byProviderError,
     refetch: refetchByProvider,
   } = useWindowQuery({
@@ -1080,6 +1081,7 @@ export function UsageAnalytics() {
 
   const {
     data: topModels,
+    isLoading: topModelsLoading,
     isError: topModelsError,
     refetch: refetchTopModels,
   } = useWindowQuery({
@@ -1335,7 +1337,7 @@ export function UsageAnalytics() {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            {summaryLoading ? (
+            {summaryLoading || topModelsLoading ? (
               <Skeleton className="h-7 w-16" />
             ) : topModelsFailed ? (
               <UsageStatFailed />
@@ -1508,7 +1510,9 @@ export function UsageAnalytics() {
             <CardTitle className="text-base">By provider</CardTitle>
           </CardHeader>
           <CardContent>
-            {byProviderFailed ? (
+            {byProviderLoading ? (
+              <Skeleton className="h-[200px] w-full" />
+            ) : byProviderFailed ? (
               <UsageReadFailed
                 label="usage by provider"
                 onRetry={() => void refetchByProvider()}
@@ -1562,7 +1566,13 @@ export function UsageAnalytics() {
             <CardTitle className="text-base">Top models</CardTitle>
           </CardHeader>
           <CardContent>
-            {topModelsFailed ? (
+            {topModelsLoading ? (
+              <div className="space-y-3">
+                {['a', 'b', 'c', 'd'].map((key) => (
+                  <Skeleton key={key} className="h-5 w-full" />
+                ))}
+              </div>
+            ) : topModelsFailed ? (
               <UsageReadFailed
                 label="top models"
                 onRetry={() => void refetchTopModels()}

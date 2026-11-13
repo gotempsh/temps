@@ -3,7 +3,15 @@
 
 import { afterEach, expect, test } from 'bun:test'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from '@testing-library/react'
 import { MemoryRouter } from 'react-router'
 import { installBrowserWindow } from '@/test/dom'
 import { UsageAnalytics } from './AiGateway'
@@ -137,4 +145,35 @@ test('a failed usage read says so instead of showing zero usage', async () => {
   expect(screen.queryByText('No usage data')).toBeNull()
   expect(screen.queryByText('$0.00')).toBeNull()
   expect(screen.getAllByRole('button', { name: 'Retry' }).length).toBe(5)
+})
+
+test('Retry on a failed breakdown shows loading, never "No data", while it runs', async () => {
+  let failing = true
+  let releaseProviders: (() => void) | undefined
+  globalThis.fetch = (async (input: Request | string | URL) => {
+    const url = new URL(String(input), 'http://localhost')
+    if (url.pathname === '/api/ai/usage/recent')
+      return json({ entries: [], total: 0 })
+    if (url.pathname === '/api/ai/usage/by-provider') {
+      if (failing) return new Response('{}', { status: 500 })
+      return new Promise<Response>((resolve) => {
+        releaseProviders = () => resolve(json([]))
+      })
+    }
+    if (url.pathname.startsWith('/api/ai/usage/')) return json([])
+    return new Response('{}', { status: 404 })
+  }) as typeof fetch
+  renderUsage()
+  // The card's content: the failure, then the loading state, then the answer.
+  const card = (await screen.findByText("Couldn't load usage by provider."))
+    .parentElement!.parentElement!
+
+  failing = false
+  fireEvent.click(within(card).getByRole('button', { name: 'Retry' }))
+
+  await waitFor(() => expect(releaseProviders).toBeDefined())
+  expect(within(card).queryByText('No data')).toBeNull()
+  expect(card.querySelector('.animate-pulse')).not.toBeNull()
+  await act(async () => releaseProviders!())
+  await within(card).findByText('No data')
 })
