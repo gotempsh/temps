@@ -7,6 +7,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { useState } from 'react'
 import { MemoryRouter } from 'react-router'
 import { client } from '@/api/client/client.gen'
+import { restoreApiClient } from '@/test/api-client'
 import { installBrowserWindow } from '@/test/dom'
 import {
   SelfHostedProviderFields,
@@ -20,7 +21,7 @@ const originalConfig = client.getConfig()
 
 afterEach(() => {
   cleanup()
-  client.setConfig(originalConfig)
+  restoreApiClient(originalConfig)
 })
 
 /** Answer model discovery with `answer`, recording each request body. */
