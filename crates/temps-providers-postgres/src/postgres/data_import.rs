@@ -87,9 +87,35 @@ const PRODUCER: &str = "printf 'BEGIN;\\n' && \
      --dbname=\"$TEMPS_IMPORT_SOURCE\" && \
      printf 'COMMIT;\\n'";
 
+/// Drops the `pg_attver` column option from the dump's
+/// `ALTER [FOREIGN] TABLE ... ALTER COLUMN ... SET (...)` statements, leaving
+/// any other option on the column and every `COPY` data block untouched.
+///
+/// Recent PostgreSQL minor releases set this option on every column
+/// themselves, and an older `pg_dump` copies it into the dump as if it were
+/// the user's, which a server of an older minor release rejects
+/// (`unrecognized parameter "pg_attver"`), failing the whole import. A
+/// release that knows it sets its own value and leaves it out of dumps, so
+/// dropping it loses nothing.
+///
+/// It runs on the consumer side: the producer's `COMMIT` must still depend
+/// only on `pg_dump`'s status, which a pipe inside the producer would hide
+/// (`sh` has no `pipefail`). Should it fail, `psql` reads no `COMMIT` and the
+/// transaction rolls back.
+const STRIP_SERVER_COLUMN_OPTIONS: &str = r"sed -E \
+     -e '/^COPY .* FROM stdin;$/,/^\\\.$/b' \
+     -e '/^ALTER (FOREIGN )?TABLE .* ALTER COLUMN .* SET \(pg_attver=[^,)]*\);$/d' \
+     -e '/^ALTER (FOREIGN )?TABLE .* ALTER COLUMN .* SET \(/{s/ SET \(pg_attver=[^,)]*, / SET (/;s/, pg_attver=[^,)]*([,)])/\1/;}'";
+
 /// Stops at the first error; output other than errors is discarded.
-const CONSUMER: &str = "psql --no-psqlrc --quiet --no-password --set ON_ERROR_STOP=1 \
+const PSQL: &str = "psql --no-psqlrc --quiet --no-password --set ON_ERROR_STOP=1 \
      --dbname=\"$TEMPS_IMPORT_TARGET\" >/dev/null";
+
+/// The consumer: the dump, with server-managed column options dropped, into
+/// `psql`.
+fn consumer() -> String {
+    format!("{STRIP_SERVER_COLUMN_OPTIONS} | {PSQL}")
+}
 
 impl PostgresService {
     fn import_config(&self, config: &ServiceConfig) -> Result<PostgresConfig, DataImportError> {
@@ -378,7 +404,7 @@ impl DataImportEngine for PostgresService {
         Ok(TransferPlan {
             image: pg.docker_image,
             producer: PRODUCER.to_string(),
-            consumer: CONSUMER.to_string(),
+            consumer: consumer(),
             env: vec![
                 TransferEnv::secret("TEMPS_IMPORT_SOURCE", source.raw()),
                 TransferEnv::secret("TEMPS_IMPORT_TARGET", target_url),
@@ -553,8 +579,56 @@ mod tests {
         let commit = PRODUCER.find("COMMIT").expect("commit");
         assert!(begin < dump && dump < commit);
         assert!(PRODUCER.contains("--no-owner"));
-        assert!(!CONSUMER.contains("--single-transaction"));
-        assert!(CONSUMER.contains("ON_ERROR_STOP=1"));
+        assert!(!consumer().contains("--single-transaction"));
+        assert!(consumer().contains("ON_ERROR_STOP=1"));
+        // The filter is on the target side, never between pg_dump and COMMIT.
+        assert!(!PRODUCER.contains('|'));
+    }
+
+    #[test]
+    fn server_managed_column_options_are_dropped_and_nothing_else() {
+        let dump = "SET statement_timeout = 0;\n\
+             CREATE TABLE public.items (id integer NOT NULL, name text);\n\
+             ALTER TABLE ONLY public.items ALTER COLUMN id SET (pg_attver=22075360);\n\
+             ALTER TABLE ONLY public.items ALTER COLUMN name SET (pg_attver=22075360, n_distinct=5);\n\
+             ALTER TABLE ONLY public.items ALTER COLUMN name SET (n_distinct=5, pg_attver=1);\n\
+             ALTER TABLE ONLY public.items ALTER COLUMN name SET (n_distinct=5, pg_attver=1, n_distinct_inherited=2);\n\
+             ALTER FOREIGN TABLE ONLY public.remote ALTER COLUMN id SET (pg_attver=7);\n\
+             ALTER TABLE ONLY public.items ALTER COLUMN name SET STATISTICS 100;\n\
+             COPY public.items (id, name) FROM stdin;\n\
+             1\tALTER TABLE ONLY public.items ALTER COLUMN id SET (pg_attver=3);\n\
+             2\tpg_attver=4\n\
+             \\.\n\
+             ALTER TABLE ONLY public.items ALTER COLUMN id SET (pg_attver=9);\n";
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(STRIP_SERVER_COLUMN_OPTIONS)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("sh");
+        use std::io::Write;
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(dump.as_bytes())
+            .expect("write");
+        let output = child.wait_with_output().expect("filter ran");
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("utf-8"),
+            "SET statement_timeout = 0;\n\
+             CREATE TABLE public.items (id integer NOT NULL, name text);\n\
+             ALTER TABLE ONLY public.items ALTER COLUMN name SET (n_distinct=5);\n\
+             ALTER TABLE ONLY public.items ALTER COLUMN name SET (n_distinct=5);\n\
+             ALTER TABLE ONLY public.items ALTER COLUMN name SET (n_distinct=5, n_distinct_inherited=2);\n\
+             ALTER TABLE ONLY public.items ALTER COLUMN name SET STATISTICS 100;\n\
+             COPY public.items (id, name) FROM stdin;\n\
+             1\tALTER TABLE ONLY public.items ALTER COLUMN id SET (pg_attver=3);\n\
+             2\tpg_attver=4\n\
+             \\.\n"
+        );
     }
 
     #[test]
