@@ -28,7 +28,7 @@ use crate::error::WorkflowResult;
 use crate::payload::StoredPayload;
 use crate::types::{RunStatus, StepKind, StepStatus, WorkflowSettings};
 
-pub use postgres::PgWorkflowStore;
+pub use postgres::{PgWorkflowStore, DUE_CHANNEL};
 
 pub type RunRow = workflow_runs::Model;
 pub type StepRow = workflow_steps::Model;

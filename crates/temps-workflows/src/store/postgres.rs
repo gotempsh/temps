@@ -75,12 +75,9 @@ fn stale(row: Option<&RunRow>, run_id: Uuid, presented: i64) -> WorkflowError {
 }
 
 async fn notify<C: ConnectionTrait>(conn: &C) -> WorkflowResult<()> {
-    conn.execute(stmt(
-        "SELECT pg_notify($1, '')",
-        vec![DUE_CHANNEL.into()],
-    ))
-    .await
-    .map_err(WorkflowError::db("notifying the workflow scheduler"))?;
+    conn.execute(stmt("SELECT pg_notify($1, '')", vec![DUE_CHANNEL.into()]))
+        .await
+        .map_err(WorkflowError::db("notifying the workflow scheduler"))?;
     Ok(())
 }
 
@@ -208,7 +205,9 @@ impl WorkflowStore for PgWorkflowStore {
             vec![environment_id.into()],
         ))
         .await
-        .map_err(WorkflowError::db("revoking the previous workflow credential"))?;
+        .map_err(WorkflowError::db(
+            "revoking the previous workflow credential",
+        ))?;
         let row = workflow_credentials::ActiveModel {
             project_id: Set(project_id),
             environment_id: Set(environment_id),
@@ -343,9 +342,7 @@ impl WorkflowStore for PgWorkflowStore {
                 let existing = workflow_runs::Entity::find()
                     .filter(workflow_runs::Column::EnvironmentId.eq(run.environment_id))
                     .filter(workflow_runs::Column::WorkflowName.eq(run.workflow_name.clone()))
-                    .filter(
-                        workflow_runs::Column::IdempotencyKey.eq(run.idempotency_key.clone()),
-                    )
+                    .filter(workflow_runs::Column::IdempotencyKey.eq(run.idempotency_key.clone()))
                     .one(&txn)
                     .await
                     .map_err(WorkflowError::db("looking up a run by idempotency key"))?
@@ -853,7 +850,10 @@ impl WorkflowStore for PgWorkflowStore {
         .all(self.db.as_ref())
         .await
         .map_err(WorkflowError::db("finding runs waiting for an event"))?;
-        Ok(rows.into_iter().filter_map(WaitingRow::into_waiting).collect())
+        Ok(rows
+            .into_iter()
+            .filter_map(WaitingRow::into_waiting)
+            .collect())
     }
 
     async fn undelivered_waits(&self, limit: u64) -> WorkflowResult<Vec<WaitingRun>> {
@@ -871,7 +871,10 @@ impl WorkflowStore for PgWorkflowStore {
         .all(self.db.as_ref())
         .await
         .map_err(WorkflowError::db("reconciling event deliveries"))?;
-        Ok(rows.into_iter().filter_map(WaitingRow::into_waiting).collect())
+        Ok(rows
+            .into_iter()
+            .filter_map(WaitingRow::into_waiting)
+            .collect())
     }
 
     async fn buffered_event(

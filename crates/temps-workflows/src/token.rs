@@ -143,10 +143,7 @@ impl InvocationSigner {
                 reason: "malformed signature",
             })?;
         self.verifying_key
-            .verify_strict(
-                format!("{TOKEN_VERSION}.{payload}").as_bytes(),
-                &signature,
-            )
+            .verify_strict(format!("{TOKEN_VERSION}.{payload}").as_bytes(), &signature)
             .map_err(|_| WorkflowError::InvalidToken {
                 reason: "bad signature",
             })?;
@@ -271,7 +268,9 @@ mod tests {
         let expired = signer.sign(&claims(run, now.timestamp() - 1)).unwrap();
         assert!(matches!(
             signer.verify(&expired, now),
-            Err(WorkflowError::InvalidToken { reason: "token expired" })
+            Err(WorkflowError::InvalidToken {
+                reason: "token expired"
+            })
         ));
 
         // Swap the claims for another run's, keeping the signature.
@@ -286,7 +285,9 @@ mod tests {
         );
         assert!(matches!(
             signer.verify(&forged, now),
-            Err(WorkflowError::InvalidToken { reason: "bad signature" })
+            Err(WorkflowError::InvalidToken {
+                reason: "bad signature"
+            })
         ));
     }
 

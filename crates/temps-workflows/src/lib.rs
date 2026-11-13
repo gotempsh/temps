@@ -11,12 +11,23 @@
 //! metrics leave through [`temps_core::ProjectMetricsSink`] and large payloads
 //! through [`temps_core::PayloadBlobStore`].
 
+pub mod engine;
 pub mod error;
+pub mod executor;
+pub mod manifest;
+pub mod metrics;
 pub mod payload;
 pub mod protocol;
+pub mod scheduler;
+pub mod service;
 pub mod store;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod token;
 pub mod types;
 
+pub use engine::WorkflowEngine;
 pub use error::{WorkflowError, WorkflowResult};
+pub use scheduler::{SchedulerConfig, WorkflowScheduler};
+pub use service::WorkflowService;
 pub use store::{PgWorkflowStore, WorkflowStore};
