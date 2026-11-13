@@ -89,7 +89,7 @@ const PRODUCER: &str = "printf 'BEGIN;\\n' && \
 
 /// Drops the `pg_attver` column option from the dump's
 /// `ALTER [FOREIGN] TABLE ... ALTER COLUMN ... SET (...)` statements, leaving
-/// any other option on the column and every `COPY` data block untouched.
+/// any other option on the column untouched.
 ///
 /// Recent PostgreSQL minor releases set this option on every column
 /// themselves, and an older `pg_dump` copies it into the dump as if it were
@@ -98,14 +98,87 @@ const PRODUCER: &str = "printf 'BEGIN;\\n' && \
 /// release that knows it sets its own value and leaves it out of dumps, so
 /// dropping it loses nothing.
 ///
+/// Only a whole statement that starts a line is rewritten: the program
+/// follows SQL's quoting (`'...'` and `E'...'` strings, `"..."` identifiers,
+/// `$tag$` bodies, comments) and skips `COPY` data, so the same text inside a
+/// comment, a function body or a row is never changed. It is plain POSIX
+/// `awk`, which every service image has (Debian's `mawk`, BusyBox's); the
+/// quote characters come in as variables so the program can sit in the
+/// shell's single quotes.
+///
 /// It runs on the consumer side: the producer's `COMMIT` must still depend
 /// only on `pg_dump`'s status, which a pipe inside the producer would hide
 /// (`sh` has no `pipefail`). Should it fail, `psql` reads no `COMMIT` and the
 /// transaction rolls back.
-const STRIP_SERVER_COLUMN_OPTIONS: &str = r"sed -E \
-     -e '/^COPY .* FROM stdin;$/,/^\\\.$/b' \
-     -e '/^ALTER (FOREIGN )?TABLE .* ALTER COLUMN .* SET \(pg_attver=[^,)]*\);$/d' \
-     -e '/^ALTER (FOREIGN )?TABLE .* ALTER COLUMN .* SET \(/{s/ SET \(pg_attver=[^,)]*, / SET (/;s/, pg_attver=[^,)]*([,)])/\1/;}'";
+const STRIP_SERVER_COLUMN_OPTIONS_AWK: &str = r#"
+function strip(s,   head, opts, n, parts, i, kept) {
+  match(s, / SET \([^()]*\);$/)
+  head = substr(s, 1, RSTART - 1)
+  opts = substr(s, RSTART + 6, RLENGTH - 8)
+  n = split(opts, parts, ", ")
+  kept = ""
+  for (i = 1; i <= n; i++)
+    if (parts[i] !~ /^pg_attver=/) kept = kept (kept == "" ? "" : ", ") parts[i]
+  return kept == "" ? "" : head " SET (" kept ");"
+}
+function scan(s,   i, n, c, rest) {
+  n = length(s)
+  i = 1
+  while (i <= n) {
+    c = substr(s, i, 1)
+    if (st == "") {
+      if (c == "-" && substr(s, i + 1, 1) == "-") return
+      if (c == "/" && substr(s, i + 1, 1) == "*") { st = "c"; depth = 1; i += 2; continue }
+      if (c == SQ) {
+        st = "s"; start = 0
+        esc = i > 1 && substr(s, i - 1, 1) ~ /[Ee]/ && (i == 2 || substr(s, i - 2, 1) !~ /[A-Za-z0-9_$]/)
+        i++; continue
+      }
+      if (c == DQ) { st = "d"; start = 0; i++; continue }
+      if (c == "$" && (i == 1 || substr(s, i - 1, 1) !~ /[A-Za-z0-9_$]/)) {
+        rest = substr(s, i + 1)
+        if (match(rest, /^[A-Za-z_][A-Za-z0-9_]*[$]/) || match(rest, /^[$]/)) {
+          tag = "$" substr(rest, 1, RLENGTH); st = "q"; start = 0; i += 1 + RLENGTH; continue
+        }
+      }
+      if (c == ";") start = 1
+      else if (c != " " && c != "\t" && c != "\r") start = 0
+      i++; continue
+    }
+    if (st == "s") {
+      if (esc && c == "\\") { i += 2; continue }
+      if (c == SQ) { if (substr(s, i + 1, 1) == SQ) { i += 2; continue } st = "" }
+      i++; continue
+    }
+    if (st == "d") {
+      if (c == DQ) { if (substr(s, i + 1, 1) == DQ) { i += 2; continue } st = "" }
+      i++; continue
+    }
+    if (st == "q") {
+      if (substr(s, i, length(tag)) == tag) { st = ""; i += length(tag); continue }
+      i++; continue
+    }
+    if (substr(s, i, 2) == "/*") { depth++; i += 2; continue }
+    if (substr(s, i, 2) == "*/") { depth--; i += 2; if (depth == 0) st = ""; continue }
+    i++
+  }
+}
+BEGIN { start = 1; st = ""; copy = 0 }
+copy { print; if ($0 == "\\.") copy = 0; next }
+st == "" && start && /^\\/ { print; next }
+st == "" && start && /^COPY .* FROM stdin;$/ { print; copy = 1; next }
+st == "" && start && /^ALTER (FOREIGN )?TABLE .* ALTER COLUMN .* SET \([^()]*\);$/ && /pg_attver=/ {
+  line = strip($0)
+  if (line != "") print line
+  next
+}
+{ scan($0); print }
+"#;
+
+/// The shell command running [`STRIP_SERVER_COLUMN_OPTIONS_AWK`] as a filter.
+fn strip_server_column_options() -> String {
+    format!("awk -v SQ=\\' -v DQ=\\\" '{STRIP_SERVER_COLUMN_OPTIONS_AWK}'")
+}
 
 /// Stops at the first error; output other than errors is discarded.
 const PSQL: &str = "psql --no-psqlrc --quiet --no-password --set ON_ERROR_STOP=1 \
@@ -114,7 +187,7 @@ const PSQL: &str = "psql --no-psqlrc --quiet --no-password --set ON_ERROR_STOP=1
 /// The consumer: the dump, with server-managed column options dropped, into
 /// `psql`.
 fn consumer() -> String {
-    format!("{STRIP_SERVER_COLUMN_OPTIONS} | {PSQL}")
+    format!("{} | {PSQL}", strip_server_column_options())
 }
 
 impl PostgresService {
@@ -585,29 +658,16 @@ mod tests {
         assert!(!PRODUCER.contains('|'));
     }
 
-    #[test]
-    fn server_managed_column_options_are_dropped_and_nothing_else() {
-        let dump = "SET statement_timeout = 0;\n\
-             CREATE TABLE public.items (id integer NOT NULL, name text);\n\
-             ALTER TABLE ONLY public.items ALTER COLUMN id SET (pg_attver=22075360);\n\
-             ALTER TABLE ONLY public.items ALTER COLUMN name SET (pg_attver=22075360, n_distinct=5);\n\
-             ALTER TABLE ONLY public.items ALTER COLUMN name SET (n_distinct=5, pg_attver=1);\n\
-             ALTER TABLE ONLY public.items ALTER COLUMN name SET (n_distinct=5, pg_attver=1, n_distinct_inherited=2);\n\
-             ALTER FOREIGN TABLE ONLY public.remote ALTER COLUMN id SET (pg_attver=7);\n\
-             ALTER TABLE ONLY public.items ALTER COLUMN name SET STATISTICS 100;\n\
-             COPY public.items (id, name) FROM stdin;\n\
-             1\tALTER TABLE ONLY public.items ALTER COLUMN id SET (pg_attver=3);\n\
-             2\tpg_attver=4\n\
-             \\.\n\
-             ALTER TABLE ONLY public.items ALTER COLUMN id SET (pg_attver=9);\n";
+    /// Runs the filter the way the helper does, through `sh -c`.
+    fn strip(dump: &str) -> String {
+        use std::io::Write;
         let mut child = std::process::Command::new("sh")
             .arg("-c")
-            .arg(STRIP_SERVER_COLUMN_OPTIONS)
+            .arg(strip_server_column_options())
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .spawn()
             .expect("sh");
-        use std::io::Write;
         child
             .stdin
             .take()
@@ -616,19 +676,79 @@ mod tests {
             .expect("write");
         let output = child.wait_with_output().expect("filter ran");
         assert!(output.status.success());
-        assert_eq!(
-            String::from_utf8(output.stdout).expect("utf-8"),
-            "SET statement_timeout = 0;\n\
-             CREATE TABLE public.items (id integer NOT NULL, name text);\n\
-             ALTER TABLE ONLY public.items ALTER COLUMN name SET (n_distinct=5);\n\
-             ALTER TABLE ONLY public.items ALTER COLUMN name SET (n_distinct=5);\n\
-             ALTER TABLE ONLY public.items ALTER COLUMN name SET (n_distinct=5, n_distinct_inherited=2);\n\
-             ALTER TABLE ONLY public.items ALTER COLUMN name SET STATISTICS 100;\n\
-             COPY public.items (id, name) FROM stdin;\n\
-             1\tALTER TABLE ONLY public.items ALTER COLUMN id SET (pg_attver=3);\n\
-             2\tpg_attver=4\n\
-             \\.\n"
-        );
+        String::from_utf8(output.stdout).expect("utf-8")
+    }
+
+    #[test]
+    fn server_managed_column_options_are_dropped_and_nothing_else() {
+        let dump = r#"\restrict k3y
+SET statement_timeout = 0;
+CREATE TABLE public.items (id integer NOT NULL, name text);
+ALTER TABLE ONLY public.items ALTER COLUMN id SET (pg_attver=22075360);
+ALTER TABLE ONLY public.items ALTER COLUMN name SET (pg_attver=22075360, n_distinct=5);
+ALTER TABLE ONLY public.items ALTER COLUMN name SET (n_distinct=5, pg_attver=1);
+ALTER TABLE ONLY public.items ALTER COLUMN name SET (n_distinct=5, pg_attver=1, n_distinct_inherited=2);
+ALTER FOREIGN TABLE ONLY public.remote ALTER COLUMN id SET (pg_attver=7);
+ALTER TABLE ONLY public.items ALTER COLUMN name SET STATISTICS 100;
+COMMENT ON TABLE public.items IS 'it''s a list;
+ALTER TABLE ONLY public.items ALTER COLUMN id SET (pg_attver=1);
+end';
+CREATE FUNCTION public.f() RETURNS text LANGUAGE sql AS $_$
+SELECT 1;
+ALTER TABLE ONLY public.items ALTER COLUMN id SET (pg_attver=2);
+$_$;
+CREATE FUNCTION public.g() RETURNS void LANGUAGE plpgsql AS $$ BEGIN
+ALTER TABLE ONLY public.items ALTER COLUMN id SET (pg_attver=5);
+END $$;
+COMMENT ON COLUMN public.items.name IS E'back\\slash\' quote;
+ALTER TABLE ONLY public.items ALTER COLUMN id SET (pg_attver=6);
+';
+/* a comment;
+ALTER TABLE ONLY public.items ALTER COLUMN id SET (pg_attver=8);
+*/
+CREATE VIEW "odd;
+name" AS SELECT 1;
+ALTER TABLE ONLY public.items ALTER COLUMN id SET (pg_attver=10);
+COPY public.items (id, name) FROM stdin;
+1	ALTER TABLE ONLY public.items ALTER COLUMN id SET (pg_attver=3);
+2	it's
+\.
+ALTER TABLE ONLY public.items ALTER COLUMN id SET (pg_attver=9);
+"#;
+        // Only the statements that start a line outside any string, body,
+        // comment or COPY block lose the option; one left with no option
+        // is dropped whole.
+        let expected = r#"\restrict k3y
+SET statement_timeout = 0;
+CREATE TABLE public.items (id integer NOT NULL, name text);
+ALTER TABLE ONLY public.items ALTER COLUMN name SET (n_distinct=5);
+ALTER TABLE ONLY public.items ALTER COLUMN name SET (n_distinct=5);
+ALTER TABLE ONLY public.items ALTER COLUMN name SET (n_distinct=5, n_distinct_inherited=2);
+ALTER TABLE ONLY public.items ALTER COLUMN name SET STATISTICS 100;
+COMMENT ON TABLE public.items IS 'it''s a list;
+ALTER TABLE ONLY public.items ALTER COLUMN id SET (pg_attver=1);
+end';
+CREATE FUNCTION public.f() RETURNS text LANGUAGE sql AS $_$
+SELECT 1;
+ALTER TABLE ONLY public.items ALTER COLUMN id SET (pg_attver=2);
+$_$;
+CREATE FUNCTION public.g() RETURNS void LANGUAGE plpgsql AS $$ BEGIN
+ALTER TABLE ONLY public.items ALTER COLUMN id SET (pg_attver=5);
+END $$;
+COMMENT ON COLUMN public.items.name IS E'back\\slash\' quote;
+ALTER TABLE ONLY public.items ALTER COLUMN id SET (pg_attver=6);
+';
+/* a comment;
+ALTER TABLE ONLY public.items ALTER COLUMN id SET (pg_attver=8);
+*/
+CREATE VIEW "odd;
+name" AS SELECT 1;
+COPY public.items (id, name) FROM stdin;
+1	ALTER TABLE ONLY public.items ALTER COLUMN id SET (pg_attver=3);
+2	it's
+\.
+"#;
+        assert_eq!(strip(dump), expected);
     }
 
     #[test]
