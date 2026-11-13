@@ -121,6 +121,7 @@ the number of the ADR they belong to; they do not take a number of their own.
 | [100](./100-control-plane-backup-without-docker.md) | The control-plane backup dumps with the local PostgreSQL client when there is no Docker | Accepted |  |
 | [101](./101-internal-access-grants.md) | Internal access grants let another project call a project's `*.temps.local` routes | Proposed |  |
 | [102](./102-scoped-s3-credentials-for-worker-jobs.md) | A worker receives S3 credentials scoped to the job, never the source's own | Proposed | amends [099](./099-worker-backups-run-the-local-engines.md) |
+| [103](./103-durable-workflows.md) | Durable workflows orchestrated by Temps | Proposed |  |
 
 ## Supporting documents
 
