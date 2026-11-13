@@ -39,6 +39,7 @@ pub const QUEUE_DEPTH: &str = "temps.workflow.queue_depth";
 pub const QUEUE_AGE: &str = "temps.workflow.queue_age";
 pub const STUCK_RUNS: &str = "temps.workflow.stuck_runs";
 pub const STORAGE_BYTES: &str = "temps.workflow.storage_bytes";
+pub const DELIVERIES_DEFERRED: &str = "temps.workflow.event_deliveries_deferred";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SeriesKey {
@@ -163,6 +164,12 @@ impl WorkflowMetrics {
             workflow,
             reason,
         );
+    }
+
+    /// An event sent by a step was left to the reconciliation pass because
+    /// [`crate::engine::MAX_BACKGROUND_DELIVERIES`] were already running.
+    pub fn delivery_deferred(&self, project_id: i32, environment_id: i32) {
+        self.count(DELIVERIES_DEFERRED, project_id, environment_id, "", "");
     }
 
     /// A journal entry reached a final status; `outcome` is its status.

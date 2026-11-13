@@ -35,6 +35,14 @@ pub struct Authorized {
 
 impl WorkflowEngine {
     /// Verify an invocation token for `run_id`.
+    /// Check an invocation token's signature, expiry and run without the
+    /// database: what a route checks before it reads a large body.
+    pub fn verify_invocation_token(&self, token: &str, run_id: Uuid) -> WorkflowResult<()> {
+        self.signer
+            .verify_run(token, run_id, Utc::now())
+            .map(|_| ())
+    }
+
     pub async fn authorize(&self, token: &str, run_id: Uuid) -> WorkflowResult<Authorized> {
         let (claims, lease) = self.signer.verify_run(token, run_id, Utc::now())?;
         let run = self

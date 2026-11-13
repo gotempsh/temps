@@ -297,7 +297,8 @@ impl WorkflowEngine {
         let mut entries = Vec::with_capacity(rows.len());
         let mut bytes = 0usize;
         for row in rows {
-            let size = usize::try_from(row.result_bytes).unwrap_or(0);
+            let size = usize::try_from(i64::from(row.result_bytes) + i64::from(row.error_bytes))
+                .unwrap_or(0);
             if !entries.is_empty() && bytes + size > JOURNAL_PAGE_BYTES {
                 return Ok((entries, Some(row.sequence)));
             }

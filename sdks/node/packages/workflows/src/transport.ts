@@ -108,21 +108,27 @@ export class ExecutorTransport {
     let lastError: unknown;
     for (let attempt = 1; attempt <= this.attempts; attempt += 1) {
       let response: Response;
+      let body: T | undefined;
       try {
         // Bounded: a Temps that accepts the connection and never answers
-        // must not hold the invocation (and its lease) forever.
+        // must not hold the invocation (and its lease) forever. The body is
+        // read inside the same attempt: a connection that drops, or a
+        // timeout that fires, after the headers is a transport failure to
+        // retry, not a workflow failure. Every call is idempotent (a step
+        // already recorded answers `already_recorded`).
         response = await this.fetchImpl(`${this.apiUrl}${path}`, {
           method,
           headers,
           body: options.body === undefined ? undefined : JSON.stringify(options.body),
           signal: AbortSignal.timeout(this.timeoutMs),
         });
+        if (response.ok) body = (await response.json()) as T;
       } catch (error) {
         lastError = error;
         await this.pause(attempt);
         continue;
       }
-      if (response.ok) return (await response.json()) as T;
+      if (response.ok) return body as T;
       const problem = await readProblem(response);
       if (response.status === 409 && problem.title === 'Stale Lease') {
         throw new StaleLeaseError(options.runId ?? '', problem.detail);

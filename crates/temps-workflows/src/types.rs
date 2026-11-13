@@ -252,13 +252,13 @@ impl WorkflowSettings {
             "inline_payload_limit_bytes",
             self.inline_payload_limit_bytes.into(),
             1024,
-            1024 * 1024,
+            MAX_INLINE_LIMIT_BYTES.into(),
         )?;
         range(
             "max_payload_bytes",
             self.max_payload_bytes.into(),
             1024,
-            64 * 1024 * 1024,
+            MAX_PAYLOAD_LIMIT_BYTES.into(),
         )?;
         if self.max_payload_bytes < self.inline_payload_limit_bytes {
             return Err(WorkflowError::Validation {
@@ -276,6 +276,14 @@ impl WorkflowSettings {
         Ok(())
     }
 }
+
+/// The largest `max_payload_bytes` an environment may set.
+pub const MAX_PAYLOAD_LIMIT_BYTES: i32 = 64 * 1024 * 1024;
+/// The largest `inline_payload_limit_bytes` an environment may set.
+pub const MAX_INLINE_LIMIT_BYTES: i32 = 1024 * 1024;
+
+/// The longest event name, in characters (the `workflow_events.name` CHECK).
+pub const MAX_EVENT_NAME: usize = 200;
 
 /// Validate a workflow, step or event name: 1..=`max` characters of
 /// `[A-Za-z0-9._:/-]`. Names are plaintext metadata (labels, URLs-free

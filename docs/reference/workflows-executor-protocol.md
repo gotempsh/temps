@@ -216,7 +216,7 @@ Records one journal entry **before** the workflow continues past it.
 |---|---|---|
 | `step` | `pending` (attempt failed, will retry), `completed`, `failed` | `error` holds the message. |
 | `sleep` | `pending` with `wake_at`, then `completed` | The executor completes it on the first invocation whose `now` is at or past `wake_at`. An operator's resume moves `wake_at` to now. |
-| `wait` | `pending` with `wake_at` = the timeout (optional), then `completed` | Temps completes it with `{"received": true, "payload": ...}` when the event arrives. At the timeout the run is invoked with the entry still `pending`, and the executor records `{"received": false, "payload": null}`. |
+| `wait` | `pending` with `wake_at` = the timeout (optional), then `completed` | Temps completes it with `{"received": true, "payload": ...}` when the event arrives, while the run is still suspended on it. One event completes at most one wait of a run, and only an event sent after the run started. A result that would exceed `max_journal_bytes_per_run` fails the run (`error_kind` `quota_exceeded`). At the timeout the run is invoked with the entry still `pending`, and the executor records `{"received": false, "payload": null}`. |
 | `now` | `completed` with the timestamp | Never `pending`. |
 | `random` | `completed` with the value | Never `pending`. |
 | `send_event` | `completed` with `event` set | Never `pending`. Only this kind carries `event`; Temps delivers the event once, when the entry is first recorded. |
@@ -225,6 +225,14 @@ Records one journal entry **before** the workflow continues past it.
   to the attempt's span and error-tracking event.
 - Limits per run: `max_steps_per_run` entries and `max_journal_bytes_per_run`
   bytes (`429` with the quota named), `max_payload_bytes` per value (`413`).
+  A rewritten `pending` entry is charged for its latest result and error
+  only.
+- Event names are 1 to 200 characters of `[A-Za-z0-9._:/-]`; keys 1 to 256
+  characters without control characters.
+- Request bodies carrying payloads (this route, the outcome, starting a run)
+  are read up to the largest `max_payload_bytes` an environment may set
+  plus room for an error, an event and the envelope, and only after the
+  token is checked.
 
 Response:
 

@@ -18,6 +18,7 @@ temps-entities = { path = "../temps-entities" }
 
 # Web framework
 axum.workspace = true
+http-body-util.workspace = true
 
 # Async
 tokio.workspace = true
@@ -55,7 +56,6 @@ base64.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
 tower.workspace = true
-http-body-util.workspace = true
 temps-test-utils = { path = "../temps-test-utils" }
 temps-migrations = { path = "../temps-migrations" }
 testcontainers.workspace = true

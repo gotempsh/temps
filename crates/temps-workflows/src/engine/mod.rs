@@ -19,6 +19,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
 use temps_core::ExecutorEndpoints;
+use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 use crate::executor::ExecutorClient;
@@ -39,6 +40,11 @@ pub const MAX_ERROR_MESSAGE_BYTES: usize = 64 * 1024;
 /// How long a run waits before it is tried again when nothing could be
 /// invoked (no healthy replica, no deployment).
 pub const BLOCKED_RETRY_SECS: i64 = 30;
+/// Most events a process delivers in the background at once (events sent
+/// by workflow steps). Past it a delivery is deferred to the reconciliation
+/// pass, which finds every wait with an event it has not consumed; each
+/// delivery holds one decrypted payload of at most the inline limit.
+pub const MAX_BACKGROUND_DELIVERIES: usize = 16;
 
 pub use events::{EventDelivery, EventSpec};
 pub use journal::Authorized;
@@ -61,6 +67,7 @@ pub struct WorkflowEngine {
     manifests: ManifestCache,
     metrics: Arc<WorkflowMetrics>,
     next_endpoint: AtomicUsize,
+    deliveries: Arc<Semaphore>,
 }
 
 impl WorkflowEngine {
@@ -81,6 +88,7 @@ impl WorkflowEngine {
             manifests: ManifestCache::new(),
             metrics,
             next_endpoint: AtomicUsize::new(0),
+            deliveries: Arc::new(Semaphore::new(MAX_BACKGROUND_DELIVERIES)),
         }
     }
 

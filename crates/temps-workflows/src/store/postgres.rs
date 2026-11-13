@@ -90,6 +90,7 @@ struct WaitingRow {
     id: Uuid,
     project_id: i32,
     environment_id: i32,
+    lease_token: i64,
     awaited_sequence: Option<i32>,
     awaited_event_name: Option<String>,
     awaited_event_key: Option<String>,
@@ -101,6 +102,7 @@ impl WaitingRow {
             run_id: self.id,
             project_id: self.project_id,
             environment_id: self.environment_id,
+            lease: self.lease_token,
             sequence: self.awaited_sequence?,
             event_name: self.awaited_event_name?,
             event_key: self.awaited_event_key.unwrap_or_default(),
@@ -767,7 +769,7 @@ impl WorkflowStore for PgWorkflowStore {
                  lease_expires_at = NULL, awaited_event_name = NULL, awaited_event_key = NULL, \
                  awaited_sequence = NULL, \
                  step_count = (SELECT count(*) FROM workflow_steps s WHERE s.run_id = r.id), \
-                 journal_bytes = COALESCE((SELECT sum(s.result_bytes) FROM workflow_steps s \
+                 journal_bytes = COALESCE((SELECT sum(s.result_bytes + s.error_bytes) FROM workflow_steps s \
                      WHERE s.run_id = r.id), 0), \
                  updated_at = now() \
                  WHERE r.id = $1 RETURNING *",
@@ -866,7 +868,7 @@ impl WorkflowStore for PgWorkflowStore {
         limit: u64,
     ) -> WorkflowResult<Vec<WaitingRun>> {
         let rows = WaitingRow::find_by_statement(stmt(
-            "SELECT id, project_id, environment_id, awaited_sequence, awaited_event_name, \
+            "SELECT id, project_id, environment_id, lease_token, awaited_sequence, awaited_event_name, \
              awaited_event_key FROM workflow_runs \
              WHERE environment_id = $1 AND status = 'waiting' AND awaited_event_name = $2 \
              AND awaited_event_key = $3 AND ($4::uuid IS NULL OR id > $4::uuid) \
@@ -890,7 +892,7 @@ impl WorkflowStore for PgWorkflowStore {
 
     async fn undelivered_waits(&self, limit: u64) -> WorkflowResult<Vec<WaitingRun>> {
         let rows = WaitingRow::find_by_statement(stmt(
-            "SELECT r.id, r.project_id, r.environment_id, r.awaited_sequence, r.awaited_event_name, \
+            "SELECT r.id, r.project_id, r.environment_id, r.lease_token, r.awaited_sequence, r.awaited_event_name, \
              r.awaited_event_key FROM workflow_runs r \
              WHERE r.status = 'waiting' AND EXISTS ( \
                 SELECT 1 FROM workflow_events e \
@@ -931,45 +933,98 @@ impl WorkflowStore for PgWorkflowStore {
 
     async fn complete_wait(
         &self,
-        run_id: Uuid,
-        sequence: i32,
+        waiting: &WaitingRun,
         event_id: Option<i64>,
         result: StoredPayload,
-    ) -> WorkflowResult<bool> {
+        max_journal_bytes: i64,
+    ) -> WorkflowResult<WaitCompletion> {
         let txn = self
             .db
             .begin()
             .await
             .map_err(WorkflowError::db("delivering a workflow event"))?;
-        let updated = txn
-            .execute(stmt(
-                "UPDATE workflow_steps SET status = 'completed', result_encrypted = $3, \
-                 result_blob_key = $4, result_bytes = $5, event_id = $6, completed_at = now(), \
-                 updated_at = now() \
-                 WHERE run_id = $1 AND sequence = $2 AND kind = 'wait' AND status = 'pending'",
-                vec![
-                    run_id.into(),
-                    sequence.into(),
-                    result.encrypted.into(),
-                    result.blob_key.into(),
-                    result.bytes.into(),
-                    event_id.into(),
-                ],
+        // The run's lock serialises this with claims, cancels, retries and
+        // other deliveries: what is checked below stays true until commit.
+        let run = workflow_runs::Entity::find()
+            .from_raw_sql(stmt(
+                "SELECT * FROM workflow_runs WHERE id = $1 FOR UPDATE",
+                vec![waiting.run_id.into()],
             ))
+            .one(&txn)
             .await
             .map_err(WorkflowError::db("delivering a workflow event"))?;
-        if updated.rows_affected() == 0 {
-            return Ok(false);
+        let suspended = run.as_ref().is_some_and(|run| {
+            status_of(run) == RunStatus::Waiting
+                && run.lease_token == waiting.lease
+                && run.awaited_sequence == Some(waiting.sequence)
+                && run.awaited_event_name.as_deref() == Some(waiting.event_name.as_str())
+                && run.awaited_event_key.as_deref().unwrap_or_default() == waiting.event_key
+        });
+        let Some(run) = run.filter(|_| suspended) else {
+            return Ok(WaitCompletion::NotWaiting);
+        };
+        if let Some(event_id) = event_id {
+            // One event satisfies one wait of a run, and only an event the
+            // run received after it started (as `buffered_event` picks).
+            let usable = txn
+                .query_one(stmt(
+                    "SELECT 1 AS usable FROM workflow_events e WHERE e.id = $2 \
+                     AND e.created_at >= $3 \
+                     AND NOT EXISTS (SELECT 1 FROM workflow_steps s \
+                                     WHERE s.run_id = $1 AND s.event_id = e.id)",
+                    vec![
+                        waiting.run_id.into(),
+                        event_id.into(),
+                        run.created_at.into(),
+                    ],
+                ))
+                .await
+                .map_err(WorkflowError::db("delivering a workflow event"))?;
+            if usable.is_none() {
+                return Ok(WaitCompletion::NotWaiting);
+            }
         }
+        let step = workflow_steps::Entity::find_by_id((waiting.run_id, waiting.sequence))
+            .one(&txn)
+            .await
+            .map_err(WorkflowError::db("delivering a workflow event"))?;
+        let Some(step) = step.filter(|step| {
+            step.kind == StepKind::Wait.as_str() && step.status == StepStatus::Pending.as_str()
+        }) else {
+            return Ok(WaitCompletion::NotWaiting);
+        };
+        let delta =
+            i64::from(result.bytes) - i64::from(step.result_bytes) - i64::from(step.error_bytes);
+        if run.journal_bytes + delta > max_journal_bytes {
+            return Ok(WaitCompletion::OverQuota {
+                journal_bytes: run.journal_bytes,
+                result_bytes: result.bytes,
+            });
+        }
+        let blob = result.blob_key.is_some();
+        txn.execute(stmt(
+            "UPDATE workflow_steps SET status = 'completed', result_encrypted = $3, \
+             result_blob_key = $4, result_bytes = $5, error_encrypted = NULL, error_bytes = 0, \
+             event_id = $6, completed_at = now(), updated_at = now() \
+             WHERE run_id = $1 AND sequence = $2",
+            vec![
+                waiting.run_id.into(),
+                waiting.sequence.into(),
+                result.encrypted.into(),
+                result.blob_key.into(),
+                result.bytes.into(),
+                event_id.into(),
+            ],
+        ))
+        .await
+        .map_err(WorkflowError::db("delivering a workflow event"))?;
         txn.execute(stmt(
             "UPDATE workflow_runs SET journal_bytes = journal_bytes + $2, \
-             status = CASE WHEN status = 'waiting' THEN 'queued' ELSE status END, \
-             due_at = CASE WHEN status = 'waiting' THEN now() ELSE due_at END, \
-             awaited_event_name = CASE WHEN status = 'waiting' THEN NULL ELSE awaited_event_name END, \
-             awaited_event_key = CASE WHEN status = 'waiting' THEN NULL ELSE awaited_event_key END, \
-             awaited_sequence = CASE WHEN status = 'waiting' THEN NULL ELSE awaited_sequence END, \
+             has_blob_payloads = has_blob_payloads OR $3, \
+             status = 'queued', due_at = now(), \
+             awaited_event_name = NULL, awaited_event_key = NULL, awaited_sequence = NULL, \
              updated_at = now() WHERE id = $1",
-            vec![run_id.into(), i64::from(result.bytes).into()],
+            vec![waiting.run_id.into(), delta.into(), blob.into()],
         ))
         .await
         .map_err(WorkflowError::db("waking a workflow run"))?;
@@ -977,7 +1032,37 @@ impl WorkflowStore for PgWorkflowStore {
         txn.commit()
             .await
             .map_err(WorkflowError::db("delivering a workflow event"))?;
-        Ok(true)
+        Ok(WaitCompletion::Completed)
+    }
+
+    async fn fail_wait(
+        &self,
+        waiting: &WaitingRun,
+        error: StoredPayload,
+        kind: &'static str,
+    ) -> WorkflowResult<Option<String>> {
+        let row = self
+            .db
+            .query_one(stmt(
+                "UPDATE workflow_runs SET status = 'failed', error_encrypted = $4, error_kind = $5, \
+                 finished_at = now(), due_at = NULL, lease_expires_at = NULL, \
+                 awaited_event_name = NULL, awaited_event_key = NULL, awaited_sequence = NULL, \
+                 consecutive_failures = 0, blocked_reason = NULL, updated_at = now() \
+                 WHERE id = $1 AND lease_token = $2 AND awaited_sequence = $3 AND status = 'waiting' \
+                 RETURNING workflow_name",
+                vec![
+                    waiting.run_id.into(),
+                    waiting.lease.into(),
+                    waiting.sequence.into(),
+                    error.encrypted.into(),
+                    kind.into(),
+                ],
+            ))
+            .await
+            .map_err(WorkflowError::db("failing a waiting workflow run"))?;
+        row.map(|row| row.try_get::<String>("", "workflow_name"))
+            .transpose()
+            .map_err(WorkflowError::db("failing a waiting workflow run"))
     }
 
     async fn record_step(
@@ -1023,7 +1108,8 @@ impl WorkflowStore for PgWorkflowStore {
                 if StepStatus::parse(&existing.status).is_some_and(StepStatus::is_final) {
                     (existing, false, 0, true)
                 } else {
-                    let old_bytes = i64::from(existing.result_bytes);
+                    let old_bytes =
+                        i64::from(existing.result_bytes) + i64::from(existing.error_bytes);
                     if run.journal_bytes + new_bytes - old_bytes > limits.max_journal_bytes {
                         return Err(WorkflowError::QuotaExceeded {
                             environment_id: run.environment_id,
@@ -1038,6 +1124,7 @@ impl WorkflowStore for PgWorkflowStore {
                     active.result_blob_key = Set(record.result.blob_key.clone());
                     active.result_bytes = Set(record.result.bytes);
                     active.error_encrypted = Set(record.error.encrypted.clone());
+                    active.error_bytes = Set(record.error.bytes);
                     active.lease_token = Set(record.lease);
                     if record.wake_at.is_some() {
                         active.wake_at = Set(record.wake_at);
@@ -1091,6 +1178,7 @@ impl WorkflowStore for PgWorkflowStore {
                     result_blob_key: Set(record.result.blob_key.clone()),
                     result_bytes: Set(record.result.bytes),
                     error_encrypted: Set(record.error.encrypted.clone()),
+                    error_bytes: Set(record.error.bytes),
                     lease_token: Set(record.lease),
                     event_id: Set(None),
                     wake_at: Set(record.wake_at),

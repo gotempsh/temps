@@ -172,9 +172,30 @@ pub struct WaitingRun {
     pub run_id: Uuid,
     pub project_id: i32,
     pub environment_id: i32,
+    /// The lease of the invocation that suspended: a delivery completes the
+    /// wait only while the run is still suspended under it, so a delivery
+    /// that lags behind a cancel, a retry or a later wait changes nothing.
+    pub lease: i64,
     pub sequence: i32,
     pub event_name: String,
     pub event_key: String,
+}
+
+/// How [`WorkflowStore::complete_wait`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitCompletion {
+    /// The wait was completed and the run queued.
+    Completed,
+    /// Nothing changed: the run is no longer suspended on this wait under
+    /// this lease, or the event is one the run already consumed or that
+    /// predates it.
+    NotWaiting,
+    /// Nothing changed: the result would take the run's journal past its
+    /// `max_journal_bytes_per_run` quota.
+    OverQuota {
+        journal_bytes: i64,
+        result_bytes: i32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -330,15 +351,27 @@ pub trait WorkflowStore: Send + Sync {
         name: &str,
         key: &str,
     ) -> WorkflowResult<Option<EventRow>>;
-    /// Complete a pending `wait` entry and make its run due. Compare-and-set:
-    /// false when the entry was no longer pending.
+    /// Complete a run's pending `wait` entry with `result` and make the run
+    /// due, under a lock on the run: only while it is still suspended on
+    /// `waiting` (same lease, sequence, name and key), only with an event it
+    /// has not consumed and that it received after it started, and only
+    /// within `max_journal_bytes`.
     async fn complete_wait(
         &self,
-        run_id: Uuid,
-        sequence: i32,
+        waiting: &WaitingRun,
         event_id: Option<i64>,
         result: StoredPayload,
-    ) -> WorkflowResult<bool>;
+        max_journal_bytes: i64,
+    ) -> WorkflowResult<WaitCompletion>;
+    /// Fail a run still suspended on `waiting` (same lease and sequence)
+    /// with `error`. Returns its workflow name, or `None` when it no longer
+    /// is suspended there.
+    async fn fail_wait(
+        &self,
+        waiting: &WaitingRun,
+        error: StoredPayload,
+        kind: &'static str,
+    ) -> WorkflowResult<Option<String>>;
 
     // ── Journal ──────────────────────────────────────────────────────
 

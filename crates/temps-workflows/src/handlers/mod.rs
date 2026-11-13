@@ -22,15 +22,19 @@ pub mod types;
 
 use std::sync::Arc;
 
+use axum::body::Body;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
+use http_body_util::{BodyExt, LengthLimitError, Limited};
+use serde::de::DeserializeOwned;
 use temps_core::problemdetails::{self, Problem};
 use temps_core::{PayloadBlobError, RequestMetadata};
 use utoipa::OpenApi;
 
 use crate::error::WorkflowError;
+use crate::types::{MAX_INLINE_LIMIT_BYTES, MAX_PAYLOAD_LIMIT_BYTES};
 pub use types::WorkflowsAppState;
 use types::*;
 
@@ -237,6 +241,50 @@ impl From<WorkflowError> for Problem {
 }
 
 /// The bearer token of a public request, or a 401.
+/// The largest body a payload-carrying route reads (a run's input, a step's
+/// result, a run's output): the largest payload any environment may allow,
+/// plus an inline error and event payload and the request's envelope. The
+/// default extractor limit (2 MiB) is below the default `max_payload_bytes`
+/// (4 MiB). The body is read only once the caller is authenticated, and the
+/// environment's own `max_payload_bytes` is enforced when the payload is
+/// sealed.
+pub const MAX_PAYLOAD_REQUEST_BYTES: usize =
+    MAX_PAYLOAD_LIMIT_BYTES as usize + 2 * MAX_INLINE_LIMIT_BYTES as usize + 1024 * 1024;
+
+/// Read and parse a JSON body of at most [`MAX_PAYLOAD_REQUEST_BYTES`].
+async fn json_body<T: DeserializeOwned>(body: Body) -> Result<T, Problem> {
+    let bytes = match Limited::new(body, MAX_PAYLOAD_REQUEST_BYTES)
+        .collect()
+        .await
+    {
+        Ok(collected) => collected.to_bytes(),
+        Err(error) if error.downcast_ref::<LengthLimitError>().is_some() => {
+            return Err(problemdetails::new(StatusCode::PAYLOAD_TOO_LARGE)
+                .with_title("Request Too Large")
+                .with_detail(format!(
+                    "the request body is over {MAX_PAYLOAD_REQUEST_BYTES} bytes"
+                )))
+        }
+        Err(error) => {
+            return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Unreadable Request Body")
+                .with_detail(format!("reading the request body failed: {error}")))
+        }
+    };
+    serde_json::from_slice(&bytes).map_err(|error| {
+        let status = if error.is_data() {
+            StatusCode::UNPROCESSABLE_ENTITY
+        } else {
+            StatusCode::BAD_REQUEST
+        };
+        problemdetails::new(status)
+            .with_title("Invalid JSON Body")
+            .with_detail(format!(
+                "the request body is not valid JSON for this route: {error}"
+            ))
+    })
+}
+
 fn bearer(headers: &HeaderMap) -> Result<&str, Problem> {
     headers
         .get(header::AUTHORIZATION)

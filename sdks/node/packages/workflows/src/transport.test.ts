@@ -91,4 +91,31 @@ describe('executor transport', () => {
     });
     await expect(transport.invocationKey('twf_x')).rejects.toMatchObject({ status: 0, title: 'Unreachable' });
   });
+  it('retries a success whose body breaks off, then reports an outage if it keeps breaking', async () => {
+    const broken = () =>
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode('{"entry":'));
+            controller.error(new TypeError('terminated'));
+          },
+        }),
+        { status: 200 },
+      );
+    let calls = 0;
+    const recovering = new ExecutorTransport({
+      apiUrl: 'http://t/api',
+      backoffMs: 1,
+      fetch: async () => {
+        calls += 1;
+        if (calls === 1) return broken();
+        return new Response(JSON.stringify({ entries: [], next_sequence: null }));
+      },
+    });
+    await expect(recovering.journal('t', 'r', 0)).resolves.toEqual({ entries: [], next_sequence: null });
+    expect(calls).toBe(2);
+
+    const failing = new ExecutorTransport({ apiUrl: 'http://t/api', attempts: 2, backoffMs: 1, fetch: async () => broken() });
+    await expect(failing.recordStep('t', 'r', write)).rejects.toMatchObject({ status: 0, title: 'Unreachable' });
+  });
 });

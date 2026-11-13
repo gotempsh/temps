@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use axum::body::Body;
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -20,7 +21,7 @@ use uuid::Uuid;
 
 use super::audit::*;
 use super::types::*;
-use super::{audit_context, no_store, record_audit, total_pages};
+use super::{audit_context, json_body, no_store, record_audit, total_pages};
 use crate::error::WorkflowError;
 use crate::service::{page_bounds, RevealField, StartRun};
 use crate::store::{RunFilter, Starter};
@@ -144,7 +145,7 @@ pub async fn start_workflow_run(
     State(state): AppState,
     Extension(metadata): Extension<RequestMetadata>,
     Path((project_id, environment_id)): Path<(i32, i32)>,
-    Json(request): Json<StartWorkflowRunRequest>,
+    body: Body,
 ) -> Result<impl IntoResponse, Problem> {
     deny_deployment_token!(auth);
     project_scope_guard!(auth, project_id);
@@ -154,6 +155,7 @@ pub async fn start_workflow_run(
         project_id,
         &state.project_access_checker
     );
+    let request: StartWorkflowRunRequest = json_body(body).await?;
     let (run, created) = state
         .service
         .start(

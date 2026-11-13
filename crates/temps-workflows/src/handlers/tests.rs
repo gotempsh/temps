@@ -23,7 +23,7 @@ use temps_entities::users;
 use tower::ServiceExt;
 
 use super::*;
-use crate::engine::tests::{harness, Harness, Reply, Script};
+use crate::engine::tests::{harness, harness_with, Harness, Reply, Script};
 use crate::metrics::WorkflowMetrics;
 use crate::payload::PayloadCodec;
 use crate::protocol::Outcome;
@@ -298,6 +298,13 @@ async fn executor_and_app_routes_reject_missing_or_forged_tokens_as_problems() {
     for (method, uri, body) in [
         ("GET", format!("/workflow-runs/{RUN}/journal"), None),
         ("POST", format!("/workflow-runs/{RUN}/heartbeat"), None),
+        (
+            "POST",
+            format!("/workflow-runs/{RUN}/steps"),
+            Some(
+                json!({"sequence": 0, "name": "a", "kind": "step", "status": "completed", "attempts": 1}),
+            ),
+        ),
         (
             "POST",
             format!("/workflow-runs/{RUN}/outcome"),
@@ -635,6 +642,141 @@ async fn an_app_uses_its_credential_to_start_read_and_signal_runs() {
     for (_, record) in audit.0.lock().unwrap().iter() {
         assert!(!record.contains(&token), "audit record holds the token");
     }
+}
+
+async fn send_raw(
+    app: Router,
+    uri: &str,
+    body: String,
+    auth: Option<AuthContext>,
+    bearer: Option<&str>,
+) -> (StatusCode, Value) {
+    let mut request = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json");
+    if let Some(token) = bearer {
+        request = request.header("authorization", format!("Bearer {token}"));
+    }
+    let mut request = request.body(Body::from(body)).unwrap();
+    request.extensions_mut().insert(metadata());
+    if let Some(auth) = auth {
+        request.extensions_mut().insert(auth);
+    }
+    let response = app.oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+#[tokio::test]
+async fn payload_routes_read_bodies_up_to_the_payload_limit_once_authenticated() {
+    let blobs = Arc::new(crate::payload::tests::MemoryBlobs::default());
+    let Some(h) = harness_with(
+        "handler large input test",
+        &["orders"],
+        completing(),
+        true,
+        Some(blobs),
+        None,
+    )
+    .await
+    else {
+        return;
+    };
+    let service = Arc::new(WorkflowService::new(
+        h.store.clone(),
+        h.engine.clone(),
+        h.codec.clone(),
+        Arc::new(WorkflowMetrics::new(Arc::new(NoopProjectMetricsSink))),
+    ));
+    let app = router(state_from(
+        service,
+        h.engine.clone(),
+        Arc::new(RecordingAudit::default()),
+    ));
+    let admin = || AuthContext::new_session(user(h.env.user_id), Role::Admin);
+    let base = format!(
+        "/projects/{}/environments/{}/workflows",
+        h.env.project_id, h.env.environment_id
+    );
+    let (_, _, issued) = send(
+        app.clone(),
+        "POST",
+        &format!("{base}/credential"),
+        None,
+        Some(admin()),
+        None,
+    )
+    .await;
+    let token = issued["token"].as_str().unwrap().to_string();
+
+    // 3 MiB: over the default 2 MiB extractor limit, within the default
+    // 4 MiB max_payload_bytes (spilled to blob storage).
+    let big = json!({"workflow": "orders", "input": "x".repeat(3 * 1024 * 1024)}).to_string();
+    let (status, started) = send_raw(
+        app.clone(),
+        "/workflows/v1/runs",
+        big.clone(),
+        None,
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{started}");
+    let (status, started) = send_raw(
+        app.clone(),
+        &format!("{base}/runs"),
+        big,
+        Some(admin()),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{started}");
+
+    // Over the environment's own max_payload_bytes: refused by the service.
+    let huge = json!({"workflow": "orders", "input": "x".repeat(5 * 1024 * 1024)}).to_string();
+    let (status, problem) =
+        send_raw(app.clone(), "/workflows/v1/runs", huge, None, Some(&token)).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{problem}");
+    assert_eq!(problem["title"], "Payload Too Large");
+
+    // Bodies that are not the route's JSON are Problems.
+    let (status, problem) = send_raw(
+        app.clone(),
+        "/workflows/v1/runs",
+        "{not json".into(),
+        None,
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(problem["title"], "Invalid JSON Body");
+    let (status, problem) = send_raw(
+        app.clone(),
+        "/workflows/v1/runs",
+        r#"{"input": 1}"#.into(),
+        None,
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(problem["title"], "Invalid JSON Body");
+
+    // Unauthenticated: refused before the body is read.
+    let (status, problem) = send_raw(
+        app,
+        &format!("/workflow-runs/{RUN}/steps"),
+        "x".repeat(3 * 1024 * 1024),
+        None,
+        Some("twi1.forged.token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{problem}");
 }
 
 #[tokio::test]

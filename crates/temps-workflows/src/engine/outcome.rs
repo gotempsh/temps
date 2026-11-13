@@ -14,7 +14,9 @@ use crate::error::{WorkflowError, WorkflowResult};
 use crate::payload::{PayloadField, StoredPayload};
 use crate::protocol::Outcome;
 use crate::store::{Release, RunRow, WaitingRun};
-use crate::types::{validate_key, validate_name, StepKind, StepStatus, WorkflowSettings};
+use crate::types::{
+    validate_key, validate_name, StepKind, StepStatus, WorkflowSettings, MAX_EVENT_NAME,
+};
 
 /// Cut `message` so its JSON encoding fits `limit` bytes, on a character
 /// boundary.
@@ -205,7 +207,7 @@ impl WorkflowEngine {
                 key,
                 timeout_at,
             } => {
-                validate_name("outcome.event", &event, 200)?;
+                validate_name("outcome.event", &event, MAX_EVENT_NAME)?;
                 let key = key.unwrap_or_default();
                 if !key.is_empty() {
                     validate_key("outcome.key", &key)?;
@@ -228,6 +230,7 @@ impl WorkflowEngine {
                     run_id: run.id,
                     project_id: run.project_id,
                     environment_id: run.environment_id,
+                    lease,
                     sequence,
                     event_name: event,
                     event_key: key,

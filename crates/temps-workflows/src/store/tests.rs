@@ -603,17 +603,21 @@ async fn events_wake_waiting_runs_exactly_once_and_buffer_early_arrivals() {
         blob_key: None,
         bytes: 4,
     };
-    assert!(f
-        .store
-        .complete_wait(run.id, 0, Some(event_id), delivered.clone())
-        .await
-        .unwrap());
+    assert_eq!(
+        f.store
+            .complete_wait(&waiting[0], Some(event_id), delivered.clone(), 1 << 20)
+            .await
+            .unwrap(),
+        WaitCompletion::Completed
+    );
     // Compare-and-set: the second delivery is a no-op.
-    assert!(!f
-        .store
-        .complete_wait(run.id, 0, Some(event_id), delivered)
-        .await
-        .unwrap());
+    assert_eq!(
+        f.store
+            .complete_wait(&waiting[0], Some(event_id), delivered, 1 << 20)
+            .await
+            .unwrap(),
+        WaitCompletion::NotWaiting
+    );
     assert!(f.store.undelivered_waits(10).await.unwrap().is_empty());
     assert!(f
         .store
@@ -630,6 +634,318 @@ async fn events_wake_waiting_runs_exactly_once_and_buffer_early_arrivals() {
     let entry = f.store.step(run.id, 0).await.unwrap().unwrap();
     assert_eq!(entry.status, "completed");
     assert_eq!(entry.event_id, Some(event_id));
+}
+
+/// Suspend `run` (claimed under `claim`) on a pending wait at `sequence`.
+async fn suspend_on(f: &Fixture, claim: &RunRow, sequence: i32, key: &str) -> WaitingRun {
+    let mut wait = step(claim, sequence, "approved", StepStatus::Pending);
+    wait.kind = StepKind::Wait;
+    wait.result = StoredPayload::default();
+    f.store.record_step(wait, LIMITS).await.unwrap();
+    f.store
+        .release(
+            claim.id,
+            claim.lease_token,
+            Release::Wait {
+                sequence,
+                event: "approved".into(),
+                key: key.into(),
+                timeout_at: None,
+            },
+        )
+        .await
+        .unwrap();
+    let waiting = f
+        .store
+        .waiting_runs(f.environment_id, "approved", key, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(waiting.len(), 1);
+    assert_eq!(waiting[0].lease, claim.lease_token);
+    waiting[0].clone()
+}
+
+async fn approved_event(f: &Fixture, key: &str) -> i64 {
+    f.store
+        .insert_event(NewEvent {
+            project_id: f.project_id,
+            environment_id: f.environment_id,
+            name: "approved".into(),
+            key: key.into(),
+            payload: StoredPayload::default(),
+            source: "api",
+            source_run_id: None,
+        })
+        .await
+        .unwrap()
+}
+
+fn sealed(bytes: i32) -> StoredPayload {
+    StoredPayload {
+        encrypted: Some("sealed".into()),
+        blob_key: None,
+        bytes,
+    }
+}
+
+#[tokio::test]
+async fn a_late_delivery_cannot_complete_a_later_wait_or_a_cancelled_run() {
+    let Some(f) = fixture("late delivery test").await else {
+        return;
+    };
+    let run = f.start("approval").await;
+    let first = f.claim_one().await.run;
+    // A delivery reads the waiting run, then lags.
+    let stale = suspend_on(&f, &first, 0, "order-7").await;
+    let event = approved_event(&f, "order-7").await;
+    assert_eq!(
+        f.store
+            .complete_wait(&stale, Some(event), sealed(4), 1 << 20)
+            .await
+            .unwrap(),
+        WaitCompletion::Completed
+    );
+
+    // The run resumes and waits again for the same name and key.
+    let second = f.claim_one().await.run;
+    let current = suspend_on(&f, &second, 1, "order-7").await;
+    // The lagging delivery of the same event changes nothing...
+    assert_eq!(
+        f.store
+            .complete_wait(&stale, Some(event), sealed(4), 1 << 20)
+            .await
+            .unwrap(),
+        WaitCompletion::NotWaiting
+    );
+    // ...and the event the run already consumed cannot satisfy the new wait.
+    assert_eq!(
+        f.store
+            .complete_wait(&current, Some(event), sealed(4), 1 << 20)
+            .await
+            .unwrap(),
+        WaitCompletion::NotWaiting
+    );
+    assert_eq!(
+        f.store.step(run.id, 1).await.unwrap().unwrap().status,
+        "pending"
+    );
+
+    // Cancelled: a delivery read before the cancel changes nothing either.
+    let another = approved_event(&f, "order-7").await;
+    f.store.cancel_run(run.id).await.unwrap().unwrap();
+    assert_eq!(
+        f.store
+            .complete_wait(&current, Some(another), sealed(4), 1 << 20)
+            .await
+            .unwrap(),
+        WaitCompletion::NotWaiting
+    );
+    assert_eq!(
+        f.store.step(run.id, 1).await.unwrap().unwrap().status,
+        "pending"
+    );
+    assert_eq!(
+        f.store.get_run(run.id).await.unwrap().unwrap().status,
+        "cancelled"
+    );
+
+    // Retried from the wait: the new suspension has a new lease, so the
+    // delivery read before the retry still cannot complete it.
+    f.store.retry_from(run.id, 1).await.unwrap().unwrap();
+    let third = f.claim_one().await.run;
+    let replaced = suspend_on(&f, &third, 1, "order-7").await;
+    assert_ne!(replaced.lease, current.lease);
+    assert_eq!(
+        f.store
+            .complete_wait(&current, Some(another), sealed(4), 1 << 20)
+            .await
+            .unwrap(),
+        WaitCompletion::NotWaiting
+    );
+    assert_eq!(
+        f.store
+            .complete_wait(&replaced, Some(another), sealed(4), 1 << 20)
+            .await
+            .unwrap(),
+        WaitCompletion::Completed
+    );
+}
+
+#[tokio::test]
+async fn a_delivered_wait_honours_the_journal_quota_and_marks_blob_payloads() {
+    let Some(f) = fixture("wait quota test").await else {
+        return;
+    };
+    let run = f.start("approval").await;
+    let claim = f.claim_one().await.run;
+    let waiting = suspend_on(&f, &claim, 0, "order-9").await;
+    let event = approved_event(&f, "order-9").await;
+    assert_eq!(
+        f.store
+            .complete_wait(&waiting, Some(event), sealed(2048), 1024)
+            .await
+            .unwrap(),
+        WaitCompletion::OverQuota {
+            journal_bytes: 0,
+            result_bytes: 2048
+        }
+    );
+    let after = f.store.get_run(run.id).await.unwrap().unwrap();
+    assert_eq!(after.journal_bytes, 0);
+    assert_eq!(after.status, "waiting");
+    assert_eq!(
+        f.store.step(run.id, 0).await.unwrap().unwrap().status,
+        "pending"
+    );
+
+    // Within the quota, with a result spilled to blob storage: the run is
+    // marked so deleting it removes the blob.
+    assert!(!after.has_blob_payloads);
+    let spilled = StoredPayload {
+        encrypted: None,
+        blob_key: Some(format!("workflows/{}/{}/wait", f.environment_id, run.id)),
+        bytes: 512,
+    };
+    assert_eq!(
+        f.store
+            .complete_wait(&waiting, Some(event), spilled, 1024)
+            .await
+            .unwrap(),
+        WaitCompletion::Completed
+    );
+    let delivered = f.store.get_run(run.id).await.unwrap().unwrap();
+    assert_eq!(delivered.journal_bytes, 512);
+    assert!(delivered.has_blob_payloads);
+}
+
+#[tokio::test]
+async fn an_over_quota_wait_fails_only_the_run_still_suspended_on_it() {
+    let Some(f) = fixture("fail wait test").await else {
+        return;
+    };
+    let run = f.start("approval").await;
+    let claim = f.claim_one().await.run;
+    let waiting = suspend_on(&f, &claim, 0, "order-10").await;
+    let stale = WaitingRun {
+        lease: waiting.lease - 1,
+        ..waiting.clone()
+    };
+    assert_eq!(
+        f.store
+            .fail_wait(&stale, sealed(8), "quota_exceeded")
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        f.store
+            .fail_wait(&waiting, sealed(8), "quota_exceeded")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("approval")
+    );
+    let failed = f.store.get_run(run.id).await.unwrap().unwrap();
+    assert_eq!(failed.status, "failed");
+    assert_eq!(failed.error_kind.as_deref(), Some("quota_exceeded"));
+    assert!(failed.awaited_event_name.is_none());
+}
+
+#[tokio::test]
+async fn a_retried_step_is_charged_only_for_its_latest_error() {
+    let Some(f) = fixture("retry error bytes test").await else {
+        return;
+    };
+    let run = f.start("flaky").await;
+    let claim = f.claim_one().await.run;
+    let limits = StepLimits {
+        max_steps: 3,
+        max_journal_bytes: 1024,
+        lease_secs: 120,
+    };
+    for attempt in 1..=3 {
+        let mut failing = step(&claim, 0, "charge", StepStatus::Pending);
+        failing.attempts = attempt;
+        failing.result = StoredPayload::default();
+        failing.error = sealed(600);
+        f.store.record_step(failing, limits).await.unwrap();
+        let charged = f
+            .store
+            .get_run(run.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .journal_bytes;
+        assert_eq!(
+            charged, 600,
+            "attempt {attempt} kept an earlier error charged"
+        );
+    }
+    let done = step(&claim, 0, "charge", StepStatus::Completed);
+    f.store.record_step(done, limits).await.unwrap();
+    let after = f.store.get_run(run.id).await.unwrap().unwrap();
+    assert_eq!(after.journal_bytes, 10);
+}
+
+#[tokio::test]
+async fn retrying_from_the_end_of_the_journal_keeps_a_pending_error_charged() {
+    let Some(f) = fixture("retry keeps error bytes test").await else {
+        return;
+    };
+    let run = f.start("flaky").await;
+    let claim = f.claim_one().await.run;
+    let limits = StepLimits {
+        max_steps: 3,
+        max_journal_bytes: 1024,
+        lease_secs: 120,
+    };
+    let mut failing = step(&claim, 0, "charge", StepStatus::Pending);
+    failing.result = StoredPayload::default();
+    failing.error = sealed(600);
+    f.store.record_step(failing, limits).await.unwrap();
+    f.store.cancel_run(run.id).await.unwrap().unwrap();
+    // From the end of the journal: the pending entry, and its error, stay.
+    let retried = f.store.retry_from(run.id, 1).await.unwrap().unwrap();
+    assert_eq!(retried.step_count, 1);
+    assert_eq!(retried.journal_bytes, 600);
+
+    let again = f.claim_one().await.run;
+    f.store
+        .record_step(step(&again, 0, "charge", StepStatus::Completed), limits)
+        .await
+        .unwrap();
+    assert_eq!(
+        f.store
+            .get_run(run.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .journal_bytes,
+        10
+    );
+}
+
+#[tokio::test]
+async fn an_event_name_as_long_as_the_api_allows_is_stored() {
+    let Some(f) = fixture("event name length test").await else {
+        return;
+    };
+    let name = "a".repeat(crate::types::MAX_EVENT_NAME);
+    crate::types::validate_name("event name", &name, crate::types::MAX_EVENT_NAME).unwrap();
+    let id = f
+        .store
+        .insert_event(NewEvent {
+            project_id: f.project_id,
+            environment_id: f.environment_id,
+            name: name.clone(),
+            key: String::new(),
+            payload: StoredPayload::default(),
+            source: "api",
+            source_run_id: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(f.store.event(id).await.unwrap().unwrap().name, name);
 }
 
 #[tokio::test]

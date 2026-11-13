@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use axum::response::IntoResponse;
@@ -14,8 +15,8 @@ use axum::Json;
 use temps_core::problemdetails::Problem;
 use uuid::Uuid;
 
-use super::bearer;
 use super::types::*;
+use super::{bearer, json_body};
 use crate::protocol::{
     HeartbeatResponse, InvocationKeyResponse, JournalPage, OutcomeRequest, OutcomeResponse,
     StepWriteRequest, StepWriteResponse,
@@ -99,9 +100,11 @@ pub async fn record_run_step(
     State(state): AppState,
     headers: HeaderMap,
     Path(run_id): Path<Uuid>,
-    Json(write): Json<StepWriteRequest>,
+    body: Body,
 ) -> Result<impl IntoResponse, Problem> {
     let token = bearer(&headers)?;
+    state.engine.verify_invocation_token(token, run_id)?;
+    let write: StepWriteRequest = json_body(body).await?;
     let response = state.engine.record_step(token, run_id, write).await?;
     Ok(Json(response))
 }
@@ -147,9 +150,11 @@ pub async fn report_run_outcome(
     State(state): AppState,
     headers: HeaderMap,
     Path(run_id): Path<Uuid>,
-    Json(request): Json<OutcomeRequest>,
+    body: Body,
 ) -> Result<impl IntoResponse, Problem> {
     let token = bearer(&headers)?;
+    state.engine.verify_invocation_token(token, run_id)?;
+    let request: OutcomeRequest = json_body(body).await?;
     Ok(Json(
         state.engine.report_outcome(token, run_id, request).await?,
     ))

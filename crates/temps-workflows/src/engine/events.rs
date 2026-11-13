@@ -16,12 +16,13 @@ use std::sync::Arc;
 use serde_json::Value;
 use uuid::Uuid;
 
+use super::outcome::fit_message;
 use super::WorkflowEngine;
 use crate::error::{WorkflowError, WorkflowResult};
 use crate::payload::{PayloadField, StoredPayload};
 use crate::protocol::wait_result;
-use crate::store::{EventRow, NewEvent, WaitingRun};
-use crate::types::{validate_key, validate_name, WorkflowSettings};
+use crate::store::{EventRow, NewEvent, WaitCompletion, WaitingRun};
+use crate::types::{validate_key, validate_name, WorkflowSettings, MAX_EVENT_NAME};
 
 /// Waiting runs handled per page of a delivery.
 const DELIVERY_PAGE: u64 = 100;
@@ -68,7 +69,7 @@ impl WorkflowEngine {
     }
 
     pub(crate) async fn seal_event(&self, spec: EventSpec<'_>) -> WorkflowResult<NewEvent> {
-        validate_name("event name", spec.name, 200)?;
+        validate_name("event name", spec.name, MAX_EVENT_NAME)?;
         if !spec.key.is_empty() {
             validate_key("event key", spec.key)?;
         }
@@ -168,19 +169,34 @@ impl WorkflowEngine {
         Ok(delivery)
     }
 
-    /// Store an event then deliver it in the background, bounded by the
-    /// caller's own rate (one task per accepted event).
+    /// Deliver an event in the background (one sent by a workflow step).
+    /// At most [`super::MAX_BACKGROUND_DELIVERIES`] run at once; past that
+    /// the delivery is deferred, counted, and made by the reconciliation
+    /// pass, so a burst of events cannot grow tasks or memory without bound.
     pub(crate) fn deliver_in_background(self: &Arc<Self>, event: EventRow) {
+        let Ok(permit) = self.deliveries.clone().try_acquire_owned() else {
+            self.metrics
+                .delivery_deferred(event.project_id, event.environment_id);
+            tracing::warn!(
+                event_id = event.id,
+                environment_id = event.environment_id,
+                "background event deliveries are saturated; reconciliation delivers this event"
+            );
+            return;
+        };
         let engine = self.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             if let Err(error) = engine.deliver_event(&event).await {
                 tracing::warn!(event_id = event.id, %error, "workflow event delivery failed; reconciliation retries it");
             }
         });
     }
 
-    /// Complete one run's wait with `payload`. False when the wait was no
-    /// longer pending (delivered already, timed out, run cancelled).
+    /// Complete one run's wait with `payload`. False when the run was no
+    /// longer suspended on that wait (delivered already, timed out, run
+    /// cancelled or retried, event already consumed) or the result would
+    /// break its journal quota, which fails the run with the reason.
     async fn deliver_to(
         &self,
         waiting: &WaitingRun,
@@ -207,16 +223,33 @@ impl WorkflowEngine {
         let completed = self
             .store
             .complete_wait(
-                waiting.run_id,
-                waiting.sequence,
+                waiting,
                 Some(event_id),
                 sealed.clone(),
+                settings.max_journal_bytes_per_run,
             )
             .await;
         match completed {
-            Ok(true) => Ok(true),
-            Ok(false) => {
+            Ok(WaitCompletion::Completed) => Ok(true),
+            Ok(WaitCompletion::NotWaiting) => {
                 self.codec.discard(waiting.project_id, &sealed).await;
+                Ok(false)
+            }
+            Ok(WaitCompletion::OverQuota {
+                journal_bytes,
+                result_bytes,
+            }) => {
+                self.codec.discard(waiting.project_id, &sealed).await;
+                let message = format!(
+                    "event {event_id} could not be delivered to wait '{}' (entry {}) of run {}: \
+                     its {result_bytes}-byte result would take the journal past the \
+                     max_journal_bytes_per_run quota of {} bytes (it holds {journal_bytes})",
+                    waiting.event_name,
+                    waiting.sequence,
+                    waiting.run_id,
+                    settings.max_journal_bytes_per_run,
+                );
+                self.fail_wait(waiting, &scope, &message, &settings).await?;
                 Ok(false)
             }
             Err(error) => {
@@ -224,6 +257,50 @@ impl WorkflowEngine {
                 Err(error)
             }
         }
+    }
+
+    /// Fail a run suspended on `waiting` because of what was delivered.
+    async fn fail_wait(
+        &self,
+        waiting: &WaitingRun,
+        scope: &crate::payload::PayloadScope,
+        message: &str,
+        settings: &WorkflowSettings,
+    ) -> WorkflowResult<()> {
+        let inline = inline_only(settings);
+        let limit = usize::try_from(inline.inline_payload_limit_bytes).unwrap_or(1024);
+        let error = self
+            .codec
+            .seal(
+                scope,
+                &PayloadField::RunError,
+                &Value::String(fit_message(message, limit)),
+                waiting.lease,
+                &inline,
+            )
+            .await?;
+        let Some(workflow) = self
+            .store
+            .fail_wait(waiting, error, "quota_exceeded")
+            .await?
+        else {
+            return Ok(());
+        };
+        self.metrics.run_finished(
+            waiting.project_id,
+            waiting.environment_id,
+            &workflow,
+            "failed",
+        );
+        tracing::warn!(
+            run_id = %waiting.run_id,
+            project_id = waiting.project_id,
+            environment_id = waiting.environment_id,
+            workflow = %workflow,
+            error_kind = "quota_exceeded",
+            "workflow run failed: a delivered event exceeded its journal quota"
+        );
+        Ok(())
     }
 
     /// A run just suspended on `name`/`key`: deliver an event it already

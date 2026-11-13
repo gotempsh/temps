@@ -31,6 +31,8 @@ pub struct Model {
     pub result_bytes: i32,
     #[serde(skip_serializing)]
     pub error_encrypted: Option<String>,
+    /// Plaintext size of the error, charged to the run's journal size.
+    pub error_bytes: i32,
     /// The lease that recorded the entry.
     pub lease_token: i64,
     /// The event a `wait` entry consumed.

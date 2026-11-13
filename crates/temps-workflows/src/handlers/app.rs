@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use axum::body::Body;
 use axum::extract::{Extension, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
@@ -17,7 +18,7 @@ use uuid::Uuid;
 
 use super::audit::*;
 use super::types::*;
-use super::{audit_context, bearer, record_audit};
+use super::{audit_context, bearer, json_body, record_audit};
 use crate::service::StartRun;
 use crate::store::{CredentialRow, RunRow, Starter};
 use crate::types::RunStatus;
@@ -68,9 +69,10 @@ pub async fn app_start_workflow_run(
     State(state): AppState,
     metadata: Option<Extension<RequestMetadata>>,
     headers: HeaderMap,
-    Json(request): Json<StartWorkflowRunRequest>,
+    body: Body,
 ) -> Result<impl IntoResponse, Problem> {
     let credential = credential(&state, &headers).await?;
+    let request: StartWorkflowRunRequest = json_body(body).await?;
     let (run, created) = state
         .service
         .start(

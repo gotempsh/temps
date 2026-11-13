@@ -524,6 +524,103 @@ async fn an_event_sent_before_the_run_suspends_is_picked_up_when_it_does() {
 }
 
 #[tokio::test]
+async fn saturated_background_deliveries_are_left_to_reconciliation() {
+    let Some(h) = harness(
+        "deferred delivery test",
+        &["approval"],
+        waiting_script(),
+        true,
+    )
+    .await
+    else {
+        return;
+    };
+    let id = h.start("approval", json!(null)).await;
+    h.tick().await;
+    assert_eq!(h.run(id).await.status, "waiting");
+    let event = h
+        .engine
+        .store_event(EventSpec {
+            project_id: h.env.project_id,
+            environment_id: h.env.environment_id,
+            name: "approved",
+            key: "order-1",
+            payload: None,
+            source: "workflow",
+            source_run_id: None,
+        })
+        .await
+        .unwrap();
+    // Every background delivery slot is taken: this one is not spawned.
+    let held = h
+        .engine
+        .deliveries
+        .clone()
+        .acquire_many_owned(MAX_BACKGROUND_DELIVERIES as u32)
+        .await
+        .unwrap();
+    h.engine.deliver_in_background(event);
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(h.run(id).await.status, "waiting");
+    drop(held);
+    // The reconciliation pass delivers it.
+    assert_eq!(h.engine.reconcile_waits(10).await.unwrap(), 1);
+    h.tick().await;
+    assert_eq!(h.run(id).await.status, "completed");
+}
+
+#[tokio::test]
+async fn an_event_over_the_journal_quota_fails_the_waiting_run_with_the_reason() {
+    let Some(h) = harness("event quota test", &["approval"], waiting_script(), true).await else {
+        return;
+    };
+    let settings = WorkflowSettings {
+        max_journal_bytes_per_run: 1024,
+        ..WorkflowSettings::default()
+    };
+    h.store
+        .upsert_settings(h.env.project_id, h.env.environment_id, &settings)
+        .await
+        .unwrap();
+    let id = h.start("approval", json!(null)).await;
+    h.tick().await;
+    assert_eq!(h.run(id).await.status, "waiting");
+    let payload = json!("p".repeat(2048));
+    let event = h
+        .engine
+        .store_event(EventSpec {
+            project_id: h.env.project_id,
+            environment_id: h.env.environment_id,
+            name: "approved",
+            key: "order-1",
+            payload: Some(&payload),
+            source: "api",
+            source_run_id: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(h.engine.deliver_event(&event).await.unwrap().delivered, 0);
+    let run = h.run(id).await;
+    assert_eq!(run.status, "failed");
+    assert_eq!(run.error_kind.as_deref(), Some("quota_exceeded"));
+    assert!(run.journal_bytes <= 1024);
+    let error = h
+        .codec
+        .open(
+            &WorkflowEngine::scope(&run),
+            &PayloadField::RunError,
+            &run_error(&run),
+            &WorkflowSettings::default(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let message = error.as_str().unwrap();
+    assert!(message.contains("max_journal_bytes_per_run"), "{message}");
+    assert!(message.contains(&event.id.to_string()), "{message}");
+}
+
+#[tokio::test]
 async fn nothing_to_invoke_blocks_the_run_without_spending_an_attempt() {
     let script: Script = Arc::new(|_, _, _| Box::pin(async { Reply::Status(500) }));
     let Some(h) = harness("blocked test", &["orders"], script, false).await else {
@@ -786,6 +883,83 @@ async fn a_retried_step_write_keeps_the_blob_result_the_first_write_committed() 
         1,
         "the losing write's object was not discarded"
     );
+}
+
+#[tokio::test]
+async fn journal_pages_count_error_bytes_toward_their_size_limit() {
+    use sea_orm::ConnectionTrait as _;
+
+    let script: Script = Arc::new(|_, _, _| Box::pin(async { Reply::Status(500) }));
+    let Some(h) = harness("journal page size test", &["reports"], script, true).await else {
+        return;
+    };
+    let id = h.start("reports", json!(null)).await;
+    let claims = h.engine.claim(10).await.unwrap();
+    let run = claims.into_iter().find(|c| c.run.id == id).unwrap().run;
+    let settings = WorkflowSettings::default();
+    for sequence in 0..3 {
+        let result = h
+            .codec
+            .seal(
+                &WorkflowEngine::scope(&run),
+                &PayloadField::StepResult(sequence),
+                &json!(sequence),
+                run.lease_token,
+                &settings,
+            )
+            .await
+            .unwrap();
+        h.store
+            .record_step(
+                crate::store::StepRecord {
+                    run_id: run.id,
+                    lease: run.lease_token,
+                    sequence,
+                    name: format!("s{sequence}"),
+                    kind: StepKind::Step,
+                    status: StepStatus::Completed,
+                    attempts: 1,
+                    result,
+                    error: crate::payload::StoredPayload::default(),
+                    wake_at: None,
+                    duration_ms: None,
+                    trace_id: None,
+                    error_ref: None,
+                    event: None,
+                },
+                crate::store::StepLimits {
+                    max_steps: 10,
+                    max_journal_bytes: i64::MAX,
+                    lease_secs: 120,
+                },
+            )
+            .await
+            .unwrap();
+    }
+    // The recorded sizes decide where a page ends. A real error is at most
+    // 64 KiB, so reaching the page limit takes over a hundred failed
+    // attempts; two entries charged 5 MiB of error each stand in for them.
+    // Their results alone are a few bytes.
+    h.env
+        .conn
+        .execute(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DbBackend::Postgres,
+            "UPDATE workflow_steps SET error_bytes = $2 WHERE run_id = $1 AND sequence IN (0, 1)",
+            vec![run.id.into(), (5 * 1024 * 1024_i32).into()],
+        ))
+        .await
+        .unwrap();
+
+    let (first, next) = h.engine.journal_entries(&run, 0, &settings).await.unwrap();
+    assert_eq!(
+        first.iter().map(|e| e.sequence).collect::<Vec<_>>(),
+        [0],
+        "the page went past {JOURNAL_PAGE_BYTES} bytes"
+    );
+    assert_eq!(next, Some(1));
+    let (rest, next) = h.engine.journal_entries(&run, 1, &settings).await.unwrap();
+    assert_eq!(rest.iter().map(|e| e.sequence).collect::<Vec<_>>(), [1, 2]);
+    assert_eq!(next, None);
 }
 
 #[tokio::test]

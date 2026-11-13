@@ -244,6 +244,28 @@ describe('replay', () => {
       });
       expect(result).toMatchObject({ type: 'unavailable' });
     }
+    // A success whose body breaks off is an outage too, never a failed run:
+    // the step may have committed.
+    const cutOff = new ExecutorTransport({
+      apiUrl: 'http://t',
+      attempts: 2,
+      backoffMs: 1,
+      fetch: async () =>
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.error(new TypeError('terminated'));
+            },
+          }),
+          { status: 200 },
+        ),
+    });
+    const interrupted = await runInvocation(quick, invokeRequest('quick', 60_000), {
+      transport: cutOff,
+      telemetry: new Telemetry({ tracer: false }),
+      token: 't',
+    });
+    expect(interrupted).toMatchObject({ type: 'unavailable' });
     // A refusal about the run itself still fails it, with the reason.
     const refusing = new ExecutorTransport({
       apiUrl: 'http://t',
