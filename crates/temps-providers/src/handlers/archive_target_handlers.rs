@@ -7,8 +7,10 @@
 //! POST /external-services/{id}/wal-archive/test   run WAL-G's write check (audited)
 //! ```
 //!
-//! WAL-G writes, reads back and deletes a small probe object in the service's
-//! own WAL-G prefix, with exactly the settings `walg.env` holds. A target that
+//! WAL-G writes a small probe object to one fixed key in the service's own
+//! WAL-G prefix, with exactly the settings `walg.env` holds, then tries to
+//! remove it (best effort: a credential that may write but not delete still
+//! passes, and the next check overwrites the same key). A target that
 //! refuses is a `200` with `ok: false` and WAL-G's error, so the console can
 //! show it next to the button.
 
@@ -35,7 +37,10 @@ use crate::services::{ArchiveTargetTestError, ArchiveTargetTestOutcome};
 /// What WAL-G said about a service's archive target.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ArchiveTargetTestResponse {
-    /// Whether WAL-G could write, read back and delete a probe object.
+    /// Whether WAL-G could write a probe object to the archive target, which
+    /// is what `archive_command` needs. The object is never read back, and
+    /// its removal afterwards is best effort: `ok` says nothing about read
+    /// or delete permission.
     pub ok: bool,
     /// The S3 source WAL is archived to.
     pub s3_source_id: i32,
@@ -94,6 +99,11 @@ impl From<ArchiveTargetTestError> for Problem {
             ArchiveTargetTestError::Cluster { .. } => problemdetails::new(StatusCode::CONFLICT)
                 .with_title("No Continuous Archiving On Clusters")
                 .with_detail(error.to_string()),
+            ArchiveTargetTestError::LocalWorkloadsDisabled { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Local Workloads Disabled")
+                    .with_detail(error.to_string())
+            }
             ArchiveTargetTestError::NotConfigured { .. } => {
                 problemdetails::new(StatusCode::CONFLICT)
                     .with_title("WAL Archiving Not Configured")
@@ -129,8 +139,8 @@ impl From<ArchiveTargetTestError> for Problem {
     }
 }
 
-/// An operator ran the archive target check, which writes and deletes a
-/// probe object in the service's WAL-G prefix. Records the outcome and the
+/// An operator ran the archive target check, which writes a probe object to
+/// the service's WAL-G prefix and tries to remove it. Records the outcome and the
 /// settings checked; never a credential.
 #[derive(Debug, Clone, Serialize)]
 pub struct ExternalServiceArchiveTargetTestedAudit {
@@ -176,7 +186,7 @@ impl AuditOperation for ExternalServiceArchiveTargetTestedAudit {
         (status = 401, description = "Unauthorized", body = temps_core::problemdetails::ProblemDetails),
         (status = 403, description = "Insufficient permissions", body = temps_core::problemdetails::ProblemDetails),
         (status = 404, description = "Service not found", body = temps_core::problemdetails::ProblemDetails),
-        (status = 409, description = "Archiving is not set up, its S3 source is gone, or the service runs on a worker node", body = temps_core::problemdetails::ProblemDetails),
+        (status = 409, description = "Archiving is not set up, its S3 source is gone, the service runs on a worker node, it is a cluster (no continuous archiving), or local workloads are disabled", body = temps_core::problemdetails::ProblemDetails),
         (status = 500, description = "The check could not run", body = temps_core::problemdetails::ProblemDetails)
     ),
     security(("bearer_auth" = []))
@@ -187,7 +197,8 @@ pub async fn test_wal_archive_target(
     Path(id): Path<i32>,
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
-    // The check writes (and deletes) an object in the service's archive.
+    // The check writes (and tries to delete) an object in the service's
+    // archive.
     permission_guard!(auth, ExternalServicesWrite);
     super::metrics_handlers::assert_service_permission_for_caller(
         id,
@@ -336,6 +347,15 @@ mod tests {
         audit: RecordingAuditLogger,
         project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
     ) -> Arc<AppState> {
+        state_with_policy(db, audit, project_access_checker, true)
+    }
+
+    fn state_with_policy(
+        db: MockDatabase,
+        audit: RecordingAuditLogger,
+        project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
+        local_workloads_enabled: bool,
+    ) -> Arc<AppState> {
         let db = Arc::new(db.into_connection());
         let encryption = Arc::new(temps_core::EncryptionService::new_from_password(
             "archive-target-handler-test",
@@ -348,7 +368,7 @@ mod tests {
             db.clone(),
             encryption,
             docker,
-            true,
+            local_workloads_enabled,
             Arc::new(temps_dns::DnsRegistry::new(db.clone())),
         ));
         Arc::new(AppState {
@@ -649,6 +669,33 @@ mod tests {
         assert!(audit.operations.lock().unwrap().is_empty());
     }
 
+    /// With local workloads disabled (and no Docker either), the operator
+    /// sees the policy, not a capability error.
+    #[tokio::test]
+    async fn a_profile_without_local_workloads_is_refused_as_policy() {
+        let audit = RecordingAuditLogger::default();
+        let mut svc = service("postgres");
+        svc.continuous_archive_s3_source_id = Some(3);
+        let app = state_with_policy(owned_then_loaded(&svc), audit.clone(), None, false);
+        let (status, body) = body_json(
+            test_wal_archive_target(
+                RequireAuth(auth(temps_auth::Role::Admin)),
+                State(app),
+                Path(7),
+                Extension(metadata()),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["title"], "Local Workloads Disabled");
+        assert!(body["detail"]
+            .as_str()
+            .unwrap()
+            .contains("local workloads disabled"));
+        assert!(audit.operations.lock().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn a_non_postgres_service_is_a_bad_request() {
         let app = state(
@@ -685,6 +732,10 @@ mod tests {
             ),
             (
                 ArchiveTargetTestError::Cluster { service_id: 7 },
+                StatusCode::CONFLICT,
+            ),
+            (
+                ArchiveTargetTestError::LocalWorkloadsDisabled { service_id: 7 },
                 StatusCode::CONFLICT,
             ),
             (

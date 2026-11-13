@@ -46,6 +46,8 @@ pub enum ArchiveTargetTestError {
     },
     #[error("PostgreSQL service {service_id} is a cluster; its backups push base backups only, without continuous WAL archiving, so there is no archive target to test")]
     Cluster { service_id: i32 },
+    #[error("PostgreSQL service {service_id} runs on this host, and this Temps runs with local workloads disabled, so it does not run commands in local containers; enable local workloads to test its archive target")]
+    LocalWorkloadsDisabled { service_id: i32 },
     #[error("PostgreSQL service {service_id} has no WAL archive target yet; run a backup of it to turn continuous archiving on")]
     NotConfigured { service_id: i32 },
     #[error("WAL archive target of PostgreSQL service {service_id} is S3 source {s3_source_id}, which no longer exists")]
@@ -105,6 +107,11 @@ impl ExternalServiceManager {
                 service_id,
                 node_id,
             });
+        }
+        // The check runs in a local container: a profile that forbids local
+        // workloads refuses it as policy, before Docker is ever asked for.
+        if !self.local_workloads_enabled {
+            return Err(ArchiveTargetTestError::LocalWorkloadsDisabled { service_id });
         }
         let s3_source_id = service
             .continuous_archive_s3_source_id
