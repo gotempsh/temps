@@ -383,12 +383,19 @@ pub fn sts_target(endpoint: Option<&str>, region: &str) -> StsTarget {
         host: format!("sts.{region}.amazonaws.com"),
         region,
     };
-    let Some(endpoint) = endpoint.map(str::trim).filter(|e| !e.is_empty()) else {
+    // The same URL every S3 client gets for this stored value: a bare
+    // `host:port` is `http://`, so STS on the store is reached the way its
+    // S3 API is.
+    let Some(endpoint) = endpoint
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .map(temps_core::s3_endpoint::endpoint_url)
+    else {
         return aws(region);
     };
     let (scheme, rest) = match endpoint.split_once("://") {
         Some((scheme, rest)) => (scheme.to_ascii_lowercase(), rest),
-        None => ("https".to_string(), endpoint),
+        None => ("https".to_string(), endpoint.as_str()),
     };
     let authority = rest.split('/').next().unwrap_or_default();
     let host = authority
@@ -1028,6 +1035,28 @@ mod tests {
         assert!(matches!(
             sts_target(Some("ftp://store"), "x"),
             StsTarget::None { .. }
+        ));
+    }
+
+    /// A bare stored endpoint is plain HTTP for every S3 client, so its STS
+    /// is too; a TLS store spells out `https://`.
+    #[test]
+    fn a_bare_endpoint_reaches_sts_the_way_s3_clients_do() {
+        assert_eq!(
+            sts_target(Some("10.0.0.5:9000"), ""),
+            StsTarget::AssumeRole {
+                url: "http://10.0.0.5:9000/".to_string(),
+                host: "10.0.0.5:9000".to_string(),
+                region: "us-east-1".to_string(),
+            }
+        );
+        assert!(matches!(
+            sts_target(Some("https://objects.example.com"), ""),
+            StsTarget::AssumeRole { url, .. } if url == "https://objects.example.com/"
+        ));
+        assert!(matches!(
+            sts_target(Some("s3.eu-west-1.amazonaws.com"), "eu-west-1"),
+            StsTarget::AwsFederation { .. }
         ));
     }
 
