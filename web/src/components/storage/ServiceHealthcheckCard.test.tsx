@@ -242,6 +242,20 @@ test('a host whose Docker ignores the start interval says so', () => {
   ).toBeTruthy()
 })
 
+test('a host whose Docker ignores the start interval shows no running start interval', () => {
+  // Such a daemon is sent the start interval as the interval, and reads the
+  // start interval back as 0.
+  const view = renderView({
+    ...STANDALONE,
+    running: { ...BUILTIN, interval_secs: 2, start_interval_secs: 0 },
+    pending_recreate: false,
+    start_interval_supported: false,
+  })
+  expect(view.getByText('Applied')).toBeTruthy()
+  expect(view.queryByText('Running: 0s')).toBeNull()
+  expect(view.getByText('Running: 2s')).toBeTruthy()
+})
+
 test('a start period of 0 with a long interval is refused before Save', async () => {
   const onSave = mock((_: HealthcheckOverrides) => {})
   const view = renderView(STANDALONE, { onSave })

@@ -118,7 +118,13 @@ export function ServiceHealthcheckView({
       <dl className="grid grid-cols-2 gap-3 text-sm md:grid-cols-5">
         {HEALTHCHECK_FIELDS.map((spec) => {
           const value = effective.timings[spec.field]
-          const runningValue = running?.[spec.field]
+          // A daemon that ignores the start interval does not store it, so
+          // the running container has none to show.
+          const runningValue =
+            spec.field === 'start_interval_secs' &&
+            healthcheck.start_interval_supported === false
+              ? undefined
+              : running?.[spec.field]
           return (
             <div key={spec.field} className="space-y-1">
               <dt className="text-muted-foreground">{spec.label}</dt>
