@@ -13,9 +13,11 @@
     reason = "temps-cli is the bootstrap binary: it parses process arguments and bootstrap environment (database URL, data dir, listen addresses) before any database exists, and may use anyhow::Context (CLAUDE.md)"
 )]
 pub mod commands;
-mod database_url_source;
+pub(crate) mod database_url_source;
 mod docker_context;
 pub mod otel_export;
+pub(crate) mod server_secrets;
+pub(crate) mod service_definition;
 
 use clap::{Parser, Subcommand};
 use commands::{

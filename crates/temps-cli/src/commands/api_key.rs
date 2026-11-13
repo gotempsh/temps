@@ -26,8 +26,9 @@ pub enum OutputFormat {
 #[derive(Args)]
 pub struct ApiKeyCommand {
     /// Database connection URL. Prefer TEMPS_DATABASE_URL (or TEMPS_DATABASE_URL_FILE / the systemd credential temps_database_url): the flag form puts the password in the process command line
+    /// When unset, the installed `temps serve` service's URL is used.
     #[arg(long, env = "TEMPS_DATABASE_URL", hide_env_values = true)]
-    pub database_url: String,
+    pub database_url: Option<String>,
 
     /// Name for the API key (for identification)
     #[arg(long)]
@@ -61,9 +62,15 @@ impl ApiKeyCommand {
     pub fn execute(self) -> anyhow::Result<()> {
         debug!("Creating API key with role: {}", self.role);
 
+        let database = crate::database_url_source::resolve_database_url(
+            self.database_url.as_deref(),
+            crate::database_url_source::UrlDiscovery::InstalledService,
+        )?;
+        database.announce_discovery();
+
         // Create tokio runtime for database connection
         let rt = tokio::runtime::Runtime::new()?;
-        let db = rt.block_on(temps_schema::establish_connection(&self.database_url))?;
+        let db = rt.block_on(temps_schema::establish_connection(database.url()))?;
 
         // Find the user to associate the API key with
         let user = rt.block_on(async {

@@ -9,7 +9,7 @@
 //!
 //! ```text
 //!   1. Download the new temps binary
-//!   2. TEMPS_DATABASE_URL=... temps migrate   # apply schema changes, server down
+//!   2. temps migrate                          # apply schema changes, server down
 //!   3. Restart the server with the new binary
 //! ```
 //!
@@ -21,6 +21,15 @@
 //! `temps serve` still applies pending migrations automatically so simple
 //! single-node installs keep their zero-step upgrade; this command is for
 //! operators who want explicit control.
+//!
+//! ## Which database
+//!
+//! The URL comes from `--database-url`, `TEMPS_DATABASE_URL`,
+//! `TEMPS_DATABASE_URL_FILE` or the systemd credential, as for `temps serve`;
+//! when none is set (a shell on the server's host) it is read from the
+//! installed `temps serve` service, together with that server's data
+//! directory, so the step above needs no flags. See
+//! [`crate::database_url_source::resolve_database_url`].
 //!
 //! ## Plan, confirm, apply
 //!
@@ -45,8 +54,9 @@ use tracing::info;
 #[derive(Args)]
 pub struct MigrateCommand {
     /// Database connection URL. Prefer TEMPS_DATABASE_URL (or TEMPS_DATABASE_URL_FILE / the systemd credential temps_database_url): the flag form puts the password in the process command line
+    /// When unset, the installed `temps serve` service's URL is used.
     #[arg(long, env = "TEMPS_DATABASE_URL", hide_env_values = true)]
-    pub database_url: String,
+    pub database_url: Option<String>,
 
     /// Show the pending migrations and exit without applying them.
     #[arg(long)]
@@ -58,7 +68,10 @@ pub struct MigrateCommand {
 
     /// Data directory of the installation (same as `temps serve`). With
     /// `--pre-migration-backup` the backup is written to
-    /// `<data dir>/backups/pre-migration/`. Defaults to `~/.temps`.
+    /// `<data dir>/backups/pre-migration/`. Defaults to the installed
+    /// server's data directory when the database is that server's, else
+    /// `~/.temps`. When it is (or may be) the server's but that directory
+    /// cannot be read, a backup is refused rather than written to `~/.temps`.
     #[arg(long, env = "TEMPS_DATA_DIR")]
     pub data_dir: Option<std::path::PathBuf>,
 
@@ -106,6 +119,17 @@ pub struct MigrateCommand {
     /// ```
     #[arg(long, value_name = "FORMAT")]
     pub progress_format: Option<String>,
+}
+
+/// What `temps migrate` acts on.
+struct MigrateTarget {
+    database: crate::database_url_source::ResolvedDatabaseUrl,
+    /// `--data-dir`, else the installed server's; `None` means `~/.temps`.
+    data_dir: Option<std::path::PathBuf>,
+    /// Why the installed server's data directory is unknown, when this is
+    /// (or may be) its database: a backup in `~/.temps` would land away
+    /// from the server's data, where nobody looks for it.
+    server_data_dir_unknown: Option<String>,
 }
 
 enum MaintenanceRace<T> {
@@ -289,7 +313,39 @@ async fn run_post_migration_maintenance(
 }
 
 impl MigrateCommand {
+    /// The database to migrate and the data directory for its backup, from
+    /// the shared resolver: this command's own sources first, then the
+    /// installed service at `locations` (with that server's data directory).
+    fn target(
+        &self,
+        locations: &crate::service_definition::ServiceLocations,
+    ) -> Result<MigrateTarget, crate::database_url_source::DatabaseUrlNotFound> {
+        let database = crate::database_url_source::resolve_database_url_in(
+            self.database_url.as_deref(),
+            crate::database_url_source::UrlDiscovery::InstalledService,
+            locations,
+        )?;
+        let (service_dir, server_data_dir_unknown) =
+            match crate::server_secrets::service_data_dir(&database) {
+                Ok(dir) => (dir, None),
+                Err(error) => (None, Some(error.to_string())),
+            };
+        Ok(MigrateTarget {
+            data_dir: self.data_dir.clone().or(service_dir),
+            database,
+            server_data_dir_unknown,
+        })
+    }
+
     pub fn execute(self) -> anyhow::Result<()> {
+        let MigrateTarget {
+            database,
+            data_dir: configured_data_dir,
+            server_data_dir_unknown,
+        } = self.target(&crate::service_definition::ServiceLocations::installed())?;
+        database.announce_discovery();
+        let database_url = database.into_url();
+
         // Local runtime — keep execute() synchronous (pingora compatibility).
         let rt = tokio::runtime::Runtime::new()?;
 
@@ -309,7 +365,7 @@ impl MigrateCommand {
             // in-flight migration server-side on Ctrl+C — otherwise the Postgres
             // backend keeps running the DDL after the CLI exits, and a re-run
             // would race a second backend against it.
-            let (db, backend_pid) = temps_database::connect_for_migrate(&self.database_url)
+            let (db, backend_pid) = temps_database::connect_for_migrate(&database_url)
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to connect to database: {}", e))?;
 
@@ -371,13 +427,13 @@ impl MigrateCommand {
                         }
                         _ = tokio::signal::ctrl_c() => {
                             return Err(interrupted_maintenance_error(
-                                &self.database_url, backend_pid, "legacy vault-link backfill",
+                                &database_url, backend_pid, "legacy vault-link backfill",
                             ).await);
                         }
                     }
                     // Non-transactional maintenance must remain retryable even
                     // after every schema migration is already recorded.
-                    run_post_migration_maintenance(&db, &self.database_url, backend_pid, use_json)
+                    run_post_migration_maintenance(&db, &database_url, backend_pid, use_json)
                         .await?;
                     if !use_json {
                         println!("{}", "✓ Post-migration maintenance complete.".green());
@@ -404,6 +460,21 @@ impl MigrateCommand {
                 return Ok(());
             }
 
+            // Only a run that takes the backup writes into the data directory,
+            // so only it is refused over where that would be, and before the
+            // operator is asked to confirm.
+            let data_dir = resolve_data_dir(configured_data_dir.as_deref())?;
+            let policy =
+                crate::commands::schema_upgrade::BackupPolicy::from_flag(self.pre_migration_backup);
+            if crate::commands::schema_upgrade::takes_backup(&schema_status, policy) {
+                check_backup_destination(
+                    configured_data_dir.as_deref(),
+                    server_data_dir_unknown.as_deref(),
+                    &data_dir,
+                    effective_uid(),
+                )?;
+            }
+
             // Confirmation gate. Skipped with --yes, in JSON mode (machine-driven),
             // or when stdin is not a TTY (piped/CI/systemd) so existing automation
             // never hangs on a prompt.
@@ -418,7 +489,6 @@ impl MigrateCommand {
 
             // Schema guard + pre-migration backup, after the operator agreed
             // to the plan and before the first migration is applied.
-            let data_dir = resolve_data_dir(self.data_dir.as_deref())?;
             if !use_json {
                 if self.pre_migration_backup {
                     println!(
@@ -443,9 +513,9 @@ impl MigrateCommand {
             }
             let prepared = crate::commands::schema_upgrade::prepare_schema_upgrade(
                 &db,
-                &self.database_url,
+                &database_url,
                 &data_dir,
-                crate::commands::schema_upgrade::BackupPolicy::from_flag(self.pre_migration_backup),
+                policy,
             )
             .await
             .map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -493,7 +563,7 @@ impl MigrateCommand {
                     }
                     _ = tokio::signal::ctrl_c() => {
                         return Err(interrupted_maintenance_error(
-                            &self.database_url,
+                            &database_url,
                             backend_pid,
                             "migration execution",
                         ).await);
@@ -506,7 +576,7 @@ impl MigrateCommand {
                     }
                     _ = tokio::signal::ctrl_c() => {
                         return Err(interrupted_maintenance_error(
-                            &self.database_url,
+                            &database_url,
                             backend_pid,
                             "migration execution",
                         ).await);
@@ -538,7 +608,7 @@ impl MigrateCommand {
             // Tokio's process-wide signal handler remains installed after the
             // migration select above, so awaiting these phases directly would
             // swallow a later SIGINT and leave the operator unable to cancel.
-            run_post_migration_maintenance(&db, &self.database_url, backend_pid, use_json).await?;
+            run_post_migration_maintenance(&db, &database_url, backend_pid, use_json).await?;
 
             let total: std::time::Duration = report.results.iter().map(|r| r.elapsed).sum();
             if use_json {
@@ -576,8 +646,83 @@ struct BackupCompletedLine {
     elapsed_ms: u64,
 }
 
-/// `--data-dir`/`TEMPS_DATA_DIR`, else `~/.temps` — the same resolution as
-/// `temps serve`.
+/// Refuse a pre-migration backup that is about to be written to `data_dir`
+/// where it does not belong:
+/// - into `~/.temps` for the installed server's database when the server's
+///   own data directory is unknown, away from its data;
+/// - as root, into a directory another account owns (a `User=` service's):
+///   the backup directory and its lock would be root's, and `temps serve`
+///   running as that account could no longer take its own backups. Root
+///   writing into a directory that account controls is unsafe as well.
+///
+/// Only called when a backup will be taken: otherwise the data directory
+/// only names leftovers to clean up.
+fn check_backup_destination(
+    configured: Option<&std::path::Path>,
+    server_data_dir_unknown: Option<&str>,
+    data_dir: &std::path::Path,
+    euid: Option<u32>,
+) -> anyhow::Result<()> {
+    if let (None, Some(reason)) = (configured, server_data_dir_unknown) {
+        return Err(anyhow::anyhow!(
+            "Not taking the pre-migration backup: it would be written to this user's \
+             ~/.temps, away from the server's data. {reason}. Nothing was changed"
+        ));
+    }
+    if let Some((owner, path)) = euid.and_then(|euid| owned_by_another_account(data_dir, euid)) {
+        return Err(anyhow::anyhow!(
+            "Not taking the pre-migration backup as root: {} belongs to uid {owner}, so the \
+             backup directory and its lock would be root's and `temps serve` running as that \
+             account could no longer take its own backups. Run the command as that account \
+             (`sudo -u '#{owner}' temps migrate {}`), or pass --data-dir with a directory \
+             root owns. Nothing was changed",
+            path.display(),
+            crate::commands::schema_upgrade::BACKUP_FLAG
+        ));
+    }
+    Ok(())
+}
+
+/// This process's effective uid, where there is one.
+fn effective_uid() -> Option<u32> {
+    #[cfg(unix)]
+    {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        Some(unsafe { libc::geteuid() })
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+/// For a root `euid`, the owner of `dir` (or of its nearest existing
+/// ancestor, which a missing `dir` would be created in) when that is not
+/// root, with the path it was read from.
+fn owned_by_another_account(dir: &std::path::Path, euid: u32) -> Option<(u32, std::path::PathBuf)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if euid != 0 {
+            return None;
+        }
+        let (path, metadata) = dir.ancestors().find_map(|path| {
+            std::fs::metadata(path)
+                .ok()
+                .map(|metadata| (path, metadata))
+        })?;
+        (metadata.uid() != 0).then(|| (metadata.uid(), path.to_path_buf()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (dir, euid);
+        None
+    }
+}
+
+/// `--data-dir`/`TEMPS_DATA_DIR` (or the installed server's data directory,
+/// when the URL came from its service definition), else `~/.temps` — the
+/// same resolution as `temps serve`.
 fn resolve_data_dir(configured: Option<&std::path::Path>) -> anyhow::Result<std::path::PathBuf> {
     match configured {
         Some(dir) => Ok(dir.to_path_buf()),
@@ -1034,7 +1179,7 @@ mod tests {
             .is_empty());
         for dry_run in [true, false] {
             let mut command = parse(&["--yes"]).unwrap();
-            command.database_url = test.database_url.clone();
+            command.database_url = Some(test.database_url.clone());
             command.dry_run = dry_run;
             tokio::task::spawn_blocking(move || command.execute())
                 .await
@@ -1267,5 +1412,193 @@ mod tests {
             parse(&["--pre-migration-backup", "--skip-pre-migration-backup"]).is_err(),
             "asking for and against the backup at once must be rejected"
         );
+    }
+
+    /// `MigrateCommand` parsed from `extra` with its env-backed arguments
+    /// pointed at variable names nothing sets, so the host's environment
+    /// cannot leak into the test.
+    fn parse_isolated(extra: &[&str]) -> super::MigrateCommand {
+        use clap::{Args, FromArgMatches};
+        let command = super::MigrateCommand::augment_args(clap::Command::new("temps"))
+            .mut_arg("database_url", |a| {
+                a.env("TEMPS_TEST_MIGRATE_UNSET_DATABASE_URL")
+            })
+            .mut_arg("data_dir", |a| a.env("TEMPS_TEST_MIGRATE_UNSET_DATA_DIR"))
+            .mut_arg("pre_migration_backup", |a| {
+                a.env("TEMPS_TEST_MIGRATE_UNSET_PRE_MIGRATION_BACKUP")
+            });
+        let mut argv = vec!["temps"];
+        argv.extend_from_slice(extra);
+        let matches = command.try_get_matches_from(argv).expect("migrate parses");
+        super::MigrateCommand::from_arg_matches(&matches).expect("migrate arguments")
+    }
+
+    fn installer_unit(home: &std::path::Path) -> crate::service_definition::ServiceLocations {
+        let unit = home.join("temps.service");
+        crate::service_definition::test_support::write_trusted(
+            &unit,
+            format!(
+                "[Service]\nExecStart={h}/.temps/bin/temps serve \\\n  \
+                 --database-url=\"postgresql://temps:pw@127.0.0.1:5432/temps\" \\\n  \
+                 --data-dir=\"{h}/.temps/data\"\n",
+                h = home.display()
+            ),
+        )
+        .unwrap();
+        crate::service_definition::ServiceLocations {
+            systemd_unit: Some(unit),
+            launchd_agent: None,
+        }
+    }
+
+    #[test]
+    fn migrate_no_longer_requires_database_url() {
+        assert!(parse_isolated(&[]).database_url.is_none());
+    }
+
+    #[test]
+    fn migrate_uses_the_installed_services_database_and_data_dir() {
+        let home = tempfile::tempdir().unwrap();
+        let locations = installer_unit(home.path());
+        let target = parse_isolated(&[])
+            .target(&locations)
+            .expect("found in the unit");
+        assert_eq!(
+            target.database.url(),
+            "postgresql://temps:pw@127.0.0.1:5432/temps"
+        );
+        assert_eq!(target.data_dir, Some(home.path().join(".temps/data")));
+    }
+
+    #[test]
+    fn migrate_flags_still_win_over_the_installed_service() {
+        let home = tempfile::tempdir().unwrap();
+        let locations = installer_unit(home.path());
+        let target = parse_isolated(&[
+            "--database-url",
+            "postgres://elsewhere/temps",
+            "--data-dir",
+            "/srv/backups",
+        ])
+        .target(&locations)
+        .expect("explicit values");
+        assert_eq!(target.database.url(), "postgres://elsewhere/temps");
+        assert_eq!(
+            target.data_dir,
+            Some(std::path::PathBuf::from("/srv/backups"))
+        );
+        // Another database: not the service's, so not its data dir either.
+        let target = parse_isolated(&["--database-url", "postgres://elsewhere/temps"])
+            .target(&locations)
+            .expect("explicit url");
+        assert_eq!(target.data_dir, None);
+    }
+
+    #[test]
+    fn a_backup_never_goes_to_home_when_the_servers_data_dir_is_unknown() {
+        let home = tempfile::tempdir().unwrap();
+        let unit = home.path().join("temps.service");
+        // No --data-dir and an account without a home: serve's data
+        // directory cannot be told.
+        crate::service_definition::test_support::write_trusted(
+            &unit,
+            "[Service]\nUser=temps-test-no-such-user\n\
+             ExecStart=/usr/bin/temps serve --database-url=postgresql://temps:pw@127.0.0.1:5432/temps\n",
+        )
+        .unwrap();
+        let locations = crate::service_definition::ServiceLocations {
+            systemd_unit: Some(unit),
+            launchd_agent: None,
+        };
+        let target = parse_isolated(&[])
+            .target(&locations)
+            .expect("found in the unit");
+        assert_eq!(target.data_dir, None);
+        let reason = target
+            .server_data_dir_unknown
+            .expect("the reason it is unknown");
+        assert!(reason.contains("--data-dir"), "{reason}");
+
+        let data = home.path().join(".temps");
+        let error = super::check_backup_destination(None, Some(&reason), &data, None).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("Not taking the pre-migration backup")
+                && message.contains("--data-dir"),
+            "{message}"
+        );
+        // With --data-dir, nothing is in the way.
+        let explicit = std::path::Path::new("/srv/temps-data");
+        assert!(
+            super::check_backup_destination(Some(explicit), Some(&reason), explicit, None).is_ok()
+        );
+
+        // With the service's data dir known, there is no reason to refuse.
+        let locations = installer_unit(home.path());
+        let target = parse_isolated(&[])
+            .target(&locations)
+            .expect("found in the unit");
+        assert!(target.server_data_dir_unknown.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_never_writes_the_backup_into_another_accounts_data_dir() {
+        use std::os::unix::fs::MetadataExt;
+        let home = tempfile::tempdir().unwrap();
+        let owner = std::fs::metadata(home.path()).unwrap().uid();
+        if owner == 0 {
+            // Running as root: no directory here belongs to another account.
+            return;
+        }
+        // A data directory that does not exist yet would be created in its
+        // parent, so the parent's owner is the one that counts.
+        let data = home.path().join(".temps/data");
+        assert_eq!(
+            super::owned_by_another_account(&data, 0),
+            Some((owner, home.path().to_path_buf()))
+        );
+        let error = super::check_backup_destination(None, None, &data, Some(0)).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("uid {owner}"))
+                && message.contains(&format!("sudo -u '#{owner}'"))
+                && message.contains("Nothing was changed"),
+            "{message}"
+        );
+        // The account itself, or any account not root, writes as itself.
+        assert!(super::check_backup_destination(None, None, &data, Some(owner)).is_ok());
+        assert_eq!(super::owned_by_another_account(&data, owner), None);
+    }
+
+    #[test]
+    fn only_a_run_that_takes_the_backup_checks_where_it_goes() {
+        use crate::commands::schema_upgrade::{takes_backup, BackupPolicy};
+        let pending = temps_schema::SchemaStatus::PendingUpgrade {
+            applied: 3,
+            pending: vec!["m20990101_000001_example".to_string()],
+        };
+        assert!(takes_backup(&pending, BackupPolicy::Enabled));
+        assert!(!takes_backup(&pending, BackupPolicy::Disabled));
+        // An up-to-date or fresh database takes none, flag or not.
+        assert!(!takes_backup(
+            &temps_schema::SchemaStatus::Fresh,
+            BackupPolicy::Enabled
+        ));
+    }
+
+    #[test]
+    fn migrate_without_any_source_lists_what_it_checked() {
+        let home = tempfile::tempdir().unwrap();
+        let locations = crate::service_definition::ServiceLocations {
+            systemd_unit: Some(home.path().join("temps.service")),
+            launchd_agent: None,
+        };
+        let error = match parse_isolated(&[]).target(&locations) {
+            Ok(_) => panic!("nothing configured must not resolve"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("TEMPS_DATABASE_URL_FILE"), "{error}");
+        assert!(error.contains("temps.service: not found"), "{error}");
     }
 }

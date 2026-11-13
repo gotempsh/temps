@@ -268,7 +268,7 @@ pub struct ServeCommand {
 
     /// Database connection URL. Prefer TEMPS_DATABASE_URL (or TEMPS_DATABASE_URL_FILE / the systemd credential temps_database_url): the flag form puts the password in the process command line
     #[arg(long, env = "TEMPS_DATABASE_URL", hide_env_values = true)]
-    pub database_url: String,
+    pub database_url: Option<String>,
 
     /// Seconds to wait for the database at startup before giving up. While
     /// it is unreachable (refused, no route, still starting up) the server
@@ -491,6 +491,13 @@ impl ServeCommand {
         ip_gate_builder: Option<crate::commands::proxy::FallibleProjectIpGateBuilder>,
         request_policy_gate_builder: Option<crate::commands::proxy::RequestPolicyGateBuilder>,
     ) -> anyhow::Result<()> {
+        // Only this process's own sources: the server never adopts another
+        // service definition's URL. Missing, this lists what was checked.
+        let database_url = crate::database_url_source::resolve_database_url(
+            self.database_url.as_deref(),
+            crate::database_url_source::UrlDiscovery::ThisProcess,
+        )?
+        .into_url();
         let has_extra_plugins = !extra_plugins.is_empty();
         let has_ip_gate_builder = ip_gate_builder.is_some();
         let has_request_policy_gate_builder = request_policy_gate_builder.is_some();
@@ -597,7 +604,7 @@ impl ServeCommand {
 
         let serve_config = temps_config::ServerConfig::new(
             effective_proxy_address,
-            self.database_url.clone(),
+            database_url.clone(),
             effective_proxy_tls_address,
             self.console_address.clone(),
         )?;
@@ -642,18 +649,18 @@ impl ServeCommand {
         // is waited for here, instead of exiting and letting a supervisor's
         // restart policy turn it into a restart loop.
         rt.block_on(temps_database::wait_for_database(
-            &self.database_url,
+            &database_url,
             std::time::Duration::from_secs(self.database_startup_wait),
         ))?;
         let bootstrap_stateless = temps_config::bootstrap_stateless_requested()?;
         _control_plane_owner = if bootstrap_stateless {
             stateless::validate_profile(self.profile, self.role)?;
             stateless::validate_scratch_directory(&serve_config.data_dir)?;
-            Some(rt.block_on(stateless::ControlPlaneOwner::acquire(&self.database_url))?)
+            Some(rt.block_on(stateless::ControlPlaneOwner::acquire(&database_url))?)
         } else {
             None
         };
-        let db = rt.block_on(connect_server_database(&self.database_url))?;
+        let db = rt.block_on(connect_server_database(&database_url))?;
         let persisted_mode = rt.block_on(temps_config::installation_mode(db.as_ref()))?;
         if persisted_mode.is_stateless() && !bootstrap_stateless {
             rt.block_on(stateless::reject_local_mode_for_managed_database(
@@ -680,7 +687,7 @@ impl ServeCommand {
             // dir may be temporary, so copy a dump to durable storage.
             rt.block_on(crate::commands::schema_upgrade::prepare_schema_upgrade(
                 db.as_ref(),
-                &self.database_url,
+                &database_url,
                 &serve_config.data_dir,
                 crate::commands::schema_upgrade::BackupPolicy::from_flag(self.pre_migration_backup),
             ))?;
@@ -695,7 +702,7 @@ impl ServeCommand {
             // start.
             rt.block_on(run_local_mode_migrations(
                 db.as_ref(),
-                &self.database_url,
+                &database_url,
                 &serve_config.data_dir,
                 crate::commands::schema_upgrade::BackupPolicy::from_flag(self.pre_migration_backup),
             ))?
@@ -892,13 +899,13 @@ impl ServeCommand {
         // resolved below — so the actual starts happen after that block.
         let route_table_listener = Arc::new(temps_routes::RouteTableListener::new(
             route_table.clone(),
-            self.database_url.clone(),
+            database_url.clone(),
             queue.clone(),
         ));
         // Keep the project listener alive on the stack so its Drop doesn't abort
         // the background task.
         let project_listener = temps_routes::ProjectChangeListener::new(
-            self.database_url.clone(),
+            database_url.clone(),
             route_table.clone(),
             queue.clone(),
         );
@@ -1037,7 +1044,7 @@ impl ServeCommand {
             self.disable_self_update,
             self_update_caveat,
             update_status.clone(),
-            self.database_url.clone(),
+            database_url.clone(),
             self.pre_migration_backup,
         ));
 
@@ -1314,7 +1321,7 @@ impl ServeCommand {
         // `Arc<ArcSwap<_>>`, so this clone writes to the same live handle.
         {
             let listener_service = Arc::new(admin_gate_service.clone());
-            let database_url = self.database_url.clone();
+            let database_url = database_url.clone();
             rt.block_on(async { listener_service.start_settings_listener(database_url) });
         }
 
@@ -1562,7 +1569,7 @@ impl ServeCommand {
             self.tls_address.clone(),
             cookie_crypto.clone(),
             encryption_service.clone(),
-            self.database_url.clone(),
+            database_url.clone(),
             route_table,
             serve_config.clone(),
             self.disable_https_redirect,
