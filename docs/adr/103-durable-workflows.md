@@ -221,8 +221,10 @@ replay that finds a different step than the journal recorded raises
   event or a release; a slow fallback poll (default 5 s) catches missed
   notifications and timers. Each tick is O(due rows), through a partial index
   on `due_at` of runnable runs.
-- A **fixed-size invoker pool** (default 8 per process) bounds concurrent
-  invocations; the claim batch never exceeds free invoker slots.
+- A **fixed-size invoker pool** (default 16 per process) bounds concurrent
+  invocations; the claim batch never exceeds free invoker slots. An
+  invocation mostly waits on the executor's reply, so the pool costs
+  connections and a few tasks, not CPU.
 - **Backpressure, never drops:** a run over its workflow's concurrency limit,
   or over the environment's, stays `queued` with `due_at` unchanged.
 
@@ -263,8 +265,10 @@ replay that finds a different step than the journal recorded raises
   step returns the recorded value).
 - Retries back off exponentially with a cap.
 - Failed runs keep their journal.
-- Repeated lease expiry (default 3 in a row) marks a run `stuck`, which feeds a
-  metric and an alarm template.
+- Repeated failed invocations or lease expiries (default 8 in a row, the
+  `stuck_after_failures` settings column) mark a run `stuck`, which feeds a
+  metric and an alarm template. With the backoff capped at 5 minutes, 8 covers
+  a redeploy or a short executor outage without parking the run.
 
 ### 10. Visibility
 
