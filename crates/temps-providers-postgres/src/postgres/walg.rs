@@ -1528,10 +1528,13 @@ pub(crate) fn walg_env_drift(live: &[String], generated: &[String]) -> Option<St
     if differences.is_empty() {
         return None;
     }
-    // A restart only helps when its repair, giving a bare endpoint the
-    // scheme the generated settings use, leaves nothing different; a file
-    // pointing at another host keeps that host through the repair.
-    let restart_repairs_it = repair_walg_env_lines(live, walg_env_endpoint_scheme(generated))
+    // A restart is only promised when the part of the start-time repair
+    // that does not depend on the store, forcing path style for an IP
+    // endpoint, removes every difference. The scheme a bare endpoint gets
+    // is whichever the store answers first (HTTPS before HTTP), not the
+    // source's, so a scheme or host difference is left to a backup, which
+    // rewrites the file from the S3 source.
+    let restart_repairs_it = repair_walg_env_lines(live, None)
         .is_some_and(|repaired| walg_env_differences(&repaired, generated).is_empty());
     let fix = if restart_repairs_it {
         "Restart the service: Temps repairs this walg.env when it starts, without changing \
@@ -1666,19 +1669,6 @@ pub(crate) fn repair_walg_env_lines(
 pub(crate) fn exec_error_without_output(error: &str) -> String {
     let first = error.lines().next().unwrap_or_default().trim_end();
     format!("{first} (the command's output is not shown: it holds walg.env)")
-}
-
-/// The scheme of a `walg.env`'s `AWS_ENDPOINT`, or `None` when it has none.
-fn walg_env_endpoint_scheme(lines: &[String]) -> Option<temps_core::s3_endpoint::S3Scheme> {
-    let endpoint = lines
-        .iter()
-        .find_map(|line| line.strip_prefix("AWS_ENDPOINT="))?;
-    if !endpoint.contains("://") {
-        return None;
-    }
-    temps_core::s3_endpoint::S3Endpoint::parse(endpoint, None)
-        .ok()
-        .map(|parsed| parsed.scheme())
 }
 
 /// How the start-time repair learns which scheme a scheme-less endpoint is

@@ -649,8 +649,11 @@ mod repair_tests {
         values.iter().map(|value| value.to_string()).collect()
     }
 
+    /// A legacy bare endpoint: what a restart writes depends on which
+    /// scheme the store answers first, so only a backup (which rewrites the
+    /// file from the source) is promised to remove the difference.
     #[test]
-    fn a_legacy_live_file_is_reported_with_the_restart_that_repairs_it() {
+    fn a_legacy_live_file_is_reported_with_the_backup_that_rewrites_it() {
         let live = lines(&[
             "WALG_S3_PREFIX=s3://archive/pg/walg",
             "AWS_SECRET_ACCESS_KEY=hunter2",
@@ -672,8 +675,33 @@ mod repair_tests {
             drift.contains("path-style addressing off instead of on"),
             "{drift}"
         );
-        assert!(drift.contains("Restart the service"), "{drift}");
+        assert!(drift.contains("Run a backup"), "{drift}");
+        assert!(!drift.contains("Restart the service"), "{drift}");
         assert!(!drift.contains("hunter2"), "{drift}");
+    }
+
+    /// A store that answers HTTPS: the restart's repair writes
+    /// `https://`, not the source's `http://`, so it is never promised.
+    #[test]
+    fn a_bare_hostname_is_not_promised_the_sources_scheme_by_a_restart() {
+        let live = lines(&["AWS_ENDPOINT=objects.example.com"]);
+        let generated = lines(&["AWS_ENDPOINT=http://objects.example.com"]);
+        let drift = walg_env_drift(&live, &generated).expect("they differ");
+        assert!(drift.contains("Run a backup"), "{drift}");
+        assert!(!drift.contains("Restart the service"), "{drift}");
+    }
+
+    /// Only path style missing for an IP endpoint: the repair forces it
+    /// whatever the store answers, so a restart is the fix.
+    #[test]
+    fn a_missing_path_style_for_an_ip_is_fixed_by_a_restart() {
+        let live = lines(&["AWS_ENDPOINT=http://10.0.0.5:9000"]);
+        let generated = lines(&[
+            "AWS_ENDPOINT=http://10.0.0.5:9000",
+            "AWS_S3_FORCE_PATH_STYLE=true",
+        ]);
+        let drift = walg_env_drift(&live, &generated).expect("they differ");
+        assert!(drift.contains("Restart the service"), "{drift}");
     }
 
     #[test]
