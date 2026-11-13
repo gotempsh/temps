@@ -14,6 +14,7 @@ import {
 import { useEffect, useState } from 'react'
 import {
   forgetWindowMove,
+  windowMovedFrom,
   isMovingWindows,
   keepPreviousWindow,
   previousWindowQuery,
@@ -68,27 +69,26 @@ export function useWindowQuery<
     ...options,
     placeholderData: keepPreviousWindow(options.queryKey),
   })
-  const failed =
-    result.isError && result.data === undefined
-      ? hashKey(options.queryKey)
-      : undefined
+  // The window this key keeps on screen until it loads: the one it moved
+  // from (through any moves that did not load), or none for a new selection.
+  const origin = windowMovedFrom(options.queryKey)
+  const fresh = result.data !== undefined && !result.isPlaceholderData
   const found =
-    failed === undefined
+    fresh || origin === undefined
       ? undefined
       : previousWindowQuery(queryClient.getQueryCache(), options.queryKey)
   // The earlier window's query is inactive once the page moved off it, so
   // the cache drops it after `gcTime`. Holding on to it here keeps its rows
-  // on screen for as long as this failed window replaces them.
-  const [kept, setKept] = useState<{ hash: string; query: Query } | null>(null)
-  if (
-    failed !== undefined &&
-    found &&
-    (kept?.query !== found || kept.hash !== failed)
-  )
-    setKept({ hash: failed, query: found })
-  else if (failed === undefined && kept) setKept(null)
-  const previous =
-    found ?? (kept && kept.hash === failed ? kept.query : undefined)
+  // for as long as moved windows keep failing in its place, until one loads
+  // or another selection is made.
+  const [kept, setKept] = useState<Query | null>(null)
+  if (fresh || origin === undefined) {
+    if (kept) setKept(null)
+  } else if (found && kept !== found) setKept(found)
+  const failed = result.isError && result.data === undefined
+  const previous = failed
+    ? (found ?? (kept?.queryHash === origin ? kept : undefined))
+    : undefined
   const keptError = previous ? result.error : null
   // The page shows an earlier window: the shell says the latest did not load.
   useEffect(() => {

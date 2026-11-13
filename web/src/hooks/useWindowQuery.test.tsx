@@ -205,4 +205,19 @@ test('the kept rows stay after the cache drops the window they came from', async
 
   expect(screen.getByText('countries')).toBeTruthy()
   expect(screen.queryByText('failed')).toBeNull()
+
+  // The next Refresh moves the failed window again, and that one fails too.
+  fireEvent.click(screen.getByRole('button', { name: 'Move window' }))
+  expect(screen.getByText('countries')).toBeTruthy()
+  await act(async () =>
+    answers[2].reject({ status: 500, title: 'Internal Server Error' })
+  )
+  await act(async () => new Promise((resolve) => setTimeout(resolve, 5)))
+  expect(screen.getByText('countries')).toBeTruthy()
+  expect(screen.queryByText('failed')).toBeNull()
+
+  // A window that loads replaces the kept rows.
+  fireEvent.click(screen.getByRole('button', { name: 'Move window' }))
+  await act(async () => answers[3].resolve('countries, later'))
+  await screen.findByText('countries, later')
 })

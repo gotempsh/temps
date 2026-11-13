@@ -157,6 +157,14 @@ export function keepPreviousWindow(queryKey: QueryKey) {
 }
 
 /**
+ * The hash of the query whose data `queryKey`'s moved window keeps on screen,
+ * or undefined when `queryKey` is not a moved window.
+ */
+export function windowMovedFrom(queryKey: QueryKey): string | undefined {
+  return movedFrom.get(hashKey(queryKey))
+}
+
+/**
  * The query whose data `queryKey`'s moved window keeps on screen, if it still
  * has data: when a moved window fails before it loads, the page keeps showing
  * that one.
