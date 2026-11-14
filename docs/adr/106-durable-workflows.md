@@ -316,12 +316,12 @@ Temps' own deployment pipeline is not moved onto the engine yet.
   actions; an approvals inbox; settings; command palette entries.
 - Reuses the templates and `RefreshButton`.
 
-### 15. API and CLI (follow-up for the CLI)
+### 15. API and CLI
 
 `temps workflows list|runs|get [--reveal]|watch|start|cancel|retry
 [--from-step]|resume|send-event|init|dev`, all with `--json`.
 
-### 16. AI (follow-up)
+### 16. AI
 
 - Operations for the assistant and MCP: list workflows, list runs, get run,
   start run (idempotency key required), cancel run, retry from step, send
@@ -332,11 +332,14 @@ Temps' own deployment pipeline is not moved onto the engine yet.
   untrusted.
 - Durable agent loops; approvals; AI-gateway cost tracking.
 
-M1 classifies every new operation for the assistant (reads in the read
-allowlist, everything else excluded with a reason) because the console's
-policy test requires it.
+Management reads and diagnosis are in the assistant read allowlist. Run
+mutations and explicit payload reveal use the existing propose/confirm path;
+starts require a nonempty idempotency key. Revealed payloads are marked
+untrusted. Credential, grant, key-shredding and development-session management
+remain console-only. The virtual CLI exposes the same classified operations
+to MCP and retains the router's project and permission checks.
 
-### 17. Onboarding (follow-up)
+### 17. Onboarding
 
 - No special deploy path: Git, local image upload (it exists, item 11) or a
   registry image.
@@ -522,8 +525,9 @@ correction.
 
 - **M1 (this ADR):** the core engine, the TypeScript SDK, permissions,
   `ExecutorEndpoints`, metrics and alarm templates; then, in follow-up PRs, the
-  console UI, the CLI, the assistant and MCP operations, `init` and the worker
-  preset.
+  console UI. The CLI, assistant/MCP lifecycle operations, `init` and the
+  worker preset are included in this branch; the remaining console views
+  listed in §14 are follow-ups.
 - **M2:** "All workflows", `dev`, Python and Go SDKs, child workflows, cron
   schedules, deploy warnings, the SDK codec.
 - **M3:** grants, drain, the Rust SDK, per-project keys, the managed journal,

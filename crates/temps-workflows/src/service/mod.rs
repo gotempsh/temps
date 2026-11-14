@@ -7,6 +7,8 @@
 //! that a run belongs to the environment, before anything else.
 
 mod dev;
+mod diagnosis;
+pub use diagnosis::WorkflowDiagnosis;
 mod global;
 mod grants;
 pub use global::GlobalRuns;

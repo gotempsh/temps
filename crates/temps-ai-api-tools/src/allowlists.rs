@@ -882,6 +882,7 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     "list_workflow_project_keys",
     "list_workflow_grants",
     "get_workflow_run",
+    "diagnose_workflow_run",
     "list_workflow_steps",
     "get_workflow_settings",
     "get_workflow_credential",
@@ -1317,10 +1318,12 @@ pub const AI_WRITE_ALLOWLIST: &[&str] = &[
     // Revenue configuration
     "revenue_update_config",
     "revenue_delete_integration",
-    // Durable workflow run lifecycle (ADR-106): stopping a run, or re-running
-    // it from a step or out of `stuck`, through the console's guards and
-    // audit. Starting a run or sending an event (which runs the app's code
-    // with a caller-chosen payload) and deleting one stay console-only.
+    // All mutations use the existing propose/confirm path and router authorization.
+    // Starts additionally require a stable idempotency key in the API caller.
+    "start_workflow_run",
+    "send_workflow_event",
+    "delete_workflow_run",
+    "reveal_workflow_payload",
     "cancel_workflow_run",
     "retry_workflow_run",
     "resume_workflow_run",
@@ -1391,6 +1394,24 @@ pub fn ai_read_safe_posts() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workflow_mutations_and_reveals_require_confirmation() {
+        for operation in [
+            "start_workflow_run",
+            "send_workflow_event",
+            "cancel_workflow_run",
+            "retry_workflow_run",
+            "resume_workflow_run",
+            "delete_workflow_run",
+            "reveal_workflow_payload",
+        ] {
+            assert!(AI_WRITE_ALLOWLIST.contains(&operation));
+            assert!(!AI_READ_ALLOWLIST.contains(&operation));
+            assert!(!AI_READ_SAFE_POSTS.contains(&operation));
+        }
+        assert!(AI_READ_ALLOWLIST.contains(&"diagnose_workflow_run"));
+    }
 
     #[test]
     fn certificate_policy_reads_and_writes_have_separate_permissions() {

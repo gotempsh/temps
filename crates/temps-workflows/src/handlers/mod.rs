@@ -62,6 +62,7 @@ use management::*;
         list_workflow_runs,
         start_workflow_run,
         get_workflow_run,
+        diagnose_workflow_run,
         list_workflow_steps,
         reveal_workflow_payload,
         cancel_workflow_run,
@@ -176,6 +177,10 @@ pub fn configure_routes() -> Router<Arc<WorkflowsAppState>> {
         .route(
             &format!("{RUNS}/runs/{{run_id}}"),
             get(get_workflow_run).delete(delete_workflow_run),
+        )
+        .route(
+            &format!("{RUNS}/runs/{{run_id}}/diagnose"),
+            get(diagnose_workflow_run),
         )
         .route(
             &format!("{RUNS}/runs/{{run_id}}/steps"),

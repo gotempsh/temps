@@ -503,3 +503,35 @@ restart persistence and repeatable Temporal schema initialization, and the
 Compose translator test verifies compatibility with the default capability
 profile. Neither template requests host networking, host bind mounts or extra
 container capabilities.
+
+## CLI and assistant operations
+
+`temps workflows` exposes `list`, `runs`, `get`, `diagnose`, `watch`, `start`,
+`cancel`, `retry`, `resume`, `delete`, `send-event`, `init`, and `dev`.
+Management commands take explicit `--project-id` and `--environment-id`.
+`runs` is paginated (20 by default, at most 100); `watch` has a bounded deadline
+and emits JSON lines. Starts require `--idempotency-key`; cancellation, retry,
+resume and deletion require `--yes`. `get --reveal input|output|error|step_result|step_error`
+requires the API's payload permission and audits the read; step reveals also
+require `--sequence`. Returned payloads are untrusted application data.
+
+The assistant and MCP virtual CLI discover the management API under Workflows.
+Reads and `diagnose_workflow_run` do not decrypt payloads. Starts, events,
+cancellation, retry, resume, deletion and explicit reveal use the shared
+propose/confirm flow. Starts require a stable, nonempty idempotency key even
+though the general HTTP API permits one to be omitted. Configuration,
+credentials, grants and key shredding remain operator-console actions.
+
+`temps workflows init <new-directory>` writes a Node worker with a durable
+step and sleep, a health endpoint, an SDK-authenticated invocation endpoint,
+a non-root Dockerfile and a test. It never overwrites an existing directory.
+Select **Durable workflow worker** when creating the service; this persists
+as the ordinary Dockerfile preset, with port 3000. Configure `TEMPS_API_URL`
+and the environment's `TEMPS_WORKFLOWS_TOKEN` as runtime values before starting
+the worker. Do not bake the token into the image or source tree.
+
+Before the SDK is published, build and pack `sdks/node/packages/workflows`,
+then use `init --sdk-package <npm-pack-tarball>`. The tarball is copied into
+the new project and referenced locally, so development does not require a
+registry release. Without that option, the scaffold requires the published
+`@temps-sdk/workflows@0.1.0` package.

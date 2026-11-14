@@ -848,6 +848,7 @@ fn validate_env_var_templates<'a>(
 /// `temps_presets::all_presets()`, which this crate cannot depend on. A test in
 /// temps-presets fails when the two lists differ.
 pub const VALID_PRESETS: &[&str] = &[
+    "workflow-worker",
     "nextjs",
     "vite",
     "react-app",

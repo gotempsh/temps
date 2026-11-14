@@ -25893,7 +25893,8 @@
         "description": "Catalog variant persisted under the canonical Dockerfile preset.\n\nExisting rows predate this discriminator and therefore deserialize as\n[`DockerfileVariant::File`].",
         "enum": [
           "file",
-          "custom"
+          "custom",
+          "workflow-worker"
         ],
         "type": "string"
       },
@@ -84361,6 +84362,38 @@
           "session_id",
           "manifest_token",
           "expires_at"
+        ],
+        "type": "object"
+      },
+      "WorkflowDiagnosis": {
+        "properties": {
+          "blocked_reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "error_kind": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "next_action": {
+            "type": "string"
+          },
+          "run_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/WorkflowRunStatus"
+          }
+        },
+        "required": [
+          "run_id",
+          "status",
+          "next_action"
         ],
         "type": "object"
       },
@@ -157528,6 +157561,75 @@
           },
           "409": {
             "description": "The run already finished"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Workflows"
+        ]
+      }
+    },
+    "/projects/{project_id}/environments/{environment_id}/workflows/runs/{run_id}/diagnose": {
+      "get": {
+        "operationId": "diagnose_workflow_run",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Run ID",
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowDiagnosis"
+                }
+              }
+            },
+            "description": "Run diagnosis without decrypted payloads"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Run not found"
           },
           "500": {
             "description": "Internal server error"

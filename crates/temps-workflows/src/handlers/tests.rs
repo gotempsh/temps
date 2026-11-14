@@ -198,6 +198,7 @@ const RUN: &str = "00000000-0000-0000-0000-000000000001";
 
 fn management_routes() -> Vec<(&'static str, String, Option<Value>)> {
     vec![
+        ("GET", format!("{BASE}/runs/{RUN}/diagnose"), None),
         ("POST", format!("{BASE}/dev"), None),
         ("PUT", format!("{BASE}/dev/{RUN}"), Some(json!({}))),
         ("DELETE", format!("{BASE}/dev/{RUN}"), None),
@@ -420,6 +421,30 @@ async fn an_operator_starts_inspects_and_reveals_a_run_with_every_write_audited(
         !started.to_string().contains(secret),
         "input leaked: {started}"
     );
+
+    let (status, _, diagnosis) = send(
+        app.clone(),
+        "GET",
+        &format!("{base}/runs/{run_id}/diagnose"),
+        None,
+        Some(admin()),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(diagnosis["run_id"], run_id.as_str());
+    assert!(diagnosis["next_action"].is_string());
+    assert!(!diagnosis.to_string().contains(secret));
+    let (status, _, _) = send(
+        app.clone(),
+        "GET",
+        &format!("{base}/runs/{RUN}/diagnose"),
+        None,
+        Some(admin()),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 
     // The same key returns the same run, 200, with no second audit record.
     let (status, _, again) = send(

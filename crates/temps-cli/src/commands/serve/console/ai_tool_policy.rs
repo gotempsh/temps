@@ -55,12 +55,8 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
         &["put_plugin_ai_tools"],
     ),
     (
-        "durable workflow operations that run the app's code with a caller-chosen payload, decrypt a stored payload, delete a run's history, or issue or revoke the app's workflow credential; the operator does these in the console",
+        "durable workflow configuration, credentials, grants and development sessions remain operator-console operations",
         &[
-            "start_workflow_run",
-            "send_workflow_event",
-            "reveal_workflow_payload",
-            "delete_workflow_run",
             "update_workflow_settings",
             "issue_workflow_credential",
             "revoke_workflow_credential",

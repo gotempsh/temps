@@ -237,6 +237,44 @@ pub async fn get_workflow_run(
 #[utoipa::path(
     tag = "Workflows",
     get,
+    path = "/projects/{project_id}/environments/{environment_id}/workflows/runs/{run_id}/diagnose",
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+        ("environment_id" = i32, Path, description = "Environment ID"),
+        ("run_id" = Uuid, Path, description = "Run ID")
+    ),
+    responses(
+        (status = 200, description = "Run diagnosis without decrypted payloads", body = crate::service::WorkflowDiagnosis),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Run not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn diagnose_workflow_run(
+    RequireAuth(auth): RequireAuth,
+    State(state): AppState,
+    Path((project_id, environment_id, run_id)): Path<(i32, i32, Uuid)>,
+) -> Result<impl IntoResponse, Problem> {
+    deny_deployment_token!(auth);
+    project_scope_guard!(auth, project_id);
+    project_permission_guard!(
+        auth,
+        WorkflowsRead,
+        project_id,
+        &state.project_access_checker
+    );
+    let run = state
+        .service
+        .diagnose(project_id, environment_id, run_id)
+        .await?;
+    Ok(Json(run))
+}
+
+#[utoipa::path(
+    tag = "Workflows",
+    get,
     path = "/projects/{project_id}/environments/{environment_id}/workflows/runs/{run_id}/steps",
     params(
         ("project_id" = i32, Path, description = "Project ID"),

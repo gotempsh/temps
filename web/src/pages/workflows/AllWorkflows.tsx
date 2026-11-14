@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { useEffect } from 'react'
+import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { useInfiniteQuery } from '@tanstack/react-query'
 import { Ledger, PageState, Status } from '@temps-sdk/ds'
 import { Workflow } from 'lucide-react'
@@ -22,6 +24,11 @@ import { runHref, workflowStatuses, workflowTone } from './status'
 
 export function AllWorkflows() {
   usePageTitle('All workflows')
+  const { setBreadcrumbs } = useBreadcrumbs()
+  useEffect(() => {
+    setBreadcrumbs([{ label: 'Workflows' }])
+    return () => setBreadcrumbs([])
+  }, [setBreadcrumbs])
   const [search, setSearch] = useSearchParams()
   const selected = search.get('status')
   const status = workflowStatuses.includes(selected as WorkflowRunStatus)

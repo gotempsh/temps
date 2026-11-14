@@ -265,6 +265,7 @@ const AllWorkflows = lazy(() =>
     default: m.AllWorkflows,
   }))
 )
+const WorkflowDetail = lazy(() => import('./pages/workflows/WorkflowDetail').then((m) => ({ default: m.WorkflowDetail })))
 const WorkflowRunDetail = lazy(() =>
   import('./pages/workflows/WorkflowRunDetail').then((m) => ({
     default: m.WorkflowRunDetail,
@@ -1287,6 +1288,7 @@ const FullAppRoutes = () => {
                           element={<DnsProviderDetail />}
                         />
                         <Route path="/workflows" element={<AllWorkflows />} />
+                        <Route path="/workflows/:projectId/:environmentId" element={<WorkflowDetail />} />
                         <Route path="/workflows/:projectId/keys" element={<ProjectWorkflowKeys />} />
                         <Route path="/workflows/:projectId/:environmentId/settings" element={<WorkflowSettings />} />
                         <Route path="/workflows/:projectId/:environmentId/grants" element={<WorkflowGrants />} />

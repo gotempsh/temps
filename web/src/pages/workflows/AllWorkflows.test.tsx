@@ -5,6 +5,7 @@ import { describe, expect, test } from 'bun:test'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { MemoryRouter } from 'react-router'
+import { BreadcrumbProvider } from '@/contexts/BreadcrumbContext'
 import { AllWorkflows } from './AllWorkflows'
 import { workflowTone } from './status'
 
@@ -19,7 +20,9 @@ function render(runs: object[], nextCursor: string | null = null) {
   return renderToStaticMarkup(
     <MemoryRouter>
       <QueryClientProvider client={client}>
-        <AllWorkflows />
+        <BreadcrumbProvider>
+          <AllWorkflows />
+        </BreadcrumbProvider>
       </QueryClientProvider>
     </MemoryRouter>
   )

@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { registerInit } from './init.js'
+import { registerManagement } from './manage.js'
 import { Command, InvalidArgumentError } from 'commander'
 import { requireAuth } from '../../config/store.js'
 import { setupClient } from '../../lib/api-client.js'
@@ -14,12 +16,15 @@ function id(value: string): number {
   return parsed
 }
 export function registerDurableWorkflowCommands(program: Command): void {
-  program.command('workflows').description('Durable application workflows')
-    .command('dev').description('Forward preview-environment invocations to a local SDK server')
+  const workflows = program.command('workflows').description('Durable application workflows')
+  registerManagement(workflows)
+  registerInit(workflows)
+  workflows.command('dev').description('Forward preview-environment invocations to a local SDK server')
     .requiredOption('--project-id <id>', 'Project ID', id)
     .requiredOption('--environment-id <id>', 'Undeployed, unprotected preview environment ID', id)
     .option('--port <port>', 'Local SDK server port', '3000')
-    .action(async (options: { projectId: number; environmentId: number; port: string }) => {
+    .option('--json', 'Output tunnel readiness as JSON')
+    .action(async (options: { projectId: number; environmentId: number; port: string; json?: boolean }) => {
       await requireAuth()
       await setupClient()
       const path = { project_id: options.projectId, environment_id: options.environmentId }
@@ -36,7 +41,7 @@ export function registerDurableWorkflowCommands(program: Command): void {
       process.once('SIGINT', abort)
       process.once('SIGTERM', abort)
       try {
-        await runTunnel(api, options.port, stop.signal, () => info(`Workflow development tunnel ready for project ${options.projectId}, environment ${options.environmentId}, local port ${options.port}. Start a run in the console. Ctrl-C disconnects.`))
+        await runTunnel(api, options.port, stop.signal, () => options.json ? console.log(JSON.stringify({ ready: true, project_id: options.projectId, environment_id: options.environmentId, port: Number(options.port) })) : info(`Workflow development tunnel ready for project ${options.projectId}, environment ${options.environmentId}, local port ${options.port}. Start a run in the console. Ctrl-C disconnects.`))
       } finally {
         process.removeListener('SIGINT', abort)
         process.removeListener('SIGTERM', abort)

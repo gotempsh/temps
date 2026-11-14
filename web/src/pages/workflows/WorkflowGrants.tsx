@@ -6,7 +6,7 @@ import { useForm } from 'react-hook-form'
 import { z } from 'zod'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { EchoDialog, Ledger, PageState } from '@temps-sdk/ds'
+import { Ledger, PageState } from '@temps-sdk/ds'
 import { ShieldCheck } from 'lucide-react'
 import { Link, useParams, useSearchParams } from 'react-router'
 import { toast } from 'sonner'
@@ -14,6 +14,7 @@ import { listWorkflowGrantsOptions } from '@/api/client/@tanstack/react-query.ge
 import { createWorkflowGrant, revokeWorkflowGrant } from '@/api/client/sdk.gen'
 import type { WorkflowGrantResponse } from '@/api/client'
 import { Button } from '@/components/ui/button'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { RefreshButton } from '@/components/ui/refresh-button'
@@ -232,16 +233,18 @@ export function WorkflowGrants() {
           />
         }
       />
-      <EchoDialog
+      <ConfirmDeleteDialog
         open={selected !== null}
         onOpenChange={(open) => {
           if (!open && !revoke.isPending) setSelected(null)
         }}
-        title="Revoke workflow access?"
-        description="New calls from the source environment will be rejected. Already authorized requests and runs may finish."
-        phrase={selected?.resource ?? ''}
+        resourceType="workflow access grant"
+        resourceName={selected?.resource ?? ''}
+        verb="Revoke"
+        requireTypedName
+        consequences="New calls from the source environment will be rejected. Already authorized requests and runs may finish."
         confirmLabel="Revoke access"
-        busy={revoke.isPending}
+        isPending={revoke.isPending}
         onConfirm={() => {
           if (selected && !revoke.isPending) revoke.mutate(selected)
         }}

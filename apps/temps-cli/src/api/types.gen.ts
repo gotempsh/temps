@@ -12364,7 +12364,7 @@ export type DockerfilePresetConfig = ContainerRuntimeOverrides & {
  * Existing rows predate this discriminator and therefore deserialize as
  * [`DockerfileVariant::File`].
  */
-export type DockerfileVariant = 'file' | 'custom';
+export type DockerfileVariant = 'file' | 'custom' | 'workflow-worker';
 
 /**
  * What to do with a domain during migration
@@ -38840,6 +38840,14 @@ export type WorkflowDevSessionResponse = {
     expires_at: string;
     manifest_token: string;
     session_id: string;
+};
+
+export type WorkflowDiagnosis = {
+    blocked_reason?: string | null;
+    error_kind?: string | null;
+    next_action: string;
+    run_id: string;
+    status: WorkflowRunStatus;
 };
 
 export type WorkflowDryRunRequest = {
@@ -82763,6 +82771,54 @@ export type CancelWorkflowRunResponses = {
 };
 
 export type CancelWorkflowRunResponse = CancelWorkflowRunResponses[keyof CancelWorkflowRunResponses];
+
+export type DiagnoseWorkflowRunData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+        /**
+         * Run ID
+         */
+        run_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/workflows/runs/{run_id}/diagnose';
+};
+
+export type DiagnoseWorkflowRunErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Run not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type DiagnoseWorkflowRunResponses = {
+    /**
+     * Run diagnosis without decrypted payloads
+     */
+    200: WorkflowDiagnosis;
+};
+
+export type DiagnoseWorkflowRunResponse = DiagnoseWorkflowRunResponses[keyof DiagnoseWorkflowRunResponses];
 
 export type ResumeWorkflowRunData = {
     body?: never;
