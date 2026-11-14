@@ -752,13 +752,18 @@ async fn complete_oidc_login(
                 })?;
 
         let mut headers = HeaderMap::new();
-        let mfa_cookie = Cookie::build(("mfa_session", encrypted_token))
-            .http_only(true)
-            .path("/")
-            .max_age(cookie::time::Duration::minutes(5))
-            .same_site(cookie::SameSite::Strict)
-            .secure(metadata.is_secure)
-            .build();
+        // Through the shared builder, so this challenge is issued under the
+        // same name the password flow uses and the one `verify_mfa` reads.
+        // Issuing the unprefixed name here while that reader preferred the
+        // host-only one let a stale password-flow challenge shadow a fresh
+        // SSO one for its whole five-minute life.
+        let mfa_cookie = crate::auth_cookies::builder(
+            crate::auth_cookies::MFA_SESSION,
+            encrypted_token,
+            metadata.is_secure,
+        )
+        .max_age(cookie::time::Duration::minutes(5))
+        .build();
         let cookie_header =
             mfa_cookie
                 .to_string()

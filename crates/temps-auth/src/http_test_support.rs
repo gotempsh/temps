@@ -73,24 +73,49 @@ pub(crate) fn auth_state(db: Arc<DatabaseConnection>) -> Arc<AuthState> {
     ))
 }
 
-pub(crate) async fn insert_request_metadata(mut request: Request<Body>, next: Next) -> Response {
+pub(crate) async fn insert_request_metadata(request: Request<Body>, next: Next) -> Response {
+    with_metadata(false, request, next).await
+}
+
+/// [`insert_request_metadata`] for an https console, where cookies carry
+/// `Secure` and so only the host-only cookie name authenticates.
+pub(crate) async fn insert_secure_request_metadata(request: Request<Body>, next: Next) -> Response {
+    with_metadata(true, request, next).await
+}
+
+async fn with_metadata(is_secure: bool, mut request: Request<Body>, next: Next) -> Response {
     let headers = request.headers().clone();
+    let scheme = if is_secure { "https" } else { "http" };
     request.extensions_mut().insert(RequestMetadata {
         ip_address: "127.0.0.1".to_string(),
         user_agent: "temps-auth-test".to_string(),
         headers,
         visitor_id_cookie: None,
         session_id_cookie: None,
-        base_url: "http://temps.test".to_string(),
-        scheme: "http".to_string(),
+        base_url: format!("{scheme}://temps.test"),
+        scheme: scheme.to_string(),
         host: "temps.test".to_string(),
-        is_secure: false,
+        is_secure,
     });
     next.run(request).await
 }
 
-/// The auth routes behind the production session/API-key middleware.
+/// The auth routes behind the production session/API-key middleware, as a
+/// plain-HTTP install serves them.
 pub(crate) fn router(state: Arc<AuthState>, db: Arc<DatabaseConnection>) -> axum::Router {
+    build_router(state, db, false)
+}
+
+/// [`router`] as an https install serves it.
+pub(crate) fn secure_router(state: Arc<AuthState>, db: Arc<DatabaseConnection>) -> axum::Router {
+    build_router(state, db, true)
+}
+
+fn build_router(
+    state: Arc<AuthState>,
+    db: Arc<DatabaseConnection>,
+    is_secure: bool,
+) -> axum::Router {
     let middleware = Arc::new(crate::temps_middleware::AuthMiddleware::new(
         state.api_key_service.clone(),
         state.auth_service.clone(),
@@ -99,14 +124,18 @@ pub(crate) fn router(state: Arc<AuthState>, db: Arc<DatabaseConnection>) -> axum
         db,
         crate::permission_denial_recorder::PermissionDenialRecorder::new(Arc::new(NoopAudit)),
     ));
-    crate::handlers::configure_routes()
-        .layer(axum::middleware::from_fn(
-            move |request: Request<Body>, next: Next| {
-                let middleware = middleware.clone();
-                async move { middleware.execute(request, next).await }
-            },
-        ))
-        .layer(axum::middleware::from_fn(insert_request_metadata))
+    let routes = crate::handlers::configure_routes().layer(axum::middleware::from_fn(
+        move |request: Request<Body>, next: Next| {
+            let middleware = middleware.clone();
+            async move { middleware.execute(request, next).await }
+        },
+    ));
+    let routes = if is_secure {
+        routes.layer(axum::middleware::from_fn(insert_secure_request_metadata))
+    } else {
+        routes.layer(axum::middleware::from_fn(insert_request_metadata))
+    };
+    routes
         .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))))
         .with_state(state)
 }

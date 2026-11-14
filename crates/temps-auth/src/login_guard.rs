@@ -34,15 +34,22 @@
 //! while cutting a distributed guessing run to a handful of attempts an
 //! hour. SSO and password reset are unaffected either way.
 //!
-//! # Counted in one statement, with no lock held across Argon2
+//! # Admission is the count, in one statement, with no lock across Argon2
 //!
 //! [`crate::mfa_guard`] serializes its read-check-write on the `users` row
 //! lock. A login cannot: verifying a password is tens of milliseconds of
 //! Argon2, and holding a row lock and a pooled connection across it would
-//! be a self-inflicted outage under load. Instead the whole increment —
-//! including the new deadline — is derived from the stored row inside one
-//! `INSERT ... ON CONFLICT DO UPDATE`, so concurrent rejected attempts
-//! cannot lose a count between them.
+//! be a self-inflicted outage under load.
+//!
+//! So the attempt is *reserved* before the password is read, by the same
+//! conditional `UPDATE` that counts it ([`reserve_attempt`]). Checking a
+//! deadline and then counting separately cannot bound a burst — one short of
+//! the threshold, every simultaneous request reads "not locked" and gets
+//! evaluated before the first count lands. An `UPDATE` whose `WHERE` clause
+//! excludes a throttled row is re-evaluated against the updated row after it
+//! waits on the row lock, so concurrent attempts are admitted one at a time
+//! and the one that reaches the threshold refuses the rest of the burst. The
+//! statement completes before any Argon2 work begins.
 
 use chrono::{DateTime, Utc};
 use sea_orm::{ConnectionTrait, DbErr, FromQueryResult, Statement};
@@ -89,108 +96,178 @@ impl From<LoginGuardError> for crate::auth_service::UserAuthError {
     }
 }
 
-/// A user id no row can have, used to read the guard for an email that does
+/// A user id no row can have, used to probe the guard for an email that does
 /// not exist so the lookup costs the same either way.
 ///
 /// `users.id` is a `serial`, which never issues a negative value.
-pub(crate) const NO_SUCH_USER: i32 = -1;
+const NO_SUCH_USER: i32 = -1;
+
+/// Touch the guard table for an email that matched no account.
+///
+/// [`reserve_attempt`] cannot run here — the table's foreign key means there
+/// is no row to reserve against — so this reads instead, keeping the work an
+/// unknown address costs in the same shape as a real one. The result is
+/// always `None`; only the lookup matters.
+pub(crate) async fn probe_missing_account<C: ConnectionTrait>(
+    conn: &C,
+) -> Result<(), LoginGuardError> {
+    let statement = Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "SELECT locked_until FROM user_login_guards WHERE user_id = $1",
+        [NO_SUCH_USER.into()],
+    );
+    ProbedGuard::find_by_statement(statement)
+        .one(conn)
+        .await
+        .map(|_| ())
+        .map_err(|source| LoginGuardError::Database {
+            operation: "probe",
+            user_id: NO_SUCH_USER,
+            source,
+        })
+}
 
 #[derive(Debug, FromQueryResult)]
-struct LockedUntilRow {
+struct ProbedGuard {
+    #[allow(dead_code, reason = "selected only so the probe costs a real lookup")]
     locked_until: Option<DateTime<Utc>>,
 }
 
-/// When `user_id`'s password login is throttled until, or `None`.
+/// What the guard decided about one password attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Admission {
+    /// The attempt is counted and may be evaluated.
+    Admitted { attempts: i32 },
+    /// The account is in its backoff window, so the password is not
+    /// evaluated at all. Nothing was counted, so whoever keeps sending
+    /// attempts cannot push the deadline further out.
+    Throttled { until: DateTime<Utc> },
+}
+
+#[derive(Debug, FromQueryResult)]
+struct AdmittedAttempt {
+    failed_attempts: i32,
+}
+
+#[derive(Debug, FromQueryResult)]
+struct Deadline {
+    locked_until: Option<DateTime<Utc>>,
+}
+
+/// Reserve one password attempt against `user_id`, **before** the password is
+/// verified, and say whether it may proceed.
 ///
-/// Call this for every attempt, including one whose email matched no row
-/// ([`NO_SUCH_USER`]): doing the lookup only for accounts that exist would
-/// make the response time say which is which.
-pub(crate) async fn locked_until<C: ConnectionTrait>(
+/// Counting after the fact cannot bound a burst: with the count one short of
+/// the threshold, any number of simultaneous requests all read "not locked",
+/// and every one of them gets its password evaluated before the first
+/// increment lands. So the increment *is* the admission, and the condition
+/// that admits it rides on the same `UPDATE`:
+///
+/// * the `WHERE` clause matches only a row that is not currently throttled;
+/// * under `READ COMMITTED` a concurrent `UPDATE` waits on the row lock and
+///   then re-evaluates its `WHERE` against the *updated* row, so once one
+///   attempt has pushed the count to the threshold and set the deadline, the
+///   rest of the burst matches nothing and is refused;
+/// * a row that matched is returned, so "admitted" and "refused" are the
+///   presence or absence of a row rather than a second read.
+///
+/// The statement finishes before any Argon2 work starts, so no row lock or
+/// pooled connection is held across the verification.
+///
+/// A refused attempt is never counted and never rewrites the deadline, so a
+/// flood of them cannot push somebody else's lockout further out.
+pub(crate) async fn reserve_attempt<C: ConnectionTrait>(
     conn: &C,
     user_id: i32,
-) -> Result<Option<DateTime<Utc>>, LoginGuardError> {
-    let statement = Statement::from_sql_and_values(
+) -> Result<Admission, LoginGuardError> {
+    // The gate below can only admit an existing row, so make sure there is
+    // one. Idempotent, and it leaves an existing row untouched.
+    let ensure = Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
-        "SELECT locked_until FROM user_login_guards \
-         WHERE user_id = $1 AND locked_until > now()",
+        "INSERT INTO user_login_guards (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING",
         [user_id.into()],
     );
-    let row = LockedUntilRow::find_by_statement(statement)
-        .one(conn)
+    conn.execute(ensure)
         .await
         .map_err(|source| LoginGuardError::Database {
-            operation: "read",
+            operation: "open a throttle record for",
             user_id,
             source,
         })?;
-    Ok(row.and_then(|row| row.locked_until))
-}
 
-#[derive(Debug, FromQueryResult)]
-struct RecordedFailure {
-    failed_attempts: i32,
-    locked_until: Option<DateTime<Utc>>,
-}
-
-/// Count one rejected password attempt for `user_id` and return the state it
-/// leaves behind.
-///
-/// The new count and the new deadline are both derived from the stored row
-/// in a single statement, so two attempts arriving together cannot overwrite
-/// each other's count.
-pub(crate) async fn record_failure<C: ConnectionTrait>(
-    conn: &C,
-    user_id: i32,
-) -> Result<(i32, Option<DateTime<Utc>>), LoginGuardError> {
-    // `failed_attempts + 1` is the count this attempt produces, and it
-    // decides the window. `power(2, ...)` is capped so neither the exponent
-    // nor the interval can run away after a long guessing run.
-    let sql = format!(
-        "INSERT INTO user_login_guards (user_id, failed_attempts, locked_until, updated_at) \
-         VALUES ($1, 1, NULL, now()) \
-         ON CONFLICT (user_id) DO UPDATE SET \
-             failed_attempts = LEAST(user_login_guards.failed_attempts + 1, {max_attempts}), \
+    // `power(2, ...)` is capped so neither the exponent nor the interval can
+    // run away after a long guessing run. An expired window matches too, so
+    // the account comes back on its own; the count carries over, which is
+    // what makes the next window longer until a success clears it.
+    let gate = format!(
+        "UPDATE user_login_guards SET \
+             failed_attempts = LEAST(failed_attempts + 1, {max_attempts}), \
              locked_until = CASE \
-                 WHEN user_login_guards.failed_attempts + 1 >= {threshold} \
+                 WHEN failed_attempts + 1 >= {threshold} \
                  THEN now() + make_interval(secs => LEAST( \
                      {max_seconds}::double precision, \
                      {base_seconds}::double precision * power(2, LEAST( \
-                         user_login_guards.failed_attempts + 1 - {threshold}, \
+                         failed_attempts + 1 - {threshold}, \
                          {max_doublings} \
                      )) \
                  )) \
                  ELSE NULL \
              END, \
              updated_at = now() \
-         RETURNING failed_attempts, locked_until",
+         WHERE user_id = $1 AND (locked_until IS NULL OR locked_until <= now()) \
+         RETURNING failed_attempts",
         max_attempts = MAX_RECORDED_ATTEMPTS,
         threshold = LOCKOUT_THRESHOLD,
         max_seconds = LOCKOUT_MAX_SECONDS,
         base_seconds = LOCKOUT_BASE_SECONDS,
         max_doublings = LOCKOUT_MAX_DOUBLINGS,
     );
-    let statement =
-        Statement::from_sql_and_values(sea_orm::DatabaseBackend::Postgres, &sql, [user_id.into()]);
-    let recorded = RecordedFailure::find_by_statement(statement)
-        .one(conn)
-        .await
-        .map_err(|source| LoginGuardError::Database {
-            operation: "record a rejected password attempt against",
-            user_id,
-            source,
-        })?
-        .ok_or_else(|| LoginGuardError::Database {
-            operation: "record a rejected password attempt against",
-            user_id,
-            source: DbErr::RecordNotInserted,
-        })?;
-    Ok((recorded.failed_attempts, recorded.locked_until))
+    let admitted = AdmittedAttempt::find_by_statement(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        &gate,
+        [user_id.into()],
+    ))
+    .one(conn)
+    .await
+    .map_err(|source| LoginGuardError::Database {
+        operation: "reserve a password attempt against",
+        user_id,
+        source,
+    })?;
+    if let Some(admitted) = admitted {
+        return Ok(Admission::Admitted {
+            attempts: admitted.failed_attempts,
+        });
+    }
+
+    // No row matched, so the account is inside its window. Read the deadline
+    // only to report it; nothing is written on this path.
+    let deadline = Deadline::find_by_statement(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "SELECT locked_until FROM user_login_guards WHERE user_id = $1",
+        [user_id.into()],
+    ))
+    .one(conn)
+    .await
+    .map_err(|source| LoginGuardError::Database {
+        operation: "read the throttle deadline of",
+        user_id,
+        source,
+    })?
+    .and_then(|row| row.locked_until);
+    // A window that expired between the two statements refuses this one
+    // attempt rather than admitting an uncounted one: failing closed costs a
+    // single retry, the other way costs a free guess.
+    Ok(Admission::Throttled {
+        until: deadline.unwrap_or_else(Utc::now),
+    })
 }
 
 /// Clear `user_id`'s throttle after a password was accepted.
 ///
-/// Writes nothing when there is nothing to clear, which is every ordinary
-/// login, so the common path stays read-only.
+/// This also releases the reservation [`reserve_attempt`] made for the
+/// accepted attempt, which is why an ordinary login writes here rather than
+/// leaving a count of one behind.
 pub(crate) async fn record_success<C: ConnectionTrait>(
     conn: &C,
     user_id: i32,

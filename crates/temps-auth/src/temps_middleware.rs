@@ -171,9 +171,20 @@ impl AuthMiddleware {
             }
         } else {
             // Try session cookie (only "session" cookie is used for user authentication)
-            if let Some(session_token) =
-                self.extract_user_session_from_cookies(req.headers(), &self.cookie_crypto)
-            {
+            // Whether this request's cookies carry `Secure` decides which
+            // cookie name may authenticate it. It comes from
+            // `RequestMetadata` (trusted server-side state, not a client
+            // header); with no metadata the strict choice is the safe one,
+            // so only the host-only name is read.
+            let secure_cookies = req
+                .extensions()
+                .get::<temps_core::RequestMetadata>()
+                .is_none_or(|metadata| metadata.is_secure);
+            if let Some(session_token) = self.extract_user_session_from_cookies(
+                req.headers(),
+                secure_cookies,
+                &self.cookie_crypto,
+            ) {
                 if let Ok(verified) = self
                     .auth_service
                     .verify_session_details(&session_token)
@@ -288,9 +299,10 @@ impl AuthMiddleware {
     fn extract_user_session_from_cookies(
         &self,
         headers: &axum::http::HeaderMap,
+        secure: bool,
         crypto: &temps_core::CookieCrypto,
     ) -> Option<String> {
-        crate::auth_cookies::read_sealed(headers, crate::auth_cookies::SESSION, crypto)
+        crate::auth_cookies::read_sealed(headers, crate::auth_cookies::SESSION, secure, crypto)
     }
 }
 
@@ -945,7 +957,8 @@ mod tests {
     /// one, driven through the real routes behind this middleware.
     mod session_cookie_name {
         use crate::http_test_support::{
-            auth_state, host_session_cookie, insert_user, router, send_with_headers, session_cookie,
+            auth_state, host_session_cookie, insert_user, router, secure_router, send_with_headers,
+            session_cookie,
         };
         use axum::extract::Request;
         use axum::http::StatusCode;
@@ -994,6 +1007,35 @@ mod tests {
             }
         }
 
+        /// Signing out removes `__Host-session`, but a `Set-Cookie` without
+        /// `Domain` cannot remove a cookie that was set with one. So on an
+        /// https console the unprefixed name is not read at all: otherwise
+        /// the request after sign-out would authenticate as whoever planted
+        /// it.
+        #[tokio::test]
+        async fn an_https_console_never_authenticates_the_unprefixed_cookie() {
+            let Some(db) = test_db().await else { return };
+            let connection = db.connection_arc();
+            let state = auth_state(connection.clone());
+            let attacker = insert_user(connection.as_ref(), "planted-https@example.com").await;
+            let owner = insert_user(connection.as_ref(), "owner-https@example.com").await;
+            let planted = session_cookie(&state, attacker.id).await;
+            let host_only = host_session_cookie(&state, owner.id).await;
+            let router = secure_router(state, connection);
+
+            // Alone -- the state the browser is in right after sign-out.
+            let (status, _) =
+                send_with_headers(&router, "GET", "/user/me", &[("cookie", &planted)], None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+            // And alongside the real one, it still counts for nothing.
+            let both = format!("{planted}; {host_only}");
+            let (status, body) =
+                send_with_headers(&router, "GET", "/user/me", &[("cookie", &both)], None).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["email"], "owner-https@example.com");
+        }
+
         #[tokio::test]
         async fn a_session_issued_before_the_prefix_still_authenticates() {
             let Some(db) = test_db().await else { return };
@@ -1003,8 +1045,8 @@ mod tests {
             let cookie = session_cookie(&state, user.id).await;
             let router = router(state, connection);
 
-            // The unprefixed name is also what a plain-HTTP install issues,
-            // so this fallback is permanent, not only an upgrade grace.
+            // The unprefixed name is the only one a plain-HTTP install can
+            // issue, which is the sole reason this path still reads it.
             let (status, body) =
                 send_with_headers(&router, "GET", "/user/me", &[("cookie", &cookie)], None).await;
 

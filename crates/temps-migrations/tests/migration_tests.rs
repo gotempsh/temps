@@ -9607,17 +9607,67 @@ fn external_database_url() -> Option<String> {
 }
 
 /// Swap the database name in a `postgresql://` URL, keeping everything else.
+///
+/// Only the path after the authority is replaced. A connection URI may carry
+/// no database path at all, and `rsplit_once('/')` on such a URL splits
+/// inside `://` and throws the credentials, host and port away -- so the
+/// authority is located explicitly and the path appended or replaced after
+/// it.
 fn replace_database(url: &str, database: &str) -> String {
-    match url.split_once('?') {
-        Some((base, query)) => {
-            let (prefix, _) = base.rsplit_once('/').unwrap_or((base, ""));
-            format!("{prefix}/{database}?{query}")
-        }
-        None => {
-            let (prefix, _) = url.rsplit_once('/').unwrap_or((url, ""));
-            format!("{prefix}/{database}")
-        }
+    let (head, query) = match url.split_once('?') {
+        Some((head, query)) => (head, Some(query)),
+        None => (url, None),
+    };
+    // Everything up to the end of the authority: the scheme separator, then
+    // the first `/` after it (if any) begins the path.
+    let authority_end = match head.find("://") {
+        Some(scheme) => head[scheme + 3..]
+            .find('/')
+            .map(|slash| scheme + 3 + slash)
+            .unwrap_or(head.len()),
+        None => head.find('/').unwrap_or(head.len()),
+    };
+    let swapped = format!("{}/{database}", &head[..authority_end]);
+    match query {
+        Some(query) => format!("{swapped}?{query}"),
+        None => swapped,
     }
+}
+
+#[test]
+fn replace_database_keeps_the_authority_and_query() {
+    // With a database path, the common case.
+    assert_eq!(
+        replace_database("postgresql://u:p@localhost:5432/testdb", "scratch"),
+        "postgresql://u:p@localhost:5432/scratch"
+    );
+    // Without one, which a connection URI is allowed to omit. The
+    // credentials, host and port must survive.
+    assert_eq!(
+        replace_database("postgresql://u:p@localhost:5432", "scratch"),
+        "postgresql://u:p@localhost:5432/scratch"
+    );
+    assert_eq!(
+        replace_database("postgresql://localhost", "scratch"),
+        "postgresql://localhost/scratch"
+    );
+    // Query parameters are preserved either way.
+    assert_eq!(
+        replace_database(
+            "postgresql://u:p@localhost:5432/testdb?sslmode=require",
+            "scratch"
+        ),
+        "postgresql://u:p@localhost:5432/scratch?sslmode=require"
+    );
+    assert_eq!(
+        replace_database("postgresql://u:p@localhost:5432?sslmode=require", "scratch"),
+        "postgresql://u:p@localhost:5432/scratch?sslmode=require"
+    );
+    // A trailing slash is a path, so it is replaced rather than doubled.
+    assert_eq!(
+        replace_database("postgresql://localhost:5432/", "scratch"),
+        "postgresql://localhost:5432/scratch"
+    );
 }
 
 /// How many `Migrator::up` steps stop just before `name`.

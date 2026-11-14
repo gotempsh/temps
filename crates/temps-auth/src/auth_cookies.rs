@@ -22,11 +22,21 @@
 //! trusted `is_secure` decision that sets the `Secure` attribute
 //! ([`temps_core::secure_cookie_for_request`]).
 //!
-//! [`read`] therefore accepts both, and **always prefers the prefixed one**:
-//! that ordering is what stops a planted parent-domain cookie overriding a
-//! host-only one. The unprefixed fallback is what a plain-HTTP install reads
-//! normally, and what lets a session issued before this change keep working
-//! until its holder next signs in.
+//! [`read`] therefore reads **only the host-only name on a secure request**.
+//! Merely *preferring* it is not enough: a `Set-Cookie` without `Domain`
+//! cannot delete a cookie that was set with one (RFC 6265 matches deletion on
+//! name, domain and path), so signing out removes `__Host-session` and leaves
+//! a planted parent-domain `session` behind. A fallback would then hand the
+//! next request to the attacker's session — authenticated as them, right
+//! after the user signed out. With no fallback there is nothing to fall back
+//! to, which is why this is the migration mechanism rather than a grace
+//! period: an https install signs its users out once on upgrade.
+//!
+//! The unprefixed name is still read on a request whose cookies would not
+//! carry `Secure`, because that is the only name a plain-HTTP install can
+//! issue. Such an install cannot be protected from a sibling app by any
+//! cookie attribute; the same-origin check on state-changing requests
+//! ([`temps_core::same_origin`]) is what limits the damage there.
 
 use axum::http::{HeaderMap, HeaderValue};
 use cookie::Cookie;
@@ -91,19 +101,21 @@ pub(crate) fn clearing_values(base: &str) -> Vec<HeaderValue> {
         .collect()
 }
 
-/// The raw value of `base`, preferring the host-only `__Host-` cookie.
+/// The raw value of `base`, read under the name this request may trust.
 ///
-/// Returns the first prefixed match if there is one, and only otherwise an
-/// unprefixed match, so a parent-domain cookie planted by a sibling app can
-/// never displace the console's own.
+/// `secure` is the same decision that sets the `Secure` attribute
+/// ([`temps_core::secure_cookie_for_request`]), so it is server-side state,
+/// not something a client can turn off.
 ///
-/// Deliberately *no* fallback when a prefixed cookie is present but turns
-/// out to be unusable (it no longer decrypts after a key change, say): that
-/// fallback is precisely what would let a planted cookie win, since a
-/// sibling app cannot alter the host-only one but can always add another.
-/// A browser holds at most one `__Host-` cookie per name and host, so there
-/// is never a second prefixed candidate to try.
-pub(crate) fn read(headers: &HeaderMap, base: &str) -> Option<String> {
+/// * **`secure`**: only `__Host-<base>`. A sibling app cannot set that name
+///   for this host, and no unprefixed value is consulted at all — not as a
+///   fallback when the host-only cookie is missing (which is what sign-out
+///   leaves behind, since deletion cannot reach a parent-domain cookie), and
+///   not when it is present but unusable.
+/// * **otherwise**: the host-only name first, then the unprefixed one. A
+///   plain-HTTP install can only issue the unprefixed name; the prefixed
+///   branch is for a non-browser client that sends it anyway.
+pub(crate) fn read(headers: &HeaderMap, base: &str, secure: bool) -> Option<String> {
     let prefixed = issued_name(base, true);
     let mut fallback = None;
     for cookie_header in headers.get_all("cookie") {
@@ -114,7 +126,7 @@ pub(crate) fn read(headers: &HeaderMap, base: &str) -> Option<String> {
             if cookie.name() == prefixed {
                 return Some(cookie.value().to_string());
             }
-            if cookie.name() == base && fallback.is_none() {
+            if !secure && cookie.name() == base && fallback.is_none() {
                 fallback = Some(cookie.value().to_string());
             }
         }
@@ -129,9 +141,10 @@ pub(crate) fn read(headers: &HeaderMap, base: &str) -> Option<String> {
 pub(crate) fn read_sealed(
     headers: &HeaderMap,
     base: &str,
+    secure: bool,
     crypto: &CookieCrypto,
 ) -> Option<String> {
-    crypto.decrypt(&read(headers, base)?).ok()
+    crypto.decrypt(&read(headers, base, secure)?).ok()
 }
 
 #[cfg(test)]
@@ -182,51 +195,72 @@ mod tests {
     fn the_host_only_cookie_wins_over_a_planted_one() {
         // A sibling app sets `session` on the parent domain; the browser
         // sends both, in whichever order it likes.
-        assert_eq!(
-            read(
-                &with_cookies(&["session=planted; __Host-session=real"]),
-                SESSION
-            )
-            .as_deref(),
-            Some("real")
-        );
-        assert_eq!(
-            read(
-                &with_cookies(&["__Host-session=real; session=planted"]),
-                SESSION
-            )
-            .as_deref(),
-            Some("real")
-        );
+        for header in [
+            "session=planted; __Host-session=real",
+            "__Host-session=real; session=planted",
+        ] {
+            assert_eq!(
+                read(&with_cookies(&[header]), SESSION, true).as_deref(),
+                Some("real"),
+                "{header}"
+            );
+            assert_eq!(
+                read(&with_cookies(&[header]), SESSION, false).as_deref(),
+                Some("real"),
+                "{header}"
+            );
+        }
         // Also across separate Cookie headers.
         assert_eq!(
             read(
                 &with_cookies(&["session=planted", "__Host-session=real"]),
-                SESSION
+                SESSION,
+                true
             )
             .as_deref(),
             Some("real")
         );
     }
 
+    /// Signing out removes `__Host-session`, and a `Set-Cookie` without
+    /// `Domain` cannot remove a cookie that was set with one. If the
+    /// unprefixed name were still read once the host-only one is gone, the
+    /// next request would be authenticated as whoever planted it -- right
+    /// after the user signed out.
     #[test]
-    fn an_unprefixed_cookie_is_read_when_it_is_the_only_one() {
+    fn a_planted_cookie_is_ignored_on_a_secure_request_even_when_alone() {
+        let planted = with_cookies(&["session=planted"]);
+        assert_eq!(read(&planted, SESSION, true), None);
+        // Only a plain-HTTP install, which cannot hold a `__Host-` cookie at
+        // all, still reads the unprefixed name.
+        assert_eq!(read(&planted, SESSION, false).as_deref(), Some("planted"));
+    }
+
+    #[test]
+    fn an_unprefixed_cookie_is_read_when_the_request_is_not_secure() {
         assert_eq!(
-            read(&with_cookies(&["session=legacy"]), SESSION).as_deref(),
+            read(&with_cookies(&["session=legacy"]), SESSION, false).as_deref(),
             Some("legacy")
         );
-        assert_eq!(read(&with_cookies(&["other=x"]), SESSION), None);
-        assert_eq!(read(&HeaderMap::new(), SESSION), None);
+        assert_eq!(read(&with_cookies(&["other=x"]), SESSION, false), None);
+        assert_eq!(read(&HeaderMap::new(), SESSION, false), None);
+        assert_eq!(read(&HeaderMap::new(), SESSION, true), None);
     }
 
     #[test]
     fn a_name_is_never_confused_with_another_cookies_name() {
         let headers = with_cookies(&["__Host-mfa_session=challenge; __Host-session=real"]);
-        assert_eq!(read(&headers, SESSION).as_deref(), Some("real"));
-        assert_eq!(read(&headers, MFA_SESSION).as_deref(), Some("challenge"));
-        assert_eq!(read(&headers, PASSWORD_CHANGE_SESSION), None);
+        assert_eq!(read(&headers, SESSION, true).as_deref(), Some("real"));
+        assert_eq!(
+            read(&headers, MFA_SESSION, true).as_deref(),
+            Some("challenge")
+        );
+        assert_eq!(read(&headers, PASSWORD_CHANGE_SESSION, true), None);
         // `session` must not match the tail of `mfa_session`.
-        assert_eq!(read(&with_cookies(&["mfa_session=c"]), SESSION), None);
+        assert_eq!(
+            read(&with_cookies(&["mfa_session=c"]), SESSION, false),
+            None
+        );
     }
 
     #[test]
@@ -256,13 +290,19 @@ mod tests {
             read_sealed(
                 &with_cookies(&[&format!("__Host-session={sealed}")]),
                 SESSION,
+                true,
                 &crypto,
             )
             .as_deref(),
             Some("session-token")
         );
         assert_eq!(
-            read_sealed(&with_cookies(&["__Host-session=forged"]), SESSION, &crypto),
+            read_sealed(
+                &with_cookies(&["__Host-session=forged"]),
+                SESSION,
+                true,
+                &crypto
+            ),
             None
         );
     }

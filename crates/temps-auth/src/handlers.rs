@@ -331,8 +331,11 @@ pub async fn verify_mfa_challenge(
     Json(verification): Json<MfaVerificationRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     // Extract and decrypt MFA session from cookie, host-only name first.
-    let encrypted_mfa_session =
-        crate::auth_cookies::read(&headers, crate::auth_cookies::MFA_SESSION);
+    let encrypted_mfa_session = crate::auth_cookies::read(
+        &headers,
+        crate::auth_cookies::MFA_SESSION,
+        metadata.is_secure,
+    );
     let encrypted_mfa_session = match encrypted_mfa_session {
         Some(session) => session,
         None => {
@@ -1673,13 +1676,16 @@ pub async fn change_required_password(
     headers: HeaderMap,
     Json(request): Json<RequiredPasswordChangeRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    let encrypted_token =
-        crate::auth_cookies::read(&headers, crate::auth_cookies::PASSWORD_CHANGE_SESSION)
-            .ok_or_else(|| {
-                problem_new(StatusCode::UNAUTHORIZED)
-                    .with_title("Password Change Session Required")
-                    .with_detail("Log in again to restart the required password change.")
-            })?;
+    let encrypted_token = crate::auth_cookies::read(
+        &headers,
+        crate::auth_cookies::PASSWORD_CHANGE_SESSION,
+        metadata.is_secure,
+    )
+    .ok_or_else(|| {
+        problem_new(StatusCode::UNAUTHORIZED)
+            .with_title("Password Change Session Required")
+            .with_detail("Log in again to restart the required password change.")
+    })?;
 
     let token = state
         .cookie_crypto
@@ -2993,6 +2999,7 @@ async fn change_password_self(
     let current_session_token: Option<String> = crate::auth_cookies::read_sealed(
         &headers,
         crate::auth_cookies::SESSION,
+        metadata.is_secure,
         &app_state.cookie_crypto,
     );
 
@@ -3594,10 +3601,14 @@ mod tests {
             .cookie_crypto
             .encrypt(session_token)
             .expect("test MFA session encrypts");
+        // `request_metadata()` describes an https console, which issues and
+        // reads only the host-only name. Through the shared helper so the
+        // fixture cannot drift from what the server looks for.
+        let name = crate::auth_cookies::issued_name(crate::auth_cookies::MFA_SESSION, true);
         let mut headers = HeaderMap::new();
         headers.insert(
             axum::http::header::COOKIE,
-            format!("mfa_session={encrypted}")
+            format!("{name}={encrypted}")
                 .parse()
                 .expect("test cookie header is valid"),
         );

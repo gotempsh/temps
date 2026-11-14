@@ -352,16 +352,15 @@ function AgentProperties({ agent }: { agent: Agent }) {
                   Token (header)
                 </label>
                 {/* The server stores only a digest of the token, so reads
-                    answer `***` and there is nothing here to copy. Say so,
-                    and say how to get a working one, rather than offering a
-                    copy button that yields the mask. */}
+                    answer `***` and there is nothing here to copy. Say that
+                    much and no more: this page offers no way to re-issue one,
+                    and the edit form has no webhook control to toggle. */}
                 <code className="block text-xs bg-muted px-2 py-1.5 rounded">
                   X-Webhook-Token: {agent.webhook_token ?? '***'}
                 </code>
                 <p className="text-xs text-muted-foreground">
-                  The token is shown in full only when it is created. Lost it?
-                  Turn the webhook trigger off and save, then on and save again,
-                  to get a new one.
+                  Shown in full only when it is created; this page cannot show
+                  it again.
                 </p>
               </div>
               <p className="text-xs text-muted-foreground">

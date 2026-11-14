@@ -920,32 +920,6 @@ impl AuthService {
     }
 
     // Login with email/password
-    /// Count one rejected password attempt against the account.
-    ///
-    /// Never fails the login with it: a write error here must not turn a
-    /// wrong password into a 500 for a real account next to a 401 for an
-    /// unknown one, which is exactly the account-existence oracle the
-    /// throttle is built to avoid. A lost count is logged and the throttle
-    /// simply does not tighten.
-    async fn record_login_failure_for_throttle(&self, user_id: i32) {
-        match crate::login_guard::record_failure(self.db.as_ref(), user_id).await {
-            Ok((failed_attempts, Some(until))) => warn!(
-                user_id,
-                failed_attempts,
-                throttled_until = %until.to_rfc3339(),
-                "Password login throttled for this account after repeated failures"
-            ),
-            Ok((failed_attempts, None)) => debug!(
-                user_id,
-                failed_attempts, "Recorded a rejected password attempt for this account"
-            ),
-            Err(error) => error!(
-                user_id, %error,
-                "Failed to record a rejected password attempt; the per-account throttle did not tighten"
-            ),
-        }
-    }
-
     pub async fn login(
         &self,
         request: LoginRequest,
@@ -959,19 +933,10 @@ impl AuthService {
             .one(self.db.as_ref())
             .await?;
 
-        // Read the per-account throttle for every attempt, against an id no
-        // row can have when the email matched nothing
-        // (`crate::login_guard`). Looking it up only for accounts that exist
-        // would let the response time say which is which.
-        let throttled_until = crate::login_guard::locked_until(
-            self.db.as_ref(),
-            found
-                .as_ref()
-                .map_or(crate::login_guard::NO_SUCH_USER, |user| user.id),
-        )
-        .await?;
-
         let Some(user) = found else {
+            // The guard is touched for an unknown address too, so the work
+            // this path costs does not say whether the account exists.
+            crate::login_guard::probe_missing_account(self.db.as_ref()).await?;
             verify_against_dummy_hash(&request.password);
             warn!(
                 "Login attempt for non-existent or deleted email: {}",
@@ -980,25 +945,32 @@ impl AuthService {
             return Err(UserAuthError::InvalidCredentials);
         };
 
-        // Past the threshold the password is not evaluated at all, and the
-        // answer is the one a wrong password gets. Nothing is counted here,
-        // so an attacker cannot extend somebody else's backoff by keeping
-        // the attempts coming.
-        if let Some(until) = throttled_until {
-            verify_against_dummy_hash(&request.password);
-            warn!(
-                user_id = user.id,
-                throttled_until = %until.to_rfc3339(),
-                "Refused a password login while the account is throttled after repeated failures"
-            );
-            return Err(UserAuthError::InvalidCredentials);
+        // Reserve this attempt *before* reading the password: the reservation
+        // is the count, so a burst of simultaneous guesses cannot slip past a
+        // threshold that a separate check-then-count would still read as
+        // clear (`crate::login_guard`). Past the threshold the password is
+        // not evaluated at all, the answer is the one a wrong password gets,
+        // and nothing is counted -- so whoever keeps sending attempts cannot
+        // push the deadline further out.
+        match crate::login_guard::reserve_attempt(self.db.as_ref(), user.id).await? {
+            crate::login_guard::Admission::Throttled { until } => {
+                verify_against_dummy_hash(&request.password);
+                warn!(
+                    user_id = user.id,
+                    throttled_until = %until.to_rfc3339(),
+                    "Refused a password login while the account is throttled after repeated failures"
+                );
+                return Err(UserAuthError::InvalidCredentials);
+            }
+            crate::login_guard::Admission::Admitted { attempts } => {
+                debug!(user_id = user.id, attempts, "Admitted a password attempt");
+            }
         }
 
         // Check if user has a password (might be GitHub-only user)
         let Some(password_hash) = user.password_hash.as_ref() else {
             verify_against_dummy_hash(&request.password);
             warn!("Login attempt for user {} with no password hash", user.id);
-            self.record_login_failure_for_throttle(user.id).await;
             return Err(UserAuthError::InvalidCredentials);
         };
 
@@ -1031,13 +1003,14 @@ impl AuthService {
         };
 
         if !password_valid {
+            // The attempt was already counted by the reservation above.
             warn!("Invalid password attempt for user {}", user.id);
-            self.record_login_failure_for_throttle(user.id).await;
             return Err(UserAuthError::InvalidCredentials);
         }
 
         // The password was right, so this account is not under attack from
-        // whoever just used it: start the count again.
+        // whoever just used it: release this attempt's reservation and start
+        // the count again.
         if let Err(error) = crate::login_guard::record_success(self.db.as_ref(), user.id).await {
             error!(user_id = user.id, %error, "Failed to clear the login throttle after a successful password");
         }
@@ -4419,21 +4392,35 @@ mod tests {
             updated_at: Utc::now(),
         };
 
+        let guard_row = temps_entities::user_login_guards::Model {
+            user_id: user.id,
+            failed_attempts: 1,
+            locked_until: None,
+            updated_at: Utc::now(),
+        };
         let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // Queries, in order:
             // 1) `find().filter(email...)` in login() -> the user above
             .append_query_results(vec![vec![user]])
-            // 2) `login_guard::locked_until` -> no row, so not throttled
-            .append_query_results(vec![Vec::<temps_entities::user_login_guards::Model>::new()])
+            // 2) `login_guard::reserve_attempt`'s gate -> admitted, so the
+            //    password is evaluated
+            .append_query_results(vec![vec![guard_row]])
             // 3) `get_settings()`'s `settings::Entity::find_by_id(1)` -> DB error
             .append_query_errors(vec![sea_orm::DbErr::Custom(
                 "connection reset by peer".to_string(),
             )])
-            // `login_guard::record_success` clears the throttle on the way
-            // through; it writes nothing when there is nothing to clear.
-            .append_exec_results(vec![sea_orm::MockExecResult {
-                last_insert_id: 0,
-                rows_affected: 0,
-            }])
+            // Statements, in order: `reserve_attempt` opens the throttle
+            // record, then `record_success` releases the reservation.
+            .append_exec_results(vec![
+                sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                },
+                sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                },
+            ])
             .into_connection();
 
         let notification_service = Arc::new(MockEmailService::new());
@@ -5081,6 +5068,70 @@ mod tests {
                     .is_ok(),
                 "the throttle is per account, so another account must be unaffected"
             );
+        }
+
+        /// The reservation is the count, so a burst of simultaneous guesses
+        /// one short of the threshold cannot all be evaluated: checking a
+        /// deadline and then counting separately would admit every one of
+        /// them.
+        #[tokio::test]
+        async fn a_simultaneous_burst_cannot_outrun_the_threshold() {
+            let Some((db, auth_service)) = setup_test_env_with_mfa_setting(false).await else {
+                return;
+            };
+            let user = create_test_user(&db.db, "burst@example.com", "Correct-Horse-9!").await;
+
+            // One attempt short of the threshold.
+            for _ in 0..crate::login_guard::LOCKOUT_THRESHOLD - 1 {
+                let _ = auth_service
+                    .login(attempt("burst@example.com", "Wrong-Password-1!"))
+                    .await;
+            }
+            let before = guard(&db.db, user.id).await.expect("a guard row");
+            assert_eq!(
+                before.failed_attempts,
+                crate::login_guard::LOCKOUT_THRESHOLD - 1
+            );
+            assert_eq!(before.locked_until, None);
+
+            // Now a burst. Reserving serializes on the row, so exactly one
+            // of these reaches the threshold and the rest are refused
+            // without being evaluated.
+            let service = std::sync::Arc::new(auth_service);
+            let mut burst = tokio::task::JoinSet::new();
+            for _ in 0..8 {
+                let service = service.clone();
+                burst.spawn(async move {
+                    service
+                        .login(attempt("burst@example.com", "Wrong-Password-1!"))
+                        .await
+                        .is_err()
+                });
+            }
+            while let Some(outcome) = burst.join_next().await {
+                assert!(outcome.expect("the attempt task runs"));
+            }
+
+            // The count advanced by exactly one: the admitted attempt. The
+            // refused ones neither counted nor pushed the deadline out.
+            let after = guard(&db.db, user.id).await.expect("a guard row");
+            assert_eq!(
+                after.failed_attempts,
+                crate::login_guard::LOCKOUT_THRESHOLD,
+                "a burst must not be able to spend more than one attempt past the threshold"
+            );
+            let deadline = after.locked_until.expect("the account is throttled");
+            assert!(deadline > Utc::now());
+
+            // And the right password is refused while the window is open.
+            assert!(matches!(
+                service
+                    .login(attempt("burst@example.com", "Correct-Horse-9!"))
+                    .await,
+                Err(UserAuthError::InvalidCredentials)
+            ));
+            let unchanged = guard(&db.db, user.id).await.expect("a guard row");
+            assert_eq!(unchanged.locked_until, after.locked_until);
         }
 
         #[tokio::test]
