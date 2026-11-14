@@ -39,8 +39,6 @@ pub const DEFAULT_PAGE_SIZE: u64 = 20;
 pub const MAX_PAGE_SIZE: u64 = 100;
 /// Longest workflow name.
 pub const MAX_WORKFLOW_NAME: usize = 128;
-/// Where the console fixes a missing executor.
-pub const EXECUTOR_SETUP_PATH: &str = "/docs/workflows/getting-started";
 
 /// `(page, page_size)` with defaults and bounds applied.
 pub fn page_bounds(page: Option<u64>, page_size: Option<u64>) -> (u64, u64) {
@@ -254,7 +252,7 @@ impl WorkflowService {
             Err(reason) => ExecutorStatus {
                 configured: false,
                 reason: Some(reason),
-                setup_path: Some(EXECUTOR_SETUP_PATH.to_string()),
+                setup_path: Some(format!("/workflows/{project_id}/{environment_id}/settings")),
                 deployment_id: probe.deployment_id,
                 replicas: probe.replicas,
                 sdk: None,

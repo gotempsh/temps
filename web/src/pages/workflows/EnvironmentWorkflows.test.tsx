@@ -20,7 +20,7 @@ test('an environment without runs exposes onboarding, grants, keys and drain set
         replicas: 0,
         configured: false,
         reason: 'No deployment is live',
-        setup_path: '/projects/example/deployments',
+        setup_path: '/docs/workflows/getting-started',
       },
       credential: { configured: false },
       workflows: [],
@@ -34,6 +34,7 @@ test('an environment without runs exposes onboarding, grants, keys and drain set
     </MemoryRouter>
   )
   expect(html).toContain('No deployment is live')
+  expect(html).not.toContain('/docs/workflows/getting-started')
   expect(html).toContain('href="/workflows/1/2/grants"')
   expect(html).toContain('href="/workflows/1/2/settings"')
   expect(html).toContain('href="/workflows/1/keys"')

@@ -863,7 +863,10 @@ async fn the_overview_shows_an_onboarding_state_when_nothing_can_run() {
         .contains("No deployment"));
     assert_eq!(
         overview["executor"]["setup_path"],
-        crate::service::EXECUTOR_SETUP_PATH
+        format!(
+            "/workflows/{}/{}/settings",
+            h.env.project_id, h.env.environment_id
+        )
     );
     assert_eq!(overview["credential"]["configured"], false);
 }

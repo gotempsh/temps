@@ -295,8 +295,11 @@ async fn the_overview_says_why_the_environment_cannot_run_workflows() {
         Some("No deployment is live in this environment yet")
     );
     assert_eq!(
-        overview.executor.setup_path.as_deref(),
-        Some(EXECUTOR_SETUP_PATH)
+        overview.executor.setup_path,
+        Some(format!(
+            "/workflows/{}/{}/settings",
+            h.env.project_id, h.env.environment_id
+        ))
     );
     assert!(overview.workflows.is_empty());
 }

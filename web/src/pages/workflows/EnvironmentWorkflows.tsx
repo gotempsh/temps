@@ -177,10 +177,7 @@ export function WorkflowEnvironment({
                   'Deploy an app using a Temps workflows SDK.'
                 }
                 example="An orders workflow can charge a payment, sleep, then wait for approval."
-                settingsHref={
-                  query.data.executor.setup_path ??
-                  `/workflows/${projectId}/${environmentId}/settings`
-                }
+                settingsHref={`/workflows/${projectId}/${environmentId}/settings`}
               />
             )}
             <div className="flex flex-wrap items-center gap-2">
