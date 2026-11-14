@@ -215,17 +215,35 @@ impl PasswordTokenPurpose {
     }
 
     /// The value persisted in `users.password_reset_token` for `token`.
+    ///
+    /// The token itself is never stored: the column keeps the purpose tag
+    /// and a SHA-256 digest, the same at-rest form API keys, deployment
+    /// tokens and node tokens already use. Whoever can read the column --
+    /// a database dump, a backup, a read-only replica -- cannot turn its
+    /// contents back into a credential that sets somebody's password.
+    ///
+    /// Lookups stay exact-match on this value, so hashing costs nothing: a
+    /// presented token is tagged and hashed the same way and compared as a
+    /// whole string.
     pub(crate) fn stored_value(self, token: &str) -> String {
-        format!("{}{}", self.prefix(), token)
+        format!("{}{}", self.prefix(), temps_core::crypto::sha256_hex(token))
     }
 }
 
-/// Whether `token` has the shape of an untagged credential written before
-/// purpose tags existed. Generated tokens are UUIDs and never contain `:`; a
-/// presented value with `:` is refused here so it can never be matched against
-/// a tagged row through the legacy lookup.
-fn is_legacy_password_token_shape(token: &str) -> bool {
-    !token.is_empty() && !token.contains(':')
+/// The value `sessions.session_token` holds for a session whose cookie
+/// carries `presented`.
+///
+/// Defence in depth. The cookie already carries the token sealed with
+/// `CookieCrypto`, so reading it off the wire is not the threat; reading the
+/// *column* is -- a database dump, a backup, a read-only replica or a query
+/// that returns more than it meant to. Storing the digest means what the
+/// column holds cannot be pasted into a cookie, the same at-rest form API
+/// keys, deployment tokens and node tokens already use.
+///
+/// Every lookup is exact-match on this value, so the index on the column
+/// keeps working and nothing scans.
+pub(crate) fn stored_session_token(presented: &str) -> String {
+    temps_core::crypto::sha256_hex(presented)
 }
 
 pub struct AuthService {
@@ -294,7 +312,7 @@ impl AuthService {
 
         let new_session = temps_entities::sessions::ActiveModel {
             user_id: Set(user_id),
-            session_token: Set(session_token.clone()),
+            session_token: Set(stored_session_token(&session_token)),
             expires_at: Set(expires_at),
             // Fully authenticated session, not an MFA challenge.
             mfa_pending: Set(false),
@@ -341,7 +359,10 @@ impl AuthService {
         session_token: &str,
     ) -> Result<VerifiedSession, AuthError> {
         let session = temps_entities::sessions::Entity::find()
-            .filter(temps_entities::sessions::Column::SessionToken.eq(session_token))
+            .filter(
+                temps_entities::sessions::Column::SessionToken
+                    .eq(stored_session_token(session_token)),
+            )
             .filter(temps_entities::sessions::Column::ExpiresAt.gt(Utc::now()))
             // A first-factor-only MFA challenge row must never authenticate a
             // real request. Only `verify_mfa_challenge` may consume those.
@@ -459,7 +480,7 @@ impl AuthService {
 
         let new_session = temps_entities::sessions::ActiveModel {
             user_id: Set(user_id),
-            session_token: Set(session_token.clone()),
+            session_token: Set(stored_session_token(&session_token)),
             expires_at: Set(expires_at),
             // Mark this as a pending MFA challenge so it can never be replayed
             // as a real session cookie -- `verify_session` rejects such rows.
@@ -493,7 +514,10 @@ impl AuthService {
         session_token: &str,
     ) -> Result<Option<String>, AuthError> {
         let session = temps_entities::sessions::Entity::find()
-            .filter(temps_entities::sessions::Column::SessionToken.eq(session_token))
+            .filter(
+                temps_entities::sessions::Column::SessionToken
+                    .eq(stored_session_token(session_token)),
+            )
             .filter(temps_entities::sessions::Column::ExpiresAt.gt(Utc::now()))
             .filter(temps_entities::sessions::Column::MfaPending.eq(true))
             .one(self.db.as_ref())
@@ -619,7 +643,10 @@ impl AuthService {
                     // real (fully authenticated) session token can never be spent as an
                     // MFA challenge -- the discriminator cuts both ways.
                     let pending = temps_entities::sessions::Entity::find()
-                        .filter(temps_entities::sessions::Column::SessionToken.eq(&session_token))
+                        .filter(
+                            temps_entities::sessions::Column::SessionToken
+                                .eq(stored_session_token(&session_token)),
+                        )
                         .filter(temps_entities::sessions::Column::ExpiresAt.gt(Utc::now()))
                         .filter(temps_entities::sessions::Column::MfaPending.eq(true))
                         .one(transaction)
@@ -1183,25 +1210,21 @@ impl AuthService {
                     // every rejection path is rolled back before this method returns.
                     //
                     // Only email-reset credentials are accepted: a first-login token
-                    // (minted after a temporary-password sign-in) is never valid here.
-                    // An untagged value predates purpose tags and is accepted only on
-                    // an account that is not awaiting a forced change: first-login
-                    // tokens exist only while `must_change_password` is set, so such
-                    // a value can only be an in-flight email reset from before the
-                    // upgrade.
-                    let column = temps_entities::users::Column::PasswordResetToken;
-                    let mut matches = sea_orm::Condition::any().add(
-                        column.eq(PasswordTokenPurpose::EmailReset.stored_value(&request.token)),
-                    );
-                    if is_legacy_password_token_shape(&request.token) {
-                        matches = matches.add(
-                            sea_orm::Condition::all()
-                                .add(column.eq(request.token.as_str()))
-                                .add(temps_entities::users::Column::MustChangePassword.eq(false)),
-                        );
-                    }
+                    // (minted after a temporary-password sign-in) is never valid here,
+                    // because the purpose tag is part of the stored value.
+                    //
+                    // There is no second branch for an untagged value. One used to
+                    // accept tokens written before purpose tags existed, by comparing
+                    // the presented token with the column; now that the column holds a
+                    // digest, such a comparison would both never match and be the one
+                    // lookup that a stolen column value could satisfy. The migration
+                    // that introduced hashing clears every outstanding token, so the
+                    // rows it existed for are gone.
                     let user = temps_entities::users::Entity::find()
-                        .filter(matches)
+                        .filter(
+                            temps_entities::users::Column::PasswordResetToken
+                                .eq(PasswordTokenPurpose::EmailReset.stored_value(&request.token)),
+                        )
                         .lock_exclusive()
                         .one(transaction)
                         .await?
@@ -1503,7 +1526,9 @@ impl AuthService {
             let mut q = temps_entities::sessions::Entity::delete_many()
                 .filter(temps_entities::sessions::Column::UserId.eq(user_id));
             if let Some(tok) = current_session_token {
-                q = q.filter(temps_entities::sessions::Column::SessionToken.ne(tok));
+                q = q.filter(
+                    temps_entities::sessions::Column::SessionToken.ne(stored_session_token(tok)),
+                );
             }
             revoked_sessions = q
                 .exec(&txn)
@@ -2148,13 +2173,21 @@ mod tests {
         assert!(!session_token.is_empty());
         assert_eq!(session_token.len(), 64); // Session token should be 64 chars
 
-        // Verify session was saved to database
+        // The row holds the token's digest, not the token: the column is
+        // not a place a session cookie can be read out of.
         let session = sessions::Entity::find()
-            .filter(sessions::Column::SessionToken.eq(&session_token))
+            .filter(sessions::Column::SessionToken.eq(stored_session_token(&session_token)))
             .one(db.db.as_ref())
             .await
             .unwrap()
             .unwrap();
+        assert_ne!(session.session_token, session_token);
+        assert!(sessions::Entity::find()
+            .filter(sessions::Column::SessionToken.eq(&session_token))
+            .one(db.db.as_ref())
+            .await
+            .unwrap()
+            .is_none());
 
         assert_eq!(session.user_id, user.id);
         assert!(session.expires_at > Utc::now());
@@ -2455,9 +2488,10 @@ mod tests {
         let headers = HeaderMap::new();
         auth_service.logout(user.id, &headers).await.unwrap();
 
-        // Verify session was deleted
+        // Verify session was deleted. Look it up the way the column stores
+        // it, or the assertion would hold whether or not the row is gone.
         let session = sessions::Entity::find()
-            .filter(sessions::Column::SessionToken.eq(&session_token))
+            .filter(sessions::Column::SessionToken.eq(stored_session_token(&session_token)))
             .one(db.db.as_ref())
             .await
             .unwrap();
@@ -2825,7 +2859,7 @@ mod tests {
             .unwrap();
 
         assert!(sessions::Entity::find()
-            .filter(sessions::Column::SessionToken.eq(&earlier_session))
+            .filter(sessions::Column::SessionToken.eq(stored_session_token(&earlier_session)))
             .one(db.db.as_ref())
             .await
             .unwrap()
@@ -2869,7 +2903,7 @@ mod tests {
             .unwrap();
         assert_eq!(remaining_sessions, 0, "existing sessions must be revoked");
         assert!(sessions::Entity::find()
-            .filter(sessions::Column::SessionToken.eq(&session_token))
+            .filter(sessions::Column::SessionToken.eq(stored_session_token(&session_token)))
             .one(db.db.as_ref())
             .await
             .unwrap()
@@ -3393,47 +3427,75 @@ mod tests {
             .unwrap();
     }
 
-    /// Reset emails sent before the upgrade stored the token untagged. They
-    /// keep working for accounts not awaiting a forced change (the only state
-    /// in which an untagged value can be an email reset), and nowhere else.
+    /// The column holds a digest, so what it holds is not a credential.
+    ///
+    /// This replaces a test that asserted the opposite for untagged values
+    /// written before purpose tags existed: that lookup compared the
+    /// presented token with the column, which is exactly the comparison a
+    /// stolen column value could satisfy. The migration that introduced
+    /// hashing clears every outstanding token, so no row it served survives.
     #[tokio::test]
-    async fn legacy_untagged_email_reset_token_remains_valid_only_without_forced_change() {
+    async fn a_value_read_out_of_the_column_cannot_be_redeemed() {
         let (db, auth_service, _) = setup_test_env().await;
-        let user = create_test_user(&db.db, "legacy-reset@example.com", "OldPassword123!").await;
-        let legacy_token = Uuid::new_v4().to_string();
-        let mut user_update: users::ActiveModel = user.clone().into();
-        user_update.password_reset_token = Set(Some(legacy_token.clone()));
-        user_update.password_reset_expires = Set(Some(Utc::now() + Duration::hours(1)));
-        user_update.must_change_password = Set(true);
-        let flagged = user_update.update(db.db.as_ref()).await.unwrap();
+        let user = create_test_user(&db.db, "stolen-column@example.com", "OldPassword123!").await;
 
-        // Ambiguous while the account awaits a forced change: refused by both flows.
+        let token = auth_service.generate_token();
+        let mut user_update: users::ActiveModel = user.clone().into();
+        user_update.password_reset_token =
+            Set(Some(PasswordTokenPurpose::EmailReset.stored_value(&token)));
+        user_update.password_reset_expires = Set(Some(Utc::now() + Duration::hours(1)));
+        let stored = user_update.update(db.db.as_ref()).await.unwrap();
+
+        // What is on disk is neither the token nor usable as one.
+        let on_disk = stored.password_reset_token.clone().unwrap();
+        assert!(!on_disk.contains(&token), "{on_disk}");
+        for presented in [on_disk.clone(), temps_core::crypto::sha256_hex(&token)] {
+            assert!(
+                matches!(
+                    auth_service
+                        .reset_password(ResetPasswordRequest {
+                            token: presented.clone(),
+                            new_password: "Stolen-Column-123!".to_string(),
+                        })
+                        .await,
+                    Err(UserAuthError::InvalidToken)
+                ),
+                "{presented}"
+            );
+        }
+
+        // An untagged plaintext value, as rows written before purpose tags
+        // held, is refused too: there is no lookup left that compares the
+        // presented token with the column.
+        let mut user_update: users::ActiveModel = stored.into();
+        user_update.password_reset_token = Set(Some(token.clone()));
+        user_update.must_change_password = Set(false);
+        user_update.update(db.db.as_ref()).await.unwrap();
         assert!(matches!(
             auth_service
                 .reset_password(ResetPasswordRequest {
-                    token: legacy_token.clone(),
-                    new_password: "Legacy-Reset-123!".to_string(),
-                })
-                .await,
-            Err(UserAuthError::InvalidToken)
-        ));
-        assert!(matches!(
-            auth_service
-                .reset_required_password(ResetPasswordRequest {
-                    token: legacy_token.clone(),
-                    new_password: "Legacy-Reset-123!".to_string(),
+                    token: token.clone(),
+                    new_password: "Stolen-Column-123!".to_string(),
                 })
                 .await,
             Err(UserAuthError::InvalidToken)
         ));
 
-        let mut user_update: users::ActiveModel = flagged.into();
-        user_update.must_change_password = Set(false);
+        // The emailed token itself still works, against the digest.
+        let mut user_update: users::ActiveModel = users::Entity::find_by_id(user.id)
+            .one(db.db.as_ref())
+            .await
+            .unwrap()
+            .unwrap()
+            .into();
+        user_update.password_reset_token =
+            Set(Some(PasswordTokenPurpose::EmailReset.stored_value(&token)));
+        user_update.password_reset_expires = Set(Some(Utc::now() + Duration::hours(1)));
         user_update.update(db.db.as_ref()).await.unwrap();
         let reset = auth_service
             .reset_password(ResetPasswordRequest {
-                token: legacy_token,
-                new_password: "Legacy-Reset-123!".to_string(),
+                token,
+                new_password: "Stolen-Column-123!".to_string(),
             })
             .await
             .unwrap();
@@ -3445,10 +3507,13 @@ mod tests {
         let (db, auth_service, _) = setup_test_env().await;
         let user = create_test_user(&db.db, "user@example.com", "oldpassword").await;
 
-        // Set expired reset token
+        // Set expired reset token, stored the way the service stores it so
+        // this test fails on the expiry check and not on a lookup miss.
         let reset_token = Uuid::new_v4().to_string();
         let mut user_update: users::ActiveModel = user.into();
-        user_update.password_reset_token = Set(Some(reset_token.clone()));
+        user_update.password_reset_token = Set(Some(
+            PasswordTokenPurpose::EmailReset.stored_value(&reset_token),
+        ));
         user_update.password_reset_expires = Set(Some(Utc::now() - Duration::hours(1)));
         user_update.update(db.db.as_ref()).await.unwrap();
 
@@ -3538,13 +3603,15 @@ mod tests {
 
         assert!(!mfa_session_token.is_empty());
 
-        // Verify MFA session was created with short expiration
+        // Verify MFA session was created with short expiration. The row
+        // holds the challenge token's digest, not the token.
         let session = sessions::Entity::find()
-            .filter(sessions::Column::SessionToken.eq(&mfa_session_token))
+            .filter(sessions::Column::SessionToken.eq(stored_session_token(&mfa_session_token)))
             .one(db.db.as_ref())
             .await
             .unwrap()
             .unwrap();
+        assert_ne!(session.session_token, mfa_session_token);
 
         assert_eq!(session.user_id, user.id);
 
@@ -4502,7 +4569,7 @@ mod tests {
         );
 
         let pending = sessions::Entity::find()
-            .filter(sessions::Column::SessionToken.eq(&challenge))
+            .filter(sessions::Column::SessionToken.eq(stored_session_token(&challenge)))
             .one(db.db.as_ref())
             .await
             .unwrap();
@@ -4800,6 +4867,77 @@ mod tests {
             before + 2,
             "a real account verifies against its own hash, not the dummy"
         );
+    }
+
+    /// Session tokens are stored as a digest, so the column cannot be
+    /// replayed as a cookie.
+    mod session_token_at_rest {
+        use super::*;
+        use sea_orm::ConnectionTrait;
+
+        /// The migration that introduced hashing computes the digest in SQL
+        /// (`encode(sha256(convert_to(t, 'UTF8')), 'hex')`) while every
+        /// lookup computes it in Rust. If the two ever disagreed, the
+        /// upgrade would sign every user out, so pin them against each
+        /// other here, where both are reachable.
+        #[tokio::test]
+        async fn the_stored_digest_is_what_the_database_computes() {
+            let Some((db, _auth_service)) = setup_test_env_with_mfa_setting(false).await else {
+                return;
+            };
+
+            for token in [
+                "plain-token",
+                "",
+                "tok3n-with-sym/bols+and=padding",
+                // Non-ASCII, because `convert_to(.., 'UTF8')` and Rust's
+                // `str::as_bytes` have to agree on the encoding too.
+                "sesión-ñ-token",
+            ] {
+                let row = db
+                    .db
+                    .query_one(sea_orm::Statement::from_sql_and_values(
+                        sea_orm::DatabaseBackend::Postgres,
+                        "SELECT encode(sha256(convert_to($1, 'UTF8')), 'hex') AS digest",
+                        [token.into()],
+                    ))
+                    .await
+                    .expect("the digest query runs")
+                    .expect("one row");
+                let in_sql: String = row.try_get("", "digest").expect("a digest");
+                assert_eq!(in_sql, stored_session_token(token), "{token}");
+            }
+        }
+
+        /// A token read out of the column cannot be presented as a session.
+        #[tokio::test]
+        async fn a_value_read_out_of_the_column_is_not_a_session() {
+            let Some((db, auth_service)) = setup_test_env_with_mfa_setting(false).await else {
+                return;
+            };
+            let user = create_test_user(&db.db, "stolen-session@example.com", "Password-9!").await;
+            let token = auth_service.create_session(user.id).await.unwrap();
+
+            let stored = sessions::Entity::find()
+                .filter(sessions::Column::UserId.eq(user.id))
+                .one(db.db.as_ref())
+                .await
+                .unwrap()
+                .unwrap()
+                .session_token;
+            assert_ne!(stored, token);
+
+            // The token still authenticates...
+            assert_eq!(
+                auth_service.verify_session(&token).await.unwrap().id,
+                user.id
+            );
+            // ...and what the column holds does not.
+            assert!(matches!(
+                auth_service.verify_session(&stored).await,
+                Err(AuthError::NotFound(_))
+            ));
+        }
     }
 
     /// Per-account password throttling. The address-based limiter slows one

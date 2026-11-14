@@ -838,8 +838,13 @@ export type AgentConfigResponse = {
     trigger_config: unknown;
     updated_at: string;
     /**
-     * Secret token for the `X-Webhook-Token` header. Shown once when created,
-     * masked with `***` prefix in subsequent reads.
+     * Secret token for the `X-Webhook-Token` header.
+     *
+     * Returned in full exactly once, by the request that mints it (creating
+     * an agent with the webhook trigger on, or turning that trigger on).
+     * Every later read is `***`: the row holds only a digest, so the token
+     * cannot be shown again. Turn the webhook trigger off and on to mint a
+     * replacement.
      */
     webhook_token?: string | null;
     /**

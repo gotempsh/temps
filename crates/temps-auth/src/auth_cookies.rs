@@ -96,6 +96,13 @@ pub(crate) fn clearing_values(base: &str) -> Vec<HeaderValue> {
 /// Returns the first prefixed match if there is one, and only otherwise an
 /// unprefixed match, so a parent-domain cookie planted by a sibling app can
 /// never displace the console's own.
+///
+/// Deliberately *no* fallback when a prefixed cookie is present but turns
+/// out to be unusable (it no longer decrypts after a key change, say): that
+/// fallback is precisely what would let a planted cookie win, since a
+/// sibling app cannot alter the host-only one but can always add another.
+/// A browser holds at most one `__Host-` cookie per name and host, so there
+/// is never a second prefixed candidate to try.
 pub(crate) fn read(headers: &HeaderMap, base: &str) -> Option<String> {
     let prefixed = issued_name(base, true);
     let mut fallback = None;

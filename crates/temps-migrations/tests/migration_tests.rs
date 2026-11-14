@@ -9273,3 +9273,125 @@ async fn test_login_throttle_guards_migration_up_and_down() -> anyhow::Result<()
 
     scratch.close().await
 }
+
+const HASH_CREDENTIALS_MIGRATION: &str = "m20261114_000002_hash_credentials_at_rest";
+
+/// Hashing credentials at rest arrives on a populated database: signed-in
+/// users stay signed in, configured webhooks keep working, and only the
+/// short-lived reset credentials are invalidated.
+#[tokio::test]
+async fn test_hash_credentials_at_rest_migration_up_and_down() -> anyhow::Result<()> {
+    let Some(scratch) =
+        ScratchDatabase::open("test_hash_credentials_at_rest_migration_up_and_down").await?
+    else {
+        return Ok(());
+    };
+    let db = &scratch.db;
+
+    Migrator::up(db, Some(steps_up_to(HASH_CREDENTIALS_MIGRATION))).await?;
+
+    // An install in use before the upgrade: a signed-in browser, an agent
+    // whose webhook somebody already configured, and a reset email in flight.
+    db.execute_unprepared(
+        "INSERT INTO users (id, name, email, email_verified, mfa_enabled, \
+                            password_reset_token, password_reset_expires) \
+         VALUES (9911, 'Existing', 'existing@example.com', TRUE, FALSE, \
+                 'email-reset:in-flight-token', now() + interval '1 hour'); \
+         INSERT INTO sessions (user_id, session_token, expires_at, mfa_pending) \
+         VALUES (9911, 'live-session-token', now() + interval '7 days', FALSE); \
+         INSERT INTO projects (id, name, repo_name, repo_owner, directory, main_branch, \
+                               preset, slug, created_at, updated_at) \
+         VALUES (9911, 'Hashing', 'repo', 'owner', '/', 'main', 'nodejs', 'hashing', \
+                 now(), now()); \
+         INSERT INTO project_agents (project_id, slug, name, source, enabled, \
+                                     trigger_config, ai_provider, webhook_id, webhook_token) \
+         VALUES (9911, 'hooked', 'Hooked', 'dashboard', TRUE, '{\"webhook\": true}'::jsonb, \
+                 'claude', 'abcdef0123456789', 'configured-webhook-token');",
+    )
+    .await?;
+
+    Migrator::up(db, Some(1)).await?;
+
+    // The session row survives, holding the digest of the token the cookie
+    // still carries -- so nobody is signed out by the upgrade.
+    let session = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*) AS rows, \
+                    count(*) FILTER ( \
+                        WHERE session_token \
+                            = encode(sha256(convert_to('live-session-token', 'UTF8')), 'hex') \
+                    ) AS hashed \
+             FROM sessions WHERE user_id = 9911"
+                .to_string(),
+        ))
+        .await?
+        .expect("session row");
+    assert_eq!(session.try_get::<i64>("", "rows")?, 1);
+    assert_eq!(session.try_get::<i64>("", "hashed")?, 1);
+
+    // Same for the configured webhook: the caller's token keeps working.
+    let agent = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT webhook_token FROM project_agents WHERE project_id = 9911".to_string(),
+        ))
+        .await?
+        .expect("agent row");
+    let stored: String = agent.try_get("", "webhook_token")?;
+    assert_ne!(stored, "configured-webhook-token");
+    assert_eq!(stored.len(), 64, "{stored}");
+    assert!(
+        stored
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "{stored}"
+    );
+    let expected = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT encode(sha256(convert_to('configured-webhook-token', 'UTF8')), 'hex') \
+                    AS digest"
+                .to_string(),
+        ))
+        .await?
+        .expect("digest");
+    // That this is also what `temps_core::crypto::sha256_hex` computes is
+    // pinned where both halves are reachable: see
+    // `the_stored_digest_is_what_the_database_computes` in temps-auth.
+    assert_eq!(stored, expected.try_get::<String>("", "digest")?);
+
+    // The in-flight reset credential is gone: single-use and short-lived, so
+    // one more "forgot password" click is cheaper than carrying it over.
+    let user = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT password_reset_token IS NULL AS token_cleared, \
+                    password_reset_expires IS NULL AS expiry_cleared \
+             FROM users WHERE id = 9911"
+                .to_string(),
+        ))
+        .await?
+        .expect("user row");
+    assert!(user.try_get::<bool>("", "token_cleared")?);
+    assert!(user.try_get::<bool>("", "expiry_cleared")?);
+
+    // Rolling back cannot restore a token from a digest, so it revokes.
+    Migrator::down(db, Some(steps_back_to(HASH_CREDENTIALS_MIGRATION))).await?;
+    let after_down = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT (SELECT count(*) FROM sessions) AS sessions, \
+                    (SELECT count(*) FROM project_agents WHERE webhook_token IS NOT NULL) \
+                        AS webhooks"
+                .to_string(),
+        ))
+        .await?
+        .expect("counts");
+    assert_eq!(after_down.try_get::<i64>("", "sessions")?, 0);
+    assert_eq!(after_down.try_get::<i64>("", "webhooks")?, 0);
+
+    db.execute_unprepared("DELETE FROM users WHERE id = 9911")
+        .await?;
+    scratch.close().await
+}
