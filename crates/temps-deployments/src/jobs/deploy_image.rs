@@ -762,10 +762,13 @@ pub struct DeployImageJob {
     /// ([`DeployImageSource::Registry`]). `None` when the registry needs no
     /// auth, or when the image is control-plane-local and this path is unused.
     registry_credentials: Option<temps_deployer::remote::RemotePullCredentials>,
-    /// Platforms each registry image's index offers, once read. Scheduling
-    /// and every replica's node check ask for the same tag, and on a daemon
-    /// without a local index each answer costs a registry request.
-    registry_index_platforms: Arc<Mutex<HashMap<String, Vec<String>>>>,
+    /// What each registry image's index offered, once asked: `Some` with its
+    /// platforms, or `None` when it could not be read or listed none (the
+    /// local store answers instead). Scheduling and every replica's node
+    /// check ask for the same tag; on a daemon without a local index each
+    /// lookup is a registry request, and an unreachable registry must not be
+    /// waited on again for every replica.
+    registry_index_platforms: Arc<Mutex<HashMap<String, Option<Vec<String>>>>>,
 }
 
 /// What the control plane's own Docker can tell a deploy job about an image.
@@ -1802,39 +1805,59 @@ impl DeployImageJob {
         image_tag: &str,
     ) -> Result<Vec<String>, temps_deployer::BuilderError> {
         if self.resolved_image_source(image_tag) == DeployImageSource::Registry {
-            if let Some(platforms) =
+            let cached =
                 lock_deployment_state(&self.registry_index_platforms, "registry_index_platforms")
                     .get(image_tag)
-                    .cloned()
-            {
-                return Ok(platforms);
-            }
-            match image_builder
-                .registry_image_platforms(image_tag, self.registry_credentials.clone())
-                .await
-            {
-                Ok(platforms) if !platforms.is_empty() => {
+                    .cloned();
+            let index = match cached {
+                Some(index) => index,
+                None => {
+                    let index = self.read_registry_index(image_builder, image_tag).await;
                     lock_deployment_state(
                         &self.registry_index_platforms,
                         "registry_index_platforms",
                     )
-                    .insert(image_tag.to_string(), platforms.clone());
-                    return Ok(platforms);
+                    .insert(image_tag.to_string(), index.clone());
+                    index
                 }
-                Ok(_) => tracing::warn!(
+            };
+            if let Some(platforms) = index {
+                return Ok(platforms);
+            }
+        }
+        image_builder.image_platforms(image_tag).await
+    }
+
+    /// The platforms `image_tag`'s registry index offers, or `None` — logged
+    /// once, with the reason — when it cannot be read or lists none.
+    async fn read_registry_index(
+        &self,
+        image_builder: &Arc<dyn temps_deployer::ImageBuilder>,
+        image_tag: &str,
+    ) -> Option<Vec<String>> {
+        match image_builder
+            .registry_image_platforms(image_tag, self.registry_credentials.clone())
+            .await
+        {
+            Ok(platforms) if !platforms.is_empty() => Some(platforms),
+            Ok(_) => {
+                tracing::warn!(
                     image = %image_tag,
                     "The registry index of this image lists no platforms; scheduling \
                      on the platforms the control plane holds locally"
-                ),
-                Err(error) => tracing::warn!(
+                );
+                None
+            }
+            Err(error) => {
+                tracing::warn!(
                     image = %image_tag,
                     %error,
                     "Could not read the registry index of this image; scheduling on \
                      the platforms the control plane holds locally"
-                ),
+                );
+                None
             }
         }
-        image_builder.image_platforms(image_tag).await
     }
 
     /// Guard the "just deploy it locally" fallbacks.
@@ -5394,6 +5417,7 @@ mod tests {
             discoverable: None,
             local_platforms: Vec::new(),
             registry_platforms: Vec::new(),
+            registry_reads: Default::default(),
         });
         let mut output = build_output_with_tags(&[
             ("linux/amd64", "myapp:latest"),
@@ -5416,6 +5440,7 @@ mod tests {
             discoverable: None,
             local_platforms: vec!["linux/amd64".into(), "linux/arm64".into()],
             registry_platforms: Vec::new(),
+            registry_reads: Default::default(),
         });
         let output = build_output_with_tags(&[]);
         let mut platforms = job.available_image_platforms(&output).await;
@@ -5445,6 +5470,7 @@ mod tests {
             discoverable: None,
             local_platforms: Vec::new(),
             registry_platforms: vec!["linux/amd64".into(), "linux/arm64".into()],
+            registry_reads: Default::default(),
         }
     }
 
@@ -5693,6 +5719,8 @@ mod tests {
         /// What the image's registry index offers; empty models an index
         /// that cannot be read.
         registry_platforms: Vec<String>,
+        /// How many times the registry index was asked for.
+        registry_reads: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl PlatformOnlyImageBuilder {
@@ -5704,6 +5732,7 @@ mod tests {
                 discoverable: None,
                 local_platforms: Vec::new(),
                 registry_platforms: Vec::new(),
+                registry_reads: Default::default(),
             }
         }
 
@@ -5718,6 +5747,7 @@ mod tests {
                 discoverable: Some(daemon.to_string()),
                 local_platforms: Vec::new(),
                 registry_platforms: Vec::new(),
+                registry_reads: Default::default(),
             }
         }
     }
@@ -5811,6 +5841,7 @@ mod tests {
             _image_name: &str,
             _credentials: Option<temps_deployer::remote::RemotePullCredentials>,
         ) -> Result<Vec<String>, temps_deployer::BuilderError> {
+            self.registry_reads.fetch_add(1, Ordering::SeqCst);
             Ok(self.registry_platforms.clone())
         }
 
@@ -5857,6 +5888,7 @@ mod tests {
             discoverable: None,
             local_platforms: Vec::new(),
             registry_platforms: Vec::new(),
+            registry_reads: Default::default(),
         })
     }
 
@@ -5955,6 +5987,7 @@ mod tests {
             discoverable: None,
             local_platforms: Vec::new(),
             registry_platforms: Vec::new(),
+            registry_reads: Default::default(),
         });
         let context = crate::test_utils::create_test_context("wf".to_string(), 1, 1, 1);
 
@@ -8365,6 +8398,7 @@ mod tests {
             discoverable: None,
             local_platforms: Vec::new(),
             registry_platforms: Vec::new(),
+            registry_reads: Default::default(),
         });
         let mut output = build_output_with_tags(&[("linux/arm64", "myapp:latest")]);
         output.builder_node_id = Some(7);
@@ -8769,6 +8803,62 @@ mod tests {
             &["exists", "pull"],
             "the arm64 node pulls its own variant from the registry",
         );
+    }
+
+    /// Scheduling and every replica's node check ask for the same tag's
+    /// platforms: the registry index is read once per job, whether the read
+    /// succeeds or not. An unreachable registry would otherwise be waited on
+    /// again for every replica, each time to fall back to the local store.
+    #[tokio::test]
+    async fn registry_index_is_read_once_per_job_even_when_unreadable() {
+        for (registry_platforms, node_platform) in [
+            (
+                vec!["linux/amd64".into(), "linux/arm64".into()],
+                "linux/arm64",
+            ),
+            // Unreadable: the local store's amd64 answers, so amd64 nodes.
+            (Vec::new(), "linux/amd64"),
+        ] {
+            let mut builder = amd64_control_plane_with_multi_arch_index();
+            builder.registry_platforms = registry_platforms;
+            let registry_reads = builder.registry_reads.clone();
+            let job = job_with_image_builder(builder)
+                .with_external_image_tag(REGISTRY_IMAGE.to_string())
+                .with_image_source(DeployImageSource::Registry);
+            let context = crate::test_utils::create_test_context("wf-once".to_string(), 1, 1, 1);
+            let mut output = build_output_with_tags(&[]);
+            output.image_tag = REGISTRY_IMAGE.to_string();
+
+            assert!(job
+                .available_image_platforms(&output)
+                .await
+                .iter()
+                .any(|platform| temps_deployer::platform::platforms_match(
+                    platform,
+                    node_platform
+                )));
+            for _ in 0..3 {
+                let (remote, _requests) =
+                    spawn_recording_agent_on(PULL_OK, false, vec![node_platform], node_platform)
+                        .await;
+                job.ensure_image_on_remote(
+                    REGISTRY_IMAGE,
+                    &remote,
+                    "worker-1",
+                    &context,
+                    None,
+                    Some(1),
+                )
+                .await
+                .expect("the node runs a platform the job has an image for");
+            }
+
+            assert_eq!(
+                registry_reads.load(Ordering::SeqCst),
+                1,
+                "scheduling plus three node checks for {node_platform}"
+            );
+        }
     }
 
     /// A registry-image job whose control plane holds a copy of the tag
