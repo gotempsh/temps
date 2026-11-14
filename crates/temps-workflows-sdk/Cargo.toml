@@ -5,6 +5,7 @@
 name = "temps-workflows-sdk"
 version = "0.1.0"
 edition.workspace = true
+repository.workspace = true
 license.workspace = true
 description = "Rust durable workflow client and authenticated executor for Temps"
 

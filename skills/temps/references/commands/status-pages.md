@@ -6,12 +6,12 @@ Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing 
 
 ## `status-pages` (alias: `status-page`)
 
-Publish public status pages for selected monitors
+Publish public status pages showing monitors from any of your projects
 
 **Subcommands:**
 
-- `list` (`ls`) - List a project's status pages
-- `create` - Create a draft status page
+- `list` (`ls`) - List status pages, optionally only those showing one project
+- `create` - Create a draft status page; monitors may come from any project
 - `show` - Show a status page
 - `update` - Change the title, description or monitor selection
 - `publish` - Publish the page at its public URL
@@ -22,27 +22,27 @@ Publish public status pages for selected monitors
 
 ### `status-pages list` (alias: `ls`)
 
-List a project's status pages
+List status pages, optionally only those showing one project
 
 **Options:**
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--project-id <id>` | Project ID | - | Yes |
+| `--project-id <id>` | Only pages with a component from this project | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `status-pages create`
 
-Create a draft status page
+Create a draft status page; monitors may come from any project
 
 **Options:**
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--project-id <id>` | Project ID | - | Yes |
 | `-t, --title <title>` | Public page title | - | Yes |
+| `-m, --monitor <id=name>` | Monitor to show and its public name (repeatable) | - | Yes |
+| `-g, --group <name=ids>` | Show monitors together under a group, e.g. "Cloud=12,13" (repeatable) | - | No |
 | `-d, --description <text>` | Public description | - | No |
-| `-m, --monitor <id=name>` | Monitor to show and its public name (repeatable) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `status-pages show`
@@ -68,7 +68,7 @@ Change the title, description or monitor selection
 | `-t, --title <title>` | Public page title | - | No |
 | `-d, --description <text>` | Public description ("" clears it) | - | No |
 | `-m, --monitor <id=name>` | Replace the selection; repeat for each monitor | - | No |
-| `--clear-monitors` | Remove every monitor (drafts only) | - | No |
+| `-g, --group <name=ids>` | With --monitor: group monitors, e.g. "Cloud=12,13" (repeatable) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `status-pages publish`

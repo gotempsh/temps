@@ -45,6 +45,10 @@ Create a new incident
 | `-t, --title <title>` | Incident title | - | No |
 | `-d, --description <description>` | Incident description | - | No |
 | `-s, --severity <severity>` | Severity level (critical, major, minor) | - | No |
+| `--public-title <title>` | Headline shown on published status pages (the title stays internal) | - | No |
+| `-m, --message <message>` | First update, written by you instead of the automatic one | - | No |
+| `--public` | Post the first update to published status pages (needs --message) | - | No |
+| `--monitor-id <id>` | Monitor (status page component) the incident affects; omit for the whole project | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `incidents show`

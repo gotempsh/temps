@@ -206,7 +206,7 @@ test("project and environment lists are complete; deployment lists are ordered a
 
 test("preview permission snapshot matches production role permissions and wire names", async () => {
   const { previewPermissions } = await import("./preview-permissions.js");
-  const source = await Bun.file(new URL("../../../../../../crates/temps-auth/src/permissions.rs", import.meta.url)).text();
+  const source = await Bun.file(new URL("../../../../../../crates/temps-authz/src/permissions.rs", import.meta.url)).text();
   const names = new Map([...source.matchAll(/Permission::(\w+) => "([^"]+)"/g)].map(m => [m[1], m[2]]));
   for (const role of ["Admin", "Reader"] as const) {
     const block = source.match(new RegExp(String.raw`Role::${role} => &\[([\s\S]*?)\]`))?.[1];

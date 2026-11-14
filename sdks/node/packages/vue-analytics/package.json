@@ -1,7 +1,7 @@
 {
 	"name": "@temps-sdk/vue-analytics",
 	"version": "0.0.6",
-	"description": "Temps analytics for Vue 3 — plugin + composables for events, Web Vitals, engagement, and session replay.",
+	"description": "Temps analytics for Vue 3 \u2014 plugin + composables for events, Web Vitals, engagement, and session replay.",
 	"private": false,
 	"type": "module",
 	"main": "./dist/index.js",
@@ -36,5 +36,10 @@
 		"typescript": "^5.5.4",
 		"vue": "^3.4.0"
 	},
-	"sideEffects": false
+	"sideEffects": false,
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/gotempsh/temps.git",
+		"directory": "sdks/node/packages/vue-analytics"
+	}
 }

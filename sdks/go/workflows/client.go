@@ -160,3 +160,33 @@ func (c *Client) SendEventTo(ctx context.Context, target Target, event Event) er
 	}
 	return c.Transport.Call(ctx, "POST", path, c.Token, event, nil, false)
 }
+
+// WaitForRun polls until terminal. The timeout covers HTTP calls and waits;
+// caller cancellation stops both. A failed workflow is returned as a Run.
+func (c *Client) WaitForRun(ctx context.Context, id string, timeout, interval time.Duration) (Run, error) {
+	if timeout <= 0 || interval <= 0 {
+		return Run{}, errors.New("workflow polling timeout and interval must be positive")
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	for {
+		run, err := c.GetRun(ctx, id)
+		if err != nil {
+			if ctx.Err() != nil {
+				return Run{}, ctx.Err()
+			}
+			return Run{}, err
+		}
+		switch run.Status {
+		case "completed", "failed", "cancelled":
+			return run, nil
+		}
+		timer := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return Run{}, ctx.Err()
+		case <-timer.C:
+		}
+	}
+}

@@ -3,6 +3,7 @@
 
 import asyncio
 import json
+import math
 import urllib.error
 import urllib.request
 from urllib.parse import quote
@@ -22,7 +23,7 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 class Transport:
     """Bounded HTTP calls. Only executor callbacks are retried automatically."""
     def __init__(self, api_url: str, timeout: float = 30):
-        if timeout <= 0:
+        if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("Workflow HTTP timeout must be positive")
         self.api_url, self.timeout = api_url.rstrip("/"), timeout
 
@@ -68,6 +69,20 @@ class Client:
 
     async def get_run(self, run_id: str):
         return await self.transport.call("GET", "/workflows/v1/runs/" + quote(run_id, safe=""), self.token)
+
+    async def wait_for_run(self, run_id: str, *, timeout: float = 60, interval: float = 1):
+        """Read until terminal, with a deadline covering requests and polling.
+
+        Raises TimeoutError on expiry; cancelling the coroutine stops polling.
+        """
+        if any(not math.isfinite(value) or value <= 0 for value in (timeout, interval)):
+            raise ValueError("Workflow polling timeout and interval must be finite and positive")
+        async with asyncio.timeout(timeout):
+            while True:
+                run = await self.get_run(run_id)
+                if run["status"] in ("completed", "failed", "cancelled"):
+                    return run
+                await asyncio.sleep(interval)
 
     async def send_event(self, name: str, payload=None, *, key=None, target=None):
         return await self.transport.call("POST", target_path(target, "events"), self.token,

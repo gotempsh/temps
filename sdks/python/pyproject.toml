@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
 
 [project]
+readme = {text = "Build Temps external plugins in Python with manifest builders, typed context, a platform WebSocket client and an aiohttp runtime. Source and usage: https://github.com/gotempsh/temps", content-type = "text/markdown"}
+license = "MIT OR Apache-2.0"
 name = "temps-plugin-sdk"
 version = "0.1.0"
 description = "Python SDK for building Temps external plugins"
@@ -15,3 +17,16 @@ dev-dependencies = [
     "pyinstaller>=6.0",
     "pyright>=1.1",
 ]
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["temps_plugin"]
+
+[tool.hatch.build.targets.sdist]
+include = ["temps_plugin", "tests", "pyproject.toml"]
+
+[project.urls]
+Repository = "https://github.com/gotempsh/temps"

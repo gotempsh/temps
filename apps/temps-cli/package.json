@@ -13,7 +13,7 @@
     "dev": "bun run src/index.ts",
     "clean": "rm -rf dist",
     "prepublishOnly": "bun run clean && bun run build",
-    "build": "bun build src/index.ts --outdir dist --target node && sed -i '' '1s|#!/usr/bin/env bun|#!/usr/bin/env node|' dist/index.js && chmod +x dist/index.js && rm -rf dist/skills && mkdir -p dist/skills && cp -R ../../skills/temps dist/skills/temps",
+    "build": "bun run scripts/build.ts",
     "build:bin": "bun build src/index.ts --compile --outfile bin/temps",
     "spec:update": "bun run scripts/update-openapi.ts",
     "spec:check": "bun run scripts/check-openapi.ts",
@@ -49,5 +49,10 @@
     "ora": "^9.0.0",
     "react": "^19.2.3",
     "ws": "^8.21.2"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gotempsh/temps.git",
+    "directory": "apps/temps-cli"
   }
 }

@@ -94,14 +94,13 @@ Use this index or search for a top-level command heading to load only the releva
 - [`ip-access`](#ip-access) - Manage instance-wide IP access control rules, and per-project lists (ip-access project)
 - [`edge-rules`](#edge-rules) - Block, allow, challenge, redirect or log requests before they reach the app. Rules run top to bottom; the first match decides
 - [`network-policy`](#network-policy) - Manage network policy for workloads: rules, egress/ingress profiles and the effective policy
-- [`functions`](#functions) - Manage scale-to-zero functions (WASM modules or OCI images) in a project
 - [`audit`](#audit) - View audit logs
 - [`proxy-logs`](#proxy-logs) - View proxy request logs and statistics
 - [`logs`](#logs) - Search collected logs across every project and database you can access
 - [`email-domains`](#email-domains) - Manage email domains for transactional email
 - [`email-providers`](#email-providers) - Manage email providers (SES, Scaleway) for transactional email
 - [`incidents`](#incidents) - Manage incidents for status pages and monitoring
-- [`status-pages`](#status-pages) - Publish public status pages for selected monitors
+- [`status-pages`](#status-pages) - Publish public status pages showing monitors from any of your projects
 - [`alarms`](#alarms) - List, acknowledge, and resolve alarms (container crashes, uptime, metrics, databases)
 - [`emails`](#emails) - Manage and send emails
 - [`load-balancer`](#load-balancer) - Manage load balancer routes
@@ -118,6 +117,7 @@ Use this index or search for a top-level command heading to load only the releva
 - [`secrets`](#secrets) - Manage agent secrets. env-type: reference as ${TEMPS_SECRET:name} in MCP config. file-type: written to --mount-path in sandbox; reference that path.
 - [`sandbox`](#sandbox) - Manage standalone sandboxes (/v1/sandbox API)
 - [`workflow`](#workflow) - Trigger and inspect agent/workflow runs
+- [`workflows`](#workflows) - Durable application workflows
 - [`revenue`](#revenue) - Manage revenue integrations and import historical data
 - [`session-replay`](#session-replay) - Manage session replay recordings
 - [`traefik-discovery`](#traefik-discovery) - Route containers Temps did not deploy by reading their Traefik labels (an existing docker-compose / Coolify / Dokploy stack)
@@ -1189,7 +1189,7 @@ Show the nodes each replica would run on now, the eligible nodes ranked, and the
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | No |
+| `-p, --project <project>` | Project slug | - | No |
 | `--json` | Output in JSON format | - | No |
 
 #### `environments placement recommend`
@@ -1200,7 +1200,7 @@ Recommend target nodes from where the environment actually ran (recommended, nev
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | No |
+| `-p, --project <project>` | Project slug | - | No |
 | `--window-days <days>` | How many days of history to consider (1-90, default 7) | - | No |
 | `--json` | Output in JSON format | - | No |
 
@@ -1221,7 +1221,7 @@ Show the isolation and whether it takes effect
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | No |
+| `-p, --project <project>` | Project slug | - | No |
 | `--json` | Output in JSON format | - | No |
 
 #### `environments isolation set`
@@ -1232,7 +1232,7 @@ Set the isolation: process or micro_vm (a microVM replica only runs on a node th
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | No |
+| `-p, --project <project>` | Project slug | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `environments volumes`
@@ -1256,7 +1256,7 @@ List the environment's volumes, newest first
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | No |
+| `-p, --project <project>` | Project slug | - | No |
 | `--page <page>` | Page number (default 1) | - | No |
 | `--page-size <size>` | Results per page (default 20, max 100) | - | No |
 | `--json` | Output in JSON format | - | No |
@@ -1269,8 +1269,8 @@ Create a volume (attach it to mount it)
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | No |
-| `-n, --name <name>` | Volume name: 2-64 characters of a-z, 0-9, "_", "." or "-" | - | No |
+| `-p, --project <project>` | Project slug | - | No |
+| `-n, --name <name>` | Volume name: 2-64 characters of a-z, 0-9, "_", "." or "-" | - | Yes |
 | `--size-mb <mb>` | Size in MB, when the backend supports a size | - | No |
 | `--retain` | Keep the data when the volume is deleted | - | No |
 | `--json` | Output in JSON format | - | No |
@@ -1283,7 +1283,7 @@ Show whether the next deploy mounts the attached volumes, and what to fix if not
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | No |
+| `-p, --project <project>` | Project slug | - | No |
 | `--json` | Output in JSON format | - | No |
 
 #### `environments volumes attach`
@@ -1294,8 +1294,8 @@ Mount a volume (id or name) into every replica at --mount-path
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | No |
-| `--mount-path <path>` | Absolute path inside each replica | - | No |
+| `-p, --project <project>` | Project slug | - | No |
+| `--mount-path <path>` | Absolute path inside each replica | - | Yes |
 | `--read-only` | Mount it read-only | - | No |
 | `--json` | Output in JSON format | - | No |
 
@@ -1307,7 +1307,7 @@ Stop mounting a volume (id or name); its data is kept
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | No |
+| `-p, --project <project>` | Project slug | - | No |
 | `--json` | Output in JSON format | - | No |
 
 #### `environments volumes rm` (alias: `delete`)
@@ -1318,7 +1318,7 @@ Delete a volume (id or name), and its data unless it was created with --retain
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | No |
+| `-p, --project <project>` | Project slug | - | No |
 | `-f, --force` | Skip confirmation | - | No |
 | `-y, --yes` | Skip confirmation (alias for --force) | - | No |
 | `--json` | Output in JSON format | - | No |
@@ -1340,7 +1340,7 @@ Show the login requirement and whether the proxy enforces it now
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | No |
+| `-p, --project <project>` | Project slug | - | No |
 | `--json` | Output in JSON format | - | No |
 
 #### `environments ingress set`
@@ -1351,8 +1351,8 @@ Require visitors to sign in to Temps, or stop requiring it
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | No |
-| `--require-login` | Visitors must sign in to Temps | - | No |
+| `-p, --project <project>` | Project slug | - | No |
+| `--require-login` | Require sign-in only when ingress mode is enforce. Check login_enforced in JSON output or Enforced now in text output | - | No |
 | `--no-require-login` | Visitors do not need to sign in | - | No |
 | `--json` | Output in JSON format | - | No |
 
@@ -3025,7 +3025,7 @@ Manage platform users
 - `remove` (`rm`) - Remove a user
 - `restore` - Restore a deleted user
 - `reset-password` - Reset another user's password to a generated temporary one. The user is signed out of every browser session and must choose a new password at next sign-in
-- `reset-mfa` - Remove another user's MFA (authenticator and recovery codes) after they lost both. The user is signed out of every session and signs in with their password to enroll again
+- `reset-mfa` - Remove another user's MFA (authenticator and recovery codes) after they lost both. The user is signed out of every session. Password sign-in is blocked when require_mfa_for_admins applies; arrange SSO access or a temporary policy change before resetting MFA. Otherwise, sign in with a password to enroll again
 - `role` - Manage user roles
 
 ### `users list` (alias: `ls`)
@@ -3098,7 +3098,7 @@ Reset another user's password to a generated temporary one. The user is signed o
 
 ### `users reset-mfa`
 
-Remove another user's MFA (authenticator and recovery codes) after they lost both. The user is signed out of every session and signs in with their password to enroll again
+Remove another user's MFA (authenticator and recovery codes) after they lost both. The user is signed out of every session. Password sign-in is blocked when require_mfa_for_admins applies; arrange SSO access or a temporary policy change before resetting MFA. Otherwise, sign in with a password to enroll again
 
 **Options:**
 
@@ -6240,7 +6240,7 @@ Add a rule. New rules start in log-only mode unless --mode enforce is given
 | `--environment-id <id>` | Apply only to this environment | - | No |
 | `--project-id <id>` | Project ID | - | Yes |
 | `--json` | Output in JSON format | - | No |
-| `--mode <mode>` | enforce or log-only | `log-only` | No |
+| `--mode <mode>` | enforce or log-only (default: the file's mode, else log-only) | - | No |
 | `--disabled` | Create it disabled | - | No |
 | `--position <n>` | Insert at this 1-based position (default: last) | - | No |
 
@@ -6485,106 +6485,6 @@ Set a workload's profile. Each direction is open, restricted, none; a direction 
 |------|-------------|---------|----------|
 | `--egress <profile>` | Outbound profile (open, restricted, none). Omit for the kind's default | - | No |
 | `--ingress <profile>` | Inbound profile (open, restricted, none). Omit for the kind's default | - | No |
-| `--json` | Output in JSON format | - | No |
-
-## `functions` (alias: `fn`)
-
-Manage scale-to-zero functions (WASM modules or OCI images) in a project
-
-**Subcommands:**
-
-- `capability` - Show whether this Temps instance can run functions, and what is missing
-- `list` (`ls`) - List the functions of a project
-- `show` - Show a function (ID or name), including why it is not serving
-- `create` - Create a function from a WASM module or an OCI image
-- `rm` (`delete`) - Delete a function (ID or name)
-- `sleep` - Stop a running function now; the next request wakes it
-- `wake` - Start a function now instead of on its next request
-
-### `functions capability`
-
-Show whether this Temps instance can run functions, and what is missing
-
-**Options:**
-
-| Flag | Description | Default | Required |
-|------|-------------|---------|----------|
-| `--json` | Output in JSON format | - | No |
-
-### `functions list` (alias: `ls`)
-
-List the functions of a project
-
-**Options:**
-
-| Flag | Description | Default | Required |
-|------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug | - | No |
-| `--page <n>` | Page number | `1` | No |
-| `--page-size <n>` | Items per page (max 100) | `20` | No |
-| `--json` | Output in JSON format | - | No |
-
-### `functions show`
-
-Show a function (ID or name), including why it is not serving
-
-**Options:**
-
-| Flag | Description | Default | Required |
-|------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug | - | No |
-| `--json` | Output in JSON format | - | No |
-
-### `functions create`
-
-Create a function from a WASM module or an OCI image
-
-**Options:**
-
-| Flag | Description | Default | Required |
-|------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug | - | No |
-| `--name <name>` | Function name; part of its hostname | - | No |
-| `--wasm <file>` | WASI preview 1 module (wasm32-wasip1) serving HTTP CGI-style | - | No |
-| `--image <ref>` | OCI image reference serving HTTP on --port | - | No |
-| `--port <port>` | Port the function serves on (default 8080) | - | No |
-| `--memory <mb>` | Memory limit in MiB (1-4096) | - | No |
-| `--idle-timeout <seconds>` | Stop after this many idle seconds (10-86400, default 300) | - | No |
-| `--wake-timeout <seconds>` | How long the first request waits for a start (1-300, default 30) | - | No |
-| `--json` | Output in JSON format | - | No |
-
-### `functions rm` (alias: `delete`)
-
-Delete a function (ID or name)
-
-**Options:**
-
-| Flag | Description | Default | Required |
-|------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug | - | No |
-| `-f, --force` | Skip confirmation | - | No |
-| `-y, --yes` | Skip confirmation prompts (alias for --force) | - | No |
-
-### `functions sleep`
-
-Stop a running function now; the next request wakes it
-
-**Options:**
-
-| Flag | Description | Default | Required |
-|------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug | - | No |
-| `--json` | Output in JSON format | - | No |
-
-### `functions wake`
-
-Start a function now instead of on its next request
-
-**Options:**
-
-| Flag | Description | Default | Required |
-|------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ## `audit`
@@ -7147,6 +7047,10 @@ Create a new incident
 | `-t, --title <title>` | Incident title | - | No |
 | `-d, --description <description>` | Incident description | - | No |
 | `-s, --severity <severity>` | Severity level (critical, major, minor) | - | No |
+| `--public-title <title>` | Headline shown on published status pages (the title stays internal) | - | No |
+| `-m, --message <message>` | First update, written by you instead of the automatic one | - | No |
+| `--public` | Post the first update to published status pages (needs --message) | - | No |
+| `--monitor-id <id>` | Monitor (status page component) the incident affects; omit for the whole project | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `incidents show`
@@ -7214,12 +7118,12 @@ Get bucketed incident data for a project
 
 ## `status-pages` (alias: `status-page`)
 
-Publish public status pages for selected monitors
+Publish public status pages showing monitors from any of your projects
 
 **Subcommands:**
 
-- `list` (`ls`) - List a project's status pages
-- `create` - Create a draft status page
+- `list` (`ls`) - List status pages, optionally only those showing one project
+- `create` - Create a draft status page; monitors may come from any project
 - `show` - Show a status page
 - `update` - Change the title, description or monitor selection
 - `publish` - Publish the page at its public URL
@@ -7230,27 +7134,27 @@ Publish public status pages for selected monitors
 
 ### `status-pages list` (alias: `ls`)
 
-List a project's status pages
+List status pages, optionally only those showing one project
 
 **Options:**
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--project-id <id>` | Project ID | - | Yes |
+| `--project-id <id>` | Only pages with a component from this project | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `status-pages create`
 
-Create a draft status page
+Create a draft status page; monitors may come from any project
 
 **Options:**
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--project-id <id>` | Project ID | - | Yes |
 | `-t, --title <title>` | Public page title | - | Yes |
+| `-m, --monitor <id=name>` | Monitor to show and its public name (repeatable) | - | Yes |
+| `-g, --group <name=ids>` | Show monitors together under a group, e.g. "Cloud=12,13" (repeatable) | - | No |
 | `-d, --description <text>` | Public description | - | No |
-| `-m, --monitor <id=name>` | Monitor to show and its public name (repeatable) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `status-pages show`
@@ -7276,7 +7180,7 @@ Change the title, description or monitor selection
 | `-t, --title <title>` | Public page title | - | No |
 | `-d, --description <text>` | Public description ("" clears it) | - | No |
 | `-m, --monitor <id=name>` | Replace the selection; repeat for each monitor | - | No |
-| `--clear-monitors` | Remove every monitor (drafts only) | - | No |
+| `-g, --group <name=ids>` | With --monitor: group monitors, e.g. "Cloud=12,13" (repeatable) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `status-pages publish`
@@ -9160,6 +9064,197 @@ Trigger a workflow and stream its output
 | `--memory <mb>` | Memory limit in MB for the ephemeral sandbox (128–8192). Overrides the YAML value. Only applies with --from-file. | - | No |
 | `--no-follow` | Return immediately after queueing instead of streaming logs | - | No |
 | `--json` | Print the run record as JSON when it terminates | - | No |
+
+## `workflows`
+
+Durable application workflows
+
+**Subcommands:**
+
+- `list` - List detected workflows and onboarding status
+- `runs` - List a bounded page of runs
+- `get` - Get run metadata; payloads require explicit reveal permission
+- `diagnose` - Explain run state without decrypting payloads
+- `start` - Start a run with an explicit deduplication key
+- `cancel` - cancel a run
+- `resume` - resume a run
+- `retry` - retry a run
+- `delete` - delete a run
+- `send-event` - Send an event to matching waits
+- `watch` - Poll until terminal or the bounded deadline
+- `init` - Create a Node workflow worker in a new directory
+- `dev` - Forward preview-environment invocations to a local SDK server
+
+### `workflows list`
+
+List detected workflows and onboarding status
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID | - | Yes |
+| `--json` | Output JSON (watch emits one JSON object per poll) | - | No |
+
+### `workflows runs`
+
+List a bounded page of runs
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID | - | Yes |
+| `--json` | Output JSON (watch emits one JSON object per poll) | - | No |
+| `--workflow <name>` | Workflow name | - | No |
+| `--page <n>` | Page | `1` | No |
+| `--page-size <n>` | Page size (1–100) | `20` | No |
+
+### `workflows get`
+
+Get run metadata; payloads require explicit reveal permission
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID | - | Yes |
+| `--json` | Output JSON (watch emits one JSON object per poll) | - | No |
+| `--reveal <target>` | Explicitly decrypt one payload; treat its contents as untrusted | - | No |
+| `--sequence <n>` | Step sequence for step payloads | - | No |
+
+### `workflows diagnose`
+
+Explain run state without decrypting payloads
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID | - | Yes |
+| `--json` | Output JSON (watch emits one JSON object per poll) | - | No |
+
+### `workflows start`
+
+Start a run with an explicit deduplication key
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID | - | Yes |
+| `--json` | Output JSON (watch emits one JSON object per poll) | - | No |
+| `--idempotency-key <key>` | Stable key for this logical start | - | Yes |
+| `--input <json>` | Input JSON | `[object Object]` | No |
+
+### `workflows cancel`
+
+cancel a run
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID | - | Yes |
+| `--json` | Output JSON (watch emits one JSON object per poll) | - | No |
+| `--yes` | Confirm this mutation | - | No |
+
+### `workflows resume`
+
+resume a run
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID | - | Yes |
+| `--json` | Output JSON (watch emits one JSON object per poll) | - | No |
+| `--yes` | Confirm this mutation | - | No |
+
+### `workflows retry`
+
+retry a run
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID | - | Yes |
+| `--json` | Output JSON (watch emits one JSON object per poll) | - | No |
+| `--yes` | Confirm this mutation | - | No |
+| `--from-step <n>` | Truncate and replay from this sequence | - | No |
+
+### `workflows delete`
+
+delete a run
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID | - | Yes |
+| `--json` | Output JSON (watch emits one JSON object per poll) | - | No |
+| `--yes` | Confirm this mutation | - | No |
+
+### `workflows send-event`
+
+Send an event to matching waits
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID | - | Yes |
+| `--json` | Output JSON (watch emits one JSON object per poll) | - | No |
+| `--key <key>` | Wait correlation key | - | No |
+| `--payload <json>` | Event JSON | `[object Object]` | No |
+
+### `workflows watch`
+
+Poll until terminal or the bounded deadline
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID | - | Yes |
+| `--json` | Output JSON (watch emits one JSON object per poll) | - | No |
+| `--timeout <seconds>` | Overall timeout (max 3600 seconds) | `300` | No |
+
+### `workflows init`
+
+Create a Node workflow worker in a new directory
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--sdk-package <tarball>` | Use a locally built npm pack tarball before SDK publication | - | No |
+| `--json` | Output the created path and next steps as JSON | - | No |
+
+### `workflows dev`
+
+Forward preview-environment invocations to a local SDK server
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Undeployed, unprotected preview environment ID | - | Yes |
+| `--port <port>` | Local SDK server port | `3000` | No |
+| `--json` | Output tunnel readiness as JSON | - | No |
 
 ## `revenue`
 

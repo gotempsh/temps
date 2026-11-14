@@ -6,6 +6,8 @@ requires = ["hatchling>=1.25"]
 build-backend = "hatchling.build"
 
 [project]
+readme = {text = "Durable workflow client and authenticated ASGI executor for Temps. Start runs, send events, read results and poll with bounded deadlines. Source and usage: https://github.com/gotempsh/temps", content-type = "text/markdown"}
+license = "MIT OR Apache-2.0"
 name = "temps-workflows"
 version = "0.1.0"
 description = "Durable workflow executor and client for Temps"
@@ -14,3 +16,9 @@ dependencies = ["cryptography>=43"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["temps_workflows"]
+
+[tool.hatch.build.targets.sdist]
+include = ["temps_workflows", "examples", "pyproject.toml"]
+
+[project.urls]
+Repository = "https://github.com/gotempsh/temps"

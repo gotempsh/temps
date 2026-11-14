@@ -1042,3 +1042,137 @@ releases:
 4. **Add a new scenario** at the bottom of the relevant section in this file
    in the same PR that fixes any regression that bit you in production.
    The scenarios should grow with every "we should have caught this" lesson.
+
+## Independent SDK and CLI releases
+
+Source and package history stay in this repository. The package catalog is
+`.github/releases/packages.json`; npm names, Python imports and the Go module
+path remain compatible. The npm CLI is `apps/temps-cli`, not the Rust server
+binary. Python `temps-plugin-sdk` exports `temps_plugin`; `temps-workflows`
+exports `temps_workflows`. Go workflows retain
+`github.com/gotempsh/temps/sdks/go/workflows`. The Python and Go workflow SDKs
+include authenticated executors, start/read/event clients and bounded polling;
+they are not generated clients for every management API. Python's existing
+plugin SDK includes its host channel client and runtime. See
+`sdks/python/workflows/examples/client.py`, `sdks/go/workflows/example_test.go`
+and `sdks/python/examples/hello-python` for usage. Full management API coverage
+in Python/Go remains separate work.
+
+### Prepare only the packages being released
+
+1. Change each selected package's own version in `package.json`,
+   `pyproject.toml`, `Cargo.toml`, or `sdks/go/workflows/VERSION`. Do not bump
+   unchanged libraries for a server release. The Rust plugin SDK and protocol
+   now have explicit independent versions; keep their dependency version in
+   sync only when intentionally updating that dependency.
+2. To accompany a server release, add an exact tag entry to
+   `.github/releases/prepared.json`, for example:
+   `{"v1.2.0":{"cli":"0.2.0","python-workflows":"0.1.1"}}`.
+   This is illustrative, not a queued release. The committed map starts empty.
+   A normal server tag with no entry publishes **no** packages. Retained entries
+   cannot select packages for later tags. Nightlies never select packages.
+3. For a package-only release, use `sdk/<catalog-key>/v<manifest-version>`,
+   such as `sdk/python-workflows/v0.1.1b1`. Go uses the actual module directory
+   prefix: `sdks/go/workflows/v0.1.1` (never `sdk/go-workflows/v...`). For Go
+   releases prepared alongside the server, the protected job creates that
+   canonical tag on the same commit. Existing tags must resolve to that commit;
+   they are never moved. Go v2+ requires a new module path/catalog migration.
+4. Validate before tagging:
+   `python3 scripts/sdk_release.py plan --tag <tag>` and
+   `python3 scripts/sdk_release.py build --tag <tag> --output <empty-directory>`.
+   Build runs the selected package tests and packaging checks without uploading.
+   Rust packaging requires a clean committed tree. The workflow's manual
+   dispatch validates an **existing tag** and never publishes. It is not a way
+   to publish an arbitrary branch.
+
+Stable server tags require stable package versions. Prerelease server tags
+require prerelease package versions: SemVer `-alpha.N`, `-beta.N`, `-rc.N`, or
+Python's canonical PEP 440 `aN`, `bN`, `rcN`. All prereleases use the beta
+publishing environment; npm prereleases use `beta`, stable uses `latest`.
+Unsupported package-version spellings/build metadata and tag/manifest mismatches
+fail closed. The existing server tag grammar is preserved.
+Promoting beta to stable means preparing a new stable package version; no
+channel-only promotion or mass version bump occurs. A package-only GitHub
+release is never marked the repository's Latest release.
+
+The SDK workflow runs alongside the server workflow on tag pushes. It neither
+triggers nor changes the server build/test gates. Server release notes list the
+**prepared** package versions; that list is not proof of publication. Inspect
+SDK job summaries for actual results. SDK-only tags do not match the server's
+release triggers. Package-only GitHub notes are created after successful
+publication. A manually created Go module tag itself makes source discoverable;
+run the tests before pushing it, not only in the post-tag workflow.
+
+### Required registry and GitHub setup (operator action)
+
+No registry configuration or publication is implied by merging these files.
+Create protected GitHub environments **sdk-stable** and **sdk-beta**, require
+maintainer approval, restrict permitted release tags, prevent self-review and
+unauthorized bypass, and protect release tags from creation/replacement by
+untrusted users. Ensure environment tag rules cover the actual server, SDK and
+Go prefixes above. Stable/beta version checks are also enforced in code. GitHub
+plan capabilities for environment protection must be verified by the operator.
+
+Configure each selected package's trusted publisher for owner **gotempsh**,
+repository **temps**, workflow filename **sdk-release.yml**, and the exact
+`sdk-stable` or `sdk-beta` environment. Configure both environment identities
+when supporting both channels. Publication runs on GitHub-hosted Linux runners;
+local builds and self-hosted test machines do not authenticate as publishers.
+
+- **npm:** package Settings → Trusted publishing, with direct `npm publish`
+  allowed. The workflow uses Node 24 (npm must be at least 11.5.1; Node at least
+  22.14), OIDC and provenance, with no `NPM_TOKEN`/`NODE_AUTH_TOKEN`. It builds
+  with Bun, packs workspace dependencies into registry version ranges, then
+  publishes that tarball with npm. Confirm ownership and first-package setup
+  before trying an unregistered name. npm currently permits up to ten trusted
+  publishers; new configurations must make their first successful publication
+  within two days. These are registry policies, not something CI can configure.
+  See the [official npm requirements](https://docs.npmjs.com/trusted-publishers/).
+- **PyPI:** configure existing project publishers, or pending publishers for
+  `temps-plugin-sdk` and `temps-workflows` before their first upload. This is a
+  direct workflow, not a reusable publishing workflow. The PyPA action uses
+  OIDC and attestations. See [PyPI publishing](https://docs.pypi.org/trusted-publishers/using-a-publisher/)
+  and [pending publishers](https://docs.pypi.org/trusted-publishers/creating-a-project-through-oidc/).
+- **crates.io:** configure trusted publishing for `temps-workflows-sdk`,
+  `temps-plugin-protocol` and `temps-plugin-sdk` as applicable. The official
+  auth action exchanges GitHub OIDC for a short-lived Cargo token only inside
+  the job; no token is stored in repository secrets. New crate ownership/first
+  publication is an external prerequisite: verify the registry's current
+  first-publication support before scheduling a release. The plugin protocol
+  must already be available at the exact dependency version before packaging
+  the plugin SDK. Bootstrap it in its own package release first; selecting both
+  for their very first release cannot bypass Cargo's registry resolution.
+  See [crates.io trusted publishing](https://crates.io/docs/trusted-publishing)
+  and the [official auth action](https://github.com/rust-lang/crates-io-auth-action).
+- **Go:** no registry token. `contents: write` is restricted to the tag/notes
+  jobs; registry publishers have `contents: read` and `id-token: write`.
+  Verify repository rules allow the workflow to create approved module tags.
+  Module discovery follows the [official subdirectory tag rules](https://go.dev/ref/mod#vcs-version).
+
+Never add stored publishing tokens as a workaround for a missing trusted
+publisher. Do not configure publishers for the check-only workflow.
+
+### Partial failure and retry
+
+Re-run failed jobs on the same immutable tag/run to reuse its tested artifact.
+Each registry job reports package/version status. Already-published npm and
+Cargo archives must have matching registry hashes; PyPI checks each wheel and
+sdist independently and uploads only missing files. A conflicting/yanked file,
+authentication error, rate limit or registry outage stops the job. Only a real
+404 means absence. There is no catch-all `skip-existing` and no overwrite.
+A retry after one PyPI file succeeds can finish the other. npm refuses to move
+a channel backwards; Go refuses to move a tag to another commit. Publication
+jobs serialize across release tags. GitHub keeps only one pending run in this
+concurrency group: if another release cancels a pending run, explicitly rerun
+that cancelled run after the current publication finishes. Do not enqueue
+multiple releases at once. Related npm packages are ordered with
+analytics-core first. Existing npm artifacts are not republished to repair a
+channel alias; an operator must investigate any externally modified alias.
+
+A new build that differs from an existing registry artifact requires a new
+version, even if it was intended as a retry. Preserve the run's artifacts until
+publication finishes. Cargo checks the rebuilt archive against the tested
+archive before uploading. Registry configuration, initial crate dependencies,
+remote service availability, and Docker-dependent tests can block a release;
+none is silently bypassed. Do not test by creating real tags or publishing a
+throwaway package version.

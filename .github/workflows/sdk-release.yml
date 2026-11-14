@@ -1,0 +1,221 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+name: SDK and CLI release
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+      - 'sdk/*/v*'
+      - 'sdks/go/workflows/v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag to validate (never publishes)'
+        required: true
+        type: string
+permissions: {}
+# Serialize publication across tags so registry channel aliases cannot race.
+concurrency:
+  group: sdk-registry-publication
+  cancel-in-progress: false
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      selected: ${{ steps.plan.outputs.selected }}
+      tag: ${{ steps.plan.outputs.tag }}
+      sha: ${{ steps.plan.outputs.sha }}
+      channel: ${{ steps.plan.outputs.channel }}
+      kinds: ${{ steps.plan.outputs.kinds }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'push' && github.sha || format('refs/tags/{0}', inputs.tag) }}
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - id: plan
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          python3 scripts/sdk_release.py plan --tag "$RELEASE_TAG" > plan.json
+          python3 - <<'PY'
+          import json, os
+          packages = json.load(open('plan.json'))
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              print('selected=' + str(bool(packages)).lower(), file=out)
+              print('tag=' + os.environ['RELEASE_TAG'], file=out)
+              print('channel=' + (packages[0]['channel'] if packages else 'stable'), file=out)
+              print('kinds=' + json.dumps(sorted({p['kind'] for p in packages})), file=out)
+          PY
+          python3 scripts/sdk_release.py notes --tag "$RELEASE_TAG" >> "$GITHUB_STEP_SUMMARY"
+  build:
+    needs: plan
+    if: needs.plan.outputs.selected == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: '1.4.2'
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
+        with:
+          enable-cache: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: sdks/go/workflows/go.mod
+          cache: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        if: contains(fromJSON(needs.plan.outputs.kinds), 'crate')
+        with:
+          toolchain: 1.99.1
+      - name: Test and package selected libraries
+        env:
+          RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+        run: python3 scripts/sdk_release.py build --tag "$RELEASE_TAG"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: sdk-packages
+          path: sdk-artifacts/
+          if-no-files-found: error
+  publish:
+    needs: [plan, build]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: sdk-${{ needs.plan.outputs.channel }}
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        kind: ${{ fromJSON(needs.plan.outputs.kinds) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: sdk-packages
+          path: sdk-artifacts/
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        if: matrix.kind == 'npm'
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Check registry versions and artifact hashes
+        if: matrix.kind != 'go'
+        env:
+          RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+          REGISTRY_KIND: ${{ matrix.kind }}
+        run: python3 scripts/sdk_release.py check --tag "$RELEASE_TAG" --kind "$REGISTRY_KIND"
+      - name: Check whether PyPI uploads remain
+        id: pypi
+        if: matrix.kind == 'pypi'
+        run: |
+          if find sdk-artifacts/pending-pypi -type f | grep -q .; then
+            echo 'pending=true' >> "$GITHUB_OUTPUT"
+          fi
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # release/v1
+        if: matrix.kind == 'pypi' && steps.pypi.outputs.pending == 'true'
+        with:
+          packages-dir: sdk-artifacts/pending-pypi/
+          # No skip-existing: preflight compares every already-uploaded hash.
+          attestations: true
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        if: matrix.kind == 'crate'
+        with:
+          toolchain: 1.99.1
+      - uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1
+        if: matrix.kind == 'crate'
+        id: crates-auth
+      - name: Publish npm or crates.io packages
+        if: matrix.kind == 'npm' || matrix.kind == 'crate'
+        env:
+          RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+          REGISTRY_KIND: ${{ matrix.kind }}
+          CARGO_REGISTRIES_CRATES_IO_TOKEN: ${{ steps.crates-auth.outputs.token }}
+        run: python3 scripts/sdk_release.py publish --tag "$RELEASE_TAG" --kind "$REGISTRY_KIND"
+      - name: Registry result
+        if: always()
+        env:
+          RESULT: ${{ job.status }}
+          KIND: ${{ matrix.kind }}
+        run: echo "Registry $KIND result = $RESULT (see per-package checks above)" >> "$GITHUB_STEP_SUMMARY"
+  go-tags:
+    needs: [plan, build]
+    if: github.event_name == 'push' && contains(fromJSON(needs.plan.outputs.kinds), 'go')
+    runs-on: ubuntu-latest
+    environment: sdk-${{ needs.plan.outputs.channel }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Create or verify canonical Go module tags
+        env:
+          RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/sdk_release.py publish-go --tag "$RELEASE_TAG"
+  package-notes:
+    needs: [plan, publish, go-tags]
+    if: >-
+      always() && github.event_name == 'push' && needs.plan.outputs.selected == 'true' &&
+      needs.publish.result == 'success' &&
+      (needs.go-tags.result == 'success' || needs.go-tags.result == 'skipped') &&
+      !startsWith(needs.plan.outputs.tag, 'v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Record package-only release versions
+        env:
+          RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+          CHANNEL: ${{ needs.plan.outputs.channel }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/sdk_release.py notes --tag "$RELEASE_TAG" > package-notes.md
+          # A failed lookup must not be treated as permission to replace a release.
+          gh api --paginate 'repos/{owner}/{repo}/releases?per_page=100' --jq '.[].tag_name' > existing-tags.txt
+          if grep -Fxq -- "$RELEASE_TAG" existing-tags.txt; then
+            gh release edit "$RELEASE_TAG" --notes-file package-notes.md
+          else
+            args=(--latest=false --verify-tag --title "$RELEASE_TAG" --notes-file package-notes.md)
+            if [[ "$CHANNEL" == beta ]]; then args+=(--prerelease); fi
+            gh release create "$RELEASE_TAG" "${args[@]}"
+          fi

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Snapshot of Role::permissions() and Permission::Display in
-// crates/temps-auth/src/permissions.rs. The conformance test detects drift.
+// crates/temps-authz/src/permissions.rs. The conformance test detects drift.
 // Caller permissions are independent of plugin host grants.
 export const previewPermissions = {
   "admin": [

@@ -1,0 +1,52 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+name: SDK release checks
+on:
+  pull_request:
+    paths:
+      - '.github/releases/**'
+      - '.github/workflows/sdk-release*.yml'
+      - 'scripts/*sdk_release*'
+      - 'sdks/**'
+      - 'apps/temps-cli/**'
+      - 'packages/api/**'
+      - 'crates/temps-*-sdk/**'
+  push:
+    branches: [main, feat/sdk-monorepo-releases]
+permissions:
+  contents: read
+jobs:
+  release-logic:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - run: python -m pip install pyyaml
+      - run: python -m unittest discover -s scripts -p test_sdk_release.py
+      - uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
+        with:
+          enable-cache: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: sdks/go/workflows/go.mod
+          cache: false
+      - name: Test Python packages and installed wheels
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from scripts.sdk_release import build, manifest, plan, read_json, ROOT
+          catalog = read_json(ROOT / '.github/releases/packages.json')
+          for key in ('python-plugin', 'python-workflows'):
+              version = manifest(catalog[key])['version']
+              build(plan(f'sdk/{key}/v{version}'), (ROOT / 'sdk-artifacts' / key))
+          PY
+      - name: Test Go library and examples
+        working-directory: sdks/go/workflows
+        run: |
+          go test -race ./...
+          go vet ./...

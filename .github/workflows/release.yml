@@ -940,6 +940,9 @@ jobs:
           OUTPUT: release/CHANGELOG.md
 
       - name: Create release notes file
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
           {
             echo "## Changes"
@@ -1090,6 +1093,10 @@ jobs:
           } >> release/release-notes.md
 
           echo "Release notes created:"
+          # Listing is informational; SDK publication has its own protected jobs.
+          if [[ "$DRY_RUN" != "true" ]]; then
+            python3 scripts/sdk_release.py notes --tag "$RELEASE_TAG" >> release/release-notes.md
+          fi
           cat release/release-notes.md
 
       - name: Create GitHub Release

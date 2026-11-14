@@ -1,7 +1,7 @@
 {
 	"name": "@temps-sdk/svelte-analytics",
 	"version": "0.0.6",
-	"description": "Temps analytics for Svelte — stores, actions, and helpers for events, Web Vitals, engagement, and session replay.",
+	"description": "Temps analytics for Svelte \u2014 stores, actions, and helpers for events, Web Vitals, engagement, and session replay.",
 	"private": false,
 	"type": "module",
 	"main": "./dist/index.js",
@@ -36,5 +36,10 @@
 		"svelte": "^5.53.5",
 		"typescript": "^5.5.4"
 	},
-	"sideEffects": false
+	"sideEffects": false,
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/gotempsh/temps.git",
+		"directory": "sdks/node/packages/svelte-analytics"
+	}
 }

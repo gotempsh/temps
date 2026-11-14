@@ -3,8 +3,9 @@
 
 [package]
 name = "temps-plugin-sdk"
-version.workspace = true
+version = "0.1.0-beta.61"
 edition.workspace = true
+repository.workspace = true
 license.workspace = true
 description = "SDK for building external Temps plugins as standalone binaries"
 
@@ -45,7 +46,7 @@ utoipa = { workspace = true }
 subtle = { workspace = true }
 
 # Wire protocol shared with the platform
-temps-plugin-protocol = { path = "../temps-plugin-protocol" }
+temps-plugin-protocol = { path = "../temps-plugin-protocol", version = "=0.1.0-beta.61" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

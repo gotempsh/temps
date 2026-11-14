@@ -49,5 +49,10 @@
 		"./dist/auto.js",
 		"./dist/temps.js",
 		"./dist/temps.min.js"
-	]
+	],
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/gotempsh/temps.git",
+		"directory": "sdks/node/packages/analytics-browser"
+	}
 }
