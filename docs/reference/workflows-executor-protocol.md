@@ -535,3 +535,23 @@ then use `init --sdk-package <npm-pack-tarball>`. The tarball is copied into
 the new project and referenced locally, so development does not require a
 registry release. Without that option, the scaffold requires the published
 `@temps-sdk/workflows@0.1.0` package.
+
+
+### Public ingress protection
+
+The main Temps proxy and edge proxy return 404 for the reserved
+`/.well-known/temps/workflows` namespace before hostname routing, wake-up,
+static serving or cache access. The guard also covers encoded paths,
+normalized separators and mount prefixes. There is no header, forwarded IP,
+workflow credential or signed-in-user exemption on public ingress.
+
+The orchestrator invokes deployed replicas directly, or uses the authenticated
+development tunnel. SDK invocation-signature, environment, body, expiry and
+lease checks remain mandatory. This ingress rule does not firewall published
+container ports or other routes that bypass Temps; those require network
+isolation. Applications must not alias executor handlers onto public routes.
+
+The guard performs no I/O, allocation, locking or background work on the
+per-request path. Ordinary paths use a byte scan; normalization uses at most
+8 KiB of stack storage and eight decoding passes. Unusual paths exceeding
+those bounds are refused rather than partially normalized.

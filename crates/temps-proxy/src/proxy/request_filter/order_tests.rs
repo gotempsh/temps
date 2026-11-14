@@ -1911,3 +1911,26 @@ async fn upstream_cannot_supply_a_shield_verdict_in_either_branding_mode() {
         }
     }
 }
+
+#[tokio::test]
+async fn workflow_executor_block_precedes_gate_wake_and_routing() {
+    let lifecycle = Arc::new(CountingLifecycle::default());
+    let (mut f, manager) = fixture().with_on_demand(lifecycle.clone());
+    manager.register_sleeping_domain(HOST.to_string(), sleeping(ENVIRONMENT));
+    f.sign_in_gate(HOST);
+    for path in [
+        "/.well-known/temps/workflows/manifest",
+        "/%2ewell-known/temps/workflows/invoke",
+        "/mount/.well-known/temps/workflows/invoke",
+    ] {
+        for method in ["GET", "POST", "OPTIONS"] {
+            let request = format!("{method} {path} HTTP/1.1\r\nHost: {HOST}\r\nAuthorization: Bearer forged\r\nX-Forwarded-For: 127.0.0.1\r\nX-Temps-Internal: true\r\nContent-Length: 0\r\n\r\n");
+            let reply = send(&f.lb, &request, CLEAN_IP).await;
+            assert!(reply.answered);
+            assert!(reply.head.starts_with("HTTP/1.1 404"), "{}", reply.head);
+            assert_eq!(reply.status(), "workflow_executor_blocked");
+            assert!(!reply.ctx.gated_host);
+        }
+    }
+    assert_eq!(lifecycle.starts.load(Ordering::SeqCst), 0);
+}

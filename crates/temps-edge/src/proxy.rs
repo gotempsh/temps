@@ -402,6 +402,12 @@ impl ProxyHttp for EdgeProxy {
     where
         Self::CTX: Send + Sync,
     {
+        if temps_core::workflow_ingress::blocks_workflow_executor(session.req_header().uri.path()) {
+            ctx.cache_status = "BLOCKED";
+            session.respond_error(404).await?;
+            return Ok(true);
+        }
+
         // Check if we have a route for this domain
         if !self.route_table.contains(&ctx.host) {
             debug!("No route for domain: {}", ctx.host);
@@ -563,6 +569,33 @@ mod tests {
             analytics,
             None,
         )
+    }
+
+    #[tokio::test]
+    async fn workflow_executor_block_precedes_route_lookup_and_cache() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let proxy = test_proxy();
+        for path in [
+            "/.well-known/temps/workflows/manifest",
+            "/%252ewell-known/temps/workflows/invoke",
+        ] {
+            let (mut client, server) = tokio::io::duplex(4096);
+            client.write_all(format!("POST {path} HTTP/1.1\r\nHost: app.example\r\nAuthorization: Bearer forged\r\nX-Temps-Internal: true\r\nContent-Length: 0\r\n\r\n").as_bytes()).await.unwrap();
+            let mut session =
+                pingora_proxy::Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
+            assert!(session.read_request().await.unwrap());
+            let mut ctx = proxy.new_ctx();
+            proxy
+                .early_request_filter(&mut session, &mut ctx)
+                .await
+                .unwrap();
+            assert!(proxy.request_filter(&mut session, &mut ctx).await.unwrap());
+            assert_eq!(ctx.cache_status, "BLOCKED");
+            drop(session);
+            let mut response = String::new();
+            client.read_to_string(&mut response).await.unwrap();
+            assert!(response.starts_with("HTTP/1.1 404"), "{response}");
+        }
     }
 
     #[test]
