@@ -1,0 +1,92 @@
+{
+  "analytics-browser": {
+    "kind": "npm",
+    "path": "sdks/node/packages/analytics-browser",
+    "name": "@temps-sdk/analytics-browser"
+  },
+  "analytics-core": {
+    "kind": "npm",
+    "path": "sdks/node/packages/analytics-core",
+    "name": "@temps-sdk/analytics-core"
+  },
+  "blob": {
+    "kind": "npm",
+    "path": "sdks/node/packages/blob",
+    "name": "@temps-sdk/blob"
+  },
+  "kv": {
+    "kind": "npm",
+    "path": "sdks/node/packages/kv",
+    "name": "@temps-sdk/kv"
+  },
+  "node-sdk": {
+    "kind": "npm",
+    "path": "sdks/node/packages/node-sdk",
+    "name": "@temps-sdk/node-sdk"
+  },
+  "plugin": {
+    "kind": "npm",
+    "path": "sdks/node/packages/plugin-sdk",
+    "name": "@temps-sdk/plugin"
+  },
+  "react-analytics": {
+    "kind": "npm",
+    "path": "sdks/node/packages/react-analytics",
+    "name": "@temps-sdk/react-analytics"
+  },
+  "sandbox": {
+    "kind": "npm",
+    "path": "sdks/node/packages/sandbox",
+    "name": "@temps-sdk/sandbox"
+  },
+  "svelte-analytics": {
+    "kind": "npm",
+    "path": "sdks/node/packages/svelte-analytics",
+    "name": "@temps-sdk/svelte-analytics"
+  },
+  "vue-analytics": {
+    "kind": "npm",
+    "path": "sdks/node/packages/vue-analytics",
+    "name": "@temps-sdk/vue-analytics"
+  },
+  "workflows": {
+    "kind": "npm",
+    "path": "sdks/node/packages/workflows",
+    "name": "@temps-sdk/workflows"
+  },
+  "api": {
+    "kind": "npm",
+    "path": "packages/api",
+    "name": "@temps-sdk/api"
+  },
+  "python-plugin": {
+    "kind": "pypi",
+    "path": "sdks/python",
+    "name": "temps-plugin-sdk"
+  },
+  "python-workflows": {
+    "kind": "pypi",
+    "path": "sdks/python/workflows",
+    "name": "temps-workflows"
+  },
+  "temps-plugin-protocol": {
+    "kind": "crate",
+    "path": "crates/temps-plugin-protocol",
+    "name": "temps-plugin-protocol"
+  },
+  "temps-plugin-sdk": {
+    "kind": "crate",
+    "path": "crates/temps-plugin-sdk",
+    "name": "temps-plugin-sdk"
+  },
+  "temps-workflows-sdk": {
+    "kind": "crate",
+    "path": "crates/temps-workflows-sdk",
+    "name": "temps-workflows-sdk"
+  },
+  "go-workflows": {
+    "kind": "go",
+    "path": "sdks/go/workflows",
+    "name": "github.com/gotempsh/temps/sdks/go/workflows"
+  }
+}

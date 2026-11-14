@@ -204,6 +204,11 @@ jobs:
       - name: Test release test gate
         run: python3 .github/scripts/test_release_test_gate.py
 
+      - name: Validate SDK release lifecycle
+        run: |
+          python3 scripts/sdk_release.py validate
+          python3 scripts/test_sdk_release.py
+
       - name: Test release binary signing
         run: python3 .github/scripts/test_sign_release_binaries.py
 
@@ -807,7 +812,7 @@ jobs:
     # protocol, so a change to either runs this.
     if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - name: Checkout code
         uses: actions/checkout@v7.0.1
@@ -815,39 +820,34 @@ jobs:
       - name: Install Bun
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: 1.4.2
           no-cache: ${{ github.ref != 'refs/heads/main' }}
 
-      - name: Install dependencies
-        working-directory: sdks/node
-        run: bun install --frozen-lockfile
-
-      # Unit tests and the executor protocol conformance suite against the
-      # in-memory orchestrator. The same suite runs against the real engine
-      # in the docker-deployments integration group
-      # (temps-workflows' conformance_tests).
-      - name: Typecheck, test and build @temps-sdk/workflows
-        working-directory: sdks/node/packages/workflows
-        run: |
-          bun run typecheck
-          bun run test:run
-          bun run build
-
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
       - uses: actions/setup-python@v7.1.0
         with:
           python-version: '3.12'
+      - uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
+        with:
+          enable-cache: false
       - uses: actions/setup-go@v7.0.0
         with:
-          go-version: '1.23.x'
+          go-version-file: sdks/go/workflows/go.mod
           cache: false
-      - name: Test Python executor
-        working-directory: sdks/python/workflows
-        run: |
-          python -m pip install .
-          python -m unittest temps_workflows.test_runtime -v
-      - name: Test Go executor and races
-        working-directory: sdks/go/workflows
-        run: go test -race ./...
+      # Reuse the existing SDK runner for all language package checks. The
+      # build command runs the existing tests, plus installed-package checks.
+      - name: Test and package Node SDKs
+        run: python3 scripts/sdk_release.py build --all --kind npm --output "$RUNNER_TEMP/sdk-npm"
+      - name: Typecheck workflow SDK
+        working-directory: sdks/node/packages/workflows
+        run: bun run typecheck
+      - name: Test installed Python wheels and source distributions
+        run: python3 scripts/sdk_release.py build --all --kind pypi --output "$RUNNER_TEMP/sdk-python"
+      - name: Test Go SDK races and package module
+        run: python3 scripts/sdk_release.py build --all --kind go --output "$RUNNER_TEMP/sdk-go"
 
   workflow-engine-templates:
     name: Workflow engine templates

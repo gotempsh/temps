@@ -410,6 +410,8 @@ expected_release_permissions = {
   "runtime-image-manifest" => {"contents" => "read", "packages" => "read"},
   "promote-runtime-images" => publish_packages,
   "build-web-assets" => read_contents,
+  # OIDC uploads plus immutable package tags, isolated from SDK builds.
+  "publish-sdks" => {"contents" => "write", "id-token" => "write"},
   "build-linux-amd64" => read_contents,
   "build-linux-arm64" => read_contents,
   "build-darwin-amd64" => read_contents,
@@ -478,7 +480,7 @@ abort "OTEL protobuf compatibility must compile temps-otel" unless
 release_steps = release.fetch("jobs").values.flat_map { |job| job.fetch("steps", []) }
 bun_versions = release_steps.map { |step| step.dig("with", "bun-version") }.compact
 abort "release workflow uses an unpinned Bun version" unless
-  bun_versions == ["1.3.14"]
+  bun_versions == ["1.3.14", "1.4.2"]
 wasm_pack_installs = release_steps.flat_map do |step|
   step.fetch("run", "").lines.map(&:strip).select { |line| line.include?("cargo install wasm-pack") }
 end

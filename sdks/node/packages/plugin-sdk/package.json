@@ -45,5 +45,10 @@
   },
   "dependencies": {
     "zod": "^4.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gotempsh/temps.git",
+    "directory": "sdks/node/packages/plugin-sdk"
   }
 }

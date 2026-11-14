@@ -18,7 +18,7 @@
     "test": "vitest",
     "test:watch": "vitest --watch",
     "test:coverage": "vitest --coverage",
-    "build": "tsc -p tsconfig.build.json",
+    "build": "tsc -p tsconfig.build.json && bun build src/index.ts --target node --packages external --outfile dist/index.js",
     "generate": "npx @hey-api/openapi-ts@0.99.0 -i ./scripts/openapi.json -o src/client -c @hey-api/client-fetch && python3 ../../../../scripts/source_attribution.py annotate sdks/node/packages/node-sdk/src/client",
     "prepublishOnly": "npm run build",
     "clean": "rm -rf dist"
@@ -35,5 +35,10 @@
   },
   "dependencies": {
     "@hey-api/client-fetch": "^0.13.1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gotempsh/temps.git",
+    "directory": "sdks/node/packages/node-sdk"
   }
 }

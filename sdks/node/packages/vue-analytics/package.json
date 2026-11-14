@@ -36,5 +36,10 @@
 		"typescript": "^5.5.4",
 		"vue": "^3.4.0"
 	},
-	"sideEffects": false
+	"sideEffects": false,
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/gotempsh/temps.git",
+		"directory": "sdks/node/packages/vue-analytics"
+	}
 }

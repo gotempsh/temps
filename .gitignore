@@ -95,3 +95,6 @@ ci-build-cache/
 # CI compose-security prebuilt-binary pipeline
 ci-prebuilt/
 ci-build-cache/
+
+# Verified SDK release artifacts (never source files).
+/sdk-artifacts/

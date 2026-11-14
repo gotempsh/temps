@@ -40,5 +40,10 @@
     "@vitest/coverage-v8": "^4.1.0",
     "typescript": "^5.5.4",
     "vitest": "^4.1.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gotempsh/temps.git",
+    "directory": "sdks/node/packages/blob"
   }
 }

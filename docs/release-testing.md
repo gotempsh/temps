@@ -1042,3 +1042,132 @@ releases:
 4. **Add a new scenario** at the bottom of the relevant section in this file
    in the same PR that fixes any regression that bit you in production.
    The scenarios should grow with every "we should have caught this" lesson.
+
+## SDK publication in the server release lifecycle
+
+`scripts/sdk_release.py` reads `.github/releases/packages.json` (the SDK catalog)
+and `.github/releases/prepared.json` (explicit upcoming server-tag selections).
+The catalog covers Node/TypeScript libraries, the Python plugin and workflow
+SDKs, Go workflows, and the Rust protocol/plugin/workflow crates. The CLI retains
+its existing lifecycle; this catalog does not publish it.
+
+Prepare SDK releases in a normal signed-off change **before** cutting the server
+tag: bump each selected package manifest, update lockfiles and local dependency
+requirements, then add its catalog key and exact version to the upcoming server
+tag. For example, this selection describes independently versioned packages:
+
+```json
+{
+  "v1.2.0": {
+    "workflows": "0.2.0",
+    "python-workflows": "0.2.0",
+    "go-workflows": "0.2.0",
+    "temps-workflows-sdk": "0.2.0"
+  }
+}
+```
+
+Keep only upcoming selections in `prepared.json`; remove a completed selection
+when advancing its manifests. The release commit retains the old selection for
+retries. The initial file is deliberately empty: existing versions must not be
+silently republished with changed bytes. Stable server tags select stable SDK
+versions; prerelease server tags select prerelease SDK versions (SemVer
+`-alpha.N`, `-beta.N`, `-rc.N`; Python `aN`, `bN`, `rcN`). Nightlies select none.
+Include unpublished workspace dependencies in the same selection: analytics
+core precedes consumers, and the Rust protocol precedes the plugin SDK. Rust
+plugin/protocol versions are explicit rather than inherited from the server.
+Go's version is in `sdks/go/workflows/VERSION`; v2+ requires a new major-version
+module path and an updated catalog rather than blindly tagging the v1 module.
+
+`release.yml` plans in its existing validation job and tests/packages in its
+existing web-assets job. A single isolated `publish-sdks` job waits for the test
+gate and GitHub Release, uploads to npm/PyPI/crates.io, verifies registry hashes,
+and creates immutable package tags. Go uses the required subdirectory tag
+`sdks/go/workflows/v<version>`; other packages use `sdk/<catalog-key>/v<version>`.
+The tags point to the tested release commit and are never moved. They are output,
+not workflow triggers. This works for the existing tag-targeted dispatch path
+used by automated releases, including tags created with `GITHUB_TOKEN`.
+
+The existing **Workflows SDK** CI job now tests/packages all Node, Python and Go
+SDKs without a new matrix; the existing release-contract job tests the planner
+and retry rules. Rust packaging batches selected crates so unpublished sibling
+dependencies can be verified together. No registry credentials are given to
+these build/check jobs. The only extra release runner isolates publication
+permissions (`id-token: write`, package-tag `contents: write`) from builds.
+
+### Dry runs and recovery
+
+```sh
+python3 scripts/sdk_release.py validate
+python3 scripts/test_sdk_release.py
+python3 scripts/sdk_release.py plan --tag v1.2.0
+python3 scripts/sdk_release.py build --all --kind npm --output sdk-artifacts/npm
+python3 scripts/sdk_release.py build --all --kind pypi --output sdk-artifacts/python
+python3 scripts/sdk_release.py build --all --kind go --output sdk-artifacts/go
+python3 scripts/sdk_release.py build --all --kind crate --output sdk-artifacts/rust
+```
+
+Run Rust packaging from a clean committed checkout. `build` runs tests and real
+package verification; it never invokes a publication command. A manual
+`release.yml` dispatch with `dry_run=true` on a branch validates every catalog
+package; on a release tag it validates that tag's explicit selection. Neither
+creates tags nor requests registry credentials. A non-dry dispatch still requires
+an existing server version tag and the normal release test gate.
+
+On an interrupted publication, rerun the **failed job**, retaining the successful
+build's `sdk-packages` artifact (30-day retention). Do not rebuild to recover a
+partial upload: artifacts carry the release SHA, plan and file hashes, and the
+publisher accepts only identical existing registry bytes. A partial PyPI upload
+sends only missing files. Auth failures, timeouts and registry errors never mean
+"version absent"; transient metadata reads retry with a bounded delay. Registry
+visibility is checked after upload, and a timeout fails the job for reconciliation
+on rerun. A conflicting/yanked version requires a new version and release commit.
+An existing npm channel ahead of a new upload is rejected rather than downgraded.
+
+Publication is serialized across server releases. GitHub concurrency can replace
+a queued pending run when another arrives: finish/reconcile the current release
+before starting another, and rerun a displaced release if it still needs SDKs.
+If SDK publication fails after the server release, the server assets remain
+published and the overall workflow is failed; the prepared-version table in the
+release notes records intent, not proof that registries succeeded. Expired build
+artifacts require a fresh validated run; changed bytes cannot overwrite an
+already uploaded version.
+
+### Registry setup and rollout blockers
+
+Configure GitHub environments `sdk-stable` and `sdk-beta` with the intended tag
+restrictions/protection. For **each package**, configure the registry's trusted
+publisher for owner `gotempsh`, repository `temps`, workflow **`release.yml`** and
+its matching environment. This is the top-level workflow, not a reusable workflow.
+No long-lived registry secrets are used or printed by these jobs.
+
+- npm: configure the package's **Settings → Trusted publishing**; Node 24 supplies
+  a supported npm OIDC client. Enable direct `npm publish` in the publisher
+  permissions. New names need registry ownership/bootstrap setup
+  before release. See [npm trusted publishing](https://docs.npmjs.com/trusted-publishers/).
+- PyPI: configure a publisher for `temps-plugin-sdk` and `temps-workflows`, or a
+  pending publisher for a new project, with the same repository/workflow/environment.
+  See [PyPI publisher setup](https://docs.pypi.org/trusted-publishers/adding-a-publisher/).
+- crates.io: configure each crate's trusted publisher. A never-published crate
+  needs the registry's first-publication bootstrap before OIDC can be configured;
+  the workflow deliberately does not invent a token fallback. See
+  [Rust trusted publishing](https://blog.rust-lang.org/2025/07/11/crates-io-development-update-2025-07/).
+- Go: permit the workflow token to create the canonical subdirectory tags; check
+  repository rulesets for tag restrictions. There is no separate Go registry secret.
+
+Read-only inspection on 2026-11-14 found neither SDK environment configured.
+The current Python and Rust catalog versions and npm API/sandbox/workflows
+versions were absent from their public registries; absence of a version does not
+prove absence of the package or ownership. Publisher configuration is private and
+has not been verified. Several existing npm versions are already public: bump
+versions for changed package bytes before selecting them. No packages or tags
+were published during implementation. Rust package verification also reported
+existing locked yanked dependencies (`chacha20 0.10.0`, `spin 0.9.8`); dependency
+remediation remains separate from this lifecycle change.
+
+Integrate the independent workflow security fixes before preparing the next
+workflow SDK versions in all four languages. This lifecycle change does not
+contain one-shot invocation admission. Re-run SDK conformance and packaging on
+the combined commit, bump each affected SDK version, and select those versions
+in the next appropriate server release; publishing this branch alone would not
+roll out the security fix.

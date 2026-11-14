@@ -88,6 +88,11 @@ jobs:
 
   validate-release-ref:
     name: Validate Release Ref
+    outputs:
+      sdk_selected: ${{ steps.sdk.outputs.selected }}
+      sdk_channel: ${{ steps.sdk.outputs.channel }}
+      sdk_kinds: ${{ steps.sdk.outputs.kinds }}
+      sdk_all: ${{ steps.sdk.outputs.all }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -102,8 +107,31 @@ jobs:
           REF_TYPE: ${{ github.ref_type }}
         run: .github/scripts/validate-release-ref.sh "$DRY_RUN" "$REF_TYPE" "$REF_NAME"
 
-  # The release runs no tests of its own, so it must not publish a commit the
-  # test workflow has not passed. Rather than re-running the whole suite here
+      - name: Plan SDK releases from committed manifests
+        id: sdk
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          python3 scripts/sdk_release.py validate
+          python3 - <<'PYTHON'
+          import json, os, sys
+          sys.path.insert(0, 'scripts')
+          import sdk_release as release
+          all_packages = os.environ['DRY_RUN'] == 'true' and os.environ['REF_TYPE'] != 'tag'
+          packages = release.catalog_packages() if all_packages else release.plan(os.environ['RELEASE_TAG'])
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              print('selected=' + str(bool(packages)).lower(), file=out)
+              print('all=' + str(all_packages).lower(), file=out)
+              print('channel=' + (packages[0]['channel'] if packages else 'stable'), file=out)
+              print('kinds=' + json.dumps(sorted({p['kind'] for p in packages})), file=out)
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as out:
+              out.write(release.notes(packages))
+          PYTHON
+
+  # SDK packaging runs focused tests, but the platform suite must also have
+  # passed before publication. Rather than re-running the whole suite here
   # (hours of runner time, plus caches written to a tag scope nothing can
   # read -- see the note at the top of this file), ask GitHub whether
   # rust-tests.yml already succeeded for this exact SHA, waiting for an
@@ -227,6 +255,121 @@ jobs:
           name: web-dist
           path: crates/temps-cli/dist
           retention-days: 1
+
+      # Reuse this runner and Rust setup; selected packages are tested before
+      # credentials are available. Branch dry-runs exercise every catalog entry.
+      - name: Install pinned SDK Bun
+        if: needs.validate-release-ref.outputs.sdk_selected == 'true'
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.2
+          no-cache: true
+      - name: Install Node for SDK packaging
+        if: needs.validate-release-ref.outputs.sdk_selected == 'true'
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Install uv for Python SDK packaging
+        if: contains(fromJSON(needs.validate-release-ref.outputs.sdk_kinds), 'pypi')
+        uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
+        with:
+          enable-cache: false
+      - name: Install Go for SDK packaging
+        if: contains(fromJSON(needs.validate-release-ref.outputs.sdk_kinds), 'go')
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: sdks/go/workflows/go.mod
+          cache: false
+      - name: Test and package SDK releases
+        if: needs.validate-release-ref.outputs.sdk_selected == 'true'
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          ALL_PACKAGES: ${{ needs.validate-release-ref.outputs.sdk_all }}
+        run: |
+          args=(--tag "$RELEASE_TAG")
+          if [[ "$ALL_PACKAGES" == true ]]; then args=(--all); fi
+          python3 scripts/sdk_release.py build "${args[@]}"
+      - name: Retain verified SDK artifacts for publication and retries
+        if: needs.validate-release-ref.outputs.sdk_selected == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: sdk-packages
+          path: sdk-artifacts/
+          if-no-files-found: error
+          retention-days: 30
+
+  # A separate runner isolates registry OIDC and tag-write permissions from
+  # unprivileged builds. All ecosystems share this job; no registry matrix.
+  publish-sdks:
+    name: Publish prepared SDK releases
+    needs: [validate-release-ref, require-tests, build-web-assets, create-release]
+    if: inputs.dry_run != true && needs.validate-release-ref.outputs.sdk_selected == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: sdk-${{ needs.validate-release-ref.outputs.sdk_channel }}
+    concurrency:
+      group: sdk-registry-publication
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      id-token: write
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: sdk-packages
+          path: sdk-artifacts/
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        if: contains(fromJSON(needs.validate-release-ref.outputs.sdk_kinds), 'npm')
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Check immutable package tags before any uploads
+        run: python3 scripts/sdk_release.py check-tags --tag "$RELEASE_TAG"
+      - name: Check registry versions and tested artifact hashes
+        id: registries
+        run: |
+          for kind in npm pypi crate; do
+            python3 scripts/sdk_release.py check --tag "$RELEASE_TAG" --kind "$kind"
+          done
+      - name: Publish npm artifacts with trusted publishing
+        if: contains(fromJSON(needs.validate-release-ref.outputs.sdk_kinds), 'npm')
+        run: python3 scripts/sdk_release.py publish --tag "$RELEASE_TAG" --kind npm
+      - name: Check whether Python uploads remain
+        id: pypi
+        run: |
+          if find sdk-artifacts/pending-pypi -type f | grep -q .; then
+            echo 'pending=true' >> "$GITHUB_OUTPUT"
+          fi
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # release/v1
+        if: steps.pypi.outputs.pending == 'true'
+        with:
+          packages-dir: sdk-artifacts/pending-pypi/
+          attestations: true
+      - name: Verify published Python artifacts
+        if: contains(fromJSON(needs.validate-release-ref.outputs.sdk_kinds), 'pypi')
+        run: python3 scripts/sdk_release.py verify --tag "$RELEASE_TAG" --kind pypi
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        if: steps.registries.outputs.crate_pending == 'true'
+        with:
+          toolchain: 1.99.1
+      - uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1
+        if: steps.registries.outputs.crate_pending == 'true'
+        id: crates-auth
+      - name: Publish verified Rust packages
+        if: steps.registries.outputs.crate_pending == 'true'
+        env:
+          CARGO_REGISTRIES_CRATES_IO_TOKEN: ${{ steps.crates-auth.outputs.token }}
+        run: python3 scripts/sdk_release.py publish --tag "$RELEASE_TAG" --kind crate
+      - name: Create immutable package tags after registry verification
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/sdk_release.py publish-tags --tag "$RELEASE_TAG"
 
   build-linux-amd64:
     name: Build Linux AMD64
@@ -940,6 +1083,9 @@ jobs:
           OUTPUT: release/CHANGELOG.md
 
       - name: Create release notes file
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          DRY_RUN: ${{ inputs.dry_run }}
         run: |
           {
             echo "## Changes"
@@ -1090,6 +1236,9 @@ jobs:
           } >> release/release-notes.md
 
           echo "Release notes created:"
+          if [[ "$DRY_RUN" != true ]]; then
+            python3 scripts/sdk_release.py notes --tag "$RELEASE_TAG" >> release/release-notes.md
+          fi
           cat release/release-notes.md
 
       - name: Create GitHub Release
