@@ -116,6 +116,7 @@ pub use serve_profile::{
     policy_or_default, LocalWorkloadPolicy, PROFILE_CONTROL_PLANE, PROFILE_FULL,
 };
 pub use update_status::{AvailableUpdate, UpdateStatusSlot, UPGRADE_DOCS_URL};
+pub mod config_repo;
 mod constants;
 mod cookie_crypto;
 #[allow(deprecated)] // generic-array 0.14.x deprecation in aes-gcm 0.10

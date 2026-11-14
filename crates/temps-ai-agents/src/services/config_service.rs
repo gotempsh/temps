@@ -1032,6 +1032,28 @@ impl AgentConfigService {
             }
         }
 
+        // A config repository other than the project's own, and not on the
+        // administrator's list, is kept on the agent but never used. Say so
+        // now, where the YAML was just read, as well as in each run's log.
+        for a in &yaml_agents {
+            let Some(repo) = a.config_repo.as_deref().filter(|r| !r.is_empty()) else {
+                continue;
+            };
+            if let Err(error) = crate::services::config_repo_policy::check_project_config_repo(
+                self.db.as_ref(),
+                project_id,
+                repo,
+            )
+            .await
+            {
+                tracing::warn!(
+                    project_id,
+                    agent = %a.slug(),
+                    "Agent config repo will not be used: {error}"
+                );
+            }
+        }
+
         // 1. Load ALL existing agents for this project (not just yaml-sourced)
         let existing = project_agents::Entity::find()
             .filter(project_agents::Column::ProjectId.eq(project_id))

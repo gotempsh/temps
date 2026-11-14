@@ -1293,6 +1293,14 @@ export type AiConfigSettings = {
      */
     config_repo?: string;
     /**
+     * Repositories a project's agents may name as their own `config_repo`,
+     * besides the project's own repository. An entry is `owner/repo`, or an
+     * owner followed by a slash and an asterisk to allow every repository of
+     * that owner. The global config repo above is the administrator's own
+     * choice and does not need to be listed.
+     */
+    config_repo_allowlist?: Array<string>;
+    /**
      * Branch of the config repo to use.
      */
     config_repo_branch?: string;

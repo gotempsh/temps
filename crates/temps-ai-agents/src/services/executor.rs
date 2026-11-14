@@ -289,6 +289,65 @@ pub(crate) async fn sandbox_git_credential(
     }
 }
 
+/// Clone `owner/repo` from GitHub with a read-only token limited to that
+/// repository. The token reaches git through the environment (a one-shot
+/// credential helper reads it), never the command line or a file.
+async fn clone_with_scoped_token(
+    owner: &str,
+    repo: &str,
+    branch: &str,
+    target_dir: &std::path::Path,
+    token: &str,
+) -> Result<(), String> {
+    // Names are interpolated into a URL and a command line: only the
+    // characters repository and branch names are made of.
+    let plain = |value: &str| {
+        !value.is_empty()
+            && !value.starts_with('-')
+            && value
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
+    };
+    if !plain(owner) || !plain(repo) || !plain(branch) || !is_plain_token(token) {
+        return Err("the repository, branch or token has unexpected characters".to_string());
+    }
+    let output = tokio::time::timeout(
+        Duration::from_secs(300),
+        Command::new("git")
+            .arg("clone")
+            .arg("--quiet")
+            .arg("--depth=1")
+            .arg(format!("--branch={branch}"))
+            .arg("--")
+            .arg(format!("https://github.com/{owner}/{repo}.git"))
+            .arg(target_dir)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "credential.helper")
+            .env(
+                "GIT_CONFIG_VALUE_0",
+                "!f() { echo username=x-access-token; echo \"password=$TEMPS_SCOPED_TOKEN\"; }; f",
+            )
+            .env("TEMPS_SCOPED_TOKEN", token)
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| "git clone timed out after 300 seconds".to_string())?
+    .map_err(|error| format!("could not run git: {error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        // Git's own message names no secret: the token never appears in a URL.
+        Err(format!(
+            "git clone exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
 fn is_plain_token(token: &str) -> bool {
     !token.is_empty()
         && token
@@ -1156,9 +1215,40 @@ impl AgentExecutor {
         }
 
         // ── Phase 2: Clone and overlay per-agent config repo (overrides global) ──
+        //
+        // The per-agent value comes from the project's `.temps.yaml` (or an API
+        // write by a project member), so it is only used when it names the
+        // project's own repository or one the administrator has allowed.
         if let Some(ref repo_url) = config.config_repo_url {
             if !repo_url.is_empty() {
-                if let Some(conn_id) = connection_id {
+                let approved = match crate::services::config_repo_policy::check_project_config_repo(
+                    self.db.as_ref(),
+                    project_id,
+                    repo_url,
+                )
+                .await
+                {
+                    Ok(()) => true,
+                    Err(refusal) => {
+                        tracing::warn!(
+                            run_id,
+                            project_id,
+                            "Per-agent config repo not used: {refusal}"
+                        );
+                        self.run_service
+                            .append_log(
+                                run_id,
+                                "warning",
+                                &format!("Per-agent config repo not used: {refusal}"),
+                                None,
+                            )
+                            .await?;
+                        false
+                    }
+                };
+                if !approved {
+                    // Skip the clone; the run continues without the overlay.
+                } else if let Some(conn_id) = connection_id {
                     let branch = config.config_repo_branch.as_deref().unwrap_or("main");
                     self.inject_config_repo(
                         run_id,
@@ -1735,16 +1825,46 @@ impl AgentExecutor {
             )
             .await?;
 
-        // Clone the config repo
-        self.git_provider_manager
-            .clone_repository(connection_id, owner, repo, &clone_dir, Some(branch))
-            .await
-            .map_err(|e| AgentError::GitError {
-                message: format!(
-                    "Failed to clone {} config repo {}/{}: {}",
-                    label, owner, repo, e
-                ),
-            })?;
+        // Clone the config repo, with a read-only token limited to this one
+        // repository when the connection can mint one (a GitHub App
+        // installation), and with the connection's own credential otherwise.
+        let scoped_clone_failed = match sandbox_git_credential(
+            self.git_provider_manager.as_ref(),
+            connection_id,
+            owner,
+            repo,
+        )
+        .await
+        {
+            SandboxGitCredential::RepoScopedRead { token, .. } => {
+                clone_with_scoped_token(owner, repo, branch, &clone_dir, &token)
+                    .await
+                    .err()
+            }
+            SandboxGitCredential::Withheld { reason } => Some(reason),
+        };
+        if let Some(reason) = scoped_clone_failed {
+            tracing::debug!(
+                run_id,
+                "Cloning {label} config repo {owner}/{repo} with the git connection's credential: {reason}"
+            );
+            // A failed scoped attempt may have left a partial checkout.
+            let _ = fs::remove_dir_all(&clone_dir).await;
+            fs::create_dir_all(&clone_dir)
+                .await
+                .map_err(|e| AgentError::GitError {
+                    message: format!("Failed to create temp dir for config repo: {}", e),
+                })?;
+            self.git_provider_manager
+                .clone_repository(connection_id, owner, repo, &clone_dir, Some(branch))
+                .await
+                .map_err(|e| AgentError::GitError {
+                    message: format!(
+                        "Failed to clone {} config repo {}/{}: {}",
+                        label, owner, repo, e
+                    ),
+                })?;
+        }
 
         // Check if .claude/ directory exists in the cloned repo
         let claude_dir = clone_dir.join(".claude");
@@ -4163,7 +4283,7 @@ fn skipped_overlay_entries_message(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use async_trait::async_trait;
     use sea_orm::{DatabaseBackend, MockDatabase};
@@ -4580,7 +4700,7 @@ mod tests {
         }
     }
 
-    fn make_project(id: i32) -> projects::Model {
+    pub(crate) fn make_project(id: i32) -> projects::Model {
         projects::Model {
             id,
             image_retention_hours: None,
@@ -5898,6 +6018,71 @@ mod tests {
             .expect("resolving the project's secrets");
 
         assert_eq!(run_svc.redact(9, "pw=evicted-run-secret"), "pw=[redacted]");
+    }
+
+    /// A per-agent config repository that is neither the project's own nor on
+    /// the administrator's list is not cloned, and the run's log says so.
+    #[tokio::test]
+    async fn a_config_repo_outside_the_projects_and_the_allow_list_is_not_cloned() {
+        let settings_row = || temps_entities::settings::Model {
+            id: 1,
+            data: serde_json::json!({
+                "ai_config": { "config_repo": "", "config_repo_branch": "main",
+                               "config_repo_allowlist": ["shared/claude-config"] }
+            }),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![settings_row()]])
+                .append_query_results([Vec::<temps_entities::agent_secrets::Model>::new()])
+                .append_query_results([vec![make_project(3)]])
+                .append_query_results([vec![settings_row()]])
+                .append_query_results([vec![make_log(9)]])
+                .into_connection(),
+        );
+        let enc = make_encryption_service();
+        let recorder = Arc::new(GitRecorder::default());
+        let git: Arc<dyn GitProviderManagerTrait> = Arc::new(FakeGitProvider {
+            recorder: recorder.clone(),
+            clone_should_fail: false,
+        });
+        let queue: Arc<dyn JobQueue> = Arc::new(FakeJobQueue {
+            sent: Mutex::new(vec![]),
+        });
+        let executor = AgentExecutor::new(
+            db.clone(),
+            git,
+            enc.clone(),
+            queue,
+            Arc::new(AgentRunService::new(db.clone())),
+            Arc::new(AgentConfigService::new(db.clone(), enc)),
+            make_notification_service(db.clone()),
+            make_sandbox_registry(),
+            make_secret_service(db.clone()),
+            make_definition_service(db.clone()),
+        );
+        let mut agent = synthetic_agent_config(3, "claude_cli", "reviewer");
+        agent.config_repo_url = Some("someone-else/private-notes".to_string());
+
+        // Later phases may need more rows than this test provides; only the
+        // config repo decision is under test.
+        let _ = executor
+            .inject_config_repos_and_secrets(9, &agent, 3, Some(5))
+            .await;
+
+        assert!(
+            recorder.cloned.lock().unwrap().is_empty(),
+            "the repository must not be cloned"
+        );
+        drop(executor);
+        let log = format!(
+            "{:?}",
+            Arc::try_unwrap(db).map(|db| db.into_transaction_log())
+        );
+        assert!(log.contains("Per-agent config repo not used"), "{log}");
+        assert!(log.contains("someone-else/private-notes"), "{log}");
     }
 
     fn make_executor_for_memory_tests() -> AgentExecutor {

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 pub mod autofixer;
+pub mod config_repo_policy;
 pub mod config_service;
 pub mod cron_scheduler;
 pub mod definition_service;

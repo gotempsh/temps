@@ -3093,6 +3093,17 @@
             "example": "",
             "type": "string"
           },
+          "config_repo_allowlist": {
+            "default": [],
+            "description": "Repositories a project's agents may name as their own `config_repo`,\nbesides the project's own repository. An entry is `owner/repo`, or an\nowner followed by a slash and an asterisk to allow every repository of\nthat owner. The global config repo above is the administrator's own\nchoice and does not need to be listed.",
+            "example": [
+              "myorg/claude-config"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "config_repo_branch": {
             "default": "main",
             "description": "Branch of the config repo to use.",
@@ -4613,6 +4624,7 @@
             "$ref": "#/components/schemas/AiConfigSettings",
             "default": {
               "config_repo": "",
+              "config_repo_allowlist": [],
               "config_repo_branch": "main"
             }
           },

@@ -1433,6 +1433,13 @@ pub struct AiConfigSettings {
     /// Branch of the config repo to use.
     #[schema(example = "main")]
     pub config_repo_branch: String,
+    /// Repositories a project's agents may name as their own `config_repo`,
+    /// besides the project's own repository. An entry is `owner/repo`, or an
+    /// owner followed by a slash and an asterisk to allow every repository of
+    /// that owner. The global config repo above is the administrator's own
+    /// choice and does not need to be listed.
+    #[schema(example = json!(["myorg/claude-config"]))]
+    pub config_repo_allowlist: Vec<String>,
 }
 
 impl Default for AiConfigSettings {
@@ -1440,6 +1447,7 @@ impl Default for AiConfigSettings {
         Self {
             config_repo: String::new(),
             config_repo_branch: "main".to_string(),
+            config_repo_allowlist: Vec::new(),
         }
     }
 }
