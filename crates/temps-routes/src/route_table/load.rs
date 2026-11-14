@@ -38,6 +38,9 @@ struct RouteLoadState {
     /// ADR 068 D3: the hosts a tunnel generated for each environment (phase
     /// 1), beside which phase 4 serves its public Compose services.
     tunnel_environment_hosts: HashMap<i32, Vec<String>>,
+    /// Every hostname an `environment_domains` row holds (phase 1), live or
+    /// not, lowercased. A project custom domain never takes one (phase 3).
+    generated_hosts: HashSet<String>,
     /// Operator custom routes (phase 2), by route type.
     http_routes_map: HashMap<String, RouteInfo>,
     tls_routes_map: HashMap<String, RouteInfo>,
@@ -211,6 +214,7 @@ impl CachedPeerTable {
             nodes_cache,
             principals,
             tunnel_environment_hosts: HashMap::new(),
+            generated_hosts: HashSet::new(),
             http_routes_map: HashMap::new(),
             tls_routes_map: HashMap::new(),
             http_wildcards_matcher: WildcardMatcher::new(),
@@ -399,6 +403,7 @@ impl CachedPeerTable {
             nodes_cache,
             principals,
             tunnel_environment_hosts,
+            generated_hosts,
             ..
         } = state;
 
@@ -416,6 +421,7 @@ impl CachedPeerTable {
         // public Compose services are served as `<label>--<service>` beside
         // each one (section 4).
         for env_domain in &env_domains {
+            generated_hosts.insert(env_domain.domain.trim_end_matches('.').to_ascii_lowercase());
             if env_domain.generated_by_connector_id.is_some()
                 && env_domain.audience == temps_entities::audience::PUBLIC
             {
@@ -830,6 +836,8 @@ impl CachedPeerTable {
             deployments_cache,
             nodes_cache,
             principals,
+            generated_hosts,
+            app_settings,
             ..
         } = state;
 
@@ -845,6 +853,25 @@ impl CachedPeerTable {
         );
 
         for custom_domain in custom_domains {
+            // The platform's own hostnames (reserved names, the preview domain
+            // and everything below it, an environment's generated address)
+            // are never served as a project's custom domain. Rows written
+            // before that was enforced are skipped, not deleted.
+            let host = custom_domain
+                .domain
+                .trim_end_matches('.')
+                .to_ascii_lowercase();
+            if app_settings.is_platform_hostname(&host) || generated_hosts.contains(&host) {
+                warn!(
+                    custom_domain_id = custom_domain.id,
+                    project_id = custom_domain.project_id,
+                    "Skipping project custom domain '{}': the name belongs to the platform \
+                     (reserved, below the preview domain, or an environment's generated \
+                     address). The row is kept; rename or delete it.",
+                    custom_domain.domain
+                );
+                continue;
+            }
             if custom_domain.audience == temps_entities::audience::SIGNED_IN {
                 gated_meta.insert(
                     gate_host_key(&custom_domain.domain),
@@ -2772,6 +2799,94 @@ mod tests {
                 .map(|route| route.get_backend_addr()),
             Some("8.8.8.8:8080".to_string())
         );
+
+        test_db.cleanup().await?;
+        Ok(())
+    }
+
+    /// A project custom domain written before the name rules existed cannot
+    /// take an environment's generated address or an unclaimed name under the
+    /// preview domain; an ordinary custom domain still routes, and the refused
+    /// rows are kept.
+    #[tokio::test]
+    async fn a_project_custom_domain_cannot_take_a_generated_hostname(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(database) = database_or_skip().await else {
+            return Ok(());
+        };
+        let test_db = TestDBMockOperations::new(database.db.clone()).await?;
+        let db = test_db.db.as_ref();
+        set_preview_domain(db).await?;
+        let (project, environment, deployment) = seed_environment(&test_db).await?;
+
+        environment_domains::ActiveModel {
+            domain: Set("env-domain.example.com".to_string()),
+            environment_id: Set(environment.id),
+            ..Default::default()
+        }
+        .insert(db)
+        .await?;
+
+        let generated = format!("shop-production.{PREVIEW_DOMAIN}");
+        let unclaimed = format!("unclaimed.{PREVIEW_DOMAIN}");
+        // Mixed case and a trailing dot are the same name.
+        let refused = [
+            generated.clone(),
+            unclaimed.clone(),
+            "Env-Domain.example.com.".to_string(),
+        ];
+        for domain in &refused {
+            project_custom_domains::ActiveModel {
+                domain: Set(domain.clone()),
+                project_id: Set(project.id),
+                environment_id: Set(environment.id),
+                status: Set("active".to_string()),
+                redirect_to: Set(Some("https://elsewhere.example.net".to_string())),
+                status_code: Set(Some(301)),
+                ..Default::default()
+            }
+            .insert(db)
+            .await?;
+        }
+        project_custom_domains::ActiveModel {
+            domain: Set("ordinary.example.org".to_string()),
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            status: Set("active".to_string()),
+            redirect_to: Set(Some("https://elsewhere.example.net".to_string())),
+            status_code: Set(Some(301)),
+            ..Default::default()
+        }
+        .insert(db)
+        .await?;
+
+        let table = CachedPeerTable::new(test_db.db.clone());
+        table.load_routes().await?;
+
+        for host in [generated.as_str(), "env-domain.example.com"] {
+            let route = table
+                .get_route_by_host(host)
+                .unwrap_or_else(|| panic!("{host} keeps its generated route"));
+            assert_eq!(route.deployment.as_ref().map(|d| d.id), Some(deployment.id));
+            assert!(
+                route.redirect_to.is_none(),
+                "{host} must not be redirected by a project custom domain"
+            );
+        }
+        assert!(
+            table.get_route_by_host(&unclaimed).is_none(),
+            "an unclaimed name below the preview domain is not served as a custom domain"
+        );
+        assert_eq!(
+            table
+                .get_route_by_host("ordinary.example.org")
+                .and_then(|route| route.redirect_to.clone())
+                .as_deref(),
+            Some("https://elsewhere.example.net"),
+            "an ordinary custom domain still routes"
+        );
+        let kept = project_custom_domains::Entity::find().all(db).await?;
+        assert_eq!(kept.len(), 4, "refused rows are kept, never deleted");
 
         test_db.cleanup().await?;
         Ok(())
