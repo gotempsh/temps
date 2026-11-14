@@ -2193,12 +2193,19 @@ mod tests {
         let (db, auth_service, _) = setup_test_env().await;
         let user = create_test_user(&db.db, "expired@example.com", "password").await;
 
-        // Manually insert an expired session (expired 1 hour ago)
+        // Manually insert an expired session (expired 1 hour ago), stored
+        // the way the service stores it so the lookup finds the row and the
+        // rejection is the expiry check doing its job.
         let expired_token = "expired_session_token_1234567890abcdef1234567890abcdef1234567890ab";
         let expired_session = sessions::ActiveModel {
             user_id: Set(user.id),
-            session_token: Set(expired_token.to_string()),
+            session_token: Set(stored_session_token(expired_token)),
             expires_at: Set(Utc::now() - Duration::hours(1)),
+            // `mfa_pending` defaults to TRUE in the database, and
+            // `verify_session_details` refuses a pending challenge, so
+            // leaving it unset would reject this row for that reason
+            // instead of for its expiry.
+            mfa_pending: Set(false),
             ..Default::default()
         };
         expired_session.insert(db.db.as_ref()).await.unwrap();
@@ -2217,12 +2224,17 @@ mod tests {
         let (db, auth_service, _) = setup_test_env().await;
         let user = create_test_user(&db.db, "justexpired@example.com", "password").await;
 
-        // Insert a session that expired just 1 second ago
+        // Insert a session that expired just 1 second ago, stored the way
+        // the service stores it so the row is findable and only the expiry
+        // can reject it.
         let token = "justexpired_token_1234567890abcdef1234567890abcdef1234567890abcde";
         let session = sessions::ActiveModel {
             user_id: Set(user.id),
-            session_token: Set(token.to_string()),
+            session_token: Set(stored_session_token(token)),
             expires_at: Set(Utc::now() - Duration::seconds(1)),
+            // A real authenticated session, not a pending challenge (see
+            // `test_verify_session_expired_is_rejected`).
+            mfa_pending: Set(false),
             ..Default::default()
         };
         session.insert(db.db.as_ref()).await.unwrap();
@@ -3653,10 +3665,12 @@ mod tests {
         let (db, auth_service, _) = setup_test_env().await;
         let user = create_test_user(&db.db, "mfa-origin-expired@example.com", "password").await;
 
+        // Stored as a digest, so the row is findable and `None` means the
+        // expiry filter rejected it rather than the lookup missing.
         let token = "expired_mfa_origin_session";
         let session = sessions::ActiveModel {
             user_id: Set(user.id),
-            session_token: Set(token.to_string()),
+            session_token: Set(stored_session_token(token)),
             expires_at: Set(Utc::now() - Duration::minutes(1)),
             mfa_pending: Set(true),
             mfa_pending_origin: Set(Some("oidc".to_string())),
@@ -3863,12 +3877,16 @@ mod tests {
         let (db, auth_service, _) = setup_test_env().await;
         let user = create_test_user(&db.db, "mfa@example.com", "password").await;
 
-        // Create expired MFA session manually
+        // Create expired MFA session manually, stored as a digest so the
+        // challenge is findable and only its expiry can reject it.
         let session_token = "expired_mfa_session";
         let session = sessions::ActiveModel {
             user_id: Set(user.id),
-            session_token: Set(session_token.to_string()),
+            session_token: Set(stored_session_token(session_token)),
             expires_at: Set(Utc::now() - Duration::minutes(1)), // Expired
+            // Stated rather than left to the database default, because
+            // `verify_mfa_challenge` only accepts a pending challenge.
+            mfa_pending: Set(true),
             ..Default::default()
         };
         session.insert(db.db.as_ref()).await.unwrap();
