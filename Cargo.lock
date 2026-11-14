@@ -16140,7 +16140,6 @@ dependencies = [
  "base64 0.23.1",
  "chrono",
  "ed25519-dalek 3.0.0",
- "futures",
  "hex",
  "rand 0.10.3",
  "reqwest 0.12.28",
