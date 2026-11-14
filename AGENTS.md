@@ -298,6 +298,22 @@ regenerate with `bun run scripts/generate-docs.ts --output docs/CLI.md` and
 
 ## Build, lint and CI
 
+### Minimize CI runner allocations
+
+- Add related checks as steps in an existing compatible job; reuse its checkout,
+  dependency installation and caches instead of adding a job per check or SDK.
+- Each job and matrix entry allocates a runner. Reusable workflows do not remove
+  that cost. Keep workflows and matrices small, avoid duplicate validation across
+  workflows, and cancel superseded PR runs where safe.
+- Create a separate job only for a concrete need: a different OS or architecture,
+  permission or secret isolation, resource requirements, or a measured improvement
+  in feedback time that justifies the extra runner cost. State that reason in the
+  workflow or PR. Keep publication permissions isolated from untrusted PR checks.
+- Preserve required checks and test coverage when consolidating jobs; update
+  coverage mappings and coordinate required-status changes rather than silently
+  removing validation.
+
+
 ```bash
 cargo check --lib -p <crate>                 # after every change
 cargo test --lib -p <crate> [test_name] [-- --nocapture]
