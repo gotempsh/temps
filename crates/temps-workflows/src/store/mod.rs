@@ -37,7 +37,7 @@ pub type EventRow = workflow_events::Model;
 pub type CredentialRow = workflow_credentials::Model;
 
 /// Who started a run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Starter {
     User(i32),
     Credential(i32),
@@ -45,7 +45,7 @@ pub enum Starter {
     Machine,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct NewRun {
     pub id: Uuid,
     pub project_id: i32,
@@ -134,6 +134,8 @@ pub struct StepRecord {
     /// For `send_event`: inserted in the same transaction as the entry, so the
     /// event exists exactly when the entry does.
     pub event: Option<NewEvent>,
+    /// Inserted atomically with this entry, fenced by the parent lease.
+    pub child: Option<(NewRun, i64)>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -486,5 +488,10 @@ pub trait WorkflowStore: Send + Sync {
     /// Delete up to `batch` finished runs past their environment's retention
     /// and return them, so their blobs can be removed afterwards.
     async fn delete_expired_runs(&self, batch: u64) -> WorkflowResult<Vec<ExpiredRun>>;
+    async fn pending_blob_cleanup(
+        &self,
+        limit: u64,
+    ) -> WorkflowResult<Vec<crate::payload::PayloadScope>>;
+    async fn acknowledge_blob_cleanup(&self, run_id: Uuid) -> WorkflowResult<()>;
     async fn delete_expired_events(&self, batch: u64) -> WorkflowResult<u64>;
 }

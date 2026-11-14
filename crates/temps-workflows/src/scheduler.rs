@@ -21,7 +21,6 @@ use tokio::sync::{Notify, Semaphore};
 use tokio::task::JoinHandle;
 
 use crate::engine::WorkflowEngine;
-use crate::payload::PayloadScope;
 use crate::store::{WorkflowStore, DUE_CHANNEL};
 
 #[derive(Debug, Clone)]
@@ -312,18 +311,22 @@ impl WorkflowScheduler {
                 }
             };
             deleted += expired.len() as u64;
-            for run in expired.iter().filter(|run| run.has_blob_payloads) {
-                self.codec
-                    .delete_run_blobs(&PayloadScope {
-                        project_id: run.project_id,
-                        environment_id: run.environment_id,
-                        run_id: run.run_id,
-                    })
-                    .await;
-            }
             if (expired.len() as u64) < RETENTION_BATCH {
                 break;
             }
+        }
+        match self.store.pending_blob_cleanup(100).await {
+            Ok(pending) => {
+                for scope in pending {
+                    if self.codec.delete_run_blobs(&scope).await {
+                        if let Err(error) = self.store.acknowledge_blob_cleanup(scope.run_id).await
+                        {
+                            tracing::warn!(run_id = %scope.run_id, %error, "could not acknowledge workflow blob cleanup");
+                        }
+                    }
+                }
+            }
+            Err(error) => tracing::warn!(%error, "could not list pending workflow blob cleanup"),
         }
         let events = self
             .store

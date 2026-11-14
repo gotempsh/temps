@@ -537,10 +537,15 @@ impl WorkflowService {
                     status: run.status.clone(),
                     operation: "delete (cancel it first)",
                 })?;
-        if deleted.has_blob_payloads {
-            self.codec
+        if deleted.has_blob_payloads
+            && self
+                .codec
                 .delete_run_blobs(&WorkflowEngine::scope(&deleted))
-                .await;
+                .await
+        {
+            if let Err(error) = self.store.acknowledge_blob_cleanup(deleted.id).await {
+                tracing::warn!(%run_id, %error, "blob deletion succeeded but cleanup acknowledgement will retry");
+            }
         }
         tracing::info!(%run_id, project_id, environment_id, "workflow run deleted");
         Ok(deleted)

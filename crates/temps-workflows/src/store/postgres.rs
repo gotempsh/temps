@@ -50,6 +50,111 @@ pub struct PgWorkflowStore {
 }
 
 impl PgWorkflowStore {
+    async fn insert_run_in(
+        &self,
+        txn: &sea_orm::DatabaseTransaction,
+        run: NewRun,
+        max_active_runs: i64,
+    ) -> WorkflowResult<StartOutcome> {
+        txn.execute(stmt(
+            "SELECT pg_advisory_xact_lock($1, $2)",
+            vec![ADMISSION_LOCK_CLASS.into(), run.environment_id.into()],
+        ))
+        .await
+        .map_err(WorkflowError::db("serializing workflow starts"))?;
+        if let Some(key) = &run.idempotency_key {
+            let existing = workflow_runs::Entity::find()
+                .filter(workflow_runs::Column::EnvironmentId.eq(run.environment_id))
+                .filter(workflow_runs::Column::WorkflowName.eq(run.workflow_name.clone()))
+                .filter(workflow_runs::Column::IdempotencyKey.eq(key.clone()))
+                .one(txn)
+                .await
+                .map_err(WorkflowError::db("looking up a run by idempotency key"))?;
+            if let Some(existing) = existing {
+                return Ok(StartOutcome::Existing(existing));
+            }
+        }
+        let active = txn
+            .query_one(stmt(
+                &format!(
+                    "SELECT count(*)::BIGINT AS n FROM workflow_runs \
+                     WHERE environment_id = $1 AND status NOT IN {TERMINAL}"
+                ),
+                vec![run.environment_id.into()],
+            ))
+            .await
+            .map_err(WorkflowError::db("counting active workflow runs"))?
+            .map(|row| row.try_get::<i64>("", "n"))
+            .transpose()
+            .map_err(WorkflowError::db("counting active workflow runs"))?
+            .unwrap_or(0);
+        if active >= max_active_runs {
+            return Err(WorkflowError::QuotaExceeded {
+                environment_id: run.environment_id,
+                quota: "max_active_runs",
+                limit: max_active_runs,
+            });
+        }
+        let (user, credential) = match run.starter {
+            Starter::User(id) => (Some(id), None),
+            Starter::Credential(id) => (None, Some(id)),
+            Starter::Machine => (None, None),
+        };
+        let inserted = workflow_runs::Entity::find()
+            .from_raw_sql(stmt(
+                "INSERT INTO workflow_runs (id, project_id, environment_id, workflow_name, status, \
+                 input_encrypted, input_blob_key, input_bytes, idempotency_key, deployment_id, \
+                 started_by_user_id, started_by_credential_id, has_blob_payloads, parent_run_id, \
+                 due_at) \
+                 VALUES ($1, $2, $3, $4, 'queued', $5, $6, $7, $8, $9, $10, $11, $12, $13, now()) \
+                 ON CONFLICT (environment_id, workflow_name, idempotency_key) \
+                 WHERE idempotency_key IS NOT NULL DO NOTHING \
+                 RETURNING *",
+                vec![
+                    run.id.into(),
+                    run.project_id.into(),
+                    run.environment_id.into(),
+                    run.workflow_name.clone().into(),
+                    run.input.encrypted.clone().into(),
+                    run.input.blob_key.clone().into(),
+                    run.input.bytes.into(),
+                    run.idempotency_key.clone().into(),
+                    run.deployment_id.into(),
+                    user.into(),
+                    credential.into(),
+                    run.input.blob_key.is_some().into(),
+                    run.parent_run_id.into(),
+                ],
+            ))
+            .one(txn)
+            .await
+            .map_err(WorkflowError::db("inserting a workflow run"))?;
+        let outcome = match inserted {
+            Some(mut row) => {
+                txn.execute(stmt("INSERT INTO workflow_managed_runs(run_id,service_id,project_id) SELECT $1,managed_store_service_id,project_id FROM workflow_environment_settings WHERE environment_id=$2 AND managed_store_service_id IS NOT NULL",vec![row.id.into(),row.environment_id.into()])).await.map_err(WorkflowError::db("pinning managed workflow journal"))?;
+                let updated = txn.execute(stmt("UPDATE workflow_runs SET has_blob_payloads=true WHERE id=$1 AND EXISTS(SELECT 1 FROM workflow_managed_runs WHERE run_id=$1)",vec![row.id.into()])).await.map_err(WorkflowError::db("tracking managed journal blob cleanup"))?;
+                row.has_blob_payloads |= updated.rows_affected() > 0;
+                notify(txn).await?;
+                StartOutcome::Created(row)
+            }
+            None => {
+                // Another start with the same key won the race.
+                let existing = workflow_runs::Entity::find()
+                    .filter(workflow_runs::Column::EnvironmentId.eq(run.environment_id))
+                    .filter(workflow_runs::Column::WorkflowName.eq(run.workflow_name.clone()))
+                    .filter(workflow_runs::Column::IdempotencyKey.eq(run.idempotency_key.clone()))
+                    .one(txn)
+                    .await
+                    .map_err(WorkflowError::db("looking up a run by idempotency key"))?
+                    .ok_or(WorkflowError::Validation {
+                        field: "idempotency_key",
+                        reason: "a concurrent start with this key did not leave a run".into(),
+                    })?;
+                StartOutcome::Existing(existing)
+            }
+        };
+        Ok(outcome)
+    }
     pub fn new(db: Arc<DatabaseConnection>) -> Self {
         Self { db, managed: None }
     }
@@ -403,103 +508,7 @@ impl WorkflowStore for PgWorkflowStore {
             .begin()
             .await
             .map_err(WorkflowError::db("starting a workflow run"))?;
-        txn.execute(stmt(
-            "SELECT pg_advisory_xact_lock($1, $2)",
-            vec![ADMISSION_LOCK_CLASS.into(), run.environment_id.into()],
-        ))
-        .await
-        .map_err(WorkflowError::db("serializing workflow starts"))?;
-        if let Some(key) = &run.idempotency_key {
-            let existing = workflow_runs::Entity::find()
-                .filter(workflow_runs::Column::EnvironmentId.eq(run.environment_id))
-                .filter(workflow_runs::Column::WorkflowName.eq(run.workflow_name.clone()))
-                .filter(workflow_runs::Column::IdempotencyKey.eq(key.clone()))
-                .one(&txn)
-                .await
-                .map_err(WorkflowError::db("looking up a run by idempotency key"))?;
-            if let Some(existing) = existing {
-                return Ok(StartOutcome::Existing(existing));
-            }
-        }
-        let active = txn
-            .query_one(stmt(
-                &format!(
-                    "SELECT count(*)::BIGINT AS n FROM workflow_runs \
-                     WHERE environment_id = $1 AND status NOT IN {TERMINAL}"
-                ),
-                vec![run.environment_id.into()],
-            ))
-            .await
-            .map_err(WorkflowError::db("counting active workflow runs"))?
-            .map(|row| row.try_get::<i64>("", "n"))
-            .transpose()
-            .map_err(WorkflowError::db("counting active workflow runs"))?
-            .unwrap_or(0);
-        if active >= max_active_runs {
-            return Err(WorkflowError::QuotaExceeded {
-                environment_id: run.environment_id,
-                quota: "max_active_runs",
-                limit: max_active_runs,
-            });
-        }
-        let (user, credential) = match run.starter {
-            Starter::User(id) => (Some(id), None),
-            Starter::Credential(id) => (None, Some(id)),
-            Starter::Machine => (None, None),
-        };
-        let inserted = workflow_runs::Entity::find()
-            .from_raw_sql(stmt(
-                "INSERT INTO workflow_runs (id, project_id, environment_id, workflow_name, status, \
-                 input_encrypted, input_blob_key, input_bytes, idempotency_key, deployment_id, \
-                 started_by_user_id, started_by_credential_id, has_blob_payloads, parent_run_id, \
-                 due_at) \
-                 VALUES ($1, $2, $3, $4, 'queued', $5, $6, $7, $8, $9, $10, $11, $12, $13, now()) \
-                 ON CONFLICT (environment_id, workflow_name, idempotency_key) \
-                 WHERE idempotency_key IS NOT NULL DO NOTHING \
-                 RETURNING *",
-                vec![
-                    run.id.into(),
-                    run.project_id.into(),
-                    run.environment_id.into(),
-                    run.workflow_name.clone().into(),
-                    run.input.encrypted.clone().into(),
-                    run.input.blob_key.clone().into(),
-                    run.input.bytes.into(),
-                    run.idempotency_key.clone().into(),
-                    run.deployment_id.into(),
-                    user.into(),
-                    credential.into(),
-                    run.input.blob_key.is_some().into(),
-                    run.parent_run_id.into(),
-                ],
-            ))
-            .one(&txn)
-            .await
-            .map_err(WorkflowError::db("inserting a workflow run"))?;
-        let outcome = match inserted {
-            Some(mut row) => {
-                txn.execute(stmt("INSERT INTO workflow_managed_runs(run_id,service_id,project_id) SELECT $1,managed_store_service_id,project_id FROM workflow_environment_settings WHERE environment_id=$2 AND managed_store_service_id IS NOT NULL",vec![row.id.into(),row.environment_id.into()])).await.map_err(WorkflowError::db("pinning managed workflow journal"))?;
-                let updated = txn.execute(stmt("UPDATE workflow_runs SET has_blob_payloads=true WHERE id=$1 AND EXISTS(SELECT 1 FROM workflow_managed_runs WHERE run_id=$1)",vec![row.id.into()])).await.map_err(WorkflowError::db("tracking managed journal blob cleanup"))?;
-                row.has_blob_payloads |= updated.rows_affected() > 0;
-                notify(&txn).await?;
-                StartOutcome::Created(row)
-            }
-            None => {
-                // Another start with the same key won the race.
-                let existing = workflow_runs::Entity::find()
-                    .filter(workflow_runs::Column::EnvironmentId.eq(run.environment_id))
-                    .filter(workflow_runs::Column::WorkflowName.eq(run.workflow_name.clone()))
-                    .filter(workflow_runs::Column::IdempotencyKey.eq(run.idempotency_key.clone()))
-                    .one(&txn)
-                    .await
-                    .map_err(WorkflowError::db("looking up a run by idempotency key"))?
-                    .ok_or(WorkflowError::Validation {
-                        field: "idempotency_key",
-                        reason: "a concurrent start with this key did not leave a run".into(),
-                    })?;
-                StartOutcome::Existing(existing)
-            }
-        };
+        let outcome = self.insert_run_in(&txn, run, max_active_runs).await?;
         txn.commit()
             .await
             .map_err(WorkflowError::db("starting a workflow run"))?;
@@ -547,9 +556,15 @@ impl WorkflowStore for PgWorkflowStore {
              ), limits AS ( \
                 SELECT e, w, lim FROM jsonb_to_recordset($2::jsonb) AS f(e int, w text, lim int) \
              ), due AS ( \
-                SELECT id, environment_id, workflow_name, due_at FROM workflow_runs \
-                WHERE status IN {RUNNABLE} AND due_at <= now() \
-                AND NOT EXISTS(SELECT 1 FROM workflow_deployment_drains drain WHERE drain.environment_id=workflow_runs.environment_id AND drain.expires_at>now()) \
+                SELECT r.id, r.environment_id, r.workflow_name, r.due_at FROM workflow_runs r \
+                LEFT JOIN running_env re ON re.environment_id=r.environment_id \
+                LEFT JOIN running_wf rw ON rw.environment_id=r.environment_id AND rw.workflow_name=r.workflow_name \
+                LEFT JOIN workflow_environment_settings s ON s.environment_id=r.environment_id \
+                LEFT JOIN limits l ON l.e=r.environment_id AND l.w=r.workflow_name \
+                WHERE r.status IN {RUNNABLE} AND r.due_at <= now() \
+                AND COALESCE(re.n,0) < COALESCE(s.max_concurrent_runs,50) \
+                AND COALESCE(rw.n,0) < COALESCE(l.lim,2147483647) \
+                AND NOT EXISTS(SELECT 1 FROM workflow_deployment_drains drain WHERE drain.environment_id=r.environment_id AND drain.expires_at>now()) \
                 ORDER BY due_at, id LIMIT {CLAIM_WINDOW} \
              ), ranked_wf AS ( \
                 SELECT d.id, d.environment_id, d.due_at, \
@@ -861,7 +876,18 @@ impl WorkflowStore for PgWorkflowStore {
     async fn cancel_descendants(&self, run_id: Uuid) -> WorkflowResult<Vec<RunRow>> {
         // `parent_run_id` is set once, at creation, to a run that already
         // exists, so the tree has no cycles.
-        workflow_runs::Entity::find()
+        let txn = self
+            .db
+            .begin()
+            .await
+            .map_err(WorkflowError::db("cancelling workflow descendants"))?;
+        txn.execute(stmt(
+            "SELECT pg_advisory_xact_lock($1, environment_id) FROM workflow_runs WHERE id=$2",
+            vec![ADMISSION_LOCK_CLASS.into(), run_id.into()],
+        ))
+        .await
+        .map_err(WorkflowError::db("serializing descendant cancellation"))?;
+        let rows = workflow_runs::Entity::find()
             .from_raw_sql(stmt(
                 &format!(
                     "WITH RECURSIVE tree AS ( \
@@ -876,9 +902,13 @@ impl WorkflowStore for PgWorkflowStore {
                 ),
                 vec![run_id.into()],
             ))
-            .all(self.db.as_ref())
+            .all(&txn)
             .await
-            .map_err(WorkflowError::db("cancelling the descendants of a workflow run"))
+            .map_err(WorkflowError::db("cancelling the descendants of a workflow run"))?;
+        txn.commit()
+            .await
+            .map_err(WorkflowError::db("committing descendant cancellation"))?;
+        Ok(rows)
     }
 
     async fn cancel_run(&self, run_id: Uuid) -> WorkflowResult<Option<RunRow>> {
@@ -1225,7 +1255,9 @@ impl WorkflowStore for PgWorkflowStore {
                 run_id: waiting.run_id,
                 sequence: waiting.sequence,
             })?;
-        let canonical = self.persist_revision(&txn, updated, &mut None).await?;
+        let canonical = self
+            .persist_revision(&txn, updated, &mut None, &mut None)
+            .await?;
         let delta = i64::from(canonical.result_bytes) + i64::from(canonical.error_bytes)
             - i64::from(step.result_bytes)
             - i64::from(step.error_bytes);
@@ -1293,6 +1325,17 @@ impl WorkflowStore for PgWorkflowStore {
             .begin()
             .await
             .map_err(WorkflowError::db("recording a journal entry"))?;
+        if record.child.is_some() {
+            // Same lock order as descendant cancellation: admission, then run.
+            txn.execute(stmt(
+                "SELECT pg_advisory_xact_lock($1, environment_id) FROM workflow_runs WHERE id=$2",
+                vec![ADMISSION_LOCK_CLASS.into(), record.run_id.into()],
+            ))
+            .await
+            .map_err(WorkflowError::db(
+                "serializing child creation with cancellation",
+            ))?;
+        }
         let run = workflow_runs::Entity::find()
             .from_raw_sql(stmt(
                 "SELECT * FROM workflow_runs WHERE id = $1 FOR UPDATE",
@@ -1323,7 +1366,9 @@ impl WorkflowStore for PgWorkflowStore {
                         found: record.name,
                     });
                 }
-                if StepStatus::parse(&existing.status).is_some_and(StepStatus::is_final) {
+                if StepStatus::parse(&existing.status).is_some_and(StepStatus::is_final)
+                    || record.kind == StepKind::Child
+                {
                     (existing, false, 0, true)
                 } else {
                     let old_bytes =
@@ -1417,7 +1462,7 @@ impl WorkflowStore for PgWorkflowStore {
         } else {
             let proposed_bytes = i64::from(entry.result_bytes) + i64::from(entry.error_bytes);
             entry = self
-                .persist_revision(&txn, entry, &mut record.event)
+                .persist_revision(&txn, entry, &mut record.event, &mut record.child)
                 .await?;
             bytes_delta +=
                 i64::from(entry.result_bytes) + i64::from(entry.error_bytes) - proposed_bytes;
@@ -1427,6 +1472,24 @@ impl WorkflowStore for PgWorkflowStore {
                     quota: "max_journal_bytes_per_run",
                     limit: limits.max_journal_bytes,
                 });
+            }
+        }
+        if !already {
+            if let Some((child, max_active)) = record.child {
+                let child_id = child.id;
+                if let StartOutcome::Existing(existing) =
+                    self.insert_run_in(&txn, child, max_active).await?
+                {
+                    if existing.id != child_id || existing.parent_run_id != Some(record.run_id) {
+                        return Err(WorkflowError::Validation {
+                            field: "child",
+                            reason: format!(
+                                "child entry {} of run {} conflicts with existing run {}",
+                                record.sequence, record.run_id, existing.id
+                            ),
+                        });
+                    }
+                }
             }
         }
         let blob = blob || entry.result_blob_key.is_some();
@@ -1824,6 +1887,33 @@ impl WorkflowStore for PgWorkflowStore {
             .collect())
     }
 
+    async fn pending_blob_cleanup(
+        &self,
+        limit: u64,
+    ) -> WorkflowResult<Vec<crate::payload::PayloadScope>> {
+        use temps_entities::workflow_blob_cleanup as cleanup;
+        Ok(cleanup::Entity::find()
+            .order_by_asc(cleanup::Column::CreatedAt)
+            .order_by_asc(cleanup::Column::RunId)
+            .limit(limit.min(100))
+            .all(self.db.as_ref())
+            .await
+            .map_err(WorkflowError::db("listing pending workflow blob cleanup"))?
+            .into_iter()
+            .map(|row| crate::payload::PayloadScope {
+                project_id: row.project_id,
+                environment_id: row.environment_id,
+                run_id: row.run_id,
+            })
+            .collect())
+    }
+    async fn acknowledge_blob_cleanup(&self, run_id: Uuid) -> WorkflowResult<()> {
+        temps_entities::workflow_blob_cleanup::Entity::delete_by_id(run_id)
+            .exec(self.db.as_ref())
+            .await
+            .map_err(WorkflowError::db("acknowledging workflow blob cleanup"))?;
+        Ok(())
+    }
     async fn delete_expired_events(&self, batch: u64) -> WorkflowResult<u64> {
         let result = self
             .db

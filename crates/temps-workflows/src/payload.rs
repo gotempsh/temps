@@ -99,7 +99,7 @@ impl PayloadScope {
 }
 
 /// A sealed payload as the row stores it. Holds ciphertext only.
-#[derive(Clone, PartialEq, Eq, Default)]
+#[derive(Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct StoredPayload {
     pub encrypted: Option<String>,
     pub blob_key: Option<String>,
@@ -373,15 +373,18 @@ impl PayloadCodec {
     }
 
     /// Delete every blob of a run (run deletion, retention).
-    pub async fn delete_run_blobs(&self, scope: &PayloadScope) {
+    pub async fn delete_run_blobs(&self, scope: &PayloadScope) -> bool {
         if let Some(blobs) = &self.blobs {
             if let Err(error) = blobs
                 .delete_prefix(scope.project_id, &scope.run_blob_prefix())
                 .await
             {
-                tracing::warn!(project_id = scope.project_id, run_id = %scope.run_id, %error, "could not delete a workflow run's payload blobs");
+                tracing::warn!(project_id = scope.project_id, run_id = %scope.run_id, %error, "could not delete a workflow run's payload blobs; durable cleanup will retry");
+                return false;
             }
+            return true;
         }
+        false
     }
 }
 
@@ -407,6 +410,7 @@ pub(crate) mod tests {
     #[derive(Default)]
     pub(crate) struct MemoryBlobs {
         pub objects: Mutex<HashMap<(i32, String), Bytes>>,
+        pub fail_delete: std::sync::atomic::AtomicBool,
     }
 
     #[async_trait::async_trait]
@@ -444,6 +448,12 @@ pub(crate) mod tests {
             project_id: i32,
             prefix: &str,
         ) -> Result<u64, PayloadBlobError> {
+            if self.fail_delete.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(PayloadBlobError::Unavailable {
+                    project_id,
+                    reason: "simulated storage outage".into(),
+                });
+            }
             let mut objects = self.objects.lock().unwrap();
             let before = objects.len();
             objects.retain(|(p, k), _| !(*p == project_id && k.starts_with(prefix)));

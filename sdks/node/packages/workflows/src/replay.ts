@@ -186,6 +186,8 @@ class Invocation<Input> {
       const output = await this.definition.run(this.context);
       if (this.control !== undefined) return this.ended(this.control);
       this.checkLease();
+      const unread = [...this.journal.values()].find((entry) => entry.sequence >= this.sequence);
+      if (unread) throw new WorkflowIncompatibleError(this.request.run_id, unread.sequence, `${unread.kind} '${unread.name}'`, 'end of workflow');
       return { type: 'outcome', outcome: { type: 'completed', output: toJson(output, 'The workflow output') } };
     } catch (error) {
       return this.ended(error);

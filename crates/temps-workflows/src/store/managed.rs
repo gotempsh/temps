@@ -38,6 +38,8 @@ struct Revision {
     result_encrypted: Option<String>,
     error_encrypted: Option<String>,
     event: Option<Event>,
+    #[serde(default)]
+    child: Option<(super::NewRun, i64)>,
 }
 impl PgWorkflowStore {
     pub(super) async fn check_managed(&self, scope: WorkflowJournalScope) -> WorkflowResult<()> {
@@ -88,6 +90,7 @@ impl PgWorkflowStore {
         txn: &DatabaseTransaction,
         mut entry: StepRow,
         event: &mut Option<NewEvent>,
+        child: &mut Option<(super::NewRun, i64)>,
     ) -> WorkflowResult<StepRow> {
         let Some(scope) = self.placement(txn, entry.run_id).await? else {
             return Ok(entry);
@@ -99,6 +102,7 @@ impl PgWorkflowStore {
         let previous = entry.managed_revision.clone();
         entry.managed_revision = Some(key.clone());
         let revision = Revision {
+            child: child.clone(),
             result_encrypted: entry.result_encrypted.clone(),
             error_encrypted: entry.error_encrypted.clone(),
             entry,
@@ -144,6 +148,10 @@ impl PgWorkflowStore {
         }
         canonical.entry.result_encrypted = canonical.result_encrypted;
         canonical.entry.error_encrypted = canonical.error_encrypted;
+        let max_active = child.as_ref().map(|(_, limit)| *limit);
+        *child = canonical
+            .child
+            .map(|(run, limit)| (run, max_active.unwrap_or(limit)));
         *event = canonical
             .event
             .map(|e| {
@@ -224,6 +232,8 @@ impl PgWorkflowStore {
                 }
                 revision.entry.result_encrypted = revision.result_encrypted;
                 revision.entry.error_encrypted = revision.error_encrypted;
+                // Resume changes scheduling metadata centrally without rewriting the payload revision.
+                revision.entry.wake_at = entry.wake_at;
                 *entry = revision.entry;
             }
         }
