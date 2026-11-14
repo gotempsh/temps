@@ -3558,7 +3558,12 @@ mod tests {
     async fn invalid_credentials_are_audited_with_normalized_identity() {
         let audit = Arc::new(RecordingAuditLogger::default());
         let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // The email matches nothing...
             .append_query_results([Vec::<users::Model>::new()])
+            // ...and the per-account throttle is read anyway, against an id
+            // no row has, so its cost cannot tell an unknown address from a
+            // real one.
+            .append_query_results([Vec::<temps_entities::user_login_guards::Model>::new()])
             .into_connection();
         let state = auth_state_with_audit(db, audit.clone());
 
@@ -5182,6 +5187,132 @@ mod tests {
             assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
             assert_eq!(body["error_code"], "MFA_LOCKED");
             assert!(body["retry_after_seconds"].as_i64().unwrap() > 0);
+        }
+    }
+
+    /// Per-account login throttling driven through the real route, behind
+    /// the per-address limiter it exists to complement.
+    mod login_throttle_http {
+        use crate::http_test_support::{auth_state, router, send_with_headers};
+        use argon2::PasswordHasher;
+        use axum::http::StatusCode;
+        use sea_orm::{ActiveModelTrait, ActiveValue::Set, DatabaseConnection};
+        use temps_entities::users;
+        use temps_test_utils::TestDatabase;
+
+        const PASSWORD: &str = "Correct-Horse-9!";
+
+        async fn test_db() -> Option<TestDatabase> {
+            match TestDatabase::with_migrations().await {
+                Ok(db) => Some(db),
+                Err(error)
+                    if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+                {
+                    println!("Docker not available, skipping test: {error}");
+                    None
+                }
+                Err(error) => panic!("test database setup failed: {error}"),
+            }
+        }
+
+        async fn user_with_password(db: &DatabaseConnection, email: &str) -> users::Model {
+            let hash = argon2::Argon2::default()
+                .hash_password(PASSWORD.as_bytes())
+                .expect("hash the test password")
+                .to_string();
+            users::ActiveModel {
+                email: Set(email.to_string()),
+                name: Set(email.to_string()),
+                password_hash: Set(Some(hash)),
+                email_verified: Set(true),
+                mfa_enabled: Set(false),
+                ..Default::default()
+            }
+            .insert(db)
+            .await
+            .expect("insert the test user")
+        }
+
+        /// One `POST /auth/login`, as if from `address`.
+        ///
+        /// The harness connects from loopback, which is how the production
+        /// listener decides a forwarded address may be trusted, so this is
+        /// the same path a request through the proxy takes.
+        async fn attempt(
+            app: &axum::Router,
+            address: &str,
+            email: &str,
+            password: &str,
+        ) -> (StatusCode, serde_json::Value) {
+            send_with_headers(
+                app,
+                "POST",
+                "/auth/login",
+                &[("x-forwarded-for", address)],
+                Some(serde_json::json!({ "email": email, "password": password })),
+            )
+            .await
+        }
+
+        #[tokio::test]
+        async fn guessing_one_account_from_many_addresses_is_throttled() {
+            let Some(db) = test_db().await else { return };
+            let connection = db.connection_arc();
+            let state = auth_state(connection.clone());
+            user_with_password(connection.as_ref(), "target@example.com").await;
+            let app = router(state, connection);
+
+            // A fresh address every time, so the per-address limiter (10 a
+            // minute) never fires: before this change nothing slowed this
+            // down at all.
+            for number in 1..=crate::login_guard::LOCKOUT_THRESHOLD {
+                let (status, _) = attempt(
+                    &app,
+                    &format!("203.0.113.{number}"),
+                    "target@example.com",
+                    "Wrong-Password-1!",
+                )
+                .await;
+                assert_eq!(status, StatusCode::UNAUTHORIZED, "attempt {number}");
+            }
+
+            // From yet another address, with the right password.
+            let (throttled_status, throttled_body) =
+                attempt(&app, "198.51.100.9", "target@example.com", PASSWORD).await;
+            assert_eq!(throttled_status, StatusCode::UNAUTHORIZED);
+
+            // Indistinguishable from an account that does not exist: an
+            // attacker must not learn which addresses are worth guessing.
+            let (unknown_status, unknown_body) =
+                attempt(&app, "198.51.100.10", "nobody@example.com", PASSWORD).await;
+            assert_eq!(throttled_status, unknown_status);
+            assert_eq!(throttled_body, unknown_body, "{throttled_body}");
+        }
+
+        #[tokio::test]
+        async fn the_right_password_still_signs_in_below_the_threshold() {
+            let Some(db) = test_db().await else { return };
+            let connection = db.connection_arc();
+            let state = auth_state(connection.clone());
+            user_with_password(connection.as_ref(), "typist@example.com").await;
+            let app = router(state, connection);
+
+            // A person fixing a typo must never meet the throttle.
+            for number in 1..crate::login_guard::LOCKOUT_THRESHOLD {
+                let (status, _) = attempt(
+                    &app,
+                    &format!("203.0.113.{number}"),
+                    "typist@example.com",
+                    "Wrong-Password-1!",
+                )
+                .await;
+                assert_eq!(status, StatusCode::UNAUTHORIZED, "attempt {number}");
+            }
+
+            let (status, body) =
+                attempt(&app, "198.51.100.20", "typist@example.com", PASSWORD).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["success"], true);
         }
     }
 }

@@ -26,6 +26,7 @@ pub mod handlers;
 mod http_test_support;
 pub mod ingress_grants;
 mod last_used_throttle;
+mod login_guard;
 mod mfa_guard;
 mod middleware;
 /// Public so other plugins (e.g. `temps-cloud`'s managed console-access

@@ -9069,3 +9069,207 @@ async fn test_deleted_project_images_migration_up_and_down() -> anyhow::Result<(
         .await?;
     Ok(())
 }
+
+/// A pristine database to run partial migrations against, and how to reach it.
+///
+/// Prefers a scratch database on the server named by `TEMPS_TEST_DATABASE_URL`
+/// when one is configured — the tests that need partial migration control
+/// used to skip outright in that setup, which silently left every upgrade-path
+/// assertion unrun wherever Docker is not what provides the database. Falls
+/// back to a container of its own.
+struct ScratchDatabase {
+    db: DatabaseConnection,
+    /// Kept alive for the test's lifetime; dropping it stops the container.
+    _container: Option<testcontainers::ContainerAsync<GenericImage>>,
+    /// `(admin url, database name)` of a scratch database to drop on cleanup.
+    external: Option<(String, String)>,
+}
+
+impl ScratchDatabase {
+    /// `None` when neither an external server nor Docker is available, which
+    /// the caller reports as a skip.
+    async fn open(label: &str) -> anyhow::Result<Option<Self>> {
+        if let Some(admin_url) = external_database_url() {
+            let name = format!(
+                "temps_mig_{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_nanos())
+                    .unwrap_or_default()
+            );
+            let admin = connect_with_retries(&admin_url).await?;
+            admin
+                .execute_unprepared(&format!("CREATE DATABASE \"{name}\""))
+                .await?;
+            let db = connect_with_retries(&replace_database(&admin_url, &name)).await?;
+            // `TestDatabase` installs these for its own databases; a scratch
+            // one needs them before the first migration asks for a `vector`
+            // column or a hypertable.
+            db.execute_unprepared(
+                "CREATE EXTENSION IF NOT EXISTS timescaledb WITH SCHEMA public CASCADE; \
+                 CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public CASCADE;",
+            )
+            .await?;
+            return Ok(Some(Self {
+                db,
+                _container: None,
+                external: Some((admin_url, name)),
+            }));
+        }
+
+        let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+            .with_wait_for(postgres_ready_wait_for())
+            .with_env_var("POSTGRES_DB", "postgres")
+            .with_env_var("POSTGRES_USER", "postgres")
+            .with_env_var("POSTGRES_PASSWORD", "postgres")
+            .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+            .with_cmd(vec![
+                "postgres",
+                "-c",
+                "timescaledb.max_background_workers=0",
+            ])
+            .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+            .start()
+            .await
+        {
+            Ok(container) => container,
+            Err(error) => {
+                eprintln!("⏭️  Skipping {label}: Docker unavailable ({error})");
+                return Ok(None);
+            }
+        };
+        let port = container.get_host_port_ipv4(5432).await?;
+        let db = connect_with_retries(&format!(
+            "postgresql://postgres:postgres@localhost:{port}/postgres"
+        ))
+        .await?;
+        Ok(Some(Self {
+            db,
+            _container: Some(container),
+            external: None,
+        }))
+    }
+
+    /// Drop the scratch database when it lives on a server we do not own.
+    async fn close(self) -> anyhow::Result<()> {
+        let Some((admin_url, name)) = self.external else {
+            return Ok(());
+        };
+        // Close this test's own connections first, or `DROP DATABASE` fails
+        // with "is being accessed by other users".
+        drop(self.db);
+        let admin = connect_with_retries(&admin_url).await?;
+        admin
+            .execute_unprepared(&format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"))
+            .await?;
+        Ok(())
+    }
+}
+
+fn external_database_url() -> Option<String> {
+    std::env::var("TEMPS_TEST_DATABASE_URL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Swap the database name in a `postgresql://` URL, keeping everything else.
+fn replace_database(url: &str, database: &str) -> String {
+    match url.split_once('?') {
+        Some((base, query)) => {
+            let (prefix, _) = base.rsplit_once('/').unwrap_or((base, ""));
+            format!("{prefix}/{database}?{query}")
+        }
+        None => {
+            let (prefix, _) = url.rsplit_once('/').unwrap_or((url, ""));
+            format!("{prefix}/{database}")
+        }
+    }
+}
+
+/// How many `Migrator::up` steps stop just before `name`.
+fn steps_up_to(name: &str) -> u32 {
+    let migrations = Migrator::migrations();
+    migrations
+        .iter()
+        .position(|migration| migration.name() == name)
+        .unwrap_or_else(|| {
+            panic!(
+                "migration `{name}` is not registered in `Migrator`; update this test's constant \
+                 if it was renamed"
+            )
+        }) as u32
+}
+
+const LOGIN_THROTTLE_MIGRATION: &str = "m20261114_000001_login_throttle_guards";
+
+/// The per-account login throttle arrives on a populated database — users
+/// already signed up, already holding sessions — without touching any of it.
+#[tokio::test]
+async fn test_login_throttle_guards_migration_up_and_down() -> anyhow::Result<()> {
+    let Some(scratch) =
+        ScratchDatabase::open("test_login_throttle_guards_migration_up_and_down").await?
+    else {
+        return Ok(());
+    };
+    let db = &scratch.db;
+
+    Migrator::up(db, Some(steps_up_to(LOGIN_THROTTLE_MIGRATION))).await?;
+    assert!(!table_exists(db, "user_login_guards").await?);
+
+    // An existing install: accounts and live sessions predate the upgrade.
+    db.execute_unprepared(
+        "INSERT INTO users (id, name, email, email_verified, mfa_enabled) \
+         VALUES (9901, 'Existing', 'existing@example.com', TRUE, FALSE); \
+         INSERT INTO sessions (user_id, session_token, expires_at, mfa_pending) \
+         VALUES (9901, 'pre-upgrade-session', now() + interval '7 days', FALSE);",
+    )
+    .await?;
+
+    Migrator::up(db, Some(1)).await?;
+    assert!(table_exists(db, "user_login_guards").await?);
+
+    // Nothing was migrated away: the account and its session are untouched,
+    // so nobody is signed out by this upgrade.
+    let survivors = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*) AS sessions FROM sessions WHERE user_id = 9901".to_string(),
+        ))
+        .await?
+        .expect("session count");
+    assert_eq!(survivors.try_get::<i64>("", "sessions")?, 1);
+
+    // An account with no recorded failures is not throttled: the table
+    // starts empty and absence means "no failures".
+    let guards = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*) AS guards FROM user_login_guards".to_string(),
+        ))
+        .await?
+        .expect("guard count");
+    assert_eq!(guards.try_get::<i64>("", "guards")?, 0);
+
+    // Deleting the account takes its throttle state with it.
+    db.execute_unprepared(
+        "INSERT INTO user_login_guards (user_id, failed_attempts, locked_until) \
+         VALUES (9901, 4, now() + interval '1 minute')",
+    )
+    .await?;
+    db.execute_unprepared("DELETE FROM users WHERE id = 9901")
+        .await?;
+    let orphans = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*) AS guards FROM user_login_guards".to_string(),
+        ))
+        .await?
+        .expect("guard count");
+    assert_eq!(orphans.try_get::<i64>("", "guards")?, 0);
+
+    Migrator::down(db, Some(steps_back_to(LOGIN_THROTTLE_MIGRATION))).await?;
+    assert!(!table_exists(db, "user_login_guards").await?);
+
+    scratch.close().await
+}

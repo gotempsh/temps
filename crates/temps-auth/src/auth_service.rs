@@ -893,6 +893,32 @@ impl AuthService {
     }
 
     // Login with email/password
+    /// Count one rejected password attempt against the account.
+    ///
+    /// Never fails the login with it: a write error here must not turn a
+    /// wrong password into a 500 for a real account next to a 401 for an
+    /// unknown one, which is exactly the account-existence oracle the
+    /// throttle is built to avoid. A lost count is logged and the throttle
+    /// simply does not tighten.
+    async fn record_login_failure_for_throttle(&self, user_id: i32) {
+        match crate::login_guard::record_failure(self.db.as_ref(), user_id).await {
+            Ok((failed_attempts, Some(until))) => warn!(
+                user_id,
+                failed_attempts,
+                throttled_until = %until.to_rfc3339(),
+                "Password login throttled for this account after repeated failures"
+            ),
+            Ok((failed_attempts, None)) => debug!(
+                user_id,
+                failed_attempts, "Recorded a rejected password attempt for this account"
+            ),
+            Err(error) => error!(
+                user_id, %error,
+                "Failed to record a rejected password attempt; the per-account throttle did not tighten"
+            ),
+        }
+    }
+
     pub async fn login(
         &self,
         request: LoginRequest,
@@ -900,27 +926,52 @@ impl AuthService {
         // Every rejection below costs one Argon2 verification, the same as a
         // wrong password for a real account, so response time does not
         // reveal whether the email exists or has a password.
-        let user = match temps_entities::users::Entity::find()
+        let found = temps_entities::users::Entity::find()
             .filter(temps_entities::users::Column::Email.eq(request.email.to_lowercase()))
             .filter(temps_entities::users::Column::DeletedAt.is_null())
             .one(self.db.as_ref())
-            .await?
-        {
-            Some(user) => user,
-            None => {
-                verify_against_dummy_hash(&request.password);
-                warn!(
-                    "Login attempt for non-existent or deleted email: {}",
-                    request.email
-                );
-                return Err(UserAuthError::InvalidCredentials);
-            }
+            .await?;
+
+        // Read the per-account throttle for every attempt, against an id no
+        // row can have when the email matched nothing
+        // (`crate::login_guard`). Looking it up only for accounts that exist
+        // would let the response time say which is which.
+        let throttled_until = crate::login_guard::locked_until(
+            self.db.as_ref(),
+            found
+                .as_ref()
+                .map_or(crate::login_guard::NO_SUCH_USER, |user| user.id),
+        )
+        .await?;
+
+        let Some(user) = found else {
+            verify_against_dummy_hash(&request.password);
+            warn!(
+                "Login attempt for non-existent or deleted email: {}",
+                request.email
+            );
+            return Err(UserAuthError::InvalidCredentials);
         };
+
+        // Past the threshold the password is not evaluated at all, and the
+        // answer is the one a wrong password gets. Nothing is counted here,
+        // so an attacker cannot extend somebody else's backoff by keeping
+        // the attempts coming.
+        if let Some(until) = throttled_until {
+            verify_against_dummy_hash(&request.password);
+            warn!(
+                user_id = user.id,
+                throttled_until = %until.to_rfc3339(),
+                "Refused a password login while the account is throttled after repeated failures"
+            );
+            return Err(UserAuthError::InvalidCredentials);
+        }
 
         // Check if user has a password (might be GitHub-only user)
         let Some(password_hash) = user.password_hash.as_ref() else {
             verify_against_dummy_hash(&request.password);
             warn!("Login attempt for user {} with no password hash", user.id);
+            self.record_login_failure_for_throttle(user.id).await;
             return Err(UserAuthError::InvalidCredentials);
         };
 
@@ -954,7 +1005,14 @@ impl AuthService {
 
         if !password_valid {
             warn!("Invalid password attempt for user {}", user.id);
+            self.record_login_failure_for_throttle(user.id).await;
             return Err(UserAuthError::InvalidCredentials);
+        }
+
+        // The password was right, so this account is not under attack from
+        // whoever just used it: start the count again.
+        if let Err(error) = crate::login_guard::record_success(self.db.as_ref(), user.id).await {
+            error!(user_id = user.id, %error, "Failed to clear the login throttle after a successful password");
         }
 
         // A required password change is completed before role-based MFA
@@ -4297,10 +4355,18 @@ mod tests {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             // 1) `find().filter(email...)` in login() -> the user above
             .append_query_results(vec![vec![user]])
-            // 2) `get_settings()`'s `settings::Entity::find_by_id(1)` -> DB error
+            // 2) `login_guard::locked_until` -> no row, so not throttled
+            .append_query_results(vec![Vec::<temps_entities::user_login_guards::Model>::new()])
+            // 3) `get_settings()`'s `settings::Entity::find_by_id(1)` -> DB error
             .append_query_errors(vec![sea_orm::DbErr::Custom(
                 "connection reset by peer".to_string(),
             )])
+            // `login_guard::record_success` clears the throttle on the way
+            // through; it writes nothing when there is nothing to clear.
+            .append_exec_results(vec![sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 0,
+            }])
             .into_connection();
 
         let notification_service = Arc::new(MockEmailService::new());
@@ -4734,5 +4800,179 @@ mod tests {
             before + 2,
             "a real account verifies against its own hash, not the dummy"
         );
+    }
+
+    /// Per-account password throttling. The address-based limiter slows one
+    /// client guessing many accounts; this is the other axis, so guessing
+    /// one account from many addresses is slowed too.
+    mod login_throttle {
+        use super::*;
+        use sea_orm::ConnectionTrait;
+
+        fn attempt(email: &str, password: &str) -> LoginRequest {
+            LoginRequest {
+                email: email.to_string(),
+                password: password.to_string(),
+            }
+        }
+
+        /// The stored state for `user_id`, or `None` when no attempt has
+        /// ever been counted.
+        async fn guard(
+            db: &Arc<DatabaseConnection>,
+            user_id: i32,
+        ) -> Option<temps_entities::user_login_guards::Model> {
+            temps_entities::user_login_guards::Entity::find_by_id(user_id)
+                .one(db.as_ref())
+                .await
+                .expect("read the login guard")
+        }
+
+        /// Move the backoff deadline into the past, as waiting it out would.
+        async fn expire_backoff(db: &Arc<DatabaseConnection>, user_id: i32) {
+            db.execute(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "UPDATE user_login_guards SET locked_until = now() - interval '1 minute' \
+                 WHERE user_id = $1",
+                [user_id.into()],
+            ))
+            .await
+            .expect("expire the backoff");
+        }
+
+        #[tokio::test]
+        async fn repeated_failures_throttle_the_account_whatever_the_address() {
+            let Some((db, auth_service)) = setup_test_env_with_mfa_setting(false).await else {
+                return;
+            };
+            let user = create_test_user(&db.db, "target@example.com", "Correct-Horse-9!").await;
+
+            // Nothing about these attempts names a client address: the count
+            // is the account's, so spreading them over many addresses (which
+            // defeats the per-IP limiter entirely) changes nothing.
+            for number in 1..=crate::login_guard::LOCKOUT_THRESHOLD {
+                assert!(
+                    matches!(
+                        auth_service
+                            .login(attempt("target@example.com", "Wrong-Password-1!"))
+                            .await,
+                        Err(UserAuthError::InvalidCredentials)
+                    ),
+                    "attempt {number}"
+                );
+            }
+            let throttled = guard(&db.db, user.id).await.expect("a guard row");
+            assert_eq!(
+                throttled.failed_attempts,
+                crate::login_guard::LOCKOUT_THRESHOLD
+            );
+            let deadline = throttled.locked_until.expect("a backoff deadline");
+            assert!(deadline > Utc::now());
+
+            // The real password is refused too, and is not even evaluated:
+            // the attempt costs exactly the dummy verification an unknown
+            // email costs.
+            let before = dummy_verifications();
+            assert!(matches!(
+                auth_service
+                    .login(attempt("target@example.com", "Correct-Horse-9!"))
+                    .await,
+                Err(UserAuthError::InvalidCredentials)
+            ));
+            assert_eq!(
+                dummy_verifications(),
+                before + 1,
+                "a throttled attempt must not be evaluated, and must cost what an unknown email costs"
+            );
+
+            // A refused attempt is not counted, so whoever is sending them
+            // cannot keep extending the account holder's wait.
+            let after = guard(&db.db, user.id).await.expect("a guard row");
+            assert_eq!(after.failed_attempts, throttled.failed_attempts);
+            assert_eq!(after.locked_until, throttled.locked_until);
+        }
+
+        #[tokio::test]
+        async fn the_account_comes_back_on_its_own_and_a_success_resets_the_count() {
+            let Some((db, auth_service)) = setup_test_env_with_mfa_setting(false).await else {
+                return;
+            };
+            let user = create_test_user(&db.db, "recovers@example.com", "Correct-Horse-9!").await;
+
+            for _ in 0..crate::login_guard::LOCKOUT_THRESHOLD {
+                let _ = auth_service
+                    .login(attempt("recovers@example.com", "Wrong-Password-1!"))
+                    .await;
+            }
+            // Bounded backoff, not a lockout somebody has to clear by hand.
+            expire_backoff(&db.db, user.id).await;
+
+            let signed_in = auth_service
+                .login(attempt("recovers@example.com", "Correct-Horse-9!"))
+                .await
+                .expect("the account must come back once the window passes");
+            assert_eq!(signed_in.id, user.id);
+
+            let cleared = guard(&db.db, user.id).await.expect("a guard row");
+            assert_eq!(cleared.failed_attempts, 0);
+            assert_eq!(cleared.locked_until, None);
+        }
+
+        #[tokio::test]
+        async fn one_account_being_throttled_does_not_touch_another() {
+            let Some((db, auth_service)) = setup_test_env_with_mfa_setting(false).await else {
+                return;
+            };
+            let target = create_test_user(&db.db, "noisy@example.com", "Correct-Horse-9!").await;
+            create_test_user(&db.db, "bystander@example.com", "Correct-Horse-9!").await;
+
+            for _ in 0..crate::login_guard::LOCKOUT_THRESHOLD {
+                let _ = auth_service
+                    .login(attempt("noisy@example.com", "Wrong-Password-1!"))
+                    .await;
+            }
+            assert!(guard(&db.db, target.id)
+                .await
+                .and_then(|row| row.locked_until)
+                .is_some());
+
+            assert!(
+                auth_service
+                    .login(attempt("bystander@example.com", "Correct-Horse-9!"))
+                    .await
+                    .is_ok(),
+                "the throttle is per account, so another account must be unaffected"
+            );
+        }
+
+        #[tokio::test]
+        async fn an_unknown_email_records_nothing_and_still_costs_a_verification() {
+            let Some((db, auth_service)) = setup_test_env_with_mfa_setting(false).await else {
+                return;
+            };
+
+            let before = dummy_verifications();
+            for _ in 0..crate::login_guard::LOCKOUT_THRESHOLD + 2 {
+                assert!(matches!(
+                    auth_service
+                        .login(attempt("nobody@example.com", "Wrong-Password-1!"))
+                        .await,
+                    Err(UserAuthError::InvalidCredentials)
+                ));
+            }
+            assert_eq!(
+                dummy_verifications(),
+                before + crate::login_guard::LOCKOUT_THRESHOLD as u32 + 2
+            );
+
+            // The guard lookup runs for an unknown email too, so its cost
+            // cannot tell an unknown address from a real one -- but it must
+            // not create a row for an account that does not exist.
+            let rows = temps_entities::user_login_guards::Entity::find()
+                .all(db.db.as_ref())
+                .await
+                .expect("read the login guards");
+            assert!(rows.is_empty(), "{rows:?}");
+        }
     }
 }
