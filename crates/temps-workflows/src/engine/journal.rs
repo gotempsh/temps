@@ -298,6 +298,19 @@ impl WorkflowEngine {
                     .unwrap_or(true)
                 {
                     self.codec.discard(run.project_id, &result).await;
+                    if let Some(child) = &child {
+                        // A database commit error can be ambiguous. Only definite
+                        // rejections prove the input was never committed.
+                        if matches!(
+                            error,
+                            WorkflowError::QuotaExceeded { .. }
+                                | WorkflowError::Validation { .. }
+                                | WorkflowError::StaleLease { .. }
+                        ) {
+                            self.store.release_child_input(child.id).await?;
+                            self.codec.discard(run.project_id, &child.input).await;
+                        }
+                    }
                 }
                 return Err(error);
             }
@@ -307,13 +320,30 @@ impl WorkflowEngine {
                 entry,
                 lease_expires_at,
                 event_id,
-            } => (entry, lease_expires_at, false, event_id),
+                child_started,
+            } => {
+                if let Some(started) = child_started {
+                    self.metrics.run_started(
+                        started.project_id,
+                        started.environment_id,
+                        &started.workflow_name,
+                    );
+                    if let Some(prepared) = &child {
+                        if prepared.id != started.id {
+                            self.store.release_child_input(prepared.id).await?;
+                            self.codec.discard(run.project_id, &prepared.input).await;
+                        }
+                    }
+                }
+                (entry, lease_expires_at, false, event_id)
+            }
             StepRecordOutcome::AlreadyRecorded {
                 entry,
                 lease_expires_at,
             } => {
                 self.codec.discard(run.project_id, &result).await;
                 if let Some(child) = &child {
+                    self.store.release_child_input(child.id).await?;
                     self.codec.discard(run.project_id, &child.input).await;
                 }
                 (entry, lease_expires_at, true, None)

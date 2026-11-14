@@ -9387,3 +9387,55 @@ async fn test_workflow_blob_cleanup_up_down_refuses_pending_work() -> anyhow::Re
     assert_eq!(row.try_get::<Option<String>>("", "name")?, None);
     Ok(())
 }
+
+#[tokio::test]
+async fn test_prepared_child_inputs_up_down_refuses_pending_work() -> anyhow::Result<()> {
+    if external_db_configured() {
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!("Skipping prepared child input migration test: Docker unavailable: {error}");
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+
+    let name = "m20261114_000002_track_prepared_child_inputs";
+    let before = Migrator::migrations().len() as u32 - steps_back_to(name);
+    Migrator::up(&db, Some(before)).await?;
+    Migrator::up(&db, Some(1)).await?;
+    db.execute_unprepared("INSERT INTO workflow_prepared_child_inputs(run_id,project_id,environment_id) VALUES(gen_random_uuid(),1,2)").await?;
+    assert!(Migrator::down(&db, Some(1)).await.is_err());
+    db.execute_unprepared("DELETE FROM workflow_prepared_child_inputs")
+        .await?;
+    Migrator::down(&db, Some(1)).await?;
+    let row = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DbBackend::Postgres,
+            "SELECT to_regclass('workflow_prepared_child_inputs')::text AS name".to_string(),
+        ))
+        .await?
+        .unwrap();
+    assert_eq!(row.try_get::<Option<String>>("", "name")?, None);
+    Ok(())
+}

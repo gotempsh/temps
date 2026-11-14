@@ -80,6 +80,7 @@ pub(crate) struct Harness {
     pub engine: Arc<WorkflowEngine>,
     pub store: Arc<PgWorkflowStore>,
     pub codec: Arc<PayloadCodec>,
+    metrics_sink: Arc<crate::metrics::tests::CapturingSink>,
 }
 
 #[derive(Clone)]
@@ -145,6 +146,7 @@ pub(crate) async fn harness_with(
             crate::project_keys::ProjectKeys::new(env.conn.clone(), encryption.clone()),
         )),
     );
+    let metrics_sink = Arc::new(crate::metrics::tests::CapturingSink::default());
     let engine = Arc::new(WorkflowEngine::new(
         store.clone(),
         codec.clone(),
@@ -153,7 +155,7 @@ pub(crate) async fn harness_with(
             base_url: live.then_some(base_url),
         }),
         crate::executor::ExecutorClient::new().unwrap(),
-        Arc::new(WorkflowMetrics::new(Arc::new(NoopProjectMetricsSink))),
+        Arc::new(WorkflowMetrics::new(metrics_sink.clone())),
     ));
     let state = FakeState {
         engine: engine.clone(),
@@ -173,6 +175,7 @@ pub(crate) async fn harness_with(
         engine,
         store,
         codec,
+        metrics_sink,
     })
 }
 
@@ -1461,4 +1464,87 @@ async fn blob_cleanup_retries_after_storage_recovers() {
     scheduler.apply_retention().await;
     assert!(h.store.pending_blob_cleanup(100).await.unwrap().is_empty());
     assert!(blobs.objects.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn child_inputs_are_cleaned_on_quota_failure_and_starts_count_once() {
+    for quota_failure in [true, false] {
+        let blobs = Arc::new(crate::payload::tests::MemoryBlobs::default());
+        let script: Script = Arc::new(move |engine, token, request| {
+            Box::pin(async move {
+                let record = StepWriteRequest {
+                    child: Some(crate::protocol::ChildStart {
+                        workflow: "child".into(),
+                        input: Some(json!("x".repeat(300_000))),
+                    }),
+                    ..write(0, "child", StepKind::Child, StepStatus::Pending)
+                };
+                let first = engine
+                    .record_step(&token, request.run_id, record.clone())
+                    .await;
+                if quota_failure {
+                    assert!(matches!(
+                        first,
+                        Err(WorkflowError::QuotaExceeded {
+                            quota: "max_active_runs",
+                            ..
+                        })
+                    ));
+                } else {
+                    assert!(!first.unwrap().already_recorded);
+                    assert!(
+                        engine
+                            .record_step(&token, request.run_id, record)
+                            .await
+                            .unwrap()
+                            .already_recorded
+                    );
+                }
+                Reply::Outcome(Outcome::Completed { output: None })
+            })
+        });
+        let Some(h) = harness_with(
+            "prepared child cleanup and metrics",
+            &["parent"],
+            script,
+            true,
+            Some(blobs.clone()),
+            None,
+        )
+        .await
+        else {
+            return;
+        };
+        h.store
+            .upsert_settings(
+                h.env.project_id,
+                h.env.environment_id,
+                &WorkflowSettings {
+                    max_active_runs: if quota_failure { 1 } else { 100 },
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        h.start("parent", Value::Null).await;
+        h.tick().await;
+        assert_eq!(
+            blobs.objects.lock().unwrap().len(),
+            usize::from(!quota_failure)
+        );
+        h.engine.metrics.flush(&[], None).await;
+        let samples = h.metrics_sink.samples.lock().unwrap();
+        let starts: f64 = samples
+            .iter()
+            .filter(|sample| {
+                sample.name == "temps.workflow.runs_started"
+                    && sample
+                        .labels
+                        .iter()
+                        .any(|(key, value)| *key == "workflow" && value == "child")
+            })
+            .map(|sample| sample.value)
+            .sum();
+        assert_eq!(starts, if quota_failure { 0.0 } else { 1.0 });
+    }
 }

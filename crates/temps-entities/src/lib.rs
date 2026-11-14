@@ -292,6 +292,7 @@ pub mod workflow_events;
 pub mod workflow_journal_cleanup;
 pub mod workflow_managed_runs;
 pub mod workflow_memory;
+pub mod workflow_prepared_child_inputs;
 pub mod workflow_project_keys;
 pub mod workflow_runs;
 pub mod workflow_steps;

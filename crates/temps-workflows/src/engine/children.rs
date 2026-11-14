@@ -49,7 +49,7 @@ impl WorkflowEngine {
             }
             None => Default::default(),
         };
-        Ok(NewRun {
+        let prepared = NewRun {
             id,
             project_id: parent.project_id,
             environment_id: parent.environment_id,
@@ -62,7 +62,14 @@ impl WorkflowEngine {
             deployment_id: None,
             starter: Starter::Machine,
             parent_run_id: Some(parent.id),
-        })
+        };
+        if prepared.input.blob_key.is_some() {
+            if let Err(error) = self.store.track_child_input(parent.id, &prepared).await {
+                self.codec.discard(parent.project_id, &prepared.input).await;
+                return Err(error);
+            }
+        }
+        Ok(prepared)
     }
 
     /// `child` just finished (completed, failed or cancelled): wake its

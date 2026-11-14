@@ -151,6 +151,7 @@ pub enum StepRecordOutcome {
         entry: StepRow,
         lease_expires_at: DateTime<Utc>,
         event_id: Option<i64>,
+        child_started: Option<Box<RunRow>>,
     },
     /// The entry existed with a final status; this is the recorded one.
     AlreadyRecorded {
@@ -488,6 +489,9 @@ pub trait WorkflowStore: Send + Sync {
     /// Delete up to `batch` finished runs past their environment's retention
     /// and return them, so their blobs can be removed afterwards.
     async fn delete_expired_runs(&self, batch: u64) -> WorkflowResult<Vec<ExpiredRun>>;
+    /// Preserve prepared input ownership until the parent can no longer replay it.
+    async fn track_child_input(&self, parent_id: Uuid, child: &NewRun) -> WorkflowResult<()>;
+    async fn release_child_input(&self, child_id: Uuid) -> WorkflowResult<()>;
     async fn pending_blob_cleanup(
         &self,
         limit: u64,

@@ -833,14 +833,6 @@ jobs:
           bun run test:run
           bun run build
 
-  workflows-other-sdks:
-    name: Workflow Python and Go SDKs
-    needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v7.0.1
       - uses: actions/setup-python@v7.1.0
         with:
           python-version: '3.12'

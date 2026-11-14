@@ -1474,20 +1474,23 @@ impl WorkflowStore for PgWorkflowStore {
                 });
             }
         }
+        let mut child_started = None;
         if !already {
             if let Some((child, max_active)) = record.child {
                 let child_id = child.id;
-                if let StartOutcome::Existing(existing) =
-                    self.insert_run_in(&txn, child, max_active).await?
-                {
-                    if existing.id != child_id || existing.parent_run_id != Some(record.run_id) {
-                        return Err(WorkflowError::Validation {
-                            field: "child",
-                            reason: format!(
-                                "child entry {} of run {} conflicts with existing run {}",
-                                record.sequence, record.run_id, existing.id
-                            ),
-                        });
+                match self.insert_run_in(&txn, child, max_active).await? {
+                    StartOutcome::Created(created) => child_started = Some(Box::new(created)),
+                    StartOutcome::Existing(existing) => {
+                        if existing.id != child_id || existing.parent_run_id != Some(record.run_id)
+                        {
+                            return Err(WorkflowError::Validation {
+                                field: "child",
+                                reason: format!(
+                                    "child entry {} of run {} conflicts with existing run {}",
+                                    record.sequence, record.run_id, existing.id
+                                ),
+                            });
+                        }
                     }
                 }
             }
@@ -1548,6 +1551,7 @@ impl WorkflowStore for PgWorkflowStore {
                 entry,
                 lease_expires_at,
                 event_id,
+                child_started,
             }
         })
     }
@@ -1887,15 +1891,28 @@ impl WorkflowStore for PgWorkflowStore {
             .collect())
     }
 
+    async fn track_child_input(&self, parent_id: Uuid, child: &NewRun) -> WorkflowResult<()> {
+        self.db.execute(stmt("INSERT INTO workflow_prepared_child_inputs(run_id,project_id,environment_id,parent_run_id) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING", vec![child.id.into(),child.project_id.into(),child.environment_id.into(),parent_id.into()])).await.map_err(WorkflowError::db("tracking prepared child input cleanup"))?;
+        Ok(())
+    }
+    async fn release_child_input(&self, child_id: Uuid) -> WorkflowResult<()> {
+        self.db
+            .execute(stmt(
+                "UPDATE workflow_prepared_child_inputs SET parent_run_id=NULL WHERE run_id=$1",
+                vec![child_id.into()],
+            ))
+            .await
+            .map_err(WorkflowError::db(
+                "releasing unused child input for cleanup",
+            ))?;
+        Ok(())
+    }
     async fn pending_blob_cleanup(
         &self,
         limit: u64,
     ) -> WorkflowResult<Vec<crate::payload::PayloadScope>> {
         use temps_entities::workflow_blob_cleanup as cleanup;
-        Ok(cleanup::Entity::find()
-            .order_by_asc(cleanup::Column::CreatedAt)
-            .order_by_asc(cleanup::Column::RunId)
-            .limit(limit.min(100))
+        Ok(cleanup::Entity::find().from_raw_sql(stmt("SELECT run_id,project_id,environment_id,min(created_at) AS created_at FROM (SELECT run_id,project_id,environment_id,created_at FROM workflow_blob_cleanup UNION ALL SELECT c.run_id,c.project_id,c.environment_id,c.created_at FROM workflow_prepared_child_inputs c WHERE NOT EXISTS(SELECT 1 FROM workflow_runs r WHERE r.id=c.run_id) AND NOT EXISTS(SELECT 1 FROM workflow_runs p WHERE p.id=c.parent_run_id)) candidates GROUP BY run_id,project_id,environment_id ORDER BY created_at,run_id LIMIT $1",vec![(limit.min(100) as i64).into()]))
             .all(self.db.as_ref())
             .await
             .map_err(WorkflowError::db("listing pending workflow blob cleanup"))?
@@ -1908,6 +1925,12 @@ impl WorkflowStore for PgWorkflowStore {
             .collect())
     }
     async fn acknowledge_blob_cleanup(&self, run_id: Uuid) -> WorkflowResult<()> {
+        temps_entities::workflow_prepared_child_inputs::Entity::delete_by_id(run_id)
+            .exec(self.db.as_ref())
+            .await
+            .map_err(WorkflowError::db(
+                "acknowledging prepared child input cleanup",
+            ))?;
         temps_entities::workflow_blob_cleanup::Entity::delete_by_id(run_id)
             .exec(self.db.as_ref())
             .await

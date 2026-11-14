@@ -335,7 +335,7 @@ fn sample(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use async_trait::async_trait;
     use temps_core::ProjectMetricsError;

@@ -330,15 +330,64 @@ async fn managed_child_creation_recovers_the_same_child_after_remote_commit() {
     let mut record = step(&parent, 0, "child", StepStatus::Pending);
     record.kind = StepKind::Child;
     record.child = Some((child.clone(), 100));
+    f.store.track_child_input(parent.id, &child).await.unwrap();
     remote
         .crash
         .store(true, std::sync::atomic::Ordering::SeqCst);
     assert!(f.store.record_step(record.clone(), LIMITS).await.is_err());
     assert!(f.store.get_run(child.id).await.unwrap().is_none());
+    // An uncertain remote write holds the input until replay or parent deletion.
+    assert!(f.store.pending_blob_cleanup(100).await.unwrap().is_empty());
     let mut other = child.clone();
     other.id = Uuid::new_v4();
     record.child = Some((other.clone(), 100));
     f.store.record_step(record, LIMITS).await.unwrap();
     assert!(f.store.get_run(child.id).await.unwrap().is_some());
     assert!(f.store.get_run(other.id).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn prepared_child_cleanup_survives_restart_and_waits_for_owners() {
+    let Some(f) = fixture("prepared child cleanup ownership").await else {
+        return;
+    };
+    let parent = f.start("parent").await;
+    let mut child = f.new_run("child", None);
+    child.parent_run_id = Some(parent.id);
+    child.input.blob_key = Some("test-input".into());
+    f.store.track_child_input(parent.id, &child).await.unwrap();
+    let restarted = PgWorkflowStore::new(f.conn.clone());
+    assert!(restarted
+        .pending_blob_cleanup(100)
+        .await
+        .unwrap()
+        .is_empty());
+    restarted.insert_run(child.clone(), 100).await.unwrap();
+    restarted.delete_run(parent.id).await.unwrap();
+    assert!(
+        restarted
+            .pending_blob_cleanup(100)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a live child still owns its input"
+    );
+    restarted.delete_run(child.id).await.unwrap();
+    assert_eq!(
+        restarted.pending_blob_cleanup(100).await.unwrap()[0].run_id,
+        child.id
+    );
+    restarted.acknowledge_blob_cleanup(child.id).await.unwrap();
+
+    let parent = f.start("another-parent").await;
+    let orphan = f.new_run("orphan", None);
+    restarted
+        .track_child_input(parent.id, &orphan)
+        .await
+        .unwrap();
+    restarted.delete_run(parent.id).await.unwrap();
+    assert_eq!(
+        restarted.pending_blob_cleanup(100).await.unwrap()[0].run_id,
+        orphan.id
+    );
 }
