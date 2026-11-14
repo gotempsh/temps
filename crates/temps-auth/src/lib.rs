@@ -14,6 +14,7 @@ mod apikey_plugin;
 mod apikey_service;
 mod apikey_types;
 mod audit;
+mod auth_cookies;
 mod auth_service;
 mod avatar;
 pub mod cli_auth_handler;

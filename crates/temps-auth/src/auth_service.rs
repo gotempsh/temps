@@ -6,7 +6,6 @@ use argon2::{PasswordHasher, PasswordVerifier};
 use axum::http::header::SET_COOKIE;
 use axum::http::HeaderMap;
 use chrono::{Duration, Utc};
-use cookie::Cookie;
 use rand::RngExt;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
@@ -370,22 +369,17 @@ impl AuthService {
             .collect()
     }
 
+    /// `Set-Cookie` headers that start an authenticated browser session.
+    ///
+    /// Over https the cookie is host-only (`__Host-session`), so an app on a
+    /// sibling subdomain cannot plant one of the same name for the console's
+    /// host; see [`crate::auth_cookies`]. The pending-challenge cookie is
+    /// cleared at the same time, under both names.
     pub fn create_session_cookie(&self, session_token: &str, is_https: bool) -> HeaderMap {
-        let session_cookie = Cookie::build(("session", session_token))
-            .http_only(true)
-            .path("/")
-            .max_age(cookie::time::Duration::days(7))
-            .same_site(cookie::SameSite::Strict)
-            .secure(is_https)
-            .build();
-
-        let mfa_clear_cookie = Cookie::build(("mfa_session", ""))
-            .http_only(true)
-            .path("/")
-            .max_age(cookie::time::Duration::seconds(0))
-            .same_site(cookie::SameSite::Strict)
-            .secure(is_https)
-            .build();
+        let session_cookie =
+            crate::auth_cookies::builder(crate::auth_cookies::SESSION, session_token, is_https)
+                .max_age(cookie::time::Duration::days(7))
+                .build();
 
         debug!("Setting session cookie (token redacted)");
         let mut headers = HeaderMap::new();
@@ -394,10 +388,8 @@ impl AuthService {
         } else {
             error!("Failed to parse session cookie header value");
         }
-        if let Ok(value) = mfa_clear_cookie.to_string().parse() {
+        for value in crate::auth_cookies::clearing_values(crate::auth_cookies::MFA_SESSION) {
             headers.append(SET_COOKIE, value);
-        } else {
-            error!("Failed to parse MFA clear cookie header value");
         }
         headers
     }
@@ -2285,13 +2277,49 @@ mod tests {
         let session_token = "test_session_token";
         let headers = auth_service.create_session_cookie(session_token, true);
 
-        let cookies: Vec<_> = headers.get_all(SET_COOKIE).iter().collect();
-        assert_eq!(cookies.len(), 2); // session and mfa_session cookies
+        let cookies: Vec<String> = headers
+            .get_all(SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().unwrap().to_string())
+            .collect();
+        // The session cookie, plus the pending-challenge cookie cleared
+        // under both of its names.
+        assert_eq!(cookies.len(), 3, "{cookies:?}");
 
-        let session_cookie = cookies[0].to_str().unwrap();
-        assert!(session_cookie.contains("session=test_session_token"));
+        // Host-only over https: a sibling app cannot plant this name, and
+        // the browser only keeps it with these exact attributes.
+        let session_cookie = &cookies[0];
+        assert!(
+            session_cookie.starts_with("__Host-session=test_session_token"),
+            "{session_cookie}"
+        );
         assert!(session_cookie.contains("HttpOnly"));
         assert!(session_cookie.contains("Secure"));
+        assert!(session_cookie.contains("Path=/"));
+        assert!(session_cookie.contains("SameSite=Strict"));
+        assert!(!session_cookie.contains("Domain"), "{session_cookie}");
+    }
+
+    /// Browsers refuse a `__Host-` cookie without `Secure`, so an install
+    /// served over plain HTTP must still be issued the unprefixed name or
+    /// nobody can sign in at all.
+    #[tokio::test]
+    async fn a_plain_http_request_is_issued_the_unprefixed_session_cookie() {
+        let (_db, auth_service, _) = setup_test_env().await;
+
+        let headers = auth_service.create_session_cookie("plain_http_token", false);
+        let session_cookie = headers
+            .get_all(SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .find(|value| value.contains("plain_http_token"))
+            .expect("a session cookie is issued");
+
+        assert!(
+            session_cookie.starts_with("session=plain_http_token"),
+            "{session_cookie}"
+        );
+        assert!(!session_cookie.contains("Secure"), "{session_cookie}");
     }
 
     // Regression: verify_mfa_challenge handler must `append` (not `insert`) the
@@ -2304,17 +2332,17 @@ mod tests {
 
         let mut response_headers = auth_service.create_session_cookie("session_tok", true);
         let pre_count = response_headers.get_all(SET_COOKIE).iter().count();
-        assert_eq!(pre_count, 2, "session_cookie + mfa_session clear");
+        assert_eq!(
+            pre_count, 3,
+            "session_cookie + mfa_session clear under both names"
+        );
 
         // Simulate the exact merge done in verify_mfa_challenge handler:
         // append a fresh mfa_session=; Max-Age=0 cookie.
-        let clear_mfa_cookie = Cookie::build(("mfa_session", ""))
-            .http_only(true)
-            .path("/")
-            .max_age(cookie::time::Duration::seconds(0))
-            .same_site(cookie::SameSite::Strict)
-            .secure(true)
-            .build();
+        let clear_mfa_cookie =
+            crate::auth_cookies::builder(crate::auth_cookies::MFA_SESSION, "", true)
+                .max_age(cookie::time::Duration::seconds(0))
+                .build();
         response_headers.append(SET_COOKIE, clear_mfa_cookie.to_string().parse().unwrap());
 
         let cookies: Vec<String> = response_headers

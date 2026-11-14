@@ -25,7 +25,6 @@ use axum::{
     Json, Router,
 };
 use cookie;
-use cookie::Cookie;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
@@ -291,13 +290,14 @@ pub async fn logout(
 
     match auth_state.auth_service.logout(user.id, &headers).await {
         Ok(_) => {
+            // Both names: the browser may hold the host-only cookie this
+            // release issues or an unprefixed one from before it, and a
+            // sign-out that leaves either behind means the next request
+            // still presents a dead session.
             let mut headers = HeaderMap::new();
-            headers.insert(
-                SET_COOKIE,
-                axum::http::HeaderValue::from_static(
-                    "session=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Strict",
-                ),
-            );
+            for value in crate::auth_cookies::clearing_values(crate::auth_cookies::SESSION) {
+                headers.append(SET_COOKIE, value);
+            }
             (StatusCode::OK, headers, Json(json!({"status": "success"}))).into_response()
         }
         Err(e) => {
@@ -330,19 +330,9 @@ pub async fn verify_mfa_challenge(
     headers: HeaderMap,
     Json(verification): Json<MfaVerificationRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    // Extract and decrypt MFA session from cookie
-    let encrypted_mfa_session = headers
-        .get_all("Cookie")
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|cookie_str| Cookie::split_parse(cookie_str).filter_map(Result::ok))
-        .find_map(|cookie| {
-            if cookie.name() == "mfa_session" {
-                Some(cookie.value().to_string())
-            } else {
-                None
-            }
-        });
+    // Extract and decrypt MFA session from cookie, host-only name first.
+    let encrypted_mfa_session =
+        crate::auth_cookies::read(&headers, crate::auth_cookies::MFA_SESSION);
     let encrypted_mfa_session = match encrypted_mfa_session {
         Some(session) => session,
         None => {
@@ -488,13 +478,13 @@ pub async fn verify_mfa_challenge(
                 .create_session_cookie(&session_token_encrypted, metadata.is_secure);
 
             // // Clear the MFA session cookie
-            let clear_mfa_cookie = Cookie::build(("mfa_session", ""))
-                .http_only(true)
-                .path("/")
-                .max_age(cookie::time::Duration::seconds(0))
-                .same_site(cookie::SameSite::Strict)
-                .secure(metadata.is_secure)
-                .build();
+            let clear_mfa_cookie = crate::auth_cookies::builder(
+                crate::auth_cookies::MFA_SESSION,
+                "",
+                metadata.is_secure,
+            )
+            .max_age(cookie::time::Duration::seconds(0))
+            .build();
             let clear_cookie_header = match clear_mfa_cookie.to_string().parse() {
                 Ok(cookie_header) => cookie_header,
                 Err(error) => {
@@ -1167,14 +1157,13 @@ pub async fn login(
                             )
                     })?;
 
-                let password_change_cookie =
-                    Cookie::build(("password_change_session", encrypted_token))
-                        .http_only(true)
-                        .path("/")
-                        .max_age(cookie::time::Duration::minutes(15))
-                        .same_site(cookie::SameSite::Strict)
-                        .secure(metadata.is_secure)
-                        .build();
+                let password_change_cookie = crate::auth_cookies::builder(
+                    crate::auth_cookies::PASSWORD_CHANGE_SESSION,
+                    encrypted_token,
+                    metadata.is_secure,
+                )
+                .max_age(cookie::time::Duration::minutes(15))
+                .build();
                 let cookie_header =
                     password_change_cookie
                         .to_string()
@@ -1251,13 +1240,13 @@ pub async fn login(
 
                         // Create MFA cookie
                         let mut headers = HeaderMap::new();
-                        let mfa_cookie = cookie::Cookie::build(("mfa_session", encrypted_token))
-                            .http_only(true)
-                            .path("/")
-                            .max_age(cookie::time::Duration::minutes(5))
-                            .same_site(cookie::SameSite::Strict)
-                            .secure(metadata.is_secure)
-                            .build();
+                        let mfa_cookie = crate::auth_cookies::builder(
+                            crate::auth_cookies::MFA_SESSION,
+                            encrypted_token,
+                            metadata.is_secure,
+                        )
+                        .max_age(cookie::time::Duration::minutes(5))
+                        .build();
                         let cookie_header = match mfa_cookie.to_string().parse() {
                             Ok(cookie_header) => cookie_header,
                             Err(error) => {
@@ -1684,19 +1673,13 @@ pub async fn change_required_password(
     headers: HeaderMap,
     Json(request): Json<RequiredPasswordChangeRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    let encrypted_token = headers
-        .get_all("Cookie")
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|cookie_header| Cookie::split_parse(cookie_header).filter_map(Result::ok))
-        .find_map(|cookie| {
-            (cookie.name() == "password_change_session").then(|| cookie.value().to_string())
-        })
-        .ok_or_else(|| {
-            problem_new(StatusCode::UNAUTHORIZED)
-                .with_title("Password Change Session Required")
-                .with_detail("Log in again to restart the required password change.")
-        })?;
+    let encrypted_token =
+        crate::auth_cookies::read(&headers, crate::auth_cookies::PASSWORD_CHANGE_SESSION)
+            .ok_or_else(|| {
+                problem_new(StatusCode::UNAUTHORIZED)
+                    .with_title("Password Change Session Required")
+                    .with_detail("Log in again to restart the required password change.")
+            })?;
 
     let token = state
         .cookie_crypto
@@ -1722,21 +1705,11 @@ pub async fn change_required_password(
     // Prepare the response cookie before changing the password. If header
     // construction fails, the temporary credential remains usable and the
     // user can safely retry instead of being locked out.
-    let clear_cookie = Cookie::build(("password_change_session", ""))
-        .http_only(true)
-        .path("/")
-        .max_age(cookie::time::Duration::seconds(0))
-        .same_site(cookie::SameSite::Strict)
-        .secure(metadata.is_secure)
-        .build();
-    let cookie_header = clear_cookie.to_string().parse().map_err(|error| {
-        error!(error = %error, "Failed to clear required password-change cookie");
-        problem_new(StatusCode::INTERNAL_SERVER_ERROR)
-            .with_title("Password Change Failed")
-            .with_detail("Could not prepare the password change. Please try again.")
-    })?;
     let mut response_headers = HeaderMap::new();
-    response_headers.append(SET_COOKIE, cookie_header);
+    for value in crate::auth_cookies::clearing_values(crate::auth_cookies::PASSWORD_CHANGE_SESSION)
+    {
+        response_headers.append(SET_COOKIE, value);
+    }
 
     let requires_mfa_enrollment = state
         .auth_service
@@ -3017,19 +2990,11 @@ async fn change_password_self(
     // plaintext token (that's what the sessions table stores). Missing /
     // undecryptable cookie just means we don't know which session is
     // "current" — fine, the service falls back to revoking everything.
-    let current_session_token: Option<String> = headers
-        .get_all("Cookie")
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|s| Cookie::split_parse(s).filter_map(Result::ok))
-        .find_map(|c| {
-            if c.name() == "session" {
-                Some(c.value().to_string())
-            } else {
-                None
-            }
-        })
-        .and_then(|enc| app_state.cookie_crypto.decrypt(&enc).ok());
+    let current_session_token: Option<String> = crate::auth_cookies::read_sealed(
+        &headers,
+        crate::auth_cookies::SESSION,
+        &app_state.cookie_crypto,
+    );
 
     match app_state
         .auth_service

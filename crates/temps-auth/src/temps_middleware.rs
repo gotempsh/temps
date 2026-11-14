@@ -279,29 +279,18 @@ impl AuthMiddleware {
         Ok(response)
     }
 
-    /// Extract user session from "session" cookie only (for authentication)
+    /// The session token from the session cookie, host-only name first.
+    ///
+    /// Only this cookie authenticates a user. Preferring `__Host-session`
+    /// over the unprefixed name is what stops a sibling app's planted
+    /// parent-domain cookie standing in for the console's own; see
+    /// [`crate::auth_cookies`].
     fn extract_user_session_from_cookies(
         &self,
         headers: &axum::http::HeaderMap,
         crypto: &temps_core::CookieCrypto,
     ) -> Option<String> {
-        use cookie::Cookie;
-
-        // Iterate through ALL cookie headers (there can be multiple)
-        for cookie_header in headers.get_all("cookie") {
-            if let Ok(cookie_str) = cookie_header.to_str() {
-                // Parse cookies and find the "session" cookie for user authentication
-                for cookie in Cookie::split_parse(cookie_str).filter_map(Result::ok) {
-                    if cookie.name() == "session" {
-                        // Decrypt the session ID - if it fails, treat as no valid session
-                        if let Ok(decrypted_session_id) = crypto.decrypt(cookie.value()) {
-                            return Some(decrypted_session_id);
-                        }
-                    }
-                }
-            }
-        }
-        None
+        crate::auth_cookies::read_sealed(headers, crate::auth_cookies::SESSION, crypto)
     }
 }
 
@@ -949,6 +938,120 @@ mod tests {
                 send_with_headers(&router, "POST", "/logout", &[("cookie", &cookie)], None).await;
 
             assert_eq!(status, StatusCode::OK);
+        }
+    }
+
+    /// Which session cookie authenticates when a browser holds more than
+    /// one, driven through the real routes behind this middleware.
+    mod session_cookie_name {
+        use crate::http_test_support::{
+            auth_state, host_session_cookie, insert_user, router, send_with_headers, session_cookie,
+        };
+        use axum::extract::Request;
+        use axum::http::StatusCode;
+        use temps_test_utils::TestDatabase;
+        use tower::ServiceExt;
+
+        async fn test_db() -> Option<TestDatabase> {
+            match TestDatabase::with_migrations().await {
+                Ok(db) => Some(db),
+                Err(error)
+                    if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+                {
+                    println!("Docker not available, skipping test: {error}");
+                    None
+                }
+                Err(error) => panic!("test database setup failed: {error}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn the_host_only_cookie_wins_over_a_planted_one() {
+            let Some(db) = test_db().await else { return };
+            let connection = db.connection_arc();
+            let state = auth_state(connection.clone());
+
+            // The attacker owns an account and a sibling app, and plants
+            // their own sealed session on the console's parent domain. The
+            // browser sends both cookies; only the host-only one is theirs
+            // to set, and that is the one that must count.
+            let attacker = insert_user(connection.as_ref(), "planted@example.com").await;
+            let owner = insert_user(connection.as_ref(), "owner@example.com").await;
+            let planted = session_cookie(&state, attacker.id).await;
+            let host_only = host_session_cookie(&state, owner.id).await;
+            let router = router(state, connection);
+
+            for cookie in [
+                format!("{planted}; {host_only}"),
+                format!("{host_only}; {planted}"),
+            ] {
+                let (status, body) =
+                    send_with_headers(&router, "GET", "/user/me", &[("cookie", &cookie)], None)
+                        .await;
+
+                assert_eq!(status, StatusCode::OK, "{cookie}");
+                assert_eq!(body["email"], "owner@example.com", "{cookie}");
+            }
+        }
+
+        #[tokio::test]
+        async fn a_session_issued_before_the_prefix_still_authenticates() {
+            let Some(db) = test_db().await else { return };
+            let connection = db.connection_arc();
+            let state = auth_state(connection.clone());
+            let user = insert_user(connection.as_ref(), "upgraded@example.com").await;
+            let cookie = session_cookie(&state, user.id).await;
+            let router = router(state, connection);
+
+            // The unprefixed name is also what a plain-HTTP install issues,
+            // so this fallback is permanent, not only an upgrade grace.
+            let (status, body) =
+                send_with_headers(&router, "GET", "/user/me", &[("cookie", &cookie)], None).await;
+
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["email"], "upgraded@example.com");
+        }
+
+        #[tokio::test]
+        async fn signing_out_clears_the_cookie_under_both_names() {
+            let Some(db) = test_db().await else { return };
+            let connection = db.connection_arc();
+            let state = auth_state(connection.clone());
+            let user = insert_user(connection.as_ref(), "signing-out@example.com").await;
+            let cookie = host_session_cookie(&state, user.id).await;
+            let router = crate::http_test_support::router(state, connection);
+
+            let response = router
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/logout")
+                        .header("cookie", &cookie)
+                        .body(axum::body::Body::empty())
+                        .expect("request builds"),
+                )
+                .await
+                .expect("route");
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let cleared: Vec<&str> = response
+                .headers()
+                .get_all(axum::http::header::SET_COOKIE)
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .collect();
+            // Leaving either name set is how a logout loop starts: the
+            // browser keeps sending a cookie the server has revoked.
+            assert!(
+                cleared
+                    .iter()
+                    .any(|value| value.starts_with("__Host-session=;")),
+                "{cleared:?}"
+            );
+            assert!(
+                cleared.iter().any(|value| value.starts_with("session=;")),
+                "{cleared:?}"
+            );
         }
     }
 }

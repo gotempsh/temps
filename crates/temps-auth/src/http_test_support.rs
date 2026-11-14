@@ -126,15 +126,25 @@ pub(crate) async fn insert_user(db: &DatabaseConnection, email: &str) -> users::
     .expect("insert test user")
 }
 
-/// `Cookie` header value for a fresh, fully authenticated session.
+/// `Cookie` header value for a fresh, fully authenticated session, under the
+/// unprefixed name a plain-HTTP install issues.
 pub(crate) async fn session_cookie(state: &AuthState, user_id: i32) -> String {
+    format!("session={}", sealed_session(state, user_id).await)
+}
+
+/// [`session_cookie`] under the host-only name an https install issues.
+pub(crate) async fn host_session_cookie(state: &AuthState, user_id: i32) -> String {
+    format!("__Host-session={}", sealed_session(state, user_id).await)
+}
+
+/// A fresh session token, sealed the way the cookie carries it.
+pub(crate) async fn sealed_session(state: &AuthState, user_id: i32) -> String {
     let token = state
         .auth_service
         .create_session(user_id)
         .await
         .expect("create session");
-    let encrypted = state.cookie_crypto.encrypt(&token).expect("encrypt");
-    format!("session={encrypted}")
+    state.cookie_crypto.encrypt(&token).expect("encrypt")
 }
 
 /// `Cookie` header value for a pending sign-in challenge, as `/auth/login`
