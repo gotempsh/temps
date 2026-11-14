@@ -8,6 +8,9 @@
 //! subdomain can open an authenticated socket with the user's session cookie.
 //! Every handler that accepts a `WebSocketUpgrade` behind cookie-capable
 //! authentication must call [`validate_websocket_origin`] before upgrading.
+//! [`crate::same_origin`] is the equivalent decision for ordinary HTTP
+//! methods, enforced once for the whole console router; both compare an
+//! `Origin` through [`crate::same_origin::origin_authority`].
 
 use axum::http::{header, HeaderMap, StatusCode};
 use tracing::warn;
@@ -45,7 +48,7 @@ pub fn validate_websocket_origin(headers: &HeaderMap) -> Result<(), Problem> {
     // Compare the authority as the browser wrote it. `Url::port()` drops a
     // scheme's default port, so `https://host:443` would otherwise look
     // portless and be rejected against `Host: host:443`.
-    if raw_origin_authority(origin)
+    if crate::same_origin::origin_authority(origin)
         .is_some_and(|authority| authority.eq_ignore_ascii_case(host.trim()))
     {
         return Ok(());
@@ -54,19 +57,6 @@ pub fn validate_websocket_origin(headers: &HeaderMap) -> Result<(), Problem> {
     Err(problemdetails::new(StatusCode::FORBIDDEN)
         .with_title("Forbidden")
         .with_detail("WebSocket Origin header is not allowed"))
-}
-
-/// The `host[:port]` part of an `Origin` value, exactly as written.
-///
-/// `None` for anything that is not a bare `scheme://host[:port]` origin, such
-/// as one carrying userinfo, so it can never match a `Host` header.
-fn raw_origin_authority(origin: &str) -> Option<&str> {
-    let (_, rest) = origin.split_once("://")?;
-    let authority = rest.split(['/', '?', '#']).next()?;
-    if authority.is_empty() || authority.contains('@') {
-        return None;
-    }
-    Some(authority)
 }
 
 #[cfg(test)]
