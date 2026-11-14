@@ -33,6 +33,7 @@ mod deploy_image;
 mod deploy_static;
 mod deploy_static_bundle;
 mod deploy_static_from_source;
+mod deployment_workflows;
 mod download_repo;
 mod mark_deployment_complete;
 mod persist_static_assets;
@@ -148,6 +149,7 @@ fn build_boxed<'a, J: FromJobRecord>(
 /// Every job a `deployment_jobs` row can build.
 const JOB_REGISTRY: &[JobRegistration] = &[
     register::<crate::jobs::ConfigureCronsJob>(),
+    register::<crate::jobs::deployment_workflows::DeploymentWorkflowsJob>(),
     register::<crate::jobs::ConfigureMetricAlertsJob>(),
     register::<crate::jobs::ConfigureAgentsJob>(),
     register::<crate::jobs::MarkDeploymentCompleteJob>(),

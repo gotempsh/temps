@@ -1,0 +1,42 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+slug: restate-workflow-engine
+name: Restate Workflow Engine
+kind: starter
+description: Self-hosted Restate with persistent storage, bounded resources and a password-protected console. Separate from Temps durable workflows; use the upstream SDK and back up its named volumes.
+git:
+  url: https://github.com/gotempsh/temps.git
+  ref: 0ae00324222f0e64953023d1d1fafd7ab5c5c187
+  subfolder: examples/workflow-engines
+preset: docker-compose
+preset_config:
+  composePath: restate.compose.yaml
+  publicPorts:
+    - service: gateway
+      port: 8080
+      healthCheckPath: /healthz
+    - service: gateway
+      port: 8081
+      healthCheckPath: /healthz
+exposed_port: 8080
+health_check_path: /healthz
+tags: [workflows, restate, durable-execution]
+features:
+  - Password-protected console with a generated secret
+  - Persistent named volumes retained across restarts
+  - Explicit memory and CPU limits; no extra container capabilities
+  - Separate authenticated ingress route on gateway-8081
+services: []
+env_vars:
+  - name: ENGINE_USER
+    description: Console and ingress Basic Auth username
+    default: admin
+    required: true
+  - name: ENGINE_PASSWORD
+    description: Console password; at least 24 characters. Store this before sharing access.
+    required: true
+    secret: true
+    default_generator: random_secret
+is_public: true
+is_featured: false
+sort_order: 30

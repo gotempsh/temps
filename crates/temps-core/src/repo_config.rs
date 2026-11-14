@@ -12,6 +12,11 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct TempsConfig {
+    /// Durable workflows started once after this deployment becomes live.
+    /// Inputs identify the project, environment and deployment; at most 16 names.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deployment_workflows: Vec<String>,
+
     /// Cron job configurations
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cron: Option<Vec<CronJobConfig>>,
@@ -102,6 +107,9 @@ pub struct SourceContextConfig {
 ///     concurrency_policy: forbid
 ///     retry_limit: 2
 ///     timeout_seconds: 1800
+///   - workflow: send-digest            # workflow (ADR-106)
+///     input: { "period": "weekly" }
+///     schedule: "0 8 * * 1"
 /// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CronJobConfig {
@@ -124,13 +132,22 @@ pub struct CronJobConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<Vec<String>>,
 
-    /// `job` mode: what a run does while the previous one is still active.
-    /// Default `forbid`.
+    /// `workflow` mode: the durable workflow each occurrence starts a run of.
+    /// Leave out `path` and `command`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<String>,
+
+    /// `workflow` mode: the input every run gets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<serde_json::Value>,
+
+    /// `job` and `workflow` modes: what a run does while the previous one is
+    /// still active. Default `forbid`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concurrency_policy: Option<CronConcurrencyPolicy>,
 
-    /// `job` mode: a run that cannot start within this many seconds of its
-    /// scheduled time is skipped instead of started late.
+    /// `job` and `workflow` modes: a run that cannot start within this many
+    /// seconds of its scheduled time is skipped instead of started late.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub starting_deadline_seconds: Option<u32>,
 
@@ -153,6 +170,27 @@ impl CronJobConfig {
     /// Whether this entry is a `job` (it has a `command`).
     pub fn is_job(&self) -> bool {
         self.command.is_some()
+    }
+
+    /// Whether this entry starts a workflow (it has a `workflow`).
+    pub fn is_workflow(&self) -> bool {
+        self.workflow.is_some()
+    }
+
+    /// Names of the fields only a `job` runs with, for refusing them on a
+    /// `workflow` entry.
+    pub fn run_only_fields(&self) -> Vec<&'static str> {
+        let mut fields = Vec::new();
+        if self.retry_limit.is_some() {
+            fields.push("retry_limit");
+        }
+        if self.timeout_seconds.is_some() {
+            fields.push("timeout_seconds");
+        }
+        if self.ttl_seconds_after_finished.is_some() {
+            fields.push("ttl_seconds_after_finished");
+        }
+        fields
     }
 
     /// Names of the `job`-only fields this entry sets, for refusing them on
@@ -1329,6 +1367,7 @@ build:
             health: None,
             agents: None,
             workflows: None,
+            deployment_workflows: vec![],
             source_context: None,
             alerts: None,
         };

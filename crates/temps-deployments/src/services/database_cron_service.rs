@@ -127,6 +127,11 @@ pub struct DatabaseCronConfigService {
     /// every plugin has registered. Unset means `job` crons are recorded
     /// as failed with that reason; `http` crons never use it.
     plane: OnceLock<Arc<WorkloadPlane>>,
+    /// Starts the runs of `workflow` crons (ADR-106 §9). Late-bound: set
+    /// from `initialize_plugin_services` when the workflows plugin is
+    /// loaded. Unset means `workflow` crons are recorded as failed with
+    /// that reason.
+    workflows: OnceLock<Arc<dyn temps_core::WorkflowControl>>,
 }
 
 /// Where a `job` cron's run comes from: the environment's current
@@ -153,7 +158,13 @@ impl DatabaseCronConfigService {
             deployment_token_service,
             alarm_service: OnceLock::new(),
             plane: OnceLock::new(),
+            workflows: OnceLock::new(),
         }
+    }
+
+    /// Wire in the workflows engine that `workflow` crons start runs on.
+    pub fn set_workflow_control(&self, control: Arc<dyn temps_core::WorkflowControl>) {
+        let _ = self.workflows.set(control);
     }
 
     /// Wire in the workload plane that runs `job` crons.
@@ -460,19 +471,37 @@ impl DatabaseCronConfigService {
         }
 
         // First verify the cron exists and belongs to the project/environment
-        self.get_cron_by_id(project_id, env_id, cron_id).await?;
+        let cron = self.get_cron_by_id(project_id, env_id, cron_id).await?;
 
         let query = cron_executions::Entity::find()
             .filter(cron_executions::Column::CronId.eq(cron_id))
             .order_by_desc(cron_executions::Column::ExecutedAt);
 
         let paginator = query.paginate(self.db.as_ref(), per_page.max(1) as u64);
-        let executions = paginator
+        let mut executions = paginator
             .fetch_page(temps_core::config::page_index(page.max(1) as u64))
             .await
             .map_err(|e| {
                 CronConfigError::DatabaseError(format!("Failed to fetch executions: {}", e))
             })?;
+
+        // A workflow cron's runs finish on their own: settle the page's
+        // finished ones, so the history never shows a done run as running.
+        // Best effort: on failure the rows stay as they are.
+        if let Some(control) = self.workflows.get() {
+            if cron.mode == crons::MODE_WORKFLOW {
+                if let Err(error) = super::cron_workflows::settle_workflow_executions(
+                    self.db.as_ref(),
+                    control.as_ref(),
+                    &cron,
+                    &mut executions,
+                )
+                .await
+                {
+                    warn!(cron_id, %error, "could not settle the finished runs of a workflow cron");
+                }
+            }
+        }
 
         Ok(executions)
     }
@@ -648,6 +677,35 @@ impl DatabaseCronConfigService {
         let should_run = due_at <= now;
 
         if should_run {
+            if cron.mode == crons::MODE_WORKFLOW {
+                // Only the scheduler holding this exact due occurrence may
+                // dispatch it. A concurrent scheduler or a reconfiguration
+                // must not repeat `replace` against newer workflow runs.
+                let claimed = crons::Entity::update_many()
+                    .col_expr(
+                        crons::Column::NextRun,
+                        Expr::value(upcoming.unwrap_or_else(Self::retired_sentinel)),
+                    )
+                    .filter(crons::Column::Id.eq(cron.id))
+                    .filter(crons::Column::NextRun.eq(due_at))
+                    .filter(crons::Column::UpdatedAt.eq(cron.updated_at))
+                    .filter(crons::Column::DeletedAt.is_null())
+                    .exec(self.db.as_ref())
+                    .await?;
+                if claimed.rows_affected == 0 {
+                    return Ok(());
+                }
+                return super::cron_workflows::dispatch_workflow(
+                    self.db.as_ref(),
+                    self.workflows.get(),
+                    cron,
+                    due_at,
+                    now,
+                )
+                .await
+                .map_err(CronServiceError::from);
+            }
+
             // Advance the due time *before* executing. A failed execution
             // returns early below, and leaving `next_run` in the past would
             // then replay the same minute on every sweep.
@@ -1726,6 +1784,7 @@ mod tests {
         let service = DatabaseCronConfigService::new(db.clone(), queue, token_service);
 
         let configs = vec![CronConfig {
+            workflow: None,
             path: "/api/cron/cleanup".to_string(),
             schedule: "0 0 * * * *".to_string(),
             job: None,
@@ -1763,6 +1822,7 @@ mod tests {
 
         // Use standard 5-field cron (the format users actually write in .temps.yaml)
         let configs = vec![CronConfig {
+            workflow: None,
             path: "/api/cron/daily".to_string(),
             schedule: "0 0 * * *".to_string(),
             job: None,
@@ -1801,6 +1861,7 @@ mod tests {
 
         // Create initial cron
         let configs = vec![CronConfig {
+            workflow: None,
             path: "/api/cron/task".to_string(),
             schedule: "0 0 * * * *".to_string(),
             job: None,
@@ -1811,6 +1872,7 @@ mod tests {
 
         // Update with different schedule
         let updated_configs = vec![CronConfig {
+            workflow: None,
             path: "/api/cron/task".to_string(),
             schedule: "0 */5 * * * *".to_string(),
             job: None,
@@ -1848,11 +1910,13 @@ mod tests {
         // Create two crons
         let configs = vec![
             CronConfig {
+                workflow: None,
                 path: "/api/cron/task1".to_string(),
                 schedule: "0 0 * * * *".to_string(),
                 job: None,
             },
             CronConfig {
+                workflow: None,
                 path: "/api/cron/task2".to_string(),
                 schedule: "0 0 * * * *".to_string(),
                 job: None,
@@ -1864,6 +1928,7 @@ mod tests {
 
         // Update with only one cron (task2 removed)
         let updated_configs = vec![CronConfig {
+            workflow: None,
             path: "/api/cron/task1".to_string(),
             schedule: "0 0 * * * *".to_string(),
             job: None,
@@ -1988,6 +2053,8 @@ mod tests {
             retry_limit: 0,
             timeout_seconds: None,
             ttl_seconds_after_finished: None,
+            workflow_name: None,
+            workflow_input: None,
         }
     }
 
@@ -2339,10 +2406,66 @@ mod tests {
         assert_eq!(wait_for_cron_alarms(db.as_ref(), project.id).await.len(), 1);
     }
 
+    #[tokio::test]
+    async fn workflow_occurrence_is_claimed_once_across_schedulers() {
+        if !temps_test_utils::docker_available().await
+            && !temps_test_utils::external_database_configured()
+        {
+            eprintln!("skipping: Docker and external test database unavailable");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.connection_arc();
+        let (project, environment) = create_test_project_and_environment(db.as_ref())
+            .await
+            .unwrap();
+        let service = cron_service(&db);
+        let fake = Arc::new(super::super::cron_workflows::fake::FakeWorkflowControl::default());
+        service.set_workflow_control(fake.clone());
+        let config = CronConfig::from_repo(&temps_core::CronJobConfig {
+            workflow: Some("digest".into()),
+            schedule: "* * * * *".into(),
+            concurrency_policy: Some(CronConcurrencyPolicy::Replace),
+            ..Default::default()
+        })
+        .unwrap();
+        service
+            .configure_crons(project.id, environment.id, vec![config])
+            .await
+            .unwrap();
+        let row = service
+            .get_environment_crons(project.id, environment.id)
+            .await
+            .unwrap()
+            .remove(0);
+        let now = Utc::now();
+        let mut update: crons::ActiveModel = row.into();
+        update.next_run = Set(Some(now - chrono::Duration::seconds(1)));
+        let row = update.update(db.as_ref()).await.unwrap();
+        let (first, second) = tokio::join!(
+            service.process_cron(&row, now),
+            service.process_cron(&row, now)
+        );
+        first.unwrap();
+        second.unwrap();
+        assert_eq!(fake.runs.lock().unwrap().len(), 1);
+        assert!(fake.cancelled.lock().unwrap().is_empty());
+        let executions = service
+            .get_cron_executions(project.id, environment.id, row.id, 1, 20)
+            .await
+            .unwrap();
+        assert_eq!(executions.len(), 1);
+        assert_eq!(
+            executions[0].state.as_deref(),
+            Some(cron_executions::STATE_RUNNING)
+        );
+    }
+
     // ---- job crons (ADR-055 §14) ----
 
     fn job_config(retry_limit: u32, policy: CronConcurrencyPolicy) -> CronConfig {
         CronConfig {
+            workflow: None,
             path: "job:nightly-report".to_string(),
             schedule: "0 3 * * *".to_string(),
             job: Some(crate::jobs::configure_crons::JobCronConfig {
@@ -2368,6 +2491,7 @@ mod tests {
             .expect("fixtures");
         let service = cron_service(&db);
         let http = CronConfig {
+            workflow: None,
             path: "/api/cron/cleanup".to_string(),
             schedule: "0 0 * * *".to_string(),
             job: None,

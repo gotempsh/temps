@@ -38,6 +38,7 @@ pub mod sandbox_s3;
 pub mod service_dns;
 pub mod services;
 pub mod worker_s3_scope;
+mod workflow_journal;
 pub use services::*;
 pub mod plugin;
 mod types;

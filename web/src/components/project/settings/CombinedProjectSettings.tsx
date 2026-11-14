@@ -293,6 +293,7 @@ export function CombinedProjectSettings({
         />
       )}
       {banner}
+      {intro}
       {single ? (
         <section
           id={settingsSectionDomId(sections[0].id)}
@@ -303,7 +304,6 @@ export function CombinedProjectSettings({
         </section>
       ) : (
         <div className="min-w-0 divide-y [&>section]:py-8 [&>section:first-child]:pt-0">
-          {intro}
           {sections.map((section) => (
             <SettingsBlock
               key={`${page}-${section.id}`}

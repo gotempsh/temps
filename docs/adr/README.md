@@ -124,6 +124,7 @@ the number of the ADR they belong to; they do not take a number of their own.
 | [103](./103-general-access-vaults.md) | General access vaults with explicit consumer links | Proposed |  |
 | [104](./104-single-server-internal-routing.md) | A single-server control plane serves its own containers' `*.temps.local` names | Proposed |  |
 | [105](./105-sandbox-internal-access.md) | A sandbox can call a project's internal address when that project allows it | Proposed | amends [101](./101-internal-access-grants.md) |
+| [106](./106-durable-workflows.md) | Durable workflows orchestrated by Temps | Proposed |  |
 
 ## Supporting documents
 

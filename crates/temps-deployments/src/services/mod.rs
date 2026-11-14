@@ -50,6 +50,7 @@ pub mod job_tracker;
 pub use job_tracker::*;
 
 pub mod cron_jobs;
+pub mod cron_workflows;
 pub mod database_cron_service;
 pub use database_cron_service::*;
 
@@ -115,6 +116,9 @@ pub(crate) mod deployment_commit;
 pub use temps_ci_tokens::services::ci_dispatch;
 
 pub mod runtime_health;
+
+pub mod executor_endpoints;
+pub use executor_endpoints::DeploymentExecutorEndpoints;
 
 pub mod workload_placement;
 pub use workload_placement::{WorkloadPlacementError, WorkloadPlacementService};

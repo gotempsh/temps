@@ -404,6 +404,18 @@ impl TempsPlugin for DeploymentsPlugin {
                 deployment_service.clone() as Arc<dyn temps_core::ProjectImageCleaner>;
             context.register_service(project_image_cleaner);
 
+            // Where the durable workflows engine invokes an environment's code
+            // (ADR-106): the current deployment's healthy replicas. Absent in
+            // embeddings that never register a runtime context, which keeps
+            // the historical host behaviour, as for `LocalWorkloadPolicy`.
+            let runtime_context = context
+                .get_service::<temps_core::RuntimeContext>()
+                .unwrap_or_else(|| Arc::new(temps_core::RuntimeContext::host()));
+            let executor_endpoints: Arc<dyn temps_core::ExecutorEndpoints> = Arc::new(
+                crate::services::DeploymentExecutorEndpoints::new(db.clone(), runtime_context),
+            );
+            context.register_service(executor_endpoints);
+
             // Remote container log source — lets the log-aggregator collect logs
             // from containers on remote worker nodes into searchable history. The
             // aggregator picks this up via get_service and runs its reconcile
@@ -1039,6 +1051,29 @@ impl TempsPlugin for DeploymentsPlugin {
                 ),
                 (Some(_), None) => tracing::warn!(
                     "Cron scheduler service is not registered; cron failure alarms are off"
+                ),
+            }
+
+            // `workflow` crons start durable workflow runs (ADR-106 §9).
+            // The workflows plugin may register after this one, so its
+            // control is only resolvable here.
+            match (
+                context.get_service::<dyn temps_core::WorkflowControl>(),
+                context.get_service::<crate::services::DatabaseCronConfigService>(),
+            ) {
+                (Some(control), Some(cron_service)) => {
+                    cron_service.set_workflow_control(control.clone());
+                    context
+                        .require_service::<WorkflowExecutionService>()
+                        .set_workflow_control(control);
+                    tracing::debug!("workflow control wired into cron scheduler");
+                }
+                (None, _) => tracing::info!(
+                    "durable workflows are not loaded: workflow crons are recorded as failed \
+                     with that reason"
+                ),
+                (Some(_), None) => tracing::warn!(
+                    "Cron scheduler service is not registered; workflow crons cannot run"
                 ),
             }
 

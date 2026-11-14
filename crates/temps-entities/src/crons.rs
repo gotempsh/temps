@@ -38,11 +38,17 @@ pub struct Model {
     /// How long a finished run's container is kept. NULL takes the plane's
     /// default for jobs.
     pub ttl_seconds_after_finished: Option<i32>,
+    /// The workflow a `workflow` cron starts (ADR-106 §9). NULL otherwise.
+    pub workflow_name: Option<String>,
+    /// The input of each run a `workflow` cron starts, as written in
+    /// `.temps.yaml`. NULL: no input.
+    pub workflow_input: Option<Json>,
 }
 
 /// `crons.mode` values.
 pub const MODE_HTTP: &str = "http";
 pub const MODE_JOB: &str = "job";
+pub const MODE_WORKFLOW: &str = "workflow";
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {

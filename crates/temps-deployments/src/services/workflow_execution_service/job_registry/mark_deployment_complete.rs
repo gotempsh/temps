@@ -24,6 +24,7 @@ impl FromJobRecord for MarkDeploymentCompleteJob {
 
         let mut builder = MarkDeploymentCompleteJobBuilder::new()
             .environment_addresses(service.environment_addresses.get().cloned())
+            .workflow_control(service.workflow_control.get().cloned())
             .job_id(db_job.job_id.clone())
             .deployment_id(deployment_id)
             .db(service.db.clone())
