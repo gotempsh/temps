@@ -31,6 +31,7 @@ function invokeRequest(workflow: string, windowMs: number): InvokeRequest {
 /** A Temps that records every step write and echoes it back as the journal entry. */
 function recordingTemps(writes: number[]) {
   return async (_input: string, init?: RequestInit): Promise<Response> => {
+    if (_input.endsWith('/admit')) return Response.json({ entries: [], next_sequence: null });
     const write = JSON.parse(String(init?.body)) as { sequence: number; name: string; kind: string; status: string; attempts: number; result?: unknown };
     writes.push(write.sequence);
     return new Response(
@@ -274,7 +275,7 @@ describe('replay', () => {
     // A refusal about the run itself still fails it, with the reason.
     const refusing = new ExecutorTransport({
       apiUrl: 'http://t',
-      fetch: async () =>
+      fetch: async (input) => input.endsWith('/admit') ? Response.json({ entries: [], next_sequence: null }) :
         new Response(JSON.stringify({ title: 'Payload Too Large', detail: 'step result over 4194304 bytes' }), { status: 413 }),
     });
     const failed = await runInvocation(quick, invokeRequest('quick', 60_000), {
@@ -330,5 +331,23 @@ it('rejects completion when deployed code removes a recorded approval wait, incl
       transport: new ExecutorTransport({ apiUrl: 'http://t', fetch: async () => new Response(JSON.stringify({ entries: [entry], next_sequence: null })) }),
     });
     expect(result).toMatchObject({ type: 'outcome', outcome: { type: 'incompatible', sequence: 0 } });
+  }
+});
+
+it('admits before codecs and effects, fails closed without retrying ambiguous admission', async () => {
+  for (const status of [409, 503]) {
+    let calls = 0;
+    let effects = 0;
+    const result = await runInvocation(defineWorkflow('orders', async () => ++effects), invokeRequest('orders', 60_000), {
+      token: 't', telemetry: new Telemetry({ tracer: false }),
+      codec: { encode: async value => value, decode: async value => { effects++; return value } },
+      transport: new ExecutorTransport({ apiUrl: 'http://t', attempts: 4, fetch: async () => {
+        calls++;
+        return Response.json({ title: status === 409 ? 'Stale Lease' : 'Unavailable' }, { status });
+      } }),
+    });
+    expect(calls).toBe(1);
+    expect(effects).toBe(0);
+    expect(result.type).toBe(status === 409 ? 'stale' : 'unavailable');
   }
 });

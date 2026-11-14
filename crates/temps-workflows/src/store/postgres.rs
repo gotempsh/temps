@@ -376,8 +376,8 @@ impl WorkflowStore for PgWorkflowStore {
                 "INSERT INTO workflow_environment_settings (environment_id, project_id, host_service, \
                  invocation_deadline_secs, lease_secs, max_concurrent_runs, max_active_runs, \
                  max_steps_per_run, max_journal_bytes_per_run, inline_payload_limit_bytes, \
-                 max_payload_bytes, retention_days, stuck_after_failures, drain_timeout_secs, managed_store_service_id) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) \
+                 max_payload_bytes, retention_days, stuck_after_failures, drain_timeout_secs, managed_store_service_id, max_retained_events, max_retained_event_bytes) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17) \
                  ON CONFLICT (environment_id) DO UPDATE SET host_service = EXCLUDED.host_service, \
                  invocation_deadline_secs = EXCLUDED.invocation_deadline_secs, \
                  lease_secs = EXCLUDED.lease_secs, max_concurrent_runs = EXCLUDED.max_concurrent_runs, \
@@ -385,7 +385,7 @@ impl WorkflowStore for PgWorkflowStore {
                  max_journal_bytes_per_run = EXCLUDED.max_journal_bytes_per_run, \
                  inline_payload_limit_bytes = EXCLUDED.inline_payload_limit_bytes, \
                  max_payload_bytes = EXCLUDED.max_payload_bytes, retention_days = EXCLUDED.retention_days, \
-                 stuck_after_failures = EXCLUDED.stuck_after_failures, drain_timeout_secs = EXCLUDED.drain_timeout_secs, managed_store_service_id = EXCLUDED.managed_store_service_id, updated_at = now() \
+                 stuck_after_failures = EXCLUDED.stuck_after_failures, drain_timeout_secs = EXCLUDED.drain_timeout_secs, managed_store_service_id = EXCLUDED.managed_store_service_id, max_retained_events = EXCLUDED.max_retained_events, max_retained_event_bytes = EXCLUDED.max_retained_event_bytes, updated_at = now() \
                  RETURNING *",
                 vec![
                     environment_id.into(),
@@ -403,6 +403,8 @@ impl WorkflowStore for PgWorkflowStore {
                     settings.stuck_after_failures.into(),
                     settings.drain_timeout_secs.into(),
                     settings.managed_store_service_id.into(),
+                    settings.max_retained_events.into(),
+                    settings.max_retained_event_bytes.into(),
                 ],
             ))
             .one(self.db.as_ref())
@@ -708,6 +710,33 @@ impl WorkflowStore for PgWorkflowStore {
                 .map_err(WorkflowError::db("recording a failed invocation"))
         })
         .transpose()
+    }
+
+    async fn event_usage(&self, environment_id: i32) -> WorkflowResult<(i64, i64)> {
+        let row = temps_entities::workflow_event_usage::Entity::find_by_id(environment_id)
+            .one(self.db.as_ref())
+            .await
+            .map_err(WorkflowError::db("reading retained event usage"))?;
+        Ok(row.map_or((0, 0), |row| (row.event_count, row.payload_bytes)))
+    }
+
+    async fn admit_invocation(&self, run_id: Uuid, lease: i64) -> WorkflowResult<bool> {
+        let admitted = self
+            .db
+            .query_one(stmt(
+                "WITH current_run AS MATERIALIZED (
+                SELECT id,lease_token FROM workflow_runs
+                WHERE id=$1 AND lease_token=$2 AND status='running' AND lease_expires_at>now()
+                FOR UPDATE
+            ) INSERT INTO workflow_invocation_admissions(run_id,lease)
+            SELECT id,lease_token FROM current_run
+            ON CONFLICT(run_id) DO UPDATE SET lease=EXCLUDED.lease
+            WHERE workflow_invocation_admissions.lease < EXCLUDED.lease RETURNING run_id",
+                vec![run_id.into(), lease.into()],
+            ))
+            .await
+            .map_err(WorkflowError::db("admitting workflow invocation"))?;
+        Ok(admitted.is_some())
     }
 
     async fn heartbeat(&self, run_id: Uuid, lease: i64) -> WorkflowResult<DateTime<Utc>> {
@@ -1045,7 +1074,7 @@ impl WorkflowStore for PgWorkflowStore {
         }
         .insert(self.db.as_ref())
         .await
-        .map_err(WorkflowError::db("storing a workflow event"))?;
+        .map_err(WorkflowError::event_db(event.environment_id))?;
         Ok(row.id)
     }
 
@@ -1518,7 +1547,7 @@ impl WorkflowStore for PgWorkflowStore {
                 }
                 .insert(&txn)
                 .await
-                .map_err(WorkflowError::db("storing an event sent by a workflow"))?;
+                .map_err(WorkflowError::event_db(event.environment_id))?;
                 event_id = Some(row.id);
             }
         }

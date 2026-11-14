@@ -68,14 +68,14 @@ export type FetchHandler = (request: Request) => Promise<Response>;
 function problem(status: number, title: string, detail: string): Response {
   return new Response(JSON.stringify({ type: 'about:blank', status, title, detail }), {
     status,
-    headers: { 'content-type': 'application/problem+json', [PROTOCOL_HEADER]: String(PROTOCOL_VERSION) },
+    headers: { 'cache-control': 'no-store', 'content-type': 'application/problem+json', [PROTOCOL_HEADER]: String(PROTOCOL_VERSION) },
   });
 }
 
 function json(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { 'content-type': 'application/json', [PROTOCOL_HEADER]: String(PROTOCOL_VERSION) },
+    headers: { 'cache-control': 'no-store', 'content-type': 'application/json', [PROTOCOL_HEADER]: String(PROTOCOL_VERSION) },
   });
 }
 

@@ -149,6 +149,7 @@ pub async fn app_get_workflow_run(
     request_body = SendWorkflowEventRequest,
     responses(
         (status = 200, description = "Event stored and delivered to the runs waiting on it", body = SendWorkflowEventResponse),
+        (status = 429, description = "Retained event count or byte budget reached"),
         (status = 400, description = "Validation error"),
         (status = 401, description = "Missing, unknown or revoked workflow credential"),
         (status = 413, description = "Payload too large")

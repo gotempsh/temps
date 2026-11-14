@@ -121,6 +121,8 @@ impl From<WorkflowInfo> for WorkflowSummaryResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct WorkflowsOverviewResponse {
+    pub retained_event_count: i64,
+    pub retained_event_bytes: i64,
     pub executor: ExecutorCapabilityResponse,
     pub credential: CredentialStatusResponse,
     pub workflows: Vec<WorkflowSummaryResponse>,
@@ -129,6 +131,8 @@ pub struct WorkflowsOverviewResponse {
 impl From<Overview> for WorkflowsOverviewResponse {
     fn from(overview: Overview) -> Self {
         Self {
+            retained_event_count: overview.retained_event_count,
+            retained_event_bytes: overview.retained_event_bytes,
             executor: overview.executor.into(),
             credential: overview.credential.into(),
             workflows: overview.workflows.into_iter().map(Into::into).collect(),

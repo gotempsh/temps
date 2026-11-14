@@ -111,5 +111,5 @@ class WorkflowApp:
 
     @staticmethod
     async def respond(send, status, value):
-        await send({"type": "http.response.start", "status": status, "headers": [(b"content-type", b"application/json"), (b"temps-workflows-protocol", b"1")]})
+        await send({"type": "http.response.start", "status": status, "headers": [(b"cache-control", b"no-store"), (b"content-type", b"application/json"), (b"temps-workflows-protocol", b"1")]})
         await send({"type": "http.response.body", "body": json.dumps(value, allow_nan=False).encode()})

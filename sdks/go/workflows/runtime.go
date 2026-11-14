@@ -364,6 +364,21 @@ func clip(message string) string {
 func RunInvocation(parent context.Context, workflow Workflow, request Invocation, token string, transport Transport) (int, Outcome) {
 	ctx, cancel := context.WithTimeout(parent, request.Deadline.Sub(request.Now))
 	defer cancel()
+	var page struct {
+		Entries *[]Entry `json:"entries"`
+		Next    *int     `json:"next_sequence"`
+	}
+	if err := transport.Call(ctx, "POST", "/workflow-runs/"+url.PathEscape(request.RunID)+"/admit", token, struct{}{}, &page, false); err != nil {
+		var api *APIError
+		if errors.As(err, &api) && api.Status == 409 {
+			return 202, Outcome{}
+		}
+		return 503, Outcome{}
+	}
+	if page.Entries == nil {
+		return 503, Outcome{}
+	}
+	request.Journal, request.Next = *page.Entries, page.Next
 	c := &Context{Context: ctx, Input: request.Input, RunID: request.RunID, Workflow: request.Workflow, Attempt: request.Attempt, request: request, transport: transport, token: token, journal: map[int]Entry{}, started: time.Now()}
 	for _, entry := range request.Journal {
 		c.journal[entry.Sequence] = entry

@@ -26,6 +26,8 @@ test('an environment without runs exposes onboarding, grants, keys and drain set
         reason: 'No deployment is live',
         setup_path: '/docs/workflows/getting-started',
       },
+      retained_event_count: 3,
+      retained_event_bytes: 42,
       credential: { configured: false },
       workflows: [],
     }
@@ -42,6 +44,8 @@ test('an environment without runs exposes onboarding, grants, keys and drain set
   expect(html).toContain('href="/workflows/1/2/grants"')
   expect(html).toContain('href="/workflows/1/2/settings"')
   expect(html).toContain('href="/workflows/1/keys"')
+  expect(html).toContain('Retained events: 3')
+  expect(html).toContain('Payload bytes: 42')
   expect(html).toContain('Create credential')
   expect(html).toContain('Runs stay queued')
   expect(html).toContain('Start run')
@@ -60,6 +64,8 @@ test('the selector offers current workflows and excludes historical names', asyn
       .queryKey,
     {
       executor: { configured: true, replicas: 1 },
+      retained_event_count: 0,
+      retained_event_bytes: 0,
       credential: { configured: true },
       workflows: [
         {

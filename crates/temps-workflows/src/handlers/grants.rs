@@ -222,7 +222,7 @@ pub async fn app_start_granted_workflow(
         }),
     ))
 }
-#[utoipa::path(post,path="/workflows/v1/projects/{project_id}/environments/{environment_id}/events",tag="Workflow App API",params(("project_id"=i32,Path),("environment_id"=i32,Path)),request_body=SendWorkflowEventRequest,responses((status=200,body=SendWorkflowEventResponse,description="Event delivered through grant"),(status=400,description="Invalid event"),(status=401,description="Invalid credential"),(status=403,description="Grant required"),(status=413,description="Payload too large")),security(("bearer_auth"=[])))]
+#[utoipa::path(post,path="/workflows/v1/projects/{project_id}/environments/{environment_id}/events",tag="Workflow App API",params(("project_id"=i32,Path),("environment_id"=i32,Path)),request_body=SendWorkflowEventRequest,responses((status=429,description="Retained event budget reached"),(status=200,body=SendWorkflowEventResponse,description="Event delivered through grant"),(status=400,description="Invalid event"),(status=401,description="Invalid credential"),(status=403,description="Grant required"),(status=413,description="Payload too large")),security(("bearer_auth"=[])))]
 pub async fn app_send_granted_event(
     State(state): State<Arc<WorkflowsAppState>>,
     metadata: Option<Extension<RequestMetadata>>,

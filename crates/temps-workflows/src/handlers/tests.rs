@@ -322,6 +322,7 @@ async fn executor_and_app_routes_reject_missing_or_forged_tokens_as_problems() {
     for (method, uri, body) in [
         ("GET", format!("/workflow-runs/{RUN}/journal"), None),
         ("POST", format!("/workflow-runs/{RUN}/heartbeat"), None),
+        ("POST", format!("/workflow-runs/{RUN}/admit"), None),
         (
             "POST",
             format!("/workflow-runs/{RUN}/steps"),
@@ -1454,4 +1455,145 @@ async fn development_sessions_require_payload_access_and_audit_without_tokens() 
         4
     );
     assert!(rows.iter().all(|(_, body)| !body.contains(token)));
+}
+
+#[tokio::test]
+async fn admitted_invocations_read_fresh_uncacheable_journals_and_reject_replays() {
+    use crate::store::WorkflowStore;
+    let Some((h, _, app)) = live("admitted invocation responses").await else {
+        return;
+    };
+    let id = h.start("orders", json!(null)).await;
+    let claim = h.store.claim_due(1, &[]).await.unwrap().remove(0);
+    let signer =
+        InvocationSigner::new(&EncryptionService::new("12345678901234567890123456789012").unwrap());
+    let claims = crate::token::InvocationClaims {
+        v: 1,
+        typ: crate::token::TokenPurpose::Invoke,
+        pid: h.env.project_id,
+        eid: h.env.environment_id,
+        run: Some(id),
+        lease: Some(claim.run.lease_token),
+        exp: chrono::Utc::now().timestamp() + 120,
+        body: None,
+    };
+    let token = signer.sign(&claims).unwrap();
+    let write = json!({"sequence":0,"name":"example","kind":"step","status":"completed","attempts":1,"result":"synthetic-sensitive-value"});
+    let (status, headers, body) = send(
+        app.clone(),
+        "POST",
+        &format!("/workflow-runs/{id}/steps"),
+        Some(write),
+        None,
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(headers["cache-control"], "no-store");
+    for path in ["journal", "admit"] {
+        let method = if path == "admit" { "POST" } else { "GET" };
+        let (status, headers, body) = send(
+            app.clone(),
+            method,
+            &format!("/workflow-runs/{id}/{path}"),
+            None,
+            None,
+            Some(&token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(headers["cache-control"], "no-store");
+        assert_eq!(body["entries"][0]["result"], "synthetic-sensitive-value");
+    }
+    let (status, _, _) = send(
+        app.clone(),
+        "POST",
+        &format!("/workflow-runs/{id}/admit"),
+        None,
+        None,
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let wrong = signer
+        .sign(&crate::token::InvocationClaims {
+            eid: claims.eid + 1,
+            ..claims
+        })
+        .unwrap();
+    let (status, _, _) = send(
+        app,
+        "POST",
+        &format!("/workflow-runs/{id}/admit"),
+        None,
+        None,
+        Some(&wrong),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn event_quota_returns_a_typed_problem_and_does_not_block_another_environment() {
+    use crate::store::WorkflowStore;
+    let Some((h, _, app)) = live("event quota response").await else {
+        return;
+    };
+    let settings = crate::types::WorkflowSettings {
+        max_retained_events: 1,
+        ..Default::default()
+    };
+    h.store
+        .upsert_settings(h.env.project_id, h.env.environment_id, &settings)
+        .await
+        .unwrap();
+    let path = format!(
+        "/projects/{}/environments/{}/workflows/events",
+        h.env.project_id, h.env.environment_id
+    );
+    for expected in [StatusCode::OK, StatusCode::TOO_MANY_REQUESTS] {
+        let (status, headers, body) = send(
+            app.clone(),
+            "POST",
+            &path,
+            Some(json!({"name":"approved"})),
+            Some(AuthContext::new_session(user(h.env.user_id), Role::Admin)),
+            None,
+        )
+        .await;
+        assert_eq!(status, expected, "{body}");
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            assert_eq!(body["title"], "Workflow Quota Exceeded");
+            assert_eq!(headers["content-type"], "application/problem+json");
+        }
+    }
+    assert_eq!(
+        h.store.event_usage(h.env.environment_id).await.unwrap(),
+        (1, 0)
+    );
+    // A second environment in the same database has its own budget and counter.
+    use sea_orm::{ActiveModelTrait, ActiveValue::Set, EntityTrait, IntoActiveModel};
+    let mut other = temps_entities::environments::Entity::find_by_id(h.env.environment_id)
+        .one(h.env.conn.as_ref())
+        .await
+        .unwrap()
+        .unwrap()
+        .into_active_model();
+    other.id = Default::default();
+    other.name = Set("other-budget".into());
+    other.slug = Set("other-budget".into());
+    let other = other.insert(h.env.conn.as_ref()).await.unwrap();
+    h.store
+        .insert_event(crate::store::NewEvent {
+            project_id: h.env.project_id,
+            environment_id: other.id,
+            name: "approved".into(),
+            key: String::new(),
+            payload: Default::default(),
+            source: "api",
+            source_run_id: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(h.store.event_usage(other.id).await.unwrap(), (1, 0));
 }

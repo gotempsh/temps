@@ -150,6 +150,7 @@ Token `typ: "invoke"`. Body:
 ```
 
 - `now` is Temps' clock. Replays must not depend on the replica's.
+- Before any workflow or payload-codec callback, call `POST /workflow-runs/{run_id}/admit` and replace the supplied journal and cursor with its response.
 - `journal` is in sequence order from 0, decrypted. When it does not fit in
   one page (1000 entries or 8 MiB), `journal_next_sequence` is set. Fetch the
   rest with `GET {TEMPS_API_URL}/workflow-runs/{run_id}/journal?from=<n>`,
@@ -177,13 +178,29 @@ reported as "is the SDK handler mounted?".
 ## Endpoints Temps serves for the executor
 
 Relative to `TEMPS_API_URL` (the `/api` root the app already uses for
-telemetry). All take the invocation token, and all except the journal read
-and heartbeat require the token's lease to be the run's current lease while
-the run is `running`. Errors are RFC 7807 problem documents. A request
+telemetry). All take the invocation token. Journal reads and writes require
+the current lease while the run is `running`; heartbeat can also report cancellation. Errors are RFC 7807 problem documents. A request
 with a stale lease gets `409` with title `Stale Lease`, and the executor
 must stop the invocation: it answers the invoke request `202` and
 reports no outcome, since the run now belongs to another lease; an invalid or
 expired token gets `401` with title `Invalid Invocation Token`.
+
+### `POST /workflow-runs/{run_id}/admit`
+
+One-shot admission before any application code, including payload codecs.
+Returns the authoritative first journal page (`entries`, `next_sequence`).
+The control plane atomically accepts at most one request per run/lease across
+replicas. An expired, completed, cancelled, superseded or already admitted
+lease gets `409 Stale Lease`. A new scheduler lease can be admitted normally.
+
+Do not retry this call: a lost response can mean admission committed. Fail
+closed with `503` and no outcome on an unavailable, missing or invalid response;
+let the scheduler recover with a new lease. Never fall back to executing the
+signed body's journal. Upgrade the control plane before upgrading executors;
+older SDKs must be upgraded to gain this protection. This does not provide
+exactly-once external effects across leases: step side effects still need
+idempotency keys. Admission, journal and step-result responses, and SDK
+invocation responses, use `Cache-Control: no-store`.
 
 ### `GET /workflow-runs/{run_id}/journal?from=<n>`
 
@@ -290,6 +307,20 @@ When nothing can be invoked (no deployment, no healthy replica, a Compose
 deployment with no `host_service` chosen), the run stays `queued`, is
 re-checked every 30 s, spends no attempt, and the reason is shown on the run
 and in the environment's workflow overview.
+
+## Retained event budgets
+
+Workflow settings expose `max_retained_events` (default 10,000) and
+`max_retained_event_bytes` (default 64 MiB) per environment. Payload bytes
+measure the JSON before storage encryption; database and index overhead is
+additional. Every insert, including events emitted by workflows, reserves
+capacity atomically. A full budget rejects the request with `429 Workflow
+Quota Exceeded`; accepted events are never silently dropped. Deletion and
+retention cleanup release capacity. Existing events survive upgrades and
+lowered limits; new writes remain blocked until capacity is available.
+The workflow overview reports retained count and bytes, and settings lets an
+operator change the limits. The migration backfills existing usage once under
+a write lock; subsequent admission reads only the environment's counter.
 
 ## Payloads
 

@@ -11,6 +11,8 @@ import { SettingsForm } from './WorkflowSettings'
 test('drain is explicitly opt-in and explains suspended runs and timeout behavior', () => {
   const settings = {
     drain_timeout_secs: 0,
+    max_retained_events: 10000,
+    max_retained_event_bytes: 67108864,
     host_service: null,
   } as WorkflowSettings
   const html = renderToStaticMarkup(
@@ -23,6 +25,10 @@ test('drain is explicitly opt-in and explains suspended runs and timeout behavio
       </QueryClientProvider>
     </MemoryRouter>
   )
+  expect(html).toContain('Retained events')
+  expect(html).toContain('Retained event payload bytes')
+  expect(html).toContain('max="1000000"')
+  expect(html).toContain('Existing events are preserved')
   expect(html).toContain('Journal storage')
   expect(html).toContain('existing runs keep their original store')
   expect(html).toContain('/projects/1/storage')

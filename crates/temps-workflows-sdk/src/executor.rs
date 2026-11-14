@@ -118,6 +118,15 @@ impl Executor {
             .route("/.well-known/temps/workflows/manifest", get(manifest))
             .route("/.well-known/temps/workflows/invoke", post(invoke))
             .with_state(Arc::new(self))
+            .layer(axum::middleware::map_response(
+                |mut response: Response| async move {
+                    response.headers_mut().insert(
+                        axum::http::header::CACHE_CONTROL,
+                        axum::http::HeaderValue::from_static("no-store"),
+                    );
+                    response
+                },
+            ))
     }
     fn verify(&self, headers: &HeaderMap, purpose: &str) -> Result<(String, Claims), Error> {
         let header = headers
@@ -237,10 +246,34 @@ impl Drop for Pulse {
 }
 pub(crate) async fn run(
     workflow: &dyn Workflow,
-    request: Invocation,
+    mut request: Invocation,
     token: String,
     transport: Arc<dyn Transport>,
 ) -> (StatusCode, Option<Outcome>) {
+    #[derive(Deserialize)]
+    struct Admission {
+        entries: Vec<crate::Entry>,
+        next_sequence: Option<i32>,
+    }
+    let admitted = transport
+        .call(
+            "POST",
+            &format!("/workflow-runs/{}/admit", request.run_id),
+            &token,
+            Some(json!({})),
+            false,
+        )
+        .await;
+    let page = match admitted {
+        Ok(value) => match serde_json::from_value::<Admission>(value) {
+            Ok(page) => page,
+            Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, None),
+        },
+        Err(Error::Api { status: 409, .. }) => return (StatusCode::ACCEPTED, None),
+        Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, None),
+    };
+    request.journal = page.entries;
+    request.journal_next_sequence = page.next_sequence;
     let deadline = (request.deadline_at - request.now)
         .to_std()
         .unwrap_or_default();

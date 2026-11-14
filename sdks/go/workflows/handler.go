@@ -166,6 +166,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}{outcome})
 }
 func respond(w http.ResponseWriter, status int, value any) {
+	w.Header().Set("Cache-Control", "no-store")
 	body, err := json.Marshal(value)
 	if err != nil {
 		status = 500

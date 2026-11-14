@@ -349,6 +349,9 @@ pub trait WorkflowStore: Send + Sync {
         reason: &str,
     ) -> WorkflowResult<Option<RunStatus>>;
     /// Extend the lease; returns its new expiry.
+    async fn event_usage(&self, environment_id: i32) -> WorkflowResult<(i64, i64)>;
+
+    async fn admit_invocation(&self, run_id: Uuid, lease: i64) -> WorkflowResult<bool>;
     async fn heartbeat(&self, run_id: Uuid, lease: i64) -> WorkflowResult<DateTime<Utc>>;
     /// End an invocation; fenced by `lease`.
     async fn release(&self, run_id: Uuid, lease: i64, release: Release) -> WorkflowResult<RunRow>;

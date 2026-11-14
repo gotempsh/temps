@@ -20,13 +20,13 @@ def request(journal=None):
 
 
 class Recorder:
-    def __init__(self):
-        self.entries, self.outage = [], False
+    def __init__(self, entries=None):
+        self.entries, self.outage = entries or [], False
 
     async def call(self, method, path, token, body=None, retry=False):
         if self.outage:
             raise ApiError(503)
-        if "/journal?" in path:
+        if "/journal?" in path or path.endswith("/admit"):
             return {"entries": self.entries, "next_sequence": None}
         self.entries.append(body)
         return {"entry": body}
@@ -41,7 +41,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             req = request([] if paged else [entry])
             if paged:
                 req["journal_next_sequence"] = 0
-            status, result = await run_invocation(Workflow("orders", workflow), req, "token", Recorder())
+            status, result = await run_invocation(Workflow("orders", workflow), req, "token", Recorder([entry]))
             self.assertEqual(status, 200)
             self.assertEqual(result["outcome"]["type"], "incompatible")
             self.assertEqual(result["outcome"]["sequence"], 0)
@@ -88,7 +88,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         async def waits(ctx):
             return await ctx.wait_for_event("approval", "approved")
         pending = dict(sequence=0, name="approval", kind="wait", status="pending", attempts=1, wake_at=iso(time.time()-1))
-        _, result = await run_invocation(Workflow("orders", waits), request([pending]), "token", Recorder())
+        _, result = await run_invocation(Workflow("orders", waits), request([pending]), "token", Recorder([pending]))
         self.assertEqual(result["outcome"]["output"], {"received": False, "payload": None})
 
     async def test_auth_checks_scope_body_lease_and_expiry_before_user_code(self):
@@ -113,6 +113,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             async def send(event):
                 events.append(event)
             await app(dict(type="http", method="POST", path="/.well-known/temps/workflows/invoke", headers=[(b"authorization", ("Bearer " + token).encode())]), receive, send)
+            self.assertIn((b"cache-control", b"no-store"), events[0]["headers"])
             return events[0]["status"], reads
         for override in [dict(pid=3), dict(eid=4), dict(exp=0), dict(typ="manifest")]:
             status, reads = await invoke(override)
@@ -148,8 +149,12 @@ class TargetTests(unittest.IsolatedAsyncioTestCase):
 class PageBudgetTests(unittest.IsolatedAsyncioTestCase):
     async def test_unreached_pages_are_not_loaded_and_consumed_entries_are_discarded(self):
         from .runtime import Context
-        transport = Recorder()
         entry = dict(sequence=0, name="first", kind="step", status="completed", attempts=1, result=7)
+        class Admission:
+            async def call(self, method, path, token, body=None, retry=False):
+                assert path.endswith("/admit") and not retry
+                return {"entries": [entry], "next_sequence": 1}
+        transport = Admission()
         req = request([entry])
         req["journal_next_sequence"] = 1
         async def workflow(ctx):
@@ -160,4 +165,28 @@ class PageBudgetTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 200)
         self.assertEqual(result["outcome"]["type"], "incompatible")
         self.assertEqual(result["outcome"]["sequence"], 1)
-        self.assertEqual(transport.entries, [])
+
+
+class AdmissionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_denial_and_outage_execute_nothing(self):
+        for status in (409, 503):
+            calls, effects = [], []
+            class Denied:
+                async def call(self, method, path, token, body=None, retry=False):
+                    calls.append((path, retry))
+                    raise ApiError(status)
+            async def workflow(ctx):
+                effects.append(True)
+            code, _ = await run_invocation(Workflow("orders", workflow), request(), "token", Denied())
+            self.assertEqual(code, 202 if status == 409 else 503)
+            self.assertEqual(effects, [])
+            self.assertEqual(calls, [("/workflow-runs/synthetic-run/admit", False)])
+
+    async def test_malformed_admission_runs_no_user_code(self):
+        class Malformed:
+            async def call(self, *args, **kwargs):
+                return {"entries": None}
+        async def workflow(ctx):
+            self.fail("malformed admission executed workflow")
+        status, _ = await run_invocation(Workflow("orders", workflow), request(), "token", Malformed())
+        self.assertEqual(status, 503)

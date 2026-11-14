@@ -76,6 +76,8 @@ pub struct WorkflowInfo {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Overview {
+    pub retained_event_count: i64,
+    pub retained_event_bytes: i64,
     pub executor: ExecutorStatus,
     pub credential: Option<CredentialRow>,
     pub workflows: Vec<WorkflowInfo>,
@@ -223,7 +225,11 @@ impl WorkflowService {
             failed_runs: summary.failed,
             last_run_at: summary.last_run_at,
         }));
+        let (retained_event_count, retained_event_bytes) =
+            self.store.event_usage(environment_id).await?;
         Ok(Overview {
+            retained_event_count,
+            retained_event_bytes,
             executor,
             credential,
             workflows,

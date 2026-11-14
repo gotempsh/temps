@@ -509,6 +509,8 @@ export class FakeOrchestrator {
     return { run: this.require(runId), lease: claims.lease };
   }
 
+  private readonly admitted = new Map<string, number>();
+
   private requireLease(run: FakeRun, lease: number): void {
     if (!this.holds(run, lease)) {
       throw new HttpError(
@@ -532,6 +534,14 @@ export class FakeOrchestrator {
       return json(200, this.invocationKey);
     }
 
+    if ((match = /^\/workflow-runs\/([^/]+)\/admit$/.exec(path))) {
+      const { run, lease } = this.authorize(request, match[1] as string);
+      this.requireLease(run, lease);
+      if (this.admitted.get(run.id) === lease) throw new HttpError(409, 'Stale Lease', 'invocation already admitted');
+      this.admitted.set(run.id, lease);
+      const entries = run.journal.slice(0, this.options.journalPageSize);
+      return json(200, { entries: structuredClone(entries), next_sequence: entries.length < run.journal.length ? entries.length : null });
+    }
     if ((match = /^\/workflow-runs\/([^/]+)\/journal$/.exec(path))) {
       const { run, lease } = this.authorize(request, match[1] as string);
       this.requireLease(run, lease);

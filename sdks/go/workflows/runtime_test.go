@@ -29,7 +29,10 @@ func (r *recorder) Call(_ context.Context, method, path, token string, body, out
 		return &APIError{503, "unavailable"}
 	}
 	var response any
-	if strings.Contains(path, "/journal?") {
+	if r.entries == nil {
+		r.entries = []Entry{}
+	}
+	if strings.Contains(path, "/journal?") || strings.HasSuffix(path, "/admit") {
 		response = struct {
 			Entries []Entry `json:"entries"`
 			Next    *int    `json:"next_sequence"`
@@ -126,6 +129,9 @@ func TestSignedHandlerChecksScopeBodyExpiryAndLease(t *testing.T) {
 		r.Header.Set("Authorization", "Bearer "+token)
 		w := httptest.NewRecorder()
 		handler.ServeHTTP(w, r)
+		if w.Header().Get("Cache-Control") != "no-store" {
+			t.Fatal("missing no-store")
+		}
 		return w.Code
 	}
 	for _, change := range []func(*claims){func(c *claims) { c.ProjectID = 3 }, func(c *claims) { c.EnvironmentID = 4 }, func(c *claims) { c.Expires = 0 }, func(c *claims) { c.Body = "wrong" }, func(c *claims) { c.Lease = 2 }, func(c *claims) { c.Type = "manifest" }} {
@@ -178,7 +184,7 @@ func TestUnreachedJournalPagesAreNotFetched(t *testing.T) {
 	request.Journal = []Entry{{Sequence: 0, Name: "first", Kind: "step", Status: "completed", Attempts: 1, Result: 7}}
 	next := 1
 	request.Next = &next
-	transport := &neverTransport{}
+	transport := &admissionPageTransport{request.Journal, request.Next}
 	workflow := Workflow{Name: "orders", Run: func(c *Context) (any, error) {
 		value, err := c.Step("first", func(context.Context) (any, error) { t.Fatal("replay executed"); return nil, nil })
 		if len(c.journal) != 0 {
@@ -192,10 +198,17 @@ func TestUnreachedJournalPagesAreNotFetched(t *testing.T) {
 	}
 }
 
-type neverTransport struct{}
+type admissionPageTransport struct {
+	Entries []Entry
+	Next    *int
+}
 
-func (*neverTransport) Call(context.Context, string, string, string, any, any, bool) error {
-	return errors.New("unexpected API request")
+func (a *admissionPageTransport) Call(_ context.Context, _, path, _ string, _, out any, retry bool) error {
+	if !strings.HasSuffix(path, "/admit") || retry {
+		return errors.New("unexpected API request")
+	}
+	data, _ := json.Marshal(map[string]any{"entries": a.Entries, "next_sequence": a.Next})
+	return json.Unmarshal(data, out)
 }
 
 func TestRemovedWaitCannotComplete(t *testing.T) {
@@ -207,9 +220,46 @@ func TestRemovedWaitCannotComplete(t *testing.T) {
 		} else {
 			req.Journal = []Entry{{Sequence: 0, Name: "approval", Kind: "wait", Status: "pending", Attempts: 1}}
 		}
-		status, result := RunInvocation(context.Background(), Workflow{Name: "orders", Run: func(c *Context) (any, error) { return "done", nil }}, req, "token", &recorder{})
+		status, result := RunInvocation(context.Background(), Workflow{Name: "orders", Run: func(c *Context) (any, error) { return "done", nil }}, req, "token", &recorder{entries: []Entry{{Sequence: 0, Name: "approval", Kind: "wait", Status: "pending", Attempts: 1}}})
 		if status != 200 || result.Type != "incompatible" || result.Sequence == nil || *result.Sequence != 0 {
 			t.Fatalf("removed wait completed: %d %#v", status, result)
 		}
+	}
+}
+
+type deniedAdmission struct {
+	status int
+	calls  int
+}
+
+func (d *deniedAdmission) Call(_ context.Context, _, path, _ string, _, _ any, retry bool) error {
+	d.calls++
+	if !strings.HasSuffix(path, "/admit") || retry {
+		panic("admission must be one-shot")
+	}
+	return &APIError{d.status, "unavailable"}
+}
+func TestAdmissionFailsClosedBeforeEffects(t *testing.T) {
+	for _, status := range []int{409, 503} {
+		transport := &deniedAdmission{status: status}
+		effects := 0
+		workflow := Workflow{Name: "orders", Run: func(*Context) (any, error) { effects++; return nil, nil }}
+		code, _ := RunInvocation(context.Background(), workflow, invocation(), "token", transport)
+		expected := 503
+		if status == 409 {
+			expected = 202
+		}
+		if code != expected || effects != 0 || transport.calls != 1 {
+			t.Fatalf("admission failed: %d %d %d", code, effects, transport.calls)
+		}
+	}
+}
+
+func TestMalformedAdmissionRunsNoUserCode(t *testing.T) {
+	effects := 0
+	workflow := Workflow{Name: "orders", Run: func(*Context) (any, error) { effects++; return nil, nil }}
+	code, _ := RunInvocation(context.Background(), workflow, invocation(), "token", &admissionPageTransport{})
+	if code != 503 || effects != 0 {
+		t.Fatalf("malformed admission executed: %d %d", code, effects)
 	}
 }

@@ -254,3 +254,22 @@ describe('workflow handler', () => {
     expect(() => defineWorkflow('limited', async () => null, { concurrency: 1_000_000 })).not.toThrow();
   });
 });
+
+it('rejects a captured request after completion and concurrent duplicate requests before effects', async () => {
+  const { temps, handler } = setup();
+  let saved: Request | undefined;
+  temps.attach(async request => {
+    saved = request.clone();
+    const duplicate = request.clone();
+    const responses = await Promise.all([handler(request), handler(duplicate)]);
+    expect(responses.map(r => r.status).sort()).toEqual([200, 202]);
+    for (const response of responses) expect(response.headers.get('cache-control')).toBe('no-store');
+    return responses.find(r => r.status === 200)!;
+  });
+  const before = ran;
+  temps.start('hello', { name: 'example' });
+  await temps.settle();
+  expect(ran).toBe(before + 1);
+  expect((await handler(saved!)).status).toBe(202);
+  expect(ran).toBe(before + 1);
+});

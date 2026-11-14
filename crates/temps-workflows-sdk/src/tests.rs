@@ -30,7 +30,7 @@ impl Transport for Recorder {
                 status: 503,
             });
         }
-        if path.contains("journal?") {
+        if path.contains("journal?") || path.ends_with("/admit") {
             return Ok(
                 json!({"entries":self.entries.lock().unwrap().clone(),"next_sequence":null}),
             );
@@ -178,6 +178,7 @@ async fn handler_binds_token_to_environment_body_run_and_lease() {
             .await
             .unwrap();
         assert_eq!(response.status().as_u16(), status);
+        assert_eq!(response.headers()["cache-control"], "no-store");
     }
     assert_eq!(counter.load(Ordering::SeqCst), 1);
 }
@@ -366,7 +367,10 @@ async fn removed_wait_cannot_complete_including_unread_pages() {
             req.journal=serde_json::from_value(json!([{"sequence":0,"name":"approval","kind":"wait","status":"pending","attempts":1}])).unwrap();
         }
         let result =
-            executor::run(&Empty, req, "token".into(), Arc::new(Recorder::default())).await;
+            executor::run(&Empty, req, "token".into(), Arc::new(Recorder {
+                entries: Mutex::new(vec![json!({"sequence":0,"name":"approval","kind":"wait","status":"pending","attempts":1})]),
+                ..Default::default()
+            })).await;
         assert!(matches!(
             result.1,
             Some(Outcome::Incompatible { sequence: 0, .. })
@@ -395,5 +399,42 @@ async fn retry_backoff_honors_configured_ten_minutes() {
     match context.outcome.unwrap() {
         Outcome::Retry { at, .. } => assert!((at - now).num_seconds() >= 600),
         other => panic!("expected retry, got {other:?}"),
+    }
+}
+
+struct DeniedAdmission(u16);
+#[async_trait]
+impl Transport for DeniedAdmission {
+    async fn call(
+        &self,
+        method: &str,
+        path: &str,
+        _: &str,
+        _: Option<Value>,
+        retry: bool,
+    ) -> Result<Value, Error> {
+        assert_eq!(method, "POST");
+        assert!(path.ends_with("/admit"));
+        assert!(!retry);
+        Err(Error::Api {
+            operation: "admit".into(),
+            status: self.0,
+        })
+    }
+}
+#[tokio::test]
+async fn admission_denial_and_outage_run_no_user_code() {
+    for status in [409, 503] {
+        let effects = Arc::new(AtomicUsize::new(0));
+        let result = executor::run(
+            &Charge(effects.clone()),
+            request(),
+            "token".into(),
+            Arc::new(DeniedAdmission(status)),
+        )
+        .await;
+        assert_eq!(result.0.as_u16(), if status == 409 { 202 } else { 503 });
+        assert_eq!(effects.load(Ordering::SeqCst), 0);
+        assert!(result.1.is_none());
     }
 }

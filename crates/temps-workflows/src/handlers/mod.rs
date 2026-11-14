@@ -79,6 +79,7 @@ use management::*;
         get_run_journal,
         record_run_step,
         heartbeat_run,
+        admit_run_invocation,
         report_run_outcome,
         app_start_workflow_run,
         app_get_workflow_run,
@@ -231,6 +232,7 @@ pub fn configure_public_routes() -> Router<Arc<WorkflowsAppState>> {
         .route("/workflow-runs/{run_id}/journal", get(get_run_journal))
         .route("/workflow-runs/{run_id}/steps", post(record_run_step))
         .route("/workflow-runs/{run_id}/heartbeat", post(heartbeat_run))
+        .route("/workflow-runs/{run_id}/admit", post(admit_run_invocation))
         .route("/workflow-runs/{run_id}/outcome", post(report_run_outcome))
         .route("/workflows/v1/runs", post(app_start_workflow_run))
         .route("/workflows/v1/runs/{run_id}", get(app_get_workflow_run))
@@ -268,7 +270,7 @@ impl From<WorkflowError> for Problem {
             WorkflowError::PayloadTooLarge { .. } => {
                 (StatusCode::PAYLOAD_TOO_LARGE, "Payload Too Large")
             }
-            WorkflowError::QuotaExceeded { .. } => {
+            WorkflowError::QuotaExceeded { .. } | WorkflowError::EventQuotaExceeded { .. } => {
                 (StatusCode::TOO_MANY_REQUESTS, "Workflow Quota Exceeded")
             }
             WorkflowError::InvalidState { .. } => {

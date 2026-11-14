@@ -16,6 +16,8 @@ use uuid::Uuid;
 
 #[derive(Debug, Error)]
 pub enum WorkflowError {
+    #[error("Retained event count or payload-byte budget of environment {environment_id} is reached; remove expired events or raise its workflow limits")]
+    EventQuotaExceeded { environment_id: i32 },
     #[error(transparent)]
     ManagedJournal(#[from] temps_core::workflow_journal::WorkflowJournalError),
     #[error("Development tunnel of environment {environment_id}: {reason}")]
@@ -199,5 +201,23 @@ mod tests {
     fn database_errors_name_the_operation() {
         let error = WorkflowError::db("claiming due runs")(DbErr::Custom("boom".into()));
         assert!(error.to_string().contains("claiming due runs"));
+    }
+}
+
+impl WorkflowError {
+    pub(crate) fn event_db(environment_id: i32) -> impl FnOnce(DbErr) -> Self {
+        move |source| {
+            if source
+                .to_string()
+                .contains("workflow_event_budget_exceeded")
+            {
+                Self::EventQuotaExceeded { environment_id }
+            } else {
+                Self::Database {
+                    operation: "storing a workflow event",
+                    source,
+                }
+            }
+        }
     }
 }

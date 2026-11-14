@@ -1476,3 +1476,124 @@ async fn child_idempotency_collision_cannot_commit_a_dangling_journal_entry() {
     assert!(f.store.step(parent.id, 0).await.unwrap().is_none());
     assert!(f.store.get_run(id).await.unwrap().is_none());
 }
+
+#[tokio::test]
+async fn invocation_admission_is_atomic_and_fences_expired_or_finished_leases() {
+    let Some(f) = fixture("invocation_admission").await else {
+        return;
+    };
+    let run = f.start("orders").await;
+    let claimed = f.claim_one().await;
+    let lease = claimed.run.lease_token;
+    let (one, two) = tokio::join!(
+        f.store.admit_invocation(run.id, lease),
+        f.store.admit_invocation(run.id, lease)
+    );
+    assert_eq!(usize::from(one.unwrap()) + usize::from(two.unwrap()), 1);
+    assert!(!f.store.admit_invocation(run.id, lease - 1).await.unwrap());
+    f.conn
+        .execute_unprepared(&format!(
+            "UPDATE workflow_runs SET lease_token=lease_token+1 WHERE id='{}'",
+            run.id
+        ))
+        .await
+        .unwrap();
+    assert!(f.store.admit_invocation(run.id, lease + 1).await.unwrap());
+    for status in ["completed", "cancelled"] {
+        f.conn.execute_unprepared(&format!("UPDATE workflow_runs SET status='{status}',lease_token=lease_token+1 WHERE id='{}'",run.id)).await.unwrap();
+        assert!(!f.store.admit_invocation(run.id, lease + 2).await.unwrap());
+    }
+    f.conn.execute_unprepared(&format!("UPDATE workflow_runs SET status='running',lease_token=99,lease_expires_at=now()-interval '1 second' WHERE id='{}'",run.id)).await.unwrap();
+    assert!(!f.store.admit_invocation(run.id, 99).await.unwrap());
+}
+
+#[tokio::test]
+async fn retained_event_budgets_are_atomic_and_deletion_restores_capacity() {
+    let Some(f) = fixture("retained_event_budgets").await else {
+        return;
+    };
+    let settings = WorkflowSettings {
+        max_retained_events: 2,
+        max_retained_event_bytes: 5,
+        ..Default::default()
+    };
+    f.store
+        .upsert_settings(f.project_id, f.environment_id, &settings)
+        .await
+        .unwrap();
+    let event = |bytes| NewEvent {
+        project_id: f.project_id,
+        environment_id: f.environment_id,
+        name: "approved".into(),
+        key: String::new(),
+        payload: StoredPayload {
+            bytes,
+            ..Default::default()
+        },
+        source: "api",
+        source_run_id: None,
+    };
+    let (one, two) = tokio::join!(
+        f.store.insert_event(event(3)),
+        f.store.insert_event(event(3))
+    );
+    assert_eq!(usize::from(one.is_ok()) + usize::from(two.is_ok()), 1);
+    let (id, error) = match (one, two) {
+        (Ok(id), Err(e)) | (Err(e), Ok(id)) => (id, e),
+        _ => panic!("quota overshoot"),
+    };
+    assert!(matches!(error, WorkflowError::EventQuotaExceeded { .. }));
+    f.store.insert_event(event(2)).await.unwrap();
+    assert!(matches!(
+        f.store.insert_event(event(0)).await,
+        Err(WorkflowError::EventQuotaExceeded { .. })
+    ));
+    f.conn
+        .execute_unprepared(&format!("DELETE FROM workflow_events WHERE id={id}"))
+        .await
+        .unwrap();
+    f.store.insert_event(event(3)).await.unwrap();
+    let usage = f
+        .conn
+        .query_one(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT event_count,payload_bytes FROM workflow_event_usage WHERE environment_id=$1",
+            [f.environment_id.into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(usage.try_get::<i64>("", "event_count").unwrap(), 2);
+    assert_eq!(usage.try_get::<i64>("", "payload_bytes").unwrap(), 5);
+}
+
+#[tokio::test]
+async fn event_budget_migration_preserves_existing_events_and_backfills_usage() {
+    use temps_migrations::{Migrator, MigratorTrait};
+    let Some(f) = fixture("event_budget_upgrade").await else {
+        return;
+    };
+    Migrator::down(f.conn.as_ref(), Some(1)).await.unwrap();
+    f.store
+        .insert_event(NewEvent {
+            project_id: f.project_id,
+            environment_id: f.environment_id,
+            name: "existing".into(),
+            key: String::new(),
+            payload: StoredPayload {
+                bytes: 7,
+                ..Default::default()
+            },
+            source: "api",
+            source_run_id: None,
+        })
+        .await
+        .unwrap();
+    Migrator::up(f.conn.as_ref(), None).await.unwrap();
+    assert_eq!(f.store.event_usage(f.environment_id).await.unwrap(), (1, 7));
+    f.conn
+        .execute_unprepared("DELETE FROM workflow_events")
+        .await
+        .unwrap();
+    assert_eq!(f.store.event_usage(f.environment_id).await.unwrap(), (0, 0));
+}

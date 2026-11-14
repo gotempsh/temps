@@ -39190,6 +39190,8 @@ export type WorkflowSettings = {
     max_concurrent_runs: number;
     max_journal_bytes_per_run: number;
     max_payload_bytes: number;
+    max_retained_event_bytes?: number;
+    max_retained_events?: number;
     max_steps_per_run: number;
     retention_days: number;
     stuck_after_failures: number;
@@ -39308,6 +39310,8 @@ export type WorkflowSummaryResponse = {
 export type WorkflowsOverviewResponse = {
     credential: WorkflowCredentialStatusResponse;
     executor: WorkflowExecutorCapabilityResponse;
+    retained_event_bytes: number;
+    retained_event_count: number;
     workflows: Array<WorkflowSummaryResponse>;
 };
 
@@ -82356,6 +82360,10 @@ export type SendWorkflowEventErrors = {
      */
     413: unknown;
     /**
+     * Retained event count or byte budget reached
+     */
+    429: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
@@ -98271,6 +98279,42 @@ export type TriggerWeeklyDigestResponses = {
 
 export type TriggerWeeklyDigestResponse = TriggerWeeklyDigestResponses[keyof TriggerWeeklyDigestResponses];
 
+export type AdmitRunInvocationData = {
+    body?: never;
+    path: {
+        /**
+         * Run ID
+         */
+        run_id: string;
+    };
+    query?: never;
+    url: '/workflow-runs/{run_id}/admit';
+};
+
+export type AdmitRunInvocationErrors = {
+    /**
+     * Invalid invocation token
+     */
+    401: unknown;
+    /**
+     * Run not found
+     */
+    404: unknown;
+    /**
+     * Already admitted, expired or stale lease
+     */
+    409: unknown;
+};
+
+export type AdmitRunInvocationResponses = {
+    /**
+     * Admitted invocation and current journal
+     */
+    200: WorkflowJournalPage;
+};
+
+export type AdmitRunInvocationResponse = AdmitRunInvocationResponses[keyof AdmitRunInvocationResponses];
+
 export type HeartbeatRunData = {
     body?: never;
     path: {
@@ -98422,7 +98466,7 @@ export type RecordRunStepErrors = {
      */
     413: unknown;
     /**
-     * The run reached its step or journal-size quota
+     * The run or environment reached its step, journal-size or retained-event quota
      */
     429: unknown;
 };
@@ -98496,6 +98540,10 @@ export type AppSendWorkflowEventErrors = {
      * Payload too large
      */
     413: unknown;
+    /**
+     * Retained event count or byte budget reached
+     */
+    429: unknown;
 };
 
 export type AppSendWorkflowEventResponses = {
@@ -98557,6 +98605,10 @@ export type AppSendGrantedEventErrors = {
      * Payload too large
      */
     413: unknown;
+    /**
+     * Retained event budget reached
+     */
+    429: unknown;
 };
 
 export type AppSendGrantedEventResponses = {

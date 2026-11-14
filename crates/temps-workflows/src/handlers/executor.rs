@@ -76,7 +76,7 @@ pub async fn get_run_journal(
         .engine
         .journal_page(token, run_id, query.from.unwrap_or(0))
         .await?;
-    Ok(Json(page))
+    Ok(super::no_store(Json(page)))
 }
 
 #[utoipa::path(
@@ -92,7 +92,7 @@ pub async fn get_run_journal(
         (status = 404, description = "Run not found"),
         (status = 409, description = "Stale lease, or the replay does not match the journal (WorkflowIncompatible)"),
         (status = 413, description = "Result too large"),
-        (status = 429, description = "The run reached its step or journal-size quota")
+        (status = 429, description = "The run or environment reached its step, journal-size or retained-event quota")
     ),
     security(("bearer_auth" = []))
 )]
@@ -106,7 +106,7 @@ pub async fn record_run_step(
     state.engine.verify_invocation_token(token, run_id)?;
     let write: StepWriteRequest = json_body(body).await?;
     let response = state.engine.record_step(token, run_id, write).await?;
-    Ok(Json(response))
+    Ok(super::no_store(Json(response)))
 }
 
 #[utoipa::path(
@@ -158,4 +158,23 @@ pub async fn report_run_outcome(
     Ok(Json(
         state.engine.report_outcome(token, run_id, request).await?,
     ))
+}
+
+/// Consume a run lease once before any executor user code runs.
+#[utoipa::path(post, path="/workflow-runs/{run_id}/admit", tag="Workflow Executor",
+    params(("run_id"=Uuid,Path,description="Run ID")),
+    responses((status=200,body=JournalPage,description="Admitted invocation and current journal"),
+        (status=401,description="Invalid invocation token"),(status=404,description="Run not found"),
+        (status=409,description="Already admitted, expired or stale lease")), security(("bearer_auth"=[])))]
+pub async fn admit_run_invocation(
+    State(state): AppState,
+    headers: HeaderMap,
+    Path(run_id): Path<Uuid>,
+) -> Result<impl IntoResponse, Problem> {
+    Ok(super::no_store(Json(
+        state
+            .engine
+            .admit_invocation(bearer(&headers)?, run_id)
+            .await?,
+    )))
 }

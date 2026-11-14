@@ -85333,6 +85333,14 @@
             "format": "int32",
             "type": "integer"
           },
+          "max_retained_event_bytes": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "max_retained_events": {
+            "format": "int64",
+            "type": "integer"
+          },
           "max_steps_per_run": {
             "format": "int32",
             "type": "integer"
@@ -85689,6 +85697,14 @@
           "executor": {
             "$ref": "#/components/schemas/WorkflowExecutorCapabilityResponse"
           },
+          "retained_event_bytes": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "retained_event_count": {
+            "format": "int64",
+            "type": "integer"
+          },
           "workflows": {
             "items": {
               "$ref": "#/components/schemas/WorkflowSummaryResponse"
@@ -85697,6 +85713,8 @@
           }
         },
         "required": [
+          "retained_event_count",
+          "retained_event_bytes",
           "executor",
           "credential",
           "workflows"
@@ -156943,6 +156961,9 @@
           "413": {
             "description": "Payload too large"
           },
+          "429": {
+            "description": "Retained event count or byte budget reached"
+          },
           "500": {
             "description": "Internal server error"
           }
@@ -182535,6 +182556,53 @@
         ]
       }
     },
+    "/workflow-runs/{run_id}/admit": {
+      "post": {
+        "operationId": "admit_run_invocation",
+        "parameters": [
+          {
+            "description": "Run ID",
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowJournalPage"
+                }
+              }
+            },
+            "description": "Admitted invocation and current journal"
+          },
+          "401": {
+            "description": "Invalid invocation token"
+          },
+          "404": {
+            "description": "Run not found"
+          },
+          "409": {
+            "description": "Already admitted, expired or stale lease"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Consume a run lease once before any executor user code runs.",
+        "tags": [
+          "Workflow Executor"
+        ]
+      }
+    },
     "/workflow-runs/{run_id}/heartbeat": {
       "post": {
         "operationId": "heartbeat_run",
@@ -182751,7 +182819,7 @@
             "description": "Result too large"
           },
           "429": {
-            "description": "The run reached its step or journal-size quota"
+            "description": "The run or environment reached its step, journal-size or retained-event quota"
           }
         },
         "security": [
@@ -182885,6 +182953,9 @@
           },
           "413": {
             "description": "Payload too large"
+          },
+          "429": {
+            "description": "Retained event count or byte budget reached"
           }
         },
         "security": [
@@ -182980,6 +183051,9 @@
           },
           "413": {
             "description": "Payload too large"
+          },
+          "429": {
+            "description": "Retained event budget reached"
           }
         },
         "security": [

@@ -62,6 +62,20 @@ impl WorkflowEngine {
         Ok(Authorized { claims, lease, run })
     }
 
+    pub async fn admit_invocation(&self, token: &str, run_id: Uuid) -> WorkflowResult<JournalPage> {
+        let auth = self.authorize(token, run_id).await?;
+        Self::require_lease(&auth)?;
+        if !self.store.admit_invocation(run_id, auth.lease).await? {
+            return Err(WorkflowError::StaleLease {
+                run_id,
+                presented: auth.lease,
+                current: auth.run.lease_token,
+                status: "invocation already admitted or lease expired".into(),
+            });
+        }
+        self.journal_page(token, run_id, 0).await
+    }
+
     fn require_lease(auth: &Authorized) -> WorkflowResult<()> {
         if auth.run.lease_token == auth.lease && auth.run.status == RunStatus::Running.as_str() {
             Ok(())

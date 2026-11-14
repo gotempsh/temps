@@ -61,6 +61,13 @@ export class ExecutorTransport {
     return this.call<InvocationKey>('invocation key', 'GET', '/workflows/v1/invocation-key', { token: credential });
   }
 
+  /** One-shot admission: an ambiguous response must never authorize execution. */
+  async admit(token: string, runId: string): Promise<JournalPage> {
+    return this.call<JournalPage>('invocation admission', 'POST',
+      `/workflow-runs/${encodeURIComponent(runId)}/admit`,
+      { token, runId, body: {}, retry: false });
+  }
+
   async journal(token: string, runId: string, from: number): Promise<JournalPage> {
     return this.call<JournalPage>(
       'journal read',
@@ -100,13 +107,14 @@ export class ExecutorTransport {
     operation: string,
     method: 'GET' | 'POST',
     path: string,
-    options: { token?: string; runId?: string; body?: unknown } = {},
+    options: { token?: string; runId?: string; body?: unknown; retry?: boolean } = {},
   ): Promise<T> {
     const headers: Record<string, string> = { [PROTOCOL_HEADER]: String(PROTOCOL_VERSION) };
     if (options.token) headers.authorization = `Bearer ${options.token}`;
     if (options.body !== undefined) headers['content-type'] = 'application/json';
     let lastError: unknown;
-    for (let attempt = 1; attempt <= this.attempts; attempt += 1) {
+    const attempts = options.retry === false ? 1 : this.attempts;
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
       let response: Response;
       let body: T | undefined;
       try {
@@ -125,7 +133,7 @@ export class ExecutorTransport {
         if (response.ok) body = (await response.json()) as T;
       } catch (error) {
         lastError = error;
-        await this.pause(attempt);
+        if (attempt < attempts) await this.pause(attempt);
         continue;
       }
       if (response.ok) return body as T;
@@ -138,7 +146,7 @@ export class ExecutorTransport {
       }
       lastError = new TempsApiError(operation, response.status, problem.title, problem.detail);
       if (!TRANSIENT.has(response.status)) throw lastError;
-      await this.pause(attempt);
+      if (attempt < attempts) await this.pause(attempt);
     }
     if (lastError instanceof TempsApiError) throw lastError;
     throw new TempsApiError(operation, 0, 'Unreachable', String(lastError));

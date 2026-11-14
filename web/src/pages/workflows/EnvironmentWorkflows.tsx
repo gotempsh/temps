@@ -193,6 +193,12 @@ export function WorkflowEnvironment({
                 settingsHref={`/workflows/${projectId}/${environmentId}/settings`}
               />
             )}
+            {query.data && (
+              <p className="text-sm text-muted-foreground">
+                Retained events: {query.data.retained_event_count ?? 0} ·
+                Payload bytes: {query.data.retained_event_bytes ?? 0}
+              </p>
+            )}
             <div className="flex flex-wrap items-center gap-2">
               <Status
                 tone={query.data?.credential.configured ? 'ok' : 'warn'}

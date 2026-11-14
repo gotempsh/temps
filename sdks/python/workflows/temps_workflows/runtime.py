@@ -210,6 +210,15 @@ class Context:
 
 
 async def run_invocation(workflow, request, token, transport):
+    try:
+        page = await transport.call("POST", "/workflow-runs/" + quote(request["run_id"], safe="") + "/admit", token, {}, retry=False)
+        if not isinstance(page.get("entries"), list):
+            return 503, {}
+        request = {**request, "journal": page["entries"], "journal_next_sequence": page.get("next_sequence")}
+    except ApiError as error:
+        return (202 if error.status == 409 else 503), {}
+    except Exception:
+        return 503, {}
     context = Context(request, token, transport)
 
     async def heartbeat():

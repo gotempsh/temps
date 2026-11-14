@@ -32,6 +32,8 @@ pub struct Model {
     pub max_concurrent_runs: i32,
     /// Non-terminal runs allowed; a start beyond it is rejected. Default 10000.
     pub max_active_runs: i32,
+    pub max_retained_events: i64,
+    pub max_retained_event_bytes: i64,
     /// Journal entries one run may record. Default 1000.
     pub max_steps_per_run: i32,
     /// Payload bytes one run's journal may hold. Default 64 MiB.

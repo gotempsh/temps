@@ -174,12 +174,23 @@ pub struct WorkflowSettings {
     pub lease_secs: i32,
     pub max_concurrent_runs: i32,
     pub max_active_runs: i32,
+    #[serde(default = "default_event_count")]
+    pub max_retained_events: i64,
+    #[serde(default = "default_event_bytes")]
+    pub max_retained_event_bytes: i64,
     pub max_steps_per_run: i32,
     pub max_journal_bytes_per_run: i64,
     pub inline_payload_limit_bytes: i32,
     pub max_payload_bytes: i32,
     pub retention_days: i32,
     pub stuck_after_failures: i32,
+}
+
+fn default_event_count() -> i64 {
+    10_000
+}
+fn default_event_bytes() -> i64 {
+    64 * 1024 * 1024
 }
 
 impl Default for WorkflowSettings {
@@ -193,6 +204,8 @@ impl Default for WorkflowSettings {
             lease_secs: 120,
             max_concurrent_runs: 50,
             max_active_runs: 10_000,
+            max_retained_events: default_event_count(),
+            max_retained_event_bytes: default_event_bytes(),
             max_steps_per_run: 1_000,
             max_journal_bytes_per_run: 64 * 1024 * 1024,
             inline_payload_limit_bytes: 256 * 1024,
@@ -213,6 +226,8 @@ impl From<&workflow_environment_settings::Model> for WorkflowSettings {
             lease_secs: row.lease_secs,
             max_concurrent_runs: row.max_concurrent_runs,
             max_active_runs: row.max_active_runs,
+            max_retained_events: row.max_retained_events,
+            max_retained_event_bytes: row.max_retained_event_bytes,
             max_steps_per_run: row.max_steps_per_run,
             max_journal_bytes_per_run: row.max_journal_bytes_per_run,
             inline_payload_limit_bytes: row.inline_payload_limit_bytes,
@@ -256,6 +271,18 @@ impl WorkflowSettings {
             self.max_concurrent_runs.into(),
             1,
             10_000,
+        )?;
+        range(
+            "max_retained_events",
+            self.max_retained_events,
+            1,
+            1_000_000,
+        )?;
+        range(
+            "max_retained_event_bytes",
+            self.max_retained_event_bytes,
+            1,
+            1024 * 1024 * 1024,
         )?;
         range("max_active_runs", self.max_active_runs.into(), 1, 1_000_000)?;
         range(

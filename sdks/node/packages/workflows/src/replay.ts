@@ -527,6 +527,10 @@ export async function runInvocation<Input>(
   deps: InvocationDeps,
 ): Promise<InvocationResult> {
   try {
+    // Admission is authoritative and serialized by the control plane, including
+    // across executor replicas. Do this before any application codec or callback.
+    const page = await deps.transport.admit(deps.token, request.run_id);
+    request = { ...request, journal: page.entries, journal_next_sequence: page.next_sequence };
     const decoded = deps.codec ? { ...request,
       input: await decode(deps.codec, request.input ?? null),
       journal: await Promise.all(request.journal.map((entry) => decodeEntry(deps.codec!, entry))),
@@ -534,8 +538,9 @@ export async function runInvocation<Input>(
     const result = await new Invocation(definition, decoded, deps).run();
     return deps.codec && result.type === 'outcome'
       ? { ...result, outcome: await encodeOutcome(deps.codec, result.outcome) } : result;
-  } catch {
-    return { type: 'unavailable', reason: new PayloadCodecError().message };
+  } catch (error) {
+    if (error instanceof StaleLeaseError) return { type: 'stale' };
+    return { type: 'unavailable', reason: error instanceof PayloadCodecError ? error.message : 'Invocation admission unavailable' };
   }
 }
 

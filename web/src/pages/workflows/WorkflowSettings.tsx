@@ -28,6 +28,8 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { problemDetail } from '@/lib/api-problem'
 
 const schema = z.object({
+  max_retained_events: z.number().int().min(1).max(1000000),
+  max_retained_event_bytes: z.number().int().min(1).max(1073741824),
   drain_timeout_secs: z.number().int().min(0).max(3600),
   host_service: z.string(),
   managed_store_service_id: z.string().regex(/^(default|[1-9]\d*)$/),
@@ -73,6 +75,8 @@ export function SettingsForm({
   const form = useForm<Fields>({
     resolver: zodResolver(schema),
     defaultValues: {
+      max_retained_events: settings.max_retained_events,
+      max_retained_event_bytes: settings.max_retained_event_bytes,
       drain_timeout_secs: settings.drain_timeout_secs,
       host_service: settings.host_service ?? '',
       managed_store_service_id:
@@ -114,6 +118,9 @@ export function SettingsForm({
       saving={save.isPending}
       dirty={form.formState.isDirty}
       errors={{
+        'Retained events': form.formState.errors.max_retained_events?.message,
+        'Retained event payload bytes':
+          form.formState.errors.max_retained_event_bytes?.message,
         'Drain timeout': form.formState.errors.drain_timeout_secs?.message,
       }}
       onSubmit={form.handleSubmit((value) => save.mutate(value))}
@@ -121,6 +128,36 @@ export function SettingsForm({
       <Button asChild variant="outline">
         <Link to="/workflows">All workflows</Link>
       </Button>
+      <Field
+        label="Retained events"
+        description="New events are rejected at this count until retention cleanup frees capacity. Existing events are preserved."
+      >
+        {(props) => (
+          <Input
+            {...props}
+            type="number"
+            min={1}
+            max={1000000}
+            {...form.register('max_retained_events', { valueAsNumber: true })}
+          />
+        )}
+      </Field>
+      <Field
+        label="Retained event payload bytes"
+        description="Total plaintext payload bytes retained by this environment. Database and index overhead is additional."
+      >
+        {(props) => (
+          <Input
+            {...props}
+            type="number"
+            min={1}
+            max={1073741824}
+            {...form.register('max_retained_event_bytes', {
+              valueAsNumber: true,
+            })}
+          />
+        )}
+      </Field>
       <Field
         label="Journal storage"
         description="The control-plane database needs no setup. Managed PostgreSQL stores new runs’ journals separately; existing runs keep their original store. Scheduling stays in Temps. Keep the selected database linked and backed up."
