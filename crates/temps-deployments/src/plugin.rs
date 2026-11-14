@@ -462,11 +462,17 @@ impl TempsPlugin for DeploymentsPlugin {
             context.register_service(deployment_token_service.clone());
 
             // Create DatabaseCronConfigService to manage cron jobs
-            let database_cron_service = Arc::new(crate::services::DatabaseCronConfigService::new(
-                db.clone(),
-                queue_service.clone(),
-                deployment_token_service.clone(),
-            ));
+            let database_cron_service = Arc::new(
+                crate::services::DatabaseCronConfigService::new(
+                    db.clone(),
+                    queue_service.clone(),
+                    deployment_token_service.clone(),
+                )
+                .map_err(|error| PluginError::PluginRegistrationFailed {
+                    plugin_name: "deployments".to_string(),
+                    error: error.to_string(),
+                })?,
+            );
             let cron_service =
                 database_cron_service.clone() as Arc<dyn crate::jobs::CronConfigService>;
 

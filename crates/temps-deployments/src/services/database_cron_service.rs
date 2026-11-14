@@ -64,6 +64,22 @@ pub enum CronServiceError {
     #[error("No active deployment found for environment {env_id}")]
     NoActiveDeployment { env_id: i32 },
 
+    /// A stored HTTP cron whose path would not stay on the app's own address.
+    /// The row is kept but never run; the repository's `.temps.yaml` has to be
+    /// fixed and redeployed.
+    #[error(
+        "Cron {cron_id} was not run: its path '{path}' is not accepted ({reason}); fix the \
+         `path` in .temps.yaml and redeploy"
+    )]
+    InvalidCronPath {
+        cron_id: i32,
+        path: String,
+        reason: String,
+    },
+
+    #[error("Could not build the HTTP client for cron requests: {reason}")]
+    HttpClient { reason: String },
+
     #[error("HTTP request failed: {0}")]
     HttpError(#[from] reqwest::Error),
 
@@ -114,7 +130,10 @@ const ALARM_DELIVERY_TIMEOUT: Duration = Duration::from_secs(60);
 /// Database-backed cron configuration service
 pub struct DatabaseCronConfigService {
     db: Arc<DatabaseConnection>,
-    http_client: Arc<reqwest::Client>,
+    /// Never follows a redirect: a cron request goes to the app's own
+    /// container and carries the project's deployment token, and the app (the
+    /// repository's code) chooses what it answers with.
+    http_client: reqwest::Client,
     queue: Arc<dyn temps_core::JobQueue>,
     deployment_token_service: Arc<DeploymentTokenService>,
     /// Raises an alarm (and its notifications) when an invocation fails.
@@ -150,16 +169,24 @@ impl DatabaseCronConfigService {
         db: Arc<DbConnection>,
         queue: Arc<dyn temps_core::JobQueue>,
         deployment_token_service: Arc<DeploymentTokenService>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, CronServiceError> {
+        // A 3xx answer is recorded as the cron's result. Following it would
+        // send the request, and the deployment token, wherever the app points.
+        let http_client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|error| CronServiceError::HttpClient {
+                reason: error.to_string(),
+            })?;
+        Ok(Self {
             db,
-            http_client: Arc::new(reqwest::Client::new()),
+            http_client,
             queue,
             deployment_token_service,
             alarm_service: OnceLock::new(),
             plane: OnceLock::new(),
             workflows: OnceLock::new(),
-        }
+        })
     }
 
     /// Wire in the workflows engine that `workflow` crons start runs on.
@@ -723,13 +750,23 @@ impl DatabaseCronConfigService {
                 return self.dispatch_job(cron, due_at, now).await;
             }
 
-            // Execute the cron
+            // Execute the cron. The address is resolved once, so the URL that
+            // is recorded is the URL that was called.
+            let base_url = self.get_deployment_url(cron).await?;
             let start_time = std::time::Instant::now();
-            let result = self.execute_cron(cron).await;
+            let (result, url) = match Self::cron_request_url(cron, &base_url) {
+                Ok(target) => {
+                    let url = target.to_string();
+                    (self.execute_cron(cron, &url).await, url)
+                }
+                Err(refusal) => {
+                    // The path no longer passes. Nothing is sent; the row stays
+                    // so the failure is visible next to the cron.
+                    error!("{refusal}");
+                    (Err(refusal), base_url)
+                }
+            };
             let execution_time = start_time.elapsed().as_millis() as i32;
-
-            // Get the deployment URL for recording the execution
-            let url = format!("{}{}", self.get_deployment_url(cron).await?, cron.path);
 
             // Record the execution with appropriate status and error message
             let (status_code, error_message, headers) = match &result {
@@ -1183,11 +1220,27 @@ impl DatabaseCronConfigService {
         Ok(url)
     }
 
+    /// The URL an HTTP cron calls: `cron.path` on the app's address `base`.
+    ///
+    /// Crons stored before paths were validated may carry one that would move
+    /// the request to another host. Those are refused here, on every run, not
+    /// only when `.temps.yaml` is read.
+    fn cron_request_url(cron: &crons::Model, base: &str) -> Result<url::Url, CronServiceError> {
+        temps_core::request_path::url_for_request_path(base, &cron.path).map_err(|error| {
+            CronServiceError::InvalidCronPath {
+                cron_id: cron.id,
+                path: cron.path.escape_debug().to_string(),
+                reason: error.to_string(),
+            }
+        })
+    }
+
     async fn execute_cron(
         &self,
         cron: &crons::Model,
+        url: &str,
     ) -> Result<reqwest::Response, CronServiceError> {
-        let url = format!("{}{}", self.get_deployment_url(cron).await?, cron.path);
+        let url = url.to_string();
         debug!("Executing cron {} at {}", cron.id, url);
 
         let mut request = self.http_client.get(&url).header("X-Cron-Job", "true");
@@ -1405,6 +1458,7 @@ mod tests {
             Arc::new(MockQueue),
             create_test_deployment_token_service(db.clone()),
         )
+        .expect("cron service")
     }
 
     #[tokio::test]
@@ -1781,7 +1835,8 @@ mod tests {
         // Create test project and environment
         let (project, environment) = create_test_project_and_environment(db.as_ref()).await?;
 
-        let service = DatabaseCronConfigService::new(db.clone(), queue, token_service);
+        let service =
+            DatabaseCronConfigService::new(db.clone(), queue, token_service).expect("cron service");
 
         let configs = vec![CronConfig {
             workflow: None,
@@ -1818,7 +1873,8 @@ mod tests {
 
         let (project, environment) = create_test_project_and_environment(db.as_ref()).await?;
 
-        let service = DatabaseCronConfigService::new(db.clone(), queue, token_service);
+        let service =
+            DatabaseCronConfigService::new(db.clone(), queue, token_service).expect("cron service");
 
         // Use standard 5-field cron (the format users actually write in .temps.yaml)
         let configs = vec![CronConfig {
@@ -1857,7 +1913,8 @@ mod tests {
         // Create test project and environment
         let (project, environment) = create_test_project_and_environment(db.as_ref()).await?;
 
-        let service = DatabaseCronConfigService::new(db.clone(), queue, token_service);
+        let service =
+            DatabaseCronConfigService::new(db.clone(), queue, token_service).expect("cron service");
 
         // Create initial cron
         let configs = vec![CronConfig {
@@ -1905,7 +1962,8 @@ mod tests {
         // Create test project and environment
         let (project, environment) = create_test_project_and_environment(db.as_ref()).await?;
 
-        let service = DatabaseCronConfigService::new(db.clone(), queue, token_service);
+        let service =
+            DatabaseCronConfigService::new(db.clone(), queue, token_service).expect("cron service");
 
         // Create two crons
         let configs = vec![
@@ -2248,10 +2306,22 @@ mod tests {
         temps_entities::environments::Model,
         crons::Model,
     ) {
+        let port = failing_endpoint().await;
+        cron_fixture_on_port(db, port).await
+    }
+
+    /// Like [`failing_cron_fixture`], with the deployment on `port`.
+    async fn cron_fixture_on_port(
+        db: &Arc<DatabaseConnection>,
+        port: u16,
+    ) -> (
+        temps_entities::projects::Model,
+        temps_entities::environments::Model,
+        crons::Model,
+    ) {
         let (project, environment) = create_test_project_and_environment(db.as_ref())
             .await
             .expect("fixtures");
-        let port = failing_endpoint().await;
 
         let deployment = deployments::ActiveModel {
             project_id: Set(project.id),
@@ -2323,7 +2393,8 @@ mod tests {
             db.clone(),
             queue.clone(),
             create_test_deployment_token_service(db.clone()),
-        );
+        )
+        .expect("cron service");
         service.set_alarm_service(Arc::new(AlarmService::new(
             db.clone(),
             Arc::new(NoopNotificationService),
@@ -2367,6 +2438,134 @@ mod tests {
         );
     }
 
+    /// Answer every connection with `response` and count the connections.
+    async fn counting_endpoint(response: String) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test endpoint");
+        let port = listener.local_addr().expect("local addr").port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut buffer = [0u8; 2048];
+                let _ = socket.read(&mut buffer).await;
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        (port, hits)
+    }
+
+    /// The app answering with a redirect is recorded as the result. The
+    /// request, and the deployment token it carries, is not sent on.
+    #[tokio::test]
+    async fn a_redirect_from_the_app_is_recorded_and_not_followed() {
+        use std::sync::atomic::Ordering;
+        let Ok(test_db) = TestDatabase::with_migrations().await else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        let db = test_db.connection_arc();
+        let (other_port, other_hits) = counting_endpoint(
+            "HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_string(),
+        )
+        .await;
+        let (app_port, app_hits) = counting_endpoint(format!(
+            "HTTP/1.1 302 Found\r\nlocation: http://127.0.0.1:{other_port}/elsewhere\r\n\
+             content-length: 0\r\nconnection: close\r\n\r\n"
+        ))
+        .await;
+        let (_project, _environment, cron) = cron_fixture_on_port(&db, app_port).await;
+        let service = cron_service(&db);
+
+        let result = service.process_cron(&cron, Utc::now()).await;
+        assert!(
+            matches!(
+                result,
+                Err(CronServiceError::ExecutionFailed { status: 302, .. })
+            ),
+            "{result:?}"
+        );
+        assert_eq!(app_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            other_hits.load(Ordering::SeqCst),
+            0,
+            "the redirect target must not be contacted"
+        );
+
+        let latest = cron_executions::Entity::find()
+            .filter(cron_executions::Column::CronId.eq(cron.id))
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("execution recorded");
+        assert_eq!(latest.status_code, 302);
+    }
+
+    /// A cron stored with a path that would leave the app's address (rows
+    /// from before paths were checked) is not run, and no request is made.
+    #[tokio::test]
+    async fn a_stored_cron_path_that_names_another_host_is_not_run() {
+        use std::sync::atomic::Ordering;
+        let Ok(test_db) = TestDatabase::with_migrations().await else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        let db = test_db.connection_arc();
+        let (other_port, other_hits) = counting_endpoint(
+            "HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_string(),
+        )
+        .await;
+        let (app_port, app_hits) = counting_endpoint(
+            "HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_string(),
+        )
+        .await;
+        let (_project, _environment, cron) = cron_fixture_on_port(&db, app_port).await;
+        let bad_path = format!("@127.0.0.1:{other_port}/internal");
+        let cron = crons::ActiveModel {
+            path: Set(bad_path.clone()),
+            ..cron.into()
+        }
+        .update(db.as_ref())
+        .await
+        .expect("cron path update");
+        let service = cron_service(&db);
+
+        let result = service.process_cron(&cron, Utc::now()).await;
+        assert!(
+            matches!(
+                &result,
+                Err(CronServiceError::InvalidCronPath { cron_id, .. }) if *cron_id == cron.id
+            ),
+            "{result:?}"
+        );
+        assert_eq!(
+            app_hits.load(Ordering::SeqCst),
+            0,
+            "nothing sent to the app"
+        );
+        assert_eq!(
+            other_hits.load(Ordering::SeqCst),
+            0,
+            "nothing sent elsewhere"
+        );
+
+        let latest = cron_executions::Entity::find()
+            .filter(cron_executions::Column::CronId.eq(cron.id))
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("the refusal is recorded next to the cron");
+        assert!(
+            !latest.url.contains("/internal"),
+            "the recorded URL is the app's address, not the refused path: {}",
+            latest.url
+        );
+    }
+
     /// A notification provider that never answers must not hold up the
     /// scheduler: the alarm is raised off the scheduler's awaited work.
     #[tokio::test]
@@ -2382,7 +2581,8 @@ mod tests {
             db.clone(),
             queue.clone(),
             create_test_deployment_token_service(db.clone()),
-        );
+        )
+        .expect("cron service");
         service.set_alarm_service(Arc::new(AlarmService::new(
             db.clone(),
             Arc::new(StalledNotificationService),

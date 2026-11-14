@@ -5217,7 +5217,8 @@ pub(crate) mod tests {
                 db.clone(),
                 queue_service.clone(),
                 deployment_token_service,
-            ),
+            )
+            .expect("cron service"),
         );
 
         let remote_deployment_service =
