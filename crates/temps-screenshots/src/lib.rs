@@ -15,6 +15,7 @@ pub mod noop_provider;
 pub mod plugin;
 pub mod provider;
 pub mod remote_provider;
+pub mod request_policy;
 pub mod service;
 
 pub use error::{ScreenshotError, ScreenshotResult};
