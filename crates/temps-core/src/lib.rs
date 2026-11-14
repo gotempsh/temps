@@ -125,6 +125,7 @@ pub mod preview_grant;
 pub mod probe_auth;
 pub mod repo_config;
 mod request_metadata;
+pub mod route_policy;
 pub mod route_table;
 pub mod sealed_request;
 pub mod stages;

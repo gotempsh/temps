@@ -11,10 +11,17 @@ use crate::service::lb_service::LbService;
 
 pub struct AppState {
     pub lb_service: Arc<LbService>,
+    pub audit_service: Arc<dyn temps_core::AuditLogger>,
 }
 
-pub fn create_lb_app_state(lb_service: Arc<LbService>) -> Arc<AppState> {
-    Arc::new(AppState { lb_service })
+pub fn create_lb_app_state(
+    lb_service: Arc<LbService>,
+    audit_service: Arc<dyn temps_core::AuditLogger>,
+) -> Arc<AppState> {
+    Arc::new(AppState {
+        lb_service,
+        audit_service,
+    })
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]

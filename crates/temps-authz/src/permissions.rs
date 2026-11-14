@@ -1131,6 +1131,9 @@ impl Role {
                 Permission::EdgeRulesRead,
                 Permission::WorkflowsRead,
             ],
+            // `LoadBalancerWrite` (custom proxy routes, the instance-wide IP block
+            // list) is deliberately absent: those settings affect every tenant on
+            // the instance, so they are an administrator action.
             Role::User => &[
                 Permission::ProjectsRead,
                 Permission::ProjectsWrite,
@@ -1166,7 +1169,6 @@ impl Role {
                 Permission::GithubWrite,
                 Permission::GithubConnect,
                 Permission::LoadBalancerRead,
-                Permission::LoadBalancerWrite,
                 Permission::LogsRead,
                 Permission::LogsDelete,
                 Permission::MetricsRead,
@@ -1527,6 +1529,29 @@ mod tests {
                 "role {role:?} must not rotate the cluster CA by default"
             );
         }
+    }
+
+    #[test]
+    fn instance_wide_proxy_settings_are_not_writable_by_a_plain_user() {
+        let write = Permission::LoadBalancerWrite;
+        assert_eq!(write.to_string(), "load_balancer:write");
+        assert_eq!(Permission::from_str("load_balancer:write"), Some(write));
+        assert!(Role::Admin.has_permission(&write));
+        assert!(Role::PlatformAdmin.has_permission(&write));
+        for role in [
+            Role::User,
+            Role::Reader,
+            Role::ApiReader,
+            Role::MetricsIngest,
+        ] {
+            assert!(
+                !role.has_permission(&write),
+                "role {role:?} must not change instance-wide proxy routes or the IP block list"
+            );
+        }
+        // Reading the configuration stays available where it was.
+        assert!(Role::User.has_permission(&Permission::LoadBalancerRead));
+        assert!(Role::Reader.has_permission(&Permission::LoadBalancerRead));
     }
 
     #[test]

@@ -2956,6 +2956,86 @@ impl AppSettings {
             .to_ascii_lowercase();
         !preview.is_empty() && preview == host
     }
+
+    /// True when `host` belongs to the platform: a reserved hostname (see
+    /// [`Self::is_reserved_hostname`]) or any name at or below the preview
+    /// domain, where every generated environment and deployment address lives.
+    ///
+    /// Generated names are only composed when the proxy loads its routes, so
+    /// they cannot be looked up in a table. A project domain or an operator
+    /// route that took one would be served in place of the real address, and
+    /// a name that nobody has generated yet can be claimed before it exists.
+    /// A leading `*.` is ignored, so a wildcard below the preview domain counts.
+    pub fn is_platform_hostname(&self, host: &str) -> bool {
+        if self.is_reserved_hostname(host.trim_start_matches("*.")) {
+            return true;
+        }
+        let preview = self
+            .preview_domain
+            .trim()
+            .trim_start_matches("*.")
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        if preview.is_empty() {
+            return false;
+        }
+        let host = host
+            .trim()
+            .trim_start_matches("*.")
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        temps_core::route_policy::is_at_or_below(&host, &preview)
+    }
+}
+
+#[cfg(test)]
+mod platform_hostname_tests {
+    use super::AppSettings;
+
+    fn settings(preview: &str, external_url: Option<&str>) -> AppSettings {
+        AppSettings {
+            preview_domain: preview.to_string(),
+            external_url: external_url.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn names_at_or_below_the_preview_domain_belong_to_the_platform() {
+        let settings = settings("apps.example.com", None);
+        for host in [
+            "apps.example.com",
+            "shop-production.apps.example.com",
+            "Shop-Production.Apps.Example.Com.",
+            "a.b.apps.example.com",
+            "*.apps.example.com",
+        ] {
+            assert!(settings.is_platform_hostname(host), "{host}");
+        }
+        for host in [
+            "example.com",
+            "myapps.example.com",
+            "shop.example.com",
+            "apps.example.org",
+            "shop-production",
+        ] {
+            assert!(!settings.is_platform_hostname(host), "{host}");
+        }
+    }
+
+    #[test]
+    fn a_wildcard_preview_domain_is_read_as_its_base() {
+        let settings = settings("*.apps.example.com", None);
+        assert!(settings.is_platform_hostname("shop.apps.example.com"));
+        assert!(!settings.is_platform_hostname("shop.example.com"));
+    }
+
+    #[test]
+    fn reserved_hostnames_still_count_and_an_empty_preview_claims_nothing() {
+        let settings = settings("", Some("https://console.example.com"));
+        assert!(settings.is_platform_hostname("console.example.com"));
+        assert!(!settings.is_platform_hostname("other.example.com"));
+    }
 }
 
 #[cfg(test)]

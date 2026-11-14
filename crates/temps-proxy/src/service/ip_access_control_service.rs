@@ -19,6 +19,13 @@ use utoipa::ToSchema;
 /// fresh. An admin block list changing within this window is acceptable.
 const BLOCKLIST_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Shortest prefix a block rule may have without an explicit confirmation.
+/// A /8 is 16 million IPv4 addresses; an IPv6 /16 is far larger than any
+/// allocation a single operator would block on purpose. Anything broader is
+/// almost always a typo or a catch-all that takes every visitor offline.
+pub const MIN_BLOCK_PREFIX_V4: u8 = 8;
+pub const MIN_BLOCK_PREFIX_V6: u8 = 16;
+
 #[derive(Error, Debug)]
 pub enum IpAccessControlError {
     #[error("Database error: {0}")]
@@ -35,6 +42,25 @@ pub enum IpAccessControlError {
 
     #[error("Internal error: {0}")]
     Internal(String),
+
+    #[error(
+        "Block rule {rule} covers a /{prefix_len} range, wider than the /{min_prefix_len} minimum \
+         for {family}; resubmit with confirm_broad_range=true if you mean to block this much of \
+         the internet"
+    )]
+    RangeTooBroad {
+        rule: String,
+        prefix_len: u8,
+        min_prefix_len: u8,
+        family: &'static str,
+    },
+
+    #[error(
+        "Block rule {rule} matches your own address {caller_ip}, so you and every other visitor \
+         from it would be refused by the proxy, the console included; resubmit with \
+         acknowledge_lockout=true if that is intended"
+    )]
+    WouldLockOutCaller { rule: String, caller_ip: String },
 }
 
 /// Response model for IP access control rules
@@ -78,6 +104,13 @@ pub struct CreateIpAccessControlRequest {
     /// Optional reason for the action
     #[schema(example = "Malicious activity detected")]
     pub reason: Option<String>,
+    /// Required to save a block rule broader than /8 (IPv4) or /16 (IPv6).
+    #[serde(default)]
+    pub confirm_broad_range: bool,
+    /// Required to save a block rule that matches the address this request
+    /// came from.
+    #[serde(default)]
+    pub acknowledge_lockout: bool,
 }
 
 /// Request to update an IP access control rule
@@ -89,6 +122,59 @@ pub struct UpdateIpAccessControlRequest {
     pub action: Option<String>,
     /// Optional new reason
     pub reason: Option<String>,
+    /// Required when the resulting block rule is broader than /8 (IPv4) or
+    /// /16 (IPv6).
+    #[serde(default)]
+    pub confirm_broad_range: bool,
+    /// Required when the resulting block rule matches the address this
+    /// request came from.
+    #[serde(default)]
+    pub acknowledge_lockout: bool,
+}
+
+/// Refuse a block rule that is unreasonably broad, or that would cut off the
+/// caller, unless the caller said so. Allow rules block nothing and are not
+/// checked. Pure: no database access.
+fn check_block_rule_safety(
+    network: &IpNetwork,
+    action: &str,
+    caller_ip: Option<IpAddr>,
+    confirm_broad_range: bool,
+    acknowledge_lockout: bool,
+) -> Result<(), IpAccessControlError> {
+    if action != "block" {
+        return Ok(());
+    }
+
+    let (min_prefix_len, family) = match network {
+        IpNetwork::V4(_) => (MIN_BLOCK_PREFIX_V4, "IPv4"),
+        IpNetwork::V6(_) => (MIN_BLOCK_PREFIX_V6, "IPv6"),
+    };
+    if network.prefix() < min_prefix_len && !confirm_broad_range {
+        return Err(IpAccessControlError::RangeTooBroad {
+            rule: network.to_string(),
+            prefix_len: network.prefix(),
+            min_prefix_len,
+            family,
+        });
+    }
+
+    if let Some(caller) = caller_ip {
+        // The proxy matches the address it sees; a caller reaching the console
+        // over IPv6 as an IPv4-mapped address is the same visitor.
+        let mapped = match caller {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4),
+            IpAddr::V4(_) => None,
+        };
+        let covered = network.contains(caller) || mapped.is_some_and(|ip| network.contains(ip));
+        if covered && !acknowledge_lockout {
+            return Err(IpAccessControlError::WouldLockOutCaller {
+                rule: network.to_string(),
+                caller_ip: mapped.unwrap_or(caller).to_string(),
+            });
+        }
+    }
+    Ok(())
 }
 
 pub struct IpAccessControlService {
@@ -144,13 +230,13 @@ impl IpAccessControlService {
         &self,
         request: CreateIpAccessControlRequest,
         created_by: Option<i32>,
+        caller_ip: Option<IpAddr>,
     ) -> Result<ip_access_control::Model, IpAccessControlError> {
         // Validate IP address format (basic validation)
-        if !Self::is_valid_ip_or_cidr(&request.ip_address) {
-            return Err(IpAccessControlError::InvalidIpAddress(
-                request.ip_address.clone(),
-            ));
-        }
+        let network = request
+            .ip_address
+            .parse::<IpNetwork>()
+            .map_err(|_| IpAccessControlError::InvalidIpAddress(request.ip_address.clone()))?;
 
         // Validate action
         if request.action != "block" && request.action != "allow" {
@@ -159,6 +245,14 @@ impl IpAccessControlService {
                 request.action
             )));
         }
+
+        check_block_rule_safety(
+            &network,
+            &request.action,
+            caller_ip,
+            request.confirm_broad_range,
+            request.acknowledge_lockout,
+        )?;
 
         // Check for duplicates and insert using raw SQL with proper inet casting
         use sea_orm::{ConnectionTrait, Statement};
@@ -333,9 +427,10 @@ impl IpAccessControlService {
         &self,
         id: i32,
         request: UpdateIpAccessControlRequest,
+        caller_ip: Option<IpAddr>,
     ) -> Result<ip_access_control::Model, IpAccessControlError> {
         // Verify the rule exists
-        let _ = self.get_by_id(id).await?;
+        let existing = self.get_by_id(id).await?;
 
         // Validate inputs
         if let Some(ref ip_address) = request.ip_address {
@@ -351,6 +446,27 @@ impl IpAccessControlService {
                     action
                 )));
             }
+        }
+
+        // Judge the rule as it will be stored, but only when the change can
+        // widen what is blocked. Editing a reason must not be refused because
+        // of a rule that was saved before these checks existed.
+        if request.ip_address.is_some() || request.action.is_some() {
+            let ip = request
+                .ip_address
+                .as_deref()
+                .unwrap_or(&existing.ip_address);
+            let action = request.action.as_deref().unwrap_or(&existing.action);
+            let network = ip
+                .parse::<IpNetwork>()
+                .map_err(|_| IpAccessControlError::InvalidIpAddress(ip.to_string()))?;
+            check_block_rule_safety(
+                &network,
+                action,
+                caller_ip,
+                request.confirm_broad_range,
+                request.acknowledge_lockout,
+            )?;
         }
 
         // Build UPDATE query with proper inet casting
@@ -420,11 +536,11 @@ impl IpAccessControlService {
     }
 
     /// Delete an IP access control rule
-    pub async fn delete(&self, id: i32) -> Result<(), IpAccessControlError> {
+    pub async fn delete(&self, id: i32) -> Result<ip_access_control::Model, IpAccessControlError> {
         let rule = self.get_by_id(id).await?;
-        rule.delete(self.db.as_ref()).await?;
+        rule.clone().delete(self.db.as_ref()).await?;
         self.refresh_blocklist_after_write().await;
-        Ok(())
+        Ok(rule)
     }
 
     /// Validates an IP address or CIDR range for either IPv4 or IPv6, using the
@@ -464,6 +580,161 @@ mod tests {
         assert!(!service.is_blocked("8.8.8.8").await.unwrap());
         // Unparsable IP fails open (not blocked)
         assert!(!service.is_blocked("not-an-ip").await.unwrap());
+    }
+
+    fn net(value: &str) -> IpNetwork {
+        value.parse().unwrap()
+    }
+
+    fn ip(value: &str) -> Option<IpAddr> {
+        Some(value.parse().unwrap())
+    }
+
+    #[test]
+    fn a_catch_all_or_very_broad_block_needs_confirmation() {
+        for broad in ["0.0.0.0/0", "::/0", "10.0.0.0/7", "0.0.0.0/1", "2000::/15"] {
+            assert!(
+                matches!(
+                    check_block_rule_safety(&net(broad), "block", None, false, false),
+                    Err(IpAccessControlError::RangeTooBroad { .. })
+                ),
+                "{broad}"
+            );
+            assert!(
+                check_block_rule_safety(&net(broad), "block", None, true, false).is_ok(),
+                "{broad} with confirmation and no caller"
+            );
+        }
+        // The floor itself and anything narrower pass untouched.
+        for fine in [
+            "10.0.0.0/8",
+            "203.0.113.0/24",
+            "198.51.100.7",
+            "2001:db8::/16",
+            "2001:db8::1",
+        ] {
+            assert!(
+                check_block_rule_safety(&net(fine), "block", None, false, false).is_ok(),
+                "{fine}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rule_that_matches_the_caller_needs_an_acknowledgement() {
+        let caller = ip("203.0.113.9");
+        for covering in ["203.0.113.9", "203.0.113.0/24", "203.0.0.0/16"] {
+            let refused = check_block_rule_safety(&net(covering), "block", caller, false, false);
+            assert!(
+                matches!(
+                    refused,
+                    Err(IpAccessControlError::WouldLockOutCaller { .. })
+                ),
+                "{covering}: {refused:?}"
+            );
+            assert!(check_block_rule_safety(&net(covering), "block", caller, false, true).is_ok());
+        }
+        assert!(
+            check_block_rule_safety(&net("198.51.100.0/24"), "block", caller, false, false).is_ok()
+        );
+    }
+
+    #[test]
+    fn an_ipv4_caller_seen_as_a_mapped_ipv6_address_is_still_the_caller() {
+        let refused = check_block_rule_safety(
+            &net("203.0.113.0/24"),
+            "block",
+            ip("::ffff:203.0.113.9"),
+            false,
+            false,
+        );
+        assert!(
+            matches!(&refused, Err(IpAccessControlError::WouldLockOutCaller { caller_ip, .. })
+                if caller_ip == "203.0.113.9"),
+            "{refused:?}"
+        );
+    }
+
+    #[test]
+    fn a_broad_range_is_reported_before_the_lockout() {
+        // 0.0.0.0/0 covers the caller too; the confirmation comes first so the
+        // operator sees both questions one after the other, not a lockout for a
+        // rule they have not yet agreed is meant to be that wide.
+        assert!(matches!(
+            check_block_rule_safety(&net("0.0.0.0/0"), "block", ip("203.0.113.9"), false, false),
+            Err(IpAccessControlError::RangeTooBroad { .. })
+        ));
+        assert!(matches!(
+            check_block_rule_safety(&net("0.0.0.0/0"), "block", ip("203.0.113.9"), true, false),
+            Err(IpAccessControlError::WouldLockOutCaller { .. })
+        ));
+        assert!(
+            check_block_rule_safety(&net("0.0.0.0/0"), "block", ip("203.0.113.9"), true, true)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn an_allow_rule_blocks_nothing_and_is_not_second_guessed() {
+        assert!(check_block_rule_safety(
+            &net("0.0.0.0/0"),
+            "allow",
+            ip("203.0.113.9"),
+            false,
+            false
+        )
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn create_refuses_a_catch_all_before_it_touches_the_database() {
+        // A MockDatabase with no queued results fails any query, so reaching
+        // the error below proves nothing was read or written.
+        let service = IpAccessControlService::new(Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
+        ));
+        let result = service
+            .create(
+                CreateIpAccessControlRequest {
+                    ip_address: "0.0.0.0/0".to_string(),
+                    action: "block".to_string(),
+                    reason: None,
+                    confirm_broad_range: false,
+                    acknowledge_lockout: false,
+                },
+                Some(1),
+                ip("203.0.113.9"),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(IpAccessControlError::RangeTooBroad { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn create_refuses_a_rule_that_blocks_the_caller() {
+        let service = IpAccessControlService::new(Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
+        ));
+        let result = service
+            .create(
+                CreateIpAccessControlRequest {
+                    ip_address: "203.0.113.0/24".to_string(),
+                    action: "block".to_string(),
+                    reason: None,
+                    confirm_broad_range: false,
+                    acknowledge_lockout: false,
+                },
+                Some(1),
+                ip("203.0.113.9"),
+            )
+            .await;
+        assert!(
+            matches!(&result, Err(IpAccessControlError::WouldLockOutCaller { caller_ip, .. })
+                if caller_ip == "203.0.113.9"),
+            "{result:?}"
+        );
     }
 
     #[tokio::test]

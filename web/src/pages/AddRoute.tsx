@@ -26,6 +26,7 @@ import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { usePlatformCapabilities } from '@/hooks/usePlatformCapabilities'
+import { routeFieldProblem } from '@/lib/proxy-write-problems'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import {
@@ -44,7 +45,7 @@ import {
 } from '@/components/routes/DomainFieldHint'
 import { useEffect, useMemo } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
-import { useNavigate } from 'react-router'
+import { Link, useNavigate } from 'react-router'
 import { toast } from 'sonner'
 import { z } from 'zod'
 
@@ -148,6 +149,17 @@ export function AddRoute() {
     onSuccess: () => {
       toast.success('Route created successfully!')
       navigate('/settings/load-balancer')
+    },
+    // A refusal about the domain or the backend is shown on that field, where
+    // the operator can change it; anything else keeps the failure toast.
+    onError: (error) => {
+      const problem = routeFieldProblem(error)
+      if (problem) {
+        form.setError(problem.field, {
+          type: 'server',
+          message: problem.message,
+        })
+      }
     },
   })
 
@@ -456,6 +468,11 @@ export function AddRoute() {
                           status={managedDomainsStatus}
                           inputType={watchedDomainInputType}
                         />
+                        <span className="mt-1 block">
+                          Names Temps generates for your apps (everything under
+                          the preview domain) and domains a project already uses
+                          cannot be routed here.
+                        </span>
                       </FormDescription>
                       <FormMessage />
                     </FormItem>
@@ -520,7 +537,16 @@ export function AddRoute() {
                           />
                         </FormControl>
                         <FormDescription>
-                          IP address or hostname of your backend service
+                          IP address or hostname of your backend service.
+                          Private, loopback and link-local addresses are refused
+                          unless their network is listed under{' '}
+                          <Link
+                            to="/settings/security"
+                            className="underline underline-offset-2"
+                          >
+                            trusted private networks
+                          </Link>
+                          .
                         </FormDescription>
                         <FormMessage />
                       </FormItem>

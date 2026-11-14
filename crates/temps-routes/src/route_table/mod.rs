@@ -4923,7 +4923,7 @@ mod unavailable_route_tests {
     }
 
     #[tokio::test]
-    async fn live_route_always_wins_over_an_unavailable_entry(
+    async fn a_live_wildcard_route_wins_over_an_unavailable_entry_but_an_exact_custom_route_does_not(
     ) -> Result<(), Box<dyn std::error::Error>> {
         use crate::route_table::UnavailableReason;
 
@@ -4942,12 +4942,12 @@ mod unavailable_route_tests {
         ] {
             insert_environment_domain(&test_db, environment.id, domain).await?;
         }
-        // Operator routes that resolve two of those hosts to a live upstream:
-        // one exact, one through a wildcard.
+        // Operator routes aimed at two of those hosts: one exact, one through
+        // a wildcard.
         for domain in ["shared.example.com", "*.wild.example.com"] {
             custom_routes::ActiveModel {
                 domain: Set(domain.to_string()),
-                host: Set("localhost".to_string()),
+                host: Set("8.8.8.8".to_string()),
                 port: Set(8080),
                 enabled: Set(true),
                 ..Default::default()
@@ -4959,16 +4959,35 @@ mod unavailable_route_tests {
         let route_table = CachedPeerTable::new(test_db.db.clone());
         route_table.load_routes().await?;
 
-        for host in ["shared.example.com", "app.wild.example.com"] {
-            assert!(
-                route_table.get_route_by_host(host).is_some(),
-                "{host} has a live route"
-            );
-            assert!(
-                route_table.get_unavailable_route(host).is_none(),
-                "{host} has a live route and must not be reported unavailable"
-            );
-        }
+        // A wildcard route is the operator's catch-all and is what serves a host
+        // the platform has no live route for.
+        assert!(
+            route_table
+                .get_route_by_host("app.wild.example.com")
+                .is_some(),
+            "a live wildcard route serves the host"
+        );
+        assert!(
+            route_table
+                .get_unavailable_route("app.wild.example.com")
+                .is_none(),
+            "a live route must not be reported unavailable"
+        );
+        // An exact custom route never takes an environment's own hostname, even
+        // while that environment has nothing running: the platform keeps the
+        // name and answers it as unavailable.
+        assert!(
+            route_table
+                .get_route_by_host("shared.example.com")
+                .is_none(),
+            "an exact custom route must not displace an environment address"
+        );
+        assert!(
+            route_table
+                .get_unavailable_route("shared.example.com")
+                .is_some(),
+            "the environment address stays reported as unavailable"
+        );
         assert_unavailable(
             &route_table,
             "only-down.example.com",
