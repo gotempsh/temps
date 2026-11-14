@@ -68,6 +68,9 @@ pub enum PermissionDenialKind {
     ProjectAccess,
     ProjectPermission,
     MissingPrincipal,
+    /// A cookie-authenticated, state-changing request that did not come from
+    /// the console's own origin (see [`crate::same_origin`]).
+    CrossOriginRequest,
 }
 
 impl PermissionDenialKind {
@@ -79,6 +82,7 @@ impl PermissionDenialKind {
             Self::ProjectAccess => "project_access",
             Self::ProjectPermission => "project_permission",
             Self::MissingPrincipal => "missing_principal",
+            Self::CrossOriginRequest => "cross_origin_request",
         }
     }
 }

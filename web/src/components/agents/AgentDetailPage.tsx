@@ -17,7 +17,6 @@ import {
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   ArrowLeft,
-  Copy,
   Cpu,
   Pencil,
   Play,
@@ -352,24 +351,18 @@ function AgentProperties({ agent }: { agent: Agent }) {
                 <label className="text-xs text-muted-foreground">
                   Token (header)
                 </label>
-                <div className="flex items-center gap-2">
-                  <code className="text-xs bg-muted px-2 py-1.5 rounded flex-1">
-                    X-Webhook-Token: {agent.webhook_token ?? '***'}
-                  </code>
-                  {agent.webhook_token && (
-                    <button
-                      type="button"
-                      onClick={() => {
-                        navigator.clipboard.writeText(agent.webhook_token!)
-                        toast.success('Token copied')
-                      }}
-                      className="text-muted-foreground hover:text-foreground p-1"
-                      title="Copy token"
-                    >
-                      <Copy className="h-3.5 w-3.5" />
-                    </button>
-                  )}
-                </div>
+                {/* The server stores only a digest of the token, so reads
+                    answer `***` and there is nothing here to copy. Say so,
+                    and say how to get a working one, rather than offering a
+                    copy button that yields the mask. */}
+                <code className="block text-xs bg-muted px-2 py-1.5 rounded">
+                  X-Webhook-Token: {agent.webhook_token ?? '***'}
+                </code>
+                <p className="text-xs text-muted-foreground">
+                  The token is shown in full only when it is created. Lost it?
+                  Turn the webhook trigger off and save, then on and save again,
+                  to get a new one.
+                </p>
               </div>
               <p className="text-xs text-muted-foreground">
                 Send a POST request with any JSON body. The body is passed as

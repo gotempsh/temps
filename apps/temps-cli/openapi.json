@@ -2186,7 +2186,7 @@
             "type": "string"
           },
           "webhook_token": {
-            "description": "Secret token for the `X-Webhook-Token` header. Shown once when created,\nmasked with `***` prefix in subsequent reads.",
+            "description": "Secret token for the `X-Webhook-Token` header.\n\nReturned in full exactly once, by the request that mints it (creating\nan agent with the webhook trigger on, or turning that trigger on).\nEvery later read is `***`: the row holds only a digest, so the token\ncannot be shown again. Turn the webhook trigger off and on to mint a\nreplacement.",
             "type": [
               "string",
               "null"

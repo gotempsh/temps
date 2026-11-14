@@ -34,6 +34,7 @@ use crate::{
 /// request header block.
 const MAX_AUDIT_USER_AGENT_BYTES: usize = 512;
 use temps_core::CookieCrypto;
+use tracing::warn;
 
 /// Authentication middleware that implements TempsMiddleware
 pub struct AuthMiddleware {
@@ -114,6 +115,12 @@ impl AuthMiddleware {
         next: Next,
     ) -> Result<Response, StatusCode> {
         let mut user = None;
+        // Set only when the credential for this request was a session cookie
+        // read off the wire, which is the only credential a browser attaches
+        // on its own. It gates the same-origin check below; a bearer token
+        // and an `AuthContext` injected by an in-process caller are both
+        // unreachable from a hostile page, so neither is affected.
+        let mut cookie_session = false;
 
         // Extract auth context - simplified to avoid Send issues
         let auth_context = if let Some(auth_header) = req.headers().get("authorization") {
@@ -183,6 +190,7 @@ impl AuthMiddleware {
                         .await
                         .unwrap_or(crate::permissions::Role::User);
                     user = Some(session_user.clone());
+                    cookie_session = true;
 
                     Some(crate::context::AuthContext::new_persisted_session(
                         session_user,
@@ -228,6 +236,35 @@ impl AuthMiddleware {
             })
             .unwrap_or_else(|| (None, "unknown".to_string()));
 
+        // The console's CSRF boundary, enforced once here rather than in each
+        // of the handlers that change state. `SameSite=Strict` keeps the
+        // session cookie off a *cross-site* request but not off a
+        // sibling-subdomain one, and a bodyless, `multipart/form-data` or
+        // plain-text request needs no preflight to ask for. So a request that
+        // authenticated with the session cookie must also prove it came from
+        // this origin before it reaches a handler.
+        if cookie_session
+            && temps_core::same_origin::is_state_changing_method(req.method())
+            && !temps_core::same_origin::request_is_same_origin(req.headers())
+        {
+            warn!(
+                method = %req.method(),
+                route = %route,
+                "Refused a cookie-authenticated request from another origin"
+            );
+            let response = cross_origin_rejection().into_response();
+            record_permission_denial_response(
+                self.permission_denial_recorder.as_ref(),
+                &response,
+                principal,
+                method,
+                route,
+                ip_address,
+                user_agent,
+            );
+            return Ok(response);
+        }
+
         // Run the next middleware/handler
         let response = next.run(req).await;
         record_permission_denial_response(
@@ -242,30 +279,38 @@ impl AuthMiddleware {
         Ok(response)
     }
 
-    /// Extract user session from "session" cookie only (for authentication)
+    /// The session token from the session cookie, host-only name first.
+    ///
+    /// Only this cookie authenticates a user. Preferring `__Host-session`
+    /// over the unprefixed name is what stops a sibling app's planted
+    /// parent-domain cookie standing in for the console's own; see
+    /// [`crate::auth_cookies`].
     fn extract_user_session_from_cookies(
         &self,
         headers: &axum::http::HeaderMap,
         crypto: &temps_core::CookieCrypto,
     ) -> Option<String> {
-        use cookie::Cookie;
-
-        // Iterate through ALL cookie headers (there can be multiple)
-        for cookie_header in headers.get_all("cookie") {
-            if let Ok(cookie_str) = cookie_header.to_str() {
-                // Parse cookies and find the "session" cookie for user authentication
-                for cookie in Cookie::split_parse(cookie_str).filter_map(Result::ok) {
-                    if cookie.name() == "session" {
-                        // Decrypt the session ID - if it fails, treat as no valid session
-                        if let Ok(decrypted_session_id) = crypto.decrypt(cookie.value()) {
-                            return Some(decrypted_session_id);
-                        }
-                    }
-                }
-            }
-        }
-        None
+        crate::auth_cookies::read_sealed(headers, crate::auth_cookies::SESSION, crypto)
     }
+}
+
+/// The console's answer to a cookie-authenticated request from another
+/// origin. Says what to do instead, because a legitimate non-browser caller
+/// that trips this has a supported way through: a bearer token, which no
+/// browser attaches on its own.
+fn cross_origin_rejection() -> temps_core::problemdetails::Problem {
+    temps_core::error_builder::ErrorBuilder::new(StatusCode::FORBIDDEN)
+        .title("Cross-Origin Request Refused")
+        .detail(
+            "This request changes state, authenticated with the session cookie, and did not \
+             come from this origin. Browsers must call the API from the console itself; \
+             programmatic clients should authenticate with an API key or token instead.",
+        )
+        .permission_denial(
+            temps_core::problemdetails::PermissionDenialKind::CrossOriginRequest,
+            None,
+        )
+        .build()
 }
 
 fn record_permission_denial_response(
@@ -666,5 +711,347 @@ mod tests {
                 .0,
             "/projects/{project_id}"
         );
+    }
+
+    /// The console's CSRF boundary, driven through the real routes behind
+    /// this middleware. `/logout` stands in for the ~150 session-reachable
+    /// writes: the decision is made here, before routing, so it does not
+    /// depend on the handler, its body or its content type.
+    mod same_origin_http {
+        use crate::apikey_service::CreateApiKeyRequest;
+        use crate::http_test_support::{
+            auth_state, insert_user, router, send_with_headers, session_cookie,
+        };
+        use axum::http::StatusCode;
+        use temps_test_utils::TestDatabase;
+
+        async fn test_db() -> Option<TestDatabase> {
+            match TestDatabase::with_migrations().await {
+                Ok(db) => Some(db),
+                Err(error)
+                    if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+                {
+                    println!("Docker not available, skipping test: {error}");
+                    None
+                }
+                Err(error) => panic!("test database setup failed: {error}"),
+            }
+        }
+
+        /// `Cookie` header for a fresh session, and the router to send it to.
+        async fn session(db: &TestDatabase) -> (axum::Router, String) {
+            let connection = db.connection_arc();
+            let state = auth_state(connection.clone());
+            let user = insert_user(
+                connection.as_ref(),
+                &format!("origin-{}@example.com", uuid::Uuid::new_v4()),
+            )
+            .await;
+            let cookie = session_cookie(&state, user.id).await;
+            (router(state, connection), cookie)
+        }
+
+        #[tokio::test]
+        async fn a_same_site_sibling_cannot_post_with_the_session_cookie() {
+            let Some(db) = test_db().await else { return };
+            let (router, cookie) = session(&db).await;
+
+            // A page on a sibling subdomain of the console's base domain is
+            // same-site, so the browser attaches the session cookie — and
+            // says so in a header it cannot forge.
+            let (status, body) = send_with_headers(
+                &router,
+                "POST",
+                "/logout",
+                &[
+                    ("cookie", &cookie),
+                    ("host", "console.example"),
+                    ("sec-fetch-site", "same-site"),
+                    ("origin", "https://app.console.example"),
+                ],
+                None,
+            )
+            .await;
+
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert_eq!(body["title"], "Cross-Origin Request Refused");
+        }
+
+        #[tokio::test]
+        async fn a_foreign_origin_cannot_post_with_the_session_cookie() {
+            let Some(db) = test_db().await else { return };
+            let (router, cookie) = session(&db).await;
+
+            // No Fetch Metadata (an older browser): the `Origin` decides.
+            let (status, _) = send_with_headers(
+                &router,
+                "POST",
+                "/logout",
+                &[
+                    ("cookie", &cookie),
+                    ("host", "console.example"),
+                    ("origin", "https://attacker.example"),
+                ],
+                None,
+            )
+            .await;
+
+            assert_eq!(status, StatusCode::FORBIDDEN);
+        }
+
+        #[tokio::test]
+        async fn a_multipart_post_is_refused_without_reaching_the_handler() {
+            let Some(db) = test_db().await else { return };
+            let (router, cookie) = session(&db).await;
+
+            // `multipart/form-data` is a "simple" content type: a hostile
+            // page can send it with no preflight to ask permission for.
+            let (status, _) = send_with_headers(
+                &router,
+                "POST",
+                "/logout",
+                &[
+                    ("cookie", &cookie),
+                    ("host", "console.example"),
+                    ("sec-fetch-site", "same-site"),
+                    ("content-type", "multipart/form-data; boundary=x"),
+                ],
+                None,
+            )
+            .await;
+
+            assert_eq!(status, StatusCode::FORBIDDEN);
+        }
+
+        #[tokio::test]
+        async fn the_console_itself_still_posts() {
+            let Some(db) = test_db().await else { return };
+            let (router, cookie) = session(&db).await;
+
+            let (status, _) = send_with_headers(
+                &router,
+                "POST",
+                "/logout",
+                &[
+                    ("cookie", &cookie),
+                    ("host", "console.example"),
+                    ("sec-fetch-site", "same-origin"),
+                    ("origin", "https://console.example"),
+                ],
+                None,
+            )
+            .await;
+
+            assert_eq!(status, StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn a_matching_origin_without_fetch_metadata_still_posts() {
+            let Some(db) = test_db().await else { return };
+            let (router, cookie) = session(&db).await;
+
+            // TLS terminates in front of Temps, so the scheme the server
+            // sees is not the browser's; only the authority is compared.
+            let (status, _) = send_with_headers(
+                &router,
+                "POST",
+                "/logout",
+                &[
+                    ("cookie", &cookie),
+                    ("host", "console.example:8443"),
+                    ("origin", "https://console.example:8443"),
+                ],
+                None,
+            )
+            .await;
+
+            assert_eq!(status, StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn a_get_is_unaffected_by_a_foreign_origin() {
+            let Some(db) = test_db().await else { return };
+            let (router, cookie) = session(&db).await;
+
+            let (status, body) = send_with_headers(
+                &router,
+                "GET",
+                "/user/me",
+                &[
+                    ("cookie", &cookie),
+                    ("host", "console.example"),
+                    ("sec-fetch-site", "cross-site"),
+                    ("origin", "https://attacker.example"),
+                ],
+                None,
+            )
+            .await;
+
+            assert_eq!(status, StatusCode::OK);
+            assert!(body["email"].is_string());
+        }
+
+        #[tokio::test]
+        async fn a_bearer_token_post_needs_no_origin_headers() {
+            let Some(db) = test_db().await else { return };
+            let connection = db.connection_arc();
+            let state = auth_state(connection.clone());
+            let user = insert_user(connection.as_ref(), "token-caller@example.com").await;
+            let created = state
+                .api_key_service
+                .create_api_key(
+                    user.id,
+                    CreateApiKeyRequest {
+                        name: "cli".to_string(),
+                        role_type: "admin".to_string(),
+                        permissions: None,
+                        expires_at: None,
+                    },
+                )
+                .await
+                .expect("create api key");
+            let router = router(state, connection);
+
+            // No `Origin`, no `Sec-Fetch-Site`, no cookie: a browser cannot
+            // attach this credential, so the check never applies.
+            let (status, _) = send_with_headers(
+                &router,
+                "POST",
+                "/logout",
+                &[("authorization", &format!("Bearer {}", created.api_key))],
+                None,
+            )
+            .await;
+
+            assert_eq!(status, StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn a_non_browser_cookie_client_with_no_origin_still_posts() {
+            let Some(db) = test_db().await else { return };
+            let (router, cookie) = session(&db).await;
+
+            // The acceptance suite and the in-process replay path both log
+            // in with a cookie and send neither header; browsers always
+            // attach `Origin` to a POST, so there is nothing to refuse here.
+            let (status, _) =
+                send_with_headers(&router, "POST", "/logout", &[("cookie", &cookie)], None).await;
+
+            assert_eq!(status, StatusCode::OK);
+        }
+    }
+
+    /// Which session cookie authenticates when a browser holds more than
+    /// one, driven through the real routes behind this middleware.
+    mod session_cookie_name {
+        use crate::http_test_support::{
+            auth_state, host_session_cookie, insert_user, router, send_with_headers, session_cookie,
+        };
+        use axum::extract::Request;
+        use axum::http::StatusCode;
+        use temps_test_utils::TestDatabase;
+        use tower::ServiceExt;
+
+        async fn test_db() -> Option<TestDatabase> {
+            match TestDatabase::with_migrations().await {
+                Ok(db) => Some(db),
+                Err(error)
+                    if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+                {
+                    println!("Docker not available, skipping test: {error}");
+                    None
+                }
+                Err(error) => panic!("test database setup failed: {error}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn the_host_only_cookie_wins_over_a_planted_one() {
+            let Some(db) = test_db().await else { return };
+            let connection = db.connection_arc();
+            let state = auth_state(connection.clone());
+
+            // The attacker owns an account and a sibling app, and plants
+            // their own sealed session on the console's parent domain. The
+            // browser sends both cookies; only the host-only one is theirs
+            // to set, and that is the one that must count.
+            let attacker = insert_user(connection.as_ref(), "planted@example.com").await;
+            let owner = insert_user(connection.as_ref(), "owner@example.com").await;
+            let planted = session_cookie(&state, attacker.id).await;
+            let host_only = host_session_cookie(&state, owner.id).await;
+            let router = router(state, connection);
+
+            for cookie in [
+                format!("{planted}; {host_only}"),
+                format!("{host_only}; {planted}"),
+            ] {
+                let (status, body) =
+                    send_with_headers(&router, "GET", "/user/me", &[("cookie", &cookie)], None)
+                        .await;
+
+                assert_eq!(status, StatusCode::OK, "{cookie}");
+                assert_eq!(body["email"], "owner@example.com", "{cookie}");
+            }
+        }
+
+        #[tokio::test]
+        async fn a_session_issued_before_the_prefix_still_authenticates() {
+            let Some(db) = test_db().await else { return };
+            let connection = db.connection_arc();
+            let state = auth_state(connection.clone());
+            let user = insert_user(connection.as_ref(), "upgraded@example.com").await;
+            let cookie = session_cookie(&state, user.id).await;
+            let router = router(state, connection);
+
+            // The unprefixed name is also what a plain-HTTP install issues,
+            // so this fallback is permanent, not only an upgrade grace.
+            let (status, body) =
+                send_with_headers(&router, "GET", "/user/me", &[("cookie", &cookie)], None).await;
+
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["email"], "upgraded@example.com");
+        }
+
+        #[tokio::test]
+        async fn signing_out_clears_the_cookie_under_both_names() {
+            let Some(db) = test_db().await else { return };
+            let connection = db.connection_arc();
+            let state = auth_state(connection.clone());
+            let user = insert_user(connection.as_ref(), "signing-out@example.com").await;
+            let cookie = host_session_cookie(&state, user.id).await;
+            let router = crate::http_test_support::router(state, connection);
+
+            let response = router
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/logout")
+                        .header("cookie", &cookie)
+                        .body(axum::body::Body::empty())
+                        .expect("request builds"),
+                )
+                .await
+                .expect("route");
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let cleared: Vec<&str> = response
+                .headers()
+                .get_all(axum::http::header::SET_COOKIE)
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .collect();
+            // Leaving either name set is how a logout loop starts: the
+            // browser keeps sending a cookie the server has revoked.
+            assert!(
+                cleared
+                    .iter()
+                    .any(|value| value.starts_with("__Host-session=;")),
+                "{cleared:?}"
+            );
+            assert!(
+                cleared.iter().any(|value| value.starts_with("session=;")),
+                "{cleared:?}"
+            );
+        }
     }
 }

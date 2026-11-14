@@ -14,6 +14,7 @@ mod apikey_plugin;
 mod apikey_service;
 mod apikey_types;
 mod audit;
+mod auth_cookies;
 mod auth_service;
 mod avatar;
 pub mod cli_auth_handler;
@@ -25,6 +26,7 @@ pub mod handlers;
 mod http_test_support;
 pub mod ingress_grants;
 mod last_used_throttle;
+mod login_guard;
 mod mfa_guard;
 mod middleware;
 /// Public so other plugins (e.g. `temps-cloud`'s managed console-access

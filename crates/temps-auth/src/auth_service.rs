@@ -6,7 +6,6 @@ use argon2::{PasswordHasher, PasswordVerifier};
 use axum::http::header::SET_COOKIE;
 use axum::http::HeaderMap;
 use chrono::{Duration, Utc};
-use cookie::Cookie;
 use rand::RngExt;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
@@ -216,17 +215,35 @@ impl PasswordTokenPurpose {
     }
 
     /// The value persisted in `users.password_reset_token` for `token`.
+    ///
+    /// The token itself is never stored: the column keeps the purpose tag
+    /// and a SHA-256 digest, the same at-rest form API keys, deployment
+    /// tokens and node tokens already use. Whoever can read the column --
+    /// a database dump, a backup, a read-only replica -- cannot turn its
+    /// contents back into a credential that sets somebody's password.
+    ///
+    /// Lookups stay exact-match on this value, so hashing costs nothing: a
+    /// presented token is tagged and hashed the same way and compared as a
+    /// whole string.
     pub(crate) fn stored_value(self, token: &str) -> String {
-        format!("{}{}", self.prefix(), token)
+        format!("{}{}", self.prefix(), temps_core::crypto::sha256_hex(token))
     }
 }
 
-/// Whether `token` has the shape of an untagged credential written before
-/// purpose tags existed. Generated tokens are UUIDs and never contain `:`; a
-/// presented value with `:` is refused here so it can never be matched against
-/// a tagged row through the legacy lookup.
-fn is_legacy_password_token_shape(token: &str) -> bool {
-    !token.is_empty() && !token.contains(':')
+/// The value `sessions.session_token` holds for a session whose cookie
+/// carries `presented`.
+///
+/// Defence in depth. The cookie already carries the token sealed with
+/// `CookieCrypto`, so reading it off the wire is not the threat; reading the
+/// *column* is -- a database dump, a backup, a read-only replica or a query
+/// that returns more than it meant to. Storing the digest means what the
+/// column holds cannot be pasted into a cookie, the same at-rest form API
+/// keys, deployment tokens and node tokens already use.
+///
+/// Every lookup is exact-match on this value, so the index on the column
+/// keeps working and nothing scans.
+pub(crate) fn stored_session_token(presented: &str) -> String {
+    temps_core::crypto::sha256_hex(presented)
 }
 
 pub struct AuthService {
@@ -295,7 +312,7 @@ impl AuthService {
 
         let new_session = temps_entities::sessions::ActiveModel {
             user_id: Set(user_id),
-            session_token: Set(session_token.clone()),
+            session_token: Set(stored_session_token(&session_token)),
             expires_at: Set(expires_at),
             // Fully authenticated session, not an MFA challenge.
             mfa_pending: Set(false),
@@ -342,7 +359,10 @@ impl AuthService {
         session_token: &str,
     ) -> Result<VerifiedSession, AuthError> {
         let session = temps_entities::sessions::Entity::find()
-            .filter(temps_entities::sessions::Column::SessionToken.eq(session_token))
+            .filter(
+                temps_entities::sessions::Column::SessionToken
+                    .eq(stored_session_token(session_token)),
+            )
             .filter(temps_entities::sessions::Column::ExpiresAt.gt(Utc::now()))
             // A first-factor-only MFA challenge row must never authenticate a
             // real request. Only `verify_mfa_challenge` may consume those.
@@ -370,22 +390,17 @@ impl AuthService {
             .collect()
     }
 
+    /// `Set-Cookie` headers that start an authenticated browser session.
+    ///
+    /// Over https the cookie is host-only (`__Host-session`), so an app on a
+    /// sibling subdomain cannot plant one of the same name for the console's
+    /// host; see [`crate::auth_cookies`]. The pending-challenge cookie is
+    /// cleared at the same time, under both names.
     pub fn create_session_cookie(&self, session_token: &str, is_https: bool) -> HeaderMap {
-        let session_cookie = Cookie::build(("session", session_token))
-            .http_only(true)
-            .path("/")
-            .max_age(cookie::time::Duration::days(7))
-            .same_site(cookie::SameSite::Strict)
-            .secure(is_https)
-            .build();
-
-        let mfa_clear_cookie = Cookie::build(("mfa_session", ""))
-            .http_only(true)
-            .path("/")
-            .max_age(cookie::time::Duration::seconds(0))
-            .same_site(cookie::SameSite::Strict)
-            .secure(is_https)
-            .build();
+        let session_cookie =
+            crate::auth_cookies::builder(crate::auth_cookies::SESSION, session_token, is_https)
+                .max_age(cookie::time::Duration::days(7))
+                .build();
 
         debug!("Setting session cookie (token redacted)");
         let mut headers = HeaderMap::new();
@@ -394,10 +409,8 @@ impl AuthService {
         } else {
             error!("Failed to parse session cookie header value");
         }
-        if let Ok(value) = mfa_clear_cookie.to_string().parse() {
+        for value in crate::auth_cookies::clearing_values(crate::auth_cookies::MFA_SESSION) {
             headers.append(SET_COOKIE, value);
-        } else {
-            error!("Failed to parse MFA clear cookie header value");
         }
         headers
     }
@@ -467,7 +480,7 @@ impl AuthService {
 
         let new_session = temps_entities::sessions::ActiveModel {
             user_id: Set(user_id),
-            session_token: Set(session_token.clone()),
+            session_token: Set(stored_session_token(&session_token)),
             expires_at: Set(expires_at),
             // Mark this as a pending MFA challenge so it can never be replayed
             // as a real session cookie -- `verify_session` rejects such rows.
@@ -501,7 +514,10 @@ impl AuthService {
         session_token: &str,
     ) -> Result<Option<String>, AuthError> {
         let session = temps_entities::sessions::Entity::find()
-            .filter(temps_entities::sessions::Column::SessionToken.eq(session_token))
+            .filter(
+                temps_entities::sessions::Column::SessionToken
+                    .eq(stored_session_token(session_token)),
+            )
             .filter(temps_entities::sessions::Column::ExpiresAt.gt(Utc::now()))
             .filter(temps_entities::sessions::Column::MfaPending.eq(true))
             .one(self.db.as_ref())
@@ -627,7 +643,10 @@ impl AuthService {
                     // real (fully authenticated) session token can never be spent as an
                     // MFA challenge -- the discriminator cuts both ways.
                     let pending = temps_entities::sessions::Entity::find()
-                        .filter(temps_entities::sessions::Column::SessionToken.eq(&session_token))
+                        .filter(
+                            temps_entities::sessions::Column::SessionToken
+                                .eq(stored_session_token(&session_token)),
+                        )
                         .filter(temps_entities::sessions::Column::ExpiresAt.gt(Utc::now()))
                         .filter(temps_entities::sessions::Column::MfaPending.eq(true))
                         .one(transaction)
@@ -901,6 +920,32 @@ impl AuthService {
     }
 
     // Login with email/password
+    /// Count one rejected password attempt against the account.
+    ///
+    /// Never fails the login with it: a write error here must not turn a
+    /// wrong password into a 500 for a real account next to a 401 for an
+    /// unknown one, which is exactly the account-existence oracle the
+    /// throttle is built to avoid. A lost count is logged and the throttle
+    /// simply does not tighten.
+    async fn record_login_failure_for_throttle(&self, user_id: i32) {
+        match crate::login_guard::record_failure(self.db.as_ref(), user_id).await {
+            Ok((failed_attempts, Some(until))) => warn!(
+                user_id,
+                failed_attempts,
+                throttled_until = %until.to_rfc3339(),
+                "Password login throttled for this account after repeated failures"
+            ),
+            Ok((failed_attempts, None)) => debug!(
+                user_id,
+                failed_attempts, "Recorded a rejected password attempt for this account"
+            ),
+            Err(error) => error!(
+                user_id, %error,
+                "Failed to record a rejected password attempt; the per-account throttle did not tighten"
+            ),
+        }
+    }
+
     pub async fn login(
         &self,
         request: LoginRequest,
@@ -908,27 +953,52 @@ impl AuthService {
         // Every rejection below costs one Argon2 verification, the same as a
         // wrong password for a real account, so response time does not
         // reveal whether the email exists or has a password.
-        let user = match temps_entities::users::Entity::find()
+        let found = temps_entities::users::Entity::find()
             .filter(temps_entities::users::Column::Email.eq(request.email.to_lowercase()))
             .filter(temps_entities::users::Column::DeletedAt.is_null())
             .one(self.db.as_ref())
-            .await?
-        {
-            Some(user) => user,
-            None => {
-                verify_against_dummy_hash(&request.password);
-                warn!(
-                    "Login attempt for non-existent or deleted email: {}",
-                    request.email
-                );
-                return Err(UserAuthError::InvalidCredentials);
-            }
+            .await?;
+
+        // Read the per-account throttle for every attempt, against an id no
+        // row can have when the email matched nothing
+        // (`crate::login_guard`). Looking it up only for accounts that exist
+        // would let the response time say which is which.
+        let throttled_until = crate::login_guard::locked_until(
+            self.db.as_ref(),
+            found
+                .as_ref()
+                .map_or(crate::login_guard::NO_SUCH_USER, |user| user.id),
+        )
+        .await?;
+
+        let Some(user) = found else {
+            verify_against_dummy_hash(&request.password);
+            warn!(
+                "Login attempt for non-existent or deleted email: {}",
+                request.email
+            );
+            return Err(UserAuthError::InvalidCredentials);
         };
+
+        // Past the threshold the password is not evaluated at all, and the
+        // answer is the one a wrong password gets. Nothing is counted here,
+        // so an attacker cannot extend somebody else's backoff by keeping
+        // the attempts coming.
+        if let Some(until) = throttled_until {
+            verify_against_dummy_hash(&request.password);
+            warn!(
+                user_id = user.id,
+                throttled_until = %until.to_rfc3339(),
+                "Refused a password login while the account is throttled after repeated failures"
+            );
+            return Err(UserAuthError::InvalidCredentials);
+        }
 
         // Check if user has a password (might be GitHub-only user)
         let Some(password_hash) = user.password_hash.as_ref() else {
             verify_against_dummy_hash(&request.password);
             warn!("Login attempt for user {} with no password hash", user.id);
+            self.record_login_failure_for_throttle(user.id).await;
             return Err(UserAuthError::InvalidCredentials);
         };
 
@@ -962,7 +1032,14 @@ impl AuthService {
 
         if !password_valid {
             warn!("Invalid password attempt for user {}", user.id);
+            self.record_login_failure_for_throttle(user.id).await;
             return Err(UserAuthError::InvalidCredentials);
+        }
+
+        // The password was right, so this account is not under attack from
+        // whoever just used it: start the count again.
+        if let Err(error) = crate::login_guard::record_success(self.db.as_ref(), user.id).await {
+            error!(user_id = user.id, %error, "Failed to clear the login throttle after a successful password");
         }
 
         // A required password change is completed before role-based MFA
@@ -1133,25 +1210,21 @@ impl AuthService {
                     // every rejection path is rolled back before this method returns.
                     //
                     // Only email-reset credentials are accepted: a first-login token
-                    // (minted after a temporary-password sign-in) is never valid here.
-                    // An untagged value predates purpose tags and is accepted only on
-                    // an account that is not awaiting a forced change: first-login
-                    // tokens exist only while `must_change_password` is set, so such
-                    // a value can only be an in-flight email reset from before the
-                    // upgrade.
-                    let column = temps_entities::users::Column::PasswordResetToken;
-                    let mut matches = sea_orm::Condition::any().add(
-                        column.eq(PasswordTokenPurpose::EmailReset.stored_value(&request.token)),
-                    );
-                    if is_legacy_password_token_shape(&request.token) {
-                        matches = matches.add(
-                            sea_orm::Condition::all()
-                                .add(column.eq(request.token.as_str()))
-                                .add(temps_entities::users::Column::MustChangePassword.eq(false)),
-                        );
-                    }
+                    // (minted after a temporary-password sign-in) is never valid here,
+                    // because the purpose tag is part of the stored value.
+                    //
+                    // There is no second branch for an untagged value. One used to
+                    // accept tokens written before purpose tags existed, by comparing
+                    // the presented token with the column; now that the column holds a
+                    // digest, such a comparison would both never match and be the one
+                    // lookup that a stolen column value could satisfy. The migration
+                    // that introduced hashing clears every outstanding token, so the
+                    // rows it existed for are gone.
                     let user = temps_entities::users::Entity::find()
-                        .filter(matches)
+                        .filter(
+                            temps_entities::users::Column::PasswordResetToken
+                                .eq(PasswordTokenPurpose::EmailReset.stored_value(&request.token)),
+                        )
                         .lock_exclusive()
                         .one(transaction)
                         .await?
@@ -1453,7 +1526,9 @@ impl AuthService {
             let mut q = temps_entities::sessions::Entity::delete_many()
                 .filter(temps_entities::sessions::Column::UserId.eq(user_id));
             if let Some(tok) = current_session_token {
-                q = q.filter(temps_entities::sessions::Column::SessionToken.ne(tok));
+                q = q.filter(
+                    temps_entities::sessions::Column::SessionToken.ne(stored_session_token(tok)),
+                );
             }
             revoked_sessions = q
                 .exec(&txn)
@@ -2098,13 +2173,21 @@ mod tests {
         assert!(!session_token.is_empty());
         assert_eq!(session_token.len(), 64); // Session token should be 64 chars
 
-        // Verify session was saved to database
+        // The row holds the token's digest, not the token: the column is
+        // not a place a session cookie can be read out of.
         let session = sessions::Entity::find()
-            .filter(sessions::Column::SessionToken.eq(&session_token))
+            .filter(sessions::Column::SessionToken.eq(stored_session_token(&session_token)))
             .one(db.db.as_ref())
             .await
             .unwrap()
             .unwrap();
+        assert_ne!(session.session_token, session_token);
+        assert!(sessions::Entity::find()
+            .filter(sessions::Column::SessionToken.eq(&session_token))
+            .one(db.db.as_ref())
+            .await
+            .unwrap()
+            .is_none());
 
         assert_eq!(session.user_id, user.id);
         assert!(session.expires_at > Utc::now());
@@ -2285,13 +2368,49 @@ mod tests {
         let session_token = "test_session_token";
         let headers = auth_service.create_session_cookie(session_token, true);
 
-        let cookies: Vec<_> = headers.get_all(SET_COOKIE).iter().collect();
-        assert_eq!(cookies.len(), 2); // session and mfa_session cookies
+        let cookies: Vec<String> = headers
+            .get_all(SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().unwrap().to_string())
+            .collect();
+        // The session cookie, plus the pending-challenge cookie cleared
+        // under both of its names.
+        assert_eq!(cookies.len(), 3, "{cookies:?}");
 
-        let session_cookie = cookies[0].to_str().unwrap();
-        assert!(session_cookie.contains("session=test_session_token"));
+        // Host-only over https: a sibling app cannot plant this name, and
+        // the browser only keeps it with these exact attributes.
+        let session_cookie = &cookies[0];
+        assert!(
+            session_cookie.starts_with("__Host-session=test_session_token"),
+            "{session_cookie}"
+        );
         assert!(session_cookie.contains("HttpOnly"));
         assert!(session_cookie.contains("Secure"));
+        assert!(session_cookie.contains("Path=/"));
+        assert!(session_cookie.contains("SameSite=Strict"));
+        assert!(!session_cookie.contains("Domain"), "{session_cookie}");
+    }
+
+    /// Browsers refuse a `__Host-` cookie without `Secure`, so an install
+    /// served over plain HTTP must still be issued the unprefixed name or
+    /// nobody can sign in at all.
+    #[tokio::test]
+    async fn a_plain_http_request_is_issued_the_unprefixed_session_cookie() {
+        let (_db, auth_service, _) = setup_test_env().await;
+
+        let headers = auth_service.create_session_cookie("plain_http_token", false);
+        let session_cookie = headers
+            .get_all(SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .find(|value| value.contains("plain_http_token"))
+            .expect("a session cookie is issued");
+
+        assert!(
+            session_cookie.starts_with("session=plain_http_token"),
+            "{session_cookie}"
+        );
+        assert!(!session_cookie.contains("Secure"), "{session_cookie}");
     }
 
     // Regression: verify_mfa_challenge handler must `append` (not `insert`) the
@@ -2304,17 +2423,17 @@ mod tests {
 
         let mut response_headers = auth_service.create_session_cookie("session_tok", true);
         let pre_count = response_headers.get_all(SET_COOKIE).iter().count();
-        assert_eq!(pre_count, 2, "session_cookie + mfa_session clear");
+        assert_eq!(
+            pre_count, 3,
+            "session_cookie + mfa_session clear under both names"
+        );
 
         // Simulate the exact merge done in verify_mfa_challenge handler:
         // append a fresh mfa_session=; Max-Age=0 cookie.
-        let clear_mfa_cookie = Cookie::build(("mfa_session", ""))
-            .http_only(true)
-            .path("/")
-            .max_age(cookie::time::Duration::seconds(0))
-            .same_site(cookie::SameSite::Strict)
-            .secure(true)
-            .build();
+        let clear_mfa_cookie =
+            crate::auth_cookies::builder(crate::auth_cookies::MFA_SESSION, "", true)
+                .max_age(cookie::time::Duration::seconds(0))
+                .build();
         response_headers.append(SET_COOKIE, clear_mfa_cookie.to_string().parse().unwrap());
 
         let cookies: Vec<String> = response_headers
@@ -2369,9 +2488,10 @@ mod tests {
         let headers = HeaderMap::new();
         auth_service.logout(user.id, &headers).await.unwrap();
 
-        // Verify session was deleted
+        // Verify session was deleted. Look it up the way the column stores
+        // it, or the assertion would hold whether or not the row is gone.
         let session = sessions::Entity::find()
-            .filter(sessions::Column::SessionToken.eq(&session_token))
+            .filter(sessions::Column::SessionToken.eq(stored_session_token(&session_token)))
             .one(db.db.as_ref())
             .await
             .unwrap();
@@ -2739,7 +2859,7 @@ mod tests {
             .unwrap();
 
         assert!(sessions::Entity::find()
-            .filter(sessions::Column::SessionToken.eq(&earlier_session))
+            .filter(sessions::Column::SessionToken.eq(stored_session_token(&earlier_session)))
             .one(db.db.as_ref())
             .await
             .unwrap()
@@ -2783,7 +2903,7 @@ mod tests {
             .unwrap();
         assert_eq!(remaining_sessions, 0, "existing sessions must be revoked");
         assert!(sessions::Entity::find()
-            .filter(sessions::Column::SessionToken.eq(&session_token))
+            .filter(sessions::Column::SessionToken.eq(stored_session_token(&session_token)))
             .one(db.db.as_ref())
             .await
             .unwrap()
@@ -3307,47 +3427,75 @@ mod tests {
             .unwrap();
     }
 
-    /// Reset emails sent before the upgrade stored the token untagged. They
-    /// keep working for accounts not awaiting a forced change (the only state
-    /// in which an untagged value can be an email reset), and nowhere else.
+    /// The column holds a digest, so what it holds is not a credential.
+    ///
+    /// This replaces a test that asserted the opposite for untagged values
+    /// written before purpose tags existed: that lookup compared the
+    /// presented token with the column, which is exactly the comparison a
+    /// stolen column value could satisfy. The migration that introduced
+    /// hashing clears every outstanding token, so no row it served survives.
     #[tokio::test]
-    async fn legacy_untagged_email_reset_token_remains_valid_only_without_forced_change() {
+    async fn a_value_read_out_of_the_column_cannot_be_redeemed() {
         let (db, auth_service, _) = setup_test_env().await;
-        let user = create_test_user(&db.db, "legacy-reset@example.com", "OldPassword123!").await;
-        let legacy_token = Uuid::new_v4().to_string();
-        let mut user_update: users::ActiveModel = user.clone().into();
-        user_update.password_reset_token = Set(Some(legacy_token.clone()));
-        user_update.password_reset_expires = Set(Some(Utc::now() + Duration::hours(1)));
-        user_update.must_change_password = Set(true);
-        let flagged = user_update.update(db.db.as_ref()).await.unwrap();
+        let user = create_test_user(&db.db, "stolen-column@example.com", "OldPassword123!").await;
 
-        // Ambiguous while the account awaits a forced change: refused by both flows.
+        let token = auth_service.generate_token();
+        let mut user_update: users::ActiveModel = user.clone().into();
+        user_update.password_reset_token =
+            Set(Some(PasswordTokenPurpose::EmailReset.stored_value(&token)));
+        user_update.password_reset_expires = Set(Some(Utc::now() + Duration::hours(1)));
+        let stored = user_update.update(db.db.as_ref()).await.unwrap();
+
+        // What is on disk is neither the token nor usable as one.
+        let on_disk = stored.password_reset_token.clone().unwrap();
+        assert!(!on_disk.contains(&token), "{on_disk}");
+        for presented in [on_disk.clone(), temps_core::crypto::sha256_hex(&token)] {
+            assert!(
+                matches!(
+                    auth_service
+                        .reset_password(ResetPasswordRequest {
+                            token: presented.clone(),
+                            new_password: "Stolen-Column-123!".to_string(),
+                        })
+                        .await,
+                    Err(UserAuthError::InvalidToken)
+                ),
+                "{presented}"
+            );
+        }
+
+        // An untagged plaintext value, as rows written before purpose tags
+        // held, is refused too: there is no lookup left that compares the
+        // presented token with the column.
+        let mut user_update: users::ActiveModel = stored.into();
+        user_update.password_reset_token = Set(Some(token.clone()));
+        user_update.must_change_password = Set(false);
+        user_update.update(db.db.as_ref()).await.unwrap();
         assert!(matches!(
             auth_service
                 .reset_password(ResetPasswordRequest {
-                    token: legacy_token.clone(),
-                    new_password: "Legacy-Reset-123!".to_string(),
-                })
-                .await,
-            Err(UserAuthError::InvalidToken)
-        ));
-        assert!(matches!(
-            auth_service
-                .reset_required_password(ResetPasswordRequest {
-                    token: legacy_token.clone(),
-                    new_password: "Legacy-Reset-123!".to_string(),
+                    token: token.clone(),
+                    new_password: "Stolen-Column-123!".to_string(),
                 })
                 .await,
             Err(UserAuthError::InvalidToken)
         ));
 
-        let mut user_update: users::ActiveModel = flagged.into();
-        user_update.must_change_password = Set(false);
+        // The emailed token itself still works, against the digest.
+        let mut user_update: users::ActiveModel = users::Entity::find_by_id(user.id)
+            .one(db.db.as_ref())
+            .await
+            .unwrap()
+            .unwrap()
+            .into();
+        user_update.password_reset_token =
+            Set(Some(PasswordTokenPurpose::EmailReset.stored_value(&token)));
+        user_update.password_reset_expires = Set(Some(Utc::now() + Duration::hours(1)));
         user_update.update(db.db.as_ref()).await.unwrap();
         let reset = auth_service
             .reset_password(ResetPasswordRequest {
-                token: legacy_token,
-                new_password: "Legacy-Reset-123!".to_string(),
+                token,
+                new_password: "Stolen-Column-123!".to_string(),
             })
             .await
             .unwrap();
@@ -3359,10 +3507,13 @@ mod tests {
         let (db, auth_service, _) = setup_test_env().await;
         let user = create_test_user(&db.db, "user@example.com", "oldpassword").await;
 
-        // Set expired reset token
+        // Set expired reset token, stored the way the service stores it so
+        // this test fails on the expiry check and not on a lookup miss.
         let reset_token = Uuid::new_v4().to_string();
         let mut user_update: users::ActiveModel = user.into();
-        user_update.password_reset_token = Set(Some(reset_token.clone()));
+        user_update.password_reset_token = Set(Some(
+            PasswordTokenPurpose::EmailReset.stored_value(&reset_token),
+        ));
         user_update.password_reset_expires = Set(Some(Utc::now() - Duration::hours(1)));
         user_update.update(db.db.as_ref()).await.unwrap();
 
@@ -3452,13 +3603,15 @@ mod tests {
 
         assert!(!mfa_session_token.is_empty());
 
-        // Verify MFA session was created with short expiration
+        // Verify MFA session was created with short expiration. The row
+        // holds the challenge token's digest, not the token.
         let session = sessions::Entity::find()
-            .filter(sessions::Column::SessionToken.eq(&mfa_session_token))
+            .filter(sessions::Column::SessionToken.eq(stored_session_token(&mfa_session_token)))
             .one(db.db.as_ref())
             .await
             .unwrap()
             .unwrap();
+        assert_ne!(session.session_token, mfa_session_token);
 
         assert_eq!(session.user_id, user.id);
 
@@ -4269,10 +4422,18 @@ mod tests {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             // 1) `find().filter(email...)` in login() -> the user above
             .append_query_results(vec![vec![user]])
-            // 2) `get_settings()`'s `settings::Entity::find_by_id(1)` -> DB error
+            // 2) `login_guard::locked_until` -> no row, so not throttled
+            .append_query_results(vec![Vec::<temps_entities::user_login_guards::Model>::new()])
+            // 3) `get_settings()`'s `settings::Entity::find_by_id(1)` -> DB error
             .append_query_errors(vec![sea_orm::DbErr::Custom(
                 "connection reset by peer".to_string(),
             )])
+            // `login_guard::record_success` clears the throttle on the way
+            // through; it writes nothing when there is nothing to clear.
+            .append_exec_results(vec![sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 0,
+            }])
             .into_connection();
 
         let notification_service = Arc::new(MockEmailService::new());
@@ -4408,7 +4569,7 @@ mod tests {
         );
 
         let pending = sessions::Entity::find()
-            .filter(sessions::Column::SessionToken.eq(&challenge))
+            .filter(sessions::Column::SessionToken.eq(stored_session_token(&challenge)))
             .one(db.db.as_ref())
             .await
             .unwrap();
@@ -4706,5 +4867,250 @@ mod tests {
             before + 2,
             "a real account verifies against its own hash, not the dummy"
         );
+    }
+
+    /// Session tokens are stored as a digest, so the column cannot be
+    /// replayed as a cookie.
+    mod session_token_at_rest {
+        use super::*;
+        use sea_orm::ConnectionTrait;
+
+        /// The migration that introduced hashing computes the digest in SQL
+        /// (`encode(sha256(convert_to(t, 'UTF8')), 'hex')`) while every
+        /// lookup computes it in Rust. If the two ever disagreed, the
+        /// upgrade would sign every user out, so pin them against each
+        /// other here, where both are reachable.
+        #[tokio::test]
+        async fn the_stored_digest_is_what_the_database_computes() {
+            let Some((db, _auth_service)) = setup_test_env_with_mfa_setting(false).await else {
+                return;
+            };
+
+            for token in [
+                "plain-token",
+                "",
+                "tok3n-with-sym/bols+and=padding",
+                // Non-ASCII, because `convert_to(.., 'UTF8')` and Rust's
+                // `str::as_bytes` have to agree on the encoding too.
+                "sesión-ñ-token",
+            ] {
+                let row = db
+                    .db
+                    .query_one(sea_orm::Statement::from_sql_and_values(
+                        sea_orm::DatabaseBackend::Postgres,
+                        "SELECT encode(sha256(convert_to($1, 'UTF8')), 'hex') AS digest",
+                        [token.into()],
+                    ))
+                    .await
+                    .expect("the digest query runs")
+                    .expect("one row");
+                let in_sql: String = row.try_get("", "digest").expect("a digest");
+                assert_eq!(in_sql, stored_session_token(token), "{token}");
+            }
+        }
+
+        /// A token read out of the column cannot be presented as a session.
+        #[tokio::test]
+        async fn a_value_read_out_of_the_column_is_not_a_session() {
+            let Some((db, auth_service)) = setup_test_env_with_mfa_setting(false).await else {
+                return;
+            };
+            let user = create_test_user(&db.db, "stolen-session@example.com", "Password-9!").await;
+            let token = auth_service.create_session(user.id).await.unwrap();
+
+            let stored = sessions::Entity::find()
+                .filter(sessions::Column::UserId.eq(user.id))
+                .one(db.db.as_ref())
+                .await
+                .unwrap()
+                .unwrap()
+                .session_token;
+            assert_ne!(stored, token);
+
+            // The token still authenticates...
+            assert_eq!(
+                auth_service.verify_session(&token).await.unwrap().id,
+                user.id
+            );
+            // ...and what the column holds does not.
+            assert!(matches!(
+                auth_service.verify_session(&stored).await,
+                Err(AuthError::NotFound(_))
+            ));
+        }
+    }
+
+    /// Per-account password throttling. The address-based limiter slows one
+    /// client guessing many accounts; this is the other axis, so guessing
+    /// one account from many addresses is slowed too.
+    mod login_throttle {
+        use super::*;
+        use sea_orm::ConnectionTrait;
+
+        fn attempt(email: &str, password: &str) -> LoginRequest {
+            LoginRequest {
+                email: email.to_string(),
+                password: password.to_string(),
+            }
+        }
+
+        /// The stored state for `user_id`, or `None` when no attempt has
+        /// ever been counted.
+        async fn guard(
+            db: &Arc<DatabaseConnection>,
+            user_id: i32,
+        ) -> Option<temps_entities::user_login_guards::Model> {
+            temps_entities::user_login_guards::Entity::find_by_id(user_id)
+                .one(db.as_ref())
+                .await
+                .expect("read the login guard")
+        }
+
+        /// Move the backoff deadline into the past, as waiting it out would.
+        async fn expire_backoff(db: &Arc<DatabaseConnection>, user_id: i32) {
+            db.execute(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "UPDATE user_login_guards SET locked_until = now() - interval '1 minute' \
+                 WHERE user_id = $1",
+                [user_id.into()],
+            ))
+            .await
+            .expect("expire the backoff");
+        }
+
+        #[tokio::test]
+        async fn repeated_failures_throttle_the_account_whatever_the_address() {
+            let Some((db, auth_service)) = setup_test_env_with_mfa_setting(false).await else {
+                return;
+            };
+            let user = create_test_user(&db.db, "target@example.com", "Correct-Horse-9!").await;
+
+            // Nothing about these attempts names a client address: the count
+            // is the account's, so spreading them over many addresses (which
+            // defeats the per-IP limiter entirely) changes nothing.
+            for number in 1..=crate::login_guard::LOCKOUT_THRESHOLD {
+                assert!(
+                    matches!(
+                        auth_service
+                            .login(attempt("target@example.com", "Wrong-Password-1!"))
+                            .await,
+                        Err(UserAuthError::InvalidCredentials)
+                    ),
+                    "attempt {number}"
+                );
+            }
+            let throttled = guard(&db.db, user.id).await.expect("a guard row");
+            assert_eq!(
+                throttled.failed_attempts,
+                crate::login_guard::LOCKOUT_THRESHOLD
+            );
+            let deadline = throttled.locked_until.expect("a backoff deadline");
+            assert!(deadline > Utc::now());
+
+            // The real password is refused too, and is not even evaluated:
+            // the attempt costs exactly the dummy verification an unknown
+            // email costs.
+            let before = dummy_verifications();
+            assert!(matches!(
+                auth_service
+                    .login(attempt("target@example.com", "Correct-Horse-9!"))
+                    .await,
+                Err(UserAuthError::InvalidCredentials)
+            ));
+            assert_eq!(
+                dummy_verifications(),
+                before + 1,
+                "a throttled attempt must not be evaluated, and must cost what an unknown email costs"
+            );
+
+            // A refused attempt is not counted, so whoever is sending them
+            // cannot keep extending the account holder's wait.
+            let after = guard(&db.db, user.id).await.expect("a guard row");
+            assert_eq!(after.failed_attempts, throttled.failed_attempts);
+            assert_eq!(after.locked_until, throttled.locked_until);
+        }
+
+        #[tokio::test]
+        async fn the_account_comes_back_on_its_own_and_a_success_resets_the_count() {
+            let Some((db, auth_service)) = setup_test_env_with_mfa_setting(false).await else {
+                return;
+            };
+            let user = create_test_user(&db.db, "recovers@example.com", "Correct-Horse-9!").await;
+
+            for _ in 0..crate::login_guard::LOCKOUT_THRESHOLD {
+                let _ = auth_service
+                    .login(attempt("recovers@example.com", "Wrong-Password-1!"))
+                    .await;
+            }
+            // Bounded backoff, not a lockout somebody has to clear by hand.
+            expire_backoff(&db.db, user.id).await;
+
+            let signed_in = auth_service
+                .login(attempt("recovers@example.com", "Correct-Horse-9!"))
+                .await
+                .expect("the account must come back once the window passes");
+            assert_eq!(signed_in.id, user.id);
+
+            let cleared = guard(&db.db, user.id).await.expect("a guard row");
+            assert_eq!(cleared.failed_attempts, 0);
+            assert_eq!(cleared.locked_until, None);
+        }
+
+        #[tokio::test]
+        async fn one_account_being_throttled_does_not_touch_another() {
+            let Some((db, auth_service)) = setup_test_env_with_mfa_setting(false).await else {
+                return;
+            };
+            let target = create_test_user(&db.db, "noisy@example.com", "Correct-Horse-9!").await;
+            create_test_user(&db.db, "bystander@example.com", "Correct-Horse-9!").await;
+
+            for _ in 0..crate::login_guard::LOCKOUT_THRESHOLD {
+                let _ = auth_service
+                    .login(attempt("noisy@example.com", "Wrong-Password-1!"))
+                    .await;
+            }
+            assert!(guard(&db.db, target.id)
+                .await
+                .and_then(|row| row.locked_until)
+                .is_some());
+
+            assert!(
+                auth_service
+                    .login(attempt("bystander@example.com", "Correct-Horse-9!"))
+                    .await
+                    .is_ok(),
+                "the throttle is per account, so another account must be unaffected"
+            );
+        }
+
+        #[tokio::test]
+        async fn an_unknown_email_records_nothing_and_still_costs_a_verification() {
+            let Some((db, auth_service)) = setup_test_env_with_mfa_setting(false).await else {
+                return;
+            };
+
+            let before = dummy_verifications();
+            for _ in 0..crate::login_guard::LOCKOUT_THRESHOLD + 2 {
+                assert!(matches!(
+                    auth_service
+                        .login(attempt("nobody@example.com", "Wrong-Password-1!"))
+                        .await,
+                    Err(UserAuthError::InvalidCredentials)
+                ));
+            }
+            assert_eq!(
+                dummy_verifications(),
+                before + crate::login_guard::LOCKOUT_THRESHOLD as u32 + 2
+            );
+
+            // The guard lookup runs for an unknown email too, so its cost
+            // cannot tell an unknown address from a real one -- but it must
+            // not create a row for an account that does not exist.
+            let rows = temps_entities::user_login_guards::Entity::find()
+                .all(db.db.as_ref())
+                .await
+                .expect("read the login guards");
+            assert!(rows.is_empty(), "{rows:?}");
+        }
     }
 }

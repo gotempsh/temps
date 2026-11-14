@@ -720,8 +720,10 @@ impl OidcService {
 
         txn.execute(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
+            // The column holds the token's digest, never the token (see
+            // `auth_service::stored_session_token`).
             "DELETE FROM sessions WHERE session_token = $1",
-            vec![session_token.into()],
+            vec![crate::auth_service::stored_session_token(session_token).into()],
         ))
         .await?;
         txn.commit().await?;
@@ -3537,10 +3539,11 @@ mod tests {
         .await
         .expect("test user must insert");
 
-        // A live provider: the login keeps its session.
+        // A live provider: the login keeps its session. The rows store the
+        // token's digest, the way `create_session` writes them.
         sessions::ActiveModel {
             user_id: Set(user.id),
-            session_token: Set("live-session".to_string()),
+            session_token: Set(crate::auth_service::stored_session_token("live-session")),
             expires_at: Set(Utc::now() + ChronoDuration::hours(1)),
             mfa_pending: Set(false),
             ..Default::default()
@@ -3553,7 +3556,10 @@ mod tests {
             .await
             .expect("a login completing against a live provider must keep its session");
         assert!(sessions::Entity::find()
-            .filter(sessions::Column::SessionToken.eq("live-session"))
+            .filter(
+                sessions::Column::SessionToken
+                    .eq(crate::auth_service::stored_session_token("live-session"))
+            )
             .one(db.db.as_ref())
             .await
             .expect("query must succeed")
@@ -3568,7 +3574,7 @@ mod tests {
         // revocation already deleted everything it could see.
         sessions::ActiveModel {
             user_id: Set(user.id),
-            session_token: Set("raced-session".to_string()),
+            session_token: Set(crate::auth_service::stored_session_token("raced-session")),
             expires_at: Set(Utc::now() + ChronoDuration::hours(1)),
             mfa_pending: Set(false),
             ..Default::default()
@@ -3587,7 +3593,10 @@ mod tests {
         ));
         assert!(
             sessions::Entity::find()
-                .filter(sessions::Column::SessionToken.eq("raced-session"))
+                .filter(
+                    sessions::Column::SessionToken
+                        .eq(crate::auth_service::stored_session_token("raced-session"))
+                )
                 .one(db.db.as_ref())
                 .await
                 .expect("query must succeed")
