@@ -9514,8 +9514,64 @@ struct ScratchDatabase {
     db: DatabaseConnection,
     /// Kept alive for the test's lifetime; dropping it stops the container.
     _container: Option<testcontainers::ContainerAsync<GenericImage>>,
-    /// `(admin url, database name)` of a scratch database to drop on cleanup.
-    external: Option<(String, String)>,
+    /// Present when the database lives on a server we do not own. Removing
+    /// it is this guard's `Drop`, not a step of this struct's, so it happens
+    /// even when `open` fails after creating it. Declared after `db` so the
+    /// connection closes first.
+    _external: Option<ScratchDatabaseName>,
+}
+
+/// A scratch database on a server we do not own, removed when this is
+/// dropped.
+///
+/// Owning the removal here rather than in a method is what makes it happen on
+/// every path: a `?` or a failed assertion in the test, a panic, and -- the
+/// case a method cannot reach -- a failure between `CREATE DATABASE`
+/// succeeding and `ScratchDatabase` being built. Repeated failing runs would
+/// otherwise pile databases up on a shared server.
+struct ScratchDatabaseName {
+    admin_url: String,
+    name: String,
+}
+
+impl Drop for ScratchDatabaseName {
+    fn drop(&mut self) {
+        // A dedicated thread with its own current-thread runtime and a fresh
+        // connection, the shape `TestDatabase`'s own `Drop` uses: the pool
+        // here belongs to the test's runtime, `block_in_place` panics on a
+        // current-thread runtime, and a spawned task would race the
+        // runtime's shutdown. `WITH (FORCE)` closes any session still on the
+        // database, so nothing has to be disconnected first.
+        let admin_url = std::mem::take(&mut self.admin_url);
+        let name = std::mem::take(&mut self.name);
+        let cleanup = std::thread::spawn(move || {
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                eprintln!("leaked scratch database {name}: no runtime for cleanup");
+                return;
+            };
+            runtime.block_on(async {
+                match Database::connect(&admin_url).await {
+                    Ok(admin) => {
+                        if let Err(error) = admin
+                            .execute_unprepared(&format!(
+                                "DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"
+                            ))
+                            .await
+                        {
+                            eprintln!("leaked scratch database {name}: {error}");
+                        }
+                    }
+                    Err(error) => eprintln!("leaked scratch database {name}: {error}"),
+                }
+            });
+        });
+        if cleanup.join().is_err() {
+            eprintln!("scratch database cleanup thread panicked");
+        }
+    }
 }
 
 impl ScratchDatabase {
@@ -9551,6 +9607,14 @@ impl ScratchDatabase {
                     Err(error) => return Err(error.into()),
                 }
             }
+            // The database exists from here on, so hand it to its guard
+            // before anything else that can fail: both `?`s below would
+            // otherwise leave it behind, with no `ScratchDatabase` yet for a
+            // `Drop` of its own to run on.
+            let owned = ScratchDatabaseName {
+                admin_url: admin_url.clone(),
+                name: name.clone(),
+            };
             let db = connect_with_retries(&replace_database(&admin_url, &name)).await?;
             // `TestDatabase` installs these for its own databases; a scratch
             // one needs them before the first migration asks for a `vector`
@@ -9563,7 +9627,7 @@ impl ScratchDatabase {
             return Ok(Some(Self {
                 db,
                 _container: None,
-                external: Some((admin_url, name)),
+                _external: Some(owned),
             }));
         }
 
@@ -9596,56 +9660,60 @@ impl ScratchDatabase {
         Ok(Some(Self {
             db,
             _container: Some(container),
-            external: None,
+            _external: None,
         }))
     }
 }
 
-impl Drop for ScratchDatabase {
-    /// Drop the scratch database on **every** path.
-    ///
-    /// Cleanup used to be an `async fn` the test called last, which a `?` or
-    /// a failed assertion skipped: repeated failing runs then piled scratch
-    /// databases up on a shared server. This is the shape `TestDatabase`'s
-    /// own `Drop` uses -- a dedicated thread with its own current-thread
-    /// runtime and a fresh connection, because the pool here belongs to the
-    /// test's runtime, `block_in_place` panics on a current-thread one, and a
-    /// spawned task would race the runtime's shutdown.
-    ///
-    /// `WITH (FORCE)` terminates this test's own remaining backend, so the
-    /// connection does not have to be closed first.
-    fn drop(&mut self) {
-        let Some((admin_url, name)) = self.external.take() else {
-            return;
-        };
-        let cleanup = std::thread::spawn(move || {
-            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            else {
-                eprintln!("leaked scratch database {name}: no runtime for cleanup");
-                return;
-            };
-            runtime.block_on(async {
-                match Database::connect(&admin_url).await {
-                    Ok(admin) => {
-                        if let Err(error) = admin
-                            .execute_unprepared(&format!(
-                                "DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"
-                            ))
-                            .await
-                        {
-                            eprintln!("leaked scratch database {name}: {error}");
-                        }
-                    }
-                    Err(error) => eprintln!("leaked scratch database {name}: {error}"),
-                }
-            });
-        });
-        if cleanup.join().is_err() {
-            eprintln!("scratch database cleanup thread panicked");
-        }
-    }
+/// The guard removes its database when it drops, which is what makes
+/// cleanup reach the paths a method cannot: a failed assertion, a panic, or a
+/// failure between `CREATE DATABASE` and `ScratchDatabase` being built.
+///
+/// Only meaningful against an external server, since that is the only case
+/// with a database to leak; it skips otherwise.
+#[tokio::test]
+async fn a_scratch_database_is_removed_when_its_guard_drops() -> anyhow::Result<()> {
+    let Some(admin_url) = external_database_url() else {
+        println!("⏭️  Skipping: no external database configured");
+        return Ok(());
+    };
+    let admin = connect_with_retries(&admin_url).await?;
+    let name = format!("temps_mig_guard_{}", std::process::id());
+    admin
+        .execute_unprepared(&format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"))
+        .await?;
+    admin
+        .execute_unprepared(&format!("CREATE DATABASE \"{name}\""))
+        .await?;
+
+    assert!(
+        database_exists(&admin, &name).await?,
+        "the fixture database exists"
+    );
+
+    // Dropping the guard is the whole cleanup path -- no method is called.
+    drop(ScratchDatabaseName {
+        admin_url: admin_url.clone(),
+        name: name.clone(),
+    });
+
+    assert!(
+        !database_exists(&admin, &name).await?,
+        "dropping the guard must remove {name}"
+    );
+    Ok(())
+}
+
+async fn database_exists(admin: &DatabaseConnection, name: &str) -> anyhow::Result<bool> {
+    let row = admin
+        .query_one(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1) AS present",
+            [name.into()],
+        ))
+        .await?
+        .expect("existence query returns a row");
+    Ok(row.try_get::<bool>("", "present")?)
 }
 
 fn external_database_url() -> Option<String> {
