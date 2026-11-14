@@ -261,3 +261,84 @@ async fn managed_wait_completion_recovers_after_remote_commit() {
     assert!(run.has_blob_payloads);
     assert_eq!(run.status, "queued");
 }
+
+#[tokio::test]
+async fn managed_sleep_resume_keeps_the_central_wake_time() {
+    let Some(mut f) = fixture("managed sleep resume").await else {
+        return;
+    };
+    let row=f.conn.query_one(Statement::from_string(DbBackend::Postgres,"INSERT INTO external_services(name,service_type,status,created_at,updated_at) VALUES('journal-test','postgres','running',now(),now()) RETURNING id".to_string())).await.unwrap().unwrap();
+    let service_id: i32 = row.try_get("", "id").unwrap();
+    let remote = Arc::new(ManagedFake::default());
+    f.store = PgWorkflowStore::new(f.conn.clone()).with_managed_journal(remote.clone());
+    f.store
+        .upsert_settings(
+            f.project_id,
+            f.environment_id,
+            &WorkflowSettings {
+                managed_store_service_id: Some(service_id),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let run = f.start("managed").await;
+    let claimed = f.claim_one().await.run;
+    let later = Utc::now() + Duration::hours(1);
+    let mut record = step(&claimed, 0, "nap", StepStatus::Pending);
+    record.kind = StepKind::Sleep;
+    record.wake_at = Some(later);
+    f.store.record_step(record, LIMITS).await.unwrap();
+    f.store
+        .release(run.id, claimed.lease_token, Release::Sleep { until: later })
+        .await
+        .unwrap();
+    f.store.resume_run(run.id).await.unwrap();
+    let entry = f.store.step(run.id, 0).await.unwrap().unwrap();
+    assert!(entry.wake_at.unwrap() <= Utc::now());
+    let page = f.store.journal(run.id, 0, 20).await.unwrap();
+    let hydrated = f.store.hydrate_journal(run.id, page).await.unwrap();
+    assert_eq!(hydrated[0].wake_at, entry.wake_at);
+}
+
+#[tokio::test]
+async fn managed_child_creation_recovers_the_same_child_after_remote_commit() {
+    let Some(mut f) = fixture("managed child recovery").await else {
+        return;
+    };
+    let row=f.conn.query_one(Statement::from_string(DbBackend::Postgres,"INSERT INTO external_services(name,service_type,status,created_at,updated_at) VALUES('journal-test','postgres','running',now(),now()) RETURNING id".to_string())).await.unwrap().unwrap();
+    let service_id: i32 = row.try_get("", "id").unwrap();
+    let remote = Arc::new(ManagedFake::default());
+    f.store = PgWorkflowStore::new(f.conn.clone()).with_managed_journal(remote.clone());
+    f.store
+        .upsert_settings(
+            f.project_id,
+            f.environment_id,
+            &WorkflowSettings {
+                managed_store_service_id: Some(service_id),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    f.start("parent").await;
+    let parent = f.claim_one().await.run;
+    let mut child = f.new_run("child", Some("child-recovery"));
+    child.parent_run_id = Some(parent.id);
+    let mut record = step(&parent, 0, "child", StepStatus::Pending);
+    record.kind = StepKind::Child;
+    record.child = Some((child.clone(), 100));
+    remote
+        .crash
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(f.store.record_step(record.clone(), LIMITS).await.is_err());
+    assert!(f.store.get_run(child.id).await.unwrap().is_none());
+    let mut other = child.clone();
+    other.id = Uuid::new_v4();
+    record.child = Some((other.clone(), 100));
+    f.store.record_step(record, LIMITS).await.unwrap();
+    assert!(f.store.get_run(child.id).await.unwrap().is_some());
+    assert!(f.store.get_run(other.id).await.unwrap().is_none());
+}

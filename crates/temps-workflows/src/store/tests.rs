@@ -105,6 +105,7 @@ fn step(run: &RunRow, sequence: i32, name: &str, status: StepStatus) -> StepReco
         trace_id: None,
         error_ref: None,
         event: None,
+        child: None,
     }
 }
 
@@ -1359,3 +1360,119 @@ async fn deploy_drain_pauses_claims_until_release_and_recovers_after_a_crash() {
 }
 
 mod managed;
+
+#[tokio::test]
+async fn full_workflow_backlog_does_not_starve_other_workflows() {
+    let Some(f) = fixture("claim fairness").await else {
+        return;
+    };
+    let busy = f.start("busy").await;
+    assert_eq!(f.claim_one().await.run.id, busy.id);
+    f.conn.execute(postgres::stmt("INSERT INTO workflow_runs(id,project_id,environment_id,workflow_name,status,due_at) SELECT gen_random_uuid(),$1,$2,'busy','queued',now()-interval '1 hour' FROM generate_series(1,10001)",vec![f.project_id.into(),f.environment_id.into()])).await.unwrap();
+    // Bypass admission only to build a backlog larger than the candidate window.
+    let available = Uuid::new_v4();
+    f.conn.execute(postgres::stmt("INSERT INTO workflow_runs(id,project_id,environment_id,workflow_name,status,due_at) VALUES($1,$2,$3,'available','queued',now())",vec![available.into(),f.project_id.into(),f.environment_id.into()])).await.unwrap();
+    let claimed = f
+        .store
+        .claim_due(
+            10,
+            &[WorkflowLimit {
+                environment_id: f.environment_id,
+                workflow_name: "busy".into(),
+                limit: 1,
+            }],
+        )
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].run.id, available);
+}
+
+#[tokio::test]
+async fn child_and_journal_commit_atomically_and_stale_writes_cannot_start_children() {
+    let Some(f) = fixture("atomic child start").await else {
+        return;
+    };
+    f.start("parent").await;
+    let parent = f.claim_one().await.run;
+    let mut child = f.new_run("child", Some("child-entry"));
+    child.parent_run_id = Some(parent.id);
+    let mut record = step(&parent, 0, "child", StepStatus::Pending);
+    record.kind = StepKind::Child;
+    record.child = Some((child.clone(), 0));
+    assert!(f.store.record_step(record.clone(), LIMITS).await.is_err());
+    assert!(f.store.step(parent.id, 0).await.unwrap().is_none());
+    assert!(f.store.get_run(child.id).await.unwrap().is_none());
+    record.child = Some((child.clone(), 100));
+    f.store.record_step(record.clone(), LIMITS).await.unwrap();
+    assert!(f.store.get_run(child.id).await.unwrap().is_some());
+    let other = f.new_run("child", None);
+    record.child = Some((other.clone(), 100));
+    assert!(matches!(
+        f.store.record_step(record.clone(), LIMITS).await.unwrap(),
+        StepRecordOutcome::AlreadyRecorded { .. }
+    ));
+    assert!(f.store.get_run(other.id).await.unwrap().is_none());
+    f.store.cancel_run(parent.id).await.unwrap();
+    f.store.cancel_descendants(parent.id).await.unwrap();
+    assert_eq!(
+        f.store.get_run(child.id).await.unwrap().unwrap().status,
+        "cancelled"
+    );
+    assert!(matches!(
+        f.store.record_step(record, LIMITS).await,
+        Err(WorkflowError::StaleLease { .. })
+    ));
+    assert!(f.store.get_run(other.id).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn deleted_blob_runs_remain_queued_until_cleanup_acknowledgement() {
+    let Some(f) = fixture("durable blob cleanup").await else {
+        return;
+    };
+    let mut run = f.new_run("blob", None);
+    run.input = StoredPayload {
+        encrypted: None,
+        blob_key: Some("synthetic-blob".into()),
+        bytes: 10,
+    };
+    let id = run.id;
+    f.store.insert_run(run, 100).await.unwrap();
+    f.store.delete_run(id).await.unwrap();
+    assert!(f.store.get_run(id).await.unwrap().is_none());
+    // A fresh store after a restart still sees the work, until acknowledgement.
+    let store = PgWorkflowStore::new(f.conn.clone());
+    for _ in 0..2 {
+        let pending = store.pending_blob_cleanup(20).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].run_id, id);
+        assert_eq!(pending[0].project_id, f.project_id);
+        assert_eq!(pending[0].environment_id, f.environment_id);
+    }
+    store.acknowledge_blob_cleanup(id).await.unwrap();
+    assert!(store.pending_blob_cleanup(20).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn child_idempotency_collision_cannot_commit_a_dangling_journal_entry() {
+    let Some(f) = fixture("child key collision").await else {
+        return;
+    };
+    f.start("parent").await;
+    let parent = f.claim_one().await.run;
+    let occupied = f.new_run("child", Some("reserved-child-key"));
+    f.store.insert_run(occupied, 100).await.unwrap();
+    let mut child = f.new_run("child", Some("reserved-child-key"));
+    child.parent_run_id = Some(parent.id);
+    let id = child.id;
+    let mut record = step(&parent, 0, "child", StepStatus::Pending);
+    record.kind = StepKind::Child;
+    record.child = Some((child, 100));
+    assert!(matches!(
+        f.store.record_step(record, LIMITS).await,
+        Err(WorkflowError::Validation { field: "child", .. })
+    ));
+    assert!(f.store.step(parent.id, 0).await.unwrap().is_none());
+    assert!(f.store.get_run(id).await.unwrap().is_none());
+}

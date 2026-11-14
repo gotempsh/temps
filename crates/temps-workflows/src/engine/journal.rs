@@ -208,27 +208,15 @@ impl WorkflowEngine {
         let run = &auth.run;
         let settings = self.store.settings(run.environment_id).await?;
         let scope = Self::scope(run);
-        if write.child.is_some() {
-            // An entry recorded as something else is a replay mismatch: the
-            // write below reports it, and no child is started for it.
-            let mismatched = self
-                .store
-                .step(run.id, write.sequence)
-                .await?
-                .is_some_and(|entry| {
-                    entry.kind != StepKind::Child.as_str() || entry.name != write.name
-                });
-            if mismatched {
-                write.child = None;
-            }
-        }
-        if let Some(child) = &write.child {
-            // Started before the entry is written, exactly once per entry:
-            // a retried write finds the child by its idempotency key.
-            let child_id = self
-                .start_child(run, write.sequence, child, &settings)
-                .await?;
-            write.result = Some(serde_json::json!({ "run_id": child_id }));
+        let child = match &write.child {
+            Some(child) => Some(
+                self.prepare_child(run, write.sequence, child, &settings)
+                    .await?,
+            ),
+            None => None,
+        };
+        if let Some(child) = &child {
+            write.result = Some(serde_json::json!({ "run_id": child.id }));
         }
 
         let result = match &write.result {
@@ -289,6 +277,9 @@ impl WorkflowEngine {
             trace_id: write.trace_id.clone(),
             error_ref: write.error_ref.clone(),
             event,
+            child: child
+                .clone()
+                .map(|child| (child, i64::from(settings.max_active_runs))),
         };
         let limits = StepLimits {
             max_steps: settings.max_steps_per_run,
@@ -322,6 +313,9 @@ impl WorkflowEngine {
                 lease_expires_at,
             } => {
                 self.codec.discard(run.project_id, &result).await;
+                if let Some(child) = &child {
+                    self.codec.discard(run.project_id, &child.input).await;
+                }
                 (entry, lease_expires_at, true, None)
             }
         };

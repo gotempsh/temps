@@ -187,7 +187,7 @@ func TestUnreachedJournalPagesAreNotFetched(t *testing.T) {
 		return value, err
 	}}
 	status, result := RunInvocation(context.Background(), workflow, request, "synthetic", transport)
-	if status != 200 || result.Output != 7 {
+	if status != 200 || result.Type != "incompatible" || result.Sequence == nil || *result.Sequence != 1 {
 		t.Fatalf("unexpected result %d %+v", status, result)
 	}
 }
@@ -196,4 +196,20 @@ type neverTransport struct{}
 
 func (*neverTransport) Call(context.Context, string, string, string, any, any, bool) error {
 	return errors.New("unexpected API request")
+}
+
+func TestRemovedWaitCannotComplete(t *testing.T) {
+	for _, paged := range []bool{false, true} {
+		req := invocation()
+		if paged {
+			zero := 0
+			req.Next = &zero
+		} else {
+			req.Journal = []Entry{{Sequence: 0, Name: "approval", Kind: "wait", Status: "pending", Attempts: 1}}
+		}
+		status, result := RunInvocation(context.Background(), Workflow{Name: "orders", Run: func(c *Context) (any, error) { return "done", nil }}, req, "token", &recorder{})
+		if status != 200 || result.Type != "incompatible" || result.Sequence == nil || *result.Sequence != 0 {
+			t.Fatalf("removed wait completed: %d %#v", status, result)
+		}
+	}
 }

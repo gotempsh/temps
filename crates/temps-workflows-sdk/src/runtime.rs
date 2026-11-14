@@ -72,6 +72,9 @@ impl Context {
             outcome: None,
         }
     }
+    pub(crate) fn unread_sequence(&self) -> Option<i32> {
+        self.journal.keys().copied().chain(self.cursor).min()
+    }
     fn clock(&self) -> DateTime<Utc> {
         self.request.now + chrono::Duration::from_std(self.started.elapsed()).unwrap_or_default()
     }
@@ -270,11 +273,10 @@ impl Context {
             let delay = options
                 .initial_backoff
                 .saturating_mul(2u32.saturating_pow(attempt.saturating_sub(1).min(30) as u32))
-                .min(options.max_backoff)
-                .min(Duration::from_secs(300));
+                .min(options.max_backoff);
             return Err(self.suspend(Outcome::Retry {
                 sequence,
-                at: self.clock() + chrono::Duration::from_std(delay).unwrap_or_default(),
+                at: self.deadline(delay)?,
             }));
         }
         Self::value(entry)

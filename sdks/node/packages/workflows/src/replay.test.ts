@@ -313,3 +313,17 @@ describe('replay', () => {
     expect(backoffMs({ initialBackoff: '1m', maxBackoff: '2m' }, 5)).toBe(120_000);
   });
 });
+
+it('rejects completion when deployed code removes a recorded approval wait, including later pages', async () => {
+  for (const paged of [false, true]) {
+    const request = invokeRequest('orders', 60_000);
+    const entry = { sequence: 0, name: 'approval', kind: 'wait' as const, status: 'pending' as const, attempts: 1, result: null, error: null, wake_at: null };
+    request.journal = paged ? [] : [entry];
+    request.journal_next_sequence = paged ? 0 : null;
+    const result = await runInvocation(defineWorkflow('orders', async () => 'done'), request, {
+      token: 't', telemetry: new Telemetry({ tracer: false }),
+      transport: new ExecutorTransport({ apiUrl: 'http://t', fetch: async () => new Response(JSON.stringify({ entries: [entry], next_sequence: null })) }),
+    });
+    expect(result).toMatchObject({ type: 'outcome', outcome: { type: 'incompatible', sequence: 0 } });
+  }
+});

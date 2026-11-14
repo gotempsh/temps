@@ -283,6 +283,18 @@ pub(crate) async fn run(
     if let Some(outcome) = context.outcome {
         return (StatusCode::OK, Some(outcome));
     }
+    if result.as_ref().is_ok_and(|result| result.is_ok()) {
+        if let Some(sequence) = context.unread_sequence() {
+            return (
+                StatusCode::OK,
+                Some(Outcome::Incompatible {
+                    sequence,
+                    expected: "recorded journal entry".into(),
+                    found: "end of workflow".into(),
+                }),
+            );
+        }
+    }
     match result {
         Ok(Ok(output)) => (StatusCode::OK, Some(Outcome::Completed { output })),
         Ok(Err(Error::Control)) | Err(_) => (StatusCode::SERVICE_UNAVAILABLE, None),

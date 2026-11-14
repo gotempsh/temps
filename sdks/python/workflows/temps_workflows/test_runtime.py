@@ -33,6 +33,19 @@ class Recorder:
 
 
 class RuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_removed_wait_cannot_complete_even_on_unread_page(self):
+        async def workflow(ctx):
+            return "done"
+        for paged in (False, True):
+            entry = dict(sequence=0, name="approval", kind="wait", status="pending", attempts=1)
+            req = request([] if paged else [entry])
+            if paged:
+                req["journal_next_sequence"] = 0
+            status, result = await run_invocation(Workflow("orders", workflow), req, "token", Recorder())
+            self.assertEqual(status, 200)
+            self.assertEqual(result["outcome"]["type"], "incompatible")
+            self.assertEqual(result["outcome"]["sequence"], 0)
+
     async def test_replay_pagination_and_mismatch(self):
         calls = []
         async def workflow(ctx):
@@ -145,5 +158,6 @@ class PageBudgetTests(unittest.IsolatedAsyncioTestCase):
             return value
         status, result = await run_invocation(Workflow("orders", workflow), req, "token", transport)
         self.assertEqual(status, 200)
-        self.assertEqual(result["outcome"]["output"], 7)
+        self.assertEqual(result["outcome"]["type"], "incompatible")
+        self.assertEqual(result["outcome"]["sequence"], 1)
         self.assertEqual(transport.entries, [])

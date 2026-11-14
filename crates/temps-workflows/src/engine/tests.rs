@@ -932,6 +932,7 @@ async fn journal_pages_count_error_bytes_toward_their_size_limit() {
                     trace_id: None,
                     error_ref: None,
                     event: None,
+                    child: None,
                 },
                 crate::store::StepLimits {
                     max_steps: 10,
@@ -1364,12 +1365,12 @@ async fn cancelling_a_parent_cancels_its_children_and_their_children() {
     let root = h.start("parent", json!(null)).await;
     let mut parent = h.run(root).await;
     let mut tree = Vec::new();
-    for sequence in 0..2 {
-        let id = h
+    for _ in 0..2 {
+        let prepared = h
             .engine
-            .start_child(
+            .prepare_child(
                 &parent,
-                sequence,
+                0,
                 &crate::protocol::ChildStart {
                     workflow: "child".into(),
                     input: None,
@@ -1378,21 +1379,8 @@ async fn cancelling_a_parent_cancels_its_children_and_their_children() {
             )
             .await
             .unwrap();
-        // Starting the same entry's child again finds it.
-        let again = h
-            .engine
-            .start_child(
-                &parent,
-                sequence,
-                &crate::protocol::ChildStart {
-                    workflow: "child".into(),
-                    input: None,
-                },
-                &WorkflowSettings::default(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(id, again);
+        let id = prepared.id;
+        h.store.insert_run(prepared, 100).await.unwrap();
         tree.push(id);
         parent = h.run(id).await;
     }
@@ -1404,4 +1392,73 @@ async fn cancelling_a_parent_cancels_its_children_and_their_children() {
         assert_eq!(h.run(id).await.status, "cancelled");
     }
     assert!(h.store.cancel_descendants(root).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn retrying_a_parent_from_a_child_entry_starts_a_fresh_child() {
+    let Some(h) = harness(
+        "child retry generation",
+        &["parent", "child"],
+        parent_and_child_script(),
+        true,
+    )
+    .await
+    else {
+        return;
+    };
+    let parent = h.start("parent", json!({"n":2})).await;
+    h.tick().await;
+    let first = child_of(&h, parent).await;
+    h.store.cancel_run(parent).await.unwrap();
+    h.store.cancel_descendants(parent).await.unwrap();
+    h.store.retry_from(parent, 0).await.unwrap();
+    h.tick().await;
+    let second = child_of(&h, parent).await;
+    assert_ne!(first.id, second.id);
+    assert_ne!(first.idempotency_key, second.idempotency_key);
+    assert_eq!(second.status, "queued");
+    h.tick().await;
+    h.tick().await;
+    assert_eq!(h.run(parent).await.status, "completed");
+    assert_eq!(h.output(parent).await.unwrap()["run_id"], json!(second.id));
+}
+
+#[tokio::test]
+async fn blob_cleanup_retries_after_storage_recovers() {
+    let blobs = Arc::new(crate::payload::tests::MemoryBlobs::default());
+    let Some(h) = harness_with(
+        "blob cleanup retry",
+        &["parent", "child"],
+        parent_and_child_script(),
+        false,
+        Some(blobs.clone()),
+        None,
+    )
+    .await
+    else {
+        return;
+    };
+    let id = h.start("parent", json!("x".repeat(300_000))).await;
+    assert!(!blobs.objects.lock().unwrap().is_empty());
+    let scheduler = crate::scheduler::WorkflowScheduler::new(
+        h.engine.clone(),
+        h.store.clone(),
+        h.codec.clone(),
+        Arc::new(WorkflowMetrics::new(Arc::new(NoopProjectMetricsSink))),
+        None,
+        Default::default(),
+    );
+    h.store.delete_run(id).await.unwrap();
+    blobs
+        .fail_delete
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    scheduler.apply_retention().await;
+    assert_eq!(h.store.pending_blob_cleanup(100).await.unwrap().len(), 1);
+    assert!(!blobs.objects.lock().unwrap().is_empty());
+    blobs
+        .fail_delete
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    scheduler.apply_retention().await;
+    assert!(h.store.pending_blob_cleanup(100).await.unwrap().is_empty());
+    assert!(blobs.objects.lock().unwrap().is_empty());
 }

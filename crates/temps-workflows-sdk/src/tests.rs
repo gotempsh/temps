@@ -345,3 +345,55 @@ async fn excessive_durations_return_errors_without_panicking() {
     .await;
     assert!(matches!(result.1, Some(Outcome::Completed { .. })));
 }
+
+struct Empty;
+#[async_trait]
+impl Workflow for Empty {
+    fn name(&self) -> &str {
+        "orders"
+    }
+    async fn run(&self, _: &mut Context) -> Result<Value, Error> {
+        Ok(json!("done"))
+    }
+}
+#[tokio::test]
+async fn removed_wait_cannot_complete_including_unread_pages() {
+    for paged in [false, true] {
+        let mut req = request();
+        if paged {
+            req.journal_next_sequence = Some(0);
+        } else {
+            req.journal=serde_json::from_value(json!([{"sequence":0,"name":"approval","kind":"wait","status":"pending","attempts":1}])).unwrap();
+        }
+        let result =
+            executor::run(&Empty, req, "token".into(), Arc::new(Recorder::default())).await;
+        assert!(matches!(
+            result.1,
+            Some(Outcome::Incompatible { sequence: 0, .. })
+        ));
+    }
+}
+#[tokio::test]
+async fn retry_backoff_honors_configured_ten_minutes() {
+    let req = request();
+    let now = req.now;
+    let mut context = Context::new(req, "token".into(), Arc::new(Recorder::default()));
+    let options = StepOptions {
+        initial_backoff: std::time::Duration::from_secs(600),
+        max_backoff: std::time::Duration::from_secs(600),
+        ..Default::default()
+    };
+    let result = context
+        .step("retry", options, |_| async {
+            Err(Error::Step {
+                name: "retry".into(),
+                message: "transient".into(),
+            })
+        })
+        .await;
+    assert!(matches!(result, Err(Error::Control)));
+    match context.outcome.unwrap() {
+        Outcome::Retry { at, .. } => assert!((at - now).num_seconds() >= 600),
+        other => panic!("expected retry, got {other:?}"),
+    }
+}

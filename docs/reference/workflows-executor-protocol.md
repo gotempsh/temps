@@ -220,7 +220,7 @@ Records one journal entry **before** the workflow continues past it.
 | `now` | `completed` with the timestamp | Never `pending`. |
 | `random` | `completed` with the value | Never `pending`. |
 | `send_event` | `completed` with `event` set | Never `pending`. Only this kind carries `event`; Temps delivers the event once, when the entry is first recorded. Event names starting with `temps.` are reserved and rejected. |
-| `child` | `pending` with `child` = `{"workflow": ..., "input": ...}` and no `result`; Temps completes it | Temps starts a run of `workflow` in the same environment, exactly once per entry (a rewrite finds the child it started), and records `{"run_id": ...}` as the entry's result. When the child finishes Temps completes the entry with `{"run_id", "status", "output", "error"}`, where `status` is `completed`, `failed`, `cancelled` or `deleted` (removed before it finished). The executor never records a child entry final. Only this kind carries `child`. |
+| `child` | `pending` with `child` = `{"workflow": ..., "input": ...}` and no `result`; Temps completes it | Temps starts a run of `workflow` in the same environment, exactly once per entry (a rewrite finds the child it started; truncating this entry for an operator retry creates a new child), and records `{"run_id": ...}` as the entry's result. When the child finishes Temps completes the entry with `{"run_id", "status", "output", "error"}`, where `status` is `completed`, `failed`, `cancelled` or `deleted` (removed before it finished). The executor never records a child entry final. Only this kind carries `child`. |
 
 - `trace_id` (≤ 64 characters) and `error_ref` (≤ 128) are metadata linking
   to the attempt's span and error-tracking event.
@@ -555,3 +555,14 @@ The guard performs no I/O, allocation, locking or background work on the
 per-request path. Ordinary paths use a byte scan; normalization uses at most
 8 KiB of stack storage and eight decoding passes. Unusual paths exceeding
 those bounds are refused rather than partially normalized.
+
+Successful replay must consume every recorded journal entry. Returning while
+entries remain (including an unread continuation page) reports `incompatible`,
+so removing an approval wait cannot silently complete a run. Child creation and
+its journal entry commit together under the parent lease; descendant cancellation
+serializes against child creation. Managed-journal replay preserves central
+scheduling overrides made by an operator resume.
+
+Deleting a run queues blob cleanup durably in the same database transaction.
+Retention retries a bounded batch of pending cleanup, acknowledging each only
+after blob storage confirms deletion. An unavailable store leaves work queued.

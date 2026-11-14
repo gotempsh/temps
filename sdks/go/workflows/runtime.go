@@ -414,5 +414,15 @@ func RunInvocation(parent context.Context, workflow Workflow, request Invocation
 		}
 		return 200, Outcome{Type: "failed", Error: clip(err.Error()), Sequence: sequence}
 	}
+	unread := c.cursor
+	for seq := range c.journal {
+		if unread == nil || seq < *unread {
+			value := seq
+			unread = &value
+		}
+	}
+	if unread != nil {
+		return 200, Outcome{Type: "incompatible", Sequence: unread, Expected: "recorded journal entry", Found: "end of workflow"}
+	}
 	return 200, Outcome{Type: "completed", Output: output}
 }

@@ -232,6 +232,9 @@ async def run_invocation(workflow, request, token, transport):
             output = await workflow.run(context)
         if context.control:
             raise context.control
+        unread = min(context.journal, default=context.cursor)
+        if unread is not None:
+            context.stop({"type": "incompatible", "sequence": unread, "expected": "recorded journal entry", "found": "end of workflow"})
         return 200, {"outcome": {"type": "completed", "output": output}}
     except Control as signal:
         return signal.status, {"outcome": signal.outcome} if signal.outcome else {}

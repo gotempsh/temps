@@ -10,7 +10,6 @@ use serde_json::Value;
 
 use uuid::Uuid;
 
-use super::children::child_key;
 use super::events::inline_only;
 use super::WorkflowEngine;
 use crate::error::{WorkflowError, WorkflowResult};
@@ -102,10 +101,26 @@ impl WorkflowEngine {
             Ok(child_id) => self.store.get_run(child_id).await?,
             Err(_) => None,
         };
-        let expected = child_key(run.id, sequence);
+        let entry = self.store.step(run.id, sequence).await?;
+        let recorded = match entry {
+            Some(entry) => {
+                self.journal_entry(
+                    &Self::scope(run),
+                    &entry,
+                    &self.store.settings(run.environment_id).await?,
+                )
+                .await?
+                .result
+            }
+            None => None,
+        };
         let started_here = child.as_ref().is_some_and(|child| {
             child.parent_run_id == Some(run.id)
-                && child.idempotency_key.as_deref() == Some(expected.as_str())
+                && recorded
+                    .as_ref()
+                    .and_then(|v| v.get("run_id"))
+                    .and_then(Value::as_str)
+                    == Some(key)
         });
         if started_here {
             Ok(())

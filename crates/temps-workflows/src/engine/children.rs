@@ -5,8 +5,8 @@
 //!
 //! A `child` journal entry starts a run of another workflow in the same
 //! environment. The child is started exactly once: its idempotency key is
-//! the parent's run id and the entry's sequence, so a retried write finds
-//! the child it already started. The parent records the entry `pending`
+//! scoped to the entry's creation lease. The child and entry commit together,
+//! and repeated writes return the retained entry. The parent records the entry `pending`
 //! with `{"run_id": ...}` and suspends on it ([`CHILD_EVENT`], keyed by the
 //! child's id). When the child finishes, Temps completes the entry with
 //! [`child_result`] through the same fenced, quota-checked completion as an
@@ -22,24 +22,18 @@ use crate::error::{WorkflowError, WorkflowResult};
 use crate::payload::{PayloadField, PayloadScope};
 use crate::protocol::{child_result, ChildStart, CHILD_EVENT};
 use crate::service::MAX_WORKFLOW_NAME;
-use crate::store::{NewRun, RunRow, StartOutcome, Starter, WaitingRun};
+use crate::store::{NewRun, RunRow, Starter, WaitingRun};
 use crate::types::{validate_name, RunStatus, WorkflowSettings};
 
-/// The idempotency key of the child a parent's entry starts.
-pub(crate) fn child_key(parent_run_id: Uuid, sequence: i32) -> String {
-    format!("child:{parent_run_id}:{sequence}")
-}
-
 impl WorkflowEngine {
-    /// Start the child `child` names for entry `sequence` of `parent`, or
-    /// find the one an earlier write of the entry started. Returns its id.
-    pub(crate) async fn start_child(
+    /// Prepare sealed child input. The store inserts it with the parent entry.
+    pub(crate) async fn prepare_child(
         &self,
         parent: &RunRow,
         sequence: i32,
         child: &ChildStart,
         settings: &WorkflowSettings,
-    ) -> WorkflowResult<Uuid> {
+    ) -> WorkflowResult<NewRun> {
         validate_name("child.workflow", &child.workflow, MAX_WORKFLOW_NAME)?;
         let id = Uuid::new_v4();
         let scope = PayloadScope {
@@ -55,56 +49,20 @@ impl WorkflowEngine {
             }
             None => Default::default(),
         };
-        let outcome = self
-            .store
-            .insert_run(
-                NewRun {
-                    id,
-                    project_id: parent.project_id,
-                    environment_id: parent.environment_id,
-                    workflow_name: child.workflow.clone(),
-                    input: input.clone(),
-                    idempotency_key: Some(child_key(parent.id, sequence)),
-                    deployment_id: None,
-                    starter: Starter::Machine,
-                    parent_run_id: Some(parent.id),
-                },
-                i64::from(settings.max_active_runs),
-            )
-            .await;
-        match outcome {
-            Ok(StartOutcome::Created(run)) => {
-                self.metrics
-                    .run_started(run.project_id, run.environment_id, &run.workflow_name);
-                tracing::info!(
-                    run_id = %run.id,
-                    parent_run_id = %parent.id,
-                    project_id = run.project_id,
-                    environment_id = run.environment_id,
-                    workflow = %run.workflow_name,
-                    "child workflow run started"
-                );
-                Ok(run.id)
-            }
-            Ok(StartOutcome::Existing(run)) => {
-                self.codec.discard(parent.project_id, &input).await;
-                if run.parent_run_id != Some(parent.id) {
-                    return Err(WorkflowError::Validation {
-                        field: "child",
-                        reason: format!(
-                            "entry {sequence} of run {} would start a child of workflow '{}', \
-                             but run {} already holds its idempotency key and is not its child",
-                            parent.id, child.workflow, run.id
-                        ),
-                    });
-                }
-                Ok(run.id)
-            }
-            Err(error) => {
-                self.codec.discard(parent.project_id, &input).await;
-                Err(error)
-            }
-        }
+        Ok(NewRun {
+            id,
+            project_id: parent.project_id,
+            environment_id: parent.environment_id,
+            workflow_name: child.workflow.clone(),
+            input,
+            idempotency_key: Some(format!(
+                "child:{}:{sequence}:{}",
+                parent.id, parent.lease_token
+            )),
+            deployment_id: None,
+            starter: Starter::Machine,
+            parent_run_id: Some(parent.id),
+        })
     }
 
     /// `child` just finished (completed, failed or cancelled): wake its
