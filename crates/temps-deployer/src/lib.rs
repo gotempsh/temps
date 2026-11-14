@@ -1203,6 +1203,23 @@ pub trait ImageBuilder: Send + Sync {
         Ok(vec![self.inspect_image(image_name).await?.platform])
     }
 
+    /// Every platform the registry index behind `image_name` offers.
+    ///
+    /// For an image a worker pulls from its registry itself, this — not
+    /// [`Self::image_platforms`] — is what it can run: pulling a
+    /// multi-platform tag here downloads only this daemon's architecture, so
+    /// the local store holds one runnable platform of an index that may offer
+    /// many (#1892). `credentials` authenticate a private registry. An empty
+    /// result means "unknown"; the default, for builders that cannot reach a
+    /// registry, always answers that.
+    async fn registry_image_platforms(
+        &self,
+        _image_name: &str,
+        _credentials: Option<remote::RemotePullCredentials>,
+    ) -> Result<Vec<String>, BuilderError> {
+        Ok(Vec::new())
+    }
+
     /// The identity of the image `image_name` currently resolves to.
     ///
     /// `id` is whatever the daemon reports as the image ID: the config digest

@@ -807,15 +807,27 @@ fn image_archive_client_leaves_the_shared_client_timeout_alone() {
 /// A daemon that answers an image inspect with `inspect` and an image list
 /// with `list`, as JSON.
 async fn image_store_daemon(inspect: serde_json::Value, list: serde_json::Value) -> Docker {
+    image_store_daemon_with_registry(inspect, list, None).await
+}
+
+/// [`image_store_daemon`] that also answers a registry distribution inspect
+/// with `distribution`, or refuses it with a 500 when `None`.
+async fn image_store_daemon_with_registry(
+    inspect: serde_json::Value,
+    list: serde_json::Value,
+    distribution: Option<serde_json::Value>,
+) -> Docker {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let inspect = inspect.to_string();
     let list = list.to_string();
+    let distribution = distribution.map(|body| body.to_string());
     tokio::spawn(async move {
         while let Ok((mut socket, _)) = listener.accept().await {
-            let (inspect, list) = (inspect.clone(), list.clone());
+            let (inspect, list, distribution) =
+                (inspect.clone(), list.clone(), distribution.clone());
             tokio::spawn(async move {
                 let mut request = Vec::new();
                 let mut buffer = [0_u8; 4096];
@@ -827,13 +839,21 @@ async fn image_store_daemon(inspect: serde_json::Value, list: serde_json::Value)
                 }
                 let head = String::from_utf8_lossy(&request).to_string();
                 let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
-                let body = if path.contains("/images/json") {
-                    list
+                let (status, body) = if path.contains("/distribution/") {
+                    match distribution {
+                        Some(body) => ("200 OK", body),
+                        None => (
+                            "500 Internal Server Error",
+                            r#"{"message":"registry unreachable"}"#.to_string(),
+                        ),
+                    }
+                } else if path.contains("/images/json") {
+                    ("200 OK", list)
                 } else {
-                    inspect
+                    ("200 OK", inspect)
                 };
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                     body.len()
                 );
                 let _ = socket.write_all(response.as_bytes()).await;
@@ -947,4 +967,116 @@ async fn image_platforms_falls_back_to_the_inspected_platform() {
             "{list}"
         );
     }
+}
+
+/// A registry index as `GET /distribution/{name}/json` reports it.
+fn distribution(platforms: &[(&str, &str, Option<&str>)]) -> serde_json::Value {
+    serde_json::json!({
+        "Descriptor": {
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "digest": "sha256:00",
+            "size": 1,
+        },
+        "Platforms": platforms
+            .iter()
+            .map(|(os, architecture, variant)| {
+                let mut platform = serde_json::json!({"os": os, "architecture": architecture});
+                if let Some(variant) = variant {
+                    platform["variant"] = serde_json::json!(variant);
+                }
+                platform
+            })
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// #1892: the containerd image store keeps a pulled tag's whole index, so
+/// the architectures this daemon did not download are still offered — and
+/// read without a registry round-trip (the registry here is unreachable).
+#[tokio::test]
+async fn registry_image_platforms_reads_the_pulled_index() {
+    let docker = image_store_daemon_with_registry(
+        inspected_amd64(),
+        serde_json::json!([summary(
+            INSPECTED_ID,
+            Some(vec![
+                manifest("linux", "amd64", None, "image", true),
+                // Listed by the index, never downloaded on this amd64 host.
+                manifest("linux", "arm64", None, "image", false),
+                manifest("unknown", "unknown", None, "attestation", false),
+            ]),
+        )]),
+        None,
+    )
+    .await;
+    let runtime = DockerRuntime::new(Arc::new(docker), false, "temps-test-network".to_string());
+
+    assert_eq!(
+        runtime
+            .registry_image_platforms("app:1", None)
+            .await
+            .unwrap(),
+        ["linux/amd64", "linux/arm64"]
+    );
+    // What this daemon can run itself is unchanged.
+    assert_eq!(
+        runtime.image_platforms("app:1").await.unwrap(),
+        ["linux/amd64"]
+    );
+}
+
+/// The classic image store keeps no index: the registry is asked, and the
+/// attestations it lists as `unknown/unknown` are not platforms.
+#[tokio::test]
+async fn registry_image_platforms_asks_the_registry_without_a_local_index() {
+    let docker = image_store_daemon_with_registry(
+        inspected_amd64(),
+        serde_json::json!([summary(INSPECTED_ID, None)]),
+        Some(distribution(&[
+            ("linux", "amd64", None),
+            ("linux", "arm64", Some("v8")),
+            ("unknown", "unknown", None),
+            ("unknown", "unknown", None),
+        ])),
+    )
+    .await;
+    let runtime = DockerRuntime::new(Arc::new(docker), false, "temps-test-network".to_string());
+
+    let platforms = runtime
+        .registry_image_platforms("registry.example.com/team/app:1", None)
+        .await
+        .unwrap();
+
+    assert_eq!(platforms.len(), 2, "{platforms:?}");
+    for node in ["linux/amd64", "linux/arm64"] {
+        assert!(
+            platforms
+                .iter()
+                .any(|platform| crate::platform::platforms_match(platform, node)),
+            "a {node} node must be eligible: {platforms:?}"
+        );
+    }
+}
+
+/// An unreachable registry is an error naming the image, which the deploy
+/// job answers by falling back to the platforms held locally.
+#[tokio::test]
+async fn registry_image_platforms_reports_an_unreachable_registry() {
+    let docker = image_store_daemon_with_registry(
+        inspected_amd64(),
+        serde_json::json!([summary(INSPECTED_ID, None)]),
+        None,
+    )
+    .await;
+    let runtime = DockerRuntime::new(Arc::new(docker), false, "temps-test-network".to_string());
+
+    let error = runtime
+        .registry_image_platforms("registry.example.com/team/app:1", None)
+        .await
+        .expect_err("no index locally and none from the registry");
+    let message = error.to_string();
+    assert!(
+        message.contains("registry.example.com/team/app:1"),
+        "{message}"
+    );
 }

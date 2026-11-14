@@ -145,13 +145,26 @@ fn split_repository_and_tag(image: &str) -> (&str, &str) {
     }
 }
 
-/// The platforms of `manifests` that can run from the local store: image
-/// manifests (not attestations) whose content is all present. A manifest list
-/// pulled for one architecture still lists the others, unavailable.
-fn locally_available_platforms(manifests: &[bollard::models::ImageManifestSummary]) -> Vec<String> {
+/// Which of an image's manifests [`manifest_platforms`] reports.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ManifestScope {
+    /// Only those whose content is all present: what this daemon can run.
+    Available,
+    /// Every one the image's index declares, downloaded or not: what a pull
+    /// of the same reference can fetch for each architecture.
+    Declared,
+}
+
+/// The platforms of `manifests`: image manifests, never attestations, limited
+/// to the locally runnable ones for [`ManifestScope::Available`]. A manifest
+/// list pulled for one architecture still lists the others, unavailable.
+fn manifest_platforms(
+    manifests: &[bollard::models::ImageManifestSummary],
+    scope: ManifestScope,
+) -> Vec<String> {
     let mut platforms: Vec<String> = Vec::new();
     for manifest in manifests {
-        if !manifest.available
+        if (scope == ManifestScope::Available && !manifest.available)
             || manifest.kind != Some(bollard::models::ImageManifestSummaryKindEnum::IMAGE)
         {
             continue;
@@ -159,21 +172,57 @@ fn locally_available_platforms(manifests: &[bollard::models::ImageManifestSummar
         let Some(platform) = manifest.image_data.as_ref().map(|data| &data.platform) else {
             continue;
         };
-        let (Some(os), Some(architecture)) =
-            (platform.os.as_deref(), platform.architecture.as_deref())
-        else {
-            continue;
-        };
-        let architecture = match platform.variant.as_deref().map(str::trim) {
-            Some(variant) if !variant.is_empty() => format!("{architecture}/{variant}"),
-            _ => architecture.to_string(),
-        };
-        let platform = crate::platform::normalize_platform(os, &architecture);
-        if !platforms.contains(&platform) {
-            platforms.push(platform);
-        }
+        push_platform(
+            &mut platforms,
+            platform.os.as_deref(),
+            platform.architecture.as_deref(),
+            platform.variant.as_deref(),
+        );
     }
     platforms
+}
+
+/// The platforms a registry index offers, as Docker's distribution inspect
+/// reports them. Build attestations are listed as `unknown/unknown`; they are
+/// not images and are skipped.
+fn registry_index_platforms(platforms: &[bollard::models::OciPlatform]) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    for platform in platforms {
+        push_platform(
+            &mut found,
+            platform.os.as_deref(),
+            platform.architecture.as_deref(),
+            platform.variant.as_deref(),
+        );
+    }
+    found
+}
+
+/// Append the canonical form of `os`/`architecture`/`variant` to `platforms`
+/// unless it is incomplete, `unknown`, or already there.
+fn push_platform(
+    platforms: &mut Vec<String>,
+    os: Option<&str>,
+    architecture: Option<&str>,
+    variant: Option<&str>,
+) {
+    let (Some(os), Some(architecture)) = (
+        os.map(str::trim).filter(|os| !os.is_empty()),
+        architecture.map(str::trim).filter(|arch| !arch.is_empty()),
+    ) else {
+        return;
+    };
+    if os == "unknown" || architecture == "unknown" {
+        return;
+    }
+    let architecture = match variant.map(str::trim) {
+        Some(variant) if !variant.is_empty() => format!("{architecture}/{variant}"),
+        _ => architecture.to_string(),
+    };
+    let platform = crate::platform::normalize_platform(os, &architecture);
+    if !platforms.contains(&platform) {
+        platforms.push(platform);
+    }
 }
 
 /// How long the daemon may take to start answering an image archive request.
@@ -280,6 +329,42 @@ fn stream_file_owning_dir(file: tokio::fs::File, dir: TempDir) -> ImageImportStr
 }
 
 impl DockerRuntime {
+    /// The platforms of the local index `image_name` (image `image_id`)
+    /// resolves to, within `scope`. Empty when the daemon keeps no index for
+    /// it (the classic image store) or cannot list it.
+    async fn indexed_platforms(
+        &self,
+        image_name: &str,
+        image_id: &str,
+        scope: ManifestScope,
+    ) -> Vec<String> {
+        let Ok(docker) = self.require_docker_for_build() else {
+            return Vec::new();
+        };
+        let filters = std::collections::HashMap::from([("reference", vec![image_name])]);
+        let options = bollard::query_parameters::ListImagesOptionsBuilder::new()
+            .filters(&filters)
+            .manifests(true)
+            .build();
+        let listed = match docker.list_images(Some(options)).await {
+            Ok(listed) => listed,
+            Err(error) => {
+                debug!(
+                    image = %image_name,
+                    %error,
+                    "Could not list the image's manifests"
+                );
+                return Vec::new();
+            }
+        };
+        listed
+            .iter()
+            .find(|summary| summary.id == image_id)
+            .and_then(|summary| summary.manifests.as_deref())
+            .map(|manifests| manifest_platforms(manifests, scope))
+            .unwrap_or_default()
+    }
+
     async fn create_tar_context_body(
         &self,
         context_path: PathBuf,
@@ -1194,33 +1279,52 @@ impl ImageBuilder for DockerRuntime {
     /// list is answered by inspection: one platform, as before.
     async fn image_platforms(&self, image_name: &str) -> Result<Vec<String>, BuilderError> {
         let inspected = self.inspect_image(image_name).await?;
-        let docker = self.require_docker_for_build()?;
-        let filters = std::collections::HashMap::from([("reference", vec![image_name])]);
-        let options = bollard::query_parameters::ListImagesOptionsBuilder::new()
-            .filters(&filters)
-            .manifests(true)
-            .build();
-        let listed = match docker.list_images(Some(options)).await {
-            Ok(listed) => listed,
-            Err(error) => {
-                debug!(
-                    image = %image_name,
-                    %error,
-                    "Could not list the image's manifests; using its inspected platform"
-                );
-                return Ok(vec![inspected.platform]);
-            }
-        };
-        let platforms = listed
-            .iter()
-            .find(|summary| summary.id == inspected.id)
-            .and_then(|summary| summary.manifests.as_deref())
-            .map(locally_available_platforms)
-            .unwrap_or_default();
+        let platforms = self
+            .indexed_platforms(image_name, &inspected.id, ManifestScope::Available)
+            .await;
         if platforms.is_empty() {
             return Ok(vec![inspected.platform]);
         }
         Ok(platforms)
+    }
+
+    /// The pulled index is read first: the containerd image store keeps a
+    /// pulled tag's whole manifest list, including the architectures it did
+    /// not download, so no registry round-trip is needed. The classic store
+    /// keeps only the platform it pulled, and an image this daemon does not
+    /// hold has no local index at all; both are answered by the registry.
+    async fn registry_image_platforms(
+        &self,
+        image_name: &str,
+        credentials: Option<crate::remote::RemotePullCredentials>,
+    ) -> Result<Vec<String>, BuilderError> {
+        if let Ok(inspected) = self.inspect_image(image_name).await {
+            let declared = self
+                .indexed_platforms(image_name, &inspected.id, ManifestScope::Declared)
+                .await;
+            if !declared.is_empty() {
+                return Ok(declared);
+            }
+        }
+
+        let docker = self.require_docker_for_build()?;
+        let auth = credentials.map(|c| bollard::auth::DockerCredentials {
+            username: c.username,
+            password: c.password,
+            identitytoken: c.identity_token,
+            serveraddress: c.server_address,
+            ..Default::default()
+        });
+        let distribution = docker
+            .inspect_registry_image(image_name, auth)
+            .await
+            .map_err(|e| {
+                BuilderError::Other(format!(
+                    "Failed to read the registry index of '{}': {}",
+                    image_name, e
+                ))
+            })?;
+        Ok(registry_index_platforms(&distribution.platforms))
     }
 
     async fn inspect_image(&self, image_name: &str) -> Result<crate::ImageInfo, BuilderError> {
