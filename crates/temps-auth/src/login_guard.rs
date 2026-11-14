@@ -74,6 +74,11 @@ const LOCKOUT_MAX_DOUBLINGS: i32 = 16;
 /// overflow the column. Far above the threshold, so it changes no decision.
 const MAX_RECORDED_ATTEMPTS: i32 = 1_000_000;
 
+/// Deliberately **not** convertible into `UserAuthError`: a guard failure
+/// must never become a database error on the login path, because a database
+/// that serves reads and rejects writes would then answer 500 for an address
+/// that exists and 401 for one that does not. `login` turns every one of
+/// these into the same refusal instead.
 #[derive(Debug, Error)]
 pub(crate) enum LoginGuardError {
     #[error("Failed to {operation} the login throttle for user {user_id}: {source}")]
@@ -83,17 +88,6 @@ pub(crate) enum LoginGuardError {
         #[source]
         source: DbErr,
     },
-}
-
-/// The guard's only failure is the database not answering, which `login`
-/// already reports as a database error (a 500, never an authentication
-/// outcome).
-impl From<LoginGuardError> for crate::auth_service::UserAuthError {
-    fn from(error: LoginGuardError) -> Self {
-        match error {
-            LoginGuardError::Database { source, .. } => Self::DatabaseError(source),
-        }
-    }
 }
 
 /// A user id no row can have, used to probe the guard for an email that does

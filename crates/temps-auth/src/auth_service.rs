@@ -933,10 +933,35 @@ impl AuthService {
             .one(self.db.as_ref())
             .await?;
 
+        // Consult the throttle before reading the password, for an unknown
+        // address too so the work this path costs does not say whether the
+        // account exists. Reserving *is* the count, so a burst of
+        // simultaneous guesses cannot slip past a threshold that a separate
+        // check-then-count would still read as clear
+        // (`crate::login_guard`).
+        //
+        // A guard that cannot answer refuses the login, and refuses it the
+        // same way for both branches. Propagating the error instead would
+        // be its own account-existence oracle: a database that serves reads
+        // but rejects writes answers the unknown-address probe and fails the
+        // reservation, so an address that exists would get a 500 where one
+        // that does not gets a 401. Nothing is lost by refusing -- issuing a
+        // session is itself a write, so no login can succeed through such a
+        // database anyway.
+        let admission = match found.as_ref() {
+            Some(user) => {
+                match crate::login_guard::reserve_attempt(self.db.as_ref(), user.id).await {
+                    Ok(admission) => Some(admission),
+                    Err(error) => return Err(refuse_unavailable_guard(error, &request.password)),
+                }
+            }
+            None => match crate::login_guard::probe_missing_account(self.db.as_ref()).await {
+                Ok(()) => None,
+                Err(error) => return Err(refuse_unavailable_guard(error, &request.password)),
+            },
+        };
+
         let Some(user) = found else {
-            // The guard is touched for an unknown address too, so the work
-            // this path costs does not say whether the account exists.
-            crate::login_guard::probe_missing_account(self.db.as_ref()).await?;
             verify_against_dummy_hash(&request.password);
             warn!(
                 "Login attempt for non-existent or deleted email: {}",
@@ -945,15 +970,12 @@ impl AuthService {
             return Err(UserAuthError::InvalidCredentials);
         };
 
-        // Reserve this attempt *before* reading the password: the reservation
-        // is the count, so a burst of simultaneous guesses cannot slip past a
-        // threshold that a separate check-then-count would still read as
-        // clear (`crate::login_guard`). Past the threshold the password is
-        // not evaluated at all, the answer is the one a wrong password gets,
-        // and nothing is counted -- so whoever keeps sending attempts cannot
-        // push the deadline further out.
-        match crate::login_guard::reserve_attempt(self.db.as_ref(), user.id).await? {
-            crate::login_guard::Admission::Throttled { until } => {
+        // Past the threshold the password is not evaluated at all, the answer
+        // is the one a wrong password gets, and nothing is counted -- so
+        // whoever keeps sending attempts cannot push the deadline further
+        // out.
+        match admission {
+            Some(crate::login_guard::Admission::Throttled { until }) => {
                 verify_against_dummy_hash(&request.password);
                 warn!(
                     user_id = user.id,
@@ -962,9 +984,12 @@ impl AuthService {
                 );
                 return Err(UserAuthError::InvalidCredentials);
             }
-            crate::login_guard::Admission::Admitted { attempts } => {
+            Some(crate::login_guard::Admission::Admitted { attempts }) => {
                 debug!(user_id = user.id, attempts, "Admitted a password attempt");
             }
+            // Only the unknown-address branch leaves this empty, and that
+            // branch has already returned above.
+            None => {}
         }
 
         // Check if user has a password (might be GitHub-only user)
@@ -1639,6 +1664,23 @@ fn verify_against_dummy_hash(password: &str) -> bool {
         }
     }
     false
+}
+
+/// Refuse a password login because the per-account throttle could not be
+/// consulted, with the answer a wrong password gets.
+///
+/// The database error is logged and never returned: surfacing it would make
+/// the response say whether the address exists (see `login`).
+fn refuse_unavailable_guard(
+    error: crate::login_guard::LoginGuardError,
+    password: &str,
+) -> UserAuthError {
+    error!(
+        %error,
+        "Refusing a password login: the per-account throttle is unavailable"
+    );
+    verify_against_dummy_hash(password);
+    UserAuthError::InvalidCredentials
 }
 
 /// Validate password meets minimum complexity requirements.
@@ -5150,6 +5192,54 @@ mod tests {
             ));
             let unchanged = guard(&db.db, user.id).await.expect("a guard row");
             assert_eq!(unchanged.locked_until, after.locked_until);
+        }
+
+        /// A database that serves reads and refuses writes answers the
+        /// unknown-address probe and fails the reservation. If that error
+        /// reached the caller, an address that exists would get a database
+        /// error where one that does not gets `InvalidCredentials` -- the
+        /// account-existence oracle the guard exists to avoid.
+        #[tokio::test]
+        async fn a_write_refusing_database_cannot_tell_the_two_apart() {
+            let Some((db, auth_service)) = setup_test_env_with_mfa_setting(false).await else {
+                return;
+            };
+            create_test_user(&db.db, "write-refused@example.com", "Correct-Horse-9!").await;
+
+            // Reads keep working, writes to the guard do not. A trigger
+            // rather than `REVOKE`, because the test role owns the table and
+            // privileges do not bind its owner. The database is this test's
+            // own, so the trigger goes away with it.
+            db.db
+                .execute_unprepared(
+                    "CREATE FUNCTION refuse_guard_writes() RETURNS trigger AS $$ \
+                     BEGIN RAISE EXCEPTION 'guard writes refused'; END; $$ LANGUAGE plpgsql; \
+                     CREATE TRIGGER refuse_guard_writes \
+                     BEFORE INSERT OR UPDATE ON user_login_guards \
+                     FOR EACH ROW EXECUTE FUNCTION refuse_guard_writes();",
+                )
+                .await
+                .expect("install the write-refusing trigger");
+
+            let before = dummy_verifications();
+            let existing = auth_service
+                .login(attempt("write-refused@example.com", "Correct-Horse-9!"))
+                .await;
+            let unknown = auth_service
+                .login(attempt("nobody-here@example.com", "Correct-Horse-9!"))
+                .await;
+
+            // Same answer, and the same cost, for both.
+            assert!(
+                matches!(existing, Err(UserAuthError::InvalidCredentials)),
+                "an existing address must not surface the write failure: {existing:?}"
+            );
+            assert!(matches!(unknown, Err(UserAuthError::InvalidCredentials)));
+            assert_eq!(
+                dummy_verifications(),
+                before + 2,
+                "both must cost the same single verification"
+            );
         }
 
         #[tokio::test]

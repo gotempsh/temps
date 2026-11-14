@@ -9531,9 +9531,26 @@ impl ScratchDatabase {
                     .unwrap_or_default()
             );
             let admin = connect_with_retries(&admin_url).await?;
-            admin
-                .execute_unprepared(&format!("CREATE DATABASE \"{name}\""))
-                .await?;
+            // `CREATE DATABASE` copies a template and PostgreSQL serializes
+            // that against any other create or drop on the server. These
+            // tests run concurrently against one server, so a collision is
+            // transient rather than a real failure: retry briefly before
+            // giving up.
+            let mut attempt: u64 = 1;
+            loop {
+                match admin
+                    .execute_unprepared(&format!("CREATE DATABASE \"{name}\""))
+                    .await
+                {
+                    Ok(_) => break,
+                    Err(error) if attempt < 3 => {
+                        eprintln!("retrying CREATE DATABASE {name} after: {error}");
+                        attempt += 1;
+                        tokio::time::sleep(std::time::Duration::from_millis(250 * attempt)).await;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
             let db = connect_with_retries(&replace_database(&admin_url, &name)).await?;
             // `TestDatabase` installs these for its own databases; a scratch
             // one needs them before the first migration asks for a `vector`
@@ -9582,20 +9599,52 @@ impl ScratchDatabase {
             external: None,
         }))
     }
+}
 
-    /// Drop the scratch database when it lives on a server we do not own.
-    async fn close(self) -> anyhow::Result<()> {
-        let Some((admin_url, name)) = self.external else {
-            return Ok(());
+impl Drop for ScratchDatabase {
+    /// Drop the scratch database on **every** path.
+    ///
+    /// Cleanup used to be an `async fn` the test called last, which a `?` or
+    /// a failed assertion skipped: repeated failing runs then piled scratch
+    /// databases up on a shared server. This is the shape `TestDatabase`'s
+    /// own `Drop` uses -- a dedicated thread with its own current-thread
+    /// runtime and a fresh connection, because the pool here belongs to the
+    /// test's runtime, `block_in_place` panics on a current-thread one, and a
+    /// spawned task would race the runtime's shutdown.
+    ///
+    /// `WITH (FORCE)` terminates this test's own remaining backend, so the
+    /// connection does not have to be closed first.
+    fn drop(&mut self) {
+        let Some((admin_url, name)) = self.external.take() else {
+            return;
         };
-        // Close this test's own connections first, or `DROP DATABASE` fails
-        // with "is being accessed by other users".
-        drop(self.db);
-        let admin = connect_with_retries(&admin_url).await?;
-        admin
-            .execute_unprepared(&format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"))
-            .await?;
-        Ok(())
+        let cleanup = std::thread::spawn(move || {
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                eprintln!("leaked scratch database {name}: no runtime for cleanup");
+                return;
+            };
+            runtime.block_on(async {
+                match Database::connect(&admin_url).await {
+                    Ok(admin) => {
+                        if let Err(error) = admin
+                            .execute_unprepared(&format!(
+                                "DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"
+                            ))
+                            .await
+                        {
+                            eprintln!("leaked scratch database {name}: {error}");
+                        }
+                    }
+                    Err(error) => eprintln!("leaked scratch database {name}: {error}"),
+                }
+            });
+        });
+        if cleanup.join().is_err() {
+            eprintln!("scratch database cleanup thread panicked");
+        }
     }
 }
 
@@ -9754,7 +9803,9 @@ async fn test_login_throttle_guards_migration_up_and_down() -> anyhow::Result<()
     Migrator::down(db, Some(steps_back_to(LOGIN_THROTTLE_MIGRATION))).await?;
     assert!(!table_exists(db, "user_login_guards").await?);
 
-    scratch.close().await
+    // `ScratchDatabase`'s `Drop` removes the database, on this path and
+    // on every early return above it.
+    Ok(())
 }
 
 const HASH_CREDENTIALS_MIGRATION: &str = "m20261114_000005_hash_credentials_at_rest";
@@ -9876,5 +9927,7 @@ async fn test_hash_credentials_at_rest_migration_up_and_down() -> anyhow::Result
 
     db.execute_unprepared("DELETE FROM users WHERE id = 9911")
         .await?;
-    scratch.close().await
+    // `ScratchDatabase`'s `Drop` removes the database, on this path and
+    // on every early return above it.
+    Ok(())
 }

@@ -31,10 +31,13 @@
 //! live reset token are touched. No table is rewritten, no index is built,
 //! no column is altered, so no long lock is taken.
 //!
-//! `down` cannot undo a digest. It revokes every session and clears every
-//! webhook token instead, which is the honest reverse: everyone signs in
+//! `down` cannot undo a digest, so it revokes instead: every session, every
+//! webhook token, and every outstanding reset credential. Everyone signs in
 //! again and webhooks are reconfigured, and nothing is left that an older
-//! binary would compare against the wrong form.
+//! binary would read in the wrong form. The reset columns matter most on the
+//! way back: the pre-upgrade lookup is the purpose tag plus whatever the
+//! caller presents, so a row holding the tag plus a digest would accept that
+//! digest as the token.
 
 use sea_orm_migration::prelude::*;
 
@@ -67,6 +70,19 @@ DELETE FROM sessions;
 UPDATE project_agents
 SET webhook_token = NULL
 WHERE webhook_token IS NOT NULL;
+
+-- Reset credentials must go the same way, and here "never match" is not what
+-- would happen. The pre-upgrade binary builds its lookup as the purpose tag
+-- plus the value the caller presented, so a row holding the tag plus a digest
+-- is satisfied by presenting that digest -- which anyone able to read the
+-- column has. Leaving these would hand out a password reset for as long as
+-- `password_reset_expires` stays in the future, defeating the at-rest
+-- protection this migration adds.
+UPDATE users
+SET password_reset_token = NULL,
+    password_reset_expires = NULL
+WHERE password_reset_token IS NOT NULL
+   OR password_reset_expires IS NOT NULL;
 "#;
 
 #[derive(DeriveMigrationName)]
@@ -142,6 +158,20 @@ mod tests {
         assert!(DOWN_SQL.contains("DELETE FROM sessions"), "{DOWN_SQL}");
         assert!(
             DOWN_SQL.contains("SET webhook_token = NULL"),
+            "{DOWN_SQL}"
+        );
+    }
+
+    /// Rolling back must not leave a reset row whose stored digest the
+    /// pre-upgrade lookup would accept as the token itself.
+    #[test]
+    fn down_clears_outstanding_reset_credentials() {
+        assert!(
+            DOWN_SQL.contains("SET password_reset_token = NULL"),
+            "{DOWN_SQL}"
+        );
+        assert!(
+            DOWN_SQL.contains("password_reset_expires = NULL"),
             "{DOWN_SQL}"
         );
     }
