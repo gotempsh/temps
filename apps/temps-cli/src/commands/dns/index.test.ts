@@ -10,6 +10,7 @@ import {
   bunnyCredentials,
   route53Credentials,
   digitalOceanCredentials,
+  deSecCredentials,
   namecheapCredentials,
   gcpCredentials,
   azureCredentials,
@@ -55,6 +56,15 @@ describe('digitalOceanCredentials', () => {
     expect(digitalOceanCredentials('do-token')).toEqual({
       type: 'digitalocean',
       api_token: 'do-token',
+    })
+  })
+})
+
+describe('deSecCredentials', () => {
+  test('carries the API token in the API credential shape', () => {
+    expect(deSecCredentials('desec-token')).toEqual({
+      type: 'desec',
+      api_token: 'desec-token',
     })
   })
 })

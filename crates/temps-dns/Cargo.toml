@@ -70,6 +70,7 @@ tracing = { workspace = true }
 # Utilities
 chrono = { workspace = true }
 uuid = { workspace = true }
+url = { workspace = true }
 
 [dev-dependencies]
 temps-test-utils = { path = "../temps-test-utils" }
