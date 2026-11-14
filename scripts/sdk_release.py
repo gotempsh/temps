@@ -175,7 +175,9 @@ def build(packages, output):
         elif p['kind'] == 'crate':
             run('cargo', 'check', '--lib', '-p', p['name'])
             run('cargo', 'test', '--lib', '-p', p['name'])
-            run('cargo', 'publish', '--dry-run', '--locked', '-p', p['name'])
+            # publish --dry-run can leave its archive in Cargo's private tmp-crate
+            # directory. package verifies and retains the distributable artifact.
+            run('cargo', 'package', '--locked', '-p', p['name'])
             metadata = json.loads(run('cargo', 'metadata', '--no-deps', '--format-version', '1', capture=True))
             shutil.copy(Path(metadata['target_directory']) / 'package' / f"{p['name']}-{p['version']}.crate", dest)
         else:

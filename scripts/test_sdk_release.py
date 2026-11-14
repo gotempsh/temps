@@ -119,6 +119,30 @@ class ReleaseTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             release.pending_files(package, directory, lambda _: {'dist': {'integrity': 'bad'}})
 
+    def test_rust_build_collects_verified_package_archive(self):
+        package = {'kind': 'crate', 'key': 'rust', 'path': 'crates/temps-workflows-sdk',
+                   'name': 'temps-workflows-sdk', 'version': '1.2.3'}
+        target = self.root / 'target'
+        archive = target / 'package/temps-workflows-sdk-1.2.3.crate'
+        def command(*args, **kwargs):
+            if args[:2] == ('git', 'show'):
+                return '1234567890\n'
+            if args[:2] == ('git', 'rev-parse'):
+                return 'abc\n'
+            if args[:2] == ('cargo', 'metadata'):
+                return json.dumps({'target_directory': str(target)})
+            if args[:2] == ('cargo', 'package'):
+                archive.parent.mkdir(parents=True)
+                archive.write_bytes(b'verified-crate')
+            return ''
+        output = self.root / 'artifacts'
+        with patch.object(release, 'run', side_effect=command) as run:
+            release.build([package], output)
+            commands = [call.args[:2] for call in run.call_args_list]
+            self.assertIn(('cargo', 'package'), commands)
+            self.assertNotIn(('cargo', 'publish'), commands)
+        self.assertEqual((output / 'rust' / archive.name).read_bytes(), b'verified-crate')
+
     def test_crate_retry(self):
         directory = self.root / 'artifacts'
         directory.mkdir()
