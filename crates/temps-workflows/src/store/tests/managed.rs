@@ -344,6 +344,14 @@ async fn managed_child_creation_recovers_the_same_child_after_remote_commit() {
     f.store.record_step(record, LIMITS).await.unwrap();
     assert!(f.store.get_run(child.id).await.unwrap().is_some());
     assert!(f.store.get_run(other.id).await.unwrap().is_none());
+    assert!(
+        temps_entities::workflow_prepared_child_inputs::Entity::find_by_id(child.id)
+            .one(f.conn.as_ref())
+            .await
+            .unwrap()
+            .is_none(),
+        "committed children no longer need preparation tracking"
+    );
 }
 
 #[tokio::test]
@@ -386,8 +394,58 @@ async fn prepared_child_cleanup_survives_restart_and_waits_for_owners() {
         .await
         .unwrap();
     restarted.delete_run(parent.id).await.unwrap();
+    let mut pending = restarted.pending_blob_cleanup(100).await.unwrap();
+    if pending.is_empty() {
+        // A new random ID may sort behind the persisted cursor; wrap once.
+        pending = restarted.pending_blob_cleanup(100).await.unwrap();
+    }
+    assert_eq!(pending[0].run_id, orphan.id);
+}
+
+#[tokio::test]
+async fn prepared_cleanup_scans_bounded_windows_and_resumes_after_restart() {
+    let Some(f) = fixture("bounded prepared cleanup").await else {
+        return;
+    };
+    let parent = f.start("parent").await;
+    for id in 1..=4 {
+        let mut child = f.new_run("child", None);
+        child.id = Uuid::from_u128(id);
+        f.store.track_child_input(parent.id, &child).await.unwrap();
+    }
+    f.store
+        .release_child_input(Uuid::from_u128(4))
+        .await
+        .unwrap();
+    assert!(f.store.pending_blob_cleanup(0).await.unwrap().is_empty());
+    for expected in 1..=3 {
+        let restarted = PgWorkflowStore::new(f.conn.clone());
+        assert!(restarted.pending_blob_cleanup(1).await.unwrap().is_empty());
+        let cursor = temps_entities::workflow_child_cleanup_cursor::Entity::find_by_id(true)
+            .one(f.conn.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cursor.last_run_id, Uuid::from_u128(expected));
+    }
+    let restarted = PgWorkflowStore::new(f.conn.clone());
     assert_eq!(
-        restarted.pending_blob_cleanup(100).await.unwrap()[0].run_id,
-        orphan.id
+        restarted.pending_blob_cleanup(1).await.unwrap()[0].run_id,
+        Uuid::from_u128(4)
     );
+    restarted
+        .acknowledge_blob_cleanup(Uuid::from_u128(4))
+        .await
+        .unwrap();
+    assert!(restarted.pending_blob_cleanup(1).await.unwrap().is_empty()); // wrap
+    restarted.delete_run(parent.id).await.unwrap();
+    for expected in 1..=3 {
+        let pending = restarted.pending_blob_cleanup(1).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].run_id, Uuid::from_u128(expected));
+        restarted
+            .acknowledge_blob_cleanup(pending[0].run_id)
+            .await
+            .unwrap();
+    }
 }

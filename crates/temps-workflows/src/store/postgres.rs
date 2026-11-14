@@ -1493,6 +1493,12 @@ impl WorkflowStore for PgWorkflowStore {
                         }
                     }
                 }
+                // The committed run now owns the input; its deletion trigger
+                // queues cleanup, so successful starts need no scan record.
+                temps_entities::workflow_prepared_child_inputs::Entity::delete_by_id(child_id)
+                    .exec(&txn)
+                    .await
+                    .map_err(WorkflowError::db("transferring child input ownership"))?;
             }
         }
         let blob = blob || entry.result_blob_key.is_some();
@@ -1912,7 +1918,51 @@ impl WorkflowStore for PgWorkflowStore {
         limit: u64,
     ) -> WorkflowResult<Vec<crate::payload::PayloadScope>> {
         use temps_entities::workflow_blob_cleanup as cleanup;
-        Ok(cleanup::Entity::find().from_raw_sql(stmt("SELECT run_id,project_id,environment_id,min(created_at) AS created_at FROM (SELECT run_id,project_id,environment_id,created_at FROM workflow_blob_cleanup UNION ALL SELECT c.run_id,c.project_id,c.environment_id,c.created_at FROM workflow_prepared_child_inputs c WHERE NOT EXISTS(SELECT 1 FROM workflow_runs r WHERE r.id=c.run_id) AND NOT EXISTS(SELECT 1 FROM workflow_runs p WHERE p.id=c.parent_run_id)) candidates GROUP BY run_id,project_id,environment_id ORDER BY created_at,run_id LIMIT $1",vec![(limit.min(100) as i64).into()]))
+        let batch = limit.min(100) as i64;
+        if batch == 0 {
+            return Ok(Vec::new());
+        }
+        let txn = self
+            .db
+            .begin()
+            .await
+            .map_err(WorkflowError::db("starting prepared input cleanup scan"))?;
+        // Serialize the durable cursor; ownership checks run in the next
+        // statement's fresh snapshot after the lock is acquired.
+        txn.query_one(stmt(
+            "SELECT singleton FROM workflow_child_cleanup_cursor WHERE singleton FOR UPDATE",
+            vec![],
+        ))
+        .await
+        .map_err(WorkflowError::db("locking prepared input cleanup cursor"))?;
+        txn.execute(stmt(
+            "WITH candidates AS MATERIALIZED (
+                SELECT c.* FROM workflow_prepared_child_inputs c
+                WHERE c.run_id > (SELECT last_run_id FROM workflow_child_cleanup_cursor WHERE singleton)
+                ORDER BY c.run_id LIMIT $1
+            ), removed AS (
+                DELETE FROM workflow_prepared_child_inputs c USING candidates b
+                WHERE c.run_id=b.run_id
+                  AND NOT EXISTS(SELECT 1 FROM workflow_runs r WHERE r.id=c.run_id)
+                  AND NOT EXISTS(SELECT 1 FROM workflow_runs p WHERE p.id=c.parent_run_id)
+                RETURNING c.run_id,c.project_id,c.environment_id,c.created_at
+            ), queued AS (
+                INSERT INTO workflow_blob_cleanup(run_id,project_id,environment_id,created_at)
+                SELECT run_id,project_id,environment_id,created_at FROM removed
+                ON CONFLICT DO NOTHING
+            )
+            UPDATE workflow_child_cleanup_cursor SET last_run_id=COALESCE(
+                (SELECT run_id FROM candidates ORDER BY run_id DESC LIMIT 1),
+                '00000000-0000-0000-0000-000000000000'::uuid) WHERE singleton",
+            vec![batch.into()],
+        )).await.map_err(WorkflowError::db("advancing prepared input cleanup scan"))?;
+        txn.commit()
+            .await
+            .map_err(WorkflowError::db("committing prepared input cleanup scan"))?;
+        Ok(cleanup::Entity::find()
+            .order_by_asc(cleanup::Column::CreatedAt)
+            .order_by_asc(cleanup::Column::RunId)
+            .limit(batch as u64)
             .all(self.db.as_ref())
             .await
             .map_err(WorkflowError::db("listing pending workflow blob cleanup"))?

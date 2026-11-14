@@ -286,6 +286,7 @@ pub mod sandboxes;
 
 // Workflow memory
 pub mod workflow_blob_cleanup;
+pub mod workflow_child_cleanup_cursor;
 pub mod workflow_credentials;
 pub mod workflow_environment_settings;
 pub mod workflow_events;
