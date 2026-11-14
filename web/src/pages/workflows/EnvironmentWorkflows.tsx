@@ -6,7 +6,7 @@ import { Ledger, PageState, Status, Field, EchoDialog } from '@temps-sdk/ds'
 import { Workflow } from 'lucide-react'
 import { Link, useNavigate } from 'react-router'
 import { useState } from 'react'
-import { useForm } from 'react-hook-form'
+import { Controller, useForm, useWatch } from 'react-hook-form'
 import { z } from 'zod'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { toast } from 'sonner'
@@ -16,7 +16,13 @@ import { startWorkflowRun, issueWorkflowCredential } from '@/api/client/sdk.gen'
 import { useProjectEnvironment } from '@/components/project-frame/project-environment-context'
 import { Button } from '@/components/ui/button'
 import { CopyButton } from '@/components/ui/copy-button'
-import { Input } from '@/components/ui/input'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
 import { Textarea } from '@/components/ui/textarea'
 import { RefreshButton } from '@/components/ui/refresh-button'
 import { problemDetail } from '@/lib/api-problem'
@@ -85,6 +91,13 @@ export function WorkflowEnvironment({
     resolver: zodResolver(schema),
     defaultValues: { workflow: '', input: '{}' },
   })
+  const availableWorkflows = (query.data?.workflows ?? []).filter(
+    (workflow) => workflow.defined
+  )
+  const selectedWorkflow = useWatch({ control: form.control, name: 'workflow' })
+  const canStart = availableWorkflows.some(
+    (workflow) => workflow.name === selectedWorkflow
+  )
   const start = useMutation({
     mutationFn: async (value: Fields) =>
       (
@@ -220,7 +233,7 @@ export function WorkflowEnvironment({
             <form
               className="space-y-3 rounded-lg border p-4"
               onSubmit={form.handleSubmit((value) => {
-                if (!start.isPending) start.mutate(value)
+                if (!start.isPending && canStart) start.mutate(value)
               })}
             >
               <Field
@@ -228,10 +241,39 @@ export function WorkflowEnvironment({
                 error={form.formState.errors.workflow?.message}
               >
                 {(props) => (
-                  <Input
-                    {...props}
-                    {...form.register('workflow')}
-                    placeholder="orders"
+                  <Controller
+                    name="workflow"
+                    control={form.control}
+                    render={({ field }) => (
+                      <Select
+                        value={canStart ? field.value : ''}
+                        onValueChange={field.onChange}
+                      >
+                        <SelectTrigger
+                          {...props}
+                          onBlur={field.onBlur}
+                          ref={field.ref}
+                        >
+                          <SelectValue
+                            placeholder={
+                              query.isPending
+                                ? 'Loading workflows…'
+                                : 'Select a workflow'
+                            }
+                          />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {availableWorkflows.map((workflow) => (
+                            <SelectItem
+                              key={workflow.name}
+                              value={workflow.name}
+                            >
+                              {workflow.name}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    )}
                   />
                 )}
               </Field>
@@ -241,7 +283,16 @@ export function WorkflowEnvironment({
               >
                 {(props) => <Textarea {...props} {...form.register('input')} />}
               </Field>
-              <Button type="submit" aria-disabled={start.isPending}>
+              {!query.isPending && availableWorkflows.length === 0 && (
+                <p className="text-sm text-muted-foreground">
+                  No workflows are available. Connect your local executor or
+                  deploy an app that defines workflows, then refresh.
+                </p>
+              )}
+              <Button
+                type="submit"
+                aria-disabled={start.isPending || !canStart}
+              >
                 {start.isPending ? 'Starting…' : 'Start run'}
               </Button>
               {!query.data?.executor.configured && (
