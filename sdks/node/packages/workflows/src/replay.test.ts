@@ -162,7 +162,12 @@ describe('replay', () => {
     await runner.settle();
     const sending = await runner.start('sender');
     await runner.settle();
-    await runner.advance(1000);
+    const sleeping = await runner.run(sending.id);
+    expect(sleeping.status).toBe('sleeping');
+    const wakeAt = sleeping.journal.find((entry) => entry.name === 'linger')?.wake_at;
+    expect(wakeAt).toBeTruthy();
+    // The sleep starts after sending the event, not at the invocation's start.
+    await runner.advance(Date.parse(wakeAt!) - runner.orchestrator.now);
     expect((await runner.run(sending.id)).status).toBe('completed');
     expect((await runner.run(waiting.id)).output).toEqual({ n: 1 });
     expect(runner.orchestrator.sendEvent('go', 'k').delivered).toBe(0);
