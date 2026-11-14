@@ -11,6 +11,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import type { CronExecutionInfo, CronInfo, ProjectResponse } from '@/api/client'
 import { CronJobDetail } from './CronJobDetail'
+import { executionStatus } from './cronExecutionStatus'
 
 const path = { project_id: 1, env_id: 2, cron_id: 3 }
 const cronOptions = getCronByIdOptions({ path })
@@ -27,6 +28,7 @@ const cron: CronInfo = {
   mode: 'http',
   concurrency_policy: 'forbid',
   retry_limit: 0,
+  has_workflow_input: false,
   next_run: null,
   created_at: '2026-01-01T00:00:00Z',
   updated_at: '2026-01-01T00:00:00Z',
@@ -98,6 +100,45 @@ function renderPanel({
   client.clear()
   return markup
 }
+
+describe('CronJobDetail workflow crons', () => {
+  test('shows the workflow a cron starts and links each execution to its run', () => {
+    const markup = renderPanel({
+      configuration: {
+        ...cron,
+        path: 'workflow:send-digest',
+        mode: 'workflow',
+        workflow: 'send-digest',
+        has_workflow_input: true,
+      },
+      executions: [
+        {
+          ...execution,
+          status_code: 0,
+          state: 'running',
+          workflow_run_id: '00000000-0000-4000-8000-0000000000aa',
+        },
+      ],
+    })
+    expect(markup).toContain('Starts workflow')
+    expect(markup).toContain('send-digest')
+    expect(markup).toContain('with the input set in .temps.yaml')
+    expect(markup).toContain('00000000-0000-4000-8000-0000000000aa')
+    expect(markup).toContain('Running')
+    expect(markup).not.toContain('Status: 0')
+  })
+
+  test('reads a run state before the status code', () => {
+    const at = (state: string | null, status_code: number) =>
+      executionStatus({ ...execution, state, status_code })
+    expect(at('running', 0)).toEqual({ tone: 'running', label: 'Running' })
+    expect(at('skipped', 0)).toEqual({ tone: 'idle', label: 'Skipped' })
+    expect(at('succeeded', 200)).toEqual({ tone: 'ok', label: 'Success' })
+    expect(at('failed', 500).tone).toBe('error')
+    expect(at(null, 204).tone).toBe('ok')
+    expect(at(null, 503).tone).toBe('error')
+  })
+})
 
 describe('CronJobDetail request states', () => {
   test('renders execution status, timing and failure details in the shared table', () => {

@@ -489,6 +489,7 @@ pub struct WorkflowExecutionService {
     telemetry: OnceCell<Arc<dyn temps_core::telemetry::TelemetryReporter>>,
     /// ADR 068 D5: the deploy warning (late-bound, optional).
     environment_addresses: OnceCell<Arc<temps_core::environment_address::EnvironmentAddressSlot>>,
+    workflow_control: OnceCell<Arc<dyn temps_core::WorkflowControl>>,
     /// Audit sink for deploy-path security events (late-bound, optional).
     ///
     /// Currently the ADR-045 "this deployment received the host Docker socket"
@@ -549,6 +550,7 @@ impl WorkflowExecutionService {
             file_store: OnceCell::new(),
             telemetry: OnceCell::new(),
             environment_addresses: OnceCell::new(),
+            workflow_control: OnceCell::new(),
             audit_logger: OnceCell::new(),
         }
     }
@@ -564,6 +566,11 @@ impl WorkflowExecutionService {
     }
 
     /// Wire the ADR 068 D5 deploy warning.
+    /// Optional workflows plugin, resolved after every plugin registers.
+    pub fn set_workflow_control(&self, control: Arc<dyn temps_core::WorkflowControl>) {
+        let _ = self.workflow_control.set(control);
+    }
+
     pub fn set_environment_addresses(
         &self,
         slot: Arc<temps_core::environment_address::EnvironmentAddressSlot>,
@@ -4087,12 +4094,13 @@ mod tests {
     const JOB_UNDER_TEST: &str = "job_under_test";
 
     /// Every `deployment_jobs.job_type` string that constructs a job.
-    const BUILDABLE_JOB_TYPES: [&str; 20] = [
+    const BUILDABLE_JOB_TYPES: [&str; 21] = [
         "DownloadRepoJob",
         "BuildImageJob",
         "DeployContainerJob",
         "DeployImageJob",
         "ConfigureCronsJob",
+        "DeploymentWorkflowsJob",
         "ConfigureMetricAlertsJob",
         "ConfigureAgentsJob",
         "MarkDeploymentCompleteJob",
@@ -4180,6 +4188,11 @@ mod tests {
             )
             .depends_on("build_step"),
             JobRow::builds("ConfigureCronsJob", "ConfigureCronsJob", json!({})),
+            JobRow::builds(
+                "DeploymentWorkflowsJob",
+                "DeploymentWorkflowsJob",
+                json!({}),
+            ),
             JobRow::builds(
                 "ConfigureCronsJob",
                 "ConfigureCronsJob",
@@ -4567,7 +4580,9 @@ mod tests {
 
         // Some jobs need a service the plugin binds late: they read their
         // config first, then refuse without it.
-        let refusal = |job_type: &str| match job_type {
+        let refusal = |job_type: &str| {
+            match job_type {
+            "DeploymentWorkflowsJob" => Some("Job creation failed: Durable workflows service is required for deployment workflow jobs"),
             "CaptureSourceMapsJob" | "CaptureSourceFilesJob" => {
                 Some("Invalid job config: SourceMapService not configured")
             }
@@ -4575,6 +4590,7 @@ mod tests {
                 Some("Workflow error: Job validation failed: encryption_service is required")
             }
             _ => None,
+        }
         };
         for row in &rows_that_build {
             let Some(message) = refusal(row.job_type) else {
@@ -4596,6 +4612,9 @@ mod tests {
             )
             .await;
         }
+        service.set_workflow_control(Arc::new(
+            crate::services::cron_workflows::fake::FakeWorkflowControl::default(),
+        ));
         service.set_source_map_service(Arc::new(SourceMapService::new(db.clone())));
         service.set_encryption_service(Arc::new(temps_core::EncryptionService::new(
             TEST_MASTER_KEY,

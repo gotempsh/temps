@@ -2622,6 +2622,33 @@ export type AppSettingsResponse = {
     trusted_private_networks: Array<string>;
 };
 
+export type AppStartWorkflowRunResponse = {
+    created: boolean;
+    run: AppWorkflowRunResponse;
+};
+
+/**
+ * A run as the app that started it sees it: its result once finished.
+ */
+export type AppWorkflowRunResponse = {
+    created_at: string;
+    /**
+     * Set once the run failed.
+     */
+    error?: string | null;
+    error_kind?: string | null;
+    finished_at?: string | null;
+    id: string;
+    /**
+     * Set once the run completed.
+     */
+    output: {
+        [key: string]: unknown;
+    };
+    status: WorkflowRunStatus;
+    workflow: string;
+};
+
 export type ApplicationGitConnectionsResponse = {
     bindings: Array<GitBindingResponse>;
     eligibleRepositories: Array<EligibleGitRepositoryResponse>;
@@ -9408,6 +9435,12 @@ export type CreateWebhookRequestBody = {
     url: string;
 };
 
+export type CreateWorkflowGrantRequest = {
+    action: WorkflowGrantAction;
+    resource: string;
+    source_environment_id: number;
+};
+
 /**
  * The repository that was created. Carries no credentials.
  */
@@ -9515,12 +9548,16 @@ export type CronExecutionInfo = {
     output_tail?: string | null;
     response_time_ms: number;
     /**
-     * `running | succeeded | failed | skipped` for a `job` run; absent
-     * for an `http` call, whose outcome is `status_code`.
+     * `running | succeeded | failed | skipped` for a `job` or `workflow`
+     * run; absent for an `http` call, whose outcome is `status_code`.
      */
     state?: string | null;
     status_code: number;
     url: string;
+    /**
+     * The durable workflow run a `workflow` cron started.
+     */
+    workflow_run_id?: string | null;
     /**
      * The workload the `job` run executed as.
      */
@@ -9540,11 +9577,18 @@ export type CronInfo = {
     created_at: string;
     deleted_at?: string | null;
     environment_id: number;
+    /**
+     * Whether a `workflow` cron gives its runs an input (set in
+     * `.temps.yaml`).
+     */
+    has_workflow_input: boolean;
     id: number;
     /**
-     * `http` (a GET to `path` on the running deployment) or `job`
-     * (`command` run in the environment's image until it exits). For a
-     * `job`, `path` is the cron's key, `job:<name>`.
+     * `http` (a GET to `path` on the running deployment), `job`
+     * (`command` run in the environment's image until it exits) or
+     * `workflow` (a run of the durable workflow `workflow` started). For a
+     * `job`, `path` is the cron's key, `job:<name>`; for a `workflow`,
+     * `workflow:<name>`.
      */
     mode: string;
     next_run?: string | null;
@@ -9570,6 +9614,10 @@ export type CronInfo = {
      */
     ttl_seconds_after_finished?: number | null;
     updated_at: string;
+    /**
+     * The durable workflow a `workflow` cron starts. Absent otherwise.
+     */
+    workflow?: string | null;
 };
 
 export type CronMonitorList = {
@@ -12316,7 +12364,7 @@ export type DockerfilePresetConfig = ContainerRuntimeOverrides & {
  * Existing rows predate this discriminator and therefore deserialize as
  * [`DockerfileVariant::File`].
  */
-export type DockerfileVariant = 'file' | 'custom';
+export type DockerfileVariant = 'file' | 'custom' | 'workflow-worker';
 
 /**
  * What to do with a domain during migration
@@ -16882,6 +16930,11 @@ export type GlobalTracesResponse = {
     windows: Array<GlobalTraceWindow>;
 };
 
+export type GlobalWorkflowRunsResponse = {
+    next_cursor?: string | null;
+    runs: Array<WorkflowRunResponse>;
+};
+
 /**
  * A deployment a goal is watching.
  */
@@ -19102,6 +19155,19 @@ export type IpAccessControlResponse = {
  * How a scope's CIDR list is applied.
  */
 export type IpAccessMode = 'disabled' | 'allow' | 'deny';
+
+/**
+ * A new workflow credential. `token` is shown this once.
+ */
+export type IssuedWorkflowCredentialResponse = {
+    created_at: string;
+    prefix: string;
+    token: string;
+    /**
+     * How the app uses it.
+     */
+    usage: string;
+};
 
 /**
  * Snapshot of a background job. `status` is one of "running" | "exited"
@@ -28802,6 +28868,14 @@ export type RetryClusterRequest = {
     members?: Array<ClusterMemberRequest>;
 };
 
+export type RetryWorkflowRunRequest = {
+    /**
+     * Journal entry to run again from; entries from it on are dropped.
+     * Defaults to the entry that failed, or the end of the journal.
+     */
+    from_sequence?: number | null;
+};
+
 export type RevenueRow = {
     amount_minor?: number | null;
     currency?: string | null;
@@ -30661,6 +30735,25 @@ export type SendMessageRequest = {
     turn_id?: string | null;
 };
 
+export type SendWorkflowEventRequest = {
+    /**
+     * Narrows delivery to runs waiting on this key.
+     */
+    key?: string | null;
+    name: string;
+    payload?: {
+        [key: string]: unknown;
+    };
+};
+
+export type SendWorkflowEventResponse = {
+    /**
+     * Runs woken by this event.
+     */
+    delivered: number;
+    event_id: number;
+};
+
 export type SensitiveConfigValueResponse = {
     value: string;
 };
@@ -32479,6 +32572,13 @@ export type ShieldWouldHave = {
     challenged: number;
 };
 
+export type ShredWorkflowKeyRequest = {
+    /**
+     * Exact key UUID, confirming that its retained payloads become unreadable.
+     */
+    confirm_key_id: string;
+};
+
 /**
  * A sibling project that shares the same `trace_id` and has opted in to
  * cross-project trace sharing (`cross_project_trace_sharing = TRUE`).
@@ -33424,6 +33524,25 @@ export type StartUpdateResponse = {
      * `automatic` (temps restarts itself) or `manual` (installed only).
      */
     restart_mode: SelfUpdateRestartMode;
+};
+
+export type StartWorkflowRunRequest = {
+    /**
+     * A second start with the same key returns the first run.
+     */
+    idempotency_key?: string | null;
+    input?: {
+        [key: string]: unknown;
+    };
+    workflow: string;
+};
+
+export type StartWorkflowRunResponse = {
+    /**
+     * False when the idempotency key matched an earlier run.
+     */
+    created: boolean;
+    run: WorkflowRunResponse;
 };
 
 export type StatResponse = {
@@ -38666,6 +38785,71 @@ export type WorkerInstall = {
     kind: 'latest';
 };
 
+/**
+ * The event a waiting run is suspended on.
+ */
+export type WorkflowAwaitedEventResponse = {
+    key?: string | null;
+    name: string;
+};
+
+/**
+ * A child run a `child` entry starts. Temps records the entry `pending`
+ * with `{"run_id": ...}` and completes it with the child's
+ * [`child_result`] when the child finishes.
+ */
+export type WorkflowChildStart = {
+    input?: {
+        [key: string]: unknown;
+    };
+    /**
+     * The child's workflow, in the same environment.
+     */
+    workflow: string;
+};
+
+/**
+ * The environment's workflow credential, never its token.
+ */
+export type WorkflowCredentialStatusResponse = {
+    configured: boolean;
+    created_at?: string | null;
+    last_used_at?: string | null;
+    /**
+     * First characters of the token, to recognise it.
+     */
+    prefix?: string | null;
+};
+
+export type WorkflowDevPollResponse = {
+    request?: WorkflowDevRequest | null;
+};
+
+export type WorkflowDevReply = {
+    outcome?: WorkflowOutcomeRequest | null;
+    status: number;
+};
+
+export type WorkflowDevRequest = {
+    body: string;
+    id: string;
+    token: string;
+};
+
+export type WorkflowDevSessionResponse = {
+    expires_at: string;
+    manifest_token: string;
+    session_id: string;
+};
+
+export type WorkflowDiagnosis = {
+    blocked_reason?: string | null;
+    error_kind?: string | null;
+    next_action: string;
+    run_id: string;
+    status: WorkflowRunStatus;
+};
+
 export type WorkflowDryRunRequest = {
     /**
      * Optional CPU override applied after parsing YAML (clamped server-side).
@@ -38696,6 +38880,435 @@ export type WorkflowDryRunRequest = {
      * before storing on the run row.
      */
     yaml: string;
+};
+
+export type WorkflowEmittedEvent = {
+    key?: string | null;
+    name: string;
+    payload?: {
+        [key: string]: unknown;
+    };
+};
+
+/**
+ * Whether the environment can run workflows. When `configured` is false,
+ * `reason` says what is missing and `setup_path` where to fix it.
+ */
+export type WorkflowExecutorCapabilityResponse = {
+    configured: boolean;
+    /**
+     * The deployment whose replicas would be invoked.
+     */
+    deployment_id?: number | null;
+    reason?: string | null;
+    /**
+     * Healthy replicas found.
+     */
+    replicas: number;
+    /**
+     * SDK name and version reported by the manifest.
+     */
+    sdk?: string | null;
+    setup_path?: string | null;
+};
+
+export type WorkflowGrantAction = 'start' | 'event';
+
+export type WorkflowGrantListResponse = {
+    grants: Array<WorkflowGrantResponse>;
+    page: number;
+    page_size: number;
+    total: number;
+    total_pages: number;
+};
+
+export type WorkflowGrantResponse = {
+    action: string;
+    created_at: string;
+    id: string;
+    resource: string;
+    source_environment_id: number;
+    target_environment_id: number;
+};
+
+export type WorkflowHeartbeatResponse = {
+    /**
+     * True once an operator cancelled the run: stop at the next step.
+     */
+    cancelled: boolean;
+    lease_expires_at: string;
+};
+
+/**
+ * `GET /workflows/v1/invocation-key` response, read with the environment's
+ * workflow credential. The SDK accepts only invocation tokens for this
+ * project and environment: the key alone is instance-wide, so a token
+ * another environment's executor received is still validly signed.
+ */
+export type WorkflowInvocationKeyResponse = {
+    /**
+     * `ed25519`.
+     */
+    algorithm: string;
+    /**
+     * The environment the credential belongs to; tokens must carry it as `eid`.
+     */
+    environment_id: number;
+    key_id: string;
+    /**
+     * The project the credential belongs to; tokens must carry it as `pid`.
+     */
+    project_id: number;
+    /**
+     * Base64url (no padding) of the 32-byte public key.
+     */
+    public_key: string;
+};
+
+/**
+ * One recorded journal entry as the executor replays it.
+ */
+export type WorkflowJournalEntry = {
+    attempts: number;
+    /**
+     * The recorded error message (`failed`, or the last failed attempt).
+     */
+    error?: string | null;
+    kind: WorkflowStepKind;
+    name: string;
+    /**
+     * The recorded result (`completed`), decrypted for the executor.
+     */
+    result: {
+        [key: string]: unknown;
+    };
+    sequence: number;
+    status: WorkflowStepStatus;
+    /**
+     * A `sleep`'s wake time or a `wait`'s timeout.
+     */
+    wake_at?: string | null;
+};
+
+/**
+ * `GET /workflow-runs/{run_id}/journal` response page.
+ */
+export type WorkflowJournalPage = {
+    entries: Array<WorkflowJournalEntry>;
+    next_sequence?: number | null;
+};
+
+/**
+ * `GET /.well-known/temps/workflows/manifest` response.
+ */
+export type WorkflowManifest = {
+    protocol_version: number;
+    sdk?: string | null;
+    workflows: Array<WorkflowManifestEntry>;
+};
+
+/**
+ * One workflow the executor serves.
+ */
+export type WorkflowManifestEntry = {
+    /**
+     * Runs of this workflow allowed to execute at once in the environment.
+     */
+    concurrency?: number | null;
+    name: string;
+    /**
+     * Optional label of the workflow's code version.
+     */
+    version?: string | null;
+};
+
+/**
+ * How an invocation ended.
+ */
+export type WorkflowOutcome = {
+    output?: {
+        [key: string]: unknown;
+    };
+    type: 'completed';
+} | {
+    error: string;
+    /**
+     * The journal entry that failed, when a step did.
+     */
+    sequence?: number | null;
+    type: 'failed';
+} | {
+    sequence: number;
+    type: 'sleep';
+    until: string;
+} | {
+    event: string;
+    key?: string | null;
+    sequence: number;
+    timeout_at?: string | null;
+    type: 'wait';
+} | {
+    at: string;
+    sequence: number;
+    type: 'retry';
+} | {
+    expected: string;
+    found: string;
+    sequence: number;
+    type: 'incompatible';
+};
+
+/**
+ * `POST /workflow-runs/{run_id}/outcome` body.
+ */
+export type WorkflowOutcomeRequest = {
+    outcome: WorkflowOutcome;
+};
+
+export type WorkflowOutcomeResponse = {
+    status: WorkflowRunStatus;
+};
+
+export type WorkflowProjectKeyResponse = {
+    created_at: string;
+    id: string;
+    shredded_at?: string | null;
+};
+
+export type WorkflowProjectKeysResponse = {
+    keys: Array<WorkflowProjectKeyResponse>;
+    page: number;
+    page_size: number;
+    total: number;
+    total_pages: number;
+};
+
+export type WorkflowRevealPayloadRequest = {
+    /**
+     * Required for `step_result` and `step_error`.
+     */
+    sequence?: number | null;
+    target: WorkflowRevealTarget;
+};
+
+export type WorkflowRevealPayloadResponse = {
+    sequence?: number | null;
+    target: WorkflowRevealTarget;
+    /**
+     * The decrypted payload; `null` when none was stored.
+     */
+    value: {
+        [key: string]: unknown;
+    };
+};
+
+/**
+ * Which payload to reveal.
+ */
+export type WorkflowRevealTarget = 'input' | 'output' | 'error' | 'step_result' | 'step_error';
+
+export type WorkflowRunListResponse = {
+    page: number;
+    page_size: number;
+    runs: Array<WorkflowRunResponse>;
+    total: number;
+    total_pages: number;
+};
+
+/**
+ * A run, payloads masked.
+ */
+export type WorkflowRunResponse = {
+    /**
+     * Invocations so far.
+     */
+    attempt: number;
+    awaited_event?: WorkflowAwaitedEventResponse | null;
+    /**
+     * Why the run is not progressing (no replica, invocation failures).
+     */
+    blocked_reason?: string | null;
+    consecutive_failures: number;
+    created_at: string;
+    /**
+     * When the run is next runnable.
+     */
+    due_at?: string | null;
+    environment_id: number;
+    /**
+     * Category of the failure: `step_failed`, `workflow_failed`,
+     * `incompatible`, `payload_too_large`, `cancelled`.
+     */
+    error_kind?: string | null;
+    finished_at?: string | null;
+    has_error: boolean;
+    has_input: boolean;
+    has_output: boolean;
+    id: string;
+    idempotency_key?: string | null;
+    input_bytes: number;
+    journal_bytes: number;
+    lease_expires_at?: string | null;
+    output_bytes: number;
+    parent_run_id?: string | null;
+    project_id: number;
+    started_at?: string | null;
+    started_by_credential_id?: number | null;
+    started_by_user_id?: number | null;
+    status: WorkflowRunStatus;
+    step_count: number;
+    updated_at: string;
+    workflow: string;
+};
+
+/**
+ * Where a run is in its lifecycle (ADR-106 §3).
+ */
+export type WorkflowRunStatus = 'queued' | 'running' | 'sleeping' | 'waiting' | 'retrying' | 'completed' | 'failed' | 'cancelled' | 'stuck';
+
+/**
+ * The settings in effect for an environment: its row, or the defaults.
+ */
+export type WorkflowSettings = {
+    /**
+     * Opt-in deploy drain: pause new invocations and wait for running attempts.
+     * Zero disables it. Suspended runs resume on the new deployment.
+     */
+    drain_timeout_secs?: number;
+    /**
+     * Compose service hosting the workflow handler; `None`: the main service.
+     */
+    host_service?: string | null;
+    inline_payload_limit_bytes: number;
+    invocation_deadline_secs: number;
+    lease_secs: number;
+    /**
+     * Managed PostgreSQL journal for new runs; existing runs keep their store.
+     */
+    managed_store_service_id?: number | null;
+    max_active_runs: number;
+    max_concurrent_runs: number;
+    max_journal_bytes_per_run: number;
+    max_payload_bytes: number;
+    max_steps_per_run: number;
+    retention_days: number;
+    stuck_after_failures: number;
+};
+
+/**
+ * What a journal entry records.
+ */
+export type WorkflowStepKind = 'step' | 'sleep' | 'wait' | 'now' | 'random' | 'send_event' | 'child';
+
+export type WorkflowStepListResponse = {
+    page: number;
+    page_size: number;
+    steps: Array<WorkflowStepResponse>;
+    total: number;
+    total_pages: number;
+};
+
+/**
+ * A journal entry, payloads masked.
+ */
+export type WorkflowStepResponse = {
+    attempts: number;
+    completed_at?: string | null;
+    created_at: string;
+    duration_ms?: number | null;
+    /**
+     * Error-tracking event of the attempt's exception.
+     */
+    error_ref?: string | null;
+    /**
+     * The event that completed a wait.
+     */
+    event_id?: number | null;
+    has_error: boolean;
+    has_result: boolean;
+    kind: WorkflowStepKind;
+    name: string;
+    result_bytes: number;
+    sequence: number;
+    status: WorkflowStepStatus;
+    /**
+     * OTEL trace of the attempt, to open in traces.
+     */
+    trace_id?: string | null;
+    updated_at: string;
+    /**
+     * A sleep's wake time or a wait's timeout.
+     */
+    wake_at?: string | null;
+};
+
+/**
+ * A journal entry's state. `pending` is a sleep or wait not yet over, or a
+ * step whose failed attempt is waiting for its retry.
+ */
+export type WorkflowStepStatus = 'pending' | 'completed' | 'failed';
+
+/**
+ * `POST /workflow-runs/{run_id}/steps` body: record one journal entry.
+ */
+export type WorkflowStepWriteRequest = {
+    /**
+     * Attempts made so far, this one included.
+     */
+    attempts: number;
+    child?: WorkflowChildStart | null;
+    duration_ms?: number | null;
+    error?: string | null;
+    /**
+     * Error-tracking event id of the attempt's exception.
+     */
+    error_ref?: string | null;
+    event?: WorkflowEmittedEvent | null;
+    kind: WorkflowStepKind;
+    name: string;
+    result?: {
+        [key: string]: unknown;
+    };
+    sequence: number;
+    status: WorkflowStepStatus;
+    /**
+     * OTEL trace id of the attempt's span (metadata only).
+     */
+    trace_id?: string | null;
+    wake_at?: string | null;
+};
+
+/**
+ * The entry as Temps holds it after the write. When `already_recorded` is
+ * true, the executor must continue with this recorded value, not its own.
+ */
+export type WorkflowStepWriteResponse = {
+    already_recorded: boolean;
+    entry: WorkflowJournalEntry;
+    lease_expires_at: string;
+};
+
+export type WorkflowSummaryResponse = {
+    active_runs: number;
+    completed_runs: number;
+    /**
+     * Runs allowed to execute at once, from the manifest.
+     */
+    concurrency?: number | null;
+    /**
+     * False when runs exist for a workflow the deployment no longer defines.
+     */
+    defined: boolean;
+    failed_runs: number;
+    last_run_at?: string | null;
+    name: string;
+    version?: string | null;
+};
+
+export type WorkflowsOverviewResponse = {
+    credential: WorkflowCredentialStatusResponse;
+    executor: WorkflowExecutorCapabilityResponse;
+    workflows: Array<WorkflowSummaryResponse>;
 };
 
 /**
@@ -81294,6 +81907,1228 @@ export type RevokeShieldTokenResponses = {
 
 export type RevokeShieldTokenResponse = RevokeShieldTokenResponses[keyof RevokeShieldTokenResponses];
 
+export type GetWorkflowsOverviewData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/workflows';
+};
+
+export type GetWorkflowsOverviewErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Environment not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetWorkflowsOverviewResponses = {
+    /**
+     * Workflows of the environment, whether it can run them, and its credential status
+     */
+    200: WorkflowsOverviewResponse;
+};
+
+export type GetWorkflowsOverviewResponse = GetWorkflowsOverviewResponses[keyof GetWorkflowsOverviewResponses];
+
+export type RevokeWorkflowCredentialData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/workflows/credential';
+};
+
+export type RevokeWorkflowCredentialErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Environment or credential not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type RevokeWorkflowCredentialResponses = {
+    /**
+     * Credential revoked
+     */
+    204: void;
+};
+
+export type RevokeWorkflowCredentialResponse = RevokeWorkflowCredentialResponses[keyof RevokeWorkflowCredentialResponses];
+
+export type GetWorkflowCredentialData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/workflows/credential';
+};
+
+export type GetWorkflowCredentialErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Environment not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetWorkflowCredentialResponses = {
+    /**
+     * Whether the environment has a workflow credential, never its token
+     */
+    200: WorkflowCredentialStatusResponse;
+};
+
+export type GetWorkflowCredentialResponse = GetWorkflowCredentialResponses[keyof GetWorkflowCredentialResponses];
+
+export type IssueWorkflowCredentialData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/workflows/credential';
+};
+
+export type IssueWorkflowCredentialErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Environment not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type IssueWorkflowCredentialResponses = {
+    /**
+     * New credential; the token is shown only in this response. The previous credential stops working.
+     */
+    201: IssuedWorkflowCredentialResponse;
+};
+
+export type IssueWorkflowCredentialResponse = IssueWorkflowCredentialResponses[keyof IssueWorkflowCredentialResponses];
+
+export type OpenWorkflowDevData = {
+    body?: never;
+    path: {
+        project_id: number;
+        environment_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/workflows/dev';
+};
+
+export type OpenWorkflowDevErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Requires workflow write and payload access
+     */
+    403: unknown;
+    /**
+     * Session unavailable
+     */
+    409: unknown;
+    /**
+     * Message too large
+     */
+    413: unknown;
+    /**
+     * Database failure
+     */
+    500: unknown;
+};
+
+export type OpenWorkflowDevResponses = {
+    /**
+     * Development tunnel operation completed
+     */
+    201: WorkflowDevSessionResponse;
+};
+
+export type OpenWorkflowDevResponse = OpenWorkflowDevResponses[keyof OpenWorkflowDevResponses];
+
+export type CloseWorkflowDevData = {
+    body?: never;
+    path: {
+        project_id: number;
+        environment_id: number;
+        session_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/workflows/dev/{session_id}';
+};
+
+export type CloseWorkflowDevErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Requires workflow write and payload access
+     */
+    403: unknown;
+    /**
+     * Session unavailable
+     */
+    409: unknown;
+    /**
+     * Message too large
+     */
+    413: unknown;
+    /**
+     * Database failure
+     */
+    500: unknown;
+};
+
+export type CloseWorkflowDevResponses = {
+    /**
+     * Development tunnel operation completed
+     */
+    204: void;
+};
+
+export type CloseWorkflowDevResponse = CloseWorkflowDevResponses[keyof CloseWorkflowDevResponses];
+
+export type ConfigureWorkflowDevData = {
+    body: WorkflowManifest;
+    path: {
+        project_id: number;
+        environment_id: number;
+        session_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/workflows/dev/{session_id}';
+};
+
+export type ConfigureWorkflowDevErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Requires workflow write and payload access
+     */
+    403: unknown;
+    /**
+     * Session unavailable
+     */
+    409: unknown;
+    /**
+     * Message too large
+     */
+    413: unknown;
+    /**
+     * Database failure
+     */
+    500: unknown;
+};
+
+export type ConfigureWorkflowDevResponses = {
+    /**
+     * Development tunnel operation completed
+     */
+    204: void;
+};
+
+export type ConfigureWorkflowDevResponse = ConfigureWorkflowDevResponses[keyof ConfigureWorkflowDevResponses];
+
+export type PollWorkflowDevData = {
+    body?: never;
+    path: {
+        project_id: number;
+        environment_id: number;
+        session_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/workflows/dev/{session_id}/poll';
+};
+
+export type PollWorkflowDevErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Requires workflow write and payload access
+     */
+    403: unknown;
+    /**
+     * Session unavailable
+     */
+    409: unknown;
+    /**
+     * Message too large
+     */
+    413: unknown;
+    /**
+     * Database failure
+     */
+    500: unknown;
+};
+
+export type PollWorkflowDevResponses = {
+    /**
+     * Development tunnel operation completed
+     */
+    200: WorkflowDevPollResponse;
+};
+
+export type PollWorkflowDevResponse = PollWorkflowDevResponses[keyof PollWorkflowDevResponses];
+
+export type RespondWorkflowDevData = {
+    body: WorkflowDevReply;
+    path: {
+        project_id: number;
+        environment_id: number;
+        session_id: string;
+        request_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/workflows/dev/{session_id}/requests/{request_id}';
+};
+
+export type RespondWorkflowDevErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Requires workflow write and payload access
+     */
+    403: unknown;
+    /**
+     * Session unavailable
+     */
+    409: unknown;
+    /**
+     * Message too large
+     */
+    413: unknown;
+    /**
+     * Database failure
+     */
+    500: unknown;
+};
+
+export type RespondWorkflowDevResponses = {
+    /**
+     * Development tunnel operation completed
+     */
+    204: void;
+};
+
+export type RespondWorkflowDevResponse = RespondWorkflowDevResponses[keyof RespondWorkflowDevResponses];
+
+export type SendWorkflowEventData = {
+    body: SendWorkflowEventRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/workflows/events';
+};
+
+export type SendWorkflowEventErrors = {
+    /**
+     * Validation error
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Environment not found
+     */
+    404: unknown;
+    /**
+     * Payload too large
+     */
+    413: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type SendWorkflowEventResponses = {
+    /**
+     * Event stored and delivered to the runs waiting on it
+     */
+    200: SendWorkflowEventResponse;
+};
+
+export type SendWorkflowEventResponse2 = SendWorkflowEventResponses[keyof SendWorkflowEventResponses];
+
+export type ListWorkflowGrantsData = {
+    body?: never;
+    path: {
+        project_id: number;
+        environment_id: number;
+    };
+    query?: {
+        /**
+         * 1-indexed page number. Defaults to 1.
+         */
+        page?: number | null;
+        /**
+         * Items per page. Defaults to 20, capped at 100.
+         */
+        page_size?: number | null;
+    };
+    url: '/projects/{project_id}/environments/{environment_id}/workflows/grants';
+};
+
+export type ListWorkflowGrantsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Environment not found
+     */
+    404: unknown;
+    /**
+     * Database failure
+     */
+    500: unknown;
+};
+
+export type ListWorkflowGrantsResponses = {
+    /**
+     * Incoming grants
+     */
+    200: WorkflowGrantListResponse;
+};
+
+export type ListWorkflowGrantsResponse = ListWorkflowGrantsResponses[keyof ListWorkflowGrantsResponses];
+
+export type CreateWorkflowGrantData = {
+    body: CreateWorkflowGrantRequest;
+    path: {
+        project_id: number;
+        environment_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/workflows/grants';
+};
+
+export type CreateWorkflowGrantErrors = {
+    /**
+     * Invalid grant
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Environment not found
+     */
+    404: unknown;
+    /**
+     * Database failure
+     */
+    500: unknown;
+};
+
+export type CreateWorkflowGrantResponses = {
+    /**
+     * Grant created or already exists
+     */
+    200: WorkflowGrantResponse;
+};
+
+export type CreateWorkflowGrantResponse = CreateWorkflowGrantResponses[keyof CreateWorkflowGrantResponses];
+
+export type RevokeWorkflowGrantData = {
+    body?: never;
+    path: {
+        project_id: number;
+        environment_id: number;
+        grant_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/workflows/grants/{grant_id}';
+};
+
+export type RevokeWorkflowGrantErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Environment not found
+     */
+    404: unknown;
+    /**
+     * Database failure
+     */
+    500: unknown;
+};
+
+export type RevokeWorkflowGrantResponses = {
+    /**
+     * Grant revoked; in-flight authorized operations may finish
+     */
+    204: void;
+};
+
+export type RevokeWorkflowGrantResponse = RevokeWorkflowGrantResponses[keyof RevokeWorkflowGrantResponses];
+
+export type ListWorkflowRunsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+    };
+    query?: {
+        status?: WorkflowRunStatus | null;
+        /**
+         * Only runs of this workflow.
+         */
+        workflow?: string | null;
+        /**
+         * 1-indexed page number. Defaults to 1.
+         */
+        page?: number | null;
+        /**
+         * Items per page. Defaults to 20, capped at 100.
+         */
+        page_size?: number | null;
+    };
+    url: '/projects/{project_id}/environments/{environment_id}/workflows/runs';
+};
+
+export type ListWorkflowRunsErrors = {
+    /**
+     * Invalid filter
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Environment not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListWorkflowRunsResponses = {
+    /**
+     * Runs, newest first
+     */
+    200: WorkflowRunListResponse;
+};
+
+export type ListWorkflowRunsResponse = ListWorkflowRunsResponses[keyof ListWorkflowRunsResponses];
+
+export type StartWorkflowRunData = {
+    body: StartWorkflowRunRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/workflows/runs';
+};
+
+export type StartWorkflowRunErrors = {
+    /**
+     * Validation error
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Environment not found
+     */
+    404: unknown;
+    /**
+     * Input too large
+     */
+    413: unknown;
+    /**
+     * Active run quota reached
+     */
+    429: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type StartWorkflowRunResponses = {
+    /**
+     * The idempotency key matched an earlier run
+     */
+    200: StartWorkflowRunResponse;
+    /**
+     * Run started
+     */
+    201: StartWorkflowRunResponse;
+};
+
+export type StartWorkflowRunResponse2 = StartWorkflowRunResponses[keyof StartWorkflowRunResponses];
+
+export type DeleteWorkflowRunData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+        /**
+         * Run ID
+         */
+        run_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/workflows/runs/{run_id}';
+};
+
+export type DeleteWorkflowRunErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Run not found
+     */
+    404: unknown;
+    /**
+     * The run is running; cancel it first
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type DeleteWorkflowRunResponses = {
+    /**
+     * Run and its journal deleted
+     */
+    204: void;
+};
+
+export type DeleteWorkflowRunResponse = DeleteWorkflowRunResponses[keyof DeleteWorkflowRunResponses];
+
+export type GetWorkflowRunData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+        /**
+         * Run ID
+         */
+        run_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/workflows/runs/{run_id}';
+};
+
+export type GetWorkflowRunErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Run not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetWorkflowRunResponses = {
+    /**
+     * The run, payloads masked
+     */
+    200: WorkflowRunResponse;
+};
+
+export type GetWorkflowRunResponse = GetWorkflowRunResponses[keyof GetWorkflowRunResponses];
+
+export type CancelWorkflowRunData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+        /**
+         * Run ID
+         */
+        run_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/workflows/runs/{run_id}/cancel';
+};
+
+export type CancelWorkflowRunErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Run not found
+     */
+    404: unknown;
+    /**
+     * The run already finished
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type CancelWorkflowRunResponses = {
+    /**
+     * Run cancelled; an in-flight invocation stops at its next step
+     */
+    200: WorkflowRunResponse;
+};
+
+export type CancelWorkflowRunResponse = CancelWorkflowRunResponses[keyof CancelWorkflowRunResponses];
+
+export type DiagnoseWorkflowRunData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+        /**
+         * Run ID
+         */
+        run_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/workflows/runs/{run_id}/diagnose';
+};
+
+export type DiagnoseWorkflowRunErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Run not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type DiagnoseWorkflowRunResponses = {
+    /**
+     * Run diagnosis without decrypted payloads
+     */
+    200: WorkflowDiagnosis;
+};
+
+export type DiagnoseWorkflowRunResponse = DiagnoseWorkflowRunResponses[keyof DiagnoseWorkflowRunResponses];
+
+export type ResumeWorkflowRunData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+        /**
+         * Run ID
+         */
+        run_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/workflows/runs/{run_id}/resume';
+};
+
+export type ResumeWorkflowRunErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Run not found
+     */
+    404: unknown;
+    /**
+     * The run cannot be resumed in its state
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ResumeWorkflowRunResponses = {
+    /**
+     * Run due now; a pending sleep wakes now
+     */
+    200: WorkflowRunResponse;
+};
+
+export type ResumeWorkflowRunResponse = ResumeWorkflowRunResponses[keyof ResumeWorkflowRunResponses];
+
+export type RetryWorkflowRunData = {
+    body: RetryWorkflowRunRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+        /**
+         * Run ID
+         */
+        run_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/workflows/runs/{run_id}/retry';
+};
+
+export type RetryWorkflowRunErrors = {
+    /**
+     * Sequence outside the journal
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Run not found
+     */
+    404: unknown;
+    /**
+     * The run is still active
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type RetryWorkflowRunResponses = {
+    /**
+     * Run queued again from the given journal entry
+     */
+    200: WorkflowRunResponse;
+};
+
+export type RetryWorkflowRunResponse = RetryWorkflowRunResponses[keyof RetryWorkflowRunResponses];
+
+export type RevealWorkflowPayloadData = {
+    body: WorkflowRevealPayloadRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+        /**
+         * Run ID
+         */
+        run_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/workflows/runs/{run_id}/reveal';
+};
+
+export type RevealWorkflowPayloadErrors = {
+    /**
+     * A step payload needs its sequence
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Run or step not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type RevealWorkflowPayloadResponses = {
+    /**
+     * The decrypted payload; the read is audit-logged
+     */
+    200: WorkflowRevealPayloadResponse;
+};
+
+export type RevealWorkflowPayloadResponse = RevealWorkflowPayloadResponses[keyof RevealWorkflowPayloadResponses];
+
+export type ListWorkflowStepsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+        /**
+         * Run ID
+         */
+        run_id: string;
+    };
+    query?: {
+        /**
+         * 1-indexed page number. Defaults to 1.
+         */
+        page?: number | null;
+        /**
+         * Items per page. Defaults to 20, capped at 100.
+         */
+        page_size?: number | null;
+    };
+    url: '/projects/{project_id}/environments/{environment_id}/workflows/runs/{run_id}/steps';
+};
+
+export type ListWorkflowStepsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Run not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListWorkflowStepsResponses = {
+    /**
+     * The run's journal in sequence order, payloads masked
+     */
+    200: WorkflowStepListResponse;
+};
+
+export type ListWorkflowStepsResponse = ListWorkflowStepsResponses[keyof ListWorkflowStepsResponses];
+
+export type GetWorkflowSettingsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/workflows/settings';
+};
+
+export type GetWorkflowSettingsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Environment not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetWorkflowSettingsResponses = {
+    /**
+     * Settings in effect (the defaults until changed)
+     */
+    200: WorkflowSettings;
+};
+
+export type GetWorkflowSettingsResponse = GetWorkflowSettingsResponses[keyof GetWorkflowSettingsResponses];
+
+export type UpdateWorkflowSettingsData = {
+    body: WorkflowSettings;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/workflows/settings';
+};
+
+export type UpdateWorkflowSettingsErrors = {
+    /**
+     * A value is out of range
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Environment not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateWorkflowSettingsResponses = {
+    /**
+     * Settings saved
+     */
+    200: WorkflowSettings;
+};
+
+export type UpdateWorkflowSettingsResponse = UpdateWorkflowSettingsResponses[keyof UpdateWorkflowSettingsResponses];
+
 export type ListAlertRulesData = {
     body?: never;
     path: {
@@ -87712,6 +89547,90 @@ export type RetryDeliveryResponses = {
 };
 
 export type RetryDeliveryResponse = RetryDeliveryResponses[keyof RetryDeliveryResponses];
+
+export type ListWorkflowProjectKeysData = {
+    body?: never;
+    path: {
+        project_id: number;
+    };
+    query?: {
+        /**
+         * 1-indexed page number. Defaults to 1.
+         */
+        page?: number | null;
+        /**
+         * Items per page. Defaults to 20, capped at 100.
+         */
+        page_size?: number | null;
+    };
+    url: '/projects/{project_id}/workflow-keys';
+};
+
+export type ListWorkflowProjectKeysErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Database failure
+     */
+    500: unknown;
+};
+
+export type ListWorkflowProjectKeysResponses = {
+    /**
+     * Key metadata only; never wrapped key material
+     */
+    200: WorkflowProjectKeysResponse;
+};
+
+export type ListWorkflowProjectKeysResponse = ListWorkflowProjectKeysResponses[keyof ListWorkflowProjectKeysResponses];
+
+export type ShredWorkflowProjectKeyData = {
+    body: ShredWorkflowKeyRequest;
+    path: {
+        project_id: number;
+        key_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/workflow-keys/{key_id}/shred';
+};
+
+export type ShredWorkflowProjectKeyErrors = {
+    /**
+     * Confirmation mismatch
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Key unavailable
+     */
+    410: unknown;
+    /**
+     * Database failure
+     */
+    500: unknown;
+};
+
+export type ShredWorkflowProjectKeyResponses = {
+    /**
+     * Wrapped key erased; new payloads get a new key. Backups may retain the old key.
+     */
+    204: void;
+};
+
+export type ShredWorkflowProjectKeyResponse = ShredWorkflowProjectKeyResponses[keyof ShredWorkflowProjectKeyResponses];
 
 export type WorkflowDryRunData = {
     body: WorkflowDryRunRequest;
@@ -96351,6 +98270,420 @@ export type TriggerWeeklyDigestResponses = {
 };
 
 export type TriggerWeeklyDigestResponse = TriggerWeeklyDigestResponses[keyof TriggerWeeklyDigestResponses];
+
+export type HeartbeatRunData = {
+    body?: never;
+    path: {
+        /**
+         * Run ID
+         */
+        run_id: string;
+    };
+    query?: never;
+    url: '/workflow-runs/{run_id}/heartbeat';
+};
+
+export type HeartbeatRunErrors = {
+    /**
+     * Missing or invalid invocation token
+     */
+    401: unknown;
+    /**
+     * Run not found
+     */
+    404: unknown;
+    /**
+     * The token's lease is no longer current
+     */
+    409: unknown;
+};
+
+export type HeartbeatRunResponses = {
+    /**
+     * Lease extended, or `cancelled: true` to stop
+     */
+    200: WorkflowHeartbeatResponse;
+};
+
+export type HeartbeatRunResponse = HeartbeatRunResponses[keyof HeartbeatRunResponses];
+
+export type GetRunJournalData = {
+    body?: never;
+    path: {
+        /**
+         * Run ID
+         */
+        run_id: string;
+    };
+    query?: {
+        /**
+         * First sequence to return. Defaults to 0.
+         */
+        from?: number | null;
+    };
+    url: '/workflow-runs/{run_id}/journal';
+};
+
+export type GetRunJournalErrors = {
+    /**
+     * Missing or invalid invocation token
+     */
+    401: unknown;
+    /**
+     * Run not found
+     */
+    404: unknown;
+    /**
+     * The token's lease is no longer current
+     */
+    409: unknown;
+};
+
+export type GetRunJournalResponses = {
+    /**
+     * A page of the journal, decrypted for the executor
+     */
+    200: WorkflowJournalPage;
+};
+
+export type GetRunJournalResponse = GetRunJournalResponses[keyof GetRunJournalResponses];
+
+export type ReportRunOutcomeData = {
+    body: WorkflowOutcomeRequest;
+    path: {
+        /**
+         * Run ID
+         */
+        run_id: string;
+    };
+    query?: never;
+    url: '/workflow-runs/{run_id}/outcome';
+};
+
+export type ReportRunOutcomeErrors = {
+    /**
+     * Invalid outcome
+     */
+    400: unknown;
+    /**
+     * Missing or invalid invocation token
+     */
+    401: unknown;
+    /**
+     * Run not found
+     */
+    404: unknown;
+    /**
+     * The token's lease is no longer current
+     */
+    409: unknown;
+};
+
+export type ReportRunOutcomeResponses = {
+    /**
+     * Outcome applied (for executors that answered the invoke with 202)
+     */
+    200: WorkflowOutcomeResponse;
+};
+
+export type ReportRunOutcomeResponse = ReportRunOutcomeResponses[keyof ReportRunOutcomeResponses];
+
+export type RecordRunStepData = {
+    body: WorkflowStepWriteRequest;
+    path: {
+        /**
+         * Run ID
+         */
+        run_id: string;
+    };
+    query?: never;
+    url: '/workflow-runs/{run_id}/steps';
+};
+
+export type RecordRunStepErrors = {
+    /**
+     * Invalid entry
+     */
+    400: unknown;
+    /**
+     * Missing or invalid invocation token
+     */
+    401: unknown;
+    /**
+     * Run not found
+     */
+    404: unknown;
+    /**
+     * Stale lease, or the replay does not match the journal (WorkflowIncompatible)
+     */
+    409: unknown;
+    /**
+     * Result too large
+     */
+    413: unknown;
+    /**
+     * The run reached its step or journal-size quota
+     */
+    429: unknown;
+};
+
+export type RecordRunStepResponses = {
+    /**
+     * The entry as recorded; when already_recorded, continue with it
+     */
+    200: WorkflowStepWriteResponse;
+};
+
+export type RecordRunStepResponse = RecordRunStepResponses[keyof RecordRunStepResponses];
+
+export type ListAllWorkflowRunsData = {
+    body?: never;
+    path?: never;
+    query?: {
+        status?: WorkflowRunStatus | null;
+        workflow?: string | null;
+        page_size?: number | null;
+        cursor?: string | null;
+    };
+    url: '/workflows/runs';
+};
+
+export type ListAllWorkflowRunsErrors = {
+    /**
+     * Invalid cursor
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Access or database failure
+     */
+    500: unknown;
+};
+
+export type ListAllWorkflowRunsResponses = {
+    /**
+     * Authorized runs across projects, newest first
+     */
+    200: GlobalWorkflowRunsResponse;
+};
+
+export type ListAllWorkflowRunsResponse = ListAllWorkflowRunsResponses[keyof ListAllWorkflowRunsResponses];
+
+export type AppSendWorkflowEventData = {
+    body: SendWorkflowEventRequest;
+    path?: never;
+    query?: never;
+    url: '/workflows/v1/events';
+};
+
+export type AppSendWorkflowEventErrors = {
+    /**
+     * Validation error
+     */
+    400: unknown;
+    /**
+     * Missing, unknown or revoked workflow credential
+     */
+    401: unknown;
+    /**
+     * Payload too large
+     */
+    413: unknown;
+};
+
+export type AppSendWorkflowEventResponses = {
+    /**
+     * Event stored and delivered to the runs waiting on it
+     */
+    200: SendWorkflowEventResponse;
+};
+
+export type AppSendWorkflowEventResponse = AppSendWorkflowEventResponses[keyof AppSendWorkflowEventResponses];
+
+export type GetInvocationKeyData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/workflows/v1/invocation-key';
+};
+
+export type GetInvocationKeyErrors = {
+    /**
+     * Missing, unknown or revoked workflow credential
+     */
+    401: unknown;
+};
+
+export type GetInvocationKeyResponses = {
+    /**
+     * The public key SDKs verify invocation tokens with, and the project and environment the tokens must name
+     */
+    200: WorkflowInvocationKeyResponse;
+};
+
+export type GetInvocationKeyResponse = GetInvocationKeyResponses[keyof GetInvocationKeyResponses];
+
+export type AppSendGrantedEventData = {
+    body: SendWorkflowEventRequest;
+    path: {
+        project_id: number;
+        environment_id: number;
+    };
+    query?: never;
+    url: '/workflows/v1/projects/{project_id}/environments/{environment_id}/events';
+};
+
+export type AppSendGrantedEventErrors = {
+    /**
+     * Invalid event
+     */
+    400: unknown;
+    /**
+     * Invalid credential
+     */
+    401: unknown;
+    /**
+     * Grant required
+     */
+    403: unknown;
+    /**
+     * Payload too large
+     */
+    413: unknown;
+};
+
+export type AppSendGrantedEventResponses = {
+    /**
+     * Event delivered through grant
+     */
+    200: SendWorkflowEventResponse;
+};
+
+export type AppSendGrantedEventResponse = AppSendGrantedEventResponses[keyof AppSendGrantedEventResponses];
+
+export type AppStartGrantedWorkflowData = {
+    body: StartWorkflowRunRequest;
+    path: {
+        project_id: number;
+        environment_id: number;
+    };
+    query?: never;
+    url: '/workflows/v1/projects/{project_id}/environments/{environment_id}/runs';
+};
+
+export type AppStartGrantedWorkflowErrors = {
+    /**
+     * Invalid input
+     */
+    400: unknown;
+    /**
+     * Invalid credential
+     */
+    401: unknown;
+    /**
+     * Grant required
+     */
+    403: unknown;
+    /**
+     * Payload too large
+     */
+    413: unknown;
+    /**
+     * Quota exceeded
+     */
+    429: unknown;
+};
+
+export type AppStartGrantedWorkflowResponses = {
+    /**
+     * Idempotent replay
+     */
+    200: AppStartWorkflowRunResponse;
+    /**
+     * Started through grant
+     */
+    201: AppStartWorkflowRunResponse;
+};
+
+export type AppStartGrantedWorkflowResponse = AppStartGrantedWorkflowResponses[keyof AppStartGrantedWorkflowResponses];
+
+export type AppStartWorkflowRunData = {
+    body: StartWorkflowRunRequest;
+    path?: never;
+    query?: never;
+    url: '/workflows/v1/runs';
+};
+
+export type AppStartWorkflowRunErrors = {
+    /**
+     * Validation error
+     */
+    400: unknown;
+    /**
+     * Missing, unknown or revoked workflow credential
+     */
+    401: unknown;
+    /**
+     * Input too large
+     */
+    413: unknown;
+    /**
+     * Active run quota reached
+     */
+    429: unknown;
+};
+
+export type AppStartWorkflowRunResponses = {
+    /**
+     * The idempotency key matched an earlier run
+     */
+    200: AppStartWorkflowRunResponse;
+    /**
+     * Run started
+     */
+    201: AppStartWorkflowRunResponse;
+};
+
+export type AppStartWorkflowRunResponse2 = AppStartWorkflowRunResponses[keyof AppStartWorkflowRunResponses];
+
+export type AppGetWorkflowRunData = {
+    body?: never;
+    path: {
+        /**
+         * Run ID
+         */
+        run_id: string;
+    };
+    query?: never;
+    url: '/workflows/v1/runs/{run_id}';
+};
+
+export type AppGetWorkflowRunErrors = {
+    /**
+     * Missing, unknown or revoked workflow credential
+     */
+    401: unknown;
+    /**
+     * No such run in the credential's environment
+     */
+    404: unknown;
+};
+
+export type AppGetWorkflowRunResponses = {
+    /**
+     * The run, with its output once completed or its error once failed
+     */
+    200: AppWorkflowRunResponse;
+};
+
+export type AppGetWorkflowRunResponse = AppGetWorkflowRunResponses[keyof AppGetWorkflowRunResponses];
 
 export type GetPluginAiToolsData = {
     body?: never;

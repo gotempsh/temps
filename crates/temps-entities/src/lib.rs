@@ -285,7 +285,18 @@ pub mod sandbox_snapshots;
 pub mod sandboxes;
 
 // Workflow memory
+pub mod workflow_blob_cleanup;
+pub mod workflow_child_cleanup_cursor;
+pub mod workflow_credentials;
+pub mod workflow_environment_settings;
+pub mod workflow_events;
+pub mod workflow_journal_cleanup;
+pub mod workflow_managed_runs;
 pub mod workflow_memory;
+pub mod workflow_prepared_child_inputs;
+pub mod workflow_project_keys;
+pub mod workflow_runs;
+pub mod workflow_steps;
 
 pub mod prelude;
 
@@ -337,3 +348,10 @@ pub mod access_vault_links;
 pub mod access_vault_service_history;
 pub mod access_vaults;
 pub mod external_plugin_actors;
+
+pub mod workflow_grants;
+
+pub mod workflow_deployment_drains;
+
+pub mod workflow_dev_requests;
+pub mod workflow_dev_sessions;

@@ -29,6 +29,7 @@ pub mod error;
 pub mod error_builder;
 pub mod error_metrics;
 pub mod escape;
+pub mod executor_endpoints;
 pub mod feature_maturity;
 pub mod gate;
 pub mod gate_access;
@@ -47,12 +48,14 @@ pub mod node_pki;
 pub mod notifications;
 pub mod on_demand;
 pub mod openapi;
+pub mod payload_blobs;
 pub mod plugin;
 pub mod plugin_builder;
 pub mod problemdetails;
 pub mod project_access;
 pub mod project_deletion;
 pub mod project_ip_gate;
+pub mod project_metrics;
 pub mod public_hostname;
 pub mod public_hostname_resolver;
 pub mod public_status_page;
@@ -60,6 +63,7 @@ pub mod registry_prefix;
 #[cfg(test)]
 mod release_manifest;
 pub mod request_policy_gate;
+pub mod workflow_ingress;
 /// Immutable image references embedded at compile time in official releases.
 pub mod release_images {
     pub const LOCAL_PREVIEW_GATEWAY_IMAGE: &str = "ghcr.io/gotempsh/temps-preview-gateway@sha256:02d5cdd382c3285d569032e84321d5ce8fc089372a3f08651119f6eda8cb1448";
@@ -94,6 +98,8 @@ pub mod worker_ingress;
 pub mod worker_install;
 pub mod worker_shield;
 pub mod worker_sync;
+pub mod workflow_control;
+pub mod workflow_journal;
 pub use docker_handle::{
     worker_node_required_problem, DockerHandle, DockerUnavailable, CONTROL_PLANE_DOCKER_REASON,
     WORKER_NODE_REQUIRED_ERROR_CODE, WORKER_NODE_REQUIRED_REMEDY, WORKER_NODE_REQUIRED_TITLE,
@@ -146,6 +152,9 @@ pub use env_vars_provider::{
 };
 pub use error::*;
 pub use error_builder::*;
+pub use executor_endpoints::{
+    ExecutorEndpoint, ExecutorEndpointSet, ExecutorEndpoints, ExecutorEndpointsError,
+};
 pub use jobs::*;
 pub use log_storage_config::LogStorageConfig;
 pub use managed_backup_schedule::{
@@ -159,6 +168,7 @@ pub use managed_backup_scoped_credentials::{
     ScopedS3CredentialRequest, MANAGED_SCOPED_CREDENTIAL_MAX_LIFETIME,
 };
 pub use on_demand::*;
+pub use payload_blobs::{PayloadBlobError, PayloadBlobStore};
 pub use project_access::{
     ApplicationDataNetworkReconciler, MembershipPermissionResolver, ProjectAccessChecker,
 };
@@ -166,6 +176,10 @@ pub use project_deletion::{
     ProjectDeletionHook, ProjectDeletionHookError, ProjectDeletionHooks, ProjectDeletionHooksFailed,
 };
 pub use project_ip_gate::{OpenIpGate, ProjectIpGate, ProjectIpGateSlot};
+pub use project_metrics::{
+    NoopProjectMetricsSink, ProjectMetricKind, ProjectMetricSample, ProjectMetricsError,
+    ProjectMetricsSink,
+};
 pub use public_hostname::{base_domain as public_base_domain, PublicHostnameStrategy};
 pub use public_hostname_resolver::{
     match_strategy, PublicHostnameResolver, StandardHostnameResolver,
@@ -201,6 +215,10 @@ pub use traces::{
     TraceSummaryDto,
 };
 pub use utils::*;
+pub use workflow_control::{
+    ActiveWorkflowRuns, StartedWorkflowRun, WorkflowControl, WorkflowControlError, WorkflowDrain,
+    WorkflowRunPhase, WorkflowRunState, WorkflowStart,
+};
 
 // Re-export external dependencies
 pub use anyhow;

@@ -11,6 +11,8 @@
 //! 1. Request facts, which answer a request with no usable Host with a 400,
 //!    then inbound stripping of what only the proxy may set
 //!    (`X-Temps-Demo-Mode`, identity headers, the status-host tag).
+//!    Workflow executor paths are then refused before hostname routing,
+//!    wake, cache or upstream operations.
 //! 2. Status-page hostname: answered here and nowhere else. A connection
 //!    negotiated for such a hostname cannot carry any other host (421).
 //! 3. Sandbox preview hostname. The public ingress hostname is never one.
@@ -101,6 +103,14 @@ impl LoadBalancer {
     ) -> Result<Flow> {
         stage!(self.read_request_facts(session, ctx));
         Self::strip_inbound_trust_headers(session);
+
+        // No caller-supplied header or IP grants access to executor routes.
+        // Orchestrator requests use direct replica endpoints instead.
+        if temps_core::workflow_ingress::blocks_workflow_executor(&ctx.path) {
+            ctx.routing_status = "workflow_executor_blocked".to_string();
+            session.respond_error(404).await?;
+            return Ok(Flow::Answered);
+        }
 
         stage!(self.status_page_host_stage(session, ctx));
 

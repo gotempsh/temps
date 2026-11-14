@@ -32,6 +32,7 @@ import {
 } from '@temps-sdk/ds'
 import { useParams } from 'react-router'
 import { useGoBack } from '@/hooks/useGoBack'
+import { executionStatus } from './cronExecutionStatus'
 
 const executionColumns: DataTableColumn<CronExecutionInfo>[] = [
   {
@@ -42,16 +43,7 @@ const executionColumns: DataTableColumn<CronExecutionInfo>[] = [
   {
     key: 'status',
     header: 'Status',
-    render: (execution) => {
-      const succeeded =
-        execution.status_code >= 200 && execution.status_code < 300
-      return (
-        <Status
-          tone={succeeded ? 'ok' : 'error'}
-          label={succeeded ? 'Success' : 'Failed'}
-        />
-      )
-    },
+    render: (execution) => <Status {...executionStatus(execution)} />,
   },
   {
     key: 'duration',
@@ -63,7 +55,16 @@ const executionColumns: DataTableColumn<CronExecutionInfo>[] = [
     header: 'Details',
     render: (execution) => (
       <div className="space-y-1">
-        <div>Status: {execution.status_code}</div>
+        {execution.workflow_run_id ? (
+          <div>
+            Workflow run{' '}
+            <code className="text-xs break-all">
+              {execution.workflow_run_id}
+            </code>
+          </div>
+        ) : execution.state ? null : (
+          <div>Status: {execution.status_code}</div>
+        )}
         {execution.error_message && (
           <div className="text-destructive whitespace-normal break-words">
             {execution.error_message}
@@ -182,12 +183,30 @@ export function CronJobDetail({ project }: CronJobDetailProps) {
             />
           ) : (
             <dl className="grid gap-4 md:grid-cols-2">
-              <div>
-                <dt className="text-sm font-medium">Path</dt>
-                <dd>
-                  <code className="text-sm break-all">{cronJob.path}</code>
-                </dd>
-              </div>
+              {cronJob.mode === 'workflow' ? (
+                <div>
+                  <dt className="text-sm font-medium">Starts workflow</dt>
+                  <dd>
+                    <code className="text-sm break-all">
+                      {cronJob.workflow}
+                    </code>
+                    <span className="block text-xs text-muted-foreground">
+                      Each run is a durable workflow run
+                      {cronJob.has_workflow_input
+                        ? ', with the input set in .temps.yaml'
+                        : ''}
+                      ; concurrency policy {cronJob.concurrency_policy}.
+                    </span>
+                  </dd>
+                </div>
+              ) : (
+                <div>
+                  <dt className="text-sm font-medium">Path</dt>
+                  <dd>
+                    <code className="text-sm break-all">{cronJob.path}</code>
+                  </dd>
+                </div>
+              )}
               <div>
                 <dt className="text-sm font-medium">Schedule</dt>
                 <dd>

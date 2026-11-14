@@ -624,6 +624,8 @@ pub enum DockerfileVariant {
     #[default]
     File,
     Custom,
+    #[serde(rename = "workflow-worker")]
+    WorkflowWorker,
 }
 
 impl DockerfileVariant {

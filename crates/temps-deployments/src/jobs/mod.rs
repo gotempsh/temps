@@ -64,6 +64,7 @@ pub mod deploy_image;
 pub mod deploy_static;
 pub mod deploy_static_bundle;
 pub mod deploy_static_from_source;
+pub mod deployment_workflows;
 pub mod download_repo;
 pub mod image_source;
 pub mod mark_deployment_complete;

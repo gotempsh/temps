@@ -2208,6 +2208,46 @@ mod tests {
         }
     }
 
+    #[test]
+    fn workflow_engine_templates_translate_without_relaxed_capabilities() {
+        for (engine, source) in [
+            (
+                "restate",
+                include_str!("../../../examples/workflow-engines/restate.compose.yaml"),
+            ),
+            (
+                "temporal",
+                include_str!("../../../examples/workflow-engines/temporal.compose.yaml"),
+            ),
+        ] {
+            // The build stage assigns images to source-built services before translation.
+            let mut model: Value = yaml_serde::from_str(source).unwrap();
+            for (_, service) in model["services"].as_mapping_mut().unwrap() {
+                let service = service.as_mapping_mut().unwrap();
+                if !service.contains_key(Value::String("image".into())) {
+                    service.insert(
+                        Value::String("image".into()),
+                        Value::String("built-engine-test:local".into()),
+                    );
+                }
+            }
+            let source = yaml_serde::to_string(&model).unwrap();
+            let env = vars(&[
+                ("ENGINE_PASSWORD", "generic-test-password-long-enough"),
+                ("DATABASE_PASSWORD", "generic-test-database-password"),
+            ]);
+            let source =
+                compose_interpolation::interpolate_document("engine.compose.yaml", &source, &env)
+                    .unwrap()
+                    .content;
+            let mut case = Case::new(&source);
+            case.env = env;
+            case.routed = vec!["gateway".into()];
+            case.translate()
+                .unwrap_or_else(|error| panic!("{engine}: {error}"));
+        }
+    }
+
     fn vars(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs
             .iter()

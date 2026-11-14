@@ -55,6 +55,33 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
         &["put_plugin_ai_tools"],
     ),
     (
+        "durable workflow configuration, credentials, grants and development sessions remain operator-console operations",
+        &[
+            "update_workflow_settings",
+            "issue_workflow_credential",
+            "revoke_workflow_credential",
+            "shred_workflow_project_key",
+            "open_workflow_dev","configure_workflow_dev","close_workflow_dev","poll_workflow_dev","respond_workflow_dev",
+            "create_workflow_grant",
+            "revoke_workflow_grant",
+            "app_start_granted_workflow",
+            "app_send_granted_event",
+        ],
+    ),
+    (
+        "the workflow executor and app protocol (ADR-106): called by the SDK inside a deployment with an invocation token or the environment's workflow credential, never by a user or the assistant",
+        &[
+            "get_invocation_key",
+            "get_run_journal",
+            "record_run_step",
+            "heartbeat_run",
+            "report_run_outcome",
+            "app_start_workflow_run",
+            "app_get_workflow_run",
+            "app_send_workflow_event",
+        ],
+    ),
+    (
         "revokes every visitor's gate session for an address; a security action the user takes themselves, behind step-up",
         &["sign_everyone_out_of_address"],
     ),

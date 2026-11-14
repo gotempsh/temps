@@ -1362,6 +1362,10 @@ mod tests {
             // sandbox permissions to the project whose resources they access.
             "temps-service-access",
             "temps-status-page",
+            // Workflow runs, events, settings and credentials (ADR-106) belong
+            // to one project's environment: every handler narrows its
+            // workflow permission to that project.
+            "temps-workflows",
         ];
 
         let mut sorted = expected_crates.to_vec();

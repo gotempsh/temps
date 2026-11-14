@@ -800,6 +800,66 @@ jobs:
           path: web/dist
           key: ${{ steps.console-key.outputs.key }}
 
+  workflows-sdk:
+    name: Workflows SDK
+    needs: changes
+    # sdks/ is in the Rust area: the SDK and the engine share the executor
+    # protocol, so a change to either runs this.
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7.0.1
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+          no-cache: ${{ github.ref != 'refs/heads/main' }}
+
+      - name: Install dependencies
+        working-directory: sdks/node
+        run: bun install --frozen-lockfile
+
+      # Unit tests and the executor protocol conformance suite against the
+      # in-memory orchestrator. The same suite runs against the real engine
+      # in the docker-deployments integration group
+      # (temps-workflows' conformance_tests).
+      - name: Typecheck, test and build @temps-sdk/workflows
+        working-directory: sdks/node/packages/workflows
+        run: |
+          bun run typecheck
+          bun run test:run
+          bun run build
+
+      - uses: actions/setup-python@v7.1.0
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-go@v7.0.0
+        with:
+          go-version: '1.23.x'
+          cache: false
+      - name: Test Python executor
+        working-directory: sdks/python/workflows
+        run: |
+          python -m pip install .
+          python -m unittest temps_workflows.test_runtime -v
+      - name: Test Go executor and races
+        working-directory: sdks/go/workflows
+        run: go test -race ./...
+
+  workflow-engine-templates:
+    name: Workflow engine templates
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Test authenticated routes and persistent storage
+        run: python3 -m unittest discover -s examples/workflow-engines -p test_templates.py -v
+
   openapi-canonical:
     name: OpenAPI Spec Format
     runs-on: ubuntu-latest
@@ -1121,7 +1181,7 @@ jobs:
             # that crate.
             filter: >-
               ((package(temps-providers*) and not test(/^query::/)) or package(temps-presets) or
-              package(temps-auth) or package(temps-core) or package(libsqlite3-sys) or
+              package(temps-auth) or package(temps-core) or package(temps-workflows-sdk) or package(libsqlite3-sys) or
               package(temps-monitoring) or package(temps-kv) or
               package(temps-analytics-funnels) or package(temps-webhooks) or
               package(temps-infra) or package(temps-captcha-wasm) or
@@ -1479,7 +1539,7 @@ jobs:
               package(temps-config) or package(temps-notifications) or
               package(temps-deployer) or package(temps-deployment-logs) or
               package(temps-domains) or package(temps-projects) or
-              package(temps-node-agent) or
+              package(temps-node-agent) or package(temps-workflows) or
               (package(temps-metrics) and kind(=lib)) or
               package(temps-runtime-health) or
               (package(temps-ai-agents) and kind(=lib)) or
@@ -1634,6 +1694,30 @@ jobs:
       - name: Make the default Redis image available
         if: env.GROUP_RUNS == 'true' && matrix.redis_image
         run: .github/scripts/ensure-default-redis-image.sh
+
+      # temps-workflows' real-engine conformance and end-to-end tests drive
+      # the TypeScript SDK with Bun; without it they skip.
+      - name: Install Bun
+        if: env.GROUP_RUNS == 'true' && matrix.group == 'docker-deployments'
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+          no-cache: ${{ github.ref != 'refs/heads/main' }}
+
+      - name: Install Python for workflow conformance
+        if: env.GROUP_RUNS == 'true' && matrix.group == 'docker-deployments'
+        uses: actions/setup-python@v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Install Go for workflow conformance
+        if: env.GROUP_RUNS == 'true' && matrix.group == 'docker-deployments'
+        uses: actions/setup-go@v7.0.0
+        with:
+          go-version: '1.23.x'
+          cache: false
+      - name: Install Python workflow SDK dependencies
+        if: env.GROUP_RUNS == 'true' && matrix.group == 'docker-deployments'
+        run: python -m pip install ./sdks/python/workflows
 
       - name: Run integration tests
         if: env.GROUP_RUNS == 'true'

@@ -38,6 +38,7 @@ pub mod handlers;
 pub mod ingest;
 pub mod memory;
 pub mod plugin;
+pub mod project_metrics_sink;
 pub mod proto;
 pub mod relay;
 pub mod services;

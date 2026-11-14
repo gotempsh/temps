@@ -2012,6 +2012,9 @@ pub struct ConsoleApiParams {
     pub cookie_crypto: Arc<CookieCrypto>,
     pub encryption_service: Arc<EncryptionService>,
     pub route_table: Arc<temps_proxy::CachedPeerTable>,
+    /// The process runtime context (host or container), registered for
+    /// plugins that resolve a deployment container's internal address.
+    pub runtime_context: Arc<temps_core::RuntimeContext>,
     pub queue: Arc<dyn temps_core::JobQueue>,
     /// Fires once, right after plugin two-phase init completes (see the call
     /// site in `start_console_api`) — earlier and narrower than `/readyz`,

@@ -71,9 +71,11 @@ pub struct CronInfo {
     created_at: String,
     updated_at: String,
     deleted_at: Option<String>,
-    /// `http` (a GET to `path` on the running deployment) or `job`
-    /// (`command` run in the environment's image until it exits). For a
-    /// `job`, `path` is the cron's key, `job:<name>`.
+    /// `http` (a GET to `path` on the running deployment), `job`
+    /// (`command` run in the environment's image until it exits) or
+    /// `workflow` (a run of the durable workflow `workflow` started). For a
+    /// `job`, `path` is the cron's key, `job:<name>`; for a `workflow`,
+    /// `workflow:<name>`.
     #[schema(example = "http")]
     mode: String,
     /// The argv a `job` cron runs. Absent for `http`.
@@ -92,6 +94,11 @@ pub struct CronInfo {
     /// How long a finished `job` run's container is kept; absent takes the
     /// default (600).
     ttl_seconds_after_finished: Option<i32>,
+    /// The durable workflow a `workflow` cron starts. Absent otherwise.
+    workflow: Option<String>,
+    /// Whether a `workflow` cron gives its runs an input (set in
+    /// `.temps.yaml`).
+    has_workflow_input: bool,
 }
 
 impl From<temps_entities::crons::Model> for CronInfo {
@@ -116,6 +123,8 @@ impl From<temps_entities::crons::Model> for CronInfo {
             retry_limit: cron.retry_limit,
             timeout_seconds: cron.timeout_seconds,
             ttl_seconds_after_finished: cron.ttl_seconds_after_finished,
+            workflow: cron.workflow_name,
+            has_workflow_input: cron.workflow_input.is_some(),
         }
     }
 }
@@ -130,8 +139,8 @@ pub struct CronExecutionInfo {
     headers: String,
     response_time_ms: i32,
     error_message: Option<String>,
-    /// `running | succeeded | failed | skipped` for a `job` run; absent
-    /// for an `http` call, whose outcome is `status_code`.
+    /// `running | succeeded | failed | skipped` for a `job` or `workflow`
+    /// run; absent for an `http` call, whose outcome is `status_code`.
     state: Option<String>,
     /// Exit code of the run's last attempt.
     exit_code: Option<i32>,
@@ -143,6 +152,8 @@ pub struct CronExecutionInfo {
     output_tail: Option<String>,
     /// The workload the `job` run executed as.
     workload_id: Option<i64>,
+    /// The durable workflow run a `workflow` cron started.
+    workflow_run_id: Option<uuid::Uuid>,
 }
 
 impl From<temps_entities::cron_executions::Model> for CronExecutionInfo {
@@ -164,6 +175,7 @@ impl From<temps_entities::cron_executions::Model> for CronExecutionInfo {
                 .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
             output_tail: exec.output_tail,
             workload_id: exec.workload_id,
+            workflow_run_id: exec.workflow_run_id,
         }
     }
 }

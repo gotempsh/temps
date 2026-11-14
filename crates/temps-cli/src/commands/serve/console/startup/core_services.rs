@@ -17,6 +17,7 @@ pub(super) struct CoreServices {
     pub(super) docker_available: bool,
     pub(super) profile: crate::commands::serve::ServeProfile,
     pub(super) route_table: Arc<temps_proxy::CachedPeerTable>,
+    pub(super) runtime_context: Arc<temps_core::RuntimeContext>,
     pub(super) retention_resolver_slot: Arc<temps_core::RetentionResolverSlot>,
     pub(super) project_ip_gate_slot: Arc<temps_core::ProjectIpGateSlot>,
     pub(super) request_policy_gate_slot: Arc<temps_core::RequestPolicyGateSlot>,
@@ -54,6 +55,7 @@ pub(super) async fn register_core_services(
         docker_available,
         profile,
         route_table,
+        runtime_context,
         retention_resolver_slot,
         project_ip_gate_slot,
         request_policy_gate_slot,
@@ -93,6 +95,9 @@ pub(super) async fn register_core_services(
         temps_core::LocalWorkloadPolicy::control_plane(docker_available)
     });
     service_context.register_service(local_workload_policy.clone());
+    // Host or container: how a deployment container's internal address is
+    // reached from this process (workflow executors, ADR-106).
+    service_context.register_service(runtime_context);
     // Pre-registered here (rather than left solely to AuthPlugin, which also
     // registers an equivalent instance) because TeamsPlugin, GitPlugin,
     // DomainsPlugin, and DeploymentsPlugin all gate sensitive mutations via

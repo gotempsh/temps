@@ -60,6 +60,8 @@ pub(crate) struct CronJobColumns {
     retry_limit: i32,
     timeout_seconds: Option<i32>,
     ttl_seconds_after_finished: Option<i32>,
+    workflow_name: Option<String>,
+    workflow_input: Option<serde_json::Value>,
 }
 
 fn to_column(value: Option<u32>) -> Option<i32> {
@@ -68,6 +70,19 @@ fn to_column(value: Option<u32>) -> Option<i32> {
 
 impl CronJobColumns {
     pub(crate) fn from_config(config: &CronConfig) -> Self {
+        if let Some(workflow) = &config.workflow {
+            return Self {
+                mode: crons::MODE_WORKFLOW,
+                command: None,
+                concurrency_policy: workflow.concurrency_policy.as_str(),
+                starting_deadline_seconds: to_column(workflow.starting_deadline_seconds),
+                retry_limit: 0,
+                timeout_seconds: None,
+                ttl_seconds_after_finished: None,
+                workflow_name: Some(workflow.workflow.clone()),
+                workflow_input: workflow.input.clone(),
+            };
+        }
         match &config.job {
             None => Self {
                 mode: crons::MODE_HTTP,
@@ -77,6 +92,8 @@ impl CronJobColumns {
                 retry_limit: 0,
                 timeout_seconds: None,
                 ttl_seconds_after_finished: None,
+                workflow_name: None,
+                workflow_input: None,
             },
             Some(JobCronConfig {
                 command,
@@ -93,6 +110,8 @@ impl CronJobColumns {
                 retry_limit: to_column(Some(*retry_limit)).unwrap_or(0),
                 timeout_seconds: to_column(*timeout_seconds),
                 ttl_seconds_after_finished: to_column(*ttl_seconds_after_finished),
+                workflow_name: None,
+                workflow_input: None,
             },
         }
     }
@@ -105,6 +124,8 @@ impl CronJobColumns {
             && row.retry_limit == self.retry_limit
             && row.timeout_seconds == self.timeout_seconds
             && row.ttl_seconds_after_finished == self.ttl_seconds_after_finished
+            && row.workflow_name == self.workflow_name
+            && row.workflow_input == self.workflow_input
     }
 
     pub(crate) fn apply(&self, row: &mut crons::ActiveModel) {
@@ -115,6 +136,8 @@ impl CronJobColumns {
         row.retry_limit = Set(self.retry_limit);
         row.timeout_seconds = Set(self.timeout_seconds);
         row.ttl_seconds_after_finished = Set(self.ttl_seconds_after_finished);
+        row.workflow_name = Set(self.workflow_name.clone());
+        row.workflow_input = Set(self.workflow_input.clone());
     }
 }
 
@@ -621,6 +644,8 @@ mod tests {
             retry_limit: 2,
             timeout_seconds: Some(1800),
             ttl_seconds_after_finished: None,
+            workflow_name: None,
+            workflow_input: None,
         }
     }
 
@@ -708,6 +733,7 @@ mod tests {
     #[test]
     fn http_columns_equal_the_column_defaults() {
         let http = CronConfig {
+            workflow: None,
             path: "/api/cleanup".into(),
             schedule: "0 0 * * *".into(),
             job: None,
@@ -720,6 +746,7 @@ mod tests {
         assert!(CronJobColumns::from_config(&http).matches(&row));
 
         let job = CronConfig {
+            workflow: None,
             path: "job:nightly-report".into(),
             schedule: "0 3 * * *".into(),
             job: Some(JobCronConfig {
