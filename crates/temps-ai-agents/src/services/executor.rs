@@ -1228,7 +1228,7 @@ impl AgentExecutor {
                 )
                 .await
                 {
-                    Ok(()) => true,
+                    Ok(repo) => Some(repo),
                     Err(refusal) => {
                         tracing::warn!(
                             run_id,
@@ -1243,24 +1243,25 @@ impl AgentExecutor {
                                 None,
                             )
                             .await?;
-                        false
+                        None
                     }
                 };
-                if !approved {
-                    // Skip the clone; the run continues without the overlay.
-                } else if let Some(conn_id) = connection_id {
-                    let branch = config.config_repo_branch.as_deref().unwrap_or("main");
-                    self.inject_config_repo(
-                        run_id,
-                        conn_id,
-                        repo_url,
-                        branch,
-                        "per-agent",
-                        &secret_map,
-                    )
-                    .await?;
-                } else {
-                    self.run_service
+                if let Some(repo) = approved {
+                    if let Some(conn_id) = connection_id {
+                        let branch = config.config_repo_branch.as_deref().unwrap_or("main");
+                        // Clone the repository the policy approved, in
+                        // `owner/repo` form: `repo_url` may be a GitHub URL.
+                        self.inject_config_repo(
+                            run_id,
+                            conn_id,
+                            &repo.to_string(),
+                            branch,
+                            "per-agent",
+                            &secret_map,
+                        )
+                        .await?;
+                    } else {
+                        self.run_service
                         .append_log(
                             run_id,
                             "warning",
@@ -1271,7 +1272,10 @@ impl AgentExecutor {
                             None,
                         )
                         .await?;
+                    }
                 }
+                // Not approved: skip the clone; the run continues without the
+                // overlay.
             }
         }
 
