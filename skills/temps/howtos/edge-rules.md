@@ -131,5 +131,5 @@ before and after.
 ## Version check
 
 `edge-rules` is newer than some reviewed CLI versions. Confirm
-`edge-rules --help` exists in the pinned runtime before relying on it; if it
+`edge-rules --help` exists in the current runtime before relying on it; if it
 does not, use the console page and report the version gap.

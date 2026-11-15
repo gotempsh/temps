@@ -237,7 +237,7 @@ Show the nodes each replica would run on now, the eligible nodes ranked, and the
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | No |
+| `-p, --project <project>` | Project slug | - | No |
 | `--json` | Output in JSON format | - | No |
 
 #### `environments placement recommend`
@@ -248,7 +248,7 @@ Recommend target nodes from where the environment actually ran (recommended, nev
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | No |
+| `-p, --project <project>` | Project slug | - | No |
 | `--window-days <days>` | How many days of history to consider (1-90, default 7) | - | No |
 | `--json` | Output in JSON format | - | No |
 
@@ -269,7 +269,7 @@ Show the isolation and whether it takes effect
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | No |
+| `-p, --project <project>` | Project slug | - | No |
 | `--json` | Output in JSON format | - | No |
 
 #### `environments isolation set`
@@ -280,7 +280,7 @@ Set the isolation: process or micro_vm (a microVM replica only runs on a node th
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | No |
+| `-p, --project <project>` | Project slug | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `environments volumes`
@@ -304,7 +304,7 @@ List the environment's volumes, newest first
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | No |
+| `-p, --project <project>` | Project slug | - | No |
 | `--page <page>` | Page number (default 1) | - | No |
 | `--page-size <size>` | Results per page (default 20, max 100) | - | No |
 | `--json` | Output in JSON format | - | No |
@@ -317,8 +317,8 @@ Create a volume (attach it to mount it)
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | No |
-| `-n, --name <name>` | Volume name: 2-64 characters of a-z, 0-9, "_", "." or "-" | - | No |
+| `-p, --project <project>` | Project slug | - | No |
+| `-n, --name <name>` | Volume name: 2-64 characters of a-z, 0-9, "_", "." or "-" | - | Yes |
 | `--size-mb <mb>` | Size in MB, when the backend supports a size | - | No |
 | `--retain` | Keep the data when the volume is deleted | - | No |
 | `--json` | Output in JSON format | - | No |
@@ -331,7 +331,7 @@ Show whether the next deploy mounts the attached volumes, and what to fix if not
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | No |
+| `-p, --project <project>` | Project slug | - | No |
 | `--json` | Output in JSON format | - | No |
 
 #### `environments volumes attach`
@@ -342,8 +342,8 @@ Mount a volume (id or name) into every replica at --mount-path
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | No |
-| `--mount-path <path>` | Absolute path inside each replica | - | No |
+| `-p, --project <project>` | Project slug | - | No |
+| `--mount-path <path>` | Absolute path inside each replica | - | Yes |
 | `--read-only` | Mount it read-only | - | No |
 | `--json` | Output in JSON format | - | No |
 
@@ -355,7 +355,7 @@ Stop mounting a volume (id or name); its data is kept
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | No |
+| `-p, --project <project>` | Project slug | - | No |
 | `--json` | Output in JSON format | - | No |
 
 #### `environments volumes rm` (alias: `delete`)
@@ -366,7 +366,7 @@ Delete a volume (id or name), and its data unless it was created with --retain
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | No |
+| `-p, --project <project>` | Project slug | - | No |
 | `-f, --force` | Skip confirmation | - | No |
 | `-y, --yes` | Skip confirmation (alias for --force) | - | No |
 | `--json` | Output in JSON format | - | No |
@@ -388,7 +388,7 @@ Show the login requirement and whether the proxy enforces it now
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | No |
+| `-p, --project <project>` | Project slug | - | No |
 | `--json` | Output in JSON format | - | No |
 
 #### `environments ingress set`
@@ -399,8 +399,8 @@ Require visitors to sign in to Temps, or stop requiring it
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-p, --project <project>` | Project slug or ID | - | No |
-| `--require-login` | Visitors must sign in to Temps | - | No |
+| `-p, --project <project>` | Project slug | - | No |
+| `--require-login` | Require sign-in only when ingress mode is enforce. Check login_enforced in JSON output or Enforced now in text output | - | No |
 | `--no-require-login` | Visitors do not need to sign in | - | No |
 | `--json` | Output in JSON format | - | No |
 

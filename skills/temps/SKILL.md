@@ -1,6 +1,6 @@
 ---
 name: temps
-description: Manage, deploy, operate, and instrument applications with Temps. Use this skill whenever the user mentions Temps, `@temps-sdk/cli@0.1.38`, deploying or migrating an app to Temps, projects, environments, services, domains, backups, edge rules (request blocking, redirects, bot challenges), logs, monitoring, analytics, browser Performance Insights/Core Web Vitals, observability, error tracking, OpenTelemetry, tracing, session replay, or Temps Cloud. Also use it when preparing an application for production on Temps even if the user does not explicitly ask for the CLI. Route to focused references, proactively detect missing observability during create/link/deploy journeys, and use pinned `bunx` or `npx` CLI invocations with explicit target contexts.
+description: Manage, deploy, operate, and instrument applications with Temps. Use this skill whenever the user mentions Temps, `@temps-sdk/cli@latest`, deploying or migrating an app to Temps, projects, environments, services, domains, backups, edge rules (request blocking, redirects, bot challenges), logs, monitoring, analytics, browser Performance Insights/Core Web Vitals, observability, error tracking, OpenTelemetry, tracing, session replay, or Temps Cloud. Also use it when preparing an application for production on Temps even if the user does not explicitly ask for the CLI. Route to focused references, proactively detect missing observability during create/link/deploy journeys, and use latest stable `bunx` or `npx` CLI invocations with explicit target contexts.
 ---
 
 # Temps
@@ -24,7 +24,7 @@ Python 3.9+ for the bundled read-only capability detector.
    meets the request; inspect a repository framework only for source deployment.
 3. Read only the references named in the routing table below. Do not load the
    complete command index or unrelated observability pillars.
-4. For CLI work, use the pinned zero-install invocation and the safety contract
+4. For CLI work, use the latest stable zero-install invocation and the safety contract
    in [references/cli-runtime.md](references/cli-runtime.md).
 5. Before a state change, explain its target and effect. Ask for confirmation
    when the change is destructive, secret-bearing, or otherwise requires new
@@ -105,14 +105,13 @@ Do not read a monolithic CLI manual. Open
 command-group file, and confirm uncertain syntax with runtime help:
 
 ```bash
-bunx @temps-sdk/cli@0.1.38 <group> <command> --help
+bunx @temps-sdk/cli@latest <group> <command> --help
 ```
 
-Use `npx @temps-sdk/cli@0.1.38` only when Bun is unavailable. Never omit the
-reviewed version and never assume a global `temps` binary exists.
+Use `npx @temps-sdk/cli@latest` only when Bun is unavailable. Use the latest stable release and never assume a global `temps` binary exists.
 
 For Performance Insights, confirm `analytics performance --help` exists in the
-reviewed runtime before querying. If the current reviewed version predates that
+selected runtime before querying. If the current version predates that
 command, report the version gap instead of silently substituting OTel `metrics`
 or a traffic-only `analytics top devices` query.
 

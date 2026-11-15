@@ -36,5 +36,10 @@
 		"svelte": "^5.53.5",
 		"typescript": "^5.5.4"
 	},
-	"sideEffects": false
+	"sideEffects": false,
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/gotempsh/temps.git",
+		"directory": "sdks/node/packages/svelte-analytics"
+	}
 }
