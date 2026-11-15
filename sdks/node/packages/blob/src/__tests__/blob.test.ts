@@ -159,6 +159,24 @@ describe('BlobClient', () => {
       expect(fetchOptions.headers['Content-Type']).toBe('text/plain');
     });
 
+    it.each([
+      [undefined, null],
+      [false, 'false'],
+      [true, 'true'],
+    ] as const)('preserves the server suffix default for %s', async (option, expected) => {
+      const client = new BlobClient();
+      mockFetch.mockResolvedValueOnce(createMockResponse({
+        url: `${TEST_API_URL}/api/blob/file.txt`,
+        pathname: 'file.txt',
+        contentType: 'text/plain',
+        size: 7,
+        uploadedAt: '2025-01-03T12:00:00Z',
+      }));
+      await client.put('file.txt', 'content', option === undefined ? undefined : { addRandomSuffix: option });
+      const [url] = mockFetch.mock.calls[0];
+      expect(new URL(url).searchParams.get('add_random_suffix')).toBe(expected);
+    });
+
     it('should throw on empty pathname', async () => {
       const client = new BlobClient();
       await expect(client.put('', 'content')).rejects.toThrow(BlobError);

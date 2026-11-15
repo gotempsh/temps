@@ -335,7 +335,7 @@ const storage = createClient({
   body: BlobBody,
   options?: {
     contentType?: string         // override auto-detection
-    addRandomSuffix?: boolean    // default: true — prevents collisions
+    addRandomSuffix?: boolean    // default: false — set true to prevent collisions
   },
 ): Promise<BlobInfo>`}
                   example={`const result = await blob.put('images/avatar.png', imageBuffer, {

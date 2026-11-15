@@ -131,7 +131,7 @@ import { blob } from '@temps-sdk/blob';
 // Upload (returns BlobInfo: { url, pathname, contentType, size, ... })
 const info = await blob.put('avatars/user-123.png', imageBuffer, {
   contentType: 'image/png',
-  addRandomSuffix: false,   // default true — set false to keep the exact pathname
+  addRandomSuffix: false,   // default false — keeps the exact pathname
 });
 
 // Download (returns a fetch Response — stream or buffer it yourself)
@@ -161,7 +161,7 @@ const store = new BlobClient({
 });
 ```
 
-`PutOptions`: `{ contentType?, addRandomSuffix? (default true) }`.
+`PutOptions`: `{ contentType?, addRandomSuffix? (default false) }`.
 
 > ⚠️ Methods are `put / del / head / list / download / copy`. There is **no** `blob.get()`, `blob.getStream()`, `blob.getSignedUrl()`, or `blob.createUploadUrl()` — to read content, call `download(url)` and consume the `Response`. Blob errors throw `BlobError`.
 

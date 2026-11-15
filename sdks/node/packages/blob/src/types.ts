@@ -38,7 +38,7 @@ export interface PutOptions {
 
   /**
    * Add a random suffix to the filename to prevent collisions
-   * @default true
+   * @default false
    */
   addRandomSuffix?: boolean;
 }

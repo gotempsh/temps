@@ -110,7 +110,7 @@ await blob.put('videos/clip.mp4', stream);
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `contentType` | `string` | Auto-detected | MIME type of the file |
-| `addRandomSuffix` | `boolean` | `true` | Append a random suffix to prevent name collisions |
+| `addRandomSuffix` | `boolean` | `false` | Append a random suffix to prevent name collisions |
 
 **Returns `BlobInfo`:**
 
