@@ -380,7 +380,13 @@ def publish(packages, output, kind):
     selected = [p for p in packages if p['kind'] == kind]
     if kind == 'crate' and selected and any(pending_files(p, output / p['key']) for p in selected):
         selection = [arg for p in selected for arg in ('-p', p['name'])]
-        run('cargo', 'package', '--locked', *selection)
+        # --no-verify here and on `cargo publish`: verifying compiles the locked
+        # dependency graph, running third-party build scripts and proc macros
+        # while this job holds the crates.io token and OIDC credentials. The
+        # unprivileged build job already compiled, tested and packaged these
+        # crates; the digest check below and the registry checksum check after
+        # upload tie what is published to that tested archive.
+        run('cargo', 'package', '--locked', '--no-verify', *selection)
         metadata = json.loads(run('cargo', 'metadata', '--no-deps', '--format-version', '1', capture=True))
         for p in selected:
             archive = Path(metadata['target_directory']) / 'package' / f"{p['name']}-{p['version']}.crate"
@@ -397,7 +403,7 @@ def publish(packages, output, kind):
                 '--registry', 'https://registry.npmjs.org',
                 '--tag', 'beta' if p['channel'] == 'beta' else 'latest', '--provenance')
         elif kind == 'crate':
-            run('cargo', 'publish', '--locked', '-p', p['name'])
+            run('cargo', 'publish', '--locked', '--no-verify', '-p', p['name'])
         else:
             raise ValueError('PyPI publication uses the trusted publishing action')
         verify_registry([p], output, kind)

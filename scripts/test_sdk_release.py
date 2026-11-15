@@ -348,6 +348,7 @@ class ReleaseTests(unittest.TestCase):
         published = {packages[0]['name']} if protocol_published else set()
         uploads = []
         checked_after_upload = []
+        cargo_builds = []
         real_pending = release.pending_files
         def pending(package, directory):
             def fetch(url):
@@ -359,6 +360,8 @@ class ReleaseTests(unittest.TestCase):
                 return {'version': {'checksum': release.digest(archive), 'yanked': False}}
             return real_pending(package, directory, fetch)
         def command(*args, **kwargs):
+            if args[:2] in (('cargo', 'package'), ('cargo', 'publish')):
+                cargo_builds.append(args)
             if args[:2] == ('cargo', 'metadata'):
                 return json.dumps({'target_directory': str(target)})
             if args[:2] == ('cargo', 'publish'):
@@ -382,6 +385,11 @@ class ReleaseTests(unittest.TestCase):
                 # A second invocation reconciles the completed upload without duplicating it.
                 release.publish(packages, output, 'crate')
                 self.assertEqual(uploads, expected)
+        # The publishing job holds registry credentials: it must never compile
+        # the locked dependency graph (build scripts, proc macros) again.
+        self.assertTrue(cargo_builds)
+        for args in cargo_builds:
+            self.assertIn('--no-verify', args, f'{args} would compile with registry credentials')
 
     def test_rust_uploads_verified_archives_in_dependency_order(self):
         self.exercise_rust_publication()
