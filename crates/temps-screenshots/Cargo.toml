@@ -31,6 +31,10 @@ directories = { workspace = true }
 url = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
+# The capture proxy (pinning_proxy.rs) parses each browser request on its own
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
 # Decodes captured screenshots to prove they are readable images before storing them
 image = { workspace = true, features = ["png", "jpeg", "webp"] }
 

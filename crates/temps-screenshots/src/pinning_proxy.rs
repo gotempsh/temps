@@ -13,28 +13,42 @@
 //! with [`RequestPolicy::resolve`], and connects to one of exactly those
 //! addresses. The address that was checked is the address that is dialled.
 //!
+//! Every plain HTTP request is judged and sent on its own: a browser keeps a
+//! proxy connection alive and sends requests for different sites over it, so
+//! each one gets its own upstream connection to the address checked for its
+//! own host. A `CONNECT` tunnel (HTTPS, WebSocket) is judged once, when it is
+//! opened, and then carries one stream to one destination.
+//!
 //! One proxy runs per capture, on a random loopback port, and stops with it.
-//! Resource use is bounded: at most [`MAX_CONNECTIONS`] connections at once
-//! (further ones wait for a free slot), request heads of at most
-//! [`MAX_HEAD_BYTES`], and timeouts on reading the head and on connecting.
+//! Resource use is bounded: at most [`MAX_CONNECTIONS`] browser connections
+//! and tunnels at once (further ones wait for a free slot), request heads of
+//! at most [`MAX_HEAD_BYTES`], and deadlines on reading a head, on DNS
+//! lookups and on connecting.
 
+use std::convert::Infallible;
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use bytes::Bytes;
+use http_body_util::{combinators::BoxBody, BodyExt, Empty};
+use hyper::body::Incoming;
+use hyper::header::{HeaderMap, HeaderName, HeaderValue, CONNECTION, HOST, UPGRADE};
+use hyper::{Method, Request, Response, StatusCode, Uri};
+use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, warn};
 
 use crate::request_policy::RequestPolicy;
 
-/// Connections served at once. A screenshot page needs a few dozen at most.
+/// Browser connections and tunnels served at once. A screenshot page needs a
+/// few dozen at most.
 pub const MAX_CONNECTIONS: usize = 64;
 /// Largest request line plus headers accepted from the browser.
 pub const MAX_HEAD_BYTES: usize = 16 * 1024;
@@ -65,8 +79,8 @@ pub struct PinningProxy {
 }
 
 impl PinningProxy {
-    /// Start a proxy on a random loopback port. Every connection it refuses
-    /// is counted in `refused`.
+    /// Start a proxy on a random loopback port. Every request it refuses is
+    /// counted in `refused`.
     pub async fn start(
         policy: RequestPolicy,
         lookup: Lookup,
@@ -78,6 +92,7 @@ impl PinningProxy {
             policy,
             lookup,
             refused,
+            tasks: Mutex::new(JoinSet::new()),
         });
         let task = tokio::spawn(accept_loop(listener, shared));
         Ok(Self { address, task })
@@ -96,8 +111,9 @@ impl PinningProxy {
 
 impl Drop for PinningProxy {
     fn drop(&mut self) {
-        // The connection tasks live in a `JoinSet` owned by this task, so
-        // aborting it aborts them too.
+        // Connection tasks live in a `JoinSet` owned by this task, and every
+        // tunnel and upstream connection in `Shared::tasks`, which only
+        // connection tasks keep alive: aborting this task stops them all.
         self.task.abort();
     }
 }
@@ -106,14 +122,34 @@ struct Shared {
     policy: RequestPolicy,
     lookup: Lookup,
     refused: Arc<AtomicUsize>,
+    /// Tunnels and upstream connections. Tasks in here never hold `Shared`.
+    tasks: Mutex<JoinSet<()>>,
 }
+
+impl Shared {
+    fn spawn(&self, task: impl Future<Output = ()> + Send + 'static) {
+        let mut tasks = self.tasks.lock().unwrap_or_else(PoisonError::into_inner);
+        while tasks.try_join_next().is_some() {}
+        tasks.spawn(task);
+    }
+
+    fn refuse(&self, status: StatusCode, reason: &str) -> Response<ProxyBody> {
+        self.refused.fetch_add(1, Ordering::Relaxed);
+        warn!("Blocked a request the page being captured made: {reason}");
+        respond(status)
+    }
+}
+
+/// The slot a browser connection holds, handed on to a tunnel it opens.
+type Slot = Arc<Mutex<Option<OwnedSemaphorePermit>>>;
+type ProxyBody = BoxBody<Bytes, hyper::Error>;
 
 async fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
     let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     let mut connections = JoinSet::new();
     loop {
         while connections.try_join_next().is_some() {}
-        let Ok(slot) = slots.clone().acquire_owned().await else {
+        let Ok(permit) = slots.clone().acquire_owned().await else {
             return;
         };
         let (client, peer) = match listener.accept().await {
@@ -125,193 +161,238 @@ async fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
         };
         let shared = shared.clone();
         connections.spawn(async move {
-            let _slot = slot;
-            if let Err(error) = serve(client, &shared).await {
+            let slot: Slot = Arc::new(Mutex::new(Some(permit)));
+            let service = hyper::service::service_fn({
+                let slot = slot.clone();
+                move |request| {
+                    let shared = shared.clone();
+                    let slot = slot.clone();
+                    async move { Ok::<_, Infallible>(handle(request, &shared, &slot).await) }
+                }
+            });
+            let served = hyper::server::conn::http1::Builder::new()
+                .timer(TokioTimer::new())
+                .header_read_timeout(HEAD_TIMEOUT)
+                .max_buf_size(MAX_HEAD_BYTES)
+                .serve_connection(TokioIo::new(client), service)
+                .with_upgrades()
+                .await;
+            if let Err(error) = served {
                 debug!("Screenshot proxy connection from {peer} ended: {error}");
             }
         });
     }
 }
 
-/// What the browser asked the proxy to do.
-#[derive(Debug, PartialEq, Eq)]
-struct ProxyRequest {
-    host: String,
-    port: u16,
-    /// `None` for a `CONNECT` tunnel; otherwise the head to send upstream,
-    /// rewritten from the proxy form (`GET http://host/path`) to the origin
-    /// form (`GET /path`).
-    forward_head: Option<Vec<u8>>,
+async fn handle(request: Request<Incoming>, shared: &Shared, slot: &Slot) -> Response<ProxyBody> {
+    if request.method() == Method::CONNECT {
+        tunnel(request, shared, slot).await
+    } else {
+        forward(request, shared).await
+    }
 }
 
-async fn serve(mut client: TcpStream, shared: &Shared) -> io::Result<()> {
-    let (head, rest) = match tokio::time::timeout(HEAD_TIMEOUT, read_head(&mut client)).await {
-        Ok(result) => result?,
-        Err(_) => return Ok(()),
+/// Open a `CONNECT` tunnel to a checked address of the requested authority.
+async fn tunnel(
+    mut request: Request<Incoming>,
+    shared: &Shared,
+    slot: &Slot,
+) -> Response<ProxyBody> {
+    let (host, port) = match connect_target(request.uri()) {
+        Ok(target) => target,
+        Err(reason) => return shared.refuse(StatusCode::BAD_REQUEST, &reason),
     };
-    let request = match parse_head(&head) {
-        Ok(request) => request,
-        Err(reason) => return refuse(&mut client, shared, "400 Bad Request", &reason).await,
+    let Some(upstream) = connect_checked(shared, &host, port).await else {
+        return respond(StatusCode::BAD_GATEWAY);
     };
+    let upstream = match upstream {
+        Ok(stream) => stream,
+        Err(refusal) => return refusal,
+    };
+    // The tunnel outlives this connection's HTTP handling, so it takes over
+    // the connection's slot.
+    let permit = slot.lock().unwrap_or_else(PoisonError::into_inner).take();
+    let upgrade = hyper::upgrade::on(&mut request);
+    shared.spawn(async move {
+        let _permit = permit;
+        match upgrade.await {
+            Ok(upgraded) => {
+                let mut client = TokioIo::new(upgraded);
+                let mut upstream = upstream;
+                let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+            }
+            Err(error) => debug!("Screenshot proxy tunnel was not established: {error}"),
+        }
+    });
+    respond(StatusCode::OK)
+}
 
-    let addresses = match shared
-        .policy
-        .resolve(&request.host, request.port, &shared.lookup)
-        .await
-    {
+/// Send one plain HTTP request to a checked address of its own host.
+async fn forward(mut request: Request<Incoming>, shared: &Shared) -> Response<ProxyBody> {
+    let (host, port) = match forward_target(request.uri()) {
+        Ok(target) => target,
+        Err(reason) => return shared.refuse(StatusCode::BAD_REQUEST, &reason),
+    };
+    let upstream = match connect_checked(shared, &host, port).await {
+        None => return respond(StatusCode::BAD_GATEWAY),
+        Some(Err(refusal)) => return refusal,
+        Some(Ok(stream)) => stream,
+    };
+    let (mut sender, connection) =
+        match hyper::client::conn::http1::handshake(TokioIo::new(upstream)).await {
+            Ok(parts) => parts,
+            Err(error) => {
+                debug!("Screenshot proxy could not talk HTTP to {host}:{port}: {error}");
+                return respond(StatusCode::BAD_GATEWAY);
+            }
+        };
+    shared.spawn(async move {
+        if let Err(error) = connection.with_upgrades().await {
+            debug!("Screenshot proxy upstream connection ended: {error}");
+        }
+    });
+
+    // Proxy form (`GET http://host/path`) to origin form (`GET /path`).
+    if !request.headers().contains_key(HOST) {
+        if let Some(authority) = request.uri().authority() {
+            if let Ok(value) = HeaderValue::from_str(authority.as_str()) {
+                request.headers_mut().insert(HOST, value);
+            }
+        }
+    }
+    let origin = request
+        .uri()
+        .path_and_query()
+        .map_or("/", |path| path.as_str())
+        .parse::<Uri>()
+        .unwrap_or_else(|_| Uri::from_static("/"));
+    *request.uri_mut() = origin;
+    let upgrading = request.headers().contains_key(UPGRADE);
+    strip_hop_by_hop(request.headers_mut(), upgrading);
+    let client_upgrade = upgrading.then(|| hyper::upgrade::on(&mut request));
+
+    let mut response = match sender.send_request(request).await {
+        Ok(response) => response,
+        Err(error) => {
+            debug!("Screenshot proxy request to {host}:{port} failed: {error}");
+            return respond(StatusCode::BAD_GATEWAY);
+        }
+    };
+    if response.status() == StatusCode::SWITCHING_PROTOCOLS {
+        if let Some(client_upgrade) = client_upgrade {
+            let upstream_upgrade = hyper::upgrade::on(&mut response);
+            shared.spawn(async move {
+                if let (Ok(client), Ok(upstream)) = (client_upgrade.await, upstream_upgrade.await) {
+                    let _ = tokio::io::copy_bidirectional(
+                        &mut TokioIo::new(client),
+                        &mut TokioIo::new(upstream),
+                    )
+                    .await;
+                }
+            });
+            return response.map(BodyExt::boxed);
+        }
+    }
+    strip_hop_by_hop(response.headers_mut(), false);
+    response.map(BodyExt::boxed)
+}
+
+/// Resolve and check `host:port`, then connect to one of the checked
+/// addresses. `None` when none of them answers; `Some(Err)` when the policy
+/// refuses the destination.
+async fn connect_checked(
+    shared: &Shared,
+    host: &str,
+    port: u16,
+) -> Option<Result<TcpStream, Response<ProxyBody>>> {
+    let addresses = match shared.policy.resolve(host, port, &shared.lookup).await {
         Ok(addresses) => addresses,
         Err(reason) => {
-            let reason = format!("{}:{}: {reason}", request.host, request.port);
-            return refuse(&mut client, shared, "403 Forbidden", &reason).await;
+            let reason = format!("{host}:{port}: {reason}");
+            return Some(Err(shared.refuse(StatusCode::FORBIDDEN, &reason)));
         }
     };
-    let Some(mut upstream) = connect_any(&addresses).await else {
-        let _ = client
-            .write_all(
-                b"HTTP/1.1 502 Bad Gateway\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
-            )
-            .await;
-        return Ok(());
-    };
-
-    match request.forward_head {
-        None => {
-            client
-                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-                .await?
-        }
-        Some(head) => upstream.write_all(&head).await?,
-    }
-    upstream.write_all(&rest).await?;
-    tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
-    Ok(())
+    connect_any(&addresses).await.map(Ok)
 }
 
-async fn refuse(
-    client: &mut TcpStream,
-    shared: &Shared,
-    status: &str,
-    reason: &str,
-) -> io::Result<()> {
-    shared.refused.fetch_add(1, Ordering::Relaxed);
-    warn!("Blocked a connection the page being captured tried to open: {reason}");
-    client
-        .write_all(
-            format!("HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
-                .as_bytes(),
-        )
-        .await
+/// The destination of a `CONNECT`: the authority exactly as written. Its port
+/// is required and kept as given, including the default ports.
+fn connect_target(uri: &Uri) -> Result<(String, u16), String> {
+    let authority = uri
+        .authority()
+        .ok_or_else(|| format!("CONNECT target '{uri}' is not host:port"))?;
+    if uri.scheme().is_some() || authority.as_str().contains('@') {
+        return Err(format!("malformed CONNECT target '{uri}'"));
+    }
+    let port = authority
+        .port_u16()
+        .ok_or_else(|| format!("CONNECT target '{uri}' has no port"))?;
+    Ok((bare_host(authority.host()), port))
 }
 
-/// Read up to the end of the request head. Returns the head and whatever was
-/// read past it (the start of a body or of a tunnelled stream).
-async fn read_head(client: &mut TcpStream) -> io::Result<(Vec<u8>, Vec<u8>)> {
-    let mut buffer = Vec::with_capacity(2048);
-    let mut chunk = [0u8; 2048];
-    loop {
-        let read = client.read(&mut chunk).await?;
-        if read == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "closed before the request head ended",
-            ));
-        }
-        let searched_from = buffer.len().saturating_sub(3);
-        buffer.extend_from_slice(&chunk[..read]);
-        if let Some(end) = find_head_end(&buffer[searched_from..]) {
-            let end = searched_from + end;
-            let rest = buffer.split_off(end);
-            return Ok((buffer, rest));
-        }
-        if buffer.len() > MAX_HEAD_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("request head exceeds {MAX_HEAD_BYTES} bytes"),
-            ));
-        }
+/// The destination of a plain request, which must use the proxy form.
+fn forward_target(uri: &Uri) -> Result<(String, u16), String> {
+    if uri.scheme_str() != Some("http") {
+        return Err(format!("expected an absolute http:// URL, got '{uri}'"));
+    }
+    let authority = uri
+        .authority()
+        .ok_or_else(|| format!("'{uri}' has no host"))?;
+    if authority.as_str().contains('@') {
+        return Err(format!("'{uri}' carries credentials"));
+    }
+    Ok((
+        bare_host(authority.host()),
+        authority.port_u16().unwrap_or(80),
+    ))
+}
+
+/// A host as a name or a bare IP address: no IPv6 brackets, lower case.
+fn bare_host(host: &str) -> String {
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase()
+}
+
+/// Remove the headers that describe one connection rather than the message,
+/// including any the `Connection` header names. `keep_upgrade` keeps the
+/// `Connection` and `Upgrade` headers of a protocol upgrade.
+fn strip_hop_by_hop(headers: &mut HeaderMap, keep_upgrade: bool) {
+    let named: Vec<HeaderName> = headers
+        .get_all(CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .filter_map(|token| HeaderName::from_bytes(token.trim().as_bytes()).ok())
+        .filter(|name| !(keep_upgrade && *name == UPGRADE))
+        .collect();
+    for name in named {
+        headers.remove(name);
+    }
+    for name in [
+        "keep-alive",
+        "proxy-connection",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+    ] {
+        headers.remove(name);
+    }
+    if !keep_upgrade {
+        headers.remove(CONNECTION);
+        headers.remove(UPGRADE);
     }
 }
 
-/// The index just past the blank line that ends a request head.
-fn find_head_end(bytes: &[u8]) -> Option<usize> {
-    bytes
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .map(|start| start + 4)
-}
-
-fn parse_head(head: &[u8]) -> Result<ProxyRequest, String> {
-    let text = std::str::from_utf8(head).map_err(|_| "the request head is not UTF-8")?;
-    let mut lines = text.split("\r\n");
-    let request_line = lines.next().unwrap_or_default();
-    let mut parts = request_line.split(' ');
-    let (Some(method), Some(target), Some(version), None) =
-        (parts.next(), parts.next(), parts.next(), parts.next())
-    else {
-        return Err(format!("malformed request line '{request_line}'"));
-    };
-    if !version.starts_with("HTTP/1.") {
-        return Err(format!("unsupported protocol '{version}'"));
-    }
-
-    if method.eq_ignore_ascii_case("CONNECT") {
-        let url = url::Url::parse(&format!("http://{target}/"))
-            .map_err(|error| format!("malformed CONNECT target '{target}': {error}"))?;
-        let host = host_of(&url).ok_or_else(|| format!("CONNECT target '{target}' has no host"))?;
-        let port = url
-            .port()
-            .ok_or_else(|| format!("CONNECT target '{target}' has no port"))?;
-        if url.path() != "/" || url.username() != "" || url.password().is_some() {
-            return Err(format!("malformed CONNECT target '{target}'"));
-        }
-        return Ok(ProxyRequest {
-            host,
-            port,
-            forward_head: None,
-        });
-    }
-
-    let url = url::Url::parse(target)
-        .map_err(|error| format!("expected an absolute URL, got '{target}': {error}"))?;
-    if !matches!(url.scheme(), "http" | "ws") {
-        return Err(format!("scheme '{}' cannot be proxied", url.scheme()));
-    }
-    let host = host_of(&url).ok_or_else(|| format!("'{target}' has no host"))?;
-    let port = url
-        .port_or_known_default()
-        .ok_or_else(|| format!("'{target}' has no port"))?;
-    let path = match url.query() {
-        Some(query) => format!("{}?{query}", url.path()),
-        None => url.path().to_string(),
-    };
-
-    let mut forward = format!("{method} {path} {version}\r\n");
-    for line in lines.filter(|line| !line.is_empty()) {
-        let name = line.split(':').next().unwrap_or_default().trim();
-        // Meant for this proxy, not for the server.
-        if name.eq_ignore_ascii_case("proxy-connection")
-            || name.eq_ignore_ascii_case("proxy-authorization")
-        {
-            continue;
-        }
-        forward.push_str(line);
-        forward.push_str("\r\n");
-    }
-    forward.push_str("\r\n");
-    Ok(ProxyRequest {
-        host,
-        port,
-        forward_head: Some(forward.into_bytes()),
-    })
-}
-
-/// The host of `url` as a name or a bare IP address (no IPv6 brackets).
-fn host_of(url: &url::Url) -> Option<String> {
-    match url.host()? {
-        url::Host::Domain(domain) => Some(domain.to_ascii_lowercase()),
-        url::Host::Ipv4(ip) => Some(ip.to_string()),
-        url::Host::Ipv6(ip) => Some(ip.to_string()),
-    }
+fn respond(status: StatusCode) -> Response<ProxyBody> {
+    let mut response = Response::new(
+        Empty::<Bytes>::new()
+            .map_err(|never| match never {})
+            .boxed(),
+    );
+    *response.status_mut() = status;
+    response
 }
 
 /// Connect to the first of `addresses` that answers, and only to those.
@@ -331,6 +412,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::sync::Mutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// A resolver with fixed answers, recording every lookup it is asked for.
     fn fixed_lookup(
@@ -382,7 +464,40 @@ mod tests {
         (address, hits, heads)
     }
 
+    /// Read one response: its head, then as many body bytes as it declares.
+    async fn read_response(stream: &mut TcpStream) -> String {
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            if let Some(end) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&buffer[..end]).to_ascii_lowercase();
+                let length = head
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if buffer.len() >= end + 4 + length {
+                    return String::from_utf8_lossy(&buffer[..end + 4 + length]).into_owned();
+                }
+            }
+            match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut chunk)).await {
+                Ok(Ok(read)) if read > 0 => buffer.extend_from_slice(&chunk[..read]),
+                _ => return String::from_utf8_lossy(&buffer).into_owned(),
+            }
+        }
+    }
+
+    /// Send `request` on a new connection and read one response.
     async fn send(proxy: &PinningProxy, request: &str) -> String {
+        let mut stream = TcpStream::connect(proxy.address())
+            .await
+            .expect("connect proxy");
+        stream.write_all(request.as_bytes()).await.expect("send");
+        read_response(&mut stream).await
+    }
+
+    /// Send `request` and read everything until the proxy closes: a tunnel.
+    async fn send_until_closed(proxy: &PinningProxy, request: &str) -> String {
         let mut stream = TcpStream::connect(proxy.address())
             .await
             .expect("connect proxy");
@@ -391,6 +506,20 @@ mod tests {
         let _ =
             tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response)).await;
         String::from_utf8_lossy(&response).into_owned()
+    }
+
+    /// A resolver that answers `host` with exactly `address`, whatever port
+    /// was asked for.
+    fn exact_lookup(host: &'static str, address: SocketAddr) -> Lookup {
+        Arc::new(move |asked: String, _port: u16| {
+            Box::pin(async move {
+                if asked == host {
+                    Ok(vec![address])
+                } else {
+                    Err(io::Error::new(io::ErrorKind::NotFound, "no such name"))
+                }
+            })
+        })
     }
 
     /// The DNS-rebinding case: a name the request filter lets through, because
@@ -511,7 +640,7 @@ mod tests {
             .await
             .expect("start proxy");
 
-        let response = send(
+        let response = send_until_closed(
             &proxy,
             &format!(
                 "CONNECT 127.0.0.1:{} HTTP/1.1\r\n\r\nGET / HTTP/1.1\r\nhost: x\r\n\r\n",
@@ -519,8 +648,9 @@ mod tests {
             ),
         )
         .await;
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
         assert!(
-            response.starts_with("HTTP/1.1 200 Connection Established\r\n\r\nHTTP/1.1 200 OK"),
+            response.contains("\r\n\r\nHTTP/1.1 200 OK\r\n"),
             "{response}"
         );
         assert!(response.ends_with("tunnelled"), "{response}");
@@ -530,6 +660,95 @@ mod tests {
             asked.lock().expect("lookups").is_empty(),
             "an IP literal needs no lookup"
         );
+    }
+
+    /// A browser keeps a proxy connection alive and sends requests for other
+    /// sites over it. Each request is judged and routed on its own: a later
+    /// request for a refused name is refused, rather than being passed on to
+    /// the server the first request went to, and the connection keeps
+    /// working.
+    #[tokio::test]
+    async fn each_request_on_a_kept_alive_connection_is_routed_by_its_own_host() {
+        let (app, app_hits, heads) = upstream("page").await;
+        let (internal, internal_hits, _) = upstream("internal").await;
+        let target = format!("http://app.example.test:{}/", app.port());
+        let policy = RequestPolicy::for_target(&target).expect("policy");
+        let (lookup, _) = fixed_lookup(HashMap::from([
+            ("app.example.test", vec![app]),
+            ("rebind.example.net", vec![internal]),
+        ]));
+        let refused = Arc::new(AtomicUsize::new(0));
+        let proxy = PinningProxy::start(policy, lookup, refused.clone())
+            .await
+            .expect("start proxy");
+
+        let (app_port, internal_port) = (app.port(), internal.port());
+        let mut stream = TcpStream::connect(proxy.address())
+            .await
+            .expect("connect proxy");
+        for (request, expected) in [
+            (
+                format!(
+                    "GET http://app.example.test:{app_port}/one HTTP/1.1\r\n\
+                     host: app.example.test:{app_port}\r\n\r\n"
+                ),
+                "HTTP/1.1 200",
+            ),
+            (
+                format!(
+                    "GET http://rebind.example.net:{internal_port}/secret HTTP/1.1\r\n\
+                     host: rebind.example.net:{internal_port}\r\ncookie: session=other-site\r\n\r\n"
+                ),
+                "HTTP/1.1 403",
+            ),
+            (
+                format!(
+                    "GET http://app.example.test:{app_port}/two HTTP/1.1\r\n\
+                     host: app.example.test:{app_port}\r\n\r\n"
+                ),
+                "HTTP/1.1 200",
+            ),
+        ] {
+            stream.write_all(request.as_bytes()).await.expect("send");
+            let response = read_response(&mut stream).await;
+            assert!(response.starts_with(expected), "{request}: {response}");
+        }
+
+        assert_eq!(internal_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(app_hits.load(Ordering::SeqCst), 2);
+        let heads = heads.lock().expect("heads").clone();
+        assert!(heads[0].starts_with("GET /one "), "{heads:?}");
+        assert!(heads[1].starts_with("GET /two "), "{heads:?}");
+        assert!(
+            heads.iter().all(|head| !head.contains("other-site")),
+            "a request meant for another site must not reach this one: {heads:?}"
+        );
+        assert_eq!(refused.load(Ordering::SeqCst), 1);
+    }
+
+    /// `CONNECT host:80` names its port explicitly; it is kept, not treated
+    /// as missing because 80 is HTTP's default.
+    #[tokio::test]
+    async fn a_tunnel_to_port_80_is_opened() {
+        let (app, app_hits, _) = upstream("on port 80").await;
+        let policy = RequestPolicy::for_target("https://app.example.test:80/").expect("policy");
+        let proxy = PinningProxy::start(
+            policy,
+            exact_lookup("app.example.test", app),
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .await
+        .expect("start proxy");
+
+        let response = send_until_closed(
+            &proxy,
+            "CONNECT app.example.test:80 HTTP/1.1\r\nhost: app.example.test:80\r\n\r\n\
+             GET / HTTP/1.1\r\nhost: app.example.test\r\n\r\n",
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.ends_with("on port 80"), "{response}");
+        assert_eq!(app_hits.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -558,7 +777,10 @@ mod tests {
             "a".repeat(MAX_HEAD_BYTES)
         );
         let response = send(&proxy, &oversized).await;
-        assert!(response.is_empty(), "the connection is dropped: {response}");
+        assert!(
+            response.starts_with("HTTP/1.1 431"),
+            "an oversized head is refused: {response}"
+        );
         assert!(asked.lock().expect("lookups").is_empty());
     }
 
