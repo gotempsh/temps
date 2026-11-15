@@ -30,3 +30,23 @@ test('a stale destination can be cleared when the list becomes empty or unavaila
     view.unmount()
   }
 })
+
+test('cached destinations stay visible when their background refresh fails', () => {
+  const view = render(
+    <MemoryRouter>
+      <CreationBackupSetup
+        query={{
+          isPending: false,
+          isError: true,
+          data: [{ id: 7, name: 'Sample destination' }],
+          refetch: () => {},
+        }}
+        destination="7"
+        onDestinationChange={() => {}}
+      />
+    </MemoryRouter>
+  )
+  expect(view.getByText('Backup destinations unavailable')).toBeTruthy()
+  expect(view.getByRole('combobox')).toBeTruthy()
+  expect(view.getByText('Sample destination')).toBeTruthy()
+})

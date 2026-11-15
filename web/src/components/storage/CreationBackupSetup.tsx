@@ -23,7 +23,7 @@ export function CreationBackupSetup({
   query: {
     isPending: boolean
     isError: boolean
-    data?: S3SourceResponse[]
+    data?: Pick<S3SourceResponse, 'id' | 'name'>[]
     refetch: () => unknown
   }
   destination: string
@@ -32,9 +32,7 @@ export function CreationBackupSetup({
   return (
     <div className="space-y-3">
       <Label htmlFor="backup-destination">Backups</Label>
-      {query.isPending ? (
-        <Skeleton className="h-10 w-full" />
-      ) : query.isError ? (
+      {query.isError && (
         <Alert>
           <AlertTitle>Backup destinations unavailable</AlertTitle>
           <AlertDescription>
@@ -49,7 +47,10 @@ export function CreationBackupSetup({
             . You can set up backups after creation.
           </AlertDescription>
         </Alert>
-      ) : !query.data?.length ? (
+      )}
+      {query.isPending && !query.data ? (
+        <Skeleton className="h-10 w-full" />
+      ) : !query.data ? null : !query.data.length ? (
         <Alert>
           <AlertTitle>No backup destination configured</AlertTitle>
           <AlertDescription>
@@ -75,7 +76,8 @@ export function CreationBackupSetup({
         <>
           <p className="text-sm text-muted-foreground">
             Choose a destination to configure a schedule after creation. No
-            backups are enabled until you save that schedule.
+            additional schedule is enabled until you save it. Existing instance
+            schedules may already cover this service.
           </p>
           <Select value={destination} onValueChange={onDestinationChange}>
             <SelectTrigger id="backup-destination">
