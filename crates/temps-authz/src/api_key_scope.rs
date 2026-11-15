@@ -69,6 +69,10 @@ impl ApiKeyScope {
         }
         match segments.next() {
             Some("environments") => self.allows_environment_path(segments),
+            // Static uploads stage caller-supplied content for this project;
+            // deployment still requires the bound environment's deploy route.
+            // No artifact listing, retrieval or other upload namespace is open.
+            Some("upload") => segments.next() == Some("static") && segments.next().is_none(),
             Some("trigger-pipeline") => segments.next().is_none(),
             resource if self.environment_id.is_none() => matches!(
                 resource,
@@ -213,6 +217,30 @@ mod tests {
                 assert!(
                     !scope.allows_path(&format!("/api/projects/7/environments/9/deploy/{suffix}"))
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn static_bundle_staging_is_project_bound_and_does_not_open_artifact_access() {
+        for environment_id in [None, Some(9)] {
+            let scope = ApiKeyScope {
+                project_id: 7,
+                environment_id,
+            };
+            assert!(scope.allows_path("/api/projects/7/upload/static"));
+            for path in [
+                "/api/projects/8/upload/static",
+                "/api/projects/7/upload/source",
+                "/api/projects/7/upload/static/extra",
+                "/api/projects/7/static-bundles",
+                "/api/projects/7/static-bundles/1",
+            ] {
+                assert!(!scope.allows_path(path), "{path}");
+            }
+            assert!(scope.allows_path("/api/projects/7/environments/9/deploy/static"));
+            if environment_id.is_some() {
+                assert!(!scope.allows_path("/api/projects/7/environments/8/deploy/static"));
             }
         }
     }
