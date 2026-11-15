@@ -3,7 +3,13 @@
 
 import { afterEach, expect, test } from 'bun:test'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { cleanup, fireEvent, render, waitFor } from '@testing-library/react'
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  waitFor,
+} from '@testing-library/react'
 import { MemoryRouter } from 'react-router'
 import type { EnvironmentResponse, ProjectResponse } from '@/api/client'
 import { installBrowserWindow } from '@/test/dom'
@@ -225,18 +231,20 @@ test('routing drafts survive refetch and reset for another environment', async (
     target: { value: '9' },
   })
   fireEvent.click(view.getByLabelText('Active health checks'))
-  view.rerender(
-    card({
-      ...initial,
-      deployment_config: {
-        loadBalancing: {
-          ...initial.deployment_config!.loadBalancing!,
-          preferredNodeIds: [3],
-          healthCheck: { enabled: true, intervalSeconds: 4 },
+  await act(async () => {
+    view.rerender(
+      card({
+        ...initial,
+        deployment_config: {
+          loadBalancing: {
+            ...initial.deployment_config!.loadBalancing!,
+            preferredNodeIds: [3],
+            healthCheck: { enabled: true, intervalSeconds: 4 },
+          },
         },
-      },
-    })
-  )
+      })
+    )
+  })
   expect(
     (
       view.getByLabelText(
@@ -251,7 +259,9 @@ test('routing drafts survive refetch and reset for another environment', async (
   expect(
     (view.getByLabelText('Interval (seconds)') as HTMLInputElement).value
   ).toBe('9')
-  view.rerender(card({ ...initial, id: 2 }))
+  await act(async () => {
+    view.rerender(card({ ...initial, id: 2 }))
+  })
   await waitFor(() =>
     expect(
       (
@@ -304,3 +314,72 @@ test('round robin rejects an invalid limit and keeps it editable', async () => {
   fireEvent.submit(limit.closest('form')!)
   await waitFor(() => expect(submissions).toBe(1))
 })
+
+for (const editDuringSave of [false, true]) {
+  test(`saved routing refetch preserves only later edits (${editDuringSave})`, async () => {
+    let finish!: () => void
+    const pending = new Promise<void>((resolve) => {
+      finish = resolve
+    })
+    let started = false
+    let saved = false
+    const initial = {
+      id: 1,
+      name: 'production',
+      branch: 'main',
+      deployment_config: {
+        loadBalancing: { strategy: 'preferred_nodes', preferredNodeIds: [0] },
+      },
+    } as EnvironmentResponse
+    mockApi({
+      'GET /internal/nodes': () => jsonResponse({ nodes: [] }),
+      'PUT /projects/1/environments/1/settings': async () => {
+        started = true
+        await pending
+        return jsonResponse(initial)
+      },
+    })
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    })
+    const card = (environment: EnvironmentResponse) => (
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          <EnvironmentConfigurationCard
+            project={{ id: 1, source_type: 'manual' } as ProjectResponse}
+            environment={environment}
+            onUpdate={() => {
+              saved = true
+            }}
+          />
+        </MemoryRouter>
+      </QueryClientProvider>
+    )
+    const view = render(card(initial))
+    const input = view.getByLabelText(
+      'Preferred node IDs, in priority order'
+    ) as HTMLInputElement
+    fireEvent.change(input, { target: { value: '7, 0' } })
+    fireEvent.submit(input.closest('form')!)
+    await waitFor(() => expect(started).toBe(true))
+    if (editDuringSave) fireEvent.change(input, { target: { value: '8, 0' } })
+    finish()
+    await waitFor(() => expect(saved).toBe(true))
+    await act(async () => {
+      view.rerender(
+        card({
+          ...initial,
+          deployment_config: {
+            loadBalancing: {
+              strategy: 'preferred_nodes',
+              preferredNodeIds: [9, 0],
+            },
+          },
+        })
+      )
+    })
+    await waitFor(() =>
+      expect(input.value).toBe(editDuringSave ? '8, 0' : '9, 0')
+    )
+  })
+}

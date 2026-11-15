@@ -661,6 +661,7 @@ impl LoadBalancingConfig {
                 || p.len() > 2048
                 || p.chars().any(char::is_control)
                 || p.contains('#')
+                || p.contains('\\')
         }) {
             return Err(
                 "Active health-check path must be an origin-relative path of at most 2048 bytes"
@@ -674,6 +675,23 @@ impl LoadBalancingConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_health_paths_the_probe_url_builder_cannot_use() {
+        let mut policy = LoadBalancingConfig::default();
+        policy.health_check.enabled = true;
+        for path in [
+            "/health\\ready",
+            "//elsewhere/ready",
+            "/ready#fragment",
+            "relative",
+        ] {
+            policy.health_check.path = Some(path.into());
+            assert!(policy.validate().is_err(), "{path}");
+        }
+        policy.health_check.path = Some("/ready?full=true".into());
+        assert!(policy.validate().is_ok());
+    }
 
     #[test]
     fn routing_schema_bounds_match_validation() {

@@ -16,10 +16,10 @@ fn compose_probe_path<'a>(
     config: Option<&'a temps_entities::preset::PresetConfig>,
     target: Option<&(String, i32)>,
 ) -> Option<&'a str> {
-    let temps_entities::preset::PresetConfig::DockerCompose(config) = config? else {
-        return None;
-    };
     let (service, port) = target?;
+    let Some(temps_entities::preset::PresetConfig::DockerCompose(config)) = config else {
+        return Some("/");
+    };
     config
         .public_ports
         .iter()
@@ -32,10 +32,12 @@ fn compose_probe_path<'a>(
                 .find(|candidate| candidate.name == *service)
                 .and_then(|candidate| candidate.health_check_path.as_deref())
         })
+        .or(Some("/"))
 }
 
 /// Everything one rebuild accumulates while its phases run, in the order
 /// `load_routes` threads it through them.
+#[cfg_attr(test, derive(Default))]
 struct RouteLoadState {
     /// Settings read once per rebuild.
     app_settings: AppSettings,
@@ -2458,6 +2460,10 @@ impl CachedPeerTable {
             }
         }
 
+        // Private routes must carry policy too: workers cannot enforce it.
+        self.prepare_replica_policies(&mut routes, &mut http_routes_map, &mut tls_routes_map)
+            .await;
+
         // ADR 064 D5: a private address is served only by the private
         // listener of the worker recorded for it. Take it out of every map
         // this proxy serves from, and out of the wake path, so neither this
@@ -2519,9 +2525,6 @@ impl CachedPeerTable {
         if let Some(ingress_host) = ingress_host.as_ref() {
             unavailable.exact.remove(ingress_host);
         }
-
-        self.prepare_replica_policies(&mut routes, &mut http_routes_map, &mut tls_routes_map)
-            .await;
 
         // Build the wildcard index for legacy project/environment routes. A
         // concrete hostname resolved through a wildcard is deliberately not
@@ -2705,7 +2708,7 @@ mod tests {
             ("api", 9000, Some("/admin-ready")),
             ("api", 3001, Some("/detected-api")),
             ("worker", 4000, Some("/detected-worker")),
-            ("unknown", 8080, None),
+            ("unknown", 8080, Some("/")),
         ] {
             assert_eq!(
                 super::compose_probe_path(Some(&config), Some(&(service.into(), port))),
@@ -2883,6 +2886,39 @@ mod tests {
         ));
         drop(selection);
         assert_eq!(original.state.in_flight.load(Ordering::Relaxed), 0);
+        let mut raw_route = table.get_route("shop-production").unwrap();
+        if let crate::BackendType::Upstream { backends, .. } = &mut raw_route.backend {
+            for backend in backends {
+                backend.tier = 0;
+                backend.capacity = None;
+                backend.check_health = false;
+            }
+        }
+        let private_host = "private.example.com".to_string();
+        let state = super::RouteLoadState {
+            routes: std::collections::HashMap::from([(private_host.clone(), raw_route)]),
+            private_meta: std::collections::HashMap::from([(
+                private_host,
+                super::PrivateAddress {
+                    address_id: "custom:7".into(),
+                    range: Some("100.64.0.0/10".into()),
+                    node_id: Some(3),
+                    listener: Some("100.101.102.103".into()),
+                    via: Some("listener".into()),
+                    principals: None,
+                },
+            )]),
+            ..Default::default()
+        };
+        table
+            .route_snapshot
+            .store(table.assemble_snapshot(state).await?.snapshot);
+        let private = table.snapshot_worker_private_routes(3);
+        assert_eq!(private.len(), 1);
+        assert!(
+            !private[0].2,
+            "workers must not serve a private route requiring replica policy"
+        );
         test_db.cleanup().await?;
         Ok(())
     }

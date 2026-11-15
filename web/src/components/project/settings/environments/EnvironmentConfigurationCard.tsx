@@ -266,13 +266,16 @@ export function EnvironmentConfigurationCard({
   })
 
   const routingDirty = useRef({ policy: false, nodes: false })
+  const routingRevision = useRef({ policy: 0, nodes: 0 })
   const environmentId = useRef(environment.id)
   const { loadBalancing, preferredNodeIds } = formData
   const setLoadBalancing = (value: LoadBalancingConfig | null) => {
+    routingRevision.current.policy += 1
     routingDirty.current.policy = true
     setFormData((previous) => ({ ...previous, loadBalancing: value }))
   }
   const setPreferredNodeIds = (value: string) => {
+    routingRevision.current.nodes += 1
     routingDirty.current.nodes = true
     setFormData((previous) => ({ ...previous, preferredNodeIds: value }))
   }
@@ -383,7 +386,25 @@ export function EnvironmentConfigurationCard({
     meta: {
       errorTitle: 'Failed to update environment configuration',
     },
-    onSuccess: (updated) => {
+    onMutate: () => ({
+      environmentId: environmentId.current,
+      revision: { ...routingRevision.current },
+      healthDrafts: healthForm.getValues(),
+    }),
+    onSuccess: (updated, _variables, submitted) => {
+      if (submitted?.environmentId === environmentId.current) {
+        for (const field of ['policy', 'nodes'] as const) {
+          if (routingRevision.current[field] === submitted.revision[field]) {
+            routingDirty.current[field] = false
+          }
+        }
+        const current = healthForm.getValues()
+        for (const field of Object.keys(current) as Array<keyof HealthDrafts>) {
+          if (current[field] === submitted.healthDrafts[field]) {
+            healthForm.resetField(field, { defaultValue: current[field] })
+          }
+        }
+      }
       toast.success('Environment configuration updated successfully')
       if (updated.placement_warning) {
         toast.warning(updated.placement_warning)
