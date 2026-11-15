@@ -545,8 +545,11 @@ tildify() {
 
 success "temps was installed successfully to $Bold_Green$(tildify "$exe")"
 
+capabilities_url=https://temps.sh/docs/capabilities
+
 if command -v temps >/dev/null; then
     echo "Run 'temps --help' to get started"
+    info "What Temps supports (platforms, worker and builder nodes, upgrades, backups): $capabilities_url"
     exit
 fi
 
@@ -685,3 +688,6 @@ if [[ $refresh_command ]]; then
 fi
 
 info_bold "  temps --help"
+echo
+info "What Temps supports (platforms, worker and builder nodes, upgrades, backups):"
+info_bold "  $capabilities_url"
