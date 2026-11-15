@@ -493,6 +493,12 @@ fn start_external_service_health_monitor(
             service_context.require_service::<temps_core::EncryptionService>(),
         );
 
+        health_monitor = health_monitor.with_telemetry(
+            service_context
+                .get_service::<dyn temps_core::telemetry::TelemetryReporter>()
+                .unwrap_or_else(|| Arc::new(temps_core::telemetry::NoopTelemetryReporter)),
+        );
+
         // Attach the shared metrics store (registered by the MetricsScraper
         // block above) so the monitor records container CPU/memory history
         // for services with metrics enabled.

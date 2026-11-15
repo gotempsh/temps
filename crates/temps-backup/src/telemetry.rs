@@ -18,6 +18,31 @@ use std::time::Instant;
 use temps_core::telemetry::{TelemetryEvent, TelemetryEventKind};
 use temps_core::Job;
 
+/// Always subscribe, including when telemetry is disabled at startup. The reporter
+/// applies the current operator preference per event, so enabling it at runtime
+/// works without restarting the backup plugin.
+pub(crate) fn spawn_backup_telemetry(
+    queue: &dyn temps_core::JobQueue,
+    reporter: std::sync::Arc<dyn temps_core::telemetry::TelemetryReporter>,
+) -> tokio::task::JoinHandle<()> {
+    let mut receiver = queue.subscribe();
+    tokio::spawn(async move {
+        let mut telemetry = BackupTelemetry::new();
+        loop {
+            match receiver.recv().await {
+                Ok(job) => {
+                    if let Some(event) = telemetry.on_job(&job) {
+                        reporter.report(event);
+                    }
+                }
+                Err(temps_core::QueueError::ChannelClosed) => break,
+                // Queue lag affects only best-effort telemetry.
+                Err(_) => continue,
+            }
+        }
+    })
+}
+
 /// Upper bound on in-flight start times kept for duration measurement. Far
 /// above the executor's concurrency; when exceeded (e.g. completions were
 /// lost to queue lag) the map is cleared and those runs are reported without
@@ -81,15 +106,33 @@ impl BackupTelemetry {
 /// Engine keys are code-defined (`postgres_pgdump`, `redis`, ...). Anything
 /// that doesn't look like one is sent as `other` rather than verbatim.
 fn engine_label(engine: &str) -> String {
-    let well_formed = !engine.is_empty()
-        && engine.len() <= 32
-        && engine
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
-    if well_formed {
-        engine.to_string()
-    } else {
-        "other".to_string()
+    match engine {
+        "control_plane" | "postgres" | "mariadb" | "mongodb" | "redis" | "s3"
+        | "postgres_pgdump" | "postgres_walg" | "postgres_cluster" | "worker_agent"
+        | "s3_mirror" | "mariadb_dump" | "mariadb_physical" => engine.to_string(),
+        _ => "other".to_string(),
+    }
+}
+
+/// Outcome for legacy operations that do not publish executor lifecycle jobs.
+pub(crate) fn operation_outcome(
+    restore: bool,
+    engine: &str,
+    elapsed: std::time::Duration,
+    outcome: Result<(), String>,
+) -> TelemetryEvent {
+    let kind = match (restore, outcome.is_ok()) {
+        (false, true) => TelemetryEventKind::BackupSucceeded,
+        (false, false) => TelemetryEventKind::BackupFailed,
+        (true, true) => TelemetryEventKind::RestoreSucceeded,
+        (true, false) => TelemetryEventKind::RestoreFailed,
+    };
+    let event = TelemetryEvent::new(kind)
+        .with("engine", engine_label(engine))
+        .with_duration(elapsed);
+    match outcome {
+        Ok(()) => event,
+        Err(message) => event.with_failure_from_message(&message),
     }
 }
 
@@ -116,6 +159,112 @@ mod tests {
             backup_id: id,
             engine: "postgres_pgdump".to_string(),
         })
+    }
+
+    #[tokio::test]
+    async fn subscription_survives_runtime_opt_in() {
+        use std::sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc, Mutex,
+        };
+        use temps_core::telemetry::TelemetryReporter;
+        use temps_core::{JobQueue, JobReceiver, QueueError};
+        struct Receiver(tokio::sync::mpsc::Receiver<Job>);
+        #[async_trait::async_trait]
+        impl JobReceiver for Receiver {
+            async fn recv(&mut self) -> Result<Job, QueueError> {
+                self.0.recv().await.ok_or(QueueError::ChannelClosed)
+            }
+        }
+        struct Queue {
+            tx: tokio::sync::mpsc::Sender<Job>,
+            rx: Mutex<Option<tokio::sync::mpsc::Receiver<Job>>>,
+        }
+        #[async_trait::async_trait]
+        impl JobQueue for Queue {
+            async fn send(&self, job: Job) -> Result<(), QueueError> {
+                self.tx
+                    .send(job)
+                    .await
+                    .map_err(|_| QueueError::ChannelClosed)
+            }
+            fn subscribe(&self) -> Box<dyn JobReceiver> {
+                Box::new(Receiver(self.rx.lock().unwrap().take().unwrap()))
+            }
+        }
+        #[derive(Default)]
+        struct Reporter {
+            enabled: AtomicBool,
+            attempts: AtomicUsize,
+            events: Mutex<Vec<TelemetryEvent>>,
+        }
+        impl TelemetryReporter for Reporter {
+            fn is_enabled(&self) -> bool {
+                self.enabled.load(Ordering::SeqCst)
+            }
+            fn report(&self, event: TelemetryEvent) {
+                if self.is_enabled() {
+                    self.events.lock().unwrap().push(event);
+                }
+                self.attempts.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let queue = Queue {
+            tx,
+            rx: Mutex::new(Some(rx)),
+        };
+        let reporter = Arc::new(Reporter::default());
+        let task = spawn_backup_telemetry(&queue, reporter.clone());
+        let completed = |id| {
+            Job::BackupCompleted(BackupCompletedJob {
+                backup_id: id,
+                engine: "redis".into(),
+                s3_location: "s3://sample/backup".into(),
+                size_bytes: None,
+            })
+        };
+        queue.send(completed(1)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while reporter.attempts.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(reporter.events.lock().unwrap().is_empty());
+        reporter.enabled.store(true, Ordering::SeqCst);
+        queue.send(completed(2)).await.unwrap();
+        drop(queue);
+        task.await.unwrap();
+        let events = reporter.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "backup_succeeded");
+    }
+
+    #[test]
+    fn legacy_operation_outcomes_are_anonymous_and_cover_each_result() {
+        for (restore, success, expected) in [
+            (false, true, "backup_succeeded"),
+            (false, false, "backup_failed"),
+            (true, true, "restore_succeeded"),
+            (true, false, "restore_failed"),
+        ] {
+            let event = operation_outcome(
+                restore,
+                "private_engine",
+                Duration::from_secs(90),
+                if success {
+                    Ok(())
+                } else {
+                    Err("upload to private.example failed: AccessDenied".into())
+                },
+            );
+            assert_eq!(event.event_type, expected);
+            assert_eq!(event.properties["engine"], "other");
+            assert_eq!(event.properties["duration_bucket"], "1-5m");
+            assert!(!serde_json::to_string(&event).unwrap().contains("private"));
+        }
     }
 
     #[test]
