@@ -806,12 +806,23 @@ async fn test_create_redis_service() {
     let result = manager.create_service(request).await;
 
     let service = result.expect("Failed to create Redis service");
+    let stored = external_services::Entity::find_by_id(service.id)
+        .one(manager.db.as_ref())
+        .await;
+    // Cleanup before regression assertions, including when the stored row is wrong.
+    let cleanup = manager.delete_service(service.id).await;
+    assert!(
+        cleanup.is_ok(),
+        "failed to clean up the created service: {cleanup:?}"
+    );
+    let stored = stored.unwrap().unwrap();
+    assert!(
+        stored.default_backup_provisioned,
+        "new services must not be enrolled by the legacy automatic backup reconciler"
+    );
     assert_eq!(service.name, service_name);
     assert_eq!(service.service_type, ServiceType::Redis);
     assert_eq!(service.status, "running");
-
-    // Cleanup
-    let _ = manager.delete_service(service.id).await;
 }
 
 #[cfg(feature = "docker-tests")]
