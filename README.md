@@ -236,6 +236,7 @@ For an agent that runs unattended, open **Connect your coding agent** in the con
 
 Everything else is in the docs at **[temps.sh/docs](https://temps.sh/docs?utm_source=github&utm_medium=repo&utm_content=docs_en)**:
 
+- [What Temps supports](https://temps.sh/docs/capabilities) — platforms and CPU architectures, worker and builder nodes, upgrades, backups
 - [Your first deployment](https://temps.sh/docs/your-first-deployment)
 - [Import from another platform](https://temps.sh/docs/import-existing-platform)
 - [SDKs](https://temps.sh/docs/sdks) — analytics, error tracking, KV and blob storage

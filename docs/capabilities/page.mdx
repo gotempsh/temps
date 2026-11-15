@@ -1,0 +1,152 @@
+export const metadata = {
+  title: 'What Temps Supports',
+  description:
+    'What a self-hosted Temps installation can do, on one page: operating systems and CPU architectures, single-node and multi-node setups, builder nodes, monorepo deploys, upgrades, backups and observability.',
+  alternates: {
+    canonical: '/docs/capabilities',
+  },
+}
+
+export const sections = [
+  { title: 'Where Temps runs', id: 'platforms' },
+  { title: 'Ways to install', id: 'install-methods' },
+  { title: 'Server layouts', id: 'topologies' },
+  { title: 'What you can deploy', id: 'deploy-sources' },
+  { title: 'Monorepos and subdirectories', id: 'monorepos' },
+  { title: 'Managed services', id: 'managed-services' },
+  { title: 'Upgrades', id: 'upgrades' },
+  { title: 'Backups and restores', id: 'backups' },
+  { title: 'Observability', id: 'observability' },
+  { title: 'Not supported', id: 'not-supported' },
+]
+
+# What Temps Supports
+
+Everything a self-hosted Temps installation can do, on one page, with a link to the full guide for each. Labels such as **Beta** follow [feature maturity](/docs/feature-maturity); a row without a label is Stable. {{ className: 'lead' }}
+
+---
+
+## Where Temps runs {{ anchor: true, id: 'platforms' }}
+
+Releases on [GitHub Releases](https://github.com/gotempsh/temps/releases) publish one archive per platform, each with a SHA-256 checksum.
+
+| Platform | Release archive | Notes |
+| --- | --- | --- |
+| Linux x86_64 (amd64) | `temps-linux-amd64.tar.gz` | glibc 2.35 or newer (Ubuntu 22.04+, Debian 12+) |
+| Linux ARM64 (aarch64) | `temps-linux-arm64.tar.gz` | Same glibc floor. Runs on kernels with 4K, 16K or 64K memory pages |
+| macOS Intel | `temps-darwin-amd64.tar.gz` | |
+| macOS Apple Silicon | `temps-darwin-arm64.tar.gz` | |
+| Container image | `ghcr.io/gotempsh/temps` | Multi-arch: `linux/amd64` and `linux/arm64`. Tags `latest` (stable), `beta`, `nightly`, and one per version |
+
+- **ARM64 Linux runs the full server**, not only a worker. Current beta and nightly releases ship `temps-linux-arm64.tar.gz`; older releases may not. If the newest stable release has none, the install script stops and says so: install with `--channel beta` or pin a version.
+- **Linux archives also carry the sandbox guest agents** (`temps-vm-agent` for Firecracker and `temps-pty-agent` for sandbox terminals). macOS archives do not.
+- **Distributions with an older glibc** (RHEL 8/9, Amazon Linux 2 and 2023) cannot run the release binaries; [build from source](/docs/installation#build-from-source) there.
+- **Docker is required on the server** in the default `full` profile, which builds images and runs workloads locally. A [control plane started with `--profile control-plane`](/docs/multi-node#control-plane-profile) needs no Docker daemon and runs workloads on worker nodes instead.
+
+Hardware sizing, ports and the database setup are in [Installation](/docs/installation#system-requirements).
+
+---
+
+## Ways to install {{ anchor: true, id: 'install-methods' }}
+
+| Method | What it does |
+| --- | --- |
+| `curl -fsSL https://temps.sh/deploy.sh \| bash` | Provisioning wizard: Docker, database, domain and TLS, the binary and a background service. See [Quickstart](/docs/quickstart) |
+| `install.sh` | Installs the binary into `~/.temps/bin` without provisioning anything else, picking the archive for your OS and CPU. Channels: `stable` (default), `beta`, `nightly`, or a pinned version |
+| Homebrew | A `temps.rb` formula is attached to every release |
+| Manual download | Download and verify an archive yourself; releases also carry cosign signatures and an SBOM. See [Verify release downloads](/docs/installation#verify-release-downloads) |
+| Docker Compose | `docker-compose.release.yml` pulls the published server image |
+| From source | `cargo build --release --bin temps` |
+
+All methods are described in [Installation](/docs/installation).
+
+---
+
+## Server layouts {{ anchor: true, id: 'topologies' }}
+
+| Layout | What it is | Guide |
+| --- | --- | --- |
+| **Single node** (default) | One server runs the console, API, proxy, builds, applications, managed services and backups. | [Installation](/docs/installation) |
+| **Worker nodes** (Beta) | Add servers with `temps join`; the control plane places containers on them (least-loaded plus anti-affinity). Join over a private network or a WireGuard mesh across the internet. | [Multi-node](/docs/multi-node) |
+| **Builder nodes** (Beta) | A node joined with `--labels temps.sh/role=builder` builds images but never hosts replicas, keeping build CPU and memory away from the proxy and running apps. Pick where each project or environment builds: control plane or worker node. | [Building from source](/docs/multi-node#control-plane-builds) |
+| **Dedicated nodes** (Beta) | A node joined with `--labels temps.sh/role=dedicated` runs only the environments that pin it, for GPU hosts or isolated machines. | [Dedicated nodes](/docs/multi-node#dedicated-nodes) |
+| **Control plane without workloads** (Beta) | `temps serve --profile control-plane` keeps the console, API, proxy and observability, runs no containers and needs no Docker daemon. | [Control-plane profile](/docs/multi-node#control-plane-profile) |
+| **Mixed architectures** (Beta) | amd64 and arm64 nodes in one cluster. A deployment that spans both builds one image per architecture, natively, on a node of each. | [Mixed architectures](/docs/multi-node#mixed-architectures) |
+
+Known limits of multi-node (no bin-packing, which sandbox features run on workers, how draining works) are listed under [Current limitations](/docs/multi-node#limitations).
+
+---
+
+## What you can deploy {{ anchor: true, id: 'deploy-sources' }}
+
+- **Git repositories** from GitHub, GitLab, Bitbucket Cloud, Gitea (and Forgejo/Codeberg) or any HTTPS-cloneable Git server. See [Quickstart](/docs/quickstart).
+- **Auto-detected builds** for 20+ languages and framework presets, **your own Dockerfile**, **pre-built images** from any OCI registry, and **static files**. See [Supported languages, frameworks and build methods](/docs/supported-platforms).
+- **Local files**: a folder, an HTML file or a ZIP archive, without a Git account. See [Deploy from local files](/docs/deploy-from-local-files).
+- **Preview deployments** per pull request. See [Preview deployments](/docs/set-up-preview-deployments).
+- **Rollbacks** to an earlier deployment. See [Rollbacks](/docs/rollbacks).
+
+---
+
+## Monorepos and subdirectories {{ anchor: true, id: 'monorepos' }}
+
+- **Deploy one directory of a repository**: set the project's **Root Directory** (for example `apps/web`). Detection and builds run from that directory, and each project in the same repository deploys independently.
+- **Fetch only that directory**: turn on **Pull only the root directory** in the project's Git settings, and the deployment sparse-checks out just that path. Leave it off when the build needs files elsewhere in the tree (workspace lockfiles, shared packages).
+- **Monorepo tooling** is detected: Turborepo, Nx, Lerna, pnpm workspaces, plus Go, Cargo and Elixir umbrella workspaces.
+
+See [Deploy monorepos](/docs/monorepos) and [Import services from a monorepo](/docs/import-services-from-a-monorepo).
+
+---
+
+## Managed services {{ anchor: true, id: 'managed-services' }}
+
+PostgreSQL, MariaDB, Redis and S3-compatible object storage, provisioned on your own servers and linked to projects. See [Managed services](/docs/managed-services).
+
+---
+
+## Upgrades {{ anchor: true, id: 'upgrades' }}
+
+- **`temps upgrade`** downloads the release for your platform, verifies its checksum and replaces the binary. Use `--channel beta`, `--version <tag>` or `--check`.
+- **From the console**: **Update now** downloads the new binary, runs the migrations and restarts. Start the server with `--disable-self-update` to turn this off.
+- **Database migrations** run when `temps serve` starts, or explicitly with `temps migrate`. With `--pre-migration-backup`, Temps backs up its database first.
+- **Rolling back** needs the previous binary and the database as it was before the upgrade.
+
+See [Upgrading Temps](/docs/upgrade).
+
+---
+
+## Backups and restores {{ anchor: true, id: 'backups' }}
+
+- **Scheduled and on-demand backups** to any S3-compatible bucket (AWS S3, MinIO, DigitalOcean Spaces, ...), with retention per schedule.
+- **Managed services** are backed up with each engine's own tooling, with point-in-time recovery for PostgreSQL when WAL archiving is enabled.
+- **Temps itself**: a control-plane backup holds its database and the keys needed to rebuild the instance on a new host.
+- **Restore** a service in place or into a new service, from the console or the CLI.
+- **Rebuild a whole instance** on a replacement host from an S3 recovery set.
+
+Files written inside application containers are not backed up. See [Backups](/docs/backups) and [Restore a Temps instance from S3](/docs/restore-instance-from-s3).
+
+---
+
+## Observability {{ anchor: true, id: 'observability' }}
+
+Built in, stored on your own servers, no third-party service required.
+
+| Capability | Guide |
+| --- | --- |
+| Application, build and deployment logs | [Logs](/docs/logs) |
+| Uptime checks, health checks, cron monitoring, container and server resource usage | [Monitoring](/docs/monitoring) |
+| Web analytics, custom events, funnels, Core Web Vitals (Beta) | [Analytics](/docs/analytics) |
+| Session replay (Beta) | [Session replay](/docs/session-replay) |
+| Error tracking with official Sentry SDKs (Beta) | [Error tracking](/docs/error-tracking) |
+| OpenTelemetry ingest over OTLP/HTTP: traces, metrics and logs (Beta) | [OpenTelemetry](/docs/opentelemetry) |
+| Public status pages (Beta) | [Status pages](/docs/status-pages) |
+| Export the Temps server's own traces to your collector | [Export server traces](/docs/export-server-traces) |
+
+---
+
+## Not supported {{ anchor: true, id: 'not-supported' }}
+
+- **Windows as a server**: there is no Windows build, and the install script refuses to run there. Use WSL2.
+- **Linux distributions older than glibc 2.35** with the release binaries; build from source instead.
+- **A highly available control plane**: there is one control plane, and losing its host interrupts public ingress even when workloads on worker nodes keep running.
+
+Missing something? Search the [issue tracker](https://github.com/gotempsh/temps/issues) or open a new issue.
