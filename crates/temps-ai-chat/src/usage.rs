@@ -369,12 +369,19 @@ mod tests {
     #[tokio::test]
     async fn a_free_model_is_priced_and_an_unknown_one_is_not_on_a_real_database() {
         use sea_orm::ConnectionTrait;
+        // Skip only when no container runtime can be reached; a failed
+        // migration or schema check fails the test.
         let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
-            Err(error) => {
-                println!("PostgreSQL test database unavailable, skipping: {error}");
+            Err(error)
+                if temps_test_utils::is_container_runtime_unavailable(&format!("{error:#}")) =>
+            {
+                println!(
+                    "Skipping: no container runtime for the PostgreSQL test database: {error:#}"
+                );
                 return;
             }
+            Err(error) => panic!("test database setup failed: {error:#}"),
         };
         let db = test_db.connection_arc();
         // (cost, price_known, is_byok): a free model, a self-hosted model, a

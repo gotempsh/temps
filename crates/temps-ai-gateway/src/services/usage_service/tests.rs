@@ -1126,12 +1126,15 @@ async fn a_logged_batch_total_is_priced_at_the_base_rate() {
 #[tokio::test]
 async fn the_summary_tells_free_requests_from_unpriced_ones_on_a_real_database() {
     use sea_orm::ConnectionTrait;
+    // Skip only when no container runtime can be reached; a failed
+    // migration or schema check fails the test.
     let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
         Ok(db) => db,
-        Err(error) => {
-            println!("PostgreSQL test database unavailable, skipping: {error}");
+        Err(error) if temps_test_utils::is_container_runtime_unavailable(&format!("{error:#}")) => {
+            println!("Skipping: no container runtime for the PostgreSQL test database: {error:#}");
             return;
         }
+        Err(error) => panic!("test database setup failed: {error:#}"),
     };
     let db = test_db.connection_arc();
     // (cost, price_known, input tokens): a free model, a self-hosted
