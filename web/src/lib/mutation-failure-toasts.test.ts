@@ -15,10 +15,6 @@ import { join } from 'node:path'
 //
 // Entries are `file -> mutation variables`, relative to `web/src`.
 const GUARDED: Record<string, string[]> = {
-  'components/ai-first/ApplicationDataServicesPanel.tsx': [
-    'linkMutation',
-    'unlinkMutation',
-  ],
   'components/observe/CloudTelemetryActivationSection.tsx': [
     'estimateMutation',
     'createMutation',
@@ -93,7 +89,7 @@ const GUARDED: Record<string, string[]> = {
 const UPDATE_SETTINGS_CALLERS: Record<string, string[]> = {
   'components/settings/AiChatLimitsCard.tsx': ['updateSettings'],
   'pages/Settings.tsx': ['updateSettings'],
-  'pages/agent-sandbox/AgentSandboxSandboxPage.tsx': ['updateSettings'],
+  'pages/sandbox-settings/SandboxRuntimeSettings.tsx': ['updateSettings'],
   'pages/settings/BuildLimitsPage.tsx': ['updateSettings'],
   'pages/settings/DiskMonitoringPage.tsx': ['updateSettings'],
   'pages/settings/DockerRegistryPage.tsx': ['updateSettings'],

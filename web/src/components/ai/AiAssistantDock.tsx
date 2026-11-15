@@ -33,7 +33,6 @@ import { AiSettingsMenu } from './AiSettingsMenu'
 import { ChatProjectMediaProvider } from './ChatProjectMedia'
 import { chatProjectQueryOptions } from './chat-project-media'
 import { useChatProjectMedia } from './chat-project-media-context'
-import { ConversationSandboxChip } from './ConversationSandboxChip'
 import { ChatRunBadge, ChatRunMark } from './ChatRunBadge'
 import {
   Tooltip,
@@ -100,6 +99,7 @@ import { AssistantHeaderSlot } from './assistant-header-slot'
 /** Where "Back to console" lands. */
 const CONSOLE_HOME_PATH = '/projects'
 import { toast } from 'sonner'
+import { FeatureMaturityBadge } from '@/components/feature-maturity/FeatureMaturityBadge'
 import { AiChatContext, useAiAssistant } from './AiAssistantContext'
 import { AiAssistantGate } from './AiAssistantGate'
 import {
@@ -134,7 +134,7 @@ import {
   AssistantThread,
   type NewChatWorkspaceChoice,
 } from './AssistantPanels'
-import { groupChatsByWorkspace } from './conversation-groups'
+import { filterChats, groupChatsByDate } from './conversation-groups'
 import {
   isChatListShortcut,
   isSwitcherShortcut,
@@ -1180,8 +1180,8 @@ export function DockBody({
             className="h-8 gap-1"
             title="Ask Temps to inspect or change something"
           >
-            <Sparkles className="h-4 w-4" />
-            New
+            <Plus className="h-4 w-4" />
+            New chat
           </Button>
         </div>
       </div>
@@ -1295,6 +1295,7 @@ export function DockBody({
                   headerTitle
                 )}
               </h2>
+              {isPage && <FeatureMaturityBadge featureKey="ai-chat" />}
             </div>
             {inAssistant ? (
               <p className={cn(subtitleClass, 'text-sm text-muted-foreground')}>
@@ -1350,13 +1351,10 @@ export function DockBody({
               </Button>
             )}
             {isPage && (
-              <Button asChild size="icon" variant="ghost" className="size-8">
-                <Link
-                  to={CONSOLE_HOME_PATH}
-                  title="Back to console"
-                  aria-label="Back to console"
-                >
+              <Button asChild size="sm" variant="ghost" className="h-8 gap-1">
+                <Link to={CONSOLE_HOME_PATH} title="Back to console">
                   <LayoutDashboard className="size-4" />
+                  <span className="max-sm:sr-only">Console</span>
                 </Link>
               </Button>
             )}
@@ -1420,7 +1418,22 @@ export function DockBody({
                 <Maximize2 className="h-4 w-4" />
               </button>
             )}
-            {inAssistant && (
+            {inAssistant && isPage && (
+              // The full-page view has room for a label; an icon-only "+"
+              // next to the labelled "Console" button read as decoration.
+              <Button
+                type="button"
+                size="sm"
+                variant="ghost"
+                className="h-8 gap-1"
+                onClick={startAssistant}
+                title="New assistant chat"
+              >
+                <Plus className="size-4" />
+                <span className="max-sm:sr-only">New chat</span>
+              </Button>
+            )}
+            {inAssistant && !isPage && (
               <button
                 type="button"
                 onClick={startAssistant}
@@ -1792,11 +1805,17 @@ function ConversationList({
   /** Starts a new chat that joins the given workspace. */
   onNewChatIn: (workspace: NewChatWorkspaceChoice) => void
 }) {
+  const [query, setQuery] = useState('')
+  const shown = useMemo(
+    () => filterChats(conversations, query),
+    [conversations, query]
+  )
+  const groups = useMemo(() => groupChatsByDate(shown), [shown])
   if (loading) {
     return (
       <div className="space-y-2">
         {Array.from({ length: 4 }).map((_, i) => (
-          <Skeleton key={i} className="h-14 w-full" />
+          <Skeleton key={i} className="h-12 w-full" />
         ))}
       </div>
     )
@@ -1807,46 +1826,69 @@ function ConversationList({
         <MessageSquare className="h-7 w-7 text-muted-foreground" />
         <p className="text-sm font-medium">No AI conversations yet</p>
         <p className="max-w-xs text-sm text-muted-foreground">
-          Click “Ask Temps” to manage your setup by chat, “New chat” to start
-          one for a project, or open a failed deployment / firing alert and
-          choose “Debug with AI”.
+          Start a chat with “New chat”, or open a failed deployment or a firing
+          alert and choose “Debug with AI”.
         </p>
       </div>
     )
   }
-  const rowProps = { activeId, onOpen, onOpenSource, onRename, onDelete }
+  const rowProps = {
+    activeId,
+    onOpen,
+    onOpenSource,
+    onRename,
+    onDelete,
+    onNewChatIn,
+  }
   return (
-    <div className="h-full space-y-1 overflow-y-auto pr-1">
-      {groupChatsByWorkspace(conversations).map((entry) =>
-        entry.kind === 'chat' ? (
-          <ConversationRow
-            key={entry.chat.public_id}
-            c={entry.chat}
-            {...rowProps}
-          />
-        ) : (
-          <WorkspaceChatGroup
-            key={entry.workspace.public_id}
-            workspace={entry.workspace}
-            chats={entry.chats}
-            onNewChat={() => onNewChatIn(entry.workspace)}
-            {...rowProps}
-          />
-        )
-      )}
-      {hasMore && (
-        <Button
-          type="button"
-          variant="ghost"
-          size="sm"
-          className="w-full text-muted-foreground"
-          onClick={onLoadMore}
-          disabled={loadingMore}
-        >
-          {loadingMore && <Loader2 className="size-4 animate-spin" />}
-          Load older chats
-        </Button>
-      )}
+    <div className="flex h-full min-h-0 flex-col gap-2">
+      <div className="relative shrink-0">
+        <Search
+          className="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground"
+          aria-hidden
+        />
+        <Input
+          type="search"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          placeholder="Search chats"
+          aria-label="Search chats"
+          className="h-8 pl-8 text-sm"
+        />
+      </div>
+      <div className="min-h-0 flex-1 space-y-4 overflow-y-auto pr-1">
+        {groups.map((group) => (
+          <section key={group.bucket} aria-label={group.label}>
+            <h3 className="px-2 pb-1 text-xs font-medium text-muted-foreground">
+              {group.label}
+            </h3>
+            <div className="space-y-0.5">
+              {group.chats.map((c) => (
+                <ConversationRow key={c.public_id} c={c} {...rowProps} />
+              ))}
+            </div>
+          </section>
+        ))}
+        {query.trim() && shown.length === 0 && (
+          <p className="px-2 text-sm text-muted-foreground">
+            No loaded chat matches “{query.trim()}”.
+            {hasMore && ' Load older chats to search further back.'}
+          </p>
+        )}
+        {hasMore && (
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            className="w-full text-muted-foreground"
+            onClick={onLoadMore}
+            disabled={loadingMore}
+          >
+            {loadingMore && <Loader2 className="size-4 animate-spin" />}
+            Load older chats
+          </Button>
+        )}
+      </div>
     </div>
   )
 }
@@ -1857,59 +1899,7 @@ type ConversationRowActions = {
   onOpenSource: (c: ProjectConversation) => void
   onRename: (c: ProjectConversation) => void
   onDelete: (c: ProjectConversation) => void
-}
-
-/**
- * The chats of one workspace together under its name, so the chats that share
- * an application's blueprint and sandbox read as one piece of work, with a
- * visible way to add another chat to it.
- */
-function WorkspaceChatGroup({
-  workspace,
-  chats,
-  onNewChat,
-  ...rowProps
-}: ConversationRowActions & {
-  workspace: NewChatWorkspaceChoice
-  chats: ProjectConversation[]
-  onNewChat: () => void
-}) {
-  return (
-    <section
-      aria-label={`Chats in ${workspace.name}`}
-      className="rounded-md border bg-muted/30 py-1"
-    >
-      <div className="flex items-center gap-1.5 py-1 pl-3 pr-1 text-xs text-muted-foreground">
-        <Boxes className="size-3.5 shrink-0" aria-hidden />
-        <span
-          className="min-w-0 truncate font-medium text-foreground"
-          title={`Chats in the application ${workspace.name} share its blueprint and sandbox`}
-        >
-          {workspace.name}
-        </span>
-        <span className="shrink-0">
-          · {chats.length} {chats.length === 1 ? 'chat' : 'chats'}
-        </span>
-        <Button
-          type="button"
-          variant="ghost"
-          size="sm"
-          onClick={onNewChat}
-          className="ml-auto h-7 shrink-0 gap-1 px-2 text-xs"
-          title={`Start another chat in ${workspace.name}`}
-          aria-label={`New chat in ${workspace.name}`}
-        >
-          <Plus className="size-3.5" />
-          <span>Chat</span>
-        </Button>
-      </div>
-      <div className="space-y-0.5 px-1">
-        {chats.map((c) => (
-          <ConversationRow key={c.public_id} c={c} inWorkspace {...rowProps} />
-        ))}
-      </div>
-    </section>
-  )
+  onNewChatIn: (workspace: NewChatWorkspaceChoice) => void
 }
 
 /**
@@ -2034,18 +2024,22 @@ function RailAction({
   )
 }
 
+/**
+ * One chat in the list. Every row has the same shape whatever the chat is
+ * about: the title, then where it belongs (project or workspace) and when it
+ * last moved. A status appears only while a chat works or after it failed, so
+ * the rows that need a look are the ones that stand out.
+ */
 function ConversationRow({
   c,
-  inWorkspace = false,
   activeId,
   onOpen,
   onOpenSource,
   onRename,
   onDelete,
+  onNewChatIn,
 }: ConversationRowActions & {
   c: ProjectConversation
-  /** Shown under its workspace's name, so the row does not repeat it. */
-  inWorkspace?: boolean
 }) {
   const { label } = metaFor(c.context_type)
   const hasSource = !!sourceHref({
@@ -2053,104 +2047,103 @@ function ConversationRow({
     contextId: c.context_id,
     projectSlug: c.project_slug ?? undefined,
   })
+  const place = c.project_name ?? c.workspace?.name ?? null
   return (
     <div
       className={cn(
-        'group relative flex items-center gap-2 rounded-md border border-transparent transition-colors hover:border-border hover:bg-accent',
-        c.public_id === activeId && 'border-border bg-muted'
+        'group relative flex items-center rounded-md transition-colors hover:bg-accent',
+        c.public_id === activeId && 'bg-muted'
       )}
     >
       <button
         type="button"
         onClick={() => onOpen(c)}
-        className="flex min-w-0 flex-1 items-center gap-3 px-2 py-2.5 text-left"
+        aria-current={c.public_id === activeId ? 'page' : undefined}
+        className="flex min-w-0 flex-1 items-center gap-2.5 px-2 py-2 text-left"
       >
         <ContextAvatar
           projectId={c.project_id}
           projectName={c.project_name ?? undefined}
           contextType={c.context_type}
           seed={c.public_id}
+          className="size-7"
         />
         <div className="min-w-0 flex-1">
           <div className="truncate text-sm font-medium">
             {c.title ?? `${label} ${c.context_id}`}
           </div>
-          {/* The project (name; its logo is the avatar), the sandbox the
-              chat is linked to, and the time. A context label such as
-              "Assistant" said nothing the avatar did not. */}
-          <div className="flex min-w-0 items-center gap-2 text-xs text-muted-foreground">
-            {c.project_name && (
-              <span className="min-w-0 flex-1 truncate">{c.project_name}</span>
-            )}
-            {c.workspace && !inWorkspace && (
-              <span
-                className="flex min-w-0 flex-1 items-center gap-1"
-                title={`Part of the application ${c.workspace.name}`}
-              >
-                <Boxes className="size-3 shrink-0" aria-hidden />
-                <span className="truncate">{c.workspace.name}</span>
+          <div className="flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
+            {place && (
+              <span className="flex min-w-0 items-center gap-1 truncate">
+                {!c.project_name && c.workspace && (
+                  <Boxes className="size-3 shrink-0" aria-hidden />
+                )}
+                <span className="truncate">{place}</span>
               </span>
             )}
-            {c.sandbox && (
-              <ConversationSandboxChip
-                name={c.sandbox.name}
-                backend={c.sandbox.backend}
-              />
-            )}
+            {place && <span aria-hidden>·</span>}
+            <span className="shrink-0">
+              <TimeAgo date={c.last_activity_at} />
+            </span>
             <ChatRunBadge
               turnStatus={c.turn_status}
               failureTitle={c.failure?.title}
+              attentionOnly
             />
-            <span
-              className={cn(
-                'min-w-0 truncate',
-                c.project_name || (c.workspace && !inWorkspace)
-                  ? 'shrink'
-                  : 'flex-1'
-              )}
-            >
-              <TimeAgo date={c.last_activity_at} />
-            </span>
           </div>
         </div>
       </button>
-      {/* Overlaid rather than laid out inline: as flex siblings these
-          three buttons reserved ~90px of a 320px row permanently, so
-          titles truncated to "Checkout latency …" even though they were
-          invisible until hover. Absolute positioning gives the text the
-          full row and fades the actions in over it. */}
+      {/* Overlaid rather than laid out inline, so titles get the full row
+          width and the actions fade in over it on hover or focus. */}
       <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center gap-0.5 rounded-r-md bg-gradient-to-l from-accent via-accent to-transparent pl-8 pr-1 opacity-0 transition-opacity focus-within:pointer-events-auto focus-within:opacity-100 group-hover:pointer-events-auto group-hover:opacity-100">
-        {hasSource && (
-          <button
-            type="button"
-            onClick={() => onOpenSource(c)}
-            className="shrink-0 rounded-md p-1.5 text-muted-foreground hover:bg-background hover:text-foreground"
-            title="Go to source"
-            aria-label="Go to source"
+        {c.workspace && (
+          <RowAction
+            label={`New chat in ${c.workspace.name}`}
+            onClick={() => onNewChatIn(c.workspace!)}
           >
-            <ExternalLink className="h-3.5 w-3.5" />
-          </button>
+            <Plus className="h-3.5 w-3.5" />
+          </RowAction>
         )}
-        <button
-          type="button"
-          onClick={() => onRename(c)}
-          className="shrink-0 rounded-md p-1.5 text-muted-foreground hover:bg-background hover:text-foreground"
-          title="Rename chat"
-          aria-label="Rename chat"
-        >
+        {hasSource && (
+          <RowAction label="Go to source" onClick={() => onOpenSource(c)}>
+            <ExternalLink className="h-3.5 w-3.5" />
+          </RowAction>
+        )}
+        <RowAction label="Rename chat" onClick={() => onRename(c)}>
           <Pencil className="h-3.5 w-3.5" />
-        </button>
-        <button
-          type="button"
-          onClick={() => onDelete(c)}
-          className="shrink-0 rounded-md p-1.5 text-muted-foreground hover:bg-background hover:text-destructive"
-          title="Delete chat"
-          aria-label="Delete chat"
-        >
+        </RowAction>
+        <RowAction label="Delete chat" onClick={() => onDelete(c)} destructive>
           <Trash2 className="h-3.5 w-3.5" />
-        </button>
+        </RowAction>
       </div>
     </div>
+  )
+}
+
+function RowAction({
+  label,
+  onClick,
+  destructive = false,
+  children,
+}: {
+  label: string
+  onClick: () => void
+  destructive?: boolean
+  children: ReactNode
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={cn(
+        'shrink-0 rounded-md p-1.5 text-muted-foreground hover:bg-background',
+        destructive ? 'hover:text-destructive' : 'hover:text-foreground'
+      )}
+      title={label}
+      aria-label={label}
+    >
+      {children}
+    </button>
   )
 }
 

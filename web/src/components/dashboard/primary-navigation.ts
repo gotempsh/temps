@@ -18,7 +18,6 @@ import {
   Puzzle,
   ScrollText,
   ShieldAlert,
-  Sparkles,
   type LucideIcon,
 } from 'lucide-react'
 
@@ -77,15 +76,6 @@ export const primaryPlatformGroups: PlatformNavGroup[] = [
   {
     label: 'Applications',
     items: [
-      // Experimental: the badge and page header carry the maturity promise
-      // (see `featureKeyForPath`), so the entry stays discoverable without
-      // presenting a prototype as a finished product.
-      {
-        title: 'AI workspace',
-        url: '/ai-first',
-        icon: Sparkles,
-        featureKey: 'ai-chat',
-      },
       {
         title: 'Projects',
         url: '/projects',

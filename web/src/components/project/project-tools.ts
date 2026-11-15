@@ -24,7 +24,6 @@ import {
   Users,
   Wand2,
   Webhook,
-  Workflow,
   Zap,
   type LucideIcon,
 } from 'lucide-react'
@@ -144,16 +143,8 @@ export const projectToolGroups: ProjectToolGroup[] = [
   },
   {
     label: 'Configure',
-    description: 'Connect runtime features and automate service workflows.',
-    items: [
-      { title: 'Feature Flags', url: 'flags', icon: Flag },
-      {
-        title: 'Workflows',
-        url: 'agents',
-        icon: Workflow,
-        featureKey: 'ai-agents-workflows',
-      },
-    ],
+    description: 'Connect runtime features to this service.',
+    items: [{ title: 'Feature Flags', url: 'flags', icon: Flag }],
   },
   {
     label: 'Service settings',
@@ -170,8 +161,6 @@ export const projectToolGroups: ProjectToolGroup[] = [
       { title: 'Access', url: 'settings/access', icon: Users },
       { title: 'Cron Jobs', url: 'settings/cron-jobs', icon: Clock },
       { title: 'Webhooks', url: 'settings/webhooks', icon: Webhook },
-      { title: 'Skills', url: 'settings/skills', icon: Wand2 },
-      { title: 'MCP Servers', url: 'settings/mcp-servers', icon: Server },
       {
         title: 'Alert Rules',
         url: 'errors/alert-rules',

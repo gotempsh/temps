@@ -7,7 +7,6 @@ import { join } from 'node:path'
 import { matchRoutes, type RouteObject } from 'react-router'
 import ts from 'typescript'
 
-import { autopilotPaths } from '@/components/agents/AutopilotPage'
 import {
   projectNavItems,
   projectNavItemsFor,
@@ -451,21 +450,19 @@ describe('legacy routes', () => {
   })
 })
 
-describe('autopilot links', () => {
-  test('land on the agent routes', () => {
-    const paths = autopilotPaths('demo')
-    const prefix = '/projects/demo/'
-    for (const [url, pattern] of [
-      [paths.agent('nightly'), 'agents/detail/:agentSlug'],
-      [paths.editAgent('nightly'), 'agents/detail/:agentSlug/edit'],
-      [paths.run(42), 'agents/:runId'],
+describe('agent run links', () => {
+  test('autofix runs still open at agents/:runId', () => {
+    const match = matchRoutes(PROJECT_ROUTES.hosted, '/agents/42')
+    expect((match ?? []).slice(-1)[0]?.route.path).toBe('agents/:runId')
+  })
+
+  test('retired workflow definition pages land on the redirect', () => {
+    for (const url of [
+      '/agents/detail/nightly',
+      '/agents/detail/nightly/edit',
     ]) {
-      expect(url.startsWith(prefix)).toBe(true)
-      const match = matchRoutes(
-        PROJECT_ROUTES.hosted,
-        url.slice(prefix.length - 1)
-      )
-      expect((match ?? []).slice(-1)[0]?.route.path).toBe(pattern)
+      const match = matchRoutes(PROJECT_ROUTES.hosted, url)
+      expect((match ?? []).slice(-1)[0]?.route.path).toBe('agents/detail/*')
     }
   })
 })

@@ -1793,8 +1793,8 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
             className="shrink-0 -ml-2 h-7 w-7"
           >
             <Link
-              to={settingsSectionHref(project.slug, 'automation', 'agents')}
-              aria-label="Back to agents"
+              to={settingsSectionHref(project.slug, 'automation', 'autofixer')}
+              aria-label="Back to autofixer"
             >
               <ArrowLeft className="h-4 w-4" />
             </Link>

@@ -468,75 +468,25 @@ const AiGatewayActivityPage = lazy(() =>
     default: m.AiGatewayActivityPage,
   }))
 )
-const AiGatewaySetupPage = lazy(() =>
-  import('./pages/AiGatewaySetupPage').then((m) => ({
-    default: m.AiGatewaySetupPage,
-  }))
-)
 
 const AiChat = lazy(() =>
   import('./pages/AiChat').then((m) => ({
     default: m.AiChat,
   }))
 )
-const AiFirstPrototype = lazy(() =>
-  import('./pages/AiFirstPrototype').then((m) => ({
-    default: m.AiFirstPrototype,
+const SandboxSettingsPage = lazy(() =>
+  import('./pages/sandbox-settings/SandboxSettingsPage').then((m) => ({
+    default: m.SandboxSettingsPage,
   }))
 )
-const AiWorkflowsOverview = lazy(() =>
-  import('./pages/AiWorkflowsOverview').then((m) => ({
-    default: m.AiWorkflowsOverview,
-  }))
-)
-const AgentSandboxLayout = lazy(() =>
-  import('./pages/agent-sandbox/AgentSandboxLayout').then((m) => ({
-    default: m.AgentSandboxLayout,
-  }))
-)
-const AgentSandboxDashboard = lazy(() =>
-  import('./pages/agent-sandbox/AgentSandboxDashboard').then((m) => ({
-    default: m.AgentSandboxDashboard,
-  }))
-)
-const AgentSandboxProvidersList = lazy(() =>
+const AutofixCredentialsList = lazy(() =>
   import('./pages/agent-sandbox/AgentSandboxProvidersList').then((m) => ({
     default: m.AgentSandboxProvidersList,
   }))
 )
-const AgentSandboxProviderDetail = lazy(() =>
+const AutofixCredentialDetail = lazy(() =>
   import('./pages/agent-sandbox/AgentSandboxProviderDetail').then((m) => ({
     default: m.AgentSandboxProviderDetail,
-  }))
-)
-const AgentSandboxSandboxPage = lazy(() =>
-  import('./pages/agent-sandbox/AgentSandboxSandboxPage').then((m) => ({
-    default: m.AgentSandboxSandboxPage,
-  }))
-)
-const AgentSandboxPreviewPage = lazy(() =>
-  import('./pages/agent-sandbox/AgentSandboxPreviewPage').then((m) => ({
-    default: m.AgentSandboxPreviewPage,
-  }))
-)
-const AgentSandboxSecretsPage = lazy(() =>
-  import('./pages/agent-sandbox/AgentSandboxSecretsPage').then((m) => ({
-    default: m.AgentSandboxSecretsPage,
-  }))
-)
-const GlobalSkillsSettingsPage = lazy(() =>
-  import('./components/settings/GlobalSkillsSettings').then((m) => ({
-    default: m.GlobalSkillsSettings,
-  }))
-)
-const GlobalMcpServersSettingsPage = lazy(() =>
-  import('./components/settings/GlobalMcpServersSettings').then((m) => ({
-    default: m.GlobalMcpServersSettings,
-  }))
-)
-const GlobalSkillDetailPage = lazy(() =>
-  import('./pages/settings/GlobalSkillDetail').then((m) => ({
-    default: m.GlobalSkillDetail,
   }))
 )
 const OtelPipelineStatusPage = lazy(() =>
@@ -547,11 +497,6 @@ const OtelPipelineStatusPage = lazy(() =>
 const TraefikDiscoveryPage = lazy(() =>
   import('./pages/settings/TraefikDiscoveryPage').then((m) => ({
     default: m.TraefikDiscoveryPage,
-  }))
-)
-const GlobalMcpServerDetailPage = lazy(() =>
-  import('./pages/settings/GlobalMcpServerDetail').then((m) => ({
-    default: m.GlobalMcpServerDetail,
   }))
 )
 
@@ -745,13 +690,19 @@ const FullAppRoutes = () => {
                         <Route path="/sandboxes" element={<Sandboxes />} />
                         <Route
                           path="/workspaces"
-                          element={
-                            <Sandboxes key="workspaces" workspacesOnly />
-                          }
+                          element={<RedirectWithQuery to="/sandboxes" />}
                         />
                         <Route
                           path="/workspaces/:workspaceId"
                           element={<WorkspaceDetail />}
+                        />
+                        <Route
+                          path="/sandboxes/settings"
+                          element={<SandboxSettingsPage />}
+                        />
+                        <Route
+                          path="/sandboxes/settings/preview"
+                          element={<SandboxSettingsPage />}
                         />
                         <Route
                           path="/sandboxes/:sandboxId"
@@ -1042,60 +993,56 @@ const FullAppRoutes = () => {
                           path="/ai-gateway/activity"
                           element={<AiGatewayActivityPage />}
                         />
+                        {/* Retired AI surfaces: harnesses, the harness
+                            workspace, workflows, skills, MCP servers and the
+                            gateway setup page. Old links land on the page that
+                            replaced them instead of a 404. */}
                         <Route
                           path="/ai-gateway/setup"
-                          element={<AiGatewaySetupPage />}
+                          element={<RedirectWithQuery to="/ai-gateway" />}
                         />
                         <Route path="/chat" element={<AiChat />} />
                         <Route
                           path="/ai-first"
-                          element={<AiFirstPrototype />}
+                          element={<RedirectWithQuery to="/chat" />}
                         />
                         <Route
                           path="/ai-workflows"
-                          element={<AiWorkflowsOverview />}
+                          element={<RedirectWithQuery to="/chat" />}
+                        />
+                        {/* Autofix's agent credentials. Not in navigation;
+                            autofix's setup steps link here. */}
+                        <Route
+                          path="/agent-sandbox/providers"
+                          element={<AutofixCredentialsList />}
                         />
                         <Route
-                          path="/agent-sandbox"
-                          element={<AgentSandboxLayout />}
-                        >
-                          <Route index element={<AgentSandboxDashboard />} />
-                          <Route
-                            path="providers"
-                            element={<AgentSandboxProvidersList />}
-                          />
-                          <Route
-                            path="providers/:id"
-                            element={<AgentSandboxProviderDetail />}
-                          />
-                          <Route
-                            path="sandbox"
-                            element={<AgentSandboxSandboxPage />}
-                          />
-                          <Route
-                            path="preview"
-                            element={<AgentSandboxPreviewPage />}
-                          />
-                          <Route
-                            path="secrets"
-                            element={<AgentSandboxSecretsPage />}
-                          />
-                        </Route>
-                        <Route
-                          path="/skills"
-                          element={<GlobalSkillsSettingsPage />}
+                          path="/agent-sandbox/providers/:id"
+                          element={<AutofixCredentialDetail />}
                         />
                         <Route
-                          path="/skills/:slug"
-                          element={<GlobalSkillDetailPage />}
+                          path="/agent-sandbox/sandbox"
+                          element={
+                            <RedirectWithQuery to="/sandboxes/settings" />
+                          }
                         />
                         <Route
-                          path="/mcp-servers"
-                          element={<GlobalMcpServersSettingsPage />}
+                          path="/agent-sandbox/preview"
+                          element={
+                            <RedirectWithQuery to="/sandboxes/settings/preview" />
+                          }
                         />
                         <Route
-                          path="/mcp-servers/:slug"
-                          element={<GlobalMcpServerDetailPage />}
+                          path="/agent-sandbox/*"
+                          element={<RedirectWithQuery to="/ai-gateway" />}
+                        />
+                        <Route
+                          path="/skills/*"
+                          element={<RedirectWithQuery to="/chat" />}
+                        />
+                        <Route
+                          path="/mcp-servers/*"
+                          element={<RedirectWithQuery to="/chat" />}
                         />
                         <Route path="/git-providers" element={<GitSources />} />
                         <Route
@@ -1178,7 +1125,7 @@ const FullAppRoutes = () => {
                         />
                         <Route
                           path="/settings/agent-sandbox/*"
-                          element={<RedirectWithQuery to="/agent-sandbox" />}
+                          element={<RedirectWithQuery to="/ai-gateway" />}
                         />
                         <Route
                           path="/settings/skills/*"

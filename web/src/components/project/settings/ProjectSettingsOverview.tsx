@@ -4,7 +4,6 @@
 import { ProjectResponse } from '@/api/client'
 import {
   AlarmClock,
-  Bot,
   Boxes,
   ChevronRight,
   Flag,
@@ -12,12 +11,10 @@ import {
   Globe,
   HardDrive,
   KeyRound,
-  Server,
   Settings2,
   Shield,
   SlidersHorizontal,
   Users,
-  Wand2,
   Webhook,
   type LucideIcon,
 } from 'lucide-react'
@@ -155,24 +152,6 @@ const settingsGroups: SettingsGroup[] = [
         description: 'Notify external systems about service events.',
         url: 'settings/webhooks',
         icon: Webhook,
-      },
-      {
-        title: 'AI workflows',
-        description: 'Automate service work with agents.',
-        url: 'agents',
-        icon: Bot,
-      },
-      {
-        title: 'Skills',
-        description: 'Give service agents reusable capabilities.',
-        url: 'settings/skills',
-        icon: Wand2,
-      },
-      {
-        title: 'MCP servers',
-        description: 'Connect service agents to external tools.',
-        url: 'settings/mcp-servers',
-        icon: Server,
       },
     ],
   },

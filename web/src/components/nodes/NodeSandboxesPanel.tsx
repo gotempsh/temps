@@ -49,6 +49,7 @@ import { problemDetail } from '@/lib/api-problem'
 import { WORKER_NODES_URL } from '@/lib/worker-nodes'
 import { PlatformFeatureNotice } from '@/components/platform/PlatformFeatureNotice'
 import { WorkerNodeRequiredAlert } from './WorkerNodeRequiredBanner'
+import { SANDBOX_SETTINGS_PATH } from '@/pages/sandbox-settings/sections'
 import {
   CONTROL_PLANE_RUNS_NO_SANDBOXES_MESSAGE,
   isControlPlaneWithoutWorkloads,
@@ -64,7 +65,7 @@ import {
   type EvictionReport,
 } from './node-eviction'
 
-const SANDBOX_SETTINGS_URL = '/agent-sandbox/sandbox'
+const SANDBOX_SETTINGS_URL = SANDBOX_SETTINGS_PATH
 
 /**
  * Every live sandbox on a worker node, from all users (ADR-048). The query

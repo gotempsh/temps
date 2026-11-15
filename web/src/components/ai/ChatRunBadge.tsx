@@ -42,14 +42,22 @@ export function ChatRunBadge({
   turnStatus,
   failureTitle,
   compact = false,
+  attentionOnly = false,
 }: {
   turnStatus: string
   failureTitle?: string | null
   /** Icon only, with the label for screen readers and on hover. */
   compact?: boolean
+  /**
+   * Draw nothing for the settled states (finished, stopped), which is most
+   * chats: in a list, a badge on every row says nothing. Working and failed
+   * chats still stand out.
+   */
+  attentionOnly?: boolean
 }) {
   const state = chatRunState(turnStatus)
   if (!state) return null
+  if (attentionOnly && !railMarksState(state)) return null
   const { label, title } = chatRunPresentation(state, failureTitle)
   const { Icon, className, iconClassName } = RUN_STATE_STYLES[state]
   return (

@@ -4,7 +4,6 @@
 import { SettingsSection } from '@/components/ui/settings-section'
 import {
   Blocks,
-  Bot,
   Boxes,
   Braces,
   CalendarClock,
@@ -16,8 +15,6 @@ import {
   ListChecks,
   LockKeyhole,
   Plug,
-  PlugZap,
-  Puzzle,
   Rocket,
   Settings2,
   Sparkles,
@@ -43,15 +40,12 @@ import { SecretsSettings } from './SecretsSettings'
 import { DeploymentTokensSettings } from './DeploymentTokensSettings'
 import { CronJobsSettings } from './CronJobsSettings'
 import { WebhooksSettings } from './WebhooksSettings'
-import { SkillsSettings } from './SkillsSettings'
-import { McpServersSettings } from './McpServersSettings'
 import {
   HostDockerAccessAlert,
   HostDockerAccessOnboarding,
   useHostDockerAccess,
 } from '@/components/project/HostDockerAccessAlert'
 import { ProjectFeatureFlags } from '@/components/project/flags/ProjectFeatureFlags'
-import { AutopilotPage } from '@/components/agents/AutopilotPage'
 import { AutofixerPage } from '@/components/autofixer/AutofixerPage'
 import { ProjectSetup } from '@/pages/ProjectSetup'
 import { Link, useSearchParams } from 'react-router'
@@ -219,12 +213,6 @@ export function CombinedProjectSettings({
     case 'automation':
       sections = [
         {
-          id: 'agents',
-          title: 'Agents & runs',
-          icon: Bot,
-          content: <AutopilotPage project={project} />,
-        },
-        {
           id: 'cron-jobs',
           title: 'Cron jobs',
           icon: CalendarClock,
@@ -251,18 +239,6 @@ export function CombinedProjectSettings({
           title: 'Webhooks',
           icon: Webhook,
           content: <WebhooksSettings project={project} />,
-        },
-        {
-          id: 'skills',
-          title: 'Skills',
-          icon: Puzzle,
-          content: <SkillsSettings project={project} />,
-        },
-        {
-          id: 'mcp-servers',
-          title: 'MCP servers',
-          icon: PlugZap,
-          content: <McpServersSettings project={project} />,
         },
         {
           id: 'extensions',

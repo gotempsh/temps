@@ -3520,7 +3520,7 @@ export function AgentActivity() {
                 <Link to="/projects/new">Deploy a service</Link>
               </Button>
               <Button asChild variant="outline">
-                <Link to="/ai-gateway/setup">Set up the AI gateway</Link>
+                <Link to="/ai-gateway">Set up the AI gateway</Link>
               </Button>
             </div>
           }
@@ -3541,7 +3541,7 @@ export function AgentActivity() {
           )}
         />
       ) : traces.length === 0 ? (
-        <AiActivityEmptyState setupHref="/ai-gateway/setup" />
+        <AiActivityEmptyState setupHref="/ai-gateway" />
       ) : (
         <Card>
           <CardContent className="p-0">
@@ -4445,9 +4445,6 @@ console.log(response.choices[0].message.content);`,
                 <CopyButton value={gatewayEndpoint} className="shrink-0" />
               </div>
               <div className="flex flex-wrap items-center gap-2">
-                <Button size="sm" asChild>
-                  <Link to="/ai-gateway/setup">View code examples</Link>
-                </Button>
                 {shouldPromptForFirstProviderKey(
                   keysRead,
                   SUPPORTED_PROVIDERS.map((p) => p.id)

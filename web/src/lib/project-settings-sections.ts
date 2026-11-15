@@ -28,8 +28,10 @@ export const SETTINGS_SECTION_IDS = {
     'host-access',
   ],
   variables: ['environment-variables', 'secrets', 'deployment-tokens'],
-  automation: ['agents', 'cron-jobs', 'crash-autofix', 'autofixer'],
-  integrations: ['webhooks', 'skills', 'mcp-servers', 'extensions'],
+  // `agents` (workflows), `skills` and `mcp-servers` were retired with the
+  // harness-based AI features; their old links open the page itself.
+  automation: ['cron-jobs', 'crash-autofix', 'autofixer'],
+  integrations: ['webhooks', 'extensions'],
 } as const satisfies Record<CombinedSettingsPage, readonly string[]>
 
 export type SettingsSectionId<P extends CombinedSettingsPage> =
@@ -87,12 +89,12 @@ export const LEGACY_PROJECT_ROUTES = {
   build: settingsSectionPath('delivery', 'build'),
   'settings/build': settingsSectionPath('delivery', 'build'),
   setup: settingsSectionPath('general', 'setup'),
-  agents: settingsSectionPath('automation', 'agents'),
+  agents: 'settings/automation',
   autofixer: settingsSectionPath('automation', 'autofixer'),
   'settings/cron-jobs': settingsSectionPath('automation', 'cron-jobs'),
   'settings/webhooks': settingsSectionPath('integrations', 'webhooks'),
-  'settings/skills': settingsSectionPath('integrations', 'skills'),
-  'settings/mcp-servers': settingsSectionPath('integrations', 'mcp-servers'),
+  'settings/skills': 'settings/integrations',
+  'settings/mcp-servers': 'settings/integrations',
   'settings/secrets': settingsSectionPath('variables', 'secrets'),
   'settings/deployment-tokens': settingsSectionPath(
     'variables',

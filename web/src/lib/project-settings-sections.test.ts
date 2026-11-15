@@ -48,7 +48,27 @@ describe('legacyProjectRouteTarget', () => {
       if (!path.startsWith('settings/')) continue
       const page = path.slice('settings/'.length) as CombinedSettingsPage
       expect(SETTINGS_SECTION_IDS[page]).toBeDefined()
-      expect(requestedSettingsSection(page, query ?? '')).toBeDefined()
+      // Routes of retired sections open the page itself, with no section.
+      if (query === undefined) continue
+      expect(requestedSettingsSection(page, query)).toBeDefined()
+    }
+  })
+
+  test('retired AI sections open their former page without a section', () => {
+    expect(legacyProjectRouteTarget('agents', '')).toBe('settings/automation')
+    expect(legacyProjectRouteTarget('settings/skills', '')).toBe(
+      'settings/integrations'
+    )
+    expect(legacyProjectRouteTarget('settings/mcp-servers', '')).toBe(
+      'settings/integrations'
+    )
+    for (const retired of ['agents', 'skills', 'mcp-servers']) {
+      expect(
+        requestedSettingsSection('automation', `?section=${retired}`)
+      ).toBeUndefined()
+      expect(
+        requestedSettingsSection('integrations', `?section=${retired}`)
+      ).toBeUndefined()
     }
   })
 
@@ -85,7 +105,7 @@ describe('legacyProjectRouteTarget', () => {
       legacyProjectRouteTarget('settings/environment-variables', '?q=DATABASE')
     ).toBe('environment-variables?q=DATABASE')
     expect(legacyProjectRouteTarget('agents', '?tab=runs')).toBe(
-      'settings/automation?section=agents&tab=runs'
+      'settings/automation?tab=runs'
     )
   })
 })
