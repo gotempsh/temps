@@ -92,6 +92,20 @@ pub struct CreateConnectorRequest {
     /// or only the hostnames chosen for this tunnel.
     #[serde(default)]
     pub auto_publish: Option<bool>,
+    /// Name this tunnel's environment hosts `<label>-<host_suffix>.<domain>`
+    /// (ADR 068 D3), e.g. `lab` with domain `example.com` gives
+    /// `shop-production-lab.example.com`: one level under the zone, which
+    /// Cloudflare's free certificate covers. Without it they are
+    /// `<label>.<domain>`. 1-20 lowercase letters, digits or single hyphens,
+    /// starting and ending with a letter or digit; only for a provider set
+    /// up with a domain. Creating the tunnel generates no environment
+    /// hostnames (with `auto_publish` it still publishes the worker-served
+    /// hostnames already under the domain): environment hosts start when
+    /// they are turned on for it
+    /// (`PUT /ingress/connectors/{id}/environment-hosts`).
+    #[serde(default)]
+    #[schema(example = "lab")]
+    pub host_suffix: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, ToSchema)]
@@ -170,9 +184,12 @@ pub struct ConnectorView {
     pub last_error: Option<String>,
     pub edge_port: i32,
     pub auto_publish: bool,
-    /// Publishes every environment as `<label>.<domain>` (ADR 068 D3).
-    /// At most one tunnel does.
+    /// Publishes every environment as `<label>.<domain>` (ADR 068 D3), or
+    /// `<label>-<host_suffix>.<domain>` with a host suffix. At most one
+    /// tunnel does.
     pub environment_hosts: bool,
+    /// Suffix of its environment hosts' first label; `null` for none.
+    pub host_suffix: Option<String>,
     pub nodes: Vec<ConnectorNodeView>,
     pub publications: Vec<PublicationView>,
     #[schema(value_type = String, format = DateTime)]
@@ -217,6 +234,8 @@ pub struct TunnelFact {
     pub auto_publish: bool,
     /// Publishes every environment's host (ADR 068 D3).
     pub environment_hosts: bool,
+    /// Its environment hosts are `<label>-<suffix>.<domain>`.
+    pub host_suffix: Option<String>,
 }
 
 /// Which tunnel would publish a hostname, by ADR 058 D9's selection (the
@@ -776,7 +795,9 @@ impl IngressConnectorService {
             .order_by_desc(ingress_connectors::Column::Id)
             .paginate(self.db.as_ref(), page_size);
         let total = paginator.num_items().await?;
-        let connectors = paginator.fetch_page(page - 1).await?;
+        let connectors = paginator
+            .fetch_page(temps_core::config::page_index(page))
+            .await?;
         Ok(ConnectorList {
             connectors: self.views(connectors).await?,
             total,
@@ -926,6 +947,7 @@ impl IngressConnectorService {
         // worker will refuse.
         self.validate_nodes(&request.node_ids).await?;
         let setup = self.resolve_setup(&info, &request.values).await?;
+        let host_suffix = host_suffix_for(&info, &setup, request.host_suffix.as_deref())?;
         factory.validate(&self.deps(), &setup).await?;
 
         let mut settings = serde_json::Map::new();
@@ -950,6 +972,7 @@ impl IngressConnectorService {
             settings: Set(serde_json::Value::Object(settings)),
             edge_port: Set(DEFAULT_EDGE_PORT),
             auto_publish: Set(request.auto_publish.unwrap_or(true)),
+            host_suffix: Set(host_suffix),
             status: Set("pending".into()),
             created_at: Set(now),
             updated_at: Set(now),
@@ -1092,6 +1115,7 @@ impl IngressConnectorService {
                 has_nodes: c.has_nodes,
                 auto_publish: c.model.auto_publish,
                 environment_hosts: c.model.environment_hosts,
+                host_suffix: c.model.host_suffix.clone(),
             })
             .collect();
         let mut choices: Vec<(String, Option<i32>)> = plan
@@ -1137,6 +1161,92 @@ impl IngressConnectorService {
         Ok(plan.view(&host, publications.get(&host)))
     }
 
+    /// Whether `host` may be published through tunnel `id`: the tunnel
+    /// exists, its zone holds the hostname, and moving it there is allowed.
+    async fn check_tunnel_choice(&self, host: &str, id: i32) -> Result<(), IngressError> {
+        let connector = self.find(id).await?;
+        let zone = self.zone_of(&connector).await?;
+        record_label(host, &connector.domain, &zone)?;
+        if let Some(guard) = self.move_guard.get() {
+            guard
+                .check_move(host, &connector.name)
+                .await
+                .map_err(IngressError::Validation)?;
+        }
+        Ok(())
+    }
+
+    /// Choose tunnel `connector_id` for `hostname`, only while its choice is
+    /// still `expected` (what the caller read, as `hostname_choice` returns
+    /// it): a choice someone made in between is never replaced unseen. A
+    /// reachability run decides from what it read, so it writes this way.
+    /// Already choosing this tunnel counts as done, so a resumed run whose
+    /// write landed before it stopped does not fail.
+    pub async fn choose_tunnel_if_unchanged(
+        &self,
+        hostname: &str,
+        connector_id: i32,
+        expected: Option<Option<i32>>,
+    ) -> Result<(), IngressError> {
+        let host = normalize_host(hostname)?;
+        self.check_tunnel_choice(&host, connector_id).await?;
+        let now = Utc::now();
+        let written = match expected {
+            None => {
+                let inserted = ingress_hostname_choices::ActiveModel {
+                    hostname: Set(host.clone()),
+                    connector_id: Set(Some(connector_id)),
+                    created_at: Set(now),
+                    updated_at: Set(now),
+                    ..Default::default()
+                }
+                .insert(self.db.as_ref())
+                .await;
+                match inserted {
+                    Ok(_) => true,
+                    // `hostname` is unique: a row someone inserted meanwhile
+                    // refuses this. Any other failure is reported as it is.
+                    Err(error) => {
+                        if self.hostname_choice(&host).await?.is_none() {
+                            return Err(error.into());
+                        }
+                        false
+                    }
+                }
+            }
+            Some(previous) => {
+                let column = ingress_hostname_choices::Column::ConnectorId;
+                ingress_hostname_choices::Entity::update_many()
+                    .col_expr(column, Expr::value(Some(connector_id)))
+                    .col_expr(
+                        ingress_hostname_choices::Column::UpdatedAt,
+                        Expr::value(now),
+                    )
+                    .filter(ingress_hostname_choices::Column::Hostname.eq(&host))
+                    .filter(match previous {
+                        Some(id) => column.eq(id),
+                        None => column.is_null(),
+                    })
+                    .exec(self.db.as_ref())
+                    .await?
+                    .rows_affected
+                    == 1
+            }
+        };
+        if !written {
+            let current = self.hostname_choice(&host).await?;
+            if current != Some(Some(connector_id)) {
+                return Err(IngressError::Validation(format!(
+                    "{host}'s tunnel choice changed while this setup ran, so it was left as \
+                     the other change set it. Plan again to see it, or change it under \
+                     Expose your apps."
+                )));
+            }
+        }
+        self.reconcile_all().await;
+        Ok(())
+    }
+
     /// Record the operator's choice for one hostname and apply it now.
     pub async fn set_hostname_choice(
         &self,
@@ -1171,15 +1281,7 @@ impl IngressConnectorService {
                 let id = request.connector_id.ok_or_else(|| {
                     IngressError::Validation("Pick the tunnel to publish it through.".into())
                 })?;
-                let connector = self.find(id).await?;
-                let zone = self.zone_of(&connector).await?;
-                record_label(&host, &connector.domain, &zone)?;
-                if let Some(guard) = self.move_guard.get() {
-                    guard
-                        .check_move(&host, &connector.name)
-                        .await
-                        .map_err(IngressError::Validation)?;
-                }
+                self.check_tunnel_choice(&host, id).await?;
                 Some(id)
             }
         };
@@ -2206,6 +2308,7 @@ fn connector_view(
         edge_port: connector.edge_port,
         auto_publish: connector.auto_publish,
         environment_hosts: connector.environment_hosts,
+        host_suffix: connector.host_suffix,
         nodes: node_rows
             .into_iter()
             .map(|n| ConnectorNodeView {
@@ -2244,6 +2347,25 @@ fn page_bounds(page: Option<u64>, page_size: Option<u64>) -> (u64, u64) {
 /// Whether a publication in `state` has a DNS record out there.
 fn has_record(state: &str) -> bool {
     state == "published" || state == STALE
+}
+
+/// The checked `host_suffix` for a new tunnel: only a provider set up with a
+/// domain names hosts under one.
+fn host_suffix_for(
+    info: &ProviderInfo,
+    setup: &ProviderSetup,
+    requested: Option<&str>,
+) -> Result<Option<String>, IngressError> {
+    let suffix = crate::reachability::environment_hosts::normalize_host_suffix(requested)
+        .map_err(IngressError::Validation)?;
+    match (&suffix, &setup.domain) {
+        (Some(suffix), None) => Err(IngressError::Validation(format!(
+            "{} is not set up with a domain, so it has no hostnames to add the suffix \
+             '{suffix}' to. Leave the hostname suffix empty.",
+            info.name
+        ))),
+        _ => Ok(suffix),
+    }
 }
 
 /// The record name of `host` inside `domain`. Cloudflare's free certificate
@@ -2693,6 +2815,42 @@ mod tests {
         );
     }
 
+    fn setup_with_domain(domain: Option<&str>) -> ProviderSetup {
+        ProviderSetup {
+            dns_provider: None,
+            domain: domain.map(str::to_string),
+            settings: BTreeMap::new(),
+            secrets: BTreeMap::new(),
+        }
+    }
+
+    /// A tunnel's host suffix is checked when it is created: normalised,
+    /// refused when malformed, and refused for a provider with no domain to
+    /// put hostnames under.
+    #[test]
+    fn a_new_tunnels_host_suffix_is_checked() {
+        use crate::registry::ProviderFactory;
+        let info = crate::cloudflare::CloudflareTunnelFactory.info();
+        let zone = setup_with_domain(Some("example.com"));
+        assert_eq!(host_suffix_for(&info, &zone, None).unwrap(), None);
+        assert_eq!(host_suffix_for(&info, &zone, Some("  ")).unwrap(), None);
+        assert_eq!(
+            host_suffix_for(&info, &zone, Some("Lab")).unwrap(),
+            Some("lab".to_string())
+        );
+        let malformed = host_suffix_for(&info, &zone, Some("lab.home")).unwrap_err();
+        assert!(
+            matches!(&malformed, IngressError::Validation(m) if m.contains("'lab.home'")),
+            "{malformed}"
+        );
+        let no_domain = host_suffix_for(&info, &setup_with_domain(None), Some("lab")).unwrap_err();
+        assert!(
+            matches!(&no_domain, IngressError::Validation(m)
+                if m.contains("not set up with a domain") && m.contains("'lab'")),
+            "{no_domain}"
+        );
+    }
+
     fn connector_model(id: i32, domain: &str, auto_publish: bool) -> ingress_connectors::Model {
         ingress_connectors::Model {
             id,
@@ -2706,6 +2864,7 @@ mod tests {
             edge_port: 443,
             auto_publish,
             environment_hosts: false,
+            host_suffix: None,
             status: "ready".into(),
             last_error: None,
             created_at: Utc::now(),
@@ -2908,12 +3067,12 @@ mod tests {
         }
 
         async fn setup() -> Option<(
-            temps_database::test_utils::TestDatabase,
+            temps_test_utils::TestDatabase,
             Arc<IngressConnectorService>,
             Arc<Calls>,
             i32,
         )> {
-            let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
                 Ok(db) => db,
                 Err(error) => {
                     eprintln!(
@@ -2995,6 +3154,105 @@ mod tests {
                 service.find(id).await,
                 Err(IngressError::NotFound(_))
             ));
+            drop(test_db);
+        }
+
+        /// A reachability run writes the tunnel choice it decided from only
+        /// while the hostname still has the choice it read: one someone made
+        /// meanwhile is kept and reported, never replaced unseen.
+        #[tokio::test]
+        async fn a_run_never_replaces_a_choice_made_while_it_routed() {
+            let Some((test_db, service, _calls, id)) = setup().await else {
+                return;
+            };
+            let db = test_db.connection_arc();
+            let now = Utc::now();
+            let provider = temps_entities::dns_providers::ActiveModel {
+                name: Set("choice-race".into()),
+                provider_type: Set("cloudflare".into()),
+                credentials: Set("{}".into()),
+                is_active: Set(true),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await
+            .expect("provider");
+            temps_entities::dns_managed_domains::ActiveModel {
+                provider_id: Set(provider.id),
+                domain: Set("example.com".into()),
+                auto_manage: Set(true),
+                proxied_by_default: Set(false),
+                verified: Set(true),
+                generated_hostname_mode: Set("standard".into()),
+                sync_generated_records: Set(false),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await
+            .expect("managed zone");
+            let choose = |host: &'static str, expected| {
+                let service = service.clone();
+                async move { service.choose_tunnel_if_unchanged(host, id, expected).await }
+            };
+            let choice = |host: &'static str| {
+                let service = service.clone();
+                async move { service.hostname_choice(host).await.expect("read") }
+            };
+
+            // Nothing chosen, nothing changed: the choice is recorded.
+            choose("shop.example.com", None)
+                .await
+                .expect("first choice");
+            assert_eq!(choice("shop.example.com").await, Some(Some(id)));
+            // Resumed after the write landed: already done, not a failure.
+            choose("shop.example.com", None).await.expect("resumed");
+
+            // Someone set "no tunnel" after the run read "nothing chosen".
+            ingress_hostname_choices::ActiveModel {
+                hostname: Set("blog.example.com".into()),
+                connector_id: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await
+            .expect("other choice");
+            let error = choose("blog.example.com", None)
+                .await
+                .expect_err("kept the other choice");
+            assert!(
+                error
+                    .to_string()
+                    .contains("blog.example.com's tunnel choice changed"),
+                "{error}"
+            );
+            assert_eq!(choice("blog.example.com").await, Some(None));
+
+            // The run read "no tunnel" and confirmed replacing it: written.
+            choose("blog.example.com", Some(None))
+                .await
+                .expect("confirmed change");
+            assert_eq!(choice("blog.example.com").await, Some(Some(id)));
+
+            // The run read "no tunnel", but it was changed back meanwhile.
+            ingress_hostname_choices::Entity::update_many()
+                .col_expr(
+                    ingress_hostname_choices::Column::ConnectorId,
+                    Expr::value(Option::<i32>::None),
+                )
+                .filter(ingress_hostname_choices::Column::Hostname.eq("shop.example.com"))
+                .exec(db.as_ref())
+                .await
+                .expect("set off");
+            assert!(choose("shop.example.com", Some(Some(id + 1000)))
+                .await
+                .is_err());
+            assert_eq!(choice("shop.example.com").await, Some(None));
             drop(test_db);
         }
 

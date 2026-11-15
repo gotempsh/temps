@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use temps_database::DbConnection;
 use temps_proxy::ProxyShutdownSignal;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Shutdown signal implementation for Ctrl+C with resource cleanup and timeout
 pub struct CtrlCShutdownSignal {
@@ -145,9 +145,15 @@ impl ProxyShutdownSignal for CtrlCShutdownSignal {
         let data_dir = self.data_dir.clone();
 
         Box::pin(async move {
-            tokio::signal::ctrl_c()
-                .await
-                .expect("Failed to listen for ctrl-c signal");
+            if let Err(e) = tokio::signal::ctrl_c().await {
+                // Without a handler there is no Ctrl+C to wait for. Never
+                // resolve, so the proxy keeps serving instead of shutting
+                // down; SIGINT then falls back to the default disposition.
+                error!(
+                    "Failed to listen for ctrl-c signal, graceful Ctrl+C shutdown disabled: {e}"
+                );
+                std::future::pending::<()>().await;
+            }
             info!("Received Ctrl+C, initiating graceful shutdown...");
 
             // Create a new instance for cleanup since we moved into the async block

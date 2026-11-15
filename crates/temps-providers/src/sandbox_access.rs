@@ -17,10 +17,15 @@
 use std::collections::HashMap;
 
 use hmac::{Hmac, KeyInit, Mac};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 
+use crate::externalsvc::postgres::sandbox::ENGINE;
+pub use crate::externalsvc::postgres::sandbox::{check_deployment_database, classify_database};
 use crate::externalsvc::postgres::PostgresService;
 use crate::externalsvc::scoped_resource_name;
+pub use temps_providers_core::sandbox_namespace::sandbox_role_name;
+use temps_providers_core::sandbox_namespace::{IDENTIFIER_MAX, ROLE_PREFIX};
+
 use crate::sandbox_engines::{
     choose_sandbox_resource, ExistingResource, SandboxAccessEngine, SandboxAccessRequest,
     SandboxNamespace, SandboxNamespaceConflict, SandboxResourceChoice,
@@ -32,10 +37,7 @@ use tracing::info;
 /// The environment slot sandboxes used in a project's database naming before
 /// they had a namespace of their own (`<project>_sandbox`).
 const LEGACY_SANDBOX_SCOPE: &str = "sandbox";
-const ENGINE: &str = "PostgreSQL";
 /// PostgreSQL truncates identifiers at 63 bytes.
-const IDENTIFIER_MAX: usize = 63;
-const ROLE_PREFIX: &str = "sbx_";
 /// Connections the role may hold at once, so a runaway loop in a sandbox
 /// cannot exhaust the cluster's connection slots.
 const ROLE_CONNECTION_LIMIT: u32 = 20;
@@ -81,40 +83,6 @@ pub fn legacy_sandbox_database_name(project_slug: &str) -> String {
         project_slug,
         LEGACY_SANDBOX_SCOPE,
     ))
-}
-
-/// What the database `database` is to the sandbox role `role`, from its owner
-/// (`None` when it does not exist). Only the administrator can make a role a
-/// database's owner, and the sandbox role cannot give its database away
-/// (`NOCREATEDB`), so ownership is a provenance the sandbox cannot forge.
-pub fn classify_database(owner: Option<&str>, role: &str) -> ExistingResource {
-    match owner {
-        None => ExistingResource::Missing,
-        Some(owner) if owner == role => ExistingResource::Sandbox,
-        Some(owner) => ExistingResource::Foreign {
-            evidence: format!(
-                "it is owned by the role '{owner}', not by the sandbox role '{role}'"
-            ),
-        },
-    }
-}
-
-/// The role that owns `database`. Roles are cluster-wide like databases, so the
-/// name is derived from the database name; when that would not fit in an
-/// identifier it keeps a prefix and a digest of the whole name instead, so two
-/// long names cannot collapse into one role.
-pub fn sandbox_role_name(database: &str) -> String {
-    let direct = format!("{ROLE_PREFIX}{database}");
-    if direct.len() <= IDENTIFIER_MAX {
-        return direct;
-    }
-    let digest = hex::encode(Sha256::digest(database.as_bytes()));
-    let keep = IDENTIFIER_MAX - ROLE_PREFIX.len() - 1 - 12;
-    format!(
-        "{ROLE_PREFIX}{}_{}",
-        database.chars().take(keep).collect::<String>(),
-        &digest[..12]
-    )
 }
 
 /// A stable password for the role: it survives restarts without being stored,
@@ -259,8 +227,7 @@ impl SandboxDatabasePlan {
     /// does not exist. Read before anything is changed, so a database that is
     /// not the sandbox's is never touched.
     pub const DATABASE_OWNER_QUERY: &'static str =
-        "SELECT pg_catalog.pg_get_userbyid(datdba)::text FROM pg_catalog.pg_database \
-         WHERE datname = $1";
+        crate::externalsvc::postgres::sandbox::DATABASE_OWNER_QUERY;
 
     /// `CREATE DATABASE` cannot run inside a function or transaction, so it is
     /// its own statement, chosen by the caller after the ownership check. The
@@ -530,23 +497,6 @@ fn apply_failure(service_id: i32, place: &str, error: SandboxApplyError) -> Exte
             ),
         },
     }
-}
-
-/// The PostgreSQL check a deployment runs before creating or reusing
-/// `database` (owned by `owner`, `None` when it does not exist): a name in the
-/// sandbox namespace, or a database owned by the sandbox role that name would
-/// have (a sandbox's database from before the namespace, such as
-/// `<project>_sandbox` for an environment slugged `sandbox`), is refused.
-pub fn check_deployment_database(
-    database: &str,
-    owner: Option<&str>,
-) -> Result<(), SandboxNamespaceConflict> {
-    let role = sandbox_role_name(database);
-    let evidence = match classify_database(owner, &role) {
-        ExistingResource::Sandbox => Some(format!("it is owned by the sandbox role '{role}'")),
-        ExistingResource::Missing | ExistingResource::Foreign { .. } => None,
-    };
-    crate::sandbox_engines::check_deployment_database(ENGINE, database, evidence)
 }
 
 /// Same variable names as the deployment path, whatever the credentials are.

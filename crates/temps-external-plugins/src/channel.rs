@@ -23,10 +23,10 @@ use crate::grants::{PluginGrantService, MAX_PROMPT_BYTES, MAX_SYSTEM_BYTES};
 use futures::stream::StreamExt;
 use futures::SinkExt;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder};
-use temps_core::external_plugin::channel::PluginHostPermission;
-use temps_core::external_plugin::channel::*;
-use temps_core::external_plugin::manifest::PluginCapability;
-use temps_core::external_plugin::PluginEvent;
+use temps_plugin_protocol::channel::PluginHostPermission;
+use temps_plugin_protocol::channel::*;
+use temps_plugin_protocol::manifest::PluginCapability;
+use temps_plugin_protocol::PluginEvent;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -36,12 +36,20 @@ use tracing::{debug, error, info, warn};
 static AI_CONCURRENCY: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
     std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(8)));
 
+/// Outgoing messages queued for one plugin before back-pressure applies.
+/// Responses wait for room (the reader stops taking new requests from a
+/// plugin that does not drain its socket); events are dropped when full,
+/// see [`PluginChannel::send_event`].
+const OUTGOING_CHANNEL_CAPACITY: usize = 256;
+
 /// A live channel connection to a single plugin.
 pub struct PluginChannel {
     /// Plugin name (for logging).
     plugin_name: String,
-    /// Sender for outgoing messages (responses + events).
-    tx: mpsc::UnboundedSender<ChannelMessage>,
+    /// Sender for outgoing messages (responses + events). Bounded by
+    /// [`OUTGOING_CHANNEL_CAPACITY`] so a plugin that stops reading cannot
+    /// grow the host's memory without limit.
+    tx: mpsc::Sender<ChannelMessage>,
     /// Background task reading from the WebSocket.
     reader_task: JoinHandle<()>,
     grant_service: PluginGrantService,
@@ -135,10 +143,9 @@ impl PluginChannel {
                 return None;
             }
         };
-        request.headers_mut().insert(
-            temps_core::external_plugin::headers::AUTH_SIGNATURE,
-            auth_header,
-        );
+        request
+            .headers_mut()
+            .insert(temps_plugin_protocol::headers::AUTH_SIGNATURE, auth_header);
         let ws_stream = match tokio_tungstenite::client_async(request, stream).await {
             Ok((ws, _resp)) => {
                 debug!(
@@ -161,7 +168,7 @@ impl PluginChannel {
 
         // Outgoing message channel — lets the reader task and event pushes
         // share a single send path without locking.
-        let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<ChannelMessage>();
+        let (msg_tx, mut msg_rx) = mpsc::channel::<ChannelMessage>(OUTGOING_CHANNEL_CAPACITY);
 
         // Spawn writer task: forwards from mpsc channel to WebSocket.
         let writer_plugin_name = plugin_name.clone();
@@ -225,15 +232,16 @@ impl PluginChannel {
                                     plugin = %reader_plugin_name,
                                     "Unsupported channel request {}: {}", id, e
                                 );
-                                let _ =
-                                    reader_tx.send(ChannelMessage::Response(ChannelResponse::err(
+                                let _ = reader_tx
+                                    .send(ChannelMessage::Response(ChannelResponse::err(
                                         id,
                                         ChannelErrorCode::MethodNotFound,
                                         format!(
                                             "This Temps build does not support that channel \
                                              call ({e}); rebuild the plugin against this version"
                                         ),
-                                    )));
+                                    )))
+                                    .await;
                             }
                             None => warn!(
                                 plugin = %reader_plugin_name,
@@ -259,7 +267,7 @@ impl PluginChannel {
                             &req,
                         )
                         .await;
-                        let _ = reader_tx.send(ChannelMessage::Response(response));
+                        let _ = reader_tx.send(ChannelMessage::Response(response)).await;
                     }
                     _ => {
                         warn!(
@@ -294,10 +302,22 @@ impl PluginChannel {
     }
 
     /// Push a platform event to the plugin over the channel.
+    ///
+    /// Never blocks the caller: when the plugin has
+    /// [`OUTGOING_CHANNEL_CAPACITY`] messages it has not read yet, the event is
+    /// dropped and an error says so, rather than queueing without bound.
     pub fn send_event(&self, event: PluginEvent) -> Result<(), String> {
         self.tx
-            .send(ChannelMessage::Event(ChannelEvent { event }))
-            .map_err(|_| format!("Channel closed for plugin '{}'", self.plugin_name))
+            .try_send(ChannelMessage::Event(ChannelEvent { event }))
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => format!(
+                    "Channel full for plugin '{}' ({} unread messages); event dropped",
+                    self.plugin_name, OUTGOING_CHANNEL_CAPACITY
+                ),
+                mpsc::error::TrySendError::Closed(_) => {
+                    format!("Channel closed for plugin '{}'", self.plugin_name)
+                }
+            })
     }
 
     pub async fn can_receive_events(&self) -> bool {
@@ -631,10 +651,8 @@ impl temps_core::audit::AuditOperation for PluginHostOperationAudit {
     fn user_agent(&self) -> &str {
         "external-plugin-channel"
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(|error| {
-            anyhow::anyhow!("failed to serialize plugin host-operation audit: {error}")
-        })
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -1074,7 +1092,7 @@ mod tests {
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use temps_ai::{AiError, AiRequest, AiResponse, AiService};
-    use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+    use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 
     #[test]
     fn test_format_dt() {
@@ -1265,5 +1283,77 @@ mod tests {
                 .expect_err("missing host AI service fails");
         assert_eq!(unavailable.code, ChannelErrorCode::Internal);
         assert_eq!(unavailable.message, "Host AI service is unavailable");
+    }
+
+    /// A channel to `plugin_name` over `tx`, with no live socket behind it:
+    /// `send_event` only touches the outgoing queue.
+    fn channel_over(plugin_name: &str, tx: mpsc::Sender<ChannelMessage>) -> PluginChannel {
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+        );
+        PluginChannel {
+            plugin_name: plugin_name.to_string(),
+            tx,
+            reader_task: tokio::spawn(async {}),
+            grant_service: PluginGrantService::new(db),
+            actor_id: "actor".to_string(),
+            source_identity: "sha256:test".to_string(),
+            host_permissions: vec![PluginHostPermission::EventsRead],
+        }
+    }
+
+    fn plugin_event(n: usize) -> PluginEvent {
+        PluginEvent {
+            id: n.to_string(),
+            event_type: "deployment.succeeded".to_string(),
+            timestamp: chrono::Utc::now(),
+            project_id: Some(1),
+            data: serde_json::json!({}),
+        }
+    }
+
+    /// A plugin that stops reading gets 256 events queued, then each further
+    /// event is refused at once with an error naming the plugin, instead of
+    /// queueing without bound or blocking the publisher. Once the plugin
+    /// reads one, there is room for one more.
+    #[tokio::test]
+    async fn an_event_for_a_full_channel_is_dropped_with_an_error_naming_the_plugin() {
+        let (tx, mut rx) = mpsc::channel(OUTGOING_CHANNEL_CAPACITY);
+        let channel = channel_over("slow-plugin", tx);
+        for n in 0..256 {
+            channel
+                .send_event(plugin_event(n))
+                .unwrap_or_else(|e| panic!("event {n} fits in the queue: {e}"));
+        }
+
+        let error = channel
+            .send_event(plugin_event(256))
+            .expect_err("the 257th unread event is dropped");
+        assert_eq!(
+            error,
+            "Channel full for plugin 'slow-plugin' (256 unread messages); event dropped"
+        );
+
+        let Some(ChannelMessage::Event(first)) = rx.recv().await else {
+            panic!("the oldest queued message is an event");
+        };
+        assert_eq!(first.event.id, "0", "queued events are kept, not replaced");
+        channel
+            .send_event(plugin_event(257))
+            .expect("one read frees one slot");
+    }
+
+    /// When the plugin's writer is gone, an event is refused with an error
+    /// naming the plugin rather than vanishing silently.
+    #[tokio::test]
+    async fn an_event_for_a_closed_channel_is_refused_with_an_error_naming_the_plugin() {
+        let (tx, rx) = mpsc::channel(OUTGOING_CHANNEL_CAPACITY);
+        let channel = channel_over("gone-plugin", tx);
+        drop(rx);
+
+        let error = channel
+            .send_event(plugin_event(0))
+            .expect_err("a closed channel takes no event");
+        assert_eq!(error, "Channel closed for plugin 'gone-plugin'");
     }
 }

@@ -12,7 +12,9 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use temps_auth::{permission_guard, RequireAuth};
 use temps_core::problemdetails::Problem;
-use temps_query::{ContainerInfo, ContainerPath, EntityInfo, QueryBudget, QueryOptions};
+use temps_providers_core::query::{
+    ContainerInfo, ContainerPath, EntityInfo, QueryBudget, QueryOptions,
+};
 use utoipa::ToSchema;
 
 use super::audit::{AiBackendCategory, AiEntityCategory, AiRowsReadAudit};
@@ -63,8 +65,8 @@ impl From<ContainerInfo> for ContainerResponse {
                 .map(|t| t.to_string()),
             entity_type_label: info.capabilities.entity_type_label,
             entity_count_hint: info.capabilities.entity_count_hint.map(|hint| match hint {
-                temps_query::EntityCountHint::Small => "small".to_string(),
-                temps_query::EntityCountHint::Large => "large".to_string(),
+                temps_providers_core::query::EntityCountHint::Small => "small".to_string(),
+                temps_providers_core::query::EntityCountHint::Large => "large".to_string(),
             }),
             metadata: serde_json::to_value(info.metadata).unwrap_or_default(),
         }
@@ -315,7 +317,7 @@ fn query_budget(is_ai_call: bool) -> QueryBudget {
     }
 }
 
-fn data_rows_to_json(rows: Vec<temps_query::DataRow>) -> Vec<serde_json::Value> {
+fn data_rows_to_json(rows: Vec<temps_providers_core::query::DataRow>) -> Vec<serde_json::Value> {
     rows.into_iter()
         .map(|row| serde_json::Value::Object(row.into_iter().collect()))
         .collect()
@@ -332,15 +334,19 @@ fn filter_shape(filter: Option<&serde_json::Value>) -> Option<String> {
         .map(str::to_string)
 }
 
-fn query_error_problem(error: temps_query::DataError, service_id: i32, limit: usize) -> Problem {
+fn query_error_problem(
+    error: temps_providers_core::query::DataError,
+    service_id: i32,
+    limit: usize,
+) -> Problem {
     let (status, title, kind, safe_detail) = match &error {
-        temps_query::DataError::ResultLimitExceeded { .. } => (
+        temps_providers_core::query::DataError::ResultLimitExceeded { .. } => (
             StatusCode::PAYLOAD_TOO_LARGE,
             "Query Result Too Large",
             "result_limit_exceeded",
             Some("The query result exceeds the configured response limits".to_string()),
         ),
-        temps_query::DataError::InvalidQuery(_) => (
+        temps_providers_core::query::DataError::InvalidQuery(_) => (
             StatusCode::BAD_REQUEST,
             "Invalid Query",
             "invalid_query",
@@ -348,23 +354,23 @@ fn query_error_problem(error: temps_query::DataError, service_id: i32, limit: us
         ),
         // The detail carries only the caller's own container path, depth and
         // the backend's limit, so it is safe to return verbatim.
-        temps_query::DataError::ContainerPathTooDeep { .. } => (
+        temps_providers_core::query::DataError::ContainerPathTooDeep { .. } => (
             StatusCode::BAD_REQUEST,
             "Invalid Container Path",
             "container_path_too_deep",
             Some(error.to_string()),
         ),
-        temps_query::DataError::QueryFailed(_)
-        | temps_query::DataError::BackendQueryFailed { .. } => (
+        temps_providers_core::query::DataError::QueryFailed(_)
+        | temps_providers_core::query::DataError::BackendQueryFailed { .. } => (
             StatusCode::BAD_REQUEST,
             "Query Failed",
             "backend_query_failed",
             None,
         ),
-        temps_query::DataError::NotFound(_) => {
+        temps_providers_core::query::DataError::NotFound(_) => {
             (StatusCode::NOT_FOUND, "Not Found", "not_found", None)
         }
-        temps_query::DataError::QueryTimeout(_) => (
+        temps_providers_core::query::DataError::QueryTimeout(_) => (
             StatusCode::GATEWAY_TIMEOUT,
             "Query Timed Out",
             "query_timeout",
@@ -390,20 +396,20 @@ fn query_error_problem(error: temps_query::DataError, service_id: i32, limit: us
     problem
 }
 
-/// Map a [`temps_query::DataError`] raised while *navigating* a data source
+/// Map a [`temps_providers_core::query::DataError`] raised while *navigating* a data source
 /// (listing containers/entities, reading container or entity info) to an HTTP
 /// problem. `operation` completes "Failed to ..." in the detail.
 ///
 /// Client mistakes (a path deeper than the backend's hierarchy, a malformed
 /// request, an unknown container) are 4xx; only backend/infrastructure
 /// failures are 5xx. The match is exhaustive on purpose: adding a
-/// [`temps_query::DataError`] variant must force a decision here.
+/// [`temps_providers_core::query::DataError`] variant must force a decision here.
 fn navigation_error_problem(
-    error: temps_query::DataError,
+    error: temps_providers_core::query::DataError,
     service_id: i32,
     operation: &str,
 ) -> Problem {
-    use temps_query::DataError;
+    use temps_providers_core::query::DataError;
 
     let (status, title) = match &error {
         DataError::ContainerPathTooDeep { .. } => {
@@ -1399,11 +1405,13 @@ pub async fn download_object(
         .await
         .map_err(|e| {
             let (status, title) = match &e {
-                temps_query::DataError::NotFound(_) => (StatusCode::NOT_FOUND, "Object Not Found"),
-                temps_query::DataError::InvalidQuery(_) => {
+                temps_providers_core::query::DataError::NotFound(_) => {
+                    (StatusCode::NOT_FOUND, "Object Not Found")
+                }
+                temps_providers_core::query::DataError::InvalidQuery(_) => {
                     (StatusCode::BAD_REQUEST, "Invalid Request")
                 }
-                temps_query::DataError::OperationNotSupported(_) => {
+                temps_providers_core::query::DataError::OperationNotSupported(_) => {
                     (StatusCode::BAD_REQUEST, "Operation Not Supported")
                 }
                 _ => (StatusCode::INTERNAL_SERVER_ERROR, "Download Error"),
@@ -1552,7 +1560,7 @@ mod tests {
     fn query_error_problem_does_not_echo_backend_diagnostics() {
         let secret = "alice@example.com tok_live_secret";
         let problem = query_error_problem(
-            temps_query::DataError::QueryFailed(format!("syntax near {secret}")),
+            temps_providers_core::query::DataError::QueryFailed(format!("syntax near {secret}")),
             7,
             100,
         );
@@ -1565,7 +1573,7 @@ mod tests {
     fn navigating_below_a_leaf_container_is_a_bad_request_not_a_server_error() {
         // Reported as a 500 when the console asked for the child containers
         // of a PostgreSQL schema.
-        let error = temps_query::DataError::container_path_too_deep(
+        let error = temps_providers_core::query::DataError::container_path_too_deep(
             "PostgreSQL",
             &ContainerPath::from_slice(&["appdb", "pg_catalog"]),
             2,
@@ -1584,7 +1592,7 @@ mod tests {
 
     #[test]
     fn navigation_errors_are_classified_by_who_caused_them() {
-        use temps_query::DataError;
+        use temps_providers_core::query::DataError;
         let status_of =
             |error: DataError| navigation_error_problem(error, 7, "list entities").status_code;
 
@@ -1612,7 +1620,7 @@ mod tests {
 
     #[test]
     fn data_query_with_too_deep_container_path_is_a_bad_request() {
-        let error = temps_query::DataError::container_path_too_deep(
+        let error = temps_providers_core::query::DataError::container_path_too_deep(
             "S3",
             &ContainerPath::from_slice(&["bucket", "prefix"]),
             1,
@@ -1624,7 +1632,7 @@ mod tests {
     #[test]
     fn invalid_query_problem_does_not_echo_submitted_values() {
         let problem = query_error_problem(
-            temps_query::DataError::InvalidQuery(
+            temps_providers_core::query::DataError::InvalidQuery(
                 "invalid email alice@example.com with tok_live_secret".to_string(),
             ),
             7,
@@ -1639,7 +1647,7 @@ mod tests {
     #[test]
     fn result_limit_problem_does_not_echo_sensitive_entity_name() {
         let problem = query_error_problem(
-            temps_query::DataError::ResultLimitExceeded {
+            temps_providers_core::query::DataError::ResultLimitExceeded {
                 entity: "session:tok_live_secret:alice@example.com".to_string(),
                 limit_kind: "wire_cell_bytes",
                 limit: 64,

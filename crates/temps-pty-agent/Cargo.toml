@@ -5,6 +5,7 @@
 name = "temps-pty-agent"
 version.workspace = true
 edition.workspace = true
+description = "In-sandbox PTY multiplexer binary and its framed protocol, serving workspace terminals over a Unix socket"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -31,10 +32,13 @@ bytes = { workspace = true }
 
 # PTY handling. nix gives us openpty + ioctl(TIOCSWINSZ) for resize, and
 # libc signals. Linux-only — that's fine, the sandbox is always Linux.
-nix = { version = "0.31", features = ["fs", "ioctl", "process", "signal", "term", "poll"] }
+nix = { workspace = true, features = ["fs", "ioctl", "process", "signal", "term", "poll"] }
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+libc = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+[lints]
+workspace = true

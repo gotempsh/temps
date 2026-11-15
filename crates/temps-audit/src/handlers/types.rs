@@ -76,6 +76,8 @@ pub struct AuditLogIpInfo {
 #[derive(Deserialize, Clone, ToSchema, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct ListAuditLogsQuery {
+    /// Resource ID, including child events for a vault (omit for all resources).
+    pub resource_id: Option<String>,
     /// Filter logs by operation type (omit for all)
     #[param(example = "user.login")]
     pub operation_type: Option<String>,

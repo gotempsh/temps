@@ -268,7 +268,7 @@ pub async fn get_api_key(
 }
 
 #[utoipa::path(
-    put,
+    patch,
     path = "/api-keys/{id}",
     params(
         ("id" = i32, Path, description = "API key ID")
@@ -565,7 +565,7 @@ mod tests {
         async fn create_audit_log(
             &self,
             _operation: &dyn temps_core::AuditOperation,
-        ) -> temps_core::anyhow::Result<()> {
+        ) -> temps_core::AuditResult<()> {
             Ok(())
         }
     }

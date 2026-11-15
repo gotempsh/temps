@@ -1,0 +1,32 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "temps-schema"
+version.workspace = true
+edition.workspace = true
+description = "Startup schema guard, migration runner and post-migration index and backfill maintenance"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+temps-core = { path = "../temps-core" }
+temps-database = { path = "../temps-database" }
+temps-migrations = { path = "../temps-migrations" }
+sea-orm = { workspace = true, features = ["runtime-tokio-native-tls", "sqlx-postgres"] }
+sea-orm-migration = { workspace = true }
+sqlx = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+temps-test-utils = { path = "../temps-test-utils" }
+anyhow = { workspace = true }
+testcontainers = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

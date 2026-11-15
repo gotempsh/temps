@@ -3,10 +3,10 @@
 
 use serde::{Deserialize, Serialize};
 use temps_core::docker_socket_grant::DockerSocketCapability;
-use temps_core::templates::{EnvVarTemplate, ServiceTemplateInstance, TemplateService};
 use temps_core::UtcDateTime;
 use temps_entities::deployment_config::DeploymentConfig;
 use temps_entities::source_type::SourceType;
+use temps_presets::templates::{EnvVarTemplate, ServiceTemplateInstance, TemplateService};
 use utoipa::ToSchema;
 
 use crate::services::custom_domains::CustomDomainService;
@@ -30,6 +30,9 @@ pub struct AppState {
     pub config_service: Arc<temps_config::ConfigService>,
     pub public_hostname_resolver: Arc<dyn temps_core::PublicHostnameResolver>,
     pub project_archive_cleaner: Arc<dyn temps_core::ProjectArchiveCleaner>,
+    /// Removes a deleted project's built images from the runtimes holding
+    /// them, best-effort, after its rows are gone.
+    pub project_image_cleaner: Arc<dyn temps_core::ProjectImageCleaner>,
     pub telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
     /// Optional checker enforcing team-based project access for human sessions.
     ///
@@ -47,10 +50,14 @@ pub struct AppState {
     /// in the handler, so the challenge cannot drift away from the guard it
     /// protects. See [`temps_core::SensitiveActionAuthorizer`].
     pub sensitive_action_authorizer: Arc<dyn temps_core::SensitiveActionAuthorizer>,
-    /// Optional hook run right after the deletion fence commits, so features
-    /// that serve project data publicly stop doing so before cleanup starts.
-    /// `None` when no plugin registers one.
-    pub project_deletion_hook: Option<Arc<dyn temps_core::ProjectDeletionHook>>,
+    /// Hooks run right after the deletion fence commits and before the
+    /// project's rows are deleted, so features that serve project data
+    /// publicly stop doing so before cleanup starts, and features that run
+    /// something for the project (functions) retire it while their rows
+    /// still say what to retire. Registered by plugins; empty when none
+    /// does. A failing hook fails the deletion, leaving the project fenced
+    /// for a retried `DELETE`.
+    pub project_deletion_hooks: Arc<temps_core::ProjectDeletionHooks>,
 }
 
 // Domain-related types
@@ -693,6 +700,10 @@ impl ProjectResponse {
                     .deployment_config
                     .clone()
                     .and_then(|c| c.health_check_timeout_seconds),
+                stop_timeout_seconds: project
+                    .deployment_config
+                    .as_ref()
+                    .and_then(|c| c.stop_timeout_seconds),
                 container_exec_enabled: project
                     .deployment_config
                     .clone()
@@ -894,6 +905,12 @@ pub struct UpdateDeploymentConfigRequest {
     /// 300 seconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health_check_timeout_seconds: Option<i32>,
+    /// How long, in seconds (1-3600), the previous deployment's containers get
+    /// to finish in-flight requests after SIGTERM, once a new deployment is
+    /// live, before they are killed. Absent leaves the current value
+    /// unchanged; the platform default is 10 seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_timeout_seconds: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health: Option<temps_core::repo_config::HealthCheckConfig>,
 }
@@ -1414,6 +1431,12 @@ impl From<ProjectError> for Problem {
                     .with_detail(error.to_string())
             }
 
+            ProjectError::TelemetryDetachPending { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Database Maintenance Pending")
+                    .with_detail(error.to_string())
+            }
+
             ProjectError::Other(msg) => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Internal Server Error")
                 .with_detail(msg),
@@ -1501,6 +1524,11 @@ impl From<crate::services::custom_domains::CustomDomainError> for Problem {
             CustomDomainError::DeliveryBindingBlocksChange { .. } => {
                 problemdetails::new(StatusCode::CONFLICT)
                     .with_title("Domain delivery is configured")
+                    .with_detail(error.to_string())
+            }
+            CustomDomainError::InvalidRedirectStatusCode { .. } => {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Invalid Redirect Status Code")
                     .with_detail(error.to_string())
             }
             CustomDomainError::InvalidRedirectUrl(msg) => {
@@ -1690,6 +1718,7 @@ mod tests {
             gate_access_aud: None,
             private_via: None,
             private_service: None,
+            http_policy: None,
         };
         let response = CustomDomainLookupResponse::from(Some(CustomDomainWithInfo {
             custom_domain: model,

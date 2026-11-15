@@ -108,7 +108,7 @@ impl TestDBMockOperations {
     ) -> Result<custom_routes::Model, Box<dyn std::error::Error>> {
         let custom_route = custom_routes::ActiveModel {
             domain: Set(domain.to_string()),
-            host: Set("localhost".to_string()),
+            host: Set("8.8.8.8".to_string()),
             port: Set(8080),
             enabled: Set(true),
             ..Default::default()

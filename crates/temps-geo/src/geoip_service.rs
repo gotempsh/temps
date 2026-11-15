@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use arc_swap::ArcSwap;
+use arc_swap::ArcSwapOption;
 use maxminddb::geoip2;
 use maxminddb::Mmap;
 use rand::prelude::IndexedRandom;
@@ -13,10 +13,13 @@ use std::sync::{Arc, LazyLock, Mutex, Weak};
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Clone, Default)]
 pub struct GeoLocation {
     pub country: Option<String>,
     pub country_code: Option<String>,
+    /// Two-letter continent code (`EU`, `NA`, ...). Not stored with the IP
+    /// row; filled only by a live database lookup.
+    pub continent_code: Option<String>,
     pub city: Option<String>,
     pub latitude: Option<f64>,
     pub longitude: Option<f64>,
@@ -26,12 +29,152 @@ pub struct GeoLocation {
     /// The organization that owns the ASN this IP belongs to (e.g. "Hetzner Online GmbH").
     /// `None` when the ASN database isn't available or the ASN has no organization on file.
     pub asn_org: Option<String>,
-    /// Best-effort heuristic: does `asn_org` match a known hosting/cloud/VPS provider
-    /// pattern? Datacenter IPs are never real end-user visitors, so this flags traffic
-    /// (often scrapers spoofing a real browser user-agent) that the user-agent-based
-    /// bot detector in temps-analytics-events can't catch. `None` when the ASN database
-    /// isn't available (can't tell either way).
+    /// The autonomous system number this IP is announced from (e.g. 24940 for
+    /// Hetzner). `None` when the ASN database isn't available or has no entry.
+    pub asn_number: Option<u32>,
+    /// Best-effort classification: is this IP announced by a known hosting/cloud/VPS
+    /// network? Datacenter IPs are almost never real end-user visitors, so this flags
+    /// traffic (often scrapers spoofing a real browser user-agent) that the
+    /// user-agent-based bot detector in temps-analytics-events can't catch. Decided
+    /// by [`classify_hosting`]. `None` when the ASN database isn't available (can't
+    /// tell either way).
     pub is_hosting_provider: Option<bool>,
+}
+
+/// Version of the [`classify_hosting`] rules. Stored on every
+/// `ip_geolocations` row the rules were applied to, so a row classified by an
+/// older version (or before the ASN database was available at all) is
+/// re-resolved on its next lookup instead of keeping a stale verdict until the
+/// generic staleness window expires. Bump it whenever [`DATACENTER_ASNS`],
+/// [`PRIVACY_RELAY_ASNS`], [`VPN_EGRESS_ASNS`] or [`HOSTING_ORG_PATTERNS`]
+/// change.
+pub const HOSTING_CLASSIFIER_VERSION: i16 = 1;
+
+/// Autonomous systems operated by cloud, hosting and VPS providers whose
+/// organization name carries no keyword [`HOSTING_ORG_PATTERNS`] could match
+/// (Tencent's ASN org is a street address, Alibaba's and Google Cloud's are
+/// plain company names), plus the largest providers for good measure. Matched
+/// by number, so a renamed organization cannot slip through.
+///
+/// Deliberately limited to networks that sell compute. Google's and
+/// Microsoft's *corporate/consumer* ASNs are not listed for that reason;
+/// Google Cloud (396982) and Azure (8075) are, accepting that some corporate
+/// egress shares them.
+const DATACENTER_ASNS: &[u32] = &[
+    // Amazon Web Services
+    16509, 14618, 8987, 7224, 214101, //
+    // Google Cloud
+    396982, 214609, 214611, //
+    // Microsoft Azure
+    8075, //
+    // Oracle Cloud
+    31898, //
+    // IBM Cloud
+    36351, //
+    // Alibaba Cloud
+    45102, 37963, 24429, 134963, 203513, //
+    // Tencent Cloud
+    132203, 45090, 133478, 137876, //
+    // Huawei Cloud
+    136907, 55990, 131444, //
+    // ByteDance / TikTok / BytePlus / Volcano Engine
+    396986, 138699, 137718, 150436, //
+    // Baidu
+    38365, 55967, //
+    // Kingsoft Cloud, UCloud
+    59019, 135377, //
+    // DigitalOcean
+    14061, 46652, 393406, //
+    // Akamai Connected Cloud (Linode)
+    63949, //
+    // Vultr (The Constant Company)
+    20473, //
+    // OVHcloud
+    16276, 35540, //
+    // Hetzner
+    24940, 213230, //
+    // Scaleway
+    12876, //
+    // Contabo
+    51167, //
+    // Leaseweb
+    60781, 28753, 30633, //
+    // Hostinger
+    47583, //
+    // Psychz, HostPapa (ColoCrossing), Sharktech
+    40676, 36352, 46844, //
+    // G-Core Labs
+    199524, //
+    // Fly.io, Render, Railway
+    40509, 397273, 400940, //
+];
+
+/// Autonomous systems that carry privacy relays real people browse through
+/// (iCloud Private Relay egresses via Cloudflare, Akamai and Fastly; WARP via
+/// Cloudflare). They also host compute, but treating them as datacenters would
+/// silently drop a large share of real Safari and mobile visitors, so they are
+/// never classified as hosting -- the same trade-off other privacy-focused
+/// analytics tools make by keeping VPN and relay traffic.
+const PRIVACY_RELAY_ASNS: &[u32] = &[
+    13335,  // Cloudflare (iCloud Private Relay, WARP)
+    209242, // Cloudflare London (WARP)
+    36183,  // Akamai (iCloud Private Relay)
+    20940,  // Akamai International
+    54113,  // Fastly (iCloud Private Relay)
+];
+
+/// Hosting networks that consumer VPN services rent most of their exit
+/// servers from. A large share of their web traffic is real people on a
+/// commercial VPN, and datacenter exclusion is on by default, so they are
+/// never classified as hosting: a project that wants them out adds a network
+/// filter instead. (Clouvider's name would otherwise match the `"cloud"`
+/// pattern.)
+const VPN_EGRESS_ASNS: &[u32] = &[
+    9009,  // M247
+    60068, // Datacamp / CDN77
+    62240, // Clouvider
+    21859, // Zenlayer
+];
+
+/// Organization-name counterpart of [`PRIVACY_RELAY_ASNS`]: Cloudflare
+/// announces from a dozen regional ASNs, and every one of them would otherwise
+/// match the `"cloud"` hosting pattern.
+const PRIVACY_RELAY_ORG_PATTERNS: &[&str] = &["cloudflare"];
+
+/// Decide whether an ASN belongs to a hosting/cloud/VPS provider.
+///
+/// Order matters: the privacy-relay and VPN-egress allowlists win over
+/// everything, the curated ASN list is checked next, and the
+/// organization-name heuristic is only a fallback for networks the list
+/// doesn't know about.
+pub fn classify_hosting(asn_number: Option<u32>, asn_org: Option<&str>) -> bool {
+    if asn_number.is_some_and(|number| {
+        PRIVACY_RELAY_ASNS.contains(&number) || VPN_EGRESS_ASNS.contains(&number)
+    }) {
+        return false;
+    }
+    let org_lower = asn_org.map(|org| org.trim().to_lowercase());
+    if let Some(org) = org_lower.as_deref() {
+        if PRIVACY_RELAY_ORG_PATTERNS
+            .iter()
+            .any(|pat| org.contains(pat))
+        {
+            return false;
+        }
+    }
+    if asn_number.is_some_and(|number| DATACENTER_ASNS.contains(&number)) {
+        return true;
+    }
+    asn_org.map(is_hosting_org).unwrap_or(false)
+}
+
+/// Result of an ASN lookup for one IP. All `None` means "unknown" (no ASN
+/// database, or the lookup failed).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct AsnLookup {
+    org: Option<String>,
+    number: Option<u32>,
+    is_hosting_provider: Option<bool>,
 }
 
 /// Substring patterns (lowercased) matched against an ASN organization name to
@@ -104,6 +247,15 @@ pub enum GeoIpError {
     DatabaseError(#[from] maxminddb::MaxMindDbError),
     #[error("IP address not found in database")]
     NotFound(String),
+    /// No city database is loaded: the file was missing at startup and nothing
+    /// has provided it since. Geolocation is degraded rather than broken, and
+    /// the file watcher loads the database as soon as the file appears.
+    #[error(
+        "No GeoLite2 city database is loaded, so {ip} cannot be geolocated. Add a MaxMind \
+         license key in the geolocation settings, or copy GeoLite2-City.mmdb into the data \
+         directory"
+    )]
+    DatabaseNotLoaded { ip: IpAddr },
     /// A private, loopback, link-local, CGNAT, documentation or other
     /// special-use address. No GeoIP database can place it, so it is
     /// answered without a lookup. Expected for traffic from a container
@@ -151,6 +303,12 @@ pub enum GeoIpError {
     WriteFailed { path: String, reason: String },
     #[error("Failed to load geo database from '{path}' after refresh: {reason}")]
     ReloadFailed { path: String, reason: String },
+    #[error("'{path}' holds a '{found}' database, not the expected {expected}")]
+    WrongDatabaseKind {
+        path: String,
+        expected: &'static str,
+        found: String,
+    },
     #[error("Database error while accessing geo database refresh metadata: {0}")]
     Database(#[from] sea_orm::DbErr),
     /// Reading or writing `AppSettings::geo` failed. The geo refresh policy,
@@ -159,9 +317,9 @@ pub enum GeoIpError {
     #[error("Failed to access the geolocation settings: {0}")]
     Settings(#[from] temps_config::ConfigServiceError),
     /// The MaxMind license key could not be encrypted on write or decrypted on
-    /// read. Never carries key material -- see `temps_core::GeoSettingsError`.
+    /// read. Never carries key material -- see `temps_config::GeoSettingsError`.
     #[error("{0}")]
-    LicenseKey(#[from] temps_core::GeoSettingsError),
+    LicenseKey(#[from] temps_config::GeoSettingsError),
 }
 
 impl GeoIpError {
@@ -323,6 +481,11 @@ where
 /// working directory isn't its data directory (e.g. any Docker/systemd
 /// deployment that doesn't `cd` into `TEMPS_DATA_DIR` before running) would
 /// have downloaded the file to `TEMPS_DATA_DIR` but only ever looked in CWD.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "bootstrap: TEMPS_DATA_DIR locates the data directory before any database exists \
+              (CLAUDE.md bootstrap exception)"
+)]
 pub fn resolve_mmdb_path(filename: &str) -> std::path::PathBuf {
     let cwd = std::env::current_dir().unwrap_or_default();
     let data_dir = std::env::var_os("TEMPS_DATA_DIR").map(std::path::PathBuf::from);
@@ -431,53 +594,59 @@ fn open_mmdb(
     }
 }
 
+/// Refuse a readable database of the wrong kind. Opening a file only proves it is
+/// an `.mmdb`: a City file saved under the ASN name would load, decode to empty
+/// records and classify every address as "not hosting".
+fn ensure_database_kind(
+    kind: crate::refresh::GeoDatabaseKind,
+    path: &std::path::Path,
+    reader: &maxminddb::Reader<MmdbSource>,
+) -> Result<(), GeoIpError> {
+    let database_type = &reader.metadata().database_type;
+    if kind.accepts_database_type(database_type) {
+        return Ok(());
+    }
+    Err(GeoIpError::WrongDatabaseKind {
+        path: path.display().to_string(),
+        expected: kind.filename(),
+        found: database_type.clone(),
+    })
+}
+
+/// Whether `TEMPS_GEO_MOCK=true` asks for the in-memory mock geolocation
+/// service instead of the MaxMind database.
+///
+/// Deliberately an environment variable and never a setting: it is a
+/// development/test toggle (local `temps serve` without a GeoLite2 download,
+/// and the `temps-proxy` test suites, which set it before calling
+/// [`GeoIpService::new`]). Making it an admin-editable setting would let a
+/// production instance silently geolocate every visitor to fake data. Code
+/// that wants a mock should construct `GeoIpService::Mock(MockGeoIpService::new())`
+/// directly.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "development/test-only toggle that must never be a runtime setting; see doc comment"
+)]
+pub fn geo_mock_requested() -> bool {
+    parse_geo_mock_flag(std::env::var("TEMPS_GEO_MOCK").ok().as_deref())
+}
+
+fn parse_geo_mock_flag(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v.trim().eq_ignore_ascii_case("true"))
+}
+
 impl GeoIpService {
     pub fn new() -> Result<Self, GeoIpError> {
         // Check if we should use mock service for local development
-        let use_mock = std::env::var("TEMPS_GEO_MOCK")
-            .map(|v| v.to_lowercase() == "true")
-            .unwrap_or(false);
-
-        if use_mock {
+        if geo_mock_requested() {
             info!("Using mock GeoIP service for local development");
             return Ok(Self::Mock(MockGeoIpService::new()));
         }
 
         let db_path = resolve_mmdb_path("GeoLite2-City.mmdb");
         let service = get_or_load(&LOADED_DATABASES, db_path.clone(), || {
-            debug!("Loading MaxMind database from: {:?}", db_path);
-            let reader = open_mmdb(&db_path).map_err(|e| {
-                GeoIpError::Other(format!(
-                    "Failed to open MaxMind database at '{}': {}",
-                    db_path.display(),
-                    e
-                ))
-            })?;
-
-            // ASN database is optional: hosting-provider detection degrades gracefully
-            // (asn_org/is_hosting_provider stay None) rather than failing startup when
-            // the operator hasn't provisioned it, same as the City database's own
-            // optional-file convention in Dockerfile/docker-compose.
             let asn_db_path = resolve_mmdb_path("GeoLite2-ASN.mmdb");
-            let asn_reader = match open_mmdb(&asn_db_path) {
-                Ok(reader) => {
-                    info!("Loaded MaxMind ASN database from: {:?}", asn_db_path);
-                    Some(reader)
-                }
-                Err(e) => {
-                    warn!(
-                        "MaxMind ASN database not found at '{}' ({}); hosting-provider detection disabled",
-                        asn_db_path.display(),
-                        e
-                    );
-                    None
-                }
-            };
-
-            Ok(MaxMindGeoIpService {
-                reader: ArcSwap::from_pointee(reader),
-                asn_reader,
-            })
+            MaxMindGeoIpService::load(&db_path, &asn_db_path)
         })?;
 
         Ok(Self::MaxMind(service))
@@ -498,8 +667,9 @@ impl GeoIpService {
             reason: e.to_string(),
         })?;
         Ok(Self::MaxMind(Arc::new(MaxMindGeoIpService {
-            reader: ArcSwap::from_pointee(reader),
-            asn_reader: None,
+            reader: ArcSwapOption::from_pointee(reader),
+            asn_reader: ArcSwapOption::empty(),
+            databases_arrived: std::sync::atomic::AtomicU64::new(0),
         })))
     }
 
@@ -554,8 +724,9 @@ impl GeoIpService {
                     path: path.display().to_string(),
                     reason: e.to_string(),
                 })?;
+                ensure_database_kind(crate::refresh::GeoDatabaseKind::City, path, &reader)?;
                 let build_epoch = reader.metadata().build_epoch;
-                if build_epoch == service.build_epoch() {
+                if service.build_epoch() == Some(build_epoch) {
                     return Ok(None);
                 }
                 service.refresh(reader);
@@ -569,11 +740,68 @@ impl GeoIpService {
         }
     }
 
+    /// Reload the ASN database from `path`, but only when the file holds a
+    /// different build than the one loaded. Returns the new `build_epoch` when a
+    /// swap happened. See [`Self::refresh_from_path_if_changed`].
+    pub fn refresh_asn_from_path_if_changed(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<Option<u64>, GeoIpError> {
+        match self {
+            Self::MaxMind(service) => {
+                let reader = open_mmdb(path).map_err(|e| GeoIpError::ReloadFailed {
+                    path: path.display().to_string(),
+                    reason: e.to_string(),
+                })?;
+                ensure_database_kind(crate::refresh::GeoDatabaseKind::Asn, path, &reader)?;
+                let build_epoch = reader.metadata().build_epoch;
+                if service.asn_build_epoch() == Some(build_epoch) {
+                    return Ok(None);
+                }
+                service.refresh_asn(reader);
+                Ok(Some(build_epoch))
+            }
+            Self::Mock(_) => Err(GeoIpError::ReloadFailed {
+                path: path.display().to_string(),
+                reason: "mock geo service is enabled (TEMPS_GEO_MOCK); no database is loaded"
+                    .to_string(),
+            }),
+        }
+    }
+
     /// `build_epoch` of the currently loaded city database, i.e. when MaxMind
-    /// built the data being served right now. `None` in mock mode.
+    /// built the data being served right now. `None` in mock mode and while no
+    /// city database is loaded.
     pub fn build_epoch(&self) -> Option<u64> {
         match self {
-            Self::MaxMind(service) => Some(service.build_epoch()),
+            Self::MaxMind(service) => service.build_epoch(),
+            Self::Mock(_) => None,
+        }
+    }
+
+    /// How many databases have become available since this service started. One
+    /// atomic read, for the lookup path. Always 0 in mock mode.
+    pub fn databases_arrived(&self) -> u64 {
+        match self {
+            Self::MaxMind(service) => service.databases_arrived(),
+            Self::Mock(_) => 0,
+        }
+    }
+
+    /// Whether an ASN database is loaded, i.e. whether hosting/datacenter
+    /// classification is active. Always `false` in mock mode.
+    pub fn has_asn_database(&self) -> bool {
+        match self {
+            Self::MaxMind(service) => service.has_asn_database(),
+            Self::Mock(_) => false,
+        }
+    }
+
+    /// `build_epoch` of the loaded ASN database. `None` when no ASN database
+    /// is loaded or in mock mode.
+    pub fn asn_build_epoch(&self) -> Option<u64> {
+        match self {
+            Self::MaxMind(service) => service.asn_build_epoch(),
             Self::Mock(_) => None,
         }
     }
@@ -582,12 +810,96 @@ impl GeoIpService {
 pub struct MaxMindGeoIpService {
     /// Swapped wholesale by the scheduled refresh job. `ArcSwap` keeps lookups
     /// lock-free on the proxy hot path while letting a background task publish
-    /// a newly downloaded database to every in-flight caller at once.
-    reader: ArcSwap<maxminddb::Reader<MmdbSource>>,
-    asn_reader: Option<maxminddb::Reader<MmdbSource>>,
+    /// a newly downloaded database to every in-flight caller at once. Empty
+    /// while the file is missing: a server without it still runs, and the
+    /// refresh job or the file watcher fills this in when the file arrives.
+    reader: ArcSwapOption<maxminddb::Reader<MmdbSource>>,
+    /// Swapped by the file watcher, so a database that arrives after startup
+    /// turns hosting classification on without a restart.
+    asn_reader: ArcSwapOption<maxminddb::Reader<MmdbSource>>,
+    /// How many times a database that was not loaded has become available. Lets
+    /// a cache tell, with one atomic read, whether what it holds was resolved
+    /// with less data than there is now. Replacing a loaded database does not
+    /// count: its answers were complete and stay valid until they expire.
+    databases_arrived: std::sync::atomic::AtomicU64,
 }
 
 impl MaxMindGeoIpService {
+    /// Open the databases at these paths. A missing city file is a degraded
+    /// server, not a failed one: lookups answer
+    /// [`GeoIpError::DatabaseNotLoaded`] until the file shows up. A file that is
+    /// there but cannot be read is still an error, since it means something is
+    /// wrong rather than not set up yet.
+    pub(crate) fn load(
+        db_path: &std::path::Path,
+        asn_db_path: &std::path::Path,
+    ) -> Result<Self, GeoIpError> {
+        debug!("Loading MaxMind database from: {:?}", db_path);
+        let reader = if db_path.exists() {
+            Some(open_mmdb(db_path).map_err(|e| {
+                GeoIpError::Other(format!(
+                    "Failed to open MaxMind database at '{}': {}",
+                    db_path.display(),
+                    e
+                ))
+            })?)
+        } else {
+            warn!(
+                path = %db_path.display(),
+                "GeoLite2 city database not found; starting without geolocation. Locations stay \
+                 empty until the file is provided: add a MaxMind license key in the geolocation \
+                 settings, or copy GeoLite2-City.mmdb to this path. No restart is needed"
+            );
+            None
+        };
+
+        // ASN database is optional: hosting-provider detection degrades gracefully
+        // (asn_org/is_hosting_provider stay None) rather than failing startup when
+        // the operator hasn't provisioned it, same as the City database's own
+        // optional-file convention in Dockerfile/docker-compose.
+        let asn_reader = match open_mmdb(asn_db_path)
+            .map_err(GeoIpError::from)
+            .and_then(|reader| {
+                ensure_database_kind(crate::refresh::GeoDatabaseKind::Asn, asn_db_path, &reader)?;
+                Ok(reader)
+            }) {
+            Ok(reader) => {
+                info!("Loaded MaxMind ASN database from: {:?}", asn_db_path);
+                Some(reader)
+            }
+            Err(e) => {
+                warn!(
+                    "No usable MaxMind ASN database at '{}' ({}); hosting-provider detection \
+                     stays off until the file is provided. No restart is needed",
+                    asn_db_path.display(),
+                    e
+                );
+                None
+            }
+        };
+
+        Ok(Self {
+            reader: ArcSwapOption::new(reader.map(Arc::new)),
+            asn_reader: ArcSwapOption::new(asn_reader.map(Arc::new)),
+            databases_arrived: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
+    /// The databases bundled with `temps-cli`, for tests in this crate that
+    /// need real ASN data. `None` when they are not present (e.g. a source
+    /// tarball without them), so callers can skip.
+    #[cfg(test)]
+    pub(crate) fn bundled_for_tests() -> Option<Self> {
+        let cli_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../temps-cli");
+        let city = open_mmdb(&cli_dir.join("GeoLite2-City.mmdb")).ok()?;
+        let asn = open_mmdb(&cli_dir.join("GeoLite2-ASN.mmdb")).ok()?;
+        Some(Self {
+            reader: ArcSwapOption::from_pointee(city),
+            asn_reader: ArcSwapOption::from_pointee(asn),
+            databases_arrived: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
     pub async fn geolocate(&self, ip: IpAddr) -> Result<GeoLocation, GeoIpError> {
         if !is_geolocatable(ip) {
             return Err(GeoIpError::NonGlobalAddress(ip));
@@ -597,17 +909,33 @@ impl MaxMindGeoIpService {
         // One snapshot per lookup: a concurrent refresh publishes a new reader
         // without disturbing this one, which stays alive until the guard drops.
         let reader = self.reader.load();
+        let Some(reader) = reader.as_ref() else {
+            return Err(GeoIpError::DatabaseNotLoaded { ip });
+        };
         let lookup_result = reader.lookup(ip)?;
 
         let city_data = lookup_result
             .decode::<geoip2::City>()
-            .map_err(|e| GeoIpError::Other(format!("Failed to decode city data: {}", e)))?
-            .ok_or_else(|| GeoIpError::NotFound(format!("No data found for IP: {}", ip)))?;
+            .map_err(|e| GeoIpError::Other(format!("Failed to decode city data: {}", e)))?;
+        let asn = self.lookup_asn(ip);
 
-        let mut geo_location = Self::extract_geo_location(&city_data);
-        let (asn_org, is_hosting_provider) = self.lookup_asn(ip);
-        geo_location.asn_org = asn_org;
-        geo_location.is_hosting_provider = is_hosting_provider;
+        // The City and ASN databases are built independently, and freshly
+        // announced cloud ranges regularly show up in the ASN data before they
+        // get a location. Without a city record the network is still worth
+        // returning: it is what datacenter exclusion and ASN rules act on.
+        let mut geo_location = match city_data {
+            Some(city_data) => Self::extract_geo_location(&city_data),
+            None if asn.number.is_some() => GeoLocation::default(),
+            None => {
+                return Err(GeoIpError::NotFound(format!(
+                    "No data found for IP: {}",
+                    ip
+                )))
+            }
+        };
+        geo_location.asn_org = asn.org;
+        geo_location.asn_number = asn.number;
+        geo_location.is_hosting_provider = asn.is_hosting_provider;
 
         Ok(geo_location)
     }
@@ -618,7 +946,8 @@ impl MaxMindGeoIpService {
     pub fn refresh(&self, new_reader: maxminddb::Reader<MmdbSource>) {
         let previous_epoch = self.build_epoch();
         let new_epoch = new_reader.metadata().build_epoch;
-        self.reader.store(Arc::new(new_reader));
+        let previous = self.reader.swap(Some(Arc::new(new_reader)));
+        self.note_arrival_if(previous.is_none());
         info!(
             previous_build_epoch = previous_epoch,
             new_build_epoch = new_epoch,
@@ -626,20 +955,67 @@ impl MaxMindGeoIpService {
         );
     }
 
-    /// `build_epoch` from the loaded database's metadata: the Unix timestamp
-    /// MaxMind stamped the build with, which is the real age of the data (a
-    /// freshly downloaded file can still hold a months-old build).
-    pub fn build_epoch(&self) -> u64 {
-        self.reader.load().metadata().build_epoch
+    /// Counted after the reader is published, so anyone who sees the new count
+    /// also sees the database.
+    fn note_arrival_if(&self, arrived: bool) {
+        if arrived {
+            self.databases_arrived
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
     }
 
-    /// Look up the ASN organization for `ip` and classify it as a hosting
-    /// provider. Any lookup/decode failure degrades to `(None, None)` rather
-    /// than failing the whole geolocation — the City lookup already succeeded
-    /// and callers shouldn't lose city/country data over an optional signal.
-    fn lookup_asn(&self, ip: IpAddr) -> (Option<String>, Option<bool>) {
-        let Some(asn_reader) = &self.asn_reader else {
-            return (None, None);
+    /// See [`GeoIpService::databases_arrived`].
+    pub fn databases_arrived(&self) -> u64 {
+        self.databases_arrived
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Publish `new_reader` as the ASN database for all subsequent lookups.
+    pub fn refresh_asn(&self, new_reader: maxminddb::Reader<MmdbSource>) {
+        let previous_epoch = self.asn_build_epoch();
+        let new_epoch = new_reader.metadata().build_epoch;
+        let previous = self.asn_reader.swap(Some(Arc::new(new_reader)));
+        self.note_arrival_if(previous.is_none());
+        info!(
+            previous_build_epoch = previous_epoch,
+            new_build_epoch = new_epoch,
+            "swapped in GeoLite2 ASN database"
+        );
+    }
+
+    /// `build_epoch` from the loaded database's metadata: the Unix timestamp
+    /// MaxMind stamped the build with, which is the real age of the data (a
+    /// freshly downloaded file can still hold a months-old build). `None` while
+    /// no city database is loaded.
+    pub fn build_epoch(&self) -> Option<u64> {
+        self.reader
+            .load()
+            .as_ref()
+            .map(|reader| reader.metadata().build_epoch)
+    }
+
+    /// Whether an ASN database is loaded, i.e. whether hosting-provider
+    /// classification is active at all.
+    pub fn has_asn_database(&self) -> bool {
+        self.asn_reader.load().is_some()
+    }
+
+    /// `build_epoch` of the loaded ASN database, `None` when none is loaded.
+    pub fn asn_build_epoch(&self) -> Option<u64> {
+        self.asn_reader
+            .load()
+            .as_ref()
+            .map(|reader| reader.metadata().build_epoch)
+    }
+
+    /// Look up the ASN for `ip` and classify it as a hosting provider. Any
+    /// lookup/decode failure degrades to "unknown" (all `None`) rather than
+    /// failing the whole geolocation — the City lookup already succeeded and
+    /// callers shouldn't lose city/country data over an optional signal.
+    fn lookup_asn(&self, ip: IpAddr) -> AsnLookup {
+        let asn_reader = self.asn_reader.load();
+        let Some(asn_reader) = asn_reader.as_ref() else {
+            return AsnLookup::default();
         };
 
         let asn_data = match asn_reader
@@ -647,23 +1023,36 @@ impl MaxMindGeoIpService {
             .and_then(|result| result.decode::<geoip2::Asn>())
         {
             Ok(Some(data)) => data,
-            Ok(None) => return (None, Some(false)),
+            // Not announced by any AS the database knows: a definite "not a
+            // known hosting network", not an unknown.
+            Ok(None) => {
+                return AsnLookup {
+                    is_hosting_provider: Some(false),
+                    ..AsnLookup::default()
+                }
+            }
             Err(e) => {
                 debug!("ASN lookup failed for IP {}: {}", ip, e);
-                return (None, None);
+                return AsnLookup::default();
             }
         };
 
         let org = asn_data.autonomous_system_organization.map(str::to_string);
-        let is_hosting = org.as_deref().map(is_hosting_org);
+        let number = asn_data.autonomous_system_number;
+        let is_hosting = classify_hosting(number, org.as_deref());
 
-        (org, is_hosting)
+        AsnLookup {
+            org,
+            number,
+            is_hosting_provider: Some(is_hosting),
+        }
     }
 
     fn extract_geo_location(city_data: &geoip2::City<'_>) -> GeoLocation {
         // Extract country information
         let country = city_data.country.names.english.map(String::from);
         let country_code = city_data.country.iso_code.map(String::from);
+        let continent_code = city_data.continent.code.map(String::from);
         let is_eu = city_data.country.is_in_european_union.unwrap_or(false);
 
         // Extract city name
@@ -684,6 +1073,7 @@ impl MaxMindGeoIpService {
         GeoLocation {
             country,
             country_code,
+            continent_code,
             city: city_name,
             latitude,
             longitude,
@@ -691,6 +1081,7 @@ impl MaxMindGeoIpService {
             timezone,
             is_eu,
             asn_org: None,
+            asn_number: None,
             is_hosting_provider: None,
         }
     }
@@ -722,6 +1113,7 @@ impl MockGeoIpService {
         Ok(GeoLocation {
             country: Some("Unknown".to_string()),
             country_code: Some("XX".to_string()),
+            continent_code: None,
             city: Some("Unknown".to_string()),
             latitude: Some(0.0),
             longitude: Some(0.0),
@@ -729,6 +1121,7 @@ impl MockGeoIpService {
             timezone: Some("UTC".to_string()),
             is_eu: false,
             asn_org: None,
+            asn_number: None,
             is_hosting_provider: None,
         })
     }
@@ -742,6 +1135,7 @@ impl MockGeoIpService {
         Ok(GeoLocation {
             country: Some(mock_city.country.to_string()),
             country_code: Some(mock_city.country_code.to_string()),
+            continent_code: None,
             city: Some(mock_city.city.to_string()),
             latitude: Some(mock_city.latitude),
             longitude: Some(mock_city.longitude),
@@ -749,6 +1143,7 @@ impl MockGeoIpService {
             timezone: Some(mock_city.timezone.to_string()),
             is_eu: mock_city.is_eu,
             asn_org: None,
+            asn_number: None,
             is_hosting_provider: None,
         })
     }
@@ -764,6 +1159,15 @@ impl MockGeoIpService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn geo_mock_flag_accepts_only_true() {
+        assert!(parse_geo_mock_flag(Some("true")));
+        assert!(parse_geo_mock_flag(Some(" TRUE ")));
+        assert!(!parse_geo_mock_flag(Some("1")));
+        assert!(!parse_geo_mock_flag(Some("false")));
+        assert!(!parse_geo_mock_flag(None));
+    }
 
     #[test]
     fn test_non_global_addresses_are_not_geolocatable() {
@@ -803,6 +1207,87 @@ mod tests {
         }
     }
 
+    /// `temps serve` used to exit about 30 seconds in on a host with no city
+    /// database and no way to download one. It starts instead, and lookups say
+    /// why they have no answer.
+    #[tokio::test]
+    async fn a_missing_city_database_degrades_instead_of_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = MaxMindGeoIpService::load(
+            &dir.path().join("GeoLite2-City.mmdb"),
+            &dir.path().join("GeoLite2-ASN.mmdb"),
+        )
+        .expect("a missing file must not fail startup");
+        let service = GeoIpService::MaxMind(Arc::new(service));
+
+        assert_eq!(service.build_epoch(), None);
+        assert!(!service.has_asn_database());
+
+        let ip: IpAddr = "8.8.8.8".parse().unwrap();
+        let error = service.geolocate(ip).await.unwrap_err();
+        assert!(matches!(error, GeoIpError::DatabaseNotLoaded { .. }));
+        // Not a miss: an expected miss is a verdict about the address, and
+        // `IpAddressService` stores it as "not a hosting network". No database
+        // says nothing about the address, so it goes through the failure path,
+        // which keeps the stored row and logs through a latch, not per visitor.
+        assert!(!error.is_expected_miss());
+        assert!(error.to_string().contains("8.8.8.8"));
+
+        // A private address is still answered without a lookup.
+        let private: IpAddr = "10.0.0.5".parse().unwrap();
+        assert!(matches!(
+            service.geolocate(private).await,
+            Err(GeoIpError::NonGlobalAddress(_))
+        ));
+    }
+
+    /// A file that is there but unreadable is something wrong, not something
+    /// not set up yet, and is still reported at startup.
+    #[test]
+    fn a_corrupt_city_database_still_fails_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let city = dir.path().join("GeoLite2-City.mmdb");
+        std::fs::write(&city, b"not a database").unwrap();
+
+        let error = MaxMindGeoIpService::load(&city, &dir.path().join("GeoLite2-ASN.mmdb"))
+            .err()
+            .expect("a corrupt file must fail");
+
+        assert!(error.to_string().contains("GeoLite2-City.mmdb"), "{error}");
+    }
+
+    /// The database a degraded server was missing starts answering lookups as
+    /// soon as it arrives, without a restart.
+    #[tokio::test]
+    async fn a_city_database_that_arrives_later_starts_serving_lookups() {
+        let bundled =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../temps-cli/GeoLite2-City.mmdb");
+        if !bundled.exists() {
+            eprintln!("Skipping: {} not present", bundled.display());
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let service = GeoIpService::MaxMind(Arc::new(
+            MaxMindGeoIpService::load(
+                &dir.path().join("GeoLite2-City.mmdb"),
+                &dir.path().join("GeoLite2-ASN.mmdb"),
+            )
+            .unwrap(),
+        ));
+
+        let epoch = service
+            .refresh_from_path_if_changed(&bundled)
+            .unwrap()
+            .expect("the first database is a change");
+
+        assert_eq!(service.build_epoch(), Some(epoch));
+        let ip: IpAddr = "8.8.8.8".parse().unwrap();
+        assert!(!matches!(
+            service.geolocate(ip).await,
+            Err(GeoIpError::DatabaseNotLoaded { .. })
+        ));
+    }
+
     #[test]
     fn test_expected_misses_are_distinguished_from_failures() {
         let private: IpAddr = "10.0.0.5".parse().unwrap();
@@ -823,8 +1308,11 @@ mod tests {
             return;
         }
         let service = MaxMindGeoIpService {
-            reader: ArcSwap::from_pointee(open_mmdb(&path).expect("open GeoLite2 city database")),
-            asn_reader: None,
+            reader: ArcSwapOption::from_pointee(
+                open_mmdb(&path).expect("open GeoLite2 city database"),
+            ),
+            asn_reader: ArcSwapOption::empty(),
+            databases_arrived: std::sync::atomic::AtomicU64::new(0),
         };
 
         let private: IpAddr = "172.17.0.2".parse().unwrap();
@@ -962,6 +1450,110 @@ mod tests {
         // any mapping is attempted.
         let missing = std::path::Path::new("/nonexistent/definitely-not-here.mmdb");
         assert!(open_mmdb(missing).is_err());
+    }
+
+    #[test]
+    fn classify_hosting_catches_clouds_whose_org_name_has_no_keyword() {
+        // Org names the substring heuristic alone misses.
+        assert!(!is_hosting_org("Tencent Building, Kejizhongyi Avenue"));
+        assert!(classify_hosting(
+            Some(132203),
+            Some("Tencent Building, Kejizhongyi Avenue")
+        ));
+        assert!(classify_hosting(
+            Some(45102),
+            Some("Alibaba (US) Technology Co., Ltd.")
+        ));
+        assert!(classify_hosting(Some(396982), Some("Google LLC")));
+    }
+
+    #[test]
+    fn classify_hosting_never_flags_privacy_relays() {
+        // "Cloudflare" contains "cloud", so the name heuristic alone would
+        // drop iCloud Private Relay and WARP users.
+        assert!(is_hosting_org("Cloudflare, Inc."));
+        assert!(!classify_hosting(Some(13335), Some("Cloudflare, Inc.")));
+        // A regional Cloudflare ASN that is not in the number list is still
+        // caught by the organization-name allowlist.
+        assert!(!classify_hosting(
+            Some(139242),
+            Some("Cloudflare Sydney, LLC")
+        ));
+        assert!(!classify_hosting(
+            Some(36183),
+            Some("Akamai Technologies, Inc.")
+        ));
+        assert!(!classify_hosting(Some(54113), Some("Fastly, Inc.")));
+    }
+
+    #[test]
+    fn classify_hosting_never_flags_consumer_vpn_egress_networks() {
+        // Default-on exclusion must not silently drop people on a commercial
+        // VPN, whose exits mostly sit in these networks.
+        assert!(!classify_hosting(Some(62240), Some("Clouvider Limited")));
+        assert!(!classify_hosting(Some(9009), Some("M247 Europe SRL")));
+        assert!(!classify_hosting(Some(60068), Some("Datacamp Limited")));
+        assert!(!classify_hosting(Some(21859), Some("Zenlayer Inc")));
+    }
+
+    #[test]
+    fn classify_hosting_falls_back_to_the_org_name() {
+        assert!(classify_hosting(Some(64500), Some("Example Hosting Ltd")));
+        assert!(classify_hosting(None, Some("Hetzner Online GmbH")));
+        assert!(!classify_hosting(
+            Some(7922),
+            Some("Comcast Cable Communications, LLC")
+        ));
+        assert!(!classify_hosting(None, None));
+        assert!(!classify_hosting(Some(64500), None));
+    }
+
+    /// Regression check against the ASN database shipped in the repository:
+    /// the public cloud ranges behind typical datacenter bot traffic are
+    /// classified as hosting, and privacy relays are not. Skips when the
+    /// bundled databases are not present (e.g. a source tarball without them).
+    #[tokio::test]
+    async fn bundled_asn_database_classifies_known_cloud_ranges() {
+        let cli_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../temps-cli");
+        let city_path = cli_dir.join("GeoLite2-City.mmdb");
+        let asn_path = cli_dir.join("GeoLite2-ASN.mmdb");
+        if !city_path.exists() || !asn_path.exists() {
+            println!("Bundled GeoLite2 databases not present, skipping");
+            return;
+        }
+        let service = MaxMindGeoIpService {
+            reader: ArcSwapOption::from_pointee(
+                open_mmdb(&city_path).expect("open bundled city db"),
+            ),
+            asn_reader: ArcSwapOption::from_pointee(
+                open_mmdb(&asn_path).expect("open bundled ASN db"),
+            ),
+            databases_arrived: std::sync::atomic::AtomicU64::new(0),
+        };
+        assert!(service.has_asn_database());
+
+        let cases: &[(&str, bool)] = &[
+            ("43.134.0.1", true),  // Tencent Cloud
+            ("47.74.0.1", true),   // Alibaba Cloud
+            ("34.87.0.1", true),   // Google Cloud
+            ("52.95.110.1", true), // AWS
+            ("165.22.0.1", true),  // DigitalOcean
+            ("1.1.1.1", false),    // Cloudflare (relay allowlist)
+            ("104.16.0.1", false), // Cloudflare (relay allowlist)
+        ];
+        for (ip, expected) in cases {
+            let ip: IpAddr = ip.parse().expect("valid test IP");
+            let location = service.geolocate(ip).await.expect("bundled db covers IP");
+            assert!(location.asn_number.is_some(), "{} should have an ASN", ip);
+            assert_eq!(
+                location.is_hosting_provider,
+                Some(*expected),
+                "{} (AS{:?} {:?})",
+                ip,
+                location.asn_number,
+                location.asn_org
+            );
+        }
     }
 
     #[test]

@@ -5,7 +5,6 @@ mod alerts;
 mod backup;
 mod capability;
 mod notifier;
-mod reconcile;
 mod restore;
 mod restore_cancel;
 mod restore_reconcile;
@@ -25,16 +24,15 @@ pub use backup::{
 };
 pub use capability::{BackupCapabilityError, ExternalServiceBackupCapability};
 pub use notifier::BackupNotificationAdapter;
-pub use reconcile::reconcile_orphan_backups;
 pub use restore::{
-    BackupProducerServices, BackupSelector, PlanSourceBackup, PlanTarget, RestoreError,
-    RestoreOriginBinding, RestorePlan, RestoreRequestMode, RestoreRunSourceBackup, RestoreRunView,
-    RestoreService, RestoreServiceIdentity,
+    BackupProducerServices, BackupSelector, ManagerWorkerRestoreResume, PlanSourceBackup,
+    PlanTarget, RestoreError, RestoreOriginBinding, RestorePlan, RestoreRequestMode,
+    RestoreRunSourceBackup, RestoreRunView, RestoreService, RestoreServiceIdentity,
 };
 pub use restore_cancel::{cancellable_phases, run_is_destructive, RestoreCancellations};
 pub use restore_reconcile::{
     active_restore_run_ids, reconcile_interrupted_restores, FenceTarget, ManagerRestoreFence,
-    RestoreHelperFence, RestoreReconcileReport, INTERRUPTED_STATUS,
+    RestoreHelperFence, RestoreReconcileReport, WorkerRestoreResume, INTERRUPTED_STATUS,
 };
 pub use s3_lifecycle::{ReconcileOutcome, S3LifecycleService};
 pub use s3_probe::S3ProbeFailureKind;

@@ -11,6 +11,7 @@ import {
   Globe,
   HardDrive,
   KeyRound,
+  ListFilter,
   Settings2,
   Shield,
   SlidersHorizontal,
@@ -87,6 +88,13 @@ const settingsGroups: SettingsGroup[] = [
         icon: Shield,
       },
       {
+        title: 'Edge rules',
+        description:
+          'Block, allow, challenge or redirect requests before they reach your app.',
+        url: 'settings/edge-rules',
+        icon: ListFilter,
+      },
+      {
         title: 'Access',
         description: 'Control who can view and change this service.',
         url: 'settings/access',
@@ -143,7 +151,7 @@ const settingsGroups: SettingsGroup[] = [
     items: [
       {
         title: 'Cron jobs',
-        description: 'Run commands on a schedule.',
+        description: 'Call endpoints of your app on a schedule.',
         url: 'settings/cron-jobs',
         icon: AlarmClock,
       },

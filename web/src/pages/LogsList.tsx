@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { PageHeader } from '@/components/layout/PageContainer'
 import {
   LogAttributeFilter,
   type LogAttributePredicate,
@@ -230,31 +231,28 @@ export default function LogsList({ project }: LogsListProps) {
 
   return (
     <div className="space-y-4">
-      {/* Header */}
-      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-        <div>
-          <h2 className="text-2xl font-bold tracking-tight">Logs</h2>
-          <p className="text-sm text-muted-foreground">
-            Structured application logs from OpenTelemetry and Sentry SDKs
-          </p>
-        </div>
-        <Button
-          aria-label="Refresh"
-          variant="ghost"
-          size="icon"
-          onClick={() => {
-            setQueryClock(Date.now())
-            setPage(1)
-            // Absolute windows and trace filters keep the same query key.
-            if (traceId || timeRange.startsWith('custom:')) void refetch()
-          }}
-          disabled={isFetching}
-        >
-          <RefreshCw
-            className={`h-4 w-4 ${isFetching ? 'animate-spin' : ''}`}
-          />
-        </Button>
-      </div>
+      <PageHeader
+        title="Telemetry logs"
+        description="Structured application logs from OpenTelemetry and Sentry SDKs."
+        actions={
+          <Button
+            aria-label="Refresh"
+            variant="ghost"
+            size="icon"
+            onClick={() => {
+              setQueryClock(Date.now())
+              setPage(1)
+              // Absolute windows and trace filters keep the same query key.
+              if (traceId || timeRange.startsWith('custom:')) void refetch()
+            }}
+            disabled={isFetching}
+          >
+            <RefreshCw
+              className={`h-4 w-4 ${isFetching ? 'animate-spin' : ''}`}
+            />
+          </Button>
+        }
+      />
 
       {/* Trace-correlation banner */}
       {traceId && (

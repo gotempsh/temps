@@ -15,6 +15,33 @@ import type { NodeCapabilityResponse as NodeCapability } from '@/api/client/type
  */
 export const WORKER_NODES_URL = '/settings/nodes'
 
+/**
+ * Anchors for the cards in the Worker Nodes page's collapsed "Advanced"
+ * section. Linking to one (`/settings/nodes#cluster-dns`) opens the section
+ * and scrolls to that card, so search and other pages can point at it.
+ */
+export const NODES_ADVANCED_SECTIONS = [
+  'mesh-hub',
+  'cluster-network',
+  'cluster-dns',
+  'cluster-trust',
+] as const
+
+export type NodesAdvancedSection = (typeof NODES_ADVANCED_SECTIONS)[number]
+
+/** The advanced card a location hash points at, if any. */
+export function nodesAdvancedSection(
+  hash: string
+): NodesAdvancedSection | null {
+  const id = hash.replace(/^#/, '')
+  return (NODES_ADVANCED_SECTIONS as readonly string[]).includes(id)
+    ? (id as NodesAdvancedSection)
+    : null
+}
+
+/** The Cluster DNS settings card (`*.temps.local` resolution). */
+export const CLUSTER_DNS_URL = `${WORKER_NODES_URL}#cluster-dns`
+
 /** Public documentation for joining a worker node (`temps join`). */
 export const WORKER_NODES_DOCS_URL = 'https://temps.sh/docs/multi-node'
 
@@ -327,4 +354,52 @@ export function nodeRemovalBlocker(removal: NodeRemoval): string | null {
     default:
       return null
   }
+}
+
+/**
+ * A Mac worker (ADR 090), as its agent reports in the heartbeat's
+ * `capacity.host`: its containers run in a Docker app's VM on a Mac. Such a
+ * worker suits development and personal use, and goes offline whenever the
+ * Mac sleeps, then reconnects on its own.
+ */
+export interface MacWorkerHost {
+  /** The Docker app holding its containers, when reported. */
+  dockerApp: string | null
+}
+
+const DOCKER_APP_NAMES: Record<string, string> = {
+  docker_desktop: 'Docker Desktop',
+  orb_stack: 'OrbStack',
+  colima: 'colima',
+  rancher_desktop: 'Rancher Desktop',
+}
+
+/** The Mac this node runs on, or `null` for any other worker. */
+export function macWorkerHost(capacity: unknown): MacWorkerHost | null {
+  if (!capacity || typeof capacity !== 'object') return null
+  const host = (capacity as Record<string, unknown>).host
+  if (!host || typeof host !== 'object') return null
+  const { os, docker_app: app } = host as Record<string, unknown>
+  if (os !== 'macos') return null
+  return {
+    dockerApp:
+      typeof app === 'string' ? (DOCKER_APP_NAMES[app] ?? null) : null,
+  }
+}
+
+/**
+ * How a node's status reads. An offline Mac worker is most likely asleep,
+ * not broken, so it says so instead of a bare "offline".
+ */
+export function nodeStatusLabel(
+  status: string,
+  mac: MacWorkerHost | null
+): { label: string; hint: string | null } {
+  if (status === 'offline' && mac) {
+    return {
+      label: 'Asleep or offline',
+      hint: 'A Mac worker goes offline while the Mac sleeps or leaves the network, and reconnects on its own when it wakes.',
+    }
+  }
+  return { label: status, hint: null }
 }

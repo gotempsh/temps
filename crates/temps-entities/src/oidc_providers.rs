@@ -49,6 +49,13 @@ pub struct Model {
     /// `managed_by_cloud`; a belt-and-suspenders check independent of
     /// whatever Cloud's own account-linking screen enforces.
     pub admin_only_role_required: bool,
+    /// ADR-094: when Temps Cloud last confirmed this instance's Cloud console
+    /// sessions (it answered a re-check, or there was nothing to check).
+    /// Written only on the `managed_by_cloud` row, by the session checker;
+    /// `None` when no confirmation is on record. Persisted so a restart
+    /// during a Cloud outage does not extend how long unconfirmed sessions
+    /// survive.
+    pub cloud_sessions_confirmed_at: Option<DBDateTime>,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
 }

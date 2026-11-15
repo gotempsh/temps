@@ -13,18 +13,18 @@ description = "Shield: proof-of-work challenges, clearance cookies and reputatio
 
 [dependencies]
 base64 = { workspace = true }
-hmac = "0.13"
-postcard = { version = "1", default-features = false, features = ["alloc"] }
+hmac = { workspace = true }
+postcard = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sha2 = "0.11"
+sha2 = { workspace = true }
 temps-signatures = { path = "../temps-signatures" }
 thiserror = { workspace = true }
 tokio = { workspace = true, optional = true }
 async-trait = { workspace = true, optional = true }
-hickory-resolver = { version = "0.26", optional = true }
-moka = { version = "0.12", features = ["future"], optional = true }
+hickory-resolver = { workspace = true, optional = true }
+moka = { workspace = true, optional = true }
 zstd = { workspace = true }
 arc-swap = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
@@ -56,3 +56,6 @@ utoipa = ["dep:utoipa"]
 temps-shield = { path = ".", features = ["tokio", "crawlers", "netwatch"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
+
+[lints]
+workspace = true

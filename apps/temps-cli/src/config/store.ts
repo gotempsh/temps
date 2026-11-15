@@ -142,6 +142,12 @@ export const config = {
   },
 
   set<K extends keyof TempsConfig>(key: K, value: TempsConfig[K]): void {
+    // `Conf.set` throws on `undefined`, so an unset optional key has to be
+    // deleted. Callers clear a key by setting it to `undefined`.
+    if (value === undefined) {
+      configStore.delete(key)
+      return
+    }
     configStore.set(key, value)
   },
 
@@ -151,7 +157,7 @@ export const config = {
 
   setAll(values: Partial<TempsConfig>): void {
     for (const [key, value] of Object.entries(values)) {
-      configStore.set(key as keyof TempsConfig, value)
+      config.set(key as keyof TempsConfig, value)
     }
   },
 

@@ -3,13 +3,21 @@
 
 import { describe, expect, test } from 'bun:test'
 import type { DeploymentResponse, EnvironmentResponse } from '@/api/client'
+import { jsonResponse, mockApi } from '@/test/fetch-mock'
+import { installBrowserWindow } from '@/test/dom'
 import {
+  acceptsSourceArchive,
+  canRedeployAnyInPlace,
+  redeployAvailability,
   environmentsToRedeploy,
   redeployCurrentDeployments,
   redeploySummary,
   serviceLinkRedeployMessage,
+  toastRedeployAfterLinkChange,
   type RedeployApi,
 } from './service-link-redeploy'
+
+installBrowserWindow()
 
 const env = (
   id: number,
@@ -205,5 +213,385 @@ describe('redeploySummary', () => {
       ]).message
     ).toBe('Redeploying 2 environments')
     expect(redeploySummary([]).message).toBe('Nothing to redeploy')
+  })
+})
+
+describe('redeployAvailability', () => {
+  const apiFor = (
+    deployments: Record<number, DeploymentResponse>
+  ): Pick<RedeployApi, 'getDeployment'> =>
+    ({
+      getDeployment: async ({ path }: { path: { deployment_id: number } }) => ({
+        data: deployments[path.deployment_id],
+      }),
+    }) as unknown as Pick<RedeployApi, 'getDeployment'>
+  const made = (
+    id: number,
+    envId: number,
+    type: 'manual' | 'external' | 'uploaded_source'
+  ) => deployment(id, envId, { metadata: { deploymentSourceType: type } })
+  const two = [env(3, 'production', 31), env(4, 'staging', 41)]
+
+  test.each(['manual', 'external'] as const)(
+    'every deployment being %s means there is no source to rebuild or upload',
+    async (type) => {
+      const api = apiFor({ 31: made(31, 3, type), 41: made(41, 4, type) })
+      expect(await redeployAvailability(7, 'git', two, api)).toBe('no-source')
+    }
+  )
+
+  test('every deployment being an uploaded archive means upload again', async () => {
+    const api = apiFor({
+      31: made(31, 3, 'uploaded_source'),
+      41: made(41, 4, 'uploaded_source'),
+    })
+    expect(await redeployAvailability(7, 'git', two, api)).toBe('upload')
+  })
+
+  // Neither can be rebuilt in place, so offering a deploy dialog for the
+  // project's default source would deploy something else; the redeploy
+  // reports each environment instead.
+  test('a mix of archive and no-source deployments is left to the redeploy to report', async () => {
+    const api = apiFor({
+      31: made(31, 3, 'uploaded_source'),
+      41: made(41, 4, 'manual'),
+    })
+    expect(await redeployAvailability(7, 'git', two, api)).toBe('no-source')
+  })
+
+  test('one redeployable deployment is enough', async () => {
+    const api = apiFor({
+      31: made(31, 3, 'manual'),
+      41: deployment(41, 4, { branch: 'main', commit_hash: 'abc123' }),
+    })
+    expect(await redeployAvailability(7, 'git', two, api)).toBe('redeploy')
+  })
+})
+
+describe('canRedeployAnyInPlace', () => {
+  const apiFor = (
+    deployments: Record<number, DeploymentResponse | 'fail'>
+  ): Pick<RedeployApi, 'getDeployment'> =>
+    ({
+      getDeployment: async ({ path }: { path: { deployment_id: number } }) => {
+        const found = deployments[path.deployment_id]
+        if (found === 'fail' || found === undefined) throw new Error('boom')
+        return { data: found }
+      },
+    }) as unknown as Pick<RedeployApi, 'getDeployment'>
+
+  test('a manual project running an image can still be redeployed', async () => {
+    const api = apiFor({
+      31: deployment(31, 3, { metadata: { externalImageRef: 'app:1' } }),
+    })
+    expect(
+      await canRedeployAnyInPlace(7, 'manual', [env(3, 'production', 31)], api)
+    ).toBe(true)
+  })
+
+  test('a manual project running a Git ref can still be redeployed', async () => {
+    const api = apiFor({
+      31: deployment(31, 3, { branch: 'main', commit_hash: 'abc123' }),
+    })
+    expect(
+      await canRedeployAnyInPlace(7, 'manual', [env(3, 'production', 31)], api)
+    ).toBe(true)
+  })
+
+  test('an uploaded archive cannot be redeployed in place', async () => {
+    const api = apiFor({ 31: deployment(31, 3, {}) })
+    expect(
+      await canRedeployAnyInPlace(
+        7,
+        'uploaded_source',
+        [env(3, 'production', 31)],
+        api
+      )
+    ).toBe(false)
+  })
+
+  test('a Git project whose live deployment is an uploaded archive cannot', async () => {
+    const api = apiFor({
+      31: deployment(31, 3, {
+        metadata: { deploymentSourceType: 'uploaded_source' },
+      }),
+    })
+    expect(
+      await canRedeployAnyInPlace(7, 'git', [env(3, 'production', 31)], api)
+    ).toBe(false)
+  })
+
+  // Nothing was uploaded for these, so "upload the source again" would send
+  // the user to something they never used; the redeploy explains instead.
+  test.each(['manual', 'external'] as const)(
+    'a deployment with source type %s keeps the Redeploy action, which explains there is no source',
+    async (made) => {
+      const api = apiFor({
+        31: deployment(31, 3, { metadata: { deploymentSourceType: made } }),
+      })
+      expect(
+        await canRedeployAnyInPlace(7, 'git', [env(3, 'production', 31)], api)
+      ).toBe(true)
+    }
+  )
+
+  test('one redeployable environment is enough to offer the action', async () => {
+    const api = apiFor({
+      31: deployment(31, 3, {}),
+      41: deployment(41, 4, { metadata: { externalImageRef: 'app:2' } }),
+    })
+    expect(
+      await canRedeployAnyInPlace(
+        7,
+        'uploaded_source',
+        [env(3, 'production', 31), env(4, 'staging', 41)],
+        api
+      )
+    ).toBe(true)
+  })
+
+  test('a deployment that cannot be read does not withhold the action', async () => {
+    const api = apiFor({ 31: 'fail' })
+    expect(
+      await canRedeployAnyInPlace(
+        7,
+        'uploaded_source',
+        [env(3, 'production', 31)],
+        api
+      )
+    ).toBe(true)
+  })
+
+  test('a stalled lookup does not hold back the answer', async () => {
+    const api = {
+      getDeployment: () => new Promise(() => {}),
+    } as unknown as Pick<RedeployApi, 'getDeployment'>
+    const started = Date.now()
+    expect(
+      await canRedeployAnyInPlace(
+        7,
+        'uploaded_source',
+        [env(3, 'production', 31)],
+        api,
+        30
+      )
+    ).toBe(true)
+    expect(Date.now() - started).toBeLessThan(1000)
+  })
+
+  test('answers once one environment is redeployable, without waiting for the rest, and cancels them', async () => {
+    let cancelled = false
+    const api = {
+      getDeployment: ({
+        path,
+        signal,
+      }: {
+        path: { deployment_id: number }
+        signal?: AbortSignal
+      }) => {
+        if (path.deployment_id === 41) {
+          return Promise.resolve({
+            data: deployment(41, 4, {
+              metadata: { externalImageRef: 'app:2' },
+            }),
+          })
+        }
+        return new Promise((_, reject) => {
+          signal?.addEventListener('abort', () => {
+            cancelled = true
+            reject(new Error('aborted'))
+          })
+        })
+      },
+    } as unknown as Pick<RedeployApi, 'getDeployment'>
+    expect(
+      await canRedeployAnyInPlace(
+        7,
+        'uploaded_source',
+        [env(3, 'production', 31), env(4, 'staging', 41)],
+        api,
+        5000
+      )
+    ).toBe(true)
+    expect(cancelled).toBe(true)
+  })
+
+  test('nothing to decide is not a reason to withhold it', async () => {
+    expect(
+      await canRedeployAnyInPlace(7, 'uploaded_source', [], apiFor({}))
+    ).toBe(true)
+  })
+})
+
+describe('serviceLinkRedeployMessage for a source that cannot be redeployed', () => {
+  test('says to upload the source again instead of offering a redeploy', () => {
+    const { description } = serviceLinkRedeployMessage(
+      { kind: 'linked', serviceName: 'synthetic-db' },
+      [{ name: 'production' }],
+      false
+    )
+    expect(description).toContain('Upload the source again')
+    expect(description).not.toContain('Redeploy production')
+  })
+})
+
+describe('acceptsSourceArchive', () => {
+  // Mirrors the server's `accepts_source_archive`, which refuses the upload.
+  test('an uploaded-source project always takes an archive', () => {
+    expect(
+      acceptsSourceArchive({
+        source_type: 'uploaded_source',
+        allow_alternate_sources: false,
+      })
+    ).toBe(true)
+  })
+
+  test('any other project takes one only while Other sources is on', () => {
+    for (const source_type of [
+      'git',
+      'docker_image',
+      'static_files',
+      'manual',
+    ] as const) {
+      expect(
+        acceptsSourceArchive({ source_type, allow_alternate_sources: true })
+      ).toBe(true)
+      expect(
+        acceptsSourceArchive({ source_type, allow_alternate_sources: false })
+      ).toBe(false)
+      // A project that predates the setting reads as off, as on the server.
+      expect(
+        acceptsSourceArchive({ source_type, allow_alternate_sources: null })
+      ).toBe(false)
+      expect(acceptsSourceArchive({ source_type })).toBe(false)
+    }
+  })
+
+  test('a monitoring-only project never takes one', () => {
+    expect(
+      acceptsSourceArchive({
+        source_type: 'external',
+        allow_alternate_sources: true,
+      })
+    ).toBe(false)
+  })
+})
+
+describe('serviceLinkRedeployMessage for an upload the project would refuse', () => {
+  test('says to turn on Other sources before uploading again', () => {
+    const { description } = serviceLinkRedeployMessage(
+      { kind: 'linked', serviceName: 'synthetic-db' },
+      [{ name: 'production' }],
+      false,
+      false
+    )
+    expect(description).toContain('Other sources')
+    expect(description).toContain('ask an administrator')
+    expect(description).not.toContain('Redeploy production')
+  })
+})
+
+describe('toastRedeployAfterLinkChange', () => {
+  const change = { kind: 'linked', serviceName: 'synthetic-db' } as const
+  const notifier = () => {
+    const info: { title: string; options: Record<string, unknown> }[] = []
+    return {
+      info,
+      notify: {
+        info: (title: string, options: Record<string, unknown>) =>
+          info.push({ title, options }),
+        success: () => {},
+        warning: () => {},
+        error: () => {},
+      },
+    }
+  }
+
+  test('an uploaded source gets a notice without a Redeploy action', async () => {
+    const api = mockApi({
+      'GET /projects/7/environments': () =>
+        jsonResponse([env(3, 'production', 31)]),
+      'GET /projects/7/deployments/31': () =>
+        jsonResponse(deployment(31, 3, {})),
+    })
+    const { info, notify } = notifier()
+    await toastRedeployAfterLinkChange(
+      { id: 7, name: 'synthetic-api', source_type: 'uploaded_source' },
+      change,
+      notify as never
+    )
+    expect(info).toHaveLength(1)
+    expect(info[0].options.action).toBeUndefined()
+    expect(info[0].options.description).toContain('Upload the source again')
+    api.restore()
+  })
+
+  test('a Git project with Other sources off is told to turn it on, not to upload', async () => {
+    const api = mockApi({
+      'GET /projects/7/environments': () =>
+        jsonResponse([env(3, 'production', 31)]),
+      'GET /projects/7/deployments/31': () =>
+        jsonResponse(
+          deployment(31, 3, {
+            metadata: { deploymentSourceType: 'uploaded_source' },
+          })
+        ),
+    })
+    const { info, notify } = notifier()
+    await toastRedeployAfterLinkChange(
+      {
+        id: 7,
+        name: 'synthetic-api',
+        source_type: 'git',
+        allow_alternate_sources: false,
+      },
+      change,
+      notify as never
+    )
+    expect(info).toHaveLength(1)
+    expect(info[0].title).toBe('synthetic-api: turn on Other sources to apply')
+    expect(info[0].options.action).toBeUndefined()
+    expect(info[0].options.description).toContain('Other sources')
+    api.restore()
+  })
+
+  test('a Git project still gets the Redeploy now action', async () => {
+    const api = mockApi({
+      'GET /projects/7/environments': () =>
+        jsonResponse([env(3, 'production', 31)]),
+      'GET /projects/7/deployments/31': () =>
+        jsonResponse(
+          deployment(31, 3, { branch: 'main', commit_hash: 'abc123' })
+        ),
+    })
+    const { info, notify } = notifier()
+    await toastRedeployAfterLinkChange(
+      { id: 7, name: 'synthetic-api', source_type: 'git' },
+      change,
+      notify as never
+    )
+    expect(info[0].options.action).toMatchObject({ label: 'Redeploy now' })
+    // Eligibility came from reading the live deployment, not from a failed read.
+    expect(api.called('GET', '/projects/7/deployments/31')).toBe(true)
+    api.restore()
+  })
+
+  test('a manual project running an image still gets the Redeploy now action', async () => {
+    const api = mockApi({
+      'GET /projects/7/environments': () =>
+        jsonResponse([env(3, 'production', 31)]),
+      'GET /projects/7/deployments/31': () =>
+        jsonResponse(
+          deployment(31, 3, { metadata: { externalImageRef: 'app:1' } })
+        ),
+    })
+    const { info, notify } = notifier()
+    await toastRedeployAfterLinkChange(
+      { id: 7, name: 'synthetic-api', source_type: 'manual' },
+      change,
+      notify as never
+    )
+    expect(info[0].options.action).toMatchObject({ label: 'Redeploy now' })
+    api.restore()
   })
 })

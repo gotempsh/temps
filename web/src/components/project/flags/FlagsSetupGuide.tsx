@@ -115,7 +115,7 @@ TEMPS_API_TOKEN=dt_...`}
               value={aiPrompt(flagKey, envQuery)}
               className="shrink-0 rounded-md border border-border px-3 py-1.5 text-xs font-medium"
             >
-              Copy AI Prompt
+              Copy AI prompt
             </CopyButton>
           </div>
         </CardHeader>

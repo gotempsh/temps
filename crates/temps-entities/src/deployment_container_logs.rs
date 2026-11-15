@@ -13,7 +13,7 @@ use temps_core::DBDateTime;
 /// survive and can be viewed later.
 ///
 /// The dump itself is a plain-text file on disk under the data dir (managed by
-/// `temps_logs::LogService`); this row carries only the metadata and the
+/// `temps_deployment_logs::LogService`); this row carries only the metadata and the
 /// server-generated relative `log_path` to it.
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "deployment_container_logs")]

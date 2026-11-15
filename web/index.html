@@ -3,7 +3,17 @@
 <!-- SPDX-License-Identifier: MIT OR Apache-2.0 -->
 
 <html lang="en">
-  <head></head>
+  <head>
+    <!-- The console ships its own light and dark themes, so nothing else may
+         recolour it: automatic dark-mode recolouring darkens every light fill,
+         turning the dark theme's white primary buttons and checked switches
+         black. `color-scheme` tells the browser both schemes are supported
+         (which also exempts the page from Chromium's auto dark mode and draws
+         native controls to match before the theme script runs);
+         `darkreader-lock` makes Dark Reader and its forks stand down. -->
+    <meta name="color-scheme" content="light dark" />
+    <meta name="darkreader-lock" />
+  </head>
   <body>
     <div id="<%= mountId %>"></div>
   </body>

@@ -16,6 +16,7 @@ import { AlertCircle, AlertTriangle, HardDrive, RefreshCw } from 'lucide-react'
 import { Link } from 'react-router'
 import {
   DESTINATIONS_LOAD_FAILED_MESSAGE,
+  DESTINATIONS_RESTRICTED_MESSAGE,
   DESTINATIONS_REFRESH_FAILED_MESSAGE,
   type DestinationFailure,
 } from './trigger-backup-state'
@@ -148,5 +149,17 @@ export function NoDestinationsConfigured() {
         }
       />
     </div>
+  )
+}
+
+/**
+ * The caller may start a backup but not list the destinations. Neutral, with
+ * no retry: the refusal is about the role, and a retry cannot change it.
+ */
+export function DestinationsRestricted() {
+  return (
+    <p role="note" className="text-sm text-muted-foreground">
+      {DESTINATIONS_RESTRICTED_MESSAGE}
+    </p>
   )
 }

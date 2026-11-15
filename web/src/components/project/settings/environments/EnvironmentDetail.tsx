@@ -17,11 +17,15 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { ErrorAlert } from '@/components/utils/ErrorAlert'
 import { useSettings } from '@/hooks/useSettings'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Globe, HardDrive, Loader2, RefreshCw, Trash2 } from 'lucide-react'
+import { Globe, Loader2, Trash2 } from 'lucide-react'
 import { useState } from 'react'
 import { useParams } from 'react-router'
 import { toast } from 'sonner'
 import { EnvironmentConfigurationCard } from './EnvironmentConfigurationCard'
+import { EnvironmentIngressCard } from './EnvironmentIngressCard'
+import { EnvironmentVolumesCard } from './EnvironmentVolumesCard'
+import { PurgeAssetCacheCard } from './PurgeAssetCacheCard'
+import { InternalAccessCard } from '../InternalAccessCard'
 import { ProjectIpAccessCard } from '../ProjectIpAccessCard'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 
@@ -124,6 +128,7 @@ function SubdomainCard({
 
   return (
     <SettingsSection
+      id="setting-environment-subdomain"
       title="Subdomain"
       icon={Globe}
       description="Rename the auto-managed hostname for this environment. The previous subdomain stops resolving as soon as the change is applied. Custom domains attached to this environment are unaffected."
@@ -174,61 +179,6 @@ function SubdomainCard({
           )}
         </div>
       </form>
-    </SettingsSection>
-  )
-}
-
-function PurgeAssetCacheCard({
-  projectId,
-  environmentId,
-  environmentName,
-}: {
-  projectId: number
-  environmentId: number
-  environmentName: string
-}) {
-  const [isPurging, setIsPurging] = useState(false)
-  const [showConfirm, setShowConfirm] = useState(false)
-
-  const handlePurge = async () => {
-    setIsPurging(true)
-    try {
-      const response = await fetch(
-        `/api/projects/${projectId}/environments/${environmentId}/asset-cache`,
-        { method: 'DELETE' }
-      )
-      const data = await response.json()
-      const deleted = data?.deleted ?? 0
-      toast.success(`Purged ${deleted} cached asset${deleted !== 1 ? 's' : ''}`)
-    } catch {
-      toast.error('Failed to purge asset cache')
-    } finally {
-      setIsPurging(false)
-      setShowConfirm(false)
-    }
-  }
-
-  return (
-    <SettingsSection
-      title="Asset Cache"
-      icon={HardDrive}
-      description="Static assets (JS chunks, CSS, fonts) are cached for stale-chunk fallback. Purge if you need to force-clear cached assets for this environment."
-    >
-      <Button variant="outline" size="sm" onClick={() => setShowConfirm(true)}>
-        <RefreshCw className="h-4 w-4 mr-2" />
-        Purge Asset Cache
-      </Button>
-      <ConfirmDeleteDialog
-        open={showConfirm}
-        onOpenChange={setShowConfirm}
-        verb="Purge"
-        confirmLabel="Purge Cache"
-        resourceType="asset cache of environment"
-        resourceName={environmentName}
-        consequences="All cached static assets for this environment are deleted. In-flight users with old HTML may see broken pages until they refresh. Orphaned blobs are cleaned up automatically overnight."
-        isPending={isPurging}
-        onConfirm={() => void handlePurge()}
-      />
     </SettingsSection>
   )
 }
@@ -334,6 +284,27 @@ export function EnvironmentDetail({
         scopeName={environment.name}
       />
 
+      <InternalAccessCard
+        key={`internal-access:${environment.id}`}
+        projectId={project.id}
+        projectName={project.name}
+        projectSlug={project.slug}
+        environmentId={environment.id}
+        environmentName={environment.name}
+        environmentSlug={environment.slug}
+      />
+
+      <EnvironmentIngressCard
+        key={`ingress:${environment.id}`}
+        projectId={project.id}
+        environmentId={environment.id}
+      />
+
+      <EnvironmentVolumesCard
+        key={`volumes:${environment.id}`}
+        environmentId={environment.id}
+      />
+
       <SubdomainCard
         key={`${environment.id}:${
           (environment as EnvironmentResponse & { subdomain?: string })
@@ -354,21 +325,16 @@ export function EnvironmentDetail({
       />
 
       <SettingsSection
-        title="Danger Zone"
+        id="setting-environment-danger-zone"
+        title="Danger zone"
         icon={Trash2}
-        description="Irreversible and destructive actions"
-        className="border-destructive/50 bg-destructive/5"
+        description="Permanently delete this environment and everything in it. This cannot be undone."
       >
         <div className="space-y-4">
-          <p className="text-sm text-muted-foreground">
-            Deleting this environment will remove all configurations,
-            deployments, and data associated with it. This action cannot be
-            undone.
-          </p>
           {isProduction && (
-            <p className="text-sm text-muted-foreground bg-muted p-3 rounded-md border">
-              ℹ️ The production environment cannot be deleted to prevent
-              accidental data loss.
+            <p className="text-sm text-muted-foreground">
+              The production environment cannot be deleted, so its data is never
+              lost by accident.
             </p>
           )}
           <Button
@@ -378,12 +344,12 @@ export function EnvironmentDetail({
             onClick={() => setShowDeleteConfirm(true)}
           >
             <Trash2 className="h-4 w-4 mr-2" />
-            Delete Environment
+            Delete environment
           </Button>
           <ConfirmDeleteDialog
             open={showDeleteConfirm}
             onOpenChange={setShowDeleteConfirm}
-            confirmLabel="Delete Environment"
+            confirmLabel="Delete environment"
             resourceType="environment"
             resourceName={environment.name}
             consequences="All configurations, deployments, and data associated with it are removed."

@@ -31,6 +31,7 @@ import { isStepUpRequired } from '@/lib/sensitiveActionProblem'
 import {
   hostKeyCompareCommand,
   hostKeyFileForAlgorithm,
+  parseSshPort,
 } from '@/lib/ssh-host-key'
 import { enrollmentProgress, SSH_ENROLLMENT_STEPS } from '@/lib/wireguard-mesh'
 
@@ -57,8 +58,8 @@ export function SshEnrollNode({ mesh }: { mesh: WireguardMeshStatusResponse }) {
   const { handleSensitiveActionError, verificationDialog } =
     useSensitiveActionVerification()
 
-  const portNumber = Number.parseInt(port, 10) || 22
-  const target = { host: host.trim(), port: portNumber }
+  const parsedPort = parseSshPort(port)
+  const target = { host: host.trim(), port: parsedPort.port ?? 0 }
 
   // gcTime 0: a mutation nobody observes any more (after `reset()` or
   // unmount) leaves the cache at once instead of keeping its variables, which
@@ -132,6 +133,7 @@ export function SshEnrollNode({ mesh }: { mesh: WireguardMeshStatusResponse }) {
         className="space-y-3"
         onSubmit={(event) => {
           event.preventDefault()
+          if (parsedPort.error !== null) return
           resetHostKey()
           probe.mutate({ body: target })
         }}
@@ -156,11 +158,20 @@ export function SshEnrollNode({ mesh }: { mesh: WireguardMeshStatusResponse }) {
               id="ssh-port"
               inputMode="numeric"
               value={port}
+              aria-invalid={parsedPort.error !== null}
+              aria-describedby={
+                parsedPort.error !== null ? 'ssh-port-error' : undefined
+              }
               onChange={(event) => {
                 setPort(event.target.value)
                 resetHostKey()
               }}
             />
+            {parsedPort.error !== null && (
+              <p id="ssh-port-error" className="text-xs text-destructive">
+                {parsedPort.error}
+              </p>
+            )}
           </div>
           <div className="space-y-1">
             <Label htmlFor="ssh-user">User</Label>
@@ -270,7 +281,12 @@ export function SshEnrollNode({ mesh }: { mesh: WireguardMeshStatusResponse }) {
         {!hostKey && (
           <Button
             type="submit"
-            disabled={!target.host || !user.trim() || probe.isPending}
+            disabled={
+              !target.host ||
+              parsedPort.error !== null ||
+              !user.trim() ||
+              probe.isPending
+            }
           >
             {probe.isPending ? (
               <Loader2 className="mr-1 h-4 w-4 animate-spin" />
@@ -455,7 +471,10 @@ function EnrollmentProgress({ id }: { id: number }) {
         </Alert>
       )}
       {data.log && (
-        <pre tabIndex={0} className="max-h-64 overflow-auto rounded bg-muted p-2 font-mono text-[11px] leading-snug">
+        <pre
+          tabIndex={0}
+          className="max-h-64 overflow-auto rounded bg-muted p-2 font-mono text-[11px] leading-snug"
+        >
           {data.log}
         </pre>
       )}
@@ -488,9 +507,7 @@ function RecentEnrollments({
     )
   }
   const others = (data?.enrollments ?? [])
-    .filter(
-      (enrollment: NodeSshEnrollmentSummary) => enrollment.id !== current
-    )
+    .filter((enrollment: NodeSshEnrollmentSummary) => enrollment.id !== current)
     .slice(0, 5)
   if (others.length === 0) return null
 

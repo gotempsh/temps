@@ -33,8 +33,8 @@ test('standalone database logs do not appear as Service 0 or application logs', 
     )
     expect(html).not.toContain('Service 0')
     expect(html).toContain('Service 7')
-    expect(html).toMatch(/Applications<\/span><span[^>]*>20/)
-    expect(html).toMatch(/Databases<\/span><span[^>]*>100/)
+    expect(html).toMatch(/Applications(<\/span>)+<span[^>]*>20/)
+    expect(html).toMatch(/Databases(<\/span>)+<span[^>]*>100/)
   } finally {
     if (previousWindow)
       Object.defineProperty(globalThis, 'window', previousWindow)
@@ -60,7 +60,7 @@ test('shows loaded logs without a misleading current-page volume chart', () => {
     // Facet counts come from the store now, so the sidebar must not keep
     // telling the user they only describe the lines currently loaded.
     expect(html).not.toContain('Counts from this page only')
-    expect(html).toContain('Counts across the whole time range')
+    expect(html).toContain('Counts cover the whole time range')
   } finally {
     if (previousWindow)
       Object.defineProperty(globalThis, 'window', previousWindow)
@@ -172,7 +172,7 @@ for (const [query, visible] of [
       )
       expect(html.includes('aria-label="Log facets"')).toBe(visible)
       expect(html.includes('aria-expanded="true"')).toBe(visible)
-      if (visible) expect(html).toContain('Counts across the whole time range')
+      if (visible) expect(html).toContain('Counts cover the whole time range')
     } finally {
       if (previousWindow)
         Object.defineProperty(globalThis, 'window', previousWindow)
@@ -217,14 +217,14 @@ test('facet projects with no line on the loaded page are named from projectLabel
             project_names: { '1': 'web-app', '2': 'api' },
             external_service_names: {},
           }}
-          projectLabels={{ '2': 'worker-app', '42': 'Unknown service #42' }}
+          projectLabels={{ '2': 'worker-app', '42': 'Deleted service #42' }}
           onFilter={() => {}}
         />
       </MemoryRouter>
     )
     expect(html).toContain('web-app')
     expect(html).toContain('worker-app')
-    expect(html).toContain('Unknown service #42')
+    expect(html).toContain('Deleted service #42')
     expect(html).not.toContain('Service 2<')
   } finally {
     if (previousWindow)

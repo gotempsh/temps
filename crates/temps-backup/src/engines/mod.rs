@@ -3,22 +3,25 @@
 
 //! Backup engine implementations for `temps-backup` (ADR-014 Phase 1–4).
 //!
-//! Each module implements the [`temps_backup_core::BackupEngine`] trait for a
-//! specific backup target. The runner in `temps-backup-core` dispatches to these
+//! Each module implements the [`crate::execution::BackupEngine`] trait for a
+//! specific backup target. The executor in [`crate::execution`] dispatches to these
 //! engines by matching `backup_jobs.engine` against `BackupEngine::engine()`.
 //!
 //! ## Phase 1 engines
 //! - [`control_plane`]: Control-plane (Temps server's own PostgreSQL database).
+//!   Without Docker it dumps with host client tools ([`control_plane_host`]).
 //!
 //! ## Phase 2–4 engines (external services)
 //! - [`redis`]: Redis via BGSAVE or WAL-G.
-//! - [`mongodb`]: MongoDB via mongodump.
+//! - [`mongodb`]: MongoDB via a WAL-G stream, or a mongodump archive without WAL-G; here or on a worker through its agent (ADR-099).
 //! - [`postgres_pgdump`]: Postgres via pg_dump sidecar (fallback).
 //! - [`postgres_walg`]: Postgres via WAL-G (preferred when available).
 //! - [`postgres_cluster`]: Postgres cluster (pg_auto_failover) via WAL-G.
 //! - [`mariadb_physical`]: MariaDB via `mariadb-backup` physical base (PITR).
 //! - [`mariadb_dump`]: MariaDB via `mariadb-dump` logical dump (fallback).
 //! - [`s3_mirror`]: S3-compatible object storage via `rc mirror` (RustFS CLI).
+//! - [`workload_job`]: Postgres on a worker node, as a job on that node (ADR-055).
+//! - [`worker_agent`]: Redis, MariaDB and storage on a worker node, by its agent.
 //! - [`dispatch`]: Engine-key resolution helper (`resolve_engine_key`).
 //!
 //! ## Adding a new engine
@@ -27,14 +30,15 @@
 //! 3. Instantiate and register in `plugin.rs` (`BackupPlugin::register_services`).
 
 pub mod control_plane;
+pub mod control_plane_host;
 pub mod dispatch;
 pub mod dump_capture;
 pub mod image_pull;
 pub mod mariadb_dump;
-pub mod mariadb_exec;
 pub mod mariadb_physical;
 pub mod mongodb;
 pub mod oneshot;
+pub mod pg_client_tools;
 pub mod postgres_cluster;
 pub mod postgres_pgdump;
 pub mod postgres_walg;
@@ -44,3 +48,5 @@ pub mod s3_mirror;
 pub mod sidecar;
 pub mod v2_common;
 mod walg_size;
+pub mod worker_agent;
+pub mod workload_job;

@@ -118,24 +118,15 @@ pub struct ReachabilityWarning {
 impl ReachabilityWarning {
     /// The deploy log's final block (D5.1).
     pub fn log_lines(&self) -> Vec<String> {
-        let mut lines = vec![
-            format!("⚠ {}:", self.headline),
-            format!("  {}", self.reason),
-        ];
-        if !self.fixes.is_empty() {
-            lines.push("  Make it reachable:".to_string());
-            for (index, fix) in self.fixes.iter().enumerate() {
-                let label = match &fix.command {
-                    Some(command) => format!("{}: {command}", fix.label),
-                    None => fix.label.clone(),
-                };
-                let label = lower_first(&label);
-                lines.push(if index == 0 {
-                    format!("    • {label}")
-                } else {
-                    format!("    • or {label}")
-                });
-            }
+        let mut lines = vec![format!("Make {} reachable:", self.environment)];
+        if let Some(fix) = self.fixes.first() {
+            let label = match &fix.command {
+                Some(command) => format!("{}: {command}", fix.label),
+                None => fix.label.clone(),
+            };
+            lines.push(format!("    • {}", lower_first(&label)));
+        } else {
+            lines.push("  Open Make it reachable to add an address.".to_string());
         }
         lines
     }
@@ -297,12 +288,8 @@ mod tests {
         assert_eq!(
             block,
             vec![
-                "⚠ Deployed, but nobody can reach hello-temps-production yet:",
-                "  hello-temps-production.localho.st only resolves to this computer.",
-                "  Make it reachable:",
+                "Make hello-temps-production reachable:",
                 "    • publish it through tunnel 'edge' as hello-temps-production.example.com",
-                "    • or set a wildcard preview domain in Settings → Platform",
-                "    • or add a domain to this environment",
             ]
         );
     }
@@ -321,7 +308,7 @@ mod tests {
         );
         assert!(warning(vec![])
             .message()
-            .starts_with("hello-temps-production.localho.st"));
+            .starts_with("Open Make it reachable"));
     }
 
     #[test]

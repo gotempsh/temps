@@ -159,6 +159,12 @@ impl TempsPlugin for ProxyPlugin {
             // side; enforcement is the gate installed in the proxy slot).
             let project_ip_access_service = Arc::new(ProjectIpAccessService::new(db.clone()));
 
+            // Project edge rules (ADR-089), management side; the proxy's
+            // EdgeRuleGate picks writes up from the change feed.
+            let edge_rule_service = Arc::new(
+                crate::service::edge_rule_service::EdgeRuleService::new(db.clone()),
+            );
+
             // ADR 066 D2: fetch the Shield reputation lists and compile
             // them into the snapshots every ingress loads. Every control
             // plane runs this; claims and an advisory lock keep it to one.
@@ -205,6 +211,7 @@ impl TempsPlugin for ProxyPlugin {
             context.register_service(api_traffic_data_source);
             context.register_service(ip_access_control_service);
             context.register_service(project_ip_access_service);
+            context.register_service(edge_rule_service);
             context.register_service(shield_events as Arc<dyn temps_shield::EventSink>);
 
             tracing::debug!("Proxy plugin services registered successfully");
@@ -308,6 +315,19 @@ impl TempsPlugin for ProxyPlugin {
                 project_access_checker: project_access_checker.clone(),
             });
 
+        let ip_access_control_state =
+            Arc::new(crate::handler::ip_access_control::IpAccessControlState {
+                service: ip_access_control_service,
+                audit_service: context.require_service::<dyn temps_core::AuditLogger>(),
+            });
+
+        let edge_rules_state = Arc::new(crate::handler::edge_rules::EdgeRulesState {
+            service: context
+                .require_service::<crate::service::edge_rule_service::EdgeRuleService>(),
+            audit_service: context.require_service::<dyn temps_core::AuditLogger>(),
+            project_access_checker: project_access_checker.clone(),
+        });
+
         let shield_state = Arc::new(crate::handler::shield::ShieldConsoleState {
             service: context
                 .require_service::<crate::service::shield_console_service::ShieldConsoleService>(),
@@ -317,7 +337,10 @@ impl TempsPlugin for ProxyPlugin {
         });
 
         // Create the app state directly
-        let app_state = Arc::new(crate::handler::types::AppState { lb_service });
+        let app_state = Arc::new(crate::handler::types::AppState {
+            lb_service,
+            audit_service: context.require_service::<dyn temps_core::AuditLogger>(),
+        });
 
         let proxy_logs_state = Arc::new(crate::handler::proxy_logs::ProxyLogsState {
             service: proxy_log_service,
@@ -330,12 +353,13 @@ impl TempsPlugin for ProxyPlugin {
             .merge(crate::handler::proxy_logs::create_routes().with_state(proxy_logs_state))
             .merge(
                 crate::handler::ip_access_control::create_routes()
-                    .with_state(ip_access_control_service),
+                    .with_state(ip_access_control_state),
             )
             .merge(
                 crate::handler::project_ip_access::create_routes()
                     .with_state(project_ip_access_state),
             )
+            .merge(crate::handler::edge_rules::create_routes().with_state(edge_rules_state))
             .merge(crate::handler::shield::create_routes().with_state(shield_state));
 
         Some(PluginRoutes::new(router))
@@ -348,6 +372,7 @@ impl TempsPlugin for ProxyPlugin {
         let ip_access_control_spec = crate::handler::ip_access_control::openapi();
         let project_ip_access_spec = crate::handler::project_ip_access::openapi();
         let shield_spec = crate::handler::shield::openapi();
+        let edge_rules_spec = crate::handler::edge_rules::openapi();
 
         let merged = temps_core::openapi::merge_openapi_schemas(
             lb_spec,
@@ -356,6 +381,7 @@ impl TempsPlugin for ProxyPlugin {
                 ip_access_control_spec,
                 project_ip_access_spec,
                 shield_spec,
+                edge_rules_spec,
             ],
         );
 
@@ -383,7 +409,7 @@ impl Default for ProxyPlugin {
 mod tests {
     use super::*;
     use temps_core::plugin::{PluginStateRegistry, ServiceRegistry};
-    use temps_database::test_utils::TestDatabase;
+    use temps_test_utils::TestDatabase;
 
     #[tokio::test]
     async fn test_plugin_registration() {
@@ -434,7 +460,7 @@ mod tests {
         async fn create_audit_log(
             &self,
             _operation: &dyn temps_core::AuditOperation,
-        ) -> anyhow::Result<()> {
+        ) -> temps_core::AuditResult<()> {
             Ok(())
         }
     }
@@ -488,6 +514,9 @@ mod tests {
         service_registry.register(proxy_log_service);
         service_registry.register(ip_access_control_service);
         service_registry.register(Arc::new(ProjectIpAccessService::new(db_connection.clone())));
+        service_registry.register(Arc::new(
+            crate::service::edge_rule_service::EdgeRuleService::new(db_connection.clone()),
+        ));
         service_registry.register(Arc::new(NoopAuditLogger) as Arc<dyn temps_core::AuditLogger>);
         // The Shield routes (ADR 066 I10) need their service and the
         // platform settings, as in the running server.

@@ -1,8 +1,10 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import { PageTitle } from '@temps-sdk/ds'
 import {
   getGenaiTraceOptions,
   queryGenaiTracesOptions,
+  queryGenaiTracesQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
 import type {
   GenAiSpanDetail,
@@ -22,6 +24,8 @@ import { problemDetail } from '@/lib/api-problem'
 import { AiProviderSelect } from '@/components/ai/AiProviderSelect'
 import { AiActivityEmptyState } from '@/components/ai/AiActivityEmptyState'
 import { DateTimeRange } from '@/components/ui/date-time-range'
+import { RefreshButton } from '@/components/ui/refresh-button'
+import { queryKeyPrefix } from '@/lib/refresh'
 import type { DateTimeRangeValue } from '@/lib/date-time-range'
 
 import {
@@ -213,6 +217,7 @@ import {
   compareAiModelIdsByRelevance,
   sortAiModelIdsByRelevance,
 } from '@/lib/ai-model-ranking'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 // Mutation errors here are thrown ProblemDetails response bodies, not Error
 // instances -- String(error) on an object stringifies to "[object Object]"
@@ -238,6 +243,10 @@ interface UsageSummary {
   error_count: number
   streaming_count: number
   byok_count: number
+  /** Requests that used tokens but whose cost no known price gave. */
+  unpriced_requests: number
+  /** Requests that used tokens and were priced, free models included. */
+  priced_requests: number
 }
 
 interface ProviderUsage {
@@ -265,6 +274,8 @@ interface ModelUsage {
   output_tokens: number
   total_tokens: number
   avg_latency_ms: number
+  /** Recorded cost of the model's requests in the window, in microcents. */
+  estimated_cost_microcents: number
 }
 
 interface UsageLogEntry {
@@ -276,6 +287,8 @@ interface UsageLogEntry {
   output_tokens: number
   latency_ms: number
   estimated_cost_microcents: number
+  /** Used tokens, but no known price gave its cost: unknown, not free. */
+  unpriced: boolean
   status: number
   is_streaming: boolean
   is_byok: boolean
@@ -287,17 +300,6 @@ interface UsageLogEntry {
 interface UsageLogPage {
   entries: UsageLogEntry[]
   total: number
-}
-
-interface ModelPricing {
-  model: string
-  provider: string
-  input_per_million: number
-  output_per_million: number
-}
-
-interface PricingResponse {
-  models: ModelPricing[]
 }
 
 async function fetchJson<T>(url: string): Promise<T> {
@@ -543,6 +545,7 @@ function ProviderKeyModelDetail({
       updateProviderKey({
         path: { id: providerKey.id },
         body: { default_model: modelId },
+        throwOnError: true,
       }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey })
@@ -802,48 +805,14 @@ function formatCost(dollars: number): string {
   return `$${dollars.toFixed(6)}`
 }
 
-function findPricing(
-  model: string,
-  pricingMap: Map<string, ModelPricing>
-): ModelPricing | undefined {
-  // Exact match first
-  const exact = pricingMap.get(model)
-  if (exact) return exact
-
-  // Strip common suffixes: -preview, -latest, date stamps like -20250101
-  const stripped = model
-    .replace(/-preview$/, '')
-    .replace(/-latest$/, '')
-    .replace(/-\d{6,8}$/, '')
-  if (stripped !== model) {
-    const match = pricingMap.get(stripped)
-    if (match) return match
-  }
-
-  // Prefix match: find the longest pricing key that the model starts with
-  let best: ModelPricing | undefined
-  let bestLen = 0
-  for (const [key, pricing] of pricingMap) {
-    if (model.startsWith(key) && key.length > bestLen) {
-      best = pricing
-      bestLen = key.length
-    }
-  }
-  return best
-}
-
-function computeCost(
-  model: string,
-  inputTokens: number,
-  outputTokens: number,
-  pricingMap: Map<string, ModelPricing>
-): number {
-  const pricing = findPricing(model, pricingMap)
-  if (!pricing) return 0
-  return (
-    (inputTokens / 1_000_000) * pricing.input_per_million +
-    (outputTokens / 1_000_000) * pricing.output_per_million
-  )
+/**
+ * A recorded cost in dollars. Usage logs store each request's cost in
+ * microcents (1e-6 USD) as the spend caps and budgets count it, cache prices
+ * and long-context rates included, so the console shows that figure instead
+ * of recomputing one from list prices.
+ */
+function microcentsToDollars(microcents: number): number {
+  return microcents / 1_000_000
 }
 
 type TimeRange = { label: string; hours: number }
@@ -851,6 +820,7 @@ type TimeRange = { label: string; hours: number }
 function useTimeRangeSelection(): [
   { range: TimeRange; endMs: number },
   (value: DateTimeRangeValue) => void,
+  () => void,
 ] {
   const [selection, setSelection] = useState(() => ({
     range: { label: '1d', hours: 24 },
@@ -866,6 +836,13 @@ function useTimeRangeSelection(): [
         },
         endMs: Date.parse(value.to),
       }),
+    // Refresh: a preset ("last 24 hours") ends now again; a custom range stays.
+    () =>
+      setSelection((current) =>
+        current.range.label === 'custom'
+          ? current
+          : { ...current, endMs: Date.now() }
+      ),
   ]
 }
 
@@ -953,24 +930,73 @@ const providerChartConfig = {
   request_count: { label: 'Requests', color: 'var(--chart-1)' },
 } satisfies ChartConfig
 
-function LogCostCell({
-  log,
-  pricingMap,
+/**
+ * A usage read that failed with nothing loaded. Says so instead of showing
+ * zero or "no data", which would read as a quiet gateway.
+ */
+function UsageReadFailed({
+  label,
+  onRetry,
 }: {
-  log: UsageLogEntry
-  pricingMap: Map<string, ModelPricing>
+  label: string
+  onRetry: () => void
 }) {
-  const cost = computeCost(
-    log.model,
-    log.input_tokens,
-    log.output_tokens,
-    pricingMap
+  return (
+    <div className="flex h-[200px] flex-col items-center justify-center gap-2 text-center text-sm">
+      <p className="text-destructive">Couldn&apos;t load {label}.</p>
+      <Button variant="outline" size="sm" onClick={onRetry}>
+        Retry
+      </Button>
+    </div>
   )
-  return <>{cost > 0 ? formatCost(cost) : '—'}</>
+}
+
+/** A stat card's value when its read failed with nothing loaded. */
+function UsageStatFailed() {
+  return <p className="text-sm text-destructive">Couldn&apos;t load</p>
+}
+
+/**
+ * The window's recorded spend. Requests with no recorded cost (logged before
+ * costs were estimated, or from a model with no published price) are not in
+ * the total, so it says so instead of reading as free.
+ */
+function EstimatedCostStat({ summary }: { summary: UsageSummary | undefined }) {
+  const unpriced = summary?.unpriced_requests ?? 0
+  const priced = summary?.priced_requests ?? 0
+  // Requests that used no tokens (failures) are neither, so they cannot turn
+  // a window with no priced request into a $0.00 total.
+  if (unpriced > 0 && priced === 0) {
+    return (
+      <>
+        <div className="text-2xl font-bold">—</div>
+        <p className="text-xs text-muted-foreground">No recorded cost</p>
+      </>
+    )
+  }
+  return (
+    <>
+      <div className="text-2xl font-bold">
+        {formatCost(microcentsToDollars(summary?.total_cost_microcents ?? 0))}
+      </div>
+      {unpriced > 0 && (
+        <p className="text-xs text-muted-foreground">
+          Excludes {formatTokenCount(unpriced)} unpriced{' '}
+          {unpriced === 1 ? 'request' : 'requests'}
+        </p>
+      )}
+    </>
+  )
+}
+
+function LogCostCell({ log }: { log: UsageLogEntry }) {
+  if (log.unpriced) return <>—</>
+  return <>{formatCost(microcentsToDollars(log.estimated_cost_microcents))}</>
 }
 
 export function UsageAnalytics() {
-  const [{ range: timeRange, endMs }, selectTimeRange] = useTimeRangeSelection()
+  const [{ range: timeRange, endMs }, selectTimeRange, moveToNow] =
+    useTimeRangeSelection()
 
   const timeParams = useMemo(() => {
     const to = new Date(endMs).toISOString()
@@ -979,21 +1005,34 @@ export function UsageAnalytics() {
     return { from, to, bucket }
   }, [endMs, timeRange])
 
-  const { data: summary, isLoading: summaryLoading } = useQuery({
-    queryKey: ['aiUsage', 'summary', timeParams.from, timeParams.to],
+  // The window is named in each key ({ from, to }), so a Refresh that moves
+  // it keeps the numbers on screen and picking another range does not.
+  const {
+    data: summary,
+    isLoading: summaryLoading,
+    isError: summaryError,
+  } = useWindowQuery({
+    queryKey: [
+      'aiUsage',
+      'summary',
+      { from: timeParams.from, to: timeParams.to },
+    ],
     queryFn: () =>
       fetchJson<UsageSummary>(
         buildUsageUrl('summary', { from: timeParams.from, to: timeParams.to })
       ),
   })
 
-  const { data: timeseries, isLoading: timeseriesLoading } = useQuery({
+  const {
+    data: timeseries,
+    isLoading: timeseriesLoading,
+    isError: timeseriesError,
+    refetch: refetchTimeseries,
+  } = useWindowQuery({
     queryKey: [
       'aiUsage',
       'timeseries',
-      timeParams.from,
-      timeParams.to,
-      timeParams.bucket,
+      { from: timeParams.from, to: timeParams.to, bucket: timeParams.bucket },
     ],
     queryFn: () =>
       fetchJson<TimeseriesBucket[]>(
@@ -1005,8 +1044,17 @@ export function UsageAnalytics() {
       ),
   })
 
-  const { data: byProvider } = useQuery({
-    queryKey: ['aiUsage', 'by-provider', timeParams.from, timeParams.to],
+  const {
+    data: byProvider,
+    isLoading: byProviderLoading,
+    isError: byProviderError,
+    refetch: refetchByProvider,
+  } = useWindowQuery({
+    queryKey: [
+      'aiUsage',
+      'by-provider',
+      { from: timeParams.from, to: timeParams.to },
+    ],
     queryFn: () =>
       fetchJson<ProviderUsage[]>(
         buildUsageUrl('by-provider', {
@@ -1016,8 +1064,17 @@ export function UsageAnalytics() {
       ),
   })
 
-  const { data: topModels } = useQuery({
-    queryKey: ['aiUsage', 'top-models', timeParams.from, timeParams.to],
+  const {
+    data: topModels,
+    isLoading: topModelsLoading,
+    isError: topModelsError,
+    refetch: refetchTopModels,
+  } = useWindowQuery({
+    queryKey: [
+      'aiUsage',
+      'top-models',
+      { from: timeParams.from, to: timeParams.to },
+    ],
     queryFn: () =>
       fetchJson<ModelUsage[]>(
         buildUsageUrl('top-models', {
@@ -1045,11 +1102,12 @@ export function UsageAnalytics() {
   // The filter row is collapsed by default and only revealed on demand.
   const [recentFiltersOpen, setRecentFiltersOpen] = useState(false)
 
-  // Cost is entered by the user in dollars; the API expects microcents.
+  // Cost is entered by the user in dollars; the API expects microcents
+  // (1e-6 USD), the unit costs are recorded in.
   const recentCostMicrocents = useMemo(() => {
     const dollars = parseFloat(recentCostInput)
     if (!Number.isFinite(dollars) || dollars < 0) return undefined
-    return Math.round(dollars * 1_000_000 * 100)
+    return Math.round(dollars * 1_000_000)
   }, [recentCostInput])
 
   // Tokens are entered as a plain integer count.
@@ -1115,28 +1173,11 @@ export function UsageAnalytics() {
     setRecentPage(0)
   }
 
-  const { data: pricingData } = useQuery({
-    queryKey: ['aiPricing'],
-    queryFn: () => fetchJson<PricingResponse>('/api/ai/pricing'),
-    staleTime: 60 * 60 * 1000,
-  })
-
-  const pricingMap = useMemo(() => {
-    const map = new Map<string, ModelPricing>()
-    for (const m of pricingData?.models ?? []) {
-      map.set(m.model, m)
-    }
-    return map
-  }, [pricingData])
-
-  const totalEstimatedCost = useMemo(() => {
-    if (!topModels || pricingMap.size === 0) return 0
-    return topModels.reduce(
-      (sum, m) =>
-        sum + computeCost(m.model, m.input_tokens, m.output_tokens, pricingMap),
-      0
-    )
-  }, [topModels, pricingMap])
+  // Failed with nothing to show: never rendered as zero usage.
+  const summaryFailed = summaryError && !summary
+  const timeseriesFailed = timeseriesError && !timeseries
+  const byProviderFailed = byProviderError && !byProvider
+  const topModelsFailed = topModelsError && !topModels
 
   const chartTimeseries = useMemo(
     () =>
@@ -1160,8 +1201,9 @@ export function UsageAnalytics() {
     <div className="space-y-4">
       {/* Time range selector */}
       <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-        <h3 className="text-lg font-semibold">Usage Analytics</h3>
-        <div className="flex gap-1">
+        <h3 className="text-lg font-semibold">Usage analytics</h3>
+        <div className="flex flex-wrap items-center gap-2">
+          <RefreshButton queryKeys={[['aiUsage']]} onRefresh={moveToNow} />
           <AiTimeRange
             range={timeRange}
             endMs={endMs}
@@ -1182,6 +1224,8 @@ export function UsageAnalytics() {
           <CardContent>
             {summaryLoading ? (
               <Skeleton className="h-7 w-16" />
+            ) : summaryFailed ? (
+              <UsageStatFailed />
             ) : (
               <div className="text-2xl font-bold">
                 {formatTokenCount(summary?.total_requests ?? 0)}
@@ -1193,12 +1237,14 @@ export function UsageAnalytics() {
           <CardHeader className="pb-2">
             <CardTitle className="text-sm font-medium flex items-center gap-2">
               <Zap className="h-4 w-4 text-muted-foreground" />
-              Total Tokens
+              Total tokens
             </CardTitle>
           </CardHeader>
           <CardContent>
             {summaryLoading ? (
               <Skeleton className="h-7 w-16" />
+            ) : summaryFailed ? (
+              <UsageStatFailed />
             ) : (
               <div className="text-2xl font-bold">
                 {formatTokenCount(summary?.total_tokens ?? 0)}
@@ -1210,12 +1256,14 @@ export function UsageAnalytics() {
           <CardHeader className="pb-2">
             <CardTitle className="text-sm font-medium flex items-center gap-2">
               <Clock className="h-4 w-4 text-muted-foreground" />
-              Avg Latency
+              Avg latency
             </CardTitle>
           </CardHeader>
           <CardContent>
             {summaryLoading ? (
               <Skeleton className="h-7 w-16" />
+            ) : summaryFailed ? (
+              <UsageStatFailed />
             ) : (
               <div className="text-2xl font-bold">
                 {Math.round(summary?.avg_latency_ms ?? 0)}ms
@@ -1227,12 +1275,14 @@ export function UsageAnalytics() {
           <CardHeader className="pb-2">
             <CardTitle className="text-sm font-medium flex items-center gap-2">
               <TrendingUp className="h-4 w-4 text-muted-foreground" />
-              Error Rate
+              Error rate
             </CardTitle>
           </CardHeader>
           <CardContent>
             {summaryLoading ? (
               <Skeleton className="h-7 w-16" />
+            ) : summaryFailed ? (
+              <UsageStatFailed />
             ) : (
               <div className="text-2xl font-bold">
                 {summary && summary.total_requests > 0
@@ -1252,10 +1302,10 @@ export function UsageAnalytics() {
           <CardContent>
             {summaryLoading ? (
               <Skeleton className="h-7 w-16" />
+            ) : summaryFailed ? (
+              <UsageStatFailed />
             ) : (
-              <div className="text-2xl font-bold">
-                {formatCost(totalEstimatedCost)}
-              </div>
+              <EstimatedCostStat summary={summary} />
             )}
           </CardContent>
         </Card>
@@ -1264,11 +1314,16 @@ export function UsageAnalytics() {
       {/* Requests over time chart */}
       <Card>
         <CardHeader>
-          <CardTitle className="text-base">Requests Over Time</CardTitle>
+          <CardTitle className="text-base">Requests over time</CardTitle>
         </CardHeader>
         <CardContent>
           {timeseriesLoading ? (
             <Skeleton className="h-[200px] w-full" />
+          ) : timeseriesFailed ? (
+            <UsageReadFailed
+              label="requests over time"
+              onRetry={() => void refetchTimeseries()}
+            />
           ) : chartTimeseries.length === 0 ? (
             <EmptyState
               icon={Activity}
@@ -1305,11 +1360,16 @@ export function UsageAnalytics() {
       <div className="grid gap-4 md:grid-cols-2">
         <Card>
           <CardHeader>
-            <CardTitle className="text-base">Token Usage</CardTitle>
+            <CardTitle className="text-base">Token usage</CardTitle>
           </CardHeader>
           <CardContent>
             {timeseriesLoading ? (
               <Skeleton className="h-[200px] w-full" />
+            ) : timeseriesFailed ? (
+              <UsageReadFailed
+                label="usage over time"
+                onRetry={() => void refetchTimeseries()}
+              />
             ) : chartTimeseries.length === 0 ? (
               <div className="h-[200px] flex items-center justify-center text-sm text-muted-foreground">
                 No data
@@ -1356,11 +1416,16 @@ export function UsageAnalytics() {
 
         <Card>
           <CardHeader>
-            <CardTitle className="text-base">Avg Latency</CardTitle>
+            <CardTitle className="text-base">Avg latency</CardTitle>
           </CardHeader>
           <CardContent>
             {timeseriesLoading ? (
               <Skeleton className="h-[200px] w-full" />
+            ) : timeseriesFailed ? (
+              <UsageReadFailed
+                label="usage over time"
+                onRetry={() => void refetchTimeseries()}
+              />
             ) : chartTimeseries.length === 0 ? (
               <div className="h-[200px] flex items-center justify-center text-sm text-muted-foreground">
                 No data
@@ -1403,10 +1468,17 @@ export function UsageAnalytics() {
       <div className="grid gap-4 md:grid-cols-2">
         <Card>
           <CardHeader>
-            <CardTitle className="text-base">By Provider</CardTitle>
+            <CardTitle className="text-base">By provider</CardTitle>
           </CardHeader>
           <CardContent>
-            {!byProvider || byProvider.length === 0 ? (
+            {byProviderLoading ? (
+              <Skeleton className="h-[200px] w-full" />
+            ) : byProviderFailed ? (
+              <UsageReadFailed
+                label="usage by provider"
+                onRetry={() => void refetchByProvider()}
+              />
+            ) : !byProvider || byProvider.length === 0 ? (
               <div className="h-[200px] flex items-center justify-center text-sm text-muted-foreground">
                 No data
               </div>
@@ -1452,22 +1524,28 @@ export function UsageAnalytics() {
 
         <Card>
           <CardHeader>
-            <CardTitle className="text-base">Top Models</CardTitle>
+            <CardTitle className="text-base">Top models</CardTitle>
           </CardHeader>
           <CardContent>
-            {!topModels || topModels.length === 0 ? (
+            {topModelsLoading ? (
+              <div className="space-y-3">
+                {['a', 'b', 'c', 'd'].map((key) => (
+                  <Skeleton key={key} className="h-5 w-full" />
+                ))}
+              </div>
+            ) : topModelsFailed ? (
+              <UsageReadFailed
+                label="top models"
+                onRetry={() => void refetchTopModels()}
+              />
+            ) : !topModels || topModels.length === 0 ? (
               <div className="h-[200px] flex items-center justify-center text-sm text-muted-foreground">
                 No data
               </div>
             ) : (
               <div className="space-y-3">
                 {topModels.map((m) => {
-                  const cost = computeCost(
-                    m.model,
-                    m.input_tokens,
-                    m.output_tokens,
-                    pricingMap
-                  )
+                  const cost = microcentsToDollars(m.estimated_cost_microcents)
                   return (
                     <div
                       key={m.model}
@@ -1504,7 +1582,7 @@ export function UsageAnalytics() {
       <Card>
         <CardHeader className="gap-3">
           <div className="flex items-center justify-between gap-2">
-            <CardTitle className="text-base">Recent Requests</CardTitle>
+            <CardTitle className="text-base">Recent requests</CardTitle>
             <Button
               type="button"
               variant={recentFiltersOpen ? 'secondary' : 'outline'}
@@ -1698,7 +1776,7 @@ export function UsageAnalytics() {
                         {log.latency_ms}ms
                       </TableCell>
                       <TableCell className="hidden md:table-cell text-muted-foreground">
-                        <LogCostCell log={log} pricingMap={pricingMap} />
+                        <LogCostCell log={log} />
                       </TableCell>
                       <TableCell>
                         <div className="flex items-center gap-1.5">
@@ -2512,7 +2590,7 @@ function SpanDetailSheet({
           {/* Identification */}
           <DetailSection title="Identification">
             <DetailRow label="Span ID" value={span.span_id} mono />
-            <DetailRow label="Parent Span" value={span.parent_span_id} mono />
+            <DetailRow label="Parent span" value={span.parent_span_id} mono />
             <DetailRow label="Kind" value={span.kind} />
             <DetailRow
               label="Duration"
@@ -2526,15 +2604,15 @@ function SpanDetailSheet({
 
           {/* Model */}
           <DetailSection title="Model">
-            <DetailRow label="Requested Model" value={span.gen_ai_model} mono />
+            <DetailRow label="Requested model" value={span.gen_ai_model} mono />
             <DetailRow
-              label="Response Model"
+              label="Response model"
               value={span.gen_ai_response_model}
               mono
             />
             <DetailRow label="Response ID" value={span.response_id} mono />
             <DetailRow
-              label="Finish Reasons"
+              label="Finish reasons"
               value={span.response_finish_reasons?.join(', ')}
             />
             <DetailRow
@@ -2545,32 +2623,32 @@ function SpanDetailSheet({
           </DetailSection>
 
           {/* Request Parameters */}
-          <DetailSection title="Request Parameters">
+          <DetailSection title="Request parameters">
             <DetailRow
               label="Temperature"
               value={span.request_temperature?.toString()}
             />
             <DetailRow
-              label="Max Tokens"
+              label="Max tokens"
               value={span.request_max_tokens?.toString()}
             />
             <DetailRow label="Top P" value={span.request_top_p?.toString()} />
             <DetailRow label="Top K" value={span.request_top_k?.toString()} />
             <DetailRow
-              label="Frequency Penalty"
+              label="Frequency penalty"
               value={span.request_frequency_penalty?.toString()}
             />
             <DetailRow
-              label="Presence Penalty"
+              label="Presence penalty"
               value={span.request_presence_penalty?.toString()}
             />
             <DetailRow
-              label="Stop Sequences"
+              label="Stop sequences"
               value={span.request_stop_sequences?.join(', ')}
             />
             <DetailRow label="Seed" value={span.request_seed?.toString()} />
             <DetailRow
-              label="Choice Count"
+              label="Choice count"
               value={span.request_choice_count?.toString()}
             />
           </DetailSection>
@@ -2587,8 +2665,8 @@ function SpanDetailSheet({
 
           {/* Tool */}
           {(span.tool_name || span.tool_call_id) && (
-            <DetailSection title="Tool Execution">
-              <DetailRow label="Tool Name" value={span.tool_name} />
+            <DetailSection title="Tool execution">
+              <DetailRow label="Tool name" value={span.tool_name} />
               <DetailRow label="Call ID" value={span.tool_call_id} mono />
               <DetailRow label="Type" value={span.tool_type} />
               <DetailRow label="Description" value={span.tool_description} />
@@ -2603,7 +2681,7 @@ function SpanDetailSheet({
                 value={span.embeddings_dimension_count.toString()}
               />
               <DetailRow
-                label="Encoding Formats"
+                label="Encoding formats"
                 value={span.request_encoding_formats?.join(', ')}
               />
             </DetailSection>
@@ -2612,7 +2690,7 @@ function SpanDetailSheet({
           {/* Retrieval */}
           {span.data_source_id && (
             <DetailSection title="Retrieval">
-              <DetailRow label="Data Source" value={span.data_source_id} mono />
+              <DetailRow label="Data source" value={span.data_source_id} mono />
             </DetailSection>
           )}
 
@@ -2629,18 +2707,18 @@ function SpanDetailSheet({
             span.openai_system_fingerprint ||
             span.aws_bedrock_guardrail_id ||
             span.azure_resource_provider_namespace) && (
-            <DetailSection title="Provider Specific">
-              <DetailRow label="OpenAI API Type" value={span.openai_api_type} />
+            <DetailSection title="Provider specific">
+              <DetailRow label="OpenAI API type" value={span.openai_api_type} />
               <DetailRow
-                label="Request Service Tier"
+                label="Request service tier"
                 value={span.openai_request_service_tier}
               />
               <DetailRow
-                label="Response Service Tier"
+                label="Response service tier"
                 value={span.openai_response_service_tier}
               />
               <DetailRow
-                label="System Fingerprint"
+                label="System fingerprint"
                 value={span.openai_system_fingerprint}
                 mono
               />
@@ -2655,7 +2733,7 @@ function SpanDetailSheet({
                 mono
               />
               <DetailRow
-                label="Azure Namespace"
+                label="Azure namespace"
                 value={span.azure_resource_provider_namespace}
               />
             </DetailSection>
@@ -2689,7 +2767,7 @@ function SpanDetailSheet({
               <Separator />
               <div>
                 <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-1">
-                  Tool Content
+                  Tool content
                 </h4>
                 <JsonBlock
                   label="Arguments"
@@ -3193,7 +3271,7 @@ function TraceDetailView({
             <div className="grid gap-3 grid-cols-2 md:grid-cols-4 lg:grid-cols-6">
               <Card className="p-3">
                 <div className="text-[10px] text-muted-foreground uppercase">
-                  Total Spans
+                  Total spans
                 </div>
                 <div className="text-xl font-bold">
                   {traceDetail.span_count}
@@ -3214,7 +3292,7 @@ function TraceDetailView({
               </Card>
               <Card className="p-3">
                 <div className="text-[10px] text-muted-foreground uppercase">
-                  Input Tokens
+                  Input tokens
                 </div>
                 <div className="text-xl font-bold tabular-nums">
                   {formatTokenCount(stats.totalInput)}
@@ -3227,7 +3305,7 @@ function TraceDetailView({
               </Card>
               <Card className="p-3">
                 <div className="text-[10px] text-muted-foreground uppercase">
-                  Output Tokens
+                  Output tokens
                 </div>
                 <div className="text-xl font-bold tabular-nums">
                   {formatTokenCount(stats.totalOutput)}
@@ -3236,7 +3314,7 @@ function TraceDetailView({
               {stats.tools.length > 0 && (
                 <Card className="p-3">
                   <div className="text-[10px] text-muted-foreground uppercase">
-                    Tool Calls
+                    Tool calls
                   </div>
                   <div className="text-xl font-bold">{stats.tools.length}</div>
                 </Card>
@@ -3260,8 +3338,7 @@ function TraceDetailView({
           {/* Invocations (default) + raw span tree */}
           <Tabs defaultValue="conversation" className="w-full">
             <TabsList>
-              <TabsTrigger value="conversation" className="gap-1.5">
-                <MessageSquare className="h-3.5 w-3.5" />
+              <TabsTrigger value="conversation" icon={MessageSquare}>
                 Conversation
                 {invocationCount > 0 && (
                   <span className="text-xs text-muted-foreground">
@@ -3269,8 +3346,7 @@ function TraceDetailView({
                   </span>
                 )}
               </TabsTrigger>
-              <TabsTrigger value="tree" className="gap-1.5">
-                <ListTree className="h-3.5 w-3.5" />
+              <TabsTrigger value="tree" icon={ListTree}>
                 Span tree
                 <span className="text-xs text-muted-foreground">
                   {traceDetail.span_count}
@@ -3381,7 +3457,8 @@ export function AgentActivity() {
   const [selectedProjectId, setSelectedProjectId] = useState<
     number | undefined
   >(projects[0]?.id)
-  const [{ range: timeRange, endMs }, selectTimeRange] = useTimeRangeSelection()
+  const [{ range: timeRange, endMs }, selectTimeRange, moveToNow] =
+    useTimeRangeSelection()
   const [systemFilter, setSystemFilter] = useState<string>('')
   const [selectedTraceId, setSelectedTraceId] = useState<string | null>(null)
   const [selectedTraceBounds, setSelectedTraceBounds] =
@@ -3403,7 +3480,7 @@ export function AgentActivity() {
     data: tracesResponse,
     isLoading: tracesLoading,
     error: tracesError,
-  } = useQuery({
+  } = useWindowQuery({
     ...queryGenaiTracesOptions({
       query: {
         project_id: projectId,
@@ -3449,7 +3526,7 @@ export function AgentActivity() {
     <div className="space-y-4">
       {/* Filters */}
       <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-        <h3 className="text-lg font-semibold">Agent Activity</h3>
+        <h3 className="text-lg font-semibold">Agent activity</h3>
         <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
           {projects.length > 0 && (
             <Select
@@ -3477,7 +3554,15 @@ export function AgentActivity() {
               setSystemFilter(value === 'all' ? '' : value)
             }
           />
-          <div className="flex gap-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <RefreshButton
+              queryKeys={[
+                queryKeyPrefix(queryGenaiTracesQueryKey, {
+                  query: { project_id: projectId },
+                }),
+              ]}
+              onRefresh={moveToNow}
+            />
             <AiTimeRange
               range={timeRange}
               endMs={endMs}
@@ -3721,7 +3806,8 @@ export function ProjectAgentActivity({
   projectId: number
   projectSlug: string
 }) {
-  const [{ range: timeRange, endMs }, selectTimeRange] = useTimeRangeSelection()
+  const [{ range: timeRange, endMs }, selectTimeRange, moveToNow] =
+    useTimeRangeSelection()
   const [systemFilter, setSystemFilter] = useState<string>('')
   const [searchParams, setSearchParams] = useSearchParams()
   const selectedTraceId = searchParams.get('trace') || null
@@ -3754,7 +3840,7 @@ export function ProjectAgentActivity({
     data: tracesResponse,
     isLoading: tracesLoading,
     error: tracesError,
-  } = useQuery({
+  } = useWindowQuery({
     ...queryGenaiTracesOptions({
       query: {
         project_id: projectId,
@@ -3798,7 +3884,7 @@ export function ProjectAgentActivity({
   return (
     <div className="space-y-4">
       <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-        <h3 className="text-lg font-semibold">AI Activity</h3>
+        <h3 className="text-lg font-semibold">AI activity</h3>
         <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
           <AiProviderSelect
             value={systemFilter || 'all'}
@@ -3806,7 +3892,15 @@ export function ProjectAgentActivity({
               setSystemFilter(value === 'all' ? '' : value)
             }
           />
-          <div className="flex gap-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <RefreshButton
+              queryKeys={[
+                queryKeyPrefix(queryGenaiTracesQueryKey, {
+                  query: { project_id: projectId },
+                }),
+              ]}
+              onRefresh={moveToNow}
+            />
             <AiTimeRange
               range={timeRange}
               endMs={endMs}
@@ -4158,7 +4252,8 @@ export function AiGatewayPage() {
 
   // Delete mutation
   const deleteMutation = useMutation({
-    mutationFn: (id: number) => deleteProviderKey({ path: { id } }),
+    mutationFn: (id: number) =>
+      deleteProviderKey({ path: { id }, throwOnError: true }),
     meta: { errorTitle: 'Failed to delete provider key' },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['providerKeys'] })
@@ -4171,7 +4266,11 @@ export function AiGatewayPage() {
   // Toggle active mutation
   const toggleMutation = useMutation({
     mutationFn: ({ id, is_active }: { id: number; is_active: boolean }) =>
-      updateProviderKey({ path: { id }, body: { is_active } }),
+      updateProviderKey({
+        path: { id },
+        body: { is_active },
+        throwOnError: true,
+      }),
     meta: { errorTitle: 'Failed to update provider key' },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['providerKeys'] })
@@ -4411,14 +4510,16 @@ console.log(response.choices[0].message.content);`,
       {/* Page Header */}
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div>
-          <h1 className="text-2xl sm:text-3xl font-bold">AI Gateway</h1>
+          <PageTitle className="text-2xl sm:text-3xl font-bold">
+            AI Gateway
+          </PageTitle>
           <p className="text-muted-foreground mt-1 sm:mt-2 text-sm">
             Unified API for multiple AI providers with a single endpoint
           </p>
         </div>
         <Button onClick={openAddKeyDialog} className="w-full sm:w-auto">
           <Plus className="mr-2 h-4 w-4" />
-          Add Provider Key
+          Add provider key
         </Button>
       </div>
 
@@ -4844,7 +4945,7 @@ console.log(response.choices[0].message.content);`,
               <DialogTitle>
                 {newProvider
                   ? `Configure ${providerName(newProvider)}`
-                  : 'Add Provider Key'}
+                  : 'Add provider key'}
               </DialogTitle>
               <DialogDescription>
                 Your key is encrypted at rest and used only to route requests
@@ -4897,7 +4998,7 @@ console.log(response.choices[0].message.content);`,
                   its discovery state mounted. */}
               <div className={newProvider ? 'grid gap-4' : 'hidden'}>
                 <div className="grid gap-2">
-                  <Label htmlFor="displayName">Display Name</Label>
+                  <Label htmlFor="displayName">Display name</Label>
                   <Input
                     id="displayName"
                     placeholder="Production API Key"
@@ -4913,7 +5014,7 @@ console.log(response.choices[0].message.content);`,
                 </div>
                 <div className="grid gap-2">
                   <Label htmlFor="apiKey">
-                    API Key
+                    API key
                     {newProviderIsSelfHosted && (
                       <>
                         {' '}

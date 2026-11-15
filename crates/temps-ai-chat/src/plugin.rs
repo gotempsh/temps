@@ -58,7 +58,7 @@ impl TempsPlugin for AiChatPlugin {
             let db = context.require_service::<sea_orm::DatabaseConnection>();
             let encryption = context.require_service::<temps_core::EncryptionService>();
             let ai = context.require_service::<dyn temps_ai::AiService>();
-            let log_service = context.require_service::<temps_logs::LogService>();
+            let log_service = context.require_service::<temps_deployment_logs::LogService>();
             // Audit logger for chat write operations (registered by AuditPlugin,
             // which loads well before this plugin).
             let audit_service = context.require_service::<dyn temps_core::AuditLogger>();

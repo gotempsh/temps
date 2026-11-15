@@ -385,7 +385,7 @@ export function ProvidersManagement({
         {hasProviders && canManageProviders && (
           <CreateActionButton
             onClick={() => navigate(addProviderHref)}
-            label="Add Provider"
+            label="Add provider"
           />
         )}
       </div>
@@ -425,7 +425,7 @@ export function ProvidersManagement({
             canManageProviders ? (
               <CreateActionButton
                 onClick={() => navigate(addProviderHref)}
-                label="Add Provider"
+                label="Add provider"
               />
             ) : undefined
           }
@@ -543,7 +543,7 @@ export function ProvidersManagement({
       <Dialog open={isEditDialogOpen} onOpenChange={setIsEditDialogOpen}>
         <DialogContent className="max-w-2xl max-h-[90vh] flex flex-col">
           <DialogHeader>
-            <DialogTitle>Edit Provider</DialogTitle>
+            <DialogTitle>Edit provider</DialogTitle>
             <DialogDescription>
               Update your notification provider settings.
             </DialogDescription>

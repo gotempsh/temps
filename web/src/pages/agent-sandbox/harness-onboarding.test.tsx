@@ -460,4 +460,36 @@ describe('harness onboarding', () => {
     expect(html).toContain('Model to verify')
     expect(html).not.toContain('reusable credential is never injected')
   })
+
+  test('a setup link carries a return path only when one is given and safe', () => {
+    expect(harnessSetupHref('claude_cli', null)).toBe(
+      '/agent-sandbox/providers/claude_cli'
+    )
+    expect(harnessSetupHref(null, 'https://example.com')).toBe(
+      '/agent-sandbox/providers'
+    )
+    const returnTo = '/projects/demo/settings/automation'
+    expect(harnessSetupHref(null, returnTo)).toBe(
+      `/agent-sandbox/providers?returnTo=${encodeURIComponent(returnTo)}`
+    )
+  })
+
+  test('harness setup only offers a way back when it was opened from a task', () => {
+    const editor = (returnTo?: string | null) =>
+      renderToStaticMarkup(
+        <QueryClientProvider client={new QueryClient()}>
+          <MemoryRouter>
+            <ProviderEditor
+              provider={provider}
+              isActive={false}
+              returnTo={returnTo}
+            />
+          </MemoryRouter>
+        </QueryClientProvider>
+      )
+    expect(editor()).not.toContain('>Back<')
+    const back = editor('/projects/demo/settings/automation')
+    expect(back).toContain('>Back<')
+    expect(back).toContain('href="/projects/demo/settings/automation"')
+  })
 })

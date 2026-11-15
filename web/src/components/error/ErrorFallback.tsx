@@ -3,6 +3,7 @@
 
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
+import { DiscordHelpLink } from '@/components/support/DiscordHelpLink'
 import {
   Card,
   CardContent,
@@ -100,7 +101,7 @@ export function ErrorFallback({
           <div className="flex flex-col sm:flex-row gap-3 pt-2">
             <Button onClick={resetError} className="flex-1 sm:flex-none">
               <RefreshCw className="mr-2 h-4 w-4" />
-              Try Again
+              Try again
             </Button>
             <Button
               onClick={handleGoHome}
@@ -108,9 +109,12 @@ export function ErrorFallback({
               className="flex-1 sm:flex-none"
             >
               <Home className="mr-2 h-4 w-4" />
-              Back to Dashboard
+              Back to dashboard
             </Button>
           </div>
+          <p className="text-sm text-muted-foreground">
+            Need help with Temps? <DiscordHelpLink />
+          </p>
         </CardContent>
       </Card>
     </div>

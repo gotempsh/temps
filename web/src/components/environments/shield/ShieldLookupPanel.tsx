@@ -9,8 +9,10 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { ReadFailure } from '@/components/ui/read-failure'
 import { Skeleton } from '@/components/ui/skeleton'
+import { ipDetailPath } from '@/lib/ip-detail'
 import { shieldModeLabel, shieldVerdictBadge } from '@/lib/shield'
 import { zodResolver } from '@hookform/resolvers/zod'
+import { Link } from 'react-router'
 import { useQuery } from '@tanstack/react-query'
 import { Loader2, Search } from 'lucide-react'
 import { useState } from 'react'
@@ -145,11 +147,21 @@ export function ShieldLookupPanel({ path }: { path: ShieldEnvironmentPath }) {
 }
 
 function LookupResult({ result }: { result: ShieldLookupResponse }) {
-  const subject = [result.ip, result.ja4].filter(Boolean).join(' with ')
   return (
     <div className="space-y-3" aria-live="polite">
       <div className="flex flex-wrap items-center gap-2">
-        <span className="text-sm font-medium break-all">{subject}</span>
+        <span className="text-sm font-medium break-all">
+          {result.ip ? (
+            <Link
+              to={ipDetailPath(result.ip)}
+              className="underline-offset-4 hover:underline"
+            >
+              {result.ip}
+            </Link>
+          ) : null}
+          {result.ip && result.ja4 ? ' with ' : null}
+          {result.ja4}
+        </span>
         <Badge
           variant={shieldVerdictBadge(result.allowed ? 'allow' : result.action)}
         >

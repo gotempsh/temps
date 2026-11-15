@@ -40,7 +40,7 @@ function fail(client: QueryClient, queryKey: QueryKey, error: unknown) {
     .setState({ status: 'error', error: error as Error, fetchStatus: 'idle' })
 }
 
-/** Only instance admins are offered "Add Route". */
+/** Only instance admins are offered "Add route". */
 function signedIn(role: string): UserResponse {
   return {
     id: 1,
@@ -74,9 +74,9 @@ function render(client: QueryClient, role = 'admin') {
   )
 }
 
-/** The section header always offers "Add Route"; the empty state adds a second. */
+/** The section header always offers "Add route"; the empty state adds a second. */
 function addRouteLinks(html: string) {
-  return html.split('Add Route').length - 1
+  return html.split('Add route').length - 1
 }
 
 function expectNoEmptyState(html: string) {

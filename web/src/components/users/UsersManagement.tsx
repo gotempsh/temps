@@ -243,7 +243,7 @@ export function UsersManagement({
           canManageUsers ? (
             <CreateActionButton
               onClick={() => navigate('/settings/users/new')}
-              label="Add User"
+              label="Add user"
               icon={<UserPlus className="h-4 w-4" />}
             />
           ) : undefined
@@ -287,7 +287,7 @@ export function UsersManagement({
       >
         <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-2xl">
           <DialogHeader>
-            <DialogTitle>Manage User Role</DialogTitle>
+            <DialogTitle>Manage user role</DialogTitle>
             <p className="text-sm text-muted-foreground">
               Select a role for{' '}
               {userToManageRoles?.user.name || userToManageRoles?.user.username}
@@ -432,7 +432,7 @@ export function UsersManagement({
             canManageUsers ? (
               <Button onClick={() => navigate('/settings/users/new')}>
                 <Plus className="mr-2 h-4 w-4" />
-                Add User
+                Add user
               </Button>
             ) : undefined
           }
@@ -522,7 +522,7 @@ export function UsersManagement({
                             onClick={() => setUserToManageRoles(user)}
                           >
                             <Shield className="mr-2 h-4 w-4" />
-                            Manage Roles
+                            Manage roles
                           </DropdownMenuItem>
                           {currentUser?.id === user.user.id ? (
                             <DropdownMenuItem

@@ -4,12 +4,12 @@
 import { expect, expectAppMounted, test, uniqueSlug } from '../fixtures'
 
 /**
- * Drives the console's "Add Email Provider" wizard to create an SMTP
+ * Drives the console's "Add email provider" wizard to create an SMTP
  * provider pointed at a local Mailpit instance, sends a test email through
- * the console's "Send Test Email" dialog, and confirms Mailpit actually
+ * the console's "Send test email" dialog, and confirms Mailpit actually
  * received it -- not just that the send call returned success.
  *
- * `POST /email-providers/{id}/test` (what "Send Test Email" calls) sends
+ * `POST /email-providers/{id}/test` (what "Send test email" calls) sends
  * directly through the provider with no sending-domain verification
  * prerequisite, unlike the general `/emails` send endpoint used by deployed
  * apps -- which is also why this is the one email flow reachable end-to-end
@@ -46,7 +46,7 @@ test.describe('Email provider via Mailpit (SMTP)', () => {
       // (optional)" contains "name" (case-insensitively), so a plain
       // getByLabel('Name') resolves to two elements.
       await page.getByLabel('Name', { exact: true }).fill(name)
-      await page.getByLabel('SMTP Host').fill('localhost')
+      await page.getByLabel('SMTP host').fill('localhost')
       await page.getByLabel('Port').fill('1025')
       await page.getByLabel('Encryption').click()
       await page
@@ -54,7 +54,7 @@ test.describe('Email provider via Mailpit (SMTP)', () => {
         .click()
       // Username/password left blank -- Mailpit accepts unauthenticated relays.
 
-      await page.getByRole('button', { name: 'Add Provider' }).click()
+      await page.getByRole('button', { name: 'Add provider' }).click()
       await page.waitForURL(/\/email(\?tab=providers)?$/)
 
       // Resolve the id via the API (same pattern as api-key-create.spec.ts) --
@@ -74,14 +74,14 @@ test.describe('Email provider via Mailpit (SMTP)', () => {
       await page.goto(`/email/providers/${providerId}`)
       await expectAppMounted(page)
 
-      await page.getByRole('button', { name: 'Send Test Email' }).click()
+      await page.getByRole('button', { name: 'Send test email' }).click()
       const dialog = page.getByRole('dialog')
       await expect(
-        dialog.getByRole('heading', { name: 'Send Test Email' })
+        dialog.getByRole('heading', { name: 'Send test email' })
       ).toBeVisible()
       const fromAddress = `noreply@${name}.e2e.test`
-      await dialog.getByLabel('From Email Address').fill(fromAddress)
-      await dialog.getByRole('button', { name: 'Send Test Email' }).click()
+      await dialog.getByLabel('From email address').fill(fromAddress)
+      await dialog.getByRole('button', { name: 'Send test email' }).click()
 
       await expect(page.getByText('Test email sent successfully!')).toBeVisible(
         {

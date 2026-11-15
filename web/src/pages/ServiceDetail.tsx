@@ -1,16 +1,21 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import {
+  memberProgress,
+  type MemberProgressInput,
+} from '@/lib/cluster-member-progress'
 import { linkedResourceCopy } from '@/lib/service-link-copy'
 import {
   deleteServiceMutation,
   getClusterHealthQueryKey,
   getProjectsOptions,
-  listS3SourcesOptions,
   getServiceOptions,
+  getServiceQueryKey,
   getServicePreviewEnvironmentVariablesMaskedOptions,
   linkServiceToProjectMutation,
   listServiceProjectsOptions,
+  listServiceProjectsQueryKey,
   startServiceMutation,
   stopServiceMutation,
 } from '@/api/client/@tanstack/react-query.gen'
@@ -25,15 +30,18 @@ import {
 } from '@/lib/external-service-backups'
 import { ClusterHealthPanel } from '@/components/storage/ClusterHealthPanel'
 import { MonitoringCard } from '@/components/storage/MonitoringCard'
-import { ServiceLogIngestionCard } from '@/components/storage/ServiceLogIngestionCard'
 import { EditServiceDialog } from '@/components/storage/EditServiceDialog'
 import { ServiceResourcesPanel } from '@/components/storage/ServiceResourcesPanel'
+import { ServiceTlsCard } from '@/components/storage/ServiceTlsCard'
+import { ServiceHealthcheckCard } from '@/components/storage/ServiceHealthcheckCard'
+import { ResponsivePagination } from '@/components/ui/responsive-pagination'
 import { MajorUpgradeDialog } from '@/components/storage/MajorUpgradeDialog'
 import {
   ServiceHealthBadge,
   ServiceHealthCard,
 } from '@/components/storage/ServiceHealthCard'
 import { WalHealthPanel } from '@/components/storage/WalHealthPanel'
+import { backupDestinationsOptions } from '@/components/storage/backup-destinations-query'
 import { TriggerBackupDialog } from '@/components/storage/TriggerBackupDialog'
 import {
   ScheduleBackupsAction,
@@ -85,6 +93,7 @@ import {
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { EnvVariablesDisplay } from '@/components/ui/env-variables-display'
 import { ServiceLogo } from '@/components/ui/service-logo'
+import { RefreshButton } from '@/components/ui/refresh-button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { TimeAgo } from '@/components/utils/TimeAgo'
 import { ServiceReadinessPanel } from '@/components/storage/ServiceReadinessPanel'
@@ -131,8 +140,6 @@ import {
   ArrowUpCircle,
   CheckCircle2,
   ChevronDown,
-  ChevronLeft,
-  ChevronRight,
   Clock,
   Database,
   Eye,
@@ -152,7 +159,7 @@ import {
   XCircle,
   BarChart2,
 } from 'lucide-react'
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link, useLocation, useNavigate, useParams } from 'react-router'
 import { isVerifiedNotFound } from '@/lib/read-failure'
 import { toast } from 'sonner'
@@ -259,6 +266,7 @@ export function ServiceDetail() {
     isLoading,
     error: queryError,
     refetch,
+    isFetching: isFetchingService,
   } = useQuery({
     ...getServiceOptions({
       path: { id: parseInt(id!) },
@@ -366,7 +374,7 @@ export function ServiceDetail() {
   // Backup destinations decide whether the Backups card can offer to back
   // this database up or must onboard a destination first.
   const backupSourcesQuery = useQuery({
-    ...listS3SourcesOptions(),
+    ...backupDestinationsOptions(),
     retry: false,
   })
   const backupSources = backupSourcesQuery.data ?? []
@@ -395,18 +403,6 @@ export function ServiceDetail() {
   ])
 
   const paginatedBackups = serviceBackups
-
-  const backupsPageWindow = useMemo(() => {
-    const windowSize = Math.min(5, backupsTotalPages)
-    const start = Math.max(
-      1,
-      Math.min(
-        backupsPage - Math.floor(windowSize / 2),
-        backupsTotalPages - windowSize + 1
-      )
-    )
-    return Array.from({ length: windowSize }, (_, idx) => start + idx)
-  }, [backupsPage, backupsTotalPages])
 
   const [isLinkPopoverOpen, setIsLinkPopoverOpen] = useState(
     () =>
@@ -449,7 +445,7 @@ export function ServiceDetail() {
     } else {
       setBreadcrumbs([
         { label: 'Databases', href: '/storage' },
-        { label: 'Service Details', href: `/storage/${id}` },
+        { label: 'Service details', href: `/storage/${id}` },
       ])
     }
   }, [setBreadcrumbs, id, service])
@@ -663,19 +659,10 @@ export function ServiceDetail() {
     deleteService.mutate({ path: { id: parseInt(id!) } })
   }
 
-  const backAction = (
-    <Button variant="ghost" size="icon" asChild>
-      <Link to="/storage" aria-label="Back to storage">
-        <ArrowLeft className="h-4 w-4" />
-      </Link>
-    </Button>
-  )
-
   if (isLoading) {
     return (
       <Detail
         title={<Skeleton className="h-7 w-56" />}
-        actions={backAction}
         facts={[0, 1, 2, 3].map(() => ({
           label: <Skeleton className="h-3 w-16" />,
           value: <Skeleton className="h-4 w-24" />,
@@ -707,7 +694,9 @@ export function ServiceDetail() {
     )
   }
 
-  if (queryError || !service) {
+  // A failed refresh keeps the loaded page (and its open dialogs); only a
+  // service that never loaded is replaced by the error.
+  if (!service) {
     return (
       <PageState
         variant="failed"
@@ -796,7 +785,18 @@ export function ServiceDetail() {
         facts={facts}
         actions={
           <>
-            {backAction}
+            <RefreshButton
+              queryKeys={[
+                getServiceQueryKey({ path: { id: service.service.id } }),
+                listServiceProjectsQueryKey({
+                  path: { id: service.service.id },
+                }),
+                ['pg-upgrades', id],
+                externalServiceBackupsQueryKey(service.service.id),
+                // The header badge and the health strip.
+                ['service-health', service.service.id],
+              ]}
+            />
             {/*
               Linked projects: collapsed into a header chip so the body of the
               page can stay focused on Health + Configuration. Click to see the
@@ -1041,6 +1041,19 @@ export function ServiceDetail() {
         main={
           <>
             {error ? <Callout tone="error">{error}</Callout> : null}
+            {queryError ? (
+              <Callout tone="error" title="Couldn't refresh service">
+                Showing the last loaded service.{' '}
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => void refetch()}
+                  disabled={isFetchingService}
+                >
+                  Retry service
+                </Button>
+              </Callout>
+            ) : null}
 
             <ActiveRestoreBanner serviceId={service.service.id} />
 
@@ -1081,7 +1094,13 @@ export function ServiceDetail() {
               <WalHealthPanel
                 serviceId={parseInt(id!)}
                 serviceType={service.service.service_type}
-                onUpgrade={() => setIsUpgradeDialogOpen(true)}
+                // A service on a worker node cannot change its image here
+                // (the server refuses it), so it gets no upgrade action.
+                onUpgrade={
+                  service.service.node_id
+                    ? undefined
+                    : () => setIsUpgradeDialogOpen(true)
+                }
                 onBackup={() => setIsBackupDialogOpen(true)}
                 isImported={!!service.current_parameters?.container_name}
               />
@@ -1096,18 +1115,16 @@ export function ServiceDetail() {
                 }
                 metricsEnabled={service.service.metrics_enabled ?? false}
                 onMonitoringChange={() => refetch()}
+                cluster={service.service.topology === 'cluster'}
               />
             )}
-
-            {/* Always shown: the budget applies whether or not it is running. */}
-            <ServiceLogIngestionCard serviceId={service.service.id} />
 
             {/* Cluster Creation Progress */}
             {service.service.topology === 'cluster' &&
               service.service.status === 'creating' && (
                 <Callout tone="info" title="Creating cluster members…">
-                  This may take a minute. Members will appear below as they are
-                  provisioned.
+                  Members are created one at a time, the monitor first. Each row
+                  below shows what it is doing.
                 </Callout>
               )}
 
@@ -1188,7 +1205,7 @@ export function ServiceDetail() {
                           <Button variant="outline" size="sm" asChild>
                             <Link to={`/storage/${id}/members/add`}>
                               <Plus className="h-4 w-4 mr-1" />
-                              Add Replica
+                              Add replica
                             </Link>
                           </Button>
                         )}
@@ -1263,6 +1280,7 @@ export function ServiceDetail() {
                                     </span>
                                   )}
                                 </div>
+                                <MemberProgressLine member={member} />
                               </div>
                             </div>
                             <div className="flex items-center gap-2 flex-shrink-0">
@@ -1338,6 +1356,22 @@ export function ServiceDetail() {
               serviceName={service.service.name}
             />
 
+            {/* The container's Docker healthcheck and its overrides */}
+            <ServiceHealthcheckCard
+              serviceId={service.service.id}
+              serviceName={service.service.name}
+              serviceStatus={service.service.status}
+            />
+
+            {/* Server TLS for managed PostgreSQL (ADR-093) */}
+            {service.service.service_type === 'postgres' && (
+              <ServiceTlsCard
+                serviceId={service.service.id}
+                serviceName={service.service.name}
+                serviceStatus={service.service.status}
+              />
+            )}
+
             {/* Backups Section */}
             <Card id={SERVICE_BACKUPS_ANCHOR} className="scroll-mt-20">
               <CardHeader>
@@ -1408,7 +1442,7 @@ export function ServiceDetail() {
                     onTriggerBackup={() => setIsBackupDialogOpen(true)}
                   />
                 ) : (
-                  <ul role="list" className="divide-y divide-border">
+                  <ul role="list" className="@container divide-y divide-border">
                     {paginatedBackups.map((backup) => {
                       const key =
                         backup.backup_id ||
@@ -1450,7 +1484,7 @@ export function ServiceDetail() {
                         <li key={key}>
                           <Link
                             to={linkTo}
-                            className="flex items-center gap-3 py-3 transition-colors hover:bg-muted/40 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:rounded-md sm:gap-4 -mx-2 px-2"
+                            className="flex items-center gap-3 py-3 transition-colors hover:bg-muted/40 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:rounded-md @md:gap-4 -mx-2 px-2"
                           >
                             <div className="flex size-9 shrink-0 items-center justify-center rounded-md bg-muted">
                               <ServiceIcon className="size-4 text-muted-foreground" />
@@ -1462,54 +1496,66 @@ export function ServiceDetail() {
                               short UUID, error preview). */}
                             <div className="min-w-0 flex-1">
                               <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-                                <p className="truncate text-sm font-medium">
-                                  <TimeAgo date={backup.started_at} />
-                                </p>
-                                <span
-                                  className="hidden text-xs text-muted-foreground sm:inline"
-                                  aria-hidden
-                                >
-                                  ·
-                                </span>
-                                <span className="font-mono text-xs text-muted-foreground tabular-nums hidden sm:inline">
-                                  {fmtDateTime(backup.started_at)}
-                                </span>
-                                {backup.backup_type ? (
-                                  <Badge variant="outline" className="text-xs">
-                                    {backup.backup_type}
-                                  </Badge>
-                                ) : null}
-                                {isCompleted ? (
-                                  <Badge
-                                    variant="outline"
-                                    className="gap-1 border-emerald-500/50 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 text-xs"
+                                {/* Two groups that wrap whole, so every row
+                                  breaks in the same place whatever its length. */}
+                                <div className="flex min-w-0 items-center gap-2">
+                                  <p className="truncate text-sm font-medium">
+                                    <TimeAgo date={backup.started_at} />
+                                  </p>
+                                  <span
+                                    className="hidden text-xs text-muted-foreground @md:inline"
+                                    aria-hidden
                                   >
-                                    <CheckCircle2 className="h-3 w-3" />
-                                    Completed
-                                  </Badge>
-                                ) : isRunning ? (
-                                  <Badge
-                                    variant="secondary"
-                                    className="gap-1 text-xs"
-                                  >
-                                    <Radio className="h-3 w-3 animate-pulse" />
-                                    {state === 'pending'
-                                      ? 'Pending'
-                                      : 'Running'}
-                                  </Badge>
-                                ) : isFailed ? (
-                                  <Badge
-                                    variant="destructive"
-                                    className="gap-1 text-xs"
-                                  >
-                                    <XCircle className="h-3 w-3" />
-                                    Failed
-                                  </Badge>
-                                ) : (
-                                  <Badge variant="outline" className="text-xs">
-                                    {state}
-                                  </Badge>
-                                )}
+                                    ·
+                                  </span>
+                                  <span className="font-mono text-xs text-muted-foreground tabular-nums hidden @md:inline">
+                                    {fmtDateTime(backup.started_at)}
+                                  </span>
+                                </div>
+                                <div className="flex basis-full items-center gap-2 @2xl:basis-auto">
+                                  {backup.backup_type ? (
+                                    <Badge
+                                      variant="outline"
+                                      className="text-xs"
+                                    >
+                                      {backup.backup_type}
+                                    </Badge>
+                                  ) : null}
+                                  {isCompleted ? (
+                                    <Badge
+                                      variant="outline"
+                                      className="gap-1 border-emerald-500/50 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 text-xs"
+                                    >
+                                      <CheckCircle2 className="h-3 w-3" />
+                                      Completed
+                                    </Badge>
+                                  ) : isRunning ? (
+                                    <Badge
+                                      variant="secondary"
+                                      className="gap-1 text-xs"
+                                    >
+                                      <Radio className="h-3 w-3 animate-pulse" />
+                                      {state === 'pending'
+                                        ? 'Pending'
+                                        : 'Running'}
+                                    </Badge>
+                                  ) : isFailed ? (
+                                    <Badge
+                                      variant="destructive"
+                                      className="gap-1 text-xs"
+                                    >
+                                      <XCircle className="h-3 w-3" />
+                                      Failed
+                                    </Badge>
+                                  ) : (
+                                    <Badge
+                                      variant="outline"
+                                      className="text-xs"
+                                    >
+                                      {state}
+                                    </Badge>
+                                  )}
+                                </div>
                               </div>
                               <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-muted-foreground tabular-nums">
                                 <span className="truncate">
@@ -1528,7 +1574,7 @@ export function ServiceDetail() {
                                   </span>
                                 ) : null}
                                 {backup.backup_id ? (
-                                  <span className="font-mono">
+                                  <span className="hidden font-mono @lg:inline">
                                     #{backup.backup_id.slice(0, 8)}
                                   </span>
                                 ) : null}
@@ -1555,7 +1601,7 @@ export function ServiceDetail() {
                             <Button
                               variant="ghost"
                               size="sm"
-                              className="hidden gap-2 sm:flex"
+                              className="hidden gap-2 @md:flex"
                               tabIndex={-1}
                               asChild={false}
                             >
@@ -1569,62 +1615,15 @@ export function ServiceDetail() {
                   </ul>
                 )}
                 {backupsTotalPages > 1 && (
-                  <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between mt-4">
-                    <div className="text-sm text-muted-foreground">
-                      <span className="hidden sm:inline tabular-nums">
-                        Showing {(backupsPage - 1) * BACKUPS_PAGE_SIZE + 1} to{' '}
-                        {Math.min(
-                          backupsPage * BACKUPS_PAGE_SIZE,
-                          serviceBackupsData?.total ?? 0
-                        )}{' '}
-                        of {serviceBackupsData?.total ?? 0} backups
-                      </span>
-                      <span className="sm:hidden tabular-nums">
-                        {backupsPage} / {backupsTotalPages}
-                      </span>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        onClick={() =>
-                          setBackupsPage(Math.max(1, backupsPage - 1))
-                        }
-                        disabled={backupsPage === 1}
-                      >
-                        <ChevronLeft className="h-4 w-4" />
-                        <span className="max-sm:sr-only">Previous</span>
-                      </Button>
-                      <div className="hidden sm:flex items-center gap-1">
-                        {backupsPageWindow.map((pageNum) => (
-                          <Button
-                            key={pageNum}
-                            variant={
-                              pageNum === backupsPage ? 'default' : 'outline'
-                            }
-                            size="sm"
-                            onClick={() => setBackupsPage(pageNum)}
-                            className="w-10"
-                          >
-                            {pageNum}
-                          </Button>
-                        ))}
-                      </div>
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        onClick={() =>
-                          setBackupsPage(
-                            Math.min(backupsTotalPages, backupsPage + 1)
-                          )
-                        }
-                        disabled={backupsPage === backupsTotalPages}
-                      >
-                        <span className="max-sm:sr-only">Next</span>
-                        <ChevronRight className="h-4 w-4" />
-                      </Button>
-                    </div>
-                  </div>
+                  <ResponsivePagination
+                    className="mt-4"
+                    page={backupsPage}
+                    pageSize={BACKUPS_PAGE_SIZE}
+                    total={serviceBackupsData?.total ?? 0}
+                    totalPages={backupsTotalPages}
+                    onPageChange={setBackupsPage}
+                    ariaLabel="Backups pagination"
+                  />
                 )}
               </CardContent>
             </Card>
@@ -1634,7 +1633,7 @@ export function ServiceDetail() {
                 <CardHeader>
                   <CardTitle className="flex items-center gap-2">
                     <ArrowUpCircle className="h-5 w-5" />
-                    Major Version Upgrades
+                    Major version upgrades
                   </CardTitle>
                   <CardDescription>
                     History of PostgreSQL major-version upgrades for this
@@ -1908,7 +1907,7 @@ export function ServiceDetail() {
             {/* Environment Variables Section */}
             <Card>
               <CardHeader>
-                <CardTitle>Environment Variables</CardTitle>
+                <CardTitle>Environment variables</CardTitle>
                 <CardDescription>
                   Preview of environment variables available to the services
                   linked to it
@@ -1962,7 +1961,7 @@ export function ServiceDetail() {
       <Dialog open={isStopDialogOpen} onOpenChange={setIsStopDialogOpen}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Stop Service</DialogTitle>
+            <DialogTitle>Stop service</DialogTitle>
             <DialogDescription>
               Are you sure you want to stop{' '}
               <span className="font-medium text-foreground">
@@ -1985,7 +1984,7 @@ export function ServiceDetail() {
               busy={stopService.isPending}
               busyLabel="Stopping…"
             >
-              Stop Service
+              Stop service
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -2037,7 +2036,7 @@ export function ServiceDetail() {
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Promote to Primary</DialogTitle>
+            <DialogTitle>Promote to primary</DialogTitle>
             <DialogDescription>
               Trigger a pg_auto_failover failover so{' '}
               <span className="font-mono text-foreground">
@@ -2164,6 +2163,22 @@ function LinkedResourceNote({ serviceType }: { serviceType: string }) {
         </>
       ) : null}
       {copy.trail}
+    </p>
+  )
+}
+
+function MemberProgressLine({ member }: { member: MemberProgressInput }) {
+  const progress = memberProgress(member)
+  if (!progress) return null
+  return (
+    <p
+      className={
+        progress.tone === 'error'
+          ? 'text-xs text-destructive break-words'
+          : 'text-xs text-muted-foreground'
+      }
+    >
+      {progress.text}
     </p>
   )
 }

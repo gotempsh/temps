@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { type FormEvent, useId } from 'react'
+import { type KeyboardEvent, useId, useRef } from 'react'
 import {
   ChevronLeft,
   ChevronRight,
@@ -47,14 +47,23 @@ export function ResponsivePagination({
   className,
 }: ResponsivePaginationProps) {
   const pageInputId = useId()
+  const pageInput = useRef<HTMLInputElement>(null)
 
-  const submitRequestedPage = (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault()
-    const formData = new FormData(event.currentTarget)
-    const parsed = Number(formData.get('page'))
-    const nextPage = clampPage(parsed, totalPages)
-    event.currentTarget.reset()
+  // Not a <form>: a pager often sits inside one (a picker on a settings
+  // page), where a nested form's submit reaches the outer form and saves it.
+  const goToRequestedPage = () => {
+    const input = pageInput.current
+    if (!input) return
+    const nextPage = clampPage(Number(input.value), totalPages)
+    input.value = input.defaultValue
     if (nextPage !== page) onPageChange(nextPage)
+  }
+
+  const goOnEnter = (event: KeyboardEvent<HTMLInputElement>) => {
+    if (event.key !== 'Enter') return
+    // Enter in a text box would otherwise submit the surrounding form.
+    event.preventDefault()
+    goToRequestedPage()
   }
 
   const firstItem = total === 0 ? 0 : (page - 1) * pageSize + 1
@@ -63,8 +72,10 @@ export function ResponsivePagination({
     onPageSizeChange !== undefined && pageSizeOptions.length > 0
 
   return (
-    <nav aria-label={ariaLabel} className={cn(className)}>
-      <div className="grid grid-cols-[1fr_auto_1fr] items-center gap-3 sm:hidden">
+    // By its own width: a pager in a narrow card has no more room than one on
+    // a phone, whatever the window's size.
+    <nav aria-label={ariaLabel} className={cn('@container w-full', className)}>
+      <div className="grid grid-cols-[1fr_auto_1fr] items-center gap-3 @xl:hidden">
         <Button
           type="button"
           variant="outline"
@@ -98,7 +109,7 @@ export function ResponsivePagination({
         </Button>
       </div>
 
-      <div className="hidden flex-col gap-3 sm:flex lg:flex-row lg:items-center lg:justify-between">
+      <div className="hidden flex-col gap-3 @xl:flex @2xl:flex-row @2xl:items-center @2xl:justify-between">
         <div className="flex flex-wrap items-center gap-3 text-sm text-muted-foreground">
           <span>
             Showing {firstItem}–{lastItem} of {total}
@@ -152,15 +163,17 @@ export function ResponsivePagination({
             <ChevronLeft />
           </Button>
 
-          <form
+          <div
             key={page}
+            role="group"
+            aria-label="Go to page"
             className="flex items-center gap-2"
-            onSubmit={submitRequestedPage}
           >
             <label htmlFor={pageInputId} className="text-sm">
               Page
             </label>
             <Input
+              ref={pageInput}
               id={pageInputId}
               name="page"
               type="number"
@@ -170,14 +183,20 @@ export function ResponsivePagination({
               defaultValue={page}
               className="h-9 w-20"
               aria-label="Page number"
+              onKeyDown={goOnEnter}
             />
             <span className="text-sm text-muted-foreground">
               of {totalPages}
             </span>
-            <Button type="submit" variant="outline" size="sm">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={goToRequestedPage}
+            >
               Go
             </Button>
-          </form>
+          </div>
 
           <Button
             type="button"

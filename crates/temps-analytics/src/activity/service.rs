@@ -1971,7 +1971,7 @@ mod tests {
             eprintln!("Skipping real database activity test: Docker unavailable");
             return;
         }
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let db = test_db.db.clone();

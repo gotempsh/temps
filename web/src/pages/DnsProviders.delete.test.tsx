@@ -96,9 +96,9 @@ test('an administrator can reach Delete Provider from the row menu', async () =>
   })
   const view = renderPage('admin')
   await openRowMenu(view)
-  expect(await view.findByText('View Details')).toBeTruthy()
-  expect(view.queryByText('Test Connection')).not.toBeNull()
-  expect(view.queryByText('Delete Provider')).not.toBeNull()
+  expect(await view.findByText('View details')).toBeTruthy()
+  expect(view.queryByText('Test connection')).not.toBeNull()
+  expect(view.queryByText('Delete provider')).not.toBeNull()
   api.restore()
 })
 
@@ -108,9 +108,9 @@ test('a restricted user sees View Details but neither Test Connection nor Delete
   })
   const view = renderPage('user')
   await openRowMenu(view)
-  expect(await view.findByText('View Details')).toBeTruthy()
-  expect(view.queryByText('Test Connection')).toBeNull()
-  expect(view.queryByText('Delete Provider')).toBeNull()
+  expect(await view.findByText('View details')).toBeTruthy()
+  expect(view.queryByText('Test connection')).toBeNull()
+  expect(view.queryByText('Delete provider')).toBeNull()
   api.restore()
 })
 
@@ -130,9 +130,9 @@ test('a refused delete keeps the confirmation open and the list unrefreshed', as
   const view = renderPage('admin')
   await openRowMenu(view)
   await act(async () => {
-    fireEvent.click(await view.findByText('Delete Provider'))
+    fireEvent.click(await view.findByText('Delete provider'))
   })
-  const confirm = await view.findByRole('button', { name: 'Delete Provider' })
+  const confirm = await view.findByRole('button', { name: 'Delete provider' })
   await act(async () => {
     fireEvent.click(confirm)
   })
@@ -168,11 +168,11 @@ test('a delete the server accepts closes the confirmation and refreshes the list
   const view = renderPage('admin')
   await openRowMenu(view)
   await act(async () => {
-    fireEvent.click(await view.findByText('Delete Provider'))
+    fireEvent.click(await view.findByText('Delete provider'))
   })
   await act(async () => {
     fireEvent.click(
-      await view.findByRole('button', { name: 'Delete Provider' })
+      await view.findByRole('button', { name: 'Delete provider' })
     )
   })
   await waitFor(() =>
@@ -215,7 +215,7 @@ test('losing write access while the confirmation is open closes it for good', as
   const view = render(page('admin'))
   await openRowMenu(view)
   await act(async () => {
-    fireEvent.click(await view.findByText('Delete Provider'))
+    fireEvent.click(await view.findByText('Delete provider'))
   })
   expect(await view.findByText('Delete DNS provider Example DNS?')).toBeTruthy()
 

@@ -1,33 +1,14 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import {
-  createStatusPageMutation,
-  listMonitorsOptions,
-  listStatusPagesOptions,
-} from '@/api/client/@tanstack/react-query.gen'
+import { listStatusPagesOptions } from '@/api/client/@tanstack/react-query.gen'
 import type { ProjectResponse, StatusPageResponse } from '@/api/client'
 import { Badge } from '@/components/ui/badge'
+import { RecordLink, RecordRow } from '@temps-sdk/ds'
 import { Button } from '@/components/ui/button'
 import { CreateActionButton } from '@/components/ui/create-action-button'
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog'
 import { EmptyState } from '@/components/ui/empty-state'
-import {
-  Form,
-  FormControl,
-  FormField,
-  FormItem,
-  FormLabel,
-  FormMessage,
-} from '@/components/ui/form'
-import { Input } from '@/components/ui/input'
+import { ResponsivePagination } from '@/components/ui/responsive-pagination'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
   Table,
@@ -38,27 +19,15 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import { ErrorAlert } from '@/components/utils/ErrorAlert'
-import { zodResolver } from '@hookform/resolvers/zod'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useQuery } from '@tanstack/react-query'
 import { formatDistanceToNow } from 'date-fns'
 import { Globe, Plus } from 'lucide-react'
 import { useState } from 'react'
-import { useForm } from 'react-hook-form'
-import { Link, useNavigate } from 'react-router'
+import { Link, Navigate, useParams } from 'react-router'
 import { PublicLinkCell } from './StatusPagePublicLink'
-import { toast } from 'sonner'
-import * as z from 'zod'
-import { MAX_TITLE_CHARS, operationQueries } from './status-page-form'
+import { newStatusPageUrl, statusPageUrl } from './status-page-form'
 
-const createSchema = z.object({
-  title: z
-    .string()
-    .trim()
-    .min(1, 'Title is required')
-    .max(MAX_TITLE_CHARS, `At most ${MAX_TITLE_CHARS} characters`),
-})
-
-type CreateValues = z.infer<typeof createSchema>
+const PAGE_SIZE = 20
 
 export function StatusPageStateBadge({ page }: { page: StatusPageResponse }) {
   return page.is_published ? (
@@ -68,97 +37,32 @@ export function StatusPageStateBadge({ page }: { page: StatusPageResponse }) {
   )
 }
 
-function CreateStatusPageDialog({
-  project,
-  open,
-  onOpenChange,
-  hasMonitors,
+/** The projects a page draws its components from, as links. */
+export function StatusPageProjects({
+  page,
+  max = 3,
 }: {
-  project: ProjectResponse
-  open: boolean
-  onOpenChange: (open: boolean) => void
-  hasMonitors: boolean
+  page: Pick<StatusPageResponse, 'projects'>
+  max?: number
 }) {
-  const navigate = useNavigate()
-  const queryClient = useQueryClient()
-  const form = useForm<CreateValues>({
-    resolver: zodResolver(createSchema),
-    defaultValues: { title: `${project.name} status` },
-  })
-  const create = useMutation({
-    ...createStatusPageMutation(),
-    meta: { errorTitle: 'Failed to create status page' },
-    onSuccess: async (page) => {
-      await queryClient.invalidateQueries(operationQueries('listStatusPages'))
-      toast.success('Status page created. Choose the monitors it shows.')
-      onOpenChange(false)
-      form.reset()
-      navigate(`/projects/${project.slug}/status-pages/${page.id}`)
-    },
-  })
-
+  if (page.projects.length === 0) {
+    return <span className="text-muted-foreground">No components</span>
+  }
+  const shown = page.projects.slice(0, max)
+  const rest = page.projects.length - shown.length
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent>
-        <DialogHeader>
-          <DialogTitle>Create status page</DialogTitle>
-          <DialogDescription>
-            A public page your users can open to check whether your services are
-            up. It starts as a draft: you pick which monitors it shows and what
-            they are called before publishing.
-          </DialogDescription>
-        </DialogHeader>
-        {!hasMonitors && (
-          <p className="text-sm text-muted-foreground">
-            This project has no monitors yet, so there is nothing to show.{' '}
-            <Link
-              className="underline underline-offset-4"
-              to={`/projects/${project.slug}/monitors`}
-            >
-              Create a monitor
-            </Link>{' '}
-            first, or create the draft now and add monitors later.
-          </p>
-        )}
-        <Form {...form}>
-          <form
-            className="space-y-4"
-            onSubmit={form.handleSubmit((values) =>
-              create.mutate({
-                path: { project_id: project.id },
-                body: { title: values.title, monitors: [] },
-              })
-            )}
-          >
-            <FormField
-              control={form.control}
-              name="title"
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>Public title</FormLabel>
-                  <FormControl>
-                    <Input placeholder="Acme status" {...field} />
-                  </FormControl>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
-            <DialogFooter>
-              <Button
-                type="button"
-                variant="outline"
-                onClick={() => onOpenChange(false)}
-              >
-                Cancel
-              </Button>
-              <Button type="submit" disabled={create.isPending}>
-                {create.isPending ? 'Creating...' : 'Create draft'}
-              </Button>
-            </DialogFooter>
-          </form>
-        </Form>
-      </DialogContent>
-    </Dialog>
+    <span className="inline-flex flex-wrap items-center gap-1">
+      {shown.map((p) => (
+        <Link key={p.id} to={`/projects/${p.slug}`}>
+          <Badge variant="neutral-subtle" className="hover:bg-accent">
+            {p.name}
+          </Badge>
+        </Link>
+      ))}
+      {rest > 0 && (
+        <span className="text-xs text-muted-foreground">+{rest} more</span>
+      )}
+    </span>
   )
 }
 
@@ -172,19 +76,24 @@ function StatusPagesSkeleton() {
   )
 }
 
-export function ProjectStatusPages({ project }: { project: ProjectResponse }) {
-  const [createOpen, setCreateOpen] = useState(false)
+/**
+ * Status pages, all of them or those showing one project's components. Pages
+ * are platform-level: one page can show services from many projects.
+ */
+export function StatusPagesList({ project }: { project?: ProjectResponse }) {
+  const createUrl = newStatusPageUrl(project?.id)
+  const [page, setPage] = useState(1)
   const pages = useQuery(
     listStatusPagesOptions({
-      path: { project_id: project.id },
-      query: { page: 1, page_size: 100 },
+      query: { page, page_size: PAGE_SIZE, project_id: project?.id },
     })
   )
-  const monitors = useQuery(
-    listMonitorsOptions({ path: { project_id: project.id } })
-  )
   const items = pages.data?.items ?? []
-  const hasMonitors = (monitors.data?.length ?? 0) > 0
+  const total = pages.data?.total ?? 0
+  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
+
+  // Deleting the last page's only item leaves you past the end: step back.
+  if (pages.data && page > totalPages) setPage(totalPages)
 
   return (
     <div className="w-full min-w-0 space-y-6">
@@ -192,16 +101,15 @@ export function ProjectStatusPages({ project }: { project: ProjectResponse }) {
         <div className="min-w-0">
           <h2 className="text-2xl font-bold tracking-tight">Status pages</h2>
           <p className="max-w-2xl text-muted-foreground">
-            Publish the state and 90-day uptime of selected monitors at a
-            private, unguessable public link. Only the names you choose are
-            shown — never URLs, hostnames or error details.
+            {project
+              ? `Public pages that show ${project.name}. A page can also show services from your other projects.`
+              : 'Public pages like status.example.com showing the live state, 90-day uptime and response times of the services you pick, from any project, plus the incidents you post.'}{' '}
+            Only the names you choose are shown — never URLs, hostnames or error
+            details.
           </p>
         </div>
         {items.length > 0 && (
-          <CreateActionButton
-            onClick={() => setCreateOpen(true)}
-            label="Create status page"
-          />
+          <CreateActionButton to={createUrl} label="Create status page" />
         )}
       </div>
 
@@ -221,65 +129,96 @@ export function ProjectStatusPages({ project }: { project: ProjectResponse }) {
         <EmptyState
           size="compact"
           icon={Globe}
-          title="No status pages yet"
+          title={
+            project
+              ? `No status page shows ${project.name} yet`
+              : 'No status pages yet'
+          }
           description="Show customers whether your services are up, e.g. “API — Operational, 99.98% uptime over 90 days”, without exposing anything internal."
           action={
-            <Button onClick={() => setCreateOpen(true)}>
-              <Plus className="mr-2 size-4" />
-              Create status page
+            <Button asChild>
+              <Link to={createUrl}>
+                <Plus className="mr-2 size-4" />
+                Create status page
+              </Link>
             </Button>
           }
         />
       ) : (
-        <Table>
-          <TableHeader>
-            <TableRow>
-              <TableHead>Title</TableHead>
-              <TableHead>State</TableHead>
-              <TableHead className="hidden sm:table-cell">Monitors</TableHead>
-              <TableHead className="hidden md:table-cell">
-                Public link
-              </TableHead>
-              <TableHead className="hidden lg:table-cell">Created</TableHead>
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {items.map((page) => (
-              <TableRow key={page.id}>
-                <TableCell className="min-w-0 font-medium">
-                  <Link
-                    className="hover:underline"
-                    to={`/projects/${project.slug}/status-pages/${page.id}`}
-                  >
-                    {page.title}
-                  </Link>
-                </TableCell>
-                <TableCell>
-                  <StatusPageStateBadge page={page} />
-                </TableCell>
-                <TableCell className="hidden sm:table-cell">
-                  {page.monitors.length}
-                </TableCell>
-                <TableCell className="hidden md:table-cell">
-                  <PublicLinkCell page={page} />
-                </TableCell>
-                <TableCell className="hidden text-muted-foreground lg:table-cell">
-                  {formatDistanceToNow(new Date(page.created_at), {
-                    addSuffix: true,
-                  })}
-                </TableCell>
+        <div className="space-y-4">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Title</TableHead>
+                <TableHead>State</TableHead>
+                <TableHead className="hidden md:table-cell">Projects</TableHead>
+                <TableHead className="hidden sm:table-cell">
+                  Components
+                </TableHead>
+                <TableHead className="hidden lg:table-cell">
+                  Public link
+                </TableHead>
+                <TableHead className="hidden xl:table-cell">Created</TableHead>
               </TableRow>
-            ))}
-          </TableBody>
-        </Table>
+            </TableHeader>
+            <TableBody>
+              {items.map((item) => (
+                <RecordRow key={item.id}>
+                  <TableCell className="min-w-0 font-medium">
+                    <RecordLink to={statusPageUrl(item.id)}>
+                      {item.title}
+                    </RecordLink>
+                  </TableCell>
+                  <TableCell>
+                    <StatusPageStateBadge page={item} />
+                  </TableCell>
+                  <TableCell className="hidden md:table-cell">
+                    <StatusPageProjects page={item} />
+                  </TableCell>
+                  <TableCell className="hidden sm:table-cell">
+                    {item.monitors.length}
+                  </TableCell>
+                  <TableCell className="hidden lg:table-cell">
+                    <PublicLinkCell page={item} />
+                  </TableCell>
+                  <TableCell className="hidden text-muted-foreground xl:table-cell">
+                    {formatDistanceToNow(new Date(item.created_at), {
+                      addSuffix: true,
+                    })}
+                  </TableCell>
+                </RecordRow>
+              ))}
+            </TableBody>
+          </Table>
+          {totalPages > 1 && (
+            <ResponsivePagination
+              page={page}
+              pageSize={PAGE_SIZE}
+              total={total}
+              totalPages={totalPages}
+              onPageChange={setPage}
+              ariaLabel="Status pages pagination"
+            />
+          )}
+        </div>
       )}
-
-      <CreateStatusPageDialog
-        project={project}
-        open={createOpen}
-        onOpenChange={setCreateOpen}
-        hasMonitors={hasMonitors}
-      />
     </div>
   )
+}
+
+/**
+ * Status pages used to be a project tab. They are platform-wide now, so the
+ * old project URL sends links and bookmarks to the platform list.
+ */
+export function LegacyStatusPagesRedirect() {
+  return <Navigate to="/status-pages" replace />
+}
+
+/**
+ * Pages used to live under their project. Keep those links and bookmarks
+ * working by sending them to the page's platform URL.
+ */
+export function LegacyStatusPageRedirect() {
+  const { statusPageId } = useParams()
+  return <Navigate to={`/status-pages/${statusPageId ?? ''}`} replace />
 }

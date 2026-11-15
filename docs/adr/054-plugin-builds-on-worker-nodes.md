@@ -4,7 +4,7 @@
 
 Proposed — 2026-10-19
 
-Related: ADR 052 (worker health), the `control-plane` serve profile
+Related: ADR 085 (worker health), the `control-plane` serve profile
 (`LocalWorkloadPolicy::control_plane`), external plugins
 (`crates/temps-external-plugins`).
 

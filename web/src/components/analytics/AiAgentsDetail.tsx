@@ -31,17 +31,18 @@ import {
   type TableSort,
 } from '@/lib/client-table-sort'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
-import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import {
   ArrowLeft,
   Bot,
   ChevronRight,
   ExternalLink,
+  FileText,
   Search,
 } from 'lucide-react'
 import * as React from 'react'
 import { useNavigate } from 'react-router'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 interface AiAgentsDetailProps {
   project: ProjectResponse
@@ -103,7 +104,7 @@ export function AiAgentsDetail({
   // Which page row is expanded to show its per-agent breakdown.
   const [expandedPath, setExpandedPath] = React.useState<string | null>(null)
 
-  const agentsQuery = useQuery({
+  const agentsQuery = useWindowQuery({
     ...getAiAgentBreakdownOptions({
       query: {
         project_id: project.id,
@@ -116,7 +117,7 @@ export function AiAgentsDetail({
     enabled: !!startDate && !!endDate,
   })
 
-  const pagesQuery = useQuery({
+  const pagesQuery = useWindowQuery({
     ...getAiPageBreakdownOptions({
       query: {
         project_id: project.id,
@@ -129,7 +130,7 @@ export function AiAgentsDetail({
     enabled: !!startDate && !!endDate,
   })
 
-  const statusQuery = useQuery({
+  const statusQuery = useWindowQuery({
     ...getAiStatusBreakdownOptions({
       query: {
         project_id: project.id,
@@ -414,7 +415,7 @@ export function AiAgentsDetail({
           <div>
             <h2 className="flex items-center gap-2 text-xl font-semibold tracking-tight">
               <Bot className="h-5 w-5" />
-              AI Crawlers
+              AI crawlers
             </h2>
             <p className="text-sm text-muted-foreground">{dateLabel}</p>
           </div>
@@ -452,7 +453,7 @@ export function AiAgentsDetail({
           {/* Overview card grid — mirrors the main analytics overview layout. */}
           <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
             <AiBreakdownCard
-              title="Top Agents"
+              title="Top agents"
               description="Most active AI crawlers by requests"
               rows={topAgentCards}
               isLoading={agentsQuery.isLoading}
@@ -463,7 +464,7 @@ export function AiAgentsDetail({
               }
             />
             <AiBreakdownCard
-              title="Top Providers"
+              title="Top providers"
               description="Crawler vendors, rolled up"
               rows={topProviderCards}
               isLoading={agentsQuery.isLoading}
@@ -492,7 +493,7 @@ export function AiAgentsDetail({
               footer="HTTP status classes for AI traffic"
             />
             <AiBreakdownCard
-              title="Top Pages crawled"
+              title="Top pages crawled"
               description="Which content AI crawlers request most"
               rows={topPageCards}
               isLoading={pagesQuery.isLoading}
@@ -510,8 +511,12 @@ export function AiAgentsDetail({
       {view === 'tables' && (
         <Tabs defaultValue="agents">
           <TabsList>
-            <TabsTrigger value="agents">Agents</TabsTrigger>
-            <TabsTrigger value="pages">Pages crawled</TabsTrigger>
+            <TabsTrigger value="agents" icon={Bot}>
+              Agents
+            </TabsTrigger>
+            <TabsTrigger value="pages" icon={FileText}>
+              Pages crawled
+            </TabsTrigger>
           </TabsList>
 
           {/* ─── Agents ─────────────────────────────────────────────── */}
@@ -913,7 +918,7 @@ function PageAgentBreakdown({
   onAgentClick,
   onViewAll,
 }: PageAgentBreakdownProps) {
-  const { data, isLoading, error } = useQuery({
+  const { data, isLoading, error } = useWindowQuery({
     ...getAiAgentBreakdownOptions({
       query: {
         project_id: project.id,

@@ -35,6 +35,11 @@ pub enum AiGatewayError {
         message: String,
     },
 
+    /// A provider answered 200 with a body that can't be read. The reason is for
+    /// the log: it can quote the reply and the request, so callers don't get it.
+    #[error("Provider '{provider}' returned an unreadable response: {reason}")]
+    UpstreamMalformedResponse { provider: String, reason: String },
+
     #[error("Request translation failed for provider '{provider}': {reason}")]
     TranslationError { provider: String, reason: String },
 
@@ -49,6 +54,11 @@ pub enum AiGatewayError {
 
     #[error("HTTP client error: {0}")]
     HttpClient(String),
+
+    /// The provider didn't answer within the client's timeout. Kept apart from
+    /// other client failures because the caller's response is different (504).
+    #[error("Timed out waiting for the AI provider: {reason}")]
+    UpstreamTimeout { reason: String },
 
     #[error("Internal error: {message}")]
     Internal { message: String },
@@ -159,6 +169,62 @@ impl AiGatewayError {
     }
 }
 
+/// The status the gateway answers with for a provider's error status. A rejected
+/// provider key is a Temps misconfiguration, so it must not read as the caller's
+/// own key being wrong; only the provider's rate limit and refusals of the caller's
+/// own request pass through.
+pub(crate) fn upstream_failure_status(upstream: u16) -> u16 {
+    match upstream {
+        401 | 403 => 502,
+        408 | 504 => 504,
+        400..=499 => upstream,
+        _ => 502,
+    }
+}
+
+/// What the caller is told about a provider's error. A credential failure gets a
+/// fixed message because the provider's body can echo the key.
+pub(crate) fn upstream_failure_message(model: &str, upstream: u16, message: &str) -> String {
+    match upstream {
+        401 | 403 => format!(
+            "The AI provider for model '{model}' refused its credentials (upstream status \
+             {upstream}). Check the provider key in Settings -> AI Gateway."
+        ),
+        _ => message.to_string(),
+    }
+}
+
+/// The error for a provider response whose body couldn't be read as JSON. Only a
+/// body that arrived and didn't parse is malformed: a stall or a dropped connection
+/// is a transport failure like any other.
+pub(crate) fn response_body_error(
+    provider: &str,
+    what: &str,
+    error: reqwest::Error,
+) -> AiGatewayError {
+    if !error.is_timeout() && error.is_decode() {
+        return AiGatewayError::UpstreamMalformedResponse {
+            provider: provider.to_string(),
+            reason: format!("Failed to parse {what}: {}", error.without_url()),
+        };
+    }
+    error.into()
+}
+
+/// The status to record for a request a provider failed, or `None` for a failure
+/// that never reached one. A provider's own status says more than the gateway's
+/// 502: it tells a rejected key from an outage.
+pub(crate) fn failed_request_status(error: &AiGatewayError) -> Option<i16> {
+    match error {
+        AiGatewayError::UpstreamError { status, .. } => Some(i16::try_from(*status).unwrap_or(502)),
+        AiGatewayError::UpstreamTimeout { .. } => Some(504),
+        AiGatewayError::HttpClient(_)
+        | AiGatewayError::UpstreamMalformedResponse { .. }
+        | AiGatewayError::StreamError { .. } => Some(502),
+        _ => None,
+    }
+}
+
 impl From<reqwest::Error> for AiGatewayError {
     fn from(error: reqwest::Error) -> Self {
         // A connect-time DNS block is a policy decision, not a transport
@@ -173,6 +239,11 @@ impl From<reqwest::Error> for AiGatewayError {
         // Strip the request URL before converting to string — the URL may contain
         // embedded credentials (BYOK base_url) that must not appear in logs.
         let scrubbed = error.without_url();
+        if scrubbed.is_timeout() {
+            return AiGatewayError::UpstreamTimeout {
+                reason: scrubbed.to_string(),
+            };
+        }
         AiGatewayError::HttpClient(scrubbed.to_string())
     }
 }
@@ -193,6 +264,57 @@ fn find_blocked_address(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serves one response whose body is `body`, then keeps the connection open.
+    async fn stalling_server(body: &'static str, declared_length: usize) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a local port");
+        let address = listener.local_addr().expect("its address");
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut socket, _) = listener.accept().await.expect("a connection");
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                 content-length: {declared_length}\r\n\r\n{body}"
+            );
+            socket.write_all(head.as_bytes()).await.expect("the reply");
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        });
+        format!("http://{address}")
+    }
+
+    async fn read_json(url: String) -> reqwest::Error {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(300))
+            .build()
+            .expect("a client")
+            .get(url)
+            .send()
+            .await
+            .expect("the headers arrive")
+            .json::<serde_json::Value>()
+            .await
+            .expect_err("no usable body")
+    }
+
+    #[tokio::test]
+    async fn only_a_body_that_arrived_and_did_not_parse_is_malformed() {
+        let garbled = read_json(stalling_server("not json", 8).await).await;
+        assert!(matches!(
+            response_body_error("p", "response", garbled),
+            AiGatewayError::UpstreamMalformedResponse { .. }
+        ));
+
+        // Headers, then silence until the client's timeout.
+        let stalled = read_json(stalling_server("{", 100).await).await;
+        assert!(matches!(
+            response_body_error("p", "response", stalled),
+            AiGatewayError::UpstreamTimeout { .. }
+        ));
+    }
 
     #[test]
     fn budget_exceeded_message_is_in_dollars() {

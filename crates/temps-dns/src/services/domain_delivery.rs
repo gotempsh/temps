@@ -1316,7 +1316,9 @@ impl DomainDeliveryService {
         let rows = if page_is_past_end(page, page_size, total) {
             Vec::new()
         } else {
-            paginator.fetch_page(page - 1).await?
+            paginator
+                .fetch_page(temps_core::config::page_index(page))
+                .await?
         };
         let items = rows
             .into_iter()
@@ -1367,7 +1369,7 @@ impl DomainDeliveryService {
             let defaults = settings::Entity::find_by_id(1)
                 .one(self.db.as_ref())
                 .await?
-                .map(|row| temps_core::AppSettings::from_json(row.data))
+                .map(|row| temps_config::AppSettings::from_json(row.data))
                 .unwrap_or_default();
             let default_kind = if defaults.cloudflare_new_projects {
                 Some("cloudflare")
@@ -2977,7 +2979,9 @@ impl DomainDeliveryService {
         let bindings = if page_is_past_end(page, page_size, total) {
             Vec::new()
         } else {
-            paginator.fetch_page(page - 1).await?
+            paginator
+                .fetch_page(temps_core::config::page_index(page))
+                .await?
         };
         // Every profile this page references, in one query rather than one
         // per binding.
@@ -3427,6 +3431,7 @@ mod apply_resume_and_progress_tests {
             gate_access_aud: None,
             private_via: None,
             private_service: None,
+            http_policy: None,
         };
         let request = request();
         assert!(DomainDeliveryService::route_unchanged(&route, 1, &request));

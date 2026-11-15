@@ -62,17 +62,19 @@ import type { SpanTreeNode } from '@/utils/spanTree'
 import { cn } from '@/lib/utils'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
+  AlertCircle,
   ArrowLeft,
+  Bot,
   ChevronRight,
   Clock,
-  AlertCircle,
   Info,
   Layers,
-  RefreshCw,
-  Bot,
+  ListTree,
+  Loader2,
   Pin,
   PinOff,
-  Loader2,
+  RefreshCw,
+  ScrollText,
 } from 'lucide-react'
 import { useCallback, useMemo, useState, type ReactNode } from 'react'
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router'
@@ -838,7 +840,7 @@ export default function TraceDetail({ project }: TraceDetailProps) {
           className="gap-2"
         >
           <ArrowLeft className="h-4 w-4" />
-          Back to Traces
+          Back to traces
         </Button>
         <Card>
           <CardContent className="flex items-center gap-3 p-6 text-destructive">
@@ -959,19 +961,21 @@ export default function TraceDetail({ project }: TraceDetailProps) {
       {/* Spans / Logs tabs */}
       <Tabs defaultValue="spans" className="w-full">
         <TabsList>
-          <TabsTrigger value="spans" className="gap-1.5">
+          <TabsTrigger
+            value="spans"
+            icon={ListTree}
+            count={displaySpans.length}
+          >
             Spans
-            <span className="text-xs text-muted-foreground">
-              {displaySpans.length}
-            </span>
           </TabsTrigger>
-          <TabsTrigger value="logs" className="gap-1.5">
+          <TabsTrigger
+            value="logs"
+            icon={ScrollText}
+            count={
+              correlatedLogs.length > 0 ? correlatedLogs.length : undefined
+            }
+          >
             Logs
-            {correlatedLogs.length > 0 && (
-              <span className="text-xs text-muted-foreground">
-                {correlatedLogs.length}
-              </span>
-            )}
           </TabsTrigger>
         </TabsList>
 

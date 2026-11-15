@@ -1,0 +1,458 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+import { describe, expect, test } from 'bun:test'
+import {
+  applyRawEnvChanges,
+  mapWithConcurrency,
+  rawEnvRemovals,
+  summarizeKeys,
+  parseEnvText,
+  planRawEnvChanges,
+  rawEditorVariables,
+  serializeEnvText,
+  type EnvEntry,
+} from './raw-env-editor'
+
+const production = { id: 1, name: 'production', is_preview: false }
+const staging = { id: 2, name: 'staging', is_preview: false }
+const preview = { id: 3, name: 'preview-feature', is_preview: true }
+
+function variable(
+  id: number,
+  key: string,
+  environments: { id: number; name: string }[],
+  options: { include_in_preview?: boolean; is_secret?: boolean } = {}
+) {
+  return {
+    id,
+    key,
+    environments: environments.map((env) => ({ ...env, main_url: '' })),
+    include_in_preview: options.include_in_preview ?? false,
+    is_secret: options.is_secret ?? false,
+  }
+}
+
+describe('serializeEnvText / parseEnvText', () => {
+  test('round-trips values that need quoting', () => {
+    const entries: EnvEntry[] = [
+      { key: 'PLAIN', value: 'https://api.example.com/v1?a=b' },
+      { key: 'EMPTY', value: '' },
+      {
+        key: 'MULTILINE',
+        value: '-----BEGIN KEY-----\nabc\n-----END KEY-----',
+      },
+      { key: 'QUOTES', value: `say "hi" and 'bye'` },
+      { key: 'BACKSLASH_N', value: 'literal \\n, not a newline' },
+      { key: 'HASH', value: 'pass #word' },
+      { key: 'URL_FRAGMENT', value: 'https://example.com/#top' },
+      { key: 'PADDED', value: '  spaced  ' },
+      { key: 'TAB', value: 'a\tb' },
+      { key: 'CRLF', value: 'a\r\nb' },
+      { key: 'EQUALS', value: 'a=b=c' },
+    ]
+
+    const parsed = parseEnvText(serializeEnvText(entries))
+
+    expect(parsed.errors).toEqual([])
+    expect(parsed.entries).toEqual(entries)
+  })
+
+  test('leaves simple values unquoted so the text reads like a .env file', () => {
+    expect(
+      serializeEnvText([
+        { key: 'A', value: '1' },
+        { key: 'B', value: 'https://example.com' },
+      ])
+    ).toBe('A=1\nB=https://example.com\n')
+  })
+
+  test('accepts the dotenv conventions of a pasted file', () => {
+    const parsed = parseEnvText(
+      [
+        '# a comment',
+        '',
+        'export TOKEN=abc',
+        'INLINE=value # trailing comment',
+        "SINGLE='literal \\n kept'",
+        'DOUBLE="line one',
+        'line two"',
+        '  SPACED  =  trimmed  ',
+      ].join('\r\n')
+    )
+
+    expect(parsed.errors).toEqual([])
+    expect(parsed.entries).toEqual([
+      { key: 'TOKEN', value: 'abc' },
+      { key: 'INLINE', value: 'value' },
+      { key: 'SINGLE', value: 'literal \\n kept' },
+      { key: 'DOUBLE', value: 'line one\nline two' },
+      { key: 'SPACED', value: 'trimmed' },
+    ])
+  })
+
+  test('reports malformed lines instead of skipping them', () => {
+    const parsed = parseEnvText(
+      ['GOOD=1', 'not a variable', '=missing', 'BAD KEY=1', 'OPEN="x'].join(
+        '\n'
+      )
+    )
+
+    expect(parsed.entries).toEqual([{ key: 'GOOD', value: '1' }])
+    expect(parsed.errors.map((error) => error.line)).toEqual([2, 3, 4, 5])
+  })
+
+  test('reports a duplicate key with the line it first appeared on', () => {
+    const parsed = parseEnvText('A=1\nB=2\nA=3\n')
+
+    expect(parsed.entries).toEqual([
+      { key: 'A', value: '1' },
+      { key: 'B', value: '2' },
+    ])
+    expect(parsed.errors).toEqual([
+      { line: 3, message: 'A is already set on line 1' },
+    ])
+  })
+
+  test('reports text after a closing quote', () => {
+    const parsed = parseEnvText('A="x" y')
+
+    expect(parsed.errors).toEqual([
+      { line: 1, message: 'Unexpected text after the closing " of A' },
+    ])
+  })
+})
+
+describe('rawEditorVariables', () => {
+  test('includes explicit bindings and preview inheritance, one per key', () => {
+    const variables = [
+      variable(1, 'SHARED', [production, staging]),
+      variable(2, 'STAGING_ONLY', [staging]),
+      variable(3, 'INHERITED', [production], { include_in_preview: true }),
+      variable(4, 'OVERRIDE', [], { include_in_preview: true }),
+      variable(5, 'OVERRIDE', [preview]),
+    ]
+
+    expect(
+      rawEditorVariables(variables, production).map((v) => v.variable.id)
+    ).toEqual([3, 1])
+    expect(
+      rawEditorVariables(variables, preview).map((v) => [
+        v.variable.id,
+        v.inherited,
+      ])
+    ).toEqual([
+      [3, true],
+      [5, false],
+    ])
+  })
+})
+
+describe('planRawEnvChanges', () => {
+  const variables = [
+    variable(1, 'ONLY_PROD', [production]),
+    variable(2, 'SHARED', [production, staging]),
+    variable(3, 'API_SECRET', [production], { is_secret: true }),
+  ]
+  const scoped = rawEditorVariables(variables, production)
+  const revealed = new Map([
+    [1, 'one'],
+    [2, 'two'],
+  ])
+  const plan = (text: string) =>
+    planRawEnvChanges({
+      scoped,
+      revealed,
+      entries: parseEnvText(text).entries,
+      environment: production,
+    })
+
+  test('saving the text it was opened with changes nothing', () => {
+    const opened = serializeEnvText(
+      scoped
+        .filter(({ variable }) => !variable.is_secret)
+        .map(({ variable }) => ({
+          key: variable.key,
+          value: revealed.get(variable.id) ?? '',
+        }))
+    )
+
+    expect(plan(opened)).toEqual([])
+  })
+
+  test('creates new keys in the edited environment', () => {
+    expect(plan('ONLY_PROD=one\nSHARED=two\nNEW=value')).toEqual([
+      { type: 'create', key: 'NEW', value: 'value' },
+    ])
+  })
+
+  test('says which other environments a shared value change reaches', () => {
+    expect(plan('ONLY_PROD=one\nSHARED=changed')).toEqual([
+      {
+        type: 'update',
+        variable: scoped.find((v) => v.variable.id === 2)!.variable,
+        value: 'changed',
+        alsoAffects: ['staging'],
+        replacesSecret: false,
+      },
+    ])
+  })
+
+  test('deletes a removed variable bound only here and unbinds a shared one', () => {
+    expect(plan('')).toEqual([
+      { type: 'delete', variable: variables[0] },
+      { type: 'unbind', variable: variables[1], remainingEnvironmentIds: [2] },
+    ])
+  })
+
+  test('never touches a secret that is absent from the text', () => {
+    const changes = plan('ONLY_PROD=one\nSHARED=two')
+
+    expect(
+      changes.some((change) => 'variable' in change && change.variable.id === 3)
+    ).toBe(false)
+  })
+
+  test('rotates a secret whose key is typed, but refuses an empty one', () => {
+    expect(plan('ONLY_PROD=one\nSHARED=two\nAPI_SECRET=rotated')).toEqual([
+      {
+        type: 'update',
+        variable: variables[2],
+        value: 'rotated',
+        alsoAffects: [],
+        replacesSecret: true,
+      },
+    ])
+    expect(plan('ONLY_PROD=one\nSHARED=two\nAPI_SECRET=')[0]?.type).toBe(
+      'blocked'
+    )
+  })
+
+  test('never deletes a variable whose value was not loaded', () => {
+    const changes = planRawEnvChanges({
+      scoped,
+      revealed: new Map([[2, 'two']]),
+      entries: parseEnvText('SHARED=two').entries,
+      environment: production,
+    })
+
+    expect(changes.map((change) => change.type)).toEqual(['blocked'])
+  })
+
+  test('blocks removing a preview-inherited variable from one preview', () => {
+    const inherited = variable(9, 'INHERITED', [production], {
+      include_in_preview: true,
+    })
+    const changes = planRawEnvChanges({
+      scoped: rawEditorVariables([inherited], preview),
+      revealed: new Map([[9, 'x']]),
+      entries: [],
+      environment: preview,
+    })
+
+    expect(changes.map((change) => change.type)).toEqual(['blocked'])
+  })
+
+  test('never unbinds the last environment of a variable passed to previews', () => {
+    // With no binding left the server treats the variable as project-wide,
+    // which would put it in production.
+    const both = variable(7, 'BOTH', [production], { include_in_preview: true })
+    const changes = planRawEnvChanges({
+      scoped: rawEditorVariables([both], production),
+      revealed: new Map([[7, 'x']]),
+      entries: [],
+      environment: production,
+    })
+
+    expect(changes).toHaveLength(1)
+    expect(changes[0]).toMatchObject({ type: 'blocked', variable: both })
+    expect(changes.some((change) => change.type === 'unbind')).toBe(false)
+  })
+
+  test("editing an inherited value names the row's own environments", () => {
+    const inherited = variable(9, 'API_URL', [production], {
+      include_in_preview: true,
+    })
+    const changes = planRawEnvChanges({
+      scoped: rawEditorVariables([inherited], preview),
+      revealed: new Map([[9, 'old']]),
+      entries: [{ key: 'API_URL', value: 'new' }],
+      environment: preview,
+    })
+
+    expect(changes).toEqual([
+      {
+        type: 'update',
+        variable: inherited,
+        value: 'new',
+        alsoAffects: ['production', 'every preview environment'],
+        replacesSecret: false,
+      },
+    ])
+  })
+})
+
+describe('mapWithConcurrency', () => {
+  test('keeps results in input order', async () => {
+    const results = await mapWithConcurrency([30, 10, 20], 2, async (ms) => {
+      await new Promise((resolve) => setTimeout(resolve, ms))
+      return ms * 2
+    })
+
+    expect(results).toEqual([60, 20, 40])
+  })
+
+  test('starts nothing new once the caller aborts', async () => {
+    const controller = new AbortController()
+    const started: number[] = []
+    const run = mapWithConcurrency(
+      [1, 2, 3, 4, 5],
+      2,
+      async (item) => {
+        started.push(item)
+        if (item === 2) controller.abort()
+        await new Promise((resolve) => setTimeout(resolve, 5))
+        return item
+      },
+      controller.signal
+    )
+
+    await expect(run).rejects.toBeDefined()
+    expect(started).toEqual([1, 2])
+  })
+
+  test('starts nothing new once one reveal is refused', async () => {
+    const started: number[] = []
+    const refusal = { title: 'Insufficient Permissions', status: 403 }
+
+    const outcome = mapWithConcurrency(
+      Array.from({ length: 20 }, (_, index) => index),
+      4,
+      async (index) => {
+        started.push(index)
+        if (index === 0) throw refusal
+        await new Promise((resolve) => setTimeout(resolve, 5))
+        return index
+      }
+    )
+
+    await expect(outcome).rejects.toBe(refusal)
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    // Only the reveals already in flight; the other 16 are never requested.
+    expect(started).toEqual([0, 1, 2, 3])
+  })
+})
+
+describe('rawEnvRemovals', () => {
+  test('separates deleted variables from ones removed from one environment', () => {
+    const shared = variable(1, 'SHARED', [production, staging])
+    const only = variable(2, 'ONLY_HERE', [production])
+    const kept = variable(3, 'KEPT', [production])
+    const changes = planRawEnvChanges({
+      scoped: rawEditorVariables([shared, only, kept], production),
+      revealed: new Map([
+        [1, 'a'],
+        [2, 'b'],
+        [3, 'c'],
+      ]),
+      entries: [{ key: 'KEPT', value: 'c' }],
+      environment: production,
+    })
+
+    expect(rawEnvRemovals(changes)).toEqual({
+      deleted: ['ONLY_HERE'],
+      unbound: ['SHARED'],
+    })
+  })
+
+  test('is empty when nothing is removed', () => {
+    expect(rawEnvRemovals([])).toEqual({ deleted: [], unbound: [] })
+  })
+})
+
+describe('summarizeKeys', () => {
+  test('names up to three keys and counts the rest', () => {
+    expect(summarizeKeys(['A', 'B'])).toBe('A, B')
+    expect(summarizeKeys(['A', 'B', 'C', 'D', 'E'])).toBe('A, B, C and 2 more')
+  })
+})
+
+describe('applyRawEnvChanges', () => {
+  const old = variable(1, 'OLD_KEY', [production])
+  const kept = variable(2, 'KEPT', [production, staging])
+  const rename = [
+    { type: 'create', key: 'NEW_KEY', value: 'v' },
+    { type: 'delete', variable: old },
+  ] as const
+  const describeError = (error: unknown) => String(error)
+
+  test('sends no removal once a write fails, so a rename keeps the old value', async () => {
+    const sent: string[] = []
+    const result = await applyRawEnvChanges(
+      rename,
+      async (change) => {
+        sent.push(change.type)
+        if (change.type === 'create') throw new Error('rejected key')
+      },
+      describeError
+    )
+
+    expect(sent).toEqual(['create'])
+    expect(result.applied).toBe(0)
+    expect(result.failures).toEqual([
+      { key: 'NEW_KEY', message: 'Error: rejected key' },
+      {
+        key: 'OLD_KEY',
+        message: 'Not removed because an earlier change failed',
+      },
+    ])
+  })
+
+  test('applies writes before removals and skips blocked changes', async () => {
+    const sent: string[] = []
+    const result = await applyRawEnvChanges(
+      [
+        { type: 'delete', variable: old },
+        { type: 'blocked', variable: kept, reason: 'inherited' },
+        {
+          type: 'unbind',
+          variable: kept,
+          remainingEnvironmentIds: [staging.id],
+        },
+        { type: 'create', key: 'NEW_KEY', value: 'v' },
+      ],
+      async (change) => {
+        sent.push(`${change.type}`)
+      },
+      describeError
+    )
+
+    expect(sent).toEqual(['create', 'delete', 'unbind'])
+    expect(result).toEqual({ applied: 3, failures: [] })
+  })
+
+  test('a failed removal does not stop the other removals', async () => {
+    const sent: string[] = []
+    const result = await applyRawEnvChanges(
+      [
+        { type: 'delete', variable: old },
+        {
+          type: 'unbind',
+          variable: kept,
+          remainingEnvironmentIds: [staging.id],
+        },
+      ],
+      async (change) => {
+        sent.push(change.type)
+        if (change.type === 'delete') throw new Error('gone')
+      },
+      describeError
+    )
+
+    expect(sent).toEqual(['delete', 'unbind'])
+    expect(result.applied).toBe(1)
+    expect(result.failures).toEqual([
+      { key: 'OLD_KEY', message: 'Error: gone' },
+    ])
+  })
+})

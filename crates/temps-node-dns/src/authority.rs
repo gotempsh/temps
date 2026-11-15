@@ -1,0 +1,589 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! Hickory `RequestHandler` backed by [`ZoneStore`].
+//!
+//! Implements the minimal slice of the DNS protocol we actually serve:
+//! authoritative `A`, `AAAA`, and `CNAME` answers for `*.temps.local`.
+//! Queries that fall outside the internal zone are forwarded to the
+//! upstream public resolvers configured on the agent (Cloudflare /
+//! Google by default) — without this, any container using us as its
+//! first nameserver would get NXDOMAIN for everything that isn't
+//! `*.temps.local`, breaking package installs and outbound calls.
+//!
+//! ## Why a hand-rolled handler instead of `Catalog` + `InMemoryAuthority`
+//!
+//! `Catalog` requires the full SOA/NS machinery and serial-number
+//! management that we don't need (and would have to fake for a zone
+//! whose contents change every few seconds). The handler is ~80 lines and
+//! exercises the same wire-format primitives, so we avoid an awkward
+//! impedance match.
+
+use std::collections::HashSet;
+use std::sync::Arc;
+
+use hickory_proto::op::{Header, HeaderCounts, MessageType, Metadata, OpCode, ResponseCode};
+use hickory_proto::rr::rdata::{
+    A as RDataA, AAAA as RDataAAAA, CNAME as RDataCNAME, TXT as RDataTXT,
+};
+use hickory_proto::rr::{Name, RData, Record, RecordType};
+use hickory_server::net::runtime::Time;
+use hickory_server::server::{Request, RequestHandler, ResponseHandler, ResponseInfo};
+use hickory_server::zone_handler::MessageResponseBuilder;
+use std::net::IpAddr;
+use std::str::FromStr;
+use tracing::{debug, trace, warn};
+
+use arc_swap::ArcSwap;
+use temps_workload_netpol::dns::{DnsDecision, DnsPolicy};
+
+use crate::observe::{DnsObserver, QueryObservation, QueryOutcome, ZoneClass};
+use crate::record::ZoneRecord;
+use crate::upstream::UpstreamResolver;
+use crate::zone_store::ZoneStore;
+
+/// Suffix that identifies our authoritative zone. Anything matching this
+/// (case-insensitive, with or without trailing dot) is answered from the
+/// `ZoneStore`; everything else is forwarded upstream.
+const TEMPS_ZONE_SUFFIX: &str = "temps.local";
+pub const RESOLVER_MARKER_NAME: &str = "_temps-resolver.temps.local";
+pub const RESOLVER_MARKER_VALUE: &str = "temps-dns-resolver-v1";
+
+pub struct ZoneAuthority {
+    zone: Arc<ZoneStore>,
+    upstream: Option<Arc<UpstreamResolver>>,
+    /// Per-source answers for restricted workloads (ADR-055 §9). `None`
+    /// (and an open snapshot) is today's resolver.
+    policy: Option<Arc<ArcSwap<DnsPolicy>>>,
+    /// Counts every answered query and logs the internal ones (ADR-095).
+    observer: Option<Arc<DnsObserver>>,
+}
+
+/// What one answered query was, for the observer.
+pub(crate) enum Observed {
+    /// Malformed or non-query messages, and the resolver's own readiness
+    /// probe: not traffic anyone asked about.
+    Unobserved,
+    Query {
+        name: String,
+        qtype: RecordType,
+        zone: ZoneClass,
+        /// Answered NXDOMAIN because the network policy refuses the name.
+        refused: bool,
+    },
+}
+
+impl ZoneAuthority {
+    pub fn new(zone: Arc<ZoneStore>) -> Self {
+        Self {
+            zone,
+            upstream: None,
+            policy: None,
+            observer: None,
+        }
+    }
+
+    /// Record every answered query into `observer` (ADR-095 §1).
+    pub fn with_observer(mut self, observer: Arc<DnsObserver>) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+
+    /// Answers restricted sources from the policy snapshot: the names
+    /// their policy allows (and the group short names of those), nothing
+    /// else, and never a forwarded lookup. The snapshot is swapped by the
+    /// node enforcer; reading it is one atomic load per query.
+    pub fn with_policy(mut self, policy: Arc<ArcSwap<DnsPolicy>>) -> Self {
+        self.policy = Some(policy);
+        self
+    }
+
+    pub fn with_upstream(mut self, upstream: Arc<UpstreamResolver>) -> Self {
+        self.upstream = Some(upstream);
+        self
+    }
+}
+
+fn is_internal_zone(qname: &str) -> bool {
+    let trimmed = qname.trim_end_matches('.').to_ascii_lowercase();
+    trimmed == TEMPS_ZONE_SUFFIX || trimmed.ends_with(&format!(".{TEMPS_ZONE_SUFFIX}"))
+}
+
+#[async_trait::async_trait]
+impl RequestHandler for ZoneAuthority {
+    async fn handle_request<R: ResponseHandler, T: Time>(
+        &self,
+        request: &Request,
+        mut response_handle: R,
+    ) -> ResponseInfo {
+        let started = std::time::Instant::now();
+        let (info, observed) = self.answer(request, &mut response_handle).await;
+        if let (
+            Some(observer),
+            Observed::Query {
+                name,
+                qtype,
+                zone,
+                refused,
+            },
+        ) = (&self.observer, observed)
+        {
+            let answers = info.counts().answers;
+            observer.record(QueryObservation {
+                name: &name,
+                qtype,
+                zone,
+                outcome: QueryOutcome::classify(info.response_code, answers, refused),
+                latency: started.elapsed(),
+                answers,
+                source: request.src().ip(),
+            });
+        }
+        info
+    }
+}
+
+impl ZoneAuthority {
+    /// Answer `request` and say what it was. Not observed: the caller
+    /// records it, or (a test resolution from the console) does not.
+    pub(crate) async fn answer<R: ResponseHandler>(
+        &self,
+        request: &Request,
+        response_handle: &mut R,
+    ) -> (ResponseInfo, Observed) {
+        let unobserved = |info| (info, Observed::Unobserved);
+        let info = match request.request_info() {
+            Ok(i) => i,
+            Err(e) => {
+                warn!(error = %e, "failed to parse DNS request");
+                return unobserved(
+                    reply_error(request, response_handle, ResponseCode::FormErr).await,
+                );
+            }
+        };
+
+        // Only standard queries are supported.
+        if info.metadata.op_code != OpCode::Query
+            || info.metadata.message_type != MessageType::Query
+        {
+            trace!(
+                op = ?info.metadata.op_code,
+                ty = ?info.metadata.message_type,
+                "rejecting non-Query DNS message"
+            );
+            return unobserved(reply_error(request, response_handle, ResponseCode::NotImp).await);
+        }
+
+        let qname: Name = info.query.name().into();
+        let qtype = info.query.query_type();
+        let qname_str = qname.to_utf8();
+        let in_zone = is_internal_zone(&qname_str);
+
+        let is_marker = qname_str
+            .trim_end_matches('.')
+            .eq_ignore_ascii_case(RESOLVER_MARKER_NAME);
+        if is_marker && matches!(qtype, RecordType::TXT | RecordType::ANY) {
+            let answer = Record::from_rdata(
+                qname.clone(),
+                0,
+                RData::TXT(RDataTXT::new(vec![RESOLVER_MARKER_VALUE.to_string()])),
+            );
+            let mut metadata = Metadata::response_from_request(info.metadata);
+            metadata.authoritative = true;
+            metadata.response_code = ResponseCode::NoError;
+            let builder = MessageResponseBuilder::from_message_request(request);
+            let response = builder.build(
+                metadata,
+                std::iter::once(&answer),
+                std::iter::empty::<&Record>(),
+                std::iter::empty::<&Record>(),
+                std::iter::empty::<&Record>(),
+            );
+            return unobserved(
+                response_handle
+                    .send_response(response)
+                    .await
+                    .unwrap_or_else(|_| error_info(request, ResponseCode::ServFail)),
+            );
+        }
+        if is_marker {
+            return unobserved(reply_nodata(request, response_handle, info.metadata).await);
+        }
+        let asked_zone = if in_zone {
+            ZoneClass::Internal
+        } else {
+            ZoneClass::External
+        };
+        let observed = |name: String, zone: ZoneClass, refused: bool| Observed::Query {
+            name,
+            qtype,
+            zone,
+            refused,
+        };
+
+        // Policy: who is asking decides what they may learn. A refused
+        // name is NXDOMAIN, not REFUSED, so a stub resolver does not move
+        // on to a second nameserver and ask there.
+        let normalized = temps_workload_netpol::dns::normalize(&qname_str);
+        let policy = self.policy.as_ref().map(|p| p.load_full());
+        let (lookup_name, restricted) = match policy
+            .as_deref()
+            .map(|p| p.decide(request.src().ip(), &normalized))
+        {
+            None => (normalized.clone(), false),
+            Some(DnsDecision::Unrestricted { lookup }) => (lookup.to_string(), false),
+            Some(DnsDecision::Answer { lookup }) => (lookup.to_string(), true),
+            Some(DnsDecision::Refuse) => {
+                debug!(
+                    qname = %qname_str,
+                    source = %request.src().ip(),
+                    "DNS query refused by network policy"
+                );
+                let info = reply_error(request, response_handle, ResponseCode::NXDomain).await;
+                return (info, observed(qname_str, asked_zone, true));
+            }
+        };
+        let in_zone = in_zone || is_internal_zone(&lookup_name);
+
+        // Outside-zone queries are forwarded recursively. We are the
+        // *only* nameserver app containers see, so falling through to
+        // NXDOMAIN here would break `apt-get`, `wget`, package installs,
+        // outbound API calls, …
+        if !in_zone {
+            if restricted {
+                let info = reply_error(request, response_handle, ResponseCode::NXDomain).await;
+                return (info, observed(qname_str, ZoneClass::External, true));
+            }
+            if let Some(upstream) = &self.upstream {
+                trace!(qname = %qname_str, qtype = ?qtype, "forwarding to upstream");
+                let info = upstream
+                    .forward(request, response_handle)
+                    .await
+                    .unwrap_or_else(|info| info);
+                return (info, observed(qname_str, ZoneClass::External, false));
+            }
+            // No upstream configured — degrade to NXDOMAIN as the old
+            // behaviour did, which keeps strict authoritative-only
+            // deployments compatible.
+            let info = reply_error(request, response_handle, ResponseCode::NXDomain).await;
+            return (info, observed(qname_str, ZoneClass::External, false));
+        }
+
+        let snapshot = self.zone.snapshot();
+        // First check whether the name exists at all in our zone, then
+        // narrow to the requested qtype. The two failure modes have
+        // different DNS semantics:
+        //   - name exists, no records of this type → NoError, empty
+        //     answer (NODATA). Critical for AAAA queries on names that
+        //     are A-only — busybox + glibc getaddrinfo treat NXDOMAIN
+        //     on either A or AAAA as "host doesn't exist" and refuse
+        //     the connection, so returning NXDOMAIN here breaks every
+        //     IPv4-only internal name.
+        //   - name doesn't exist at all → NXDOMAIN.
+        // An alias (a group short name) is answered from its canonical
+        // name's records, under the name that was asked.
+        let any_match = snapshot.lookup(&lookup_name).next().is_some();
+        let matches: Vec<&ZoneRecord> = snapshot
+            .lookup(&lookup_name)
+            .filter(|r| matches_qtype(r, qtype))
+            .collect();
+
+        let (answers, suppressed_duplicates) = build_unique_answers(&qname, &matches);
+
+        debug!(
+            qname = %qname_str,
+            qtype = ?qtype,
+            matching_rows = matches.len(),
+            answers = answers.len(),
+            suppressed_duplicates,
+            any_match,
+            "DNS query"
+        );
+
+        if matches.is_empty() {
+            if any_match {
+                // NODATA: name exists, just not for this qtype. Reply
+                // NoError with no answer rrs and the AA bit set.
+                let info = reply_nodata(request, response_handle, info.metadata).await;
+                return (info, observed(qname_str, ZoneClass::Internal, false));
+            }
+            // Genuine NXDOMAIN.
+            let info = reply_error(request, response_handle, ResponseCode::NXDomain).await;
+            return (info, observed(qname_str, ZoneClass::Internal, false));
+        }
+
+        if answers.is_empty() {
+            // We had matching FQDN+type rows but none were valid (e.g. all
+            // had garbage IPs). Treat as SERVFAIL — the data is broken
+            // upstream and the resolver shouldn't lie to the client.
+            let info = reply_error(request, response_handle, ResponseCode::ServFail).await;
+            return (info, observed(qname_str, ZoneClass::Internal, false));
+        }
+
+        let mut metadata = Metadata::response_from_request(info.metadata);
+        metadata.authoritative = true;
+        metadata.response_code = ResponseCode::NoError;
+
+        let builder = MessageResponseBuilder::from_message_request(request);
+        let resp = builder.build(
+            metadata,
+            answers.iter(),
+            std::iter::empty::<&Record>(),
+            std::iter::empty::<&Record>(),
+            std::iter::empty::<&Record>(),
+        );
+
+        let info = match response_handle.send_response(resp).await {
+            Ok(info) => info,
+            Err(e) => {
+                warn!(error = %e, "failed to send DNS response");
+                error_info(request, ResponseCode::ServFail)
+            }
+        };
+        (info, observed(qname_str, ZoneClass::Internal, false))
+    }
+}
+
+fn matches_qtype(record: &ZoneRecord, qtype: RecordType) -> bool {
+    let kind = match record.kind() {
+        Ok(k) => k,
+        Err(_) => return false,
+    };
+    use crate::record::RecordKind;
+    match (kind, qtype) {
+        // CNAME is returned for any QTYPE per RFC 1034 §3.6.2; the client
+        // re-resolves the target. We don't auto-chase here.
+        (RecordKind::Cname, _) => true,
+        (RecordKind::A, RecordType::A) => true,
+        (RecordKind::Aaaa, RecordType::AAAA) => true,
+        (RecordKind::Srv, RecordType::SRV) => true,
+        // ANY: return everything we have.
+        (_, RecordType::ANY) => true,
+        _ => false,
+    }
+}
+
+fn build_answer(qname: &Name, record: &ZoneRecord) -> Option<Record> {
+    let kind = record.kind().ok()?;
+    use crate::record::RecordKind;
+    let ttl = record.ttl.max(0) as u32;
+    let rdata = match kind {
+        RecordKind::A => match record.ip().ok()?? {
+            IpAddr::V4(v4) => RData::A(RDataA(v4)),
+            IpAddr::V6(_) => return None,
+        },
+        RecordKind::Aaaa => match record.ip().ok()?? {
+            IpAddr::V6(v6) => RData::AAAA(RDataAAAA(v6)),
+            IpAddr::V4(_) => return None,
+        },
+        RecordKind::Cname => {
+            let target = record.cname_target()?;
+            let name = Name::from_str(target).ok()?;
+            RData::CNAME(RDataCNAME(name))
+        }
+        RecordKind::Srv => {
+            // SRV is in the schema for forward-compatibility; we don't
+            // synthesise weight/priority today. Return None so the answer
+            // list filters it out — the schema-level CHECK constraint
+            // already prevents anyone *writing* SRV through the registry.
+            return None;
+        }
+    };
+    Some(Record::from_rdata(qname.clone(), ttl, rdata))
+}
+
+/// Build wire answers while collapsing registry rows that describe the same
+/// resource record. A stale persisted snapshot or malformed sync response
+/// must not amplify one address into a fragmented DNS packet that Docker's
+/// embedded resolver rejects.
+fn build_unique_answers(qname: &Name, records: &[&ZoneRecord]) -> (Vec<Record>, usize) {
+    let mut seen = HashSet::with_capacity(records.len());
+    let mut answers = Vec::with_capacity(records.len());
+    let mut suppressed_duplicates = 0;
+    for record in records {
+        let Some(answer) = build_answer(qname, record) else {
+            continue;
+        };
+        let key = format!("{:?}", answer.data);
+        if seen.insert(key) {
+            answers.push(answer);
+        } else {
+            suppressed_duplicates += 1;
+        }
+    }
+    (answers, suppressed_duplicates)
+}
+
+async fn reply_error<R: ResponseHandler>(
+    request: &Request,
+    response_handle: &mut R,
+    code: ResponseCode,
+) -> ResponseInfo {
+    let builder = MessageResponseBuilder::from_message_request(request);
+    // `Request` derefs to `Metadata`; `error_msg` wants `&Metadata`.
+    let mut metadata = Metadata::response_from_request(&request.metadata);
+    metadata.response_code = code;
+    metadata.authoritative = code == ResponseCode::NXDomain
+        && request.request_info().is_ok_and(|info| {
+            is_internal_zone(&info.query.name().to_string().to_ascii_lowercase())
+        });
+    let resp = builder.build(
+        metadata,
+        std::iter::empty::<&Record>(),
+        std::iter::empty::<&Record>(),
+        std::iter::empty::<&Record>(),
+        std::iter::empty::<&Record>(),
+    );
+    match response_handle.send_response(resp).await {
+        Ok(info) => info,
+        Err(e) => {
+            warn!(error = %e, "failed to send DNS error response");
+            error_info(request, code)
+        }
+    }
+}
+
+/// Reply NODATA — name exists in the zone, but no records of the
+/// requested type. Status is NoError, AA is set, answer/authority/
+/// additional sections are empty. Resolvers and stub libraries
+/// (glibc getaddrinfo, busybox) treat this as "try the other type"
+/// instead of giving up on the name entirely.
+async fn reply_nodata<R: ResponseHandler>(
+    request: &Request,
+    response_handle: &mut R,
+    request_metadata: &Metadata,
+) -> ResponseInfo {
+    let mut metadata = Metadata::response_from_request(request_metadata);
+    metadata.authoritative = true;
+    metadata.response_code = ResponseCode::NoError;
+
+    let builder = MessageResponseBuilder::from_message_request(request);
+    let resp = builder.build(
+        metadata,
+        std::iter::empty::<&Record>(),
+        std::iter::empty::<&Record>(),
+        std::iter::empty::<&Record>(),
+        std::iter::empty::<&Record>(),
+    );
+    match response_handle.send_response(resp).await {
+        Ok(info) => info,
+        Err(e) => {
+            warn!(error = %e, "failed to send DNS NODATA response");
+            error_info(request, ResponseCode::NoError)
+        }
+    }
+}
+
+fn error_info(request: &Request, code: ResponseCode) -> ResponseInfo {
+    // `Request` derefs to `Metadata`; build a fresh response Header from it.
+    // `ResponseInfo` is constructed from a `Header` (Metadata + record counts).
+    let mut metadata = Metadata::response_from_request(&request.metadata);
+    metadata.response_code = code;
+    Header {
+        metadata,
+        counts: HeaderCounts::default(),
+    }
+    .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::record::ZoneRecord;
+    use std::path::PathBuf;
+
+    fn rec(record_type: &str, target: &str) -> ZoneRecord {
+        ZoneRecord {
+            id: 1,
+            fqdn: "x.temps.local".into(),
+            record_type: record_type.into(),
+            target_ip: Some(target.into()),
+            target_port: None,
+            ttl: 30,
+            owner_kind: "static".into(),
+            owner_id: 1,
+            node_id: None,
+            generation: 1,
+        }
+    }
+
+    #[test]
+    fn matches_qtype_a_for_a_query() {
+        assert!(matches_qtype(&rec("A", "1.2.3.4"), RecordType::A));
+        assert!(!matches_qtype(&rec("A", "1.2.3.4"), RecordType::AAAA));
+    }
+
+    #[test]
+    fn matches_qtype_cname_matches_any_query_type() {
+        assert!(matches_qtype(&rec("CNAME", "y.temps.local"), RecordType::A));
+        assert!(matches_qtype(
+            &rec("CNAME", "y.temps.local"),
+            RecordType::AAAA
+        ));
+    }
+
+    #[test]
+    fn matches_any_returns_all() {
+        assert!(matches_qtype(&rec("A", "1.2.3.4"), RecordType::ANY));
+        assert!(matches_qtype(&rec("AAAA", "fd00::1"), RecordType::ANY));
+    }
+
+    #[test]
+    fn build_answer_emits_a_record() {
+        let qname = Name::from_str("x.temps.local.").unwrap();
+        let answer = build_answer(&qname, &rec("A", "172.20.5.10")).unwrap();
+        assert_eq!(answer.ttl, 30);
+        match &answer.data {
+            RData::A(RDataA(v4)) => assert_eq!(v4.to_string(), "172.20.5.10"),
+            other => panic!("expected A, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_answer_skips_garbage_ip() {
+        let qname = Name::from_str("x.temps.local.").unwrap();
+        assert!(build_answer(&qname, &rec("A", "not.an.ip")).is_none());
+    }
+
+    #[test]
+    fn build_answer_emits_aaaa_record() {
+        let qname = Name::from_str("x.temps.local.").unwrap();
+        let answer = build_answer(&qname, &rec("AAAA", "fd00::1")).unwrap();
+        match &answer.data {
+            RData::AAAA(RDataAAAA(v6)) => assert!(v6.to_string().contains("fd00")),
+            other => panic!("expected AAAA, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_unique_answers_collapses_duplicate_rows() {
+        let qname = Name::from_str("x.temps.local.").unwrap();
+        let records: Vec<ZoneRecord> = (1..=165)
+            .map(|id| {
+                let mut record = rec("A", "172.20.255.2");
+                record.id = id;
+                record.generation = id;
+                record
+            })
+            .collect();
+        let references: Vec<&ZoneRecord> = records.iter().collect();
+
+        let (answers, suppressed_duplicates) = build_unique_answers(&qname, &references);
+
+        assert_eq!(answers.len(), 1);
+        assert_eq!(suppressed_duplicates, 164);
+        match &answers[0].data {
+            RData::A(RDataA(ip)) => assert_eq!(ip.to_string(), "172.20.255.2"),
+            other => panic!("expected A, got {other:?}"),
+        }
+    }
+
+    /// Smoke test that `ZoneAuthority::new` accepts an `Arc<ZoneStore>`.
+    /// The full request-handling path is covered by the integration test
+    /// in tests/end_to_end.rs (real UDP socket + hickory client).
+    #[test]
+    fn authority_constructs() {
+        let zone = Arc::new(ZoneStore::new(PathBuf::from("/dev/null")));
+        let _ = ZoneAuthority::new(zone);
+    }
+}

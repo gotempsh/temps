@@ -44,6 +44,17 @@ pub struct ContainerRuntimeResolutionError {
     pub reason: String,
 }
 
+/// Bytes since the previous sample of a cumulative counter. A counter that
+/// went backwards was reset (the container restarted), so the new value is
+/// all that has accumulated since.
+fn counter_delta(previous: u64, current: u64) -> u64 {
+    if current >= previous {
+        current - previous
+    } else {
+        current
+    }
+}
+
 /// Cached state for a container between health checks
 #[derive(Debug, Clone)]
 struct ContainerState {
@@ -339,6 +350,10 @@ pub struct ContainerHealthMonitor {
     runtime_resolver: Arc<dyn ContainerRuntimeResolver>,
     /// Cached restart counts and network stats keyed by deployment_container.id
     container_states: tokio::sync::RwLock<HashMap<i32, ContainerState>>,
+    /// Last observed cumulative block I/O (read, written) keyed by
+    /// deployment_container.id, for the delta gauges. Kept apart from
+    /// `container_states` because not every runtime reports it.
+    block_io_baselines: tokio::sync::RwLock<HashMap<i32, (u64, u64)>>,
     /// Consecutive high-resource checks keyed by (container_db_id, alarm_type_str)
     resource_counters: tokio::sync::RwLock<HashMap<(i32, &'static str), u32>>,
     /// Log-on-transition state for conditions re-observed every poll.
@@ -359,6 +374,7 @@ impl ContainerHealthMonitor {
             metrics_store: None,
             runtime_resolver,
             container_states: tokio::sync::RwLock::new(HashMap::new()),
+            block_io_baselines: tokio::sync::RwLock::new(HashMap::new()),
             resource_counters: tokio::sync::RwLock::new(HashMap::new()),
             log_state: HealthLogState::default(),
         }
@@ -454,6 +470,10 @@ impl ContainerHealthMonitor {
         {
             let mut states = self.container_states.write().await;
             states.retain(|id, _| active_ids.contains(id));
+        }
+        {
+            let mut baselines = self.block_io_baselines.write().await;
+            baselines.retain(|id, _| active_ids.contains(id));
         }
         {
             let mut counters = self.resource_counters.write().await;
@@ -902,7 +922,7 @@ impl ContainerHealthMonitor {
                 let intentional = exit_is_intentional(container, info);
                 self.persist_exit_info(container, info, intentional).await;
 
-                // A user-initiated stop (`stop_container`/`stop_all_containers`)
+                // A user-initiated stop (`stop_container`)
                 // and a failed deployment retained for log inspection are both
                 // stopped on purpose — an exit there is expected, not a crash.
                 if intentional {
@@ -1391,6 +1411,8 @@ impl ContainerHealthMonitor {
     /// - `container.memory_percent` (Gauge, when limit is known)
     /// - `container.network_rx_bytes_delta` (Gauge — bytes received since last poll)
     /// - `container.network_tx_bytes_delta` (Gauge — bytes transmitted since last poll)
+    /// - `container.block_read_bytes_delta` / `container.block_write_bytes_delta`
+    ///   (Gauge — block I/O since last poll, only for runtimes that report it)
     ///
     /// Network metrics are emitted as **deltas** (bytes since the previous poll)
     /// rather than raw cumulative counters.  This keeps TimescaleDB rollups
@@ -1445,7 +1467,7 @@ impl ContainerHealthMonitor {
             // CPU usage relative to the CPU the container may use — its limit
             // when set, otherwise every core on the host (100% == that capacity
             // fully saturated). This is the metric alert rules should threshold
-            // against — see `container_default_seeds()` in the evaluator.
+            // against — see `container_default_seeds()` in temps-alarms.
             make_point(
                 "container.cpu_utilization_percent",
                 stats.cpu_utilization_percent(),
@@ -1511,6 +1533,34 @@ impl ContainerHealthMonitor {
             net_tx_delta,
             MetricKind::Gauge,
         ));
+
+        // Block I/O is reported by some runtimes only (Docker, microVMs): a
+        // runtime that does not report it writes no point, so a chart shows
+        // "no data" instead of a flat zero.
+        if let (Some(read), Some(written)) = (stats.block_read_bytes, stats.block_write_bytes) {
+            let (read_delta, write_delta) = {
+                let mut baselines = self.block_io_baselines.write().await;
+                let previous = baselines.insert(container_id, (read, written));
+                match previous {
+                    Some((previous_read, previous_written)) => (
+                        counter_delta(previous_read, read),
+                        counter_delta(previous_written, written),
+                    ),
+                    // No prior sample: the baseline is 0, as for network.
+                    None => (read, written),
+                }
+            };
+            points.push(make_point(
+                "container.block_read_bytes_delta",
+                read_delta as f64,
+                MetricKind::Gauge,
+            ));
+            points.push(make_point(
+                "container.block_write_bytes_delta",
+                write_delta as f64,
+                MetricKind::Gauge,
+            ));
+        }
 
         match store.write_batch(points).await {
             Ok(_) => {
@@ -1606,6 +1656,14 @@ impl ContainerHealthMonitor {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_counter_delta_is_the_growth_and_a_reset_counts_from_zero() {
+        assert_eq!(counter_delta(100, 150), 50);
+        assert_eq!(counter_delta(100, 100), 0);
+        // The container restarted: the counter began again at 0.
+        assert_eq!(counter_delta(1_000_000, 42), 42);
+    }
+
     use super::*;
     use crate::alarm_service::AlarmService;
     use async_trait::async_trait;
@@ -1661,7 +1719,6 @@ mod tests {
         fail_info: AtomicBool,
     }
 
-    #[allow(dead_code)]
     impl MockDeployer {
         fn new(restart_count: i64, status: ContainerStatus) -> Self {
             Self {
@@ -1686,6 +1743,8 @@ mod tests {
                     memory_percent: Some(19.5),
                     network_rx_bytes: 0,
                     network_tx_bytes: 0,
+                    block_read_bytes: None,
+                    block_write_bytes: None,
                     timestamp: chrono::Utc::now(),
                     ..Default::default()
                 }),
@@ -1700,14 +1759,6 @@ mod tests {
             self.info.lock().await.restart_count = Some(count);
         }
 
-        async fn set_status(&self, status: ContainerStatus) {
-            self.info.lock().await.status = status;
-        }
-
-        async fn set_cpu_percent(&self, percent: f64) {
-            self.stats.lock().await.cpu_percent = percent;
-        }
-
         /// Set the raw Docker CPU percentage together with the CPU the
         /// container is allowed to use (limit if any, plus the host's cores).
         async fn set_cpu(&self, percent: f64, limit_cores: Option<f64>, online_cpus: u32) {
@@ -1715,10 +1766,6 @@ mod tests {
             stats.cpu_percent = percent;
             stats.cpu_limit_cores = limit_cores;
             stats.online_cpus = Some(online_cpus);
-        }
-
-        async fn set_memory_percent(&self, percent: f64) {
-            self.stats.lock().await.memory_percent = Some(percent);
         }
 
         fn block_container_info(&self) {
@@ -3196,7 +3243,7 @@ mod tests {
     // forever.
 
     struct ExitFixture {
-        _database: temps_database::test_utils::TestDatabase,
+        _database: temps_test_utils::TestDatabase,
         db: Arc<sea_orm::DatabaseConnection>,
         environment_id: i32,
     }
@@ -3207,12 +3254,10 @@ mod tests {
             environments, preset::Preset, projects, upstream_config::UpstreamList,
         };
 
-        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let database = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping container exit alarm test: Docker runtime unavailable");
                 return None;

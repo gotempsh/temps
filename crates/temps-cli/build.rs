@@ -1,6 +1,12 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::disallowed_methods,
+    reason = "build script: panicking is how a build script reports failure, and it reads the variables Cargo sets for it"
+)]
 use std::env;
 use std::fs;
 use std::path::PathBuf;
@@ -281,6 +287,18 @@ fn run_cmd(cmd: &str, args: &[&str], dir: &std::path::Path) {
 /// Ensure a placeholder dist directory exists for include_dir! macro
 /// This prevents build errors when web build is skipped in debug mode
 fn ensure_placeholder_dist(dist_dir: &std::path::Path) {
+    // `dist/` is untracked, so a fresh checkout lacks it even when a restored
+    // target directory says this script already ran (CI backdates unchanged
+    // sources so cached units stay fresh). Watching the placeholder makes
+    // Cargo rerun the script when it is missing. Only the placeholder path
+    // emits this: it writes index.html once, so the script reruns one extra
+    // time and then stays fresh, whereas the release path rewrites dist/ on
+    // every run and would never settle.
+    println!(
+        "cargo:rerun-if-changed={}",
+        dist_dir.join("index.html").display()
+    );
+
     // Create dist directory if it doesn't exist
     if !dist_dir.exists() {
         fs::create_dir_all(dist_dir).unwrap_or_else(|e| {

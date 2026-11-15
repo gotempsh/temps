@@ -131,6 +131,26 @@ test('a refused create keeps the sheet open and shows the reason', async () => {
   api.restore()
 })
 
+test('a slow create explains the wait and can be closed', async () => {
+  const api = mockApi({
+    'GET /v1/sandboxes/placement': () => jsonResponse(PLACEMENT),
+    // Never answers, like a first create that is still building its image.
+    'POST /v1/sandboxes': () => new Promise<Response>(() => {}),
+  })
+  const view = renderSheet()
+
+  fireEvent.click(await view.findByRole('button', { name: 'Create sandbox' }))
+
+  await view.findByText(/builds its image, which can take several minutes/)
+  // The footer button and the sheet's own close control both stay usable.
+  const closers = view.getAllByRole('button', { name: 'Close' })
+  expect(closers.length).toBeGreaterThan(0)
+  for (const closer of closers) {
+    expect((closer as HTMLButtonElement).disabled).toBe(false)
+  }
+  api.restore()
+})
+
 test('says so, and cannot submit, when sandboxes are unavailable', async () => {
   const api = mockApi({})
   const view = renderSheet(false)
@@ -197,5 +217,49 @@ test('creating invalidates every cached page of the sandbox list', async () => {
 
   expect(client.getQueryState(pageOne)?.isInvalidated).toBe(true)
   expect(client.getQueryState(pageTwo)?.isInvalidated).toBe(true)
+  api.restore()
+})
+
+const PLACEMENT_WITH_BACKENDS = {
+  allowed_node_ids: null,
+  nodes: [
+    {
+      ...PLACEMENT.nodes[0],
+      backends: [
+        { backend: 'docker', available: true, reason: null },
+        { backend: 'firecracker', available: true, reason: null },
+        {
+          backend: 'microsandbox',
+          available: false,
+          reason: 'run `temps microsandbox setup` on the server host',
+        },
+      ],
+    },
+  ],
+}
+
+test('offers the backends the node runs and explains the missing ones', async () => {
+  let body: unknown
+  const api = mockApi({
+    'GET /v1/sandboxes/placement': () => jsonResponse(PLACEMENT_WITH_BACKENDS),
+    'POST /v1/sandboxes': async (request) => {
+      body = await request.json()
+      return jsonResponse(CREATED, 201)
+    },
+  })
+  const view = renderSheet()
+
+  // The unavailable backend stays visible, disabled, with the server's fix.
+  await view.findByText(/temps microsandbox setup/)
+  const microsandbox = view.baseElement.querySelector('#backend-microsandbox')
+  expect(microsandbox?.hasAttribute('disabled')).toBe(true)
+
+  const firecracker = view.baseElement.querySelector('#backend-firecracker')
+  expect(firecracker?.hasAttribute('disabled')).toBe(false)
+  fireEvent.click(firecracker as Element)
+  fireEvent.click(view.getByRole('button', { name: 'Create sandbox' }))
+
+  await view.findByText('detail page')
+  expect(body).toEqual({ lifecycle: 'ephemeral', backend: 'firecracker' })
   api.restore()
 })

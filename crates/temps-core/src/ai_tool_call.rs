@@ -138,3 +138,83 @@ mod tests {
         assert!(assistant_user_agent(None).contains("via Temps AI assistant"));
     }
 }
+
+/// In-process evidence that a pending write was confirmed by its human owner.
+/// Never populated from HTTP headers or model parameters.
+#[derive(Clone, Copy, Debug)]
+pub struct ConfirmedAiWrite;
+
+/// Assistant writes that widen what a credential or a sandbox can reach: a
+/// vault session, link or bundle, and an internal access grant from another
+/// project or a sandbox (ADR-101, ADR-105 D8).
+///
+/// Only the owner's confirmation of that exact pending action in the console
+/// may run one. A permission mode that approves writes on its own, an MCP
+/// `confirm_action`, or anything else the model can produce never stands in
+/// for it: a prompt-injected agent could otherwise widen its own reach, such
+/// as a sandbox agent granting its own sandbox access to a project. Each
+/// handler also checks [`require_human_confirmation`], so the rule holds
+/// however the operation is reached.
+pub const HUMAN_CONSENT_OPERATIONS: &[&str] = &[
+    "create_access_session_general",
+    "create_vault_link",
+    "create_access_bundle_general",
+    "create_internal_access_grant",
+    "create_internal_access_sandbox_grant",
+];
+
+/// Whether `operation_id` is one of [`HUMAN_CONSENT_OPERATIONS`].
+pub fn requires_human_consent(operation_id: &str) -> bool {
+    HUMAN_CONSENT_OPERATIONS.contains(&operation_id)
+}
+
+pub fn require_human_confirmation(
+    ai_call: Option<&AiToolCall>,
+    confirmation: Option<&ConfirmedAiWrite>,
+    operation: &str,
+) -> Result<(), crate::problemdetails::Problem> {
+    if confirmation.is_some() {
+        return Ok(());
+    }
+    require_human_caller(ai_call, operation)
+}
+
+#[cfg(test)]
+mod confirmation_tests {
+    use super::*;
+    #[test]
+    fn assistant_access_requires_confirmed_pending_write() {
+        assert!(require_human_confirmation(None, None, "create_access_session_general").is_ok());
+        assert!(require_human_confirmation(
+            Some(&AiToolCall),
+            None,
+            "create_access_session_general"
+        )
+        .is_err());
+        assert!(require_human_confirmation(
+            Some(&AiToolCall),
+            Some(&ConfirmedAiWrite),
+            "create_access_session_general"
+        )
+        .is_ok());
+        assert!(require_human_caller(Some(&AiToolCall), "confirm_pending_action").is_err());
+    }
+
+    #[test]
+    fn granting_internal_access_needs_human_consent_and_revoking_does_not() {
+        for operation in [
+            "create_internal_access_grant",
+            "create_internal_access_sandbox_grant",
+            "create_vault_link",
+        ] {
+            assert!(requires_human_consent(operation), "{operation}");
+        }
+        for operation in [
+            "delete_internal_access_grant",
+            "delete_internal_access_sandbox_grant",
+            "list_internal_access_sandbox_grants",
+        ] {
+            assert!(!requires_human_consent(operation), "{operation}");
+        }
+    }
+}

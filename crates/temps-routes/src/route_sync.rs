@@ -37,6 +37,8 @@
 
 use std::sync::Arc;
 use std::time::Duration;
+use temps_core::crypto::constant_time_eq;
+use temps_core::crypto::sha256_hex;
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -109,6 +111,18 @@ pub struct RouteEntryDto {
     /// an agent that declared `shield-v1`; an older one never reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shield: Option<temps_core::worker_shield::ShieldRoutePolicy>,
+    /// Callers from other projects this internal route admits (ADR 101 D5).
+    /// Set only on routes in `RouteSnapshot::routes`. An agent that predates
+    /// grants ignores it and admits its route's own project only, which is
+    /// the default; an empty list means the same, so it is not sent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_callers: Vec<temps_core::internal_access::InternalAccessCaller>,
+    /// Sandboxes on this snapshot's node this internal route admits (ADR
+    /// 105). A separate list so an agent that predates sandbox grants, which
+    /// reads `allowed_callers` as project callers, parses the snapshot and
+    /// ignores this one: it then admits no sandbox, which fails closed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_sandboxes: Vec<temps_core::internal_access::InternalAccessSandboxCaller>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -307,6 +321,26 @@ async fn count_project_rate_limit_policies(db: &DatabaseConnection) -> Result<i6
     }
 }
 
+/// Enabled edge rules of live projects (ADR-089 §8). Only the control-plane
+/// proxy evaluates them, so any such rule keeps ingress there. Log-only rules
+/// count too: a request a worker answers is never evaluated or counted, so
+/// the rule would report fewer matches than it would enforce.
+async fn count_enabled_project_edge_rules(db: &DatabaseConnection) -> Result<i64, sea_orm::DbErr> {
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+    let row = db
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT COUNT(*)::bigint AS rules FROM project_edge_rules r \
+               JOIN projects p ON p.id = r.project_id \
+             WHERE r.enabled AND p.deleted_at IS NULL",
+        ))
+        .await?;
+    match row {
+        Some(row) => row.try_get::<i64>("", "rules"),
+        None => Ok(0),
+    }
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum SnapshotBuildError {
     #[error("Failed to {operation} for node {node_id}: {source}")]
@@ -407,10 +441,9 @@ pub async fn get_routes_snapshot(
     // `load_routes()` reload that lands in that window is invisible to
     // this request: `notify_waiters()` only wakes waiters already armed
     // when it's called, so we'd then wait out the full
-    // `LONG_POLL_TIMEOUT` (25s) instead of returning almost immediately.
-    // `mark_deployment_complete`'s worker-apply gate only allows 10s, so
-    // any occurrence of this race causes a spurious deployment revert even
-    // though the worker is perfectly healthy.
+    // `LONG_POLL_TIMEOUT` (25s) instead of returning almost immediately,
+    // and `mark_deployment_complete`'s worker-apply gate would wait all that
+    // time on a perfectly healthy worker.
     let notifier = app_state.peer_table.generation_notifier();
     let armed = notifier.notified();
     tokio::pin!(armed);
@@ -672,7 +705,7 @@ pub async fn worker_route_policy(
         .one(db)
         .await
         .map_err(|source| ("load public-ingress request policy", source))?
-        .map(|row| temps_core::AppSettings::from_json(row.data))
+        .map(|row| temps_config::AppSettings::from_json(row.data))
         .unwrap_or_default();
     let ip_policy_count = ip_access_control::Entity::find()
         .count(db)
@@ -689,6 +722,9 @@ pub async fn worker_route_policy(
     let project_rate_limit_count = count_project_rate_limit_policies(db)
         .await
         .map_err(|source| ("inspect project rate-limit policies", source))?;
+    let project_edge_rule_count = count_enabled_project_edge_rules(db)
+        .await
+        .map_err(|source| ("inspect project edge rules", source))?;
     let registered_worker_addresses: std::collections::HashSet<std::net::IpAddr> =
         nodes::Entity::find()
             .filter(nodes::Column::Role.eq("worker"))
@@ -714,6 +750,9 @@ pub async fn worker_route_policy(
     }
     if project_ip_rule_count > 0 {
         blocking_policies.push("project IP access rules are configured".to_string());
+    }
+    if project_edge_rule_count > 0 {
+        blocking_policies.push("project edge rules are enabled".to_string());
     }
     if custom_request_policy {
         blocking_policies
@@ -1045,13 +1084,17 @@ pub(crate) async fn build_snapshot(
         tailnet_identity,
         runs_shield,
     } = capabilities;
-    let raw = state.peer_table.snapshot_internal_routes();
-    let mut routes = Vec::with_capacity(raw.len());
-    for (host, info) in raw {
-        if let Some(entry) = entry_from_route(host, &info) {
-            routes.push(entry);
-        }
-    }
+    let routes = internal_route_entries(
+        &state.peer_table,
+        state.db.as_ref(),
+        crate::internal_access_grants::SnapshotNode::Worker(node.id),
+    )
+    .await
+    .map_err(|source| SnapshotBuildError::Database {
+        node_id: node.id,
+        operation: "load internal access grants",
+        source,
+    })?;
     // A node running an ingress connector (ADR 058) serves public routes on
     // its loopback tunnel origin even without a public listener.
     let runs_connector = {
@@ -1498,6 +1541,33 @@ fn certificate_has_single_exact_dns_identity(certificate_pem: &str, expected: &s
         })
 }
 
+/// The internal routes an internal proxy serves: every `*.temps.local` route
+/// of `peer_table`, each with the callers from other projects its grants
+/// admit (ADR 101 D5).
+///
+/// One function for both consumers, so they cannot drift: the worker
+/// snapshot (`build_snapshot`) and the control plane's own internal proxy on
+/// a single-server install (ADR-104 D2), which applies the result to the same
+/// `RouteStore` a worker does.
+pub async fn internal_route_entries<C: sea_orm::ConnectionTrait>(
+    peer_table: &CachedPeerTable,
+    db: &C,
+    node: crate::internal_access_grants::SnapshotNode,
+) -> Result<Vec<RouteEntryDto>, sea_orm::DbErr> {
+    let raw = peer_table.snapshot_internal_routes();
+    let mut routes = Vec::with_capacity(raw.len());
+    for (host, info) in raw {
+        if let Some(entry) = entry_from_route(host, &info) {
+            routes.push(entry);
+        }
+    }
+    let grants = crate::internal_access_grants::load_live_grants(db).await?;
+    crate::internal_access_grants::attach_allowed_callers(&mut routes, &grants);
+    let sandbox_grants = crate::internal_access_grants::load_live_sandbox_grants(db, node).await?;
+    crate::internal_access_grants::attach_allowed_sandboxes(&mut routes, &sandbox_grants);
+    Ok(routes)
+}
+
 fn entry_from_route(host: String, info: &RouteInfo) -> Option<RouteEntryDto> {
     // Internal zone is always proxied to live containers; static-dir
     // routes don't make sense here and are skipped.
@@ -1520,6 +1590,8 @@ fn entry_from_route(host: String, info: &RouteInfo) -> Option<RouteEntryDto> {
         environment_id: info.environment.as_ref().map(|e| e.id),
         gate: None,
         shield: None,
+        allowed_callers: Vec::new(),
+        allowed_sandboxes: Vec::new(),
     })
 }
 
@@ -1549,7 +1621,7 @@ pub async fn authenticate_node(
                 format!("Node {} does not exist", node_id),
             )
         })?;
-    let token_hash = sha256_hash(&token);
+    let token_hash = sha256_hex(&token);
     if !constant_time_eq(node.token_hash.as_bytes(), token_hash.as_bytes()) {
         warn!(node_id, "Invalid route sync token");
         return Err((
@@ -1581,34 +1653,14 @@ fn extract_bearer_token(headers: &HeaderMap) -> Result<String, (StatusCode, Stri
     Ok(token.to_string())
 }
 
-fn sha256_hash(input: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(input.as_bytes());
-    hex::encode(hasher.finalize())
-}
-
-/// Constant-time equality for the SHA-256 token hash check.
-///
-/// Delegates to `subtle::ConstantTimeEq`, which is the same primitive used
-/// by Stripe webhook signature verification in `temps-revenue`. The hand-
-/// rolled XOR loop this replaced returned early on length mismatch — for
-/// fixed-length hashes (always 64 hex chars in our case) the practical
-/// risk was minimal, but the new impl removes the timing channel entirely
-/// and is also auditor-friendly (no DIY crypto).
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    use subtle::ConstantTimeEq;
-    a.ct_eq(b).into()
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use std::collections::HashSet;
     use std::sync::atomic::AtomicUsize;
 
     use sea_orm::{ActiveModelTrait, DatabaseBackend, DbErr, MockDatabase};
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::domains;
+    use temps_test_utils::TestDatabase;
 
     use super::*;
     use crate::route_table::BackendEntry;
@@ -1670,6 +1722,8 @@ pub(crate) mod tests {
             environment_id: None,
             gate: None,
             shield: None,
+            allowed_callers: Vec::new(),
+            allowed_sandboxes: Vec::new(),
         }
     }
 
@@ -1880,8 +1934,10 @@ pub(crate) mod tests {
             dns_resolver_consecutive_failures: 0,
             dns_resolver_last_error: None,
             dns_resolver_record_count: None,
+            deployments_without_resolver: None,
             build_limits: None,
             failover_at: None,
+            drain_requested_at: None,
             public_ingress_enabled,
             public_ingress_running: None,
             public_ingress_last_error: None,
@@ -1895,6 +1951,7 @@ pub(crate) mod tests {
             overlay_ready_cidr: None,
             overlay_remediation: None,
             overlay_network_name: None,
+            overlay_vxlan_vni: None,
             created_at: now,
             updated_at: now,
         }
@@ -1922,9 +1979,7 @@ pub(crate) mod tests {
             Ok(database) => database,
             Err(error)
                 if std::env::var_os("TEMPS_TEST_DATABASE_URL").is_none()
-                    && temps_database::test_utils::is_container_runtime_unavailable(
-                        &error.to_string(),
-                    ) =>
+                    && temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("skipping worker snapshot test: test database unavailable: {error}");
                 return Ok(());
@@ -1947,6 +2002,7 @@ pub(crate) mod tests {
             RouteInfo {
                 backend: BackendType::Upstream {
                     backends: vec![BackendEntry {
+                        pinned: None,
                         address: "192.0.2.7:32000".to_string(),
                         container_id: Some("worker-container".to_string()),
                         container_name: Some("worker-app".to_string()),
@@ -2176,6 +2232,41 @@ pub(crate) mod tests {
             .iter()
             .any(|reason| reason == "project IP access rules are configured"));
 
+        // Edge rules (ADR-089 §8) are evaluated on the control plane only. A
+        // disabled rule leaves the worker shortcut alone; an enabled one, even
+        // log-only, takes it away so the rule sees every request.
+        let set_edge_rule = |sql: &'static str| {
+            let db = test_db.db.clone();
+            async move {
+                use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+                db.execute(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    sql,
+                    [project_id.into()],
+                ))
+                .await
+            }
+        };
+        set_edge_rule("UPDATE project_ip_access_rules SET mode = 'disabled' WHERE project_id = $1")
+            .await?;
+        set_edge_rule(
+            "INSERT INTO project_edge_rules \
+               (project_id, position, name, enabled, mode, expression, action) \
+             VALUES ($1, 0, 'Log admin', false, 'log_only', \
+               '{\"combinator\":\"all\",\"children\":[]}'::jsonb, \
+               '{\"type\":\"log\"}'::jsonb)",
+        )
+        .await?;
+        assert_eq!(build_with_open_gate().await?.public_ingress.routes.len(), 1);
+        set_edge_rule("UPDATE project_edge_rules SET enabled = true WHERE project_id = $1").await?;
+        let edge_rule_snapshot = build_with_open_gate().await?;
+        assert!(edge_rule_snapshot.public_ingress.routes.is_empty());
+        assert!(edge_rule_snapshot
+            .public_ingress
+            .unsupported_reasons
+            .iter()
+            .any(|reason| reason == "project edge rules are enabled"));
+
         test_db.cleanup().await?;
         Ok(())
     }
@@ -2393,6 +2484,8 @@ mod gate_hold_back_tests {
                 access: None,
             }),
             shield: None,
+            allowed_callers: Vec::new(),
+            allowed_sandboxes: Vec::new(),
         }
     }
 

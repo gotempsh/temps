@@ -125,6 +125,16 @@ export function RunTrackingPanel({
             formatTime={formatTime}
           />
           <PhaseList view={view} />
+          {cancel === 'release' && run ? (
+            <Alert variant="warning">
+              <AlertTriangle className="h-4 w-4" />
+              <AlertTitle>The restore&apos;s outcome is unknown</AlertTitle>
+              <AlertDescription className="break-words">
+                {run.error_message ??
+                  'Temps cannot reach the worker node running this restore, so it keeps the database held until the node answers.'}
+              </AlertDescription>
+            </Alert>
+          ) : null}
           <RunOutcome view={view} />
         </CardContent>
       </Card>
@@ -203,11 +213,32 @@ export function RunTrackingPanel({
               {cancelling ? 'Cancelling…' : 'Cancel restore'}
             </Button>
           ) : null}
+          {cancel === 'release' ? (
+            <Button
+              variant="destructive"
+              onClick={onCancel}
+              disabled={cancelling}
+            >
+              {cancelling ? (
+                <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+              ) : (
+                <Ban className="h-4 w-4 mr-2" />
+              )}
+              {cancelling ? 'Releasing…' : 'Release the database'}
+            </Button>
+          ) : null}
         </div>
         {cancel === 'available' ? (
           <p className="text-sm text-muted-foreground">
             The restore has not changed any existing data yet, so it can be
             cancelled safely. A new database it was creating is removed.
+          </p>
+        ) : cancel === 'release' ? (
+          <p className="text-sm text-muted-foreground">
+            Releasing ends this restore without its outcome and lets new
+            restores of this database start. The database may be partially
+            restored, and if the node is only unreachable it may still be
+            restoring. Check the database on the node first.
           </p>
         ) : cancel === 'past_safe_point' && view.kind === 'tracking' ? (
           <p className="text-sm text-muted-foreground">

@@ -31,6 +31,7 @@ import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
+import { PageHeader } from '@/components/layout/PageContainer'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { cn } from '@/lib/utils'
 import { zodResolver } from '@hookform/resolvers/zod'
@@ -208,8 +209,8 @@ const PROVIDERS: ProviderInfo[] = [
 type WizardStep = 'provider' | 'info' | 'credentials'
 
 const STEPS: { id: WizardStep; label: string }[] = [
-  { id: 'provider', label: 'Select Provider' },
-  { id: 'info', label: 'Basic Information' },
+  { id: 'provider', label: 'Select provider' },
+  { id: 'info', label: 'Basic information' },
   { id: 'credentials', label: 'Credentials' },
 ]
 
@@ -450,12 +451,12 @@ export function AddDnsProvider() {
 
   useEffect(() => {
     setBreadcrumbs([
-      { label: 'DNS Providers', href: '/dns-providers' },
-      { label: 'Add Provider' },
+      { label: 'DNS providers', href: '/dns-providers' },
+      { label: 'Add provider' },
     ])
   }, [setBreadcrumbs])
 
-  usePageTitle('Add DNS Provider')
+  usePageTitle('Add DNS provider')
 
   const handleProviderSelect = (type: DnsProviderType) => {
     setProviderType(type)
@@ -981,7 +982,7 @@ export function AddDnsProvider() {
                 name="api_token"
                 render={({ field }) => (
                   <FormItem>
-                    <FormLabel>API Token</FormLabel>
+                    <FormLabel>API token</FormLabel>
                     <FormControl>
                       <Input
                         type="password"
@@ -1027,7 +1028,7 @@ export function AddDnsProvider() {
                 name="access_key_id"
                 render={({ field }) => (
                   <FormItem>
-                    <FormLabel>Access Key ID</FormLabel>
+                    <FormLabel>Access key ID</FormLabel>
                     <FormControl>
                       <Input placeholder="AKIAIOSFODNN7EXAMPLE" {...field} />
                     </FormControl>
@@ -1041,7 +1042,7 @@ export function AddDnsProvider() {
                 name="secret_access_key"
                 render={({ field }) => (
                   <FormItem>
-                    <FormLabel>Secret Access Key</FormLabel>
+                    <FormLabel>Secret access key</FormLabel>
                     <FormControl>
                       <Input
                         type="password"
@@ -1059,7 +1060,7 @@ export function AddDnsProvider() {
                 name="session_token"
                 render={({ field }) => (
                   <FormItem>
-                    <FormLabel>Session Token (optional)</FormLabel>
+                    <FormLabel>Session token (optional)</FormLabel>
                     <FormControl>
                       <Input
                         type="password"
@@ -1119,7 +1120,7 @@ export function AddDnsProvider() {
                 name="service_account_email"
                 render={({ field }) => (
                   <FormItem>
-                    <FormLabel>Service Account Email</FormLabel>
+                    <FormLabel>Service account email</FormLabel>
                     <FormControl>
                       <Input
                         type="email"
@@ -1137,7 +1138,7 @@ export function AddDnsProvider() {
                 name="private_key"
                 render={({ field }) => (
                   <FormItem>
-                    <FormLabel>Private Key</FormLabel>
+                    <FormLabel>Private key</FormLabel>
                     <FormControl>
                       <Textarea
                         placeholder="-----BEGIN PRIVATE KEY-----&#10;...&#10;-----END PRIVATE KEY-----"
@@ -1186,7 +1187,7 @@ export function AddDnsProvider() {
                 name="client_id"
                 render={({ field }) => (
                   <FormItem>
-                    <FormLabel>Client ID (Application ID)</FormLabel>
+                    <FormLabel>Client ID (application ID)</FormLabel>
                     <FormControl>
                       <Input
                         placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
@@ -1203,7 +1204,7 @@ export function AddDnsProvider() {
                 name="client_secret"
                 render={({ field }) => (
                   <FormItem>
-                    <FormLabel>Client Secret</FormLabel>
+                    <FormLabel>Client secret</FormLabel>
                     <FormControl>
                       <Input
                         type="password"
@@ -1238,7 +1239,7 @@ export function AddDnsProvider() {
                 name="resource_group"
                 render={({ field }) => (
                   <FormItem>
-                    <FormLabel>Resource Group</FormLabel>
+                    <FormLabel>Resource group</FormLabel>
                     <FormControl>
                       <Input placeholder="my-dns-resource-group" {...field} />
                     </FormControl>
@@ -1302,7 +1303,7 @@ export function AddDnsProvider() {
                 name="api_token"
                 render={({ field }) => (
                   <FormItem>
-                    <FormLabel>API Token</FormLabel>
+                    <FormLabel>API token</FormLabel>
                     <FormControl>
                       <Input
                         type="password"
@@ -1331,7 +1332,7 @@ export function AddDnsProvider() {
                 name="api_user"
                 render={({ field }) => (
                   <FormItem>
-                    <FormLabel>API User</FormLabel>
+                    <FormLabel>API user</FormLabel>
                     <FormControl>
                       <Input placeholder="Your Namecheap username" {...field} />
                     </FormControl>
@@ -1345,7 +1346,7 @@ export function AddDnsProvider() {
                 name="api_key"
                 render={({ field }) => (
                   <FormItem>
-                    <FormLabel>API Key</FormLabel>
+                    <FormLabel>API key</FormLabel>
                     <FormControl>
                       <Input
                         type="password"
@@ -1387,7 +1388,7 @@ export function AddDnsProvider() {
                 render={({ field }) => (
                   <FormItem className="flex flex-row items-center justify-between rounded-lg border p-4">
                     <div className="space-y-0.5">
-                      <FormLabel className="text-base">Sandbox Mode</FormLabel>
+                      <FormLabel className="text-base">Sandbox mode</FormLabel>
                       <FormDescription>
                         Use Namecheap sandbox environment for testing
                       </FormDescription>
@@ -1412,15 +1413,9 @@ export function AddDnsProvider() {
 
   return (
     <div className="flex-1 overflow-auto">
-      <div
-        className={cn(
-          'mx-auto space-y-6 p-4 sm:p-6',
-          currentStep === 'provider' ? 'max-w-5xl' : 'max-w-3xl'
-        )}
-        onKeyDown={handleEnterSubmit}
-      >
+      <div className="space-y-6 p-4 sm:p-6" onKeyDown={handleEnterSubmit}>
         {/* Header */}
-        <div className="flex items-center gap-4">
+        <div className="flex items-start gap-4">
           <Button
             aria-label="Back"
             variant="ghost"
@@ -1429,12 +1424,11 @@ export function AddDnsProvider() {
           >
             <ArrowLeft className="h-4 w-4" />
           </Button>
-          <div>
-            <h1 className="text-2xl font-bold">Add DNS Provider</h1>
-            <p className="text-muted-foreground">
-              Connect a DNS provider for automatic DNS record management
-            </p>
-          </div>
+          <PageHeader
+            className="min-w-0 flex-1"
+            title="Add DNS provider"
+            description="Connect a DNS provider for automatic DNS record management"
+          />
         </div>
 
         {/* Step Indicator */}
@@ -1444,7 +1438,7 @@ export function AddDnsProvider() {
         {currentStep === 'provider' && (
           <Card>
             <CardHeader>
-              <CardTitle>Select Provider</CardTitle>
+              <CardTitle>Select provider</CardTitle>
               <CardDescription>
                 Choose your DNS provider to get started
               </CardDescription>
@@ -1490,7 +1484,7 @@ export function AddDnsProvider() {
                   <selectedProvider.icon className="h-5 w-5" />
                 </div>
                 <div>
-                  <CardTitle>Basic Information</CardTitle>
+                  <CardTitle>Basic information</CardTitle>
                   <CardDescription>
                     Give your {selectedProvider.name} provider a name to
                     identify it
@@ -1559,7 +1553,7 @@ export function AddDnsProvider() {
               {createProviderMut.isPending && (
                 <Loader2 className="mr-2 h-4 w-4 animate-spin" />
               )}
-              Create Provider
+              Create provider
             </Button>
           ) : (
             <Button

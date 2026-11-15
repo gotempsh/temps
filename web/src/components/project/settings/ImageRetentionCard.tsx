@@ -15,15 +15,16 @@ import {
 import {
   Form,
   FormControl,
-  FormDescription,
   FormField,
   FormItem,
   FormLabel,
+  FormMessage,
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation } from '@tanstack/react-query'
-import { useForm, useWatch } from 'react-hook-form'
+import { Loader2 } from 'lucide-react'
+import { useForm, useFormState, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
 import { z } from 'zod'
 
@@ -68,6 +69,7 @@ export function ImageRetentionCard({
     },
   })
 
+  const { isDirty } = useFormState({ control: form.control })
   const retentionInput = useWatch({
     control: form.control,
     name: 'imageRetentionHours',
@@ -78,33 +80,35 @@ export function ImageRetentionCard({
   const handleSave = async (values: FormValues) => {
     if (!project?.id) return
     const trimmed = values.imageRetentionHours.trim()
-    await toast.promise(
-      updateProjectSettings.mutateAsync({
-        path: { project_id: project.id! },
+    // `toast.promise` returns a toast handle, not the request: await the
+    // mutation itself so the refetch sees the saved value.
+    try {
+      await updateProjectSettings.mutateAsync({
+        path: { project_id: project.id },
         body: {
           // Explicit null clears the override back to the system default.
           image_retention_hours: trimmed === '' ? null : parseInt(trimmed, 10),
         },
-      }),
-      {
-        loading: 'Updating image retention...',
-        success: 'Image retention updated successfully',
-      }
-    )
+      })
+    } catch {
+      // The mutation's errorTitle already explains the failure.
+      return
+    }
+    form.reset(values)
+    toast.success('Image retention saved')
     refetch()
   }
 
   return (
     <Form {...form}>
       <form onSubmit={form.handleSubmit(handleSave)}>
-        <Card className="bg-background text-foreground">
+        <Card id="setting-image-retention" className="scroll-mt-4">
           <CardHeader>
-            <CardTitle>Built Image Retention</CardTitle>
+            <CardTitle>Image retention</CardTitle>
             <CardDescription>
-              How long this service&apos;s built Docker images are kept before
-              the nightly cleanup removes them. Rolling back or promoting a
-              deployment requires its image, so this is effectively the
-              service&apos;s rollback window.
+              How long built images are kept before the nightly cleanup removes
+              them. Rolling back or promoting a deployment needs its image, so
+              this is the rollback window.
             </CardDescription>
           </CardHeader>
           <CardContent>
@@ -124,10 +128,7 @@ export function ImageRetentionCard({
                       {...field}
                     />
                   </FormControl>
-                  <FormDescription>
-                    Leave blank to use the system-wide default configured in
-                    Settings. Min 1 hour, max 8760 (one year).
-                  </FormDescription>
+                  <FormMessage />
                 </FormItem>
               )}
             />
@@ -139,8 +140,18 @@ export function ImageRetentionCard({
             )}
           </CardContent>
           <CardFooter>
-            <Button type="submit" disabled={updateProjectSettings.isPending}>
-              Save Retention
+            <p>
+              Leave it blank for the system default. 1 to 8760 hours (one year).
+            </p>
+            <Button
+              type="submit"
+              size="sm"
+              disabled={!isDirty || updateProjectSettings.isPending}
+            >
+              {updateProjectSettings.isPending && (
+                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+              )}
+              Save
             </Button>
           </CardFooter>
         </Card>

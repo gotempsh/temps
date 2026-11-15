@@ -3,6 +3,7 @@
 
 import { describe, expect, test } from 'bun:test'
 import {
+  joinIngressUnavailable,
   joinIngressFlag,
   privateIngressSummary,
   workerIngressStatus,
@@ -147,5 +148,23 @@ describe('private ingress (ADR 064 D5)', () => {
       })
     ).toContain('Start Tailscale')
     expect(privateIngressSummary({ mode: 'delegated' })).toBeNull()
+  })
+})
+
+describe('join ingress on a Mac (ADR 090)', () => {
+  test('a Mac cannot listen on its main address or on Tailscale', () => {
+    expect(joinIngressUnavailable('macos', 'fixed')).toContain('80 and 443')
+    expect(joinIngressUnavailable('macos', 'private')).toContain('tailscale0')
+  })
+
+  test('a Mac can be managed from the console or take no traffic', () => {
+    expect(joinIngressUnavailable('macos', 'delegated')).toBeNull()
+    expect(joinIngressUnavailable('macos', 'off')).toBeNull()
+  })
+
+  test('Linux workers keep every choice', () => {
+    for (const choice of ['off', 'delegated', 'fixed', 'private'] as const) {
+      expect(joinIngressUnavailable('linux', choice)).toBeNull()
+    }
   })
 })

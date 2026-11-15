@@ -74,7 +74,7 @@ import { Globe, Plus, Trash2 } from 'lucide-react'
 import { type ReactNode, useEffect, useState } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
 import { Link } from 'react-router'
-import { RecordLink } from '@temps-sdk/ds'
+import { RecordLink, RecordRow } from '@temps-sdk/ds'
 import { toast } from 'sonner'
 import { z } from 'zod'
 
@@ -370,7 +370,7 @@ export default function DeliveryProfiles() {
             }
           >
             {rows.map((profile) => (
-              <TableRow key={profile.id}>
+              <RecordRow key={profile.id}>
                 <TableCell>
                   <div className="flex min-w-0 items-center gap-3">
                     {profile.provider_kind === 'cloudflare' ? (
@@ -428,7 +428,7 @@ export default function DeliveryProfiles() {
                     <Trash2 className="size-4" />
                   </Button>
                 </TableCell>
-              </TableRow>
+              </RecordRow>
             ))}
           </ProfilesTable>
         ) : profiles.data ? (

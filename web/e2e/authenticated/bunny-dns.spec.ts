@@ -102,7 +102,7 @@ test('Bunny DNS creation submits credentials and opens masked details', async ({
     await r.fulfill({ status: 201, json: provider })
   })
   await wizard(page)
-  await page.getByRole('button', { name: 'Create Provider' }).click()
+  await page.getByRole('button', { name: 'Create provider' }).click()
   await expect(page).toHaveURL(/\/dns-providers\/84$/)
   expect(payload).toEqual({
     name: provider.name,
@@ -130,7 +130,7 @@ test('rejected Bunny credentials show the actual error without success', async (
         })
   )
   await wizard(page)
-  await page.getByRole('button', { name: 'Create Provider' }).click()
+  await page.getByRole('button', { name: 'Create provider' }).click()
   await expect(
     page.getByRole('alert').filter({ hasText: 'Bunny API key rejected' })
   ).toBeVisible()
@@ -299,8 +299,9 @@ test('delivery setup selects Bunny DNS and Bunny CDN independently using the des
   await expect(
     page.getByRole('heading', { name: 'No domains configured yet' })
   ).toBeVisible()
+  // The page header and the empty state both offer it (DESIGN.md).
   await expect(
-    page.getByRole('button', { name: /^Add domain/ })
+    page.getByRole('button', { name: /^Add domain/ }).first()
   ).toBeVisible()
   const settings = page.getByRole('button', { name: 'DNS and CDN settings' })
   await expect(settings).toHaveAttribute('aria-expanded', 'false')

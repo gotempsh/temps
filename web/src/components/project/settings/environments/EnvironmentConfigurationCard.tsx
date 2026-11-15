@@ -1,4 +1,11 @@
 import { SettingsSection } from '@/components/ui/settings-section'
+import {
+  DEFAULT_STOP_TIMEOUT_SECONDS,
+  MAX_STOP_TIMEOUT_SECONDS,
+  MIN_STOP_TIMEOUT_SECONDS,
+  stopTimeoutProblem,
+  stopTimeoutSeconds,
+} from '@/lib/deployment-stop-timeout'
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
@@ -9,6 +16,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import type { NodeInfoResponse } from '@/api/client/types.gen'
 import { BranchSelector } from '@/components/deployments/BranchSelector'
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
@@ -20,6 +28,7 @@ import {
   targetLabelsToPayload,
   targetNodesToPayload,
 } from '@/lib/environment-placement'
+import { ComposePlacementPanel } from './ComposePlacementPanel'
 import { projectHasGitRepo } from '@/lib/project-git'
 import {
   environmentShieldModeToPayload,
@@ -49,10 +58,11 @@ import {
 } from '@/components/ui/select'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import {
+  AlertTriangle,
   Clock,
   Cpu,
-  GitBranch,
   Gauge,
+  GitBranch,
   Hammer,
   KeyRound,
   Loader2,
@@ -161,6 +171,8 @@ export function EnvironmentConfigurationCard({
       environment.deployment_config?.wakeTimeoutSeconds?.toString() ?? '30',
     request_timeout_seconds:
       environment.deployment_config?.requestTimeoutSeconds?.toString() ?? '',
+    stop_timeout_seconds:
+      environment.deployment_config?.stopTimeoutSeconds?.toString() ?? '',
     sse_idle_timeout_seconds:
       environment.deployment_config?.sseIdleTimeoutSeconds?.toString() ?? '',
     websocket_idle_timeout_seconds:
@@ -235,6 +247,8 @@ export function EnvironmentConfigurationCard({
         environment.deployment_config?.wakeTimeoutSeconds?.toString() ?? '30',
       request_timeout_seconds:
         environment.deployment_config?.requestTimeoutSeconds?.toString() ?? '',
+      stop_timeout_seconds:
+        environment.deployment_config?.stopTimeoutSeconds?.toString() ?? '',
       sse_idle_timeout_seconds:
         environment.deployment_config?.sseIdleTimeoutSeconds?.toString() ?? '',
       websocket_idle_timeout_seconds:
@@ -282,13 +296,17 @@ export function EnvironmentConfigurationCard({
     meta: {
       errorTitle: 'Failed to update environment configuration',
     },
-    onSuccess: () => {
+    onSuccess: (updated) => {
       toast.success('Environment configuration updated successfully')
+      if (updated.placement_warning) {
+        toast.warning(updated.placement_warning)
+      }
       onUpdate()
     },
   })
 
   const [exemptPathsError, setExemptPathsError] = useState<string | null>(null)
+  const [stopTimeoutError, setStopTimeoutError] = useState<string | null>(null)
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -297,6 +315,12 @@ export function EnvironmentConfigurationCard({
     const exemptProblem = validateExemptPaths(exemptPaths)
     setExemptPathsError(exemptProblem)
     if (exemptProblem) return
+    const stopTimeoutError = stopTimeoutProblem(formData.stop_timeout_seconds)
+    setStopTimeoutError(stopTimeoutError)
+    if (stopTimeoutError) {
+      toast.error('Check the stop timeout', { description: stopTimeoutError })
+      return
+    }
 
     updateEnvironmentSettings.mutateAsync({
       path: {
@@ -359,6 +383,9 @@ export function EnvironmentConfigurationCard({
         // the override (inherit service/global default, itself unlimited by
         // default), "0" is a valid, distinct override meaning "explicitly
         // unlimited for this environment."
+        // Blank sends null, which clears the override so the environment
+        // follows the project (or the 10-second default).
+        stop_timeout_seconds: stopTimeoutSeconds(formData.stop_timeout_seconds),
         max_concurrent_connections: formData.max_concurrent_connections
           ? parseInt(formData.max_concurrent_connections)
           : null,
@@ -375,6 +402,17 @@ export function EnvironmentConfigurationCard({
   }
 
   const hasGitRepo = projectHasGitRepo(project)
+  const isComposeProject = project.preset === 'docker-compose'
+  const composePlacementPanel = (
+    <ComposePlacementPanel
+      projectId={project.id}
+      environmentId={environment.id}
+      nodes={activeNodes}
+      nodesLoaded={nodesQuery.isSuccess}
+      nodesError={nodesQuery.error}
+      onRetryNodes={() => void nodesQuery.refetch()}
+    />
+  )
 
   return (
     <form onSubmit={handleSubmit}>
@@ -384,9 +422,13 @@ export function EnvironmentConfigurationCard({
                 no branch to deploy from and no repository to push to, so both
                 controls here are inapplicable rather than unconfigured. */}
         {hasGitRepo && (
-          <SettingsSection title="Git & deployments" icon={GitBranch}>
+          <SettingsSection
+            id="setting-environment-git"
+            title="Git & deployments"
+            icon={GitBranch}
+          >
             <div>
-              <Label>Branch Name</Label>
+              <Label>Branch name</Label>
               <div className="mt-2">
                 <BranchSelector
                   repoOwner={project.repo_owner || ''}
@@ -433,10 +475,14 @@ export function EnvironmentConfigurationCard({
         )}
 
         {/* CPU Resources */}
-        <SettingsSection title="Compute resources" icon={Cpu}>
+        <SettingsSection
+          id="setting-environment-resources"
+          title="Compute resources"
+          icon={Cpu}
+        >
           <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
             <div className="space-y-4">
-              <h3 className="text-sm font-medium">CPU Resources</h3>
+              <h3 className="text-sm font-medium">CPU resources</h3>
               <div className="space-y-4">
                 <div>
                   <Label>CPU Request (cores)</Label>
@@ -496,7 +542,7 @@ export function EnvironmentConfigurationCard({
 
             {/* Memory Resources */}
             <div className="space-y-4">
-              <h3 className="text-sm font-medium">Memory Resources</h3>
+              <h3 className="text-sm font-medium">Memory resources</h3>
               <div className="space-y-4">
                 <div>
                   <Label>Memory Request (MB)</Label>
@@ -575,7 +621,11 @@ export function EnvironmentConfigurationCard({
         </SettingsSection>
 
         {/* Scaling & Network */}
-        <SettingsSection title="Scaling" icon={Network}>
+        <SettingsSection
+          id="setting-environment-scaling"
+          title="Scaling"
+          icon={Network}
+        >
           <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
             <div>
               <Label>Replicas</Label>
@@ -603,7 +653,11 @@ export function EnvironmentConfigurationCard({
         </SettingsSection>
 
         {/* On-Demand (Scale-to-Zero) */}
-        <SettingsSection title="Scale to zero" icon={Moon}>
+        <SettingsSection
+          id="setting-environment-scale-to-zero"
+          title="Scale to zero"
+          icon={Moon}
+        >
           <div className="space-y-4">
             <div className="flex items-start sm:items-center gap-3 p-3 border rounded-lg">
               <div className="flex-1 min-w-0">
@@ -682,7 +736,11 @@ export function EnvironmentConfigurationCard({
         </SettingsSection>
 
         {/* Request Timeouts */}
-        <SettingsSection title="Request timeouts" icon={Clock}>
+        <SettingsSection
+          id="setting-environment-timeouts"
+          title="Request timeouts"
+          icon={Clock}
+        >
           <p className="text-xs text-muted-foreground mb-4">
             Override the global request timeout defaults for this environment.
             Leave blank to inherit the service/global default (no timeout,
@@ -742,8 +800,49 @@ export function EnvironmentConfigurationCard({
           </div>
         </SettingsSection>
 
+        <SettingsSection
+          id="setting-environment-stop-timeout"
+          title="Stop timeout"
+          icon={Clock}
+        >
+          <p className="text-xs text-muted-foreground mb-4">
+            How long this environment&apos;s previous deployment gets to finish
+            in-flight work after SIGTERM, before it is killed, when a new
+            deployment replaces it. Leave blank to follow the project (default{' '}
+            {DEFAULT_STOP_TIMEOUT_SECONDS} seconds).
+          </p>
+          <div className="w-full sm:w-[200px]">
+            <Label htmlFor="environment-stop-timeout">Seconds</Label>
+            <Input
+              id="environment-stop-timeout"
+              type="number"
+              min={MIN_STOP_TIMEOUT_SECONDS}
+              max={MAX_STOP_TIMEOUT_SECONDS}
+              value={formData.stop_timeout_seconds}
+              aria-invalid={stopTimeoutError !== null}
+              onChange={(e) => {
+                setStopTimeoutError(null)
+                setFormData((prev) => ({
+                  ...prev,
+                  stop_timeout_seconds: e.target.value,
+                }))
+              }}
+              placeholder="Inherit"
+            />
+            {stopTimeoutError && (
+              <p className="mt-1 text-xs text-destructive">
+                {stopTimeoutError}
+              </p>
+            )}
+          </div>
+        </SettingsSection>
+
         {/* Concurrent Connection Limit */}
-        <SettingsSection title="Connection limits" icon={Gauge}>
+        <SettingsSection
+          id="setting-environment-connection-limits"
+          title="Connection limits"
+          icon={Gauge}
+        >
           <p className="text-xs text-muted-foreground mb-4">
             Cap on concurrent in-flight requests to this environment&apos;s
             upstream. Protects the proxy&apos;s own connection budget from a
@@ -772,7 +871,11 @@ export function EnvironmentConfigurationCard({
 
         {/* Build location: always visible so operators learn builds can
             move off the control plane, even before a worker has joined. */}
-        <SettingsSection title="Builds" icon={Hammer}>
+        <SettingsSection
+          id="setting-environment-builds"
+          title="Builds"
+          icon={Hammer}
+        >
           <div className="space-y-2">
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
               <div className="flex-1 min-w-0">
@@ -819,7 +922,7 @@ export function EnvironmentConfigurationCard({
             <p className="text-xs text-muted-foreground">
               A node labelled <code>temps.sh/role=builder</code> is preferred. A{' '}
               <code>temps.sh/role=dedicated</code> node builds only for
-              environments that select it in Target Nodes. When no worker can
+              environments that select it in Target nodes. When no worker can
               take a build, it runs on the control plane when local builds are
               enabled, and the build log says why. CI uses the configured GitHub
               Actions runner and never falls back locally.{' '}
@@ -851,9 +954,32 @@ export function EnvironmentConfigurationCard({
           </div>
         </SettingsSection>
 
+        {/* A Compose stack's placement stays visible when no worker is
+            active, or the node list failed to load: the stack still lives
+            somewhere, possibly on a node that just went offline. */}
+        {isComposeProject && activeNodes.length === 0 && (
+          <SettingsSection title="Compose stack placement" icon={Network}>
+            {composePlacementPanel}
+          </SettingsSection>
+        )}
+
+        {/* Outside node scheduling, which is hidden with no active worker: a
+            single-node install, or a failed node list, still needs this. */}
+        {environment.placement_warning && (
+          <Alert>
+            <AlertTriangle className="h-4 w-4" aria-hidden="true" />
+            <AlertTitle>Replicas can&apos;t spread as configured</AlertTitle>
+            <AlertDescription>{environment.placement_warning}</AlertDescription>
+          </Alert>
+        )}
+
         {/* Node Scheduling */}
         {activeNodes.length > 0 && (
-          <SettingsSection title="Node scheduling" icon={Network}>
+          <SettingsSection
+            id="setting-environment-node-scheduling"
+            title="Node scheduling"
+            icon={Network}
+          >
             <div className="space-y-4">
               {/* Protected environment toggle */}
               <div className="flex items-start sm:items-center gap-3 p-3 border rounded-lg">
@@ -907,12 +1033,17 @@ export function EnvironmentConfigurationCard({
                 />
               </div>
 
-              {/* Target Nodes */}
+              {/* Target nodes */}
               <div>
-                <Label className="text-sm font-medium">Target Nodes</Label>
+                <Label className="text-sm font-medium">Target nodes</Label>
                 <p className="text-xs text-muted-foreground mb-2">
-                  {targetNodesHint(activeNodes)}
+                  {isComposeProject
+                    ? 'Choose where this Compose stack first runs. After its first deployment it stays on that node, because its volumes live there.'
+                    : targetNodesHint(activeNodes)}
                 </p>
+                {isComposeProject && (
+                  <div className="mb-2">{composePlacementPanel}</div>
+                )}
                 <div className="space-y-2">
                   {activeNodes.map((node) => {
                     const isSelected = formData.target_nodes.includes(node.id)
@@ -982,11 +1113,11 @@ export function EnvironmentConfigurationCard({
 
               {/* Target Labels */}
               <div>
-                <Label className="text-sm font-medium">Label Selectors</Label>
+                <Label className="text-sm font-medium">Label selectors</Label>
                 <p className="text-xs text-muted-foreground mb-2">
                   Only deploy to nodes matching these labels. All keys must
                   match (AND logic). Labels never select a dedicated node; pick
-                  it in Target Nodes instead.
+                  it in Target nodes instead.
                 </p>
 
                 {/* Existing labels */}
@@ -1064,7 +1195,11 @@ export function EnvironmentConfigurationCard({
         )}
 
         {/* Security Configuration */}
-        <SettingsSection title="Security" icon={Shield}>
+        <SettingsSection
+          id="setting-environment-security"
+          title="Security"
+          icon={Shield}
+        >
           <div className="space-y-4">
             <div className="space-y-3 p-3 border rounded-lg">
               <div className="flex items-start sm:items-center gap-3">
@@ -1185,7 +1320,7 @@ export function EnvironmentConfigurationCard({
                   htmlFor="env-security-headers"
                   className="text-sm font-medium"
                 >
-                  Security Headers
+                  Security headers
                 </Label>
                 <p className="text-xs text-muted-foreground">
                   Enable security headers
@@ -1209,7 +1344,7 @@ export function EnvironmentConfigurationCard({
             {formData.security?.enabled && (
               <div className="space-y-4 p-4 border rounded-lg bg-muted/30">
                 <div>
-                  <Label>Header Preset</Label>
+                  <Label>Header preset</Label>
                   <Select
                     value={formData.security?.headers?.preset ?? ''}
                     onValueChange={(value) =>
@@ -1249,7 +1384,7 @@ export function EnvironmentConfigurationCard({
                   className="text-sm font-medium flex items-center gap-1.5"
                 >
                   <KeyRound className="h-4 w-4 shrink-0" />
-                  Password Protection
+                  Password protection
                 </Label>
                 <p className="text-xs text-muted-foreground">
                   Require a password to access this environment.
@@ -1299,10 +1434,10 @@ export function EnvironmentConfigurationCard({
             )}
 
             <div className="space-y-4 p-4 border rounded-lg">
-              <h4 className="text-sm font-medium">Rate Limiting</h4>
+              <h4 className="text-sm font-medium">Rate limiting</h4>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div>
-                  <Label>Max Requests Per Minute</Label>
+                  <Label>Max requests per minute</Label>
                   <Input
                     type="number"
                     value={
@@ -1327,7 +1462,7 @@ export function EnvironmentConfigurationCard({
                   />
                 </div>
                 <div>
-                  <Label>Max Requests Per Hour</Label>
+                  <Label>Max requests per hour</Label>
                   <Input
                     type="number"
                     value={

@@ -32,14 +32,15 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use temps_vm_agent::logging::{self, Level};
 use temps_vm_agent::mounts::{MountArgs, MountError};
+use temps_vm_agent::restart::RestartBackoff;
+use temps_vm_agent::stats;
+use temps_vm_agent::supervisor::{ProcessSpec, Supervision, DEFAULT_PATH};
+use temps_vm_agent::workload_log::{self, read_tail, LogLimits, LogPipeline, RotatingLog};
 use temps_vm_agent::{
-    read_frame, relay, write_frame, Request, Response, AGENT_PORT, MAX_PTY_RELAYS, PTY_AGENT_BIN,
+    read_frame, relay, write_frame, Request, Response, SpawnRestartPolicy, AGENT_PORT,
+    DEFAULT_SPAWN_LOG, MAX_PTY_RELAYS, MAX_READ_LOG_LINES, MAX_SPAWNED_PROCESSES, PTY_AGENT_BIN,
     PTY_AGENT_SOCKET, PTY_PORT, WORK_DIR,
 };
-
-/// `PATH` for processes this agent starts: PID 1's own environment is empty
-/// and guest images vary, so every child gets the same sane default.
-const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 /// Pause between PTY agent restarts, so a binary that dies at once cannot
 /// turn PID 1 into a hot loop.
@@ -90,8 +91,24 @@ const BOOT_MOUNTS: &[MountSpec] = &[
         "devpts",
         Some("mode=0620,ptmxmode=0666"),
     ),
+    // Container images expect a writable `/dev/shm`; size it like Docker's
+    // default so a guest cannot fill half its RAM through it.
+    ("tmpfs", "/dev/shm", "tmpfs", Some("mode=1777,size=65536k")),
     ("tmpfs", "/tmp", "tmpfs", None),
     ("tmpfs", "/run", "tmpfs", None),
+];
+
+/// Symlinks every container runtime creates in `/dev` and devtmpfs does not.
+///
+/// Images log by pointing files at these (nginx's `access.log` is a link to
+/// `/dev/stdout`). Without them the link dangles, the first open creates a
+/// regular file at `/dev/stdout`, and the workload's output never reaches its
+/// log stream.
+const DEV_LINKS: &[(&str, &str)] = &[
+    ("/proc/self/fd", "/dev/fd"),
+    ("/proc/self/fd/0", "/dev/stdin"),
+    ("/proc/self/fd/1", "/dev/stdout"),
+    ("/proc/self/fd/2", "/dev/stderr"),
 ];
 
 /// Minimal boot-time setup when running as PID 1.
@@ -111,6 +128,20 @@ fn setup_system() {
                     ("error", json!(e.to_string())),
                 ],
             );
+        }
+    }
+    for (target, link) in DEV_LINKS {
+        match std::os::unix::fs::symlink(target, link) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => warn(
+                "dev_link_failed",
+                &[
+                    ("link", json!(link)),
+                    ("target", json!(target)),
+                    ("error", json!(e.to_string())),
+                ],
+            ),
         }
     }
     unsafe {
@@ -547,6 +578,10 @@ fn handle_connection(mut stream: UnixStream) {
     };
 
     let shutdown = matches!(request, Request::Shutdown);
+    if shutdown {
+        // A deliberate stop: nothing is restarted on its way down.
+        stop_all_supervised();
+    }
     let response = handle_request(request);
     respond(&mut stream, &response);
 
@@ -602,6 +637,226 @@ fn handle_request(request: Request) -> Response {
             }
         }
         Request::Kill { pattern, signal } => kill_matching(&pattern, signal),
+        Request::Spawn {
+            cmd,
+            env,
+            cwd,
+            uid,
+            gid,
+            log_path,
+            restart,
+            log_max_bytes,
+            log_max_files,
+            limits,
+        } => spawn(SpawnArgs {
+            cmd,
+            env,
+            cwd,
+            uid,
+            gid,
+            log_path,
+            restart,
+            log_limits: LogLimits::from_request(log_max_bytes, log_max_files),
+            limits,
+        }),
+        Request::ProcessStatus { pid } => process_status(pid),
+        Request::ReadLog { path, tail_lines } => read_log(path, tail_lines),
+        Request::ReadLogSince {
+            path,
+            cursor,
+            max_bytes,
+            include_partial,
+        } => read_log_since(path, cursor, max_bytes, include_partial),
+        Request::ReadStats { pid } => read_stats(pid),
+    }
+}
+
+// ── Spawn (a workload's main process) ───────────────────────────────────
+
+/// Processes started by [`spawn`], each under a [`Supervision`] that reaps
+/// it, restarts it per its policy and bounds its log. Bounded by
+/// [`MAX_SPAWNED_PROCESSES`].
+static SPAWNED: std::sync::Mutex<Vec<Supervision>> = std::sync::Mutex::new(Vec::new());
+
+/// The process table; plain data, usable whatever a panicking holder did.
+fn spawned_table() -> std::sync::MutexGuard<'static, Vec<Supervision>> {
+    SPAWNED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// A deliberate shutdown: no supervised process may be restarted between
+/// the acknowledgement and the reboot.
+fn stop_all_supervised() {
+    for supervision in spawned_table().iter() {
+        supervision.mark_stopped();
+    }
+}
+
+struct SpawnArgs {
+    cmd: Vec<String>,
+    env: HashMap<String, String>,
+    cwd: Option<String>,
+    uid: Option<u32>,
+    gid: Option<u32>,
+    log_path: Option<String>,
+    restart: SpawnRestartPolicy,
+    log_limits: LogLimits,
+    limits: temps_vm_agent::SpawnLimits,
+}
+
+fn spawn(args: SpawnArgs) -> Response {
+    let Some(program) = args.cmd.first().cloned() else {
+        return Response::Err {
+            message: "spawn: empty command".to_string(),
+        };
+    };
+    let mut spawned = spawned_table();
+    // Forget supervisions that ended: nothing of theirs runs any more.
+    spawned.retain(|supervision| !supervision.is_finished());
+    if spawned.len() >= MAX_SPAWNED_PROCESSES {
+        return Response::Err {
+            message: format!(
+                "spawn {program}: {} processes already run (limit {MAX_SPAWNED_PROCESSES})",
+                spawned.len(),
+            ),
+        };
+    }
+    let log_path = args
+        .log_path
+        .unwrap_or_else(|| DEFAULT_SPAWN_LOG.to_string());
+    let log = match RotatingLog::open(&log_path, args.log_limits) {
+        Ok(log) => log,
+        Err(e) => {
+            return Response::Err {
+                message: format!("spawn {program}: open log {log_path}: {e}"),
+            }
+        }
+    };
+    let error_path = log_path.clone();
+    let pipeline = match LogPipeline::start(log, move |e: &std::io::Error| {
+        warn(
+            "workload_log_write_failed",
+            &[("path", json!(error_path)), ("error", json!(e.to_string()))],
+        );
+    }) {
+        Ok(pipeline) => pipeline,
+        Err(e) => {
+            return Response::Err {
+                message: format!("spawn {program}: start the log writer for {log_path}: {e}"),
+            }
+        }
+    };
+    let spec = ProcessSpec {
+        cmd: args.cmd,
+        env: args.env,
+        cwd: args.cwd.unwrap_or_else(|| "/".to_string()),
+        uid: args.uid,
+        gid: args.gid,
+        limits: args.limits,
+    };
+    match Supervision::start(spec, args.restart, RestartBackoff::default(), pipeline) {
+        Ok(supervision) => {
+            let pid = supervision.id();
+            spawned.push(supervision);
+            info(
+                "spawned",
+                &[
+                    ("pid", json!(pid)),
+                    ("cmd", json!(program)),
+                    ("restart", json!(args.restart)),
+                    ("log_path", json!(log_path)),
+                    ("log_max_bytes", json!(args.log_limits.max_bytes)),
+                    ("log_max_files", json!(args.log_limits.max_files)),
+                ],
+            );
+            Response::Spawned { pid }
+        }
+        Err(e) => Response::Err {
+            message: e.to_string(),
+        },
+    }
+}
+
+fn process_status(pid: u32) -> Response {
+    let spawned = spawned_table();
+    // Newest first: a pid number can be reused by a later spawn.
+    let Some(supervision) = spawned.iter().rev().find(|s| s.matches(pid)) else {
+        return Response::Err {
+            message: format!("process status: pid {pid} was not started by spawn"),
+        };
+    };
+    let status = supervision.status();
+    Response::ProcessStatus {
+        running: status.running(),
+        exit_code: if status.running() {
+            None
+        } else {
+            status.last_exit
+        },
+        restart_count: status.restart_count,
+        restarting: status.restarting,
+    }
+}
+
+fn read_log_since(
+    path: Option<String>,
+    cursor: Option<temps_vm_agent::LogCursor>,
+    max_bytes: Option<u32>,
+    include_partial: bool,
+) -> Response {
+    let path = path.unwrap_or_else(|| DEFAULT_SPAWN_LOG.to_string());
+    let limit = max_bytes
+        .unwrap_or(temps_vm_agent::DEFAULT_LOG_CHUNK_BYTES)
+        .clamp(1, temps_vm_agent::MAX_LOG_CHUNK_BYTES) as usize;
+    match workload_log::read_since(Path::new(&path), cursor, limit, include_partial) {
+        Ok(read) => Response::LogChunk {
+            data: String::from_utf8_lossy(&read.data).into_owned(),
+            cursor: read.cursor,
+            skipped: read.skipped,
+            more: read.more,
+        },
+        Err(e) => Response::Err {
+            message: format!("read log {path}: {e}"),
+        },
+    }
+}
+
+/// Sample the guest. With a `pid`, CPU and memory are those of the tree of
+/// the process spawn started as that pid, rooted at its *current* process (the
+/// supervised pid changes when it restarts); a process that is down between
+/// restarts reports an empty tree rather than the whole VM.
+fn read_stats(pid: Option<u32>) -> Response {
+    let root = match pid {
+        None => None,
+        Some(pid) => {
+            let spawned = spawned_table();
+            let Some(supervision) = spawned.iter().rev().find(|s| s.matches(pid)) else {
+                return Response::Err {
+                    message: format!("read stats: pid {pid} was not started by spawn"),
+                };
+            };
+            // No live pid: a root no process has, so the tree is empty.
+            Some(supervision.status().current_pid.unwrap_or(0))
+        }
+    };
+    Response::Stats(stats::collect(
+        Path::new("/proc"),
+        root,
+        stats::ProcUnits::from_system(),
+    ))
+}
+
+fn read_log(path: Option<String>, tail_lines: u32) -> Response {
+    let path = path.unwrap_or_else(|| DEFAULT_SPAWN_LOG.to_string());
+    let lines = tail_lines.min(MAX_READ_LOG_LINES) as usize;
+    match read_tail(Path::new(&path), lines) {
+        Ok(bytes) => Response::Log {
+            data: String::from_utf8_lossy(&bytes).into_owned(),
+        },
+        Err(e) => Response::Err {
+            message: format!("read log {path}: {e}"),
+        },
     }
 }
 
@@ -655,8 +910,14 @@ fn exec(
     };
 
     // Drain both pipes on threads so neither side can fill and deadlock.
-    let mut stdout_pipe = child.stdout.take().expect("stdout piped");
-    let mut stderr_pipe = child.stderr.take().expect("stderr piped");
+    let (Some(mut stdout_pipe), Some(mut stderr_pipe)) = (child.stdout.take(), child.stderr.take())
+    else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Response::Err {
+            message: format!("spawn {}: stdout/stderr pipes were not captured", cmd[0]),
+        };
+    };
     let stdout_thread = std::thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = stdout_pipe.read_to_end(&mut buf);
@@ -753,6 +1014,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_guest_dev_gives_images_the_links_and_shm_a_container_would() {
+        // An image that logs through `/dev/stdout` must reach the log stream,
+        // not a regular file the dangling link would create.
+        let links: Vec<_> = DEV_LINKS.iter().map(|(_, link)| *link).collect();
+        assert_eq!(
+            links,
+            ["/dev/fd", "/dev/stdin", "/dev/stdout", "/dev/stderr"]
+        );
+        for (target, link) in DEV_LINKS {
+            assert!(target.starts_with("/proc/self/fd"), "{link} -> {target}");
+        }
+
+        let mounted_at = |dir: &str| BOOT_MOUNTS.iter().position(|(_, t, _, _)| *t == dir);
+        let shm = mounted_at("/dev/shm").expect("/dev/shm is mounted at boot");
+        assert!(shm > mounted_at("/dev").expect("/dev is mounted"));
+        let (_, _, fstype, data) = BOOT_MOUNTS[shm];
+        assert_eq!(fstype, "tmpfs");
+        assert!(
+            data.is_some_and(|d| d.contains("size=")),
+            "bounded: {data:?}"
+        );
+    }
+
+    #[test]
     fn boot_mounts_provide_devpts_after_devtmpfs() {
         // Without devpts every `openpty` — and so every terminal tab — fails
         // in a guest that boots straight into this binary.
@@ -798,6 +1083,96 @@ mod tests {
     fn mount_rejects_an_argument_with_a_nul_byte_without_panicking() {
         let err = mount("tmpfs", "/run\0x", "tmpfs", None).unwrap_err();
         assert!(matches!(err, MountError::InvalidArgument { .. }), "{err}");
+    }
+
+    fn spawn_args(cmd: &[&str], log: &Path, restart: SpawnRestartPolicy) -> SpawnArgs {
+        SpawnArgs {
+            cmd: cmd.iter().map(|part| part.to_string()).collect(),
+            env: HashMap::new(),
+            cwd: None,
+            uid: None,
+            gid: None,
+            log_path: Some(log.display().to_string()),
+            restart,
+            log_limits: LogLimits::default(),
+            limits: temps_vm_agent::SpawnLimits::default(),
+        }
+    }
+
+    fn wait_for_exit(pid: u32) -> (Option<i32>, u32) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match process_status(pid) {
+                Response::ProcessStatus {
+                    running: false,
+                    restarting: false,
+                    exit_code,
+                    restart_count,
+                } => return (exit_code, restart_count),
+                _ if Instant::now() > deadline => panic!("process {pid} did not exit"),
+                _ => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+    }
+
+    #[test]
+    fn spawned_process_status_reports_running_then_its_exit_code() {
+        let dir = std::env::temp_dir().join(format!("temps-vm-agent-spawn-{}", std::process::id()));
+        let log = dir.join("out.log");
+        let response = spawn(spawn_args(
+            &["/bin/sh", "-c", "echo started; sleep 0.3; exit 7"],
+            &log,
+            SpawnRestartPolicy::Never,
+        ));
+        let Response::Spawned { pid } = response else {
+            panic!("unexpected {response:?}");
+        };
+        assert!(matches!(
+            process_status(pid),
+            Response::ProcessStatus {
+                running: true,
+                exit_code: None,
+                ..
+            }
+        ));
+        assert_eq!(wait_for_exit(pid), (Some(7), 0));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match read_log(Some(log.display().to_string()), 10) {
+                Response::Log { data } if data.contains("started") => break,
+                _ if Instant::now() > deadline => panic!("the log never showed the output"),
+                _ => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(matches!(process_status(999_999), Response::Err { .. }));
+        assert!(matches!(
+            spawn(spawn_args(&[], &log, SpawnRestartPolicy::Never)),
+            Response::Err { .. }
+        ));
+    }
+
+    #[test]
+    fn a_spawned_process_is_restarted_per_its_policy_under_the_same_pid_handle() {
+        let dir =
+            std::env::temp_dir().join(format!("temps-vm-agent-restart-{}", std::process::id()));
+        let marker = dir.join("ran-once");
+        let _ = std::fs::create_dir_all(&dir);
+        let script = format!(
+            "if [ -e {m} ]; then exit 0; else touch {m}; exit 1; fi",
+            m = marker.display()
+        );
+        let response = spawn(spawn_args(
+            &["/bin/sh", "-c", &script],
+            &dir.join("out.log"),
+            SpawnRestartPolicy::OnFailure { max_retries: None },
+        ));
+        let Response::Spawned { pid } = response else {
+            panic!("unexpected {response:?}");
+        };
+        // The first run fails, the restart (after the 1s backoff) succeeds.
+        assert_eq!(wait_for_exit(pid), (Some(0), 1));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

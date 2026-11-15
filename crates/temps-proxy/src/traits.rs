@@ -93,6 +93,22 @@ pub trait UpstreamResolver: Send + Sync {
         self.resolve_peer(host, path, sni_hostname).await
     }
 
+    /// Resolve the retry of a failed connect, skipping the backends in `avoid`
+    /// when the host has others. A resolver with one backend per host has nothing
+    /// to skip, so this defaults to resolving as usual.
+    async fn resolve_peer_avoiding(
+        &self,
+        host: &str,
+        path: &str,
+        method: &str,
+        sni_hostname: Option<&str>,
+        avoid: &[String],
+    ) -> PingoraResult<PeerSelection> {
+        let _ = avoid;
+        self.resolve_peer_for_request(host, path, method, sni_hostname)
+            .await
+    }
+
     /// Check if a host has custom routing configured
     async fn has_custom_route(&self, host: &str) -> bool;
 

@@ -900,7 +900,7 @@ function BackupScheduleStatus({
             to="/backups"
             className="inline-block text-xs underline underline-offset-4 hover:text-foreground"
           >
-            Edit in Backups
+            Edit in backups
           </Link>
         </div>
       </div>

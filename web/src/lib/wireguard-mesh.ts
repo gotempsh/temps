@@ -12,6 +12,7 @@ import type {
   WireguardMeshNodeStatus,
   WireguardMeshStatusResponse,
 } from '@/api/client/types.gen'
+import { asRootTemps, shellWord } from '@/lib/worker-join-script'
 
 /** How a worker reaches this control plane when it joins. */
 export type JoinPath = 'private' | 'internet'
@@ -38,7 +39,9 @@ export function joinCommand(
 ): string {
   const address =
     path === 'internet' ? '<worker-public-ip>' : '<worker-private-ip>'
-  return `temps join ${url} ${token ?? '<join-token>'} --private-address ${address}`
+  return asRootTemps(
+    `join ${shellWord(url)} ${token ? shellWord(token) : '<join-token>'} --private-address ${address}`
+  )
 }
 
 /**
@@ -46,7 +49,9 @@ export function joinCommand(
  * WireGuard key over HTTPS and dials this server, so it needs no address.
  */
 export function outboundJoinCommand(url: string, token: string | null): string {
-  return `temps join ${url} ${token ?? '<join-token>'}`
+  return asRootTemps(
+    `join ${shellWord(url)} ${token ? shellWord(token) : '<join-token>'}`
+  )
 }
 
 /**
@@ -274,7 +279,7 @@ export function pairingProgress(pairing: NodePairingResponse): {
 
 /**
  * The steps of adding a server over SSH, in order, as the server names them
- * (`crates/temps-deployments/src/services/node_ssh.rs` and, for the last one,
+ * (`crates/temps-nodes/src/services/node_ssh.rs` and, for the last one,
  * `node_ssh_enrollment.rs`). Before the first step the server reports
  * `queued`, and `done` once it succeeded.
  */

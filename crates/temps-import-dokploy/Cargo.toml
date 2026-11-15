@@ -5,6 +5,7 @@
 name = "temps-import-dokploy"
 version.workspace = true
 edition.workspace = true
+description = "Dokploy importer: reads projects, applications, databases and domains over the Dokploy API and builds a migration plan"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -30,3 +31,6 @@ sea-orm = { workspace = true }
 reqwest = { workspace = true }
 url = { workspace = true }
 futures-util = { workspace = true }
+
+[lints]
+workspace = true

@@ -163,7 +163,9 @@ impl SuppressionService {
             .paginate(self.db.as_ref(), page_size);
 
         let total = paginator.num_items().await?;
-        let items = paginator.fetch_page(page - 1).await?;
+        let items = paginator
+            .fetch_page(temps_core::config::page_index(page))
+            .await?;
         Ok((items, total))
     }
 }
@@ -172,8 +174,8 @@ impl SuppressionService {
 mod tests {
     use super::*;
     use sea_orm::{ActiveModelTrait, ActiveValue::Set};
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::{email_domains, email_providers};
+    use temps_test_utils::TestDatabase;
 
     fn docker_is_unavailable(error: &impl std::fmt::Display) -> bool {
         let message = error.to_string().to_lowercase();

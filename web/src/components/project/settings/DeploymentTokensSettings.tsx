@@ -21,12 +21,7 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-} from '@/components/ui/card'
+import { PageHeader } from '@temps-sdk/ds'
 import {
   Table,
   TableBody,
@@ -249,149 +244,142 @@ export function DeploymentTokensSettings({
     <div className="space-y-6">
       {verificationDialog}
 
-      <Card>
-        <CardHeader className="flex flex-row items-start justify-between gap-4 border-b">
-          <div className="space-y-1.5">
-            <CardDescription>
-              Deployment tokens provide <code>TEMPS_API_URL</code> and{' '}
-              <code>TEMPS_API_TOKEN</code> credentials that are automatically
-              injected into deployed applications.
-            </CardDescription>
-          </div>
-          {tokens.length > 0 && (
-            <Button size="sm" onClick={openCreate}>
-              <Plus className="mr-2 h-4 w-4" /> Create token
-            </Button>
-          )}
-        </CardHeader>
-        <CardContent className="pt-6">
-          {revealedToken && (
-            <div className="mb-4 rounded-md border border-amber-300 bg-amber-50 p-4 dark:border-amber-800 dark:bg-amber-950/40">
-              <p className="mb-2 text-sm font-medium text-amber-800 dark:text-amber-200">
-                New token value — copy it now, it will not be shown again:
-              </p>
-              <div className="flex items-center gap-2">
-                <code className="flex-1 text-xs break-all font-mono">
-                  {revealedToken.value}
-                </code>
-                <CopyButton value={revealedToken.value} />
-              </div>
-              <Button
-                size="sm"
-                variant="ghost"
-                className="mt-2 text-xs text-amber-700 dark:text-amber-300"
-                onClick={() => setRevealedToken(null)}
-              >
-                I have saved the token
-              </Button>
-            </div>
-          )}
-
-          {tokensQuery.isLoading ? (
-            <div className="space-y-2">
-              <Skeleton className="h-10 w-full" />
-              <Skeleton className="h-10 w-full" />
-              <Skeleton className="h-10 w-full" />
-            </div>
-          ) : tokensQuery.isError ? (
-            <p className="text-sm text-destructive">
-              Failed to load deployment tokens.
+      <PageHeader
+        title="Deployment tokens"
+        description={
+          <>
+            Scoped credentials, injected into deployed apps as{' '}
+            <code>TEMPS_API_URL</code> and <code>TEMPS_API_TOKEN</code>.
+          </>
+        }
+        actions={
+          <Button onClick={openCreate}>
+            <Plus className="mr-2 h-4 w-4" /> Create token
+          </Button>
+        }
+      />
+      <div>
+        {revealedToken && (
+          <div className="mb-4 rounded-md border border-amber-300 bg-amber-50 p-4 dark:border-amber-800 dark:bg-amber-950/40">
+            <p className="mb-2 text-sm font-medium text-amber-800 dark:text-amber-200">
+              New token value — copy it now, it will not be shown again:
             </p>
-          ) : tokens.length === 0 ? (
-            <EmptyState
-              size="compact"
-              icon={Key}
-              title="No deployment tokens yet"
-              description={
-                <p className="text-sm text-muted-foreground">
-                  Create a scoped credential for an application or integration.
-                </p>
-              }
-              action={<Button onClick={openCreate}>Create token</Button>}
-            />
-          ) : (
-            <div className="overflow-x-auto">
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>Name</TableHead>
-                    <TableHead className="hidden md:table-cell">
-                      Prefix
-                    </TableHead>
-                    <TableHead>Status</TableHead>
-                    <TableHead className="hidden md:table-cell">
-                      Last used
-                    </TableHead>
-                    <TableHead className="text-right">Actions</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {tokens.map((token) => (
-                    <TableRow key={token.id}>
-                      <TableCell className="font-medium">
-                        {token.name}
-                      </TableCell>
-                      <TableCell className="hidden md:table-cell font-mono text-xs">
-                        {token.token_prefix}…
-                      </TableCell>
-                      <TableCell>
-                        <Badge
-                          variant={token.is_active ? 'default' : 'secondary'}
-                        >
-                          {token.is_active ? 'Active' : 'Inactive'}
-                        </Badge>
-                      </TableCell>
-                      <TableCell className="hidden md:table-cell text-sm text-muted-foreground">
-                        {token.last_used_at
-                          ? new Date(token.last_used_at).toLocaleDateString()
-                          : 'Never'}
-                      </TableCell>
-                      <TableCell className="text-right">
-                        <div className="flex justify-end gap-2">
-                          <Button
-                            size="sm"
-                            variant="outline"
-                            onClick={() => setRotateTarget(token)}
-                            disabled={
-                              rotateMutation.isPending &&
-                              rotateTarget?.id === token.id
-                            }
-                          >
-                            {rotateMutation.isPending &&
-                            rotateTarget?.id === token.id ? (
-                              <Loader2 className="h-4 w-4 animate-spin" />
-                            ) : (
-                              <RefreshCw className="h-4 w-4" />
-                            )}
-                            <span className="max-sm:sr-only ml-1">Rotate</span>
-                          </Button>
-                          <Button
-                            size="sm"
-                            variant="destructive"
-                            onClick={() => setDeleteTarget(token)}
-                            disabled={
-                              deleteMutation.isPending &&
-                              deleteTarget?.id === token.id
-                            }
-                          >
-                            {deleteMutation.isPending &&
-                            deleteTarget?.id === token.id ? (
-                              <Loader2 className="h-4 w-4 animate-spin" />
-                            ) : (
-                              <Trash2 className="h-4 w-4" />
-                            )}
-                            <span className="max-sm:sr-only ml-1">Delete</span>
-                          </Button>
-                        </div>
-                      </TableCell>
-                    </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
+            <div className="flex items-center gap-2">
+              <code className="flex-1 text-xs break-all font-mono">
+                {revealedToken.value}
+              </code>
+              <CopyButton value={revealedToken.value} />
             </div>
-          )}
-        </CardContent>
-      </Card>
+            <Button
+              size="sm"
+              variant="ghost"
+              className="mt-2 text-xs text-amber-700 dark:text-amber-300"
+              onClick={() => setRevealedToken(null)}
+            >
+              I have saved the token
+            </Button>
+          </div>
+        )}
+
+        {tokensQuery.isLoading ? (
+          <div className="space-y-2">
+            <Skeleton className="h-10 w-full" />
+            <Skeleton className="h-10 w-full" />
+            <Skeleton className="h-10 w-full" />
+          </div>
+        ) : tokensQuery.isError ? (
+          <p className="text-sm text-destructive">
+            Failed to load deployment tokens.
+          </p>
+        ) : tokens.length === 0 ? (
+          <EmptyState
+            size="compact"
+            icon={Key}
+            title="No deployment tokens yet"
+            description={
+              <p className="text-sm text-muted-foreground">
+                Create a scoped credential for an application or integration.
+              </p>
+            }
+          />
+        ) : (
+          <div className="overflow-x-auto">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Name</TableHead>
+                  <TableHead className="hidden md:table-cell">Prefix</TableHead>
+                  <TableHead>Status</TableHead>
+                  <TableHead className="hidden md:table-cell">
+                    Last used
+                  </TableHead>
+                  <TableHead className="text-right">Actions</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {tokens.map((token) => (
+                  <TableRow key={token.id}>
+                    <TableCell className="font-medium">{token.name}</TableCell>
+                    <TableCell className="hidden md:table-cell font-mono text-xs">
+                      {token.token_prefix}…
+                    </TableCell>
+                    <TableCell>
+                      <Badge
+                        variant={token.is_active ? 'default' : 'secondary'}
+                      >
+                        {token.is_active ? 'Active' : 'Inactive'}
+                      </Badge>
+                    </TableCell>
+                    <TableCell className="hidden md:table-cell text-sm text-muted-foreground">
+                      {token.last_used_at
+                        ? new Date(token.last_used_at).toLocaleDateString()
+                        : 'Never'}
+                    </TableCell>
+                    <TableCell className="text-right">
+                      <div className="flex justify-end gap-2">
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={() => setRotateTarget(token)}
+                          disabled={
+                            rotateMutation.isPending &&
+                            rotateTarget?.id === token.id
+                          }
+                        >
+                          {rotateMutation.isPending &&
+                          rotateTarget?.id === token.id ? (
+                            <Loader2 className="h-4 w-4 animate-spin" />
+                          ) : (
+                            <RefreshCw className="h-4 w-4" />
+                          )}
+                          <span className="max-sm:sr-only ml-1">Rotate</span>
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="destructive"
+                          onClick={() => setDeleteTarget(token)}
+                          disabled={
+                            deleteMutation.isPending &&
+                            deleteTarget?.id === token.id
+                          }
+                        >
+                          {deleteMutation.isPending &&
+                          deleteTarget?.id === token.id ? (
+                            <Loader2 className="h-4 w-4 animate-spin" />
+                          ) : (
+                            <Trash2 className="h-4 w-4" />
+                          )}
+                          <span className="max-sm:sr-only ml-1">Delete</span>
+                        </Button>
+                      </div>
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </div>
+        )}
+      </div>
 
       <Dialog
         open={createOpen}
@@ -556,7 +544,7 @@ export function DeploymentTokensSettings({
               {rotateMutation.isPending && (
                 <Loader2 className="h-4 w-4 animate-spin mr-1" />
               )}
-              Rotate Token
+              Rotate token
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

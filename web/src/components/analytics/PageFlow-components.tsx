@@ -34,7 +34,6 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from '@/components/ui/tooltip'
-import { useQuery } from '@tanstack/react-query'
 import { useMemo, useState } from 'react'
 import {
   ArrowRight,
@@ -45,6 +44,7 @@ import {
   AlertCircle,
 } from 'lucide-react'
 import { type PageFlowProps, durationSortValue } from './PageFlow-shared'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 function formatDuration(seconds: number | null | undefined): string {
   if (seconds == null || seconds <= 0) return '-'
@@ -134,7 +134,7 @@ function EntryPagesTable({ pages }: { pages: PageFlowEntry[] }) {
             align="right"
           />
           <SortableTableHead
-            label="Bounce Rate"
+            label="Bounce rate"
             active={sort.key === 'bounce'}
             direction={sort.direction}
             onClick={() =>
@@ -241,7 +241,7 @@ function ExitPagesTable({ pages }: { pages: PageFlowEntry[] }) {
             align="right"
           />
           <SortableTableHead
-            label="Exit Rate"
+            label="Exit rate"
             active={sort.key === 'rate'}
             direction={sort.direction}
             onClick={() => setSort((current) => nextTableSort(current, 'rate'))}
@@ -345,7 +345,7 @@ function DropOffTable({ points }: { points: DropOffPoint[] }) {
             align="right"
           />
           <SortableTableHead
-            label="Exit Rate"
+            label="Exit rate"
             active={sort.key === 'rate'}
             direction={sort.direction}
             onClick={() => setSort((current) => nextTableSort(current, 'rate'))}
@@ -493,7 +493,7 @@ export function PageFlow({
   endDate,
   environment,
 }: PageFlowProps) {
-  const { data, isLoading, isError } = useQuery({
+  const { data, isLoading, isError } = useWindowQuery({
     ...getPageFlowOptions({
       query: {
         project_id: project.id,
@@ -552,7 +552,7 @@ export function PageFlow({
           <div className="flex items-center gap-2">
             <LogIn className="h-5 w-5 text-green-500" />
             <div>
-              <CardTitle>Entry Pages</CardTitle>
+              <CardTitle>Entry pages</CardTitle>
               <CardDescription>
                 Where visitors land when they first arrive
               </CardDescription>
@@ -570,7 +570,7 @@ export function PageFlow({
           <div className="flex items-center gap-2">
             <DoorOpen className="h-5 w-5 text-red-500" />
             <div>
-              <CardTitle>Exit Pages</CardTitle>
+              <CardTitle>Exit pages</CardTitle>
               <CardDescription>Where visitors leave your site</CardDescription>
             </div>
           </div>
@@ -604,7 +604,7 @@ export function PageFlow({
           <div className="flex items-center gap-2">
             <ArrowRight className="h-5 w-5 text-blue-500" />
             <div>
-              <CardTitle>Page Transitions</CardTitle>
+              <CardTitle>Page transitions</CardTitle>
               <CardDescription>
                 Most common navigation paths between pages
               </CardDescription>

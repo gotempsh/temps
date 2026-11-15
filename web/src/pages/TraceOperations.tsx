@@ -1,13 +1,11 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { useEnvironmentFilter } from '@/components/project-frame/use-environment-filter'
 import { TimeRangeFilter } from '@/components/ui/time-range-filter'
 
-import { EnvironmentResponse, ProjectResponse, SpanStats } from '@/api/client'
-import {
-  getEnvironmentsOptions,
-  querySpanStatsOptions,
-} from '@/api/client/@tanstack/react-query.gen'
+import { ProjectResponse, SpanStats } from '@/api/client'
+import { querySpanStatsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -162,11 +160,17 @@ export default function TraceOperations({ project }: TraceOperationsProps) {
   const [minCount, setMinCount] = useState(
     searchParams.get('min_count') || '10'
   )
-  const [environmentId, setEnvironmentId] = useState(
-    searchParams.get('environment') || 'all'
-  )
+  // The project bar picks the environment.
+  const [environmentFilter] = useEnvironmentFilter()
+  const environmentId =
+    environmentFilter === undefined ? 'all' : String(environmentFilter)
   const [search, setSearch] = useState(searchParams.get('q') || '')
   const [page, setPage] = useState(1)
+  const [listedEnvironment, setListedEnvironment] = useState(environmentId)
+  if (listedEnvironment !== environmentId) {
+    setListedEnvironment(environmentId)
+    setPage(1)
+  }
   // Bumping this recomputes the relative window against a fresh `now`; freezing
   // it at mount would silently exclude everything ingested since page load.
   const [refreshKey, setRefreshKey] = useState(0)
@@ -178,11 +182,6 @@ export default function TraceOperations({ project }: TraceOperationsProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [timeRange, refreshKey]
   )
-
-  const { data: environments } = useQuery({
-    ...getEnvironmentsOptions({ path: { project_id: project.id } }),
-    enabled: !!project.id,
-  })
 
   const { data, isLoading, isFetching, isError, error, refetch } = useQuery({
     ...querySpanStatsOptions({
@@ -238,14 +237,6 @@ export default function TraceOperations({ project }: TraceOperationsProps) {
       setMinCount(v)
       setPage(1)
       updateParam('min_count', v, '10')
-    },
-    [updateParam]
-  )
-  const handleEnvironmentChange = useCallback(
-    (v: string) => {
-      setEnvironmentId(v)
-      setPage(1)
-      updateParam('environment', v, 'all')
     },
     [updateParam]
   )
@@ -328,25 +319,6 @@ export default function TraceOperations({ project }: TraceOperationsProps) {
               </SelectContent>
             </Select>
 
-            {environments && environments.length > 0 && (
-              <Select
-                value={environmentId}
-                onValueChange={handleEnvironmentChange}
-              >
-                <SelectTrigger className="w-full sm:w-[180px]">
-                  <SelectValue placeholder="Environment" />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="all">All Environments</SelectItem>
-                  {environments.map((env: EnvironmentResponse) => (
-                    <SelectItem key={env.id} value={String(env.id)}>
-                      {env.name}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            )}
-
             <div className="relative flex-1 sm:min-w-[220px]">
               <Search className="absolute left-2.5 top-2.5 h-3.5 w-3.5 text-muted-foreground" />
               <Input
@@ -412,7 +384,7 @@ export default function TraceOperations({ project }: TraceOperationsProps) {
                     size="sm"
                     onClick={() => navigate(`/projects/${project.slug}/traces`)}
                   >
-                    Go to Traces
+                    Go to traces
                   </Button>
                 }
               />

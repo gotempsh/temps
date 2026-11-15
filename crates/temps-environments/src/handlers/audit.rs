@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use anyhow::Result;
 use serde::Serialize;
 use temps_core::{AuditContext, AuditOperation};
 
@@ -33,9 +32,8 @@ impl AuditOperation for EnvironmentVariableValueRevealedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|error| anyhow::anyhow!("Failed to serialize audit operation: {error}"))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -101,9 +99,8 @@ impl AuditOperation for EnvironmentSettingsUpdatedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -135,9 +132,8 @@ impl AuditOperation for EnvironmentSleepStateChangedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -171,9 +167,8 @@ impl AuditOperation for EnvironmentSubdomainUpdatedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -205,9 +200,8 @@ impl AuditOperation for EnvironmentDeletedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -242,9 +236,8 @@ impl AuditOperation for EnvironmentVariablePromotedToSecretAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -288,9 +281,8 @@ impl AuditOperation for EnvironmentVariableWrittenAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|error| anyhow::anyhow!("Failed to serialize audit operation: {error}"))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -324,9 +316,8 @@ impl AuditOperation for EnvironmentVariableDeletedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|error| anyhow::anyhow!("Failed to serialize audit operation: {error}"))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -365,9 +356,8 @@ impl AuditOperation for ProjectSecretWrittenAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|error| anyhow::anyhow!("Failed to serialize audit operation: {error}"))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -396,9 +386,150 @@ impl AuditOperation for ProjectSecretDeletedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|error| anyhow::anyhow!("Failed to serialize audit operation: {error}"))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
+    }
+}
+
+/// An environment's ingress mode or Temps login requirement changed
+/// (ADR-055 §11).
+#[derive(Debug, Clone, Serialize)]
+pub struct IngressSettingsUpdatedAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    pub environment_id: i32,
+    pub previous_mode: &'static str,
+    pub mode: &'static str,
+    pub previous_require_login: bool,
+    pub require_login: bool,
+}
+
+impl AuditOperation for IngressSettingsUpdatedAudit {
+    fn operation_type(&self) -> String {
+        "ENVIRONMENT_INGRESS_SETTINGS_UPDATED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
+    }
+}
+
+/// A user was issued a Temps login grant for an environment's host. The
+/// grant token itself is never recorded.
+#[derive(Debug, Clone, Serialize)]
+pub struct IngressLoginGrantIssuedAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    pub environment_id: i32,
+    pub grant_id: i64,
+    pub host: String,
+    pub permission: String,
+}
+
+impl AuditOperation for IngressLoginGrantIssuedAudit {
+    fn operation_type(&self) -> String {
+        "INGRESS_LOGIN_GRANT_ISSUED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
+    }
+}
+
+/// A user was issued a Temps login grant for a sandbox preview host. The
+/// grant token itself is never recorded.
+#[derive(Debug, Clone, Serialize)]
+pub struct SandboxPreviewLoginGrantIssuedAudit {
+    pub context: AuditContext,
+    /// The sandbox's public id (`sbx_...`).
+    pub sandbox_id: String,
+    pub project_id: Option<i32>,
+    pub grant_id: i64,
+    pub host: String,
+    pub permission: String,
+}
+
+impl AuditOperation for SandboxPreviewLoginGrantIssuedAudit {
+    fn operation_type(&self) -> String {
+        "SANDBOX_PREVIEW_LOGIN_GRANT_ISSUED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        serde_json::to_string(self).map_err(|source| {
+            temps_core::AuditError::serialize(
+                format!("preview login grant for sandbox {}", self.sandbox_id),
+                source,
+            )
+        })
+    }
+}
+
+/// Emitted when an operator says a regular variable is not a credential,
+/// hiding the "store as secret" suggestion for its current value. Recorded
+/// because it is a judgement about sensitive data someone can be asked about.
+#[derive(Debug, Clone, Serialize)]
+pub struct EnvironmentVariableSecretSuggestionDismissedAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    pub var_id: i32,
+    pub key: String,
+}
+
+impl AuditOperation for EnvironmentVariableSecretSuggestionDismissedAudit {
+    fn operation_type(&self) -> String {
+        "ENVIRONMENT_VARIABLE_SECRET_SUGGESTION_DISMISSED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 

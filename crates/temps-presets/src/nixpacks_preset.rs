@@ -21,6 +21,8 @@
 //!   polyglot repository pinned to `python` does not silently start building
 //!   as `node` because detection order differs.
 
+use crate::stored_preset::NixpacksProviderExt;
+use crate::stored_preset::StoredPresetConfigExt;
 use super::autopack_preset::render_or_explain;
 use crate::{DockerfileConfig, DockerfileWithArgs, Preset, ProjectType};
 use async_trait::async_trait;

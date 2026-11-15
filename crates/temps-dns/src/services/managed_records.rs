@@ -1792,7 +1792,7 @@ mod tests {
 
     #[tokio::test]
     async fn database_record_lock_serializes_processes_sharing_a_database() {
-        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error) => {
                 eprintln!("Docker/Postgres unavailable; skipping DNS advisory lock test: {error}");

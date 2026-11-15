@@ -12,7 +12,16 @@
 //! These tests are deliberately NOT gated on `integration_kernel` — they
 //! don't need privileged Linux, just Docker.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test helpers: panicking is how a test fails"
+)]
 #![cfg(feature = "control_plane")]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "integration test: reads fixture configuration from the environment"
+)]
 
 use ipnet::Ipv4Net;
 use sea_orm::{ActiveModelTrait, ConnectionTrait, Database, DatabaseConnection, EntityTrait, Set};
@@ -776,6 +785,61 @@ async fn mesh_registration_assigns_stable_addresses_and_switches_the_underlay() 
     let for_a = mesh::peers(&db, Some(node_a)).await.unwrap();
     assert_eq!(for_a.len(), 1);
     assert_eq!(for_a[0].name, "control-plane");
+}
+
+/// An upgraded cluster whose compute pool covers the stored default mesh
+/// pool (`10.201.0.0/16`, never used because the mesh was off): turning the
+/// mesh on with that default is refused, but naming a clear range works.
+#[tokio::test]
+async fn the_mesh_turns_on_with_a_requested_range_when_the_default_overlaps_the_compute_pool() {
+    use temps_network::mesh::{self, MeshError, DEFAULT_MESH_CIDR};
+
+    let Some(fx) = fixture().await else { return };
+    let db = fx.db.clone();
+    fx.db
+        .execute_unprepared(
+            "UPDATE network_config SET compute_pool_cidr = '10.201.0.0/16' WHERE id = 1",
+        )
+        .await
+        .unwrap();
+    let stored = network_config::Entity::find_by_id(1)
+        .one(db.as_ref())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.wireguard_cidr, DEFAULT_MESH_CIDR.to_string());
+    assert!(!stored.wireguard_enabled);
+
+    // No range asked for: the default overlaps, and the error says so.
+    assert_eq!(
+        mesh::enable(&db, None, None, None).await,
+        Err(MeshError::OverlapsComputePool {
+            mesh: DEFAULT_MESH_CIDR,
+            pool: "10.201.0.0/16".parse().unwrap(),
+        })
+    );
+    assert_eq!(mesh::load_settings(&db).await.unwrap(), None);
+
+    // A requested range clear of the compute pool is not held back by the
+    // stored default, and becomes the stored pool.
+    let settings = mesh::enable(&db, Some("10.250.0.0/24"), Some(51820), None)
+        .await
+        .unwrap();
+    assert_eq!(settings.cidr.to_string(), "10.250.0.0/24");
+    assert_eq!(settings.control_plane_address().to_string(), "10.250.0.1");
+    assert_eq!(
+        mesh::load_settings(&db).await.unwrap(),
+        Some(settings.clone())
+    );
+
+    // Turning it on again without a range keeps the requested one.
+    assert_eq!(mesh::enable(&db, None, None, None).await, Ok(settings));
+
+    // A requested range that overlaps is still refused.
+    assert!(matches!(
+        mesh::enable(&db, Some("10.201.4.0/24"), None, None).await,
+        Err(MeshError::OverlapsComputePool { .. })
+    ));
 }
 
 /// One-paste pairing (ADR 048 D2b): a pairing reserves an address, the

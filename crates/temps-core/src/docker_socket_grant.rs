@@ -63,6 +63,10 @@ impl DockerSocketGrant {
     /// Read the grant from this process's environment. Call once at startup
     /// and inject the result; re-reading per deploy would let a later
     /// `set_var` (tests, embedders) change container privileges at runtime.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "documented host-level operator policy: TEMPS_DOCKER_SOCKET_PROJECTS (docs/reference/environment-variables.md, ADR 079)"
+    )]
     pub fn from_env() -> Self {
         Self::parse(std::env::var(DOCKER_SOCKET_PROJECTS_ENV).ok().as_deref())
     }

@@ -47,6 +47,10 @@ pub fn redact_license_key(message: impl Into<String>, license_key: Option<&str>)
 /// lookup path resolves it.
 pub const CITY_DB_FILENAME: &str = "GeoLite2-City.mmdb";
 
+/// Filename of the ASN database. Optional: it powers hosting/datacenter
+/// detection, and every consumer degrades gracefully without it.
+pub const ASN_DB_FILENAME: &str = "GeoLite2-ASN.mmdb";
+
 /// MaxMind's authenticated download endpoint. Used when the operator has
 /// configured a license key; serves a `.tar.gz` holding a dated directory with
 /// the `.mmdb` inside.
@@ -55,6 +59,9 @@ const MAXMIND_DOWNLOAD_ENDPOINT: &str = "https://download.maxmind.com/app/geoip_
 /// Edition downloaded from MaxMind. City-level data is what the analytics and
 /// proxy paths consume.
 const MAXMIND_EDITION_ID: &str = "GeoLite2-City";
+
+/// MaxMind edition for the ASN database.
+const MAXMIND_ASN_EDITION_ID: &str = "GeoLite2-ASN";
 
 /// Fallback source: the copy committed to this repository, downloaded directly
 /// as a bare `.mmdb`. Keeps a fresh instance working with zero configuration,
@@ -67,6 +74,66 @@ const MAXMIND_EDITION_ID: &str = "GeoLite2-City";
 /// host is not an acceptable default for an unlicensed instance.
 pub const BUNDLED_GEOLITE2_URL: &str =
     "https://raw.githubusercontent.com/gotempsh/temps/refs/heads/main/crates/temps-cli/GeoLite2-City.mmdb";
+
+/// The ASN copy committed to this repository. Same rules as
+/// [`BUNDLED_GEOLITE2_URL`]: fetched only by the one-time, only-if-missing
+/// startup recovery, never on a schedule.
+pub const BUNDLED_GEOLITE2_ASN_URL: &str =
+    "https://raw.githubusercontent.com/gotempsh/temps/refs/heads/main/crates/temps-cli/GeoLite2-ASN.mmdb";
+
+/// Which GeoLite2 database a download is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeoDatabaseKind {
+    /// City-level geolocation. Required.
+    City,
+    /// Autonomous system (network owner). Optional; powers datacenter detection.
+    Asn,
+}
+
+impl GeoDatabaseKind {
+    /// Filename on disk, as shipped by MaxMind.
+    pub fn filename(self) -> &'static str {
+        match self {
+            Self::City => CITY_DB_FILENAME,
+            Self::Asn => ASN_DB_FILENAME,
+        }
+    }
+
+    fn maxmind_edition_id(self) -> &'static str {
+        match self {
+            Self::City => MAXMIND_EDITION_ID,
+            Self::Asn => MAXMIND_ASN_EDITION_ID,
+        }
+    }
+
+    fn bundled_url(self) -> &'static str {
+        match self {
+            Self::City => BUNDLED_GEOLITE2_URL,
+            Self::Asn => BUNDLED_GEOLITE2_ASN_URL,
+        }
+    }
+
+    /// Human-readable name for logs and errors.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::City => "city",
+            Self::Asn => "ASN",
+        }
+    }
+
+    /// Whether an `.mmdb`'s `database_type` metadata is the right kind of
+    /// database, so a file holding the wrong database (a City file saved as
+    /// `GeoLite2-ASN.mmdb`) is rejected instead of silently answering every
+    /// lookup with nothing.
+    pub(crate) fn accepts_database_type(self, database_type: &str) -> bool {
+        match self {
+            // GeoLite2-City, GeoIP2-City, DBIP-City-Lite, GeoIP2-Enterprise
+            Self::City => database_type.contains("City") || database_type.contains("Enterprise"),
+            // GeoLite2-ASN, GeoIP2-ISP, DBIP-ASN-Lite
+            Self::Asn => database_type.contains("ASN") || database_type.contains("ISP"),
+        }
+    }
+}
 
 /// A real GeoLite2-City database is tens of megabytes. Anything smaller is an
 /// error page, a Git LFS pointer, or a truncated transfer.
@@ -159,12 +226,25 @@ pub fn city_db_path() -> PathBuf {
     crate::geoip_service::resolve_mmdb_path(CITY_DB_FILENAME)
 }
 
+/// Resolved path of the ASN database for this process.
+pub fn asn_db_path() -> PathBuf {
+    crate::geoip_service::resolve_mmdb_path(ASN_DB_FILENAME)
+}
+
 /// The download URL and the source it represents.
 ///
 /// Returns a `Result` rather than the plain tuple because building a `Url` is
 /// fallible and this crate does not `unwrap` in production paths; the error
 /// names the source only, never the URL being built.
 pub fn geo_db_source_url(license_key: Option<&str>) -> Result<(Url, DbSource), GeoIpError> {
+    geo_db_source_url_for(GeoDatabaseKind::City, license_key)
+}
+
+/// [`geo_db_source_url`] for a specific database.
+pub fn geo_db_source_url_for(
+    kind: GeoDatabaseKind,
+    license_key: Option<&str>,
+) -> Result<(Url, DbSource), GeoIpError> {
     match license_key {
         Some(key) if !key.is_empty() => {
             let mut url = Url::parse(MAXMIND_DOWNLOAD_ENDPOINT).map_err(|e| {
@@ -176,17 +256,16 @@ pub fn geo_db_source_url(license_key: Option<&str>) -> Result<(Url, DbSource), G
             // `query_pairs_mut` percent-encodes the key, so a license key
             // containing URL-significant characters cannot corrupt the query.
             url.query_pairs_mut()
-                .append_pair("edition_id", MAXMIND_EDITION_ID)
+                .append_pair("edition_id", kind.maxmind_edition_id())
                 .append_pair("license_key", key)
                 .append_pair("suffix", "tar.gz");
             Ok((url, DbSource::MaxMindOfficial))
         }
         _ => {
-            let url =
-                Url::parse(BUNDLED_GEOLITE2_URL).map_err(|e| GeoIpError::InvalidSourceUrl {
-                    db_source: DbSource::BundledGithub.as_str(),
-                    reason: e.to_string(),
-                })?;
+            let url = Url::parse(kind.bundled_url()).map_err(|e| GeoIpError::InvalidSourceUrl {
+                db_source: DbSource::BundledGithub.as_str(),
+                reason: e.to_string(),
+            })?;
             Ok((url, DbSource::BundledGithub))
         }
     }
@@ -227,10 +306,23 @@ pub async fn fetch_latest_mmdb_bytes(
     license_key: Option<&str>,
     http: &reqwest::Client,
 ) -> Result<(Vec<u8>, DbSource), GeoIpError> {
-    let (url, source) = geo_db_source_url(license_key)?;
+    fetch_latest_mmdb_bytes_for(GeoDatabaseKind::City, license_key, http).await
+}
+
+/// [`fetch_latest_mmdb_bytes`] for a specific database.
+pub async fn fetch_latest_mmdb_bytes_for(
+    kind: GeoDatabaseKind,
+    license_key: Option<&str>,
+    http: &reqwest::Client,
+) -> Result<(Vec<u8>, DbSource), GeoIpError> {
+    let (url, source) = geo_db_source_url_for(kind, license_key)?;
     let db_source = source.as_str();
 
-    info!(source = db_source, "downloading GeoLite2 city database");
+    info!(
+        source = db_source,
+        database = kind.label(),
+        "downloading GeoLite2 database"
+    );
 
     let mut request = http.get(url);
     if matches!(source, DbSource::MaxMindOfficial) {
@@ -274,12 +366,13 @@ pub async fn fetch_latest_mmdb_bytes(
         DbSource::BundledGithub => downloaded,
     };
 
-    let build_epoch = validate_mmdb_bytes(&bytes, db_source)?;
+    let build_epoch = validate_mmdb_bytes_for(kind, &bytes, db_source)?;
     info!(
         source = db_source,
+        database = kind.label(),
         size_bytes = bytes.len(),
         build_epoch,
-        "downloaded GeoLite2 city database passed validation"
+        "downloaded GeoLite2 database passed validation"
     );
 
     Ok((bytes, source))
@@ -436,13 +529,24 @@ fn has_mmdb_extension(path: &Path) -> bool {
 /// Parsing borrows `bytes` (no copy) and is what actually rejects a corrupt
 /// download: the size check alone passes for a 2 MB HTML error page.
 pub fn validate_mmdb_bytes(bytes: &[u8], db_source: &'static str) -> Result<u64, GeoIpError> {
+    validate_mmdb_bytes_for(GeoDatabaseKind::City, bytes, db_source)
+}
+
+/// [`validate_mmdb_bytes`] for a specific database: size floor, an actual
+/// parse, and a check that the file's `database_type` is the expected kind.
+pub fn validate_mmdb_bytes_for(
+    kind: GeoDatabaseKind,
+    bytes: &[u8],
+    db_source: &'static str,
+) -> Result<u64, GeoIpError> {
     if bytes.len() < MIN_MMDB_BYTES {
         return Err(GeoIpError::InvalidDatabase {
             db_source,
             size_bytes: bytes.len(),
             reason: format!(
-                "smaller than the {} byte minimum for a GeoLite2 city database",
-                MIN_MMDB_BYTES
+                "smaller than the {} byte minimum for a GeoLite2 {} database",
+                MIN_MMDB_BYTES,
+                kind.label()
             ),
         });
     }
@@ -453,6 +557,20 @@ pub fn validate_mmdb_bytes(bytes: &[u8], db_source: &'static str) -> Result<u64,
             size_bytes: bytes.len(),
             reason: format!("not a readable MaxMind database: {}", e),
         })?;
+
+    let database_type = reader.metadata().database_type.clone();
+    if !kind.accepts_database_type(&database_type) {
+        return Err(GeoIpError::InvalidDatabase {
+            db_source,
+            size_bytes: bytes.len(),
+            reason: format!(
+                "expected a {} database ({}) but the file is '{}'",
+                kind.label(),
+                kind.filename(),
+                database_type
+            ),
+        });
+    }
 
     Ok(reader.metadata().build_epoch)
 }
@@ -595,17 +713,32 @@ pub async fn ensure_mmdb_present(
     license_key: Option<&str>,
     http: &reqwest::Client,
 ) -> Result<bool, GeoIpError> {
+    ensure_mmdb_present_for(GeoDatabaseKind::City, path, license_key, http).await
+}
+
+/// [`ensure_mmdb_present`] for a specific database.
+pub async fn ensure_mmdb_present_for(
+    kind: GeoDatabaseKind,
+    path: &Path,
+    license_key: Option<&str>,
+    http: &reqwest::Client,
+) -> Result<bool, GeoIpError> {
     if path.exists() {
-        debug!(path = %path.display(), "geo database already present; skipping download");
+        debug!(
+            path = %path.display(),
+            database = kind.label(),
+            "geo database already present; skipping download"
+        );
         return Ok(false);
     }
 
-    let (bytes, source) = fetch_latest_mmdb_bytes(license_key, http).await?;
+    let (bytes, source) = fetch_latest_mmdb_bytes_for(kind, license_key, http).await?;
     let size_bytes = bytes.len();
     write_mmdb_atomically(path, std::sync::Arc::new(bytes)).await?;
     info!(
         path = %path.display(),
         source = source.as_str(),
+        database = kind.label(),
         size_mb = format!("{:.1}", size_bytes as f64 / 1024.0 / 1024.0),
         "downloaded missing geo database"
     );
@@ -827,12 +960,12 @@ pub fn spawn_refresh_job(
                 Err(error) => {
                     warn!(
                         error = %error,
-                        default_interval_hours = temps_core::DEFAULT_GEO_REFRESH_INTERVAL_HOURS,
+                        default_interval_hours = temps_config::DEFAULT_GEO_REFRESH_INTERVAL_HOURS,
                         "could not read the geolocation settings; waiting the default interval \
                          before retrying"
                     );
                     std::time::Duration::from_secs(
-                        u64::from(temps_core::DEFAULT_GEO_REFRESH_INTERVAL_HOURS) * 3600,
+                        u64::from(temps_config::DEFAULT_GEO_REFRESH_INTERVAL_HOURS) * 3600,
                     )
                 }
             };
@@ -919,6 +1052,19 @@ pub fn spawn_refresh_job(
 /// whatever the download cadence is. One `stat` a minute is not measurable.
 pub const DB_FILE_WATCH_INTERVAL: Duration = Duration::from_secs(60);
 
+/// How long startup waits for missing geo databases before carrying on while
+/// they download. Long enough for a normal first download to be loaded straight
+/// away, short enough that a stalled one cannot keep the console down.
+pub const STARTUP_DOWNLOAD_WAIT: Duration = Duration::from_secs(30);
+
+/// When startup stops waiting for missing geo databases. There is one deadline
+/// per process, counted from the first caller, so the console's wait and plugin
+/// registration's wait do not add up.
+pub fn startup_download_deadline() -> std::time::Instant {
+    static DEADLINE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    *DEADLINE.get_or_init(|| std::time::Instant::now() + STARTUP_DOWNLOAD_WAIT)
+}
+
 /// Ensures at most one file watcher per process, for the same reason
 /// [`REFRESH_JOB_SPAWNED`] exists: the monolithic `temps serve` registers
 /// `GeoPlugin` twice (proxy registry and console registry) in one process.
@@ -940,8 +1086,9 @@ fn file_fingerprint(path: &Path) -> Option<FileFingerprint> {
     })
 }
 
-/// Watch the city database file and hot-reload `service` whenever the file on
-/// disk turns out to hold a different build than the one loaded.
+/// Watch the database files and hot-reload `service` whenever a file on disk
+/// turns out to hold a different build than the one loaded, including a file that
+/// was missing at startup: a slow download finishes after startup stops waiting.
 ///
 /// This is what makes a **split-role** deployment (ADR-017) correct. `temps
 /// proxy` and `temps serve --role=console` are separate OS processes, each with
@@ -960,7 +1107,7 @@ fn file_fingerprint(path: &Path) -> Option<FileFingerprint> {
 /// service is a mock (nothing on disk to watch), or when the thread cannot be
 /// started.
 pub fn spawn_db_file_watcher(service: std::sync::Arc<GeoIpService>) -> bool {
-    if service.build_epoch().is_none() {
+    if matches!(service.as_ref(), GeoIpService::Mock(_)) {
         debug!("mock geo service is enabled; not watching the database file for changes");
         return false;
     }
@@ -973,24 +1120,25 @@ pub fn spawn_db_file_watcher(service: std::sync::Arc<GeoIpService>) -> bool {
         return false;
     }
 
-    let path = city_db_path();
-    match spawn_db_file_watcher_every(&service, path.clone(), DB_FILE_WATCH_INTERVAL) {
+    let databases = vec![
+        (GeoDatabaseKind::City, city_db_path()),
+        (GeoDatabaseKind::Asn, asn_db_path()),
+    ];
+    match spawn_db_file_watcher_every(&service, databases, DB_FILE_WATCH_INTERVAL) {
         Ok(_handle) => {
             info!(
-                path = %path.display(),
                 poll_interval_secs = DB_FILE_WATCH_INTERVAL.as_secs(),
-                "watching the GeoLite2 city database file so a refresh performed by another \
-                 process is picked up without a restart"
+                "watching the GeoLite2 database files so a database that arrives late, or a \
+                 refresh performed by another process, is picked up without a restart"
             );
             true
         }
         Err(error) => {
             FILE_WATCHER_SPAWNED.store(false, Ordering::SeqCst);
             warn!(
-                path = %path.display(),
                 error = %error,
                 "could not start the GeoLite2 database file watcher; this process will keep \
-                 serving the database it loaded at startup until it is restarted"
+                 serving the databases it loaded at startup until it is restarted"
             );
             false
         }
@@ -1011,76 +1159,121 @@ pub fn spawn_db_file_watcher(service: std::sync::Arc<GeoIpService>) -> bool {
 /// stops the first time the `GeoIpService` it would refresh no longer exists.
 fn spawn_db_file_watcher_every(
     service: &std::sync::Arc<GeoIpService>,
-    path: PathBuf,
+    databases: Vec<(GeoDatabaseKind, PathBuf)>,
     interval: Duration,
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
     let service = std::sync::Arc::downgrade(service);
     std::thread::Builder::new()
         .name("geo-db-watch".to_string())
-        .spawn(move || watch_db_file(service, path, interval))
+        .spawn(move || watch_db_files(service, databases, interval))
 }
 
-fn watch_db_file(service: std::sync::Weak<GeoIpService>, path: PathBuf, interval: Duration) {
-    // What the loaded reader corresponds to. Seeded from the current file so a
-    // process that just opened it does not immediately re-open it.
-    let mut loaded_from = file_fingerprint(&path);
-    // The fingerprint a failure was already reported for, so a permanently
-    // broken file warns once instead of every poll.
-    let mut reported_failure: Option<FileFingerprint> = None;
+/// One database the watcher follows, and what it has already done about it.
+struct WatchedDatabase {
+    kind: GeoDatabaseKind,
+    path: PathBuf,
+    /// What the loaded reader corresponds to. Seeded from the current file so a
+    /// process that just opened it does not immediately re-open it. With nothing
+    /// loaded there is nothing to correspond to, so a file that appeared after the
+    /// service looked for it still gets loaded.
+    loaded_from: Option<FileFingerprint>,
+    /// The fingerprint a failure was already reported for, so a permanently
+    /// broken file warns once instead of every poll.
+    reported_failure: Option<FileFingerprint>,
+}
+
+impl WatchedDatabase {
+    fn new(kind: GeoDatabaseKind, path: PathBuf, service: Option<&GeoIpService>) -> Self {
+        let loaded = service.and_then(|service| match kind {
+            GeoDatabaseKind::City => service.build_epoch(),
+            GeoDatabaseKind::Asn => service.asn_build_epoch(),
+        });
+        let loaded_from = loaded.and_then(|_| file_fingerprint(&path));
+        Self {
+            kind,
+            path,
+            loaded_from,
+            reported_failure: None,
+        }
+    }
+
+    fn poll(&mut self, service: &GeoIpService) {
+        let database = self.kind.filename();
+        let path = self.path.display().to_string();
+
+        let Some(current) = file_fingerprint(&self.path) else {
+            // Missing or unreadable right now (a refresh is mid-rename, or the
+            // file was removed). The loaded database keeps serving lookups and
+            // the next poll looks again.
+            return;
+        };
+
+        if Some(&current) == self.loaded_from.as_ref() {
+            return;
+        }
+
+        let reloaded = match self.kind {
+            GeoDatabaseKind::City => service.refresh_from_path_if_changed(&self.path),
+            GeoDatabaseKind::Asn => service.refresh_asn_from_path_if_changed(&self.path),
+        };
+        match reloaded {
+            Ok(Some(build_epoch)) => {
+                info!(
+                    database,
+                    path, build_epoch, "reloaded a GeoLite2 database after it changed on disk"
+                );
+                self.loaded_from = Some(current);
+                self.reported_failure = None;
+            }
+            Ok(None) => {
+                debug!(
+                    database,
+                    path, "a GeoLite2 database file changed but holds the build already loaded"
+                );
+                self.loaded_from = Some(current);
+                self.reported_failure = None;
+            }
+            Err(error) => {
+                // `loaded_from` is deliberately left alone so the next poll
+                // retries: a reload that fails must not be remembered as done.
+                if self.reported_failure.as_ref() != Some(&current) {
+                    warn!(
+                        database,
+                        path,
+                        error = %error,
+                        "a GeoLite2 database changed on disk but could not be loaded; keeping \
+                         what is currently in memory and retrying on the next poll"
+                    );
+                    self.reported_failure = Some(current);
+                }
+            }
+        }
+    }
+}
+
+fn watch_db_files(
+    service: std::sync::Weak<GeoIpService>,
+    databases: Vec<(GeoDatabaseKind, PathBuf)>,
+    interval: Duration,
+) {
+    let mut databases: Vec<WatchedDatabase> = {
+        let service = service.upgrade();
+        databases
+            .into_iter()
+            .map(|(kind, path)| WatchedDatabase::new(kind, path, service.as_deref()))
+            .collect()
+    };
 
     loop {
         std::thread::sleep(interval);
 
         let Some(service) = service.upgrade() else {
-            debug!(
-                path = %path.display(),
-                "the geo service was dropped; stopping the database file watcher"
-            );
+            debug!("the geo service was dropped; stopping the database file watcher");
             return;
         };
 
-        let Some(current) = file_fingerprint(&path) else {
-            // Missing or unreadable right now (a refresh is mid-rename, or the
-            // file was removed). The loaded database keeps serving lookups and
-            // the next poll looks again.
-            continue;
-        };
-
-        if Some(&current) == loaded_from.as_ref() {
-            continue;
-        }
-
-        match service.refresh_from_path_if_changed(&path) {
-            Ok(Some(build_epoch)) => {
-                info!(
-                    path = %path.display(),
-                    build_epoch,
-                    "reloaded the GeoLite2 city database after it changed on disk"
-                );
-                loaded_from = Some(current);
-                reported_failure = None;
-            }
-            Ok(None) => {
-                debug!(
-                    path = %path.display(),
-                    "the GeoLite2 city database file changed but holds the build already loaded"
-                );
-                loaded_from = Some(current);
-                reported_failure = None;
-            }
-            Err(error) => {
-                // `loaded_from` is deliberately left alone so the next poll
-                // retries: a reload that fails must not be remembered as done.
-                if reported_failure.as_ref() != Some(&current) {
-                    warn!(
-                        path = %path.display(),
-                        error = %error,
-                        "the GeoLite2 city database changed on disk but could not be loaded; \
-                         keeping the database currently in memory and retrying on the next poll"
-                    );
-                    reported_failure = Some(current);
-                }
-            }
+        for database in &mut databases {
+            database.poll(&service);
         }
     }
 }
@@ -1089,6 +1282,13 @@ fn watch_db_file(service: std::sync::Weak<GeoIpService>, path: PathBuf, interval
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn every_caller_shares_one_startup_download_deadline() {
+        let first = startup_download_deadline();
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(startup_download_deadline(), first);
+    }
 
     /// Build an archive whose member names are written straight into the tar
     /// header, bypassing `Builder::append_data`'s own path validation. A
@@ -1237,6 +1437,60 @@ mod tests {
         assert!(has_mmdb_extension(Path::new("a/GeoLite2-City.MMDB")));
         assert!(!has_mmdb_extension(Path::new("a/GeoLite2-City.tar.gz")));
         assert!(!has_mmdb_extension(Path::new("a/mmdb")));
+    }
+
+    #[test]
+    fn each_database_kind_maps_to_its_own_file_edition_and_bundled_copy() {
+        assert_eq!(GeoDatabaseKind::City.filename(), "GeoLite2-City.mmdb");
+        assert_eq!(GeoDatabaseKind::Asn.filename(), "GeoLite2-ASN.mmdb");
+        assert!(GeoDatabaseKind::Asn
+            .bundled_url()
+            .ends_with("/crates/temps-cli/GeoLite2-ASN.mmdb"));
+
+        let (url, source) =
+            geo_db_source_url_for(GeoDatabaseKind::Asn, Some("k")).expect("MaxMind URL builds");
+        assert_eq!(source, DbSource::MaxMindOfficial);
+        assert!(url
+            .query_pairs()
+            .any(|(k, v)| k == "edition_id" && v == "GeoLite2-ASN"));
+
+        let (url, source) =
+            geo_db_source_url_for(GeoDatabaseKind::Asn, None).expect("bundled URL builds");
+        assert_eq!(source, DbSource::BundledGithub);
+        assert_eq!(url.as_str(), BUNDLED_GEOLITE2_ASN_URL);
+    }
+
+    #[test]
+    fn database_type_must_match_the_requested_kind() {
+        assert!(GeoDatabaseKind::City.accepts_database_type("GeoLite2-City"));
+        assert!(GeoDatabaseKind::City.accepts_database_type("DBIP-City-Lite"));
+        assert!(!GeoDatabaseKind::City.accepts_database_type("GeoLite2-ASN"));
+        assert!(GeoDatabaseKind::Asn.accepts_database_type("GeoLite2-ASN"));
+        assert!(GeoDatabaseKind::Asn.accepts_database_type("GeoIP2-ISP"));
+        assert!(!GeoDatabaseKind::Asn.accepts_database_type("GeoLite2-City"));
+    }
+
+    /// The bundled files are what Docker images and first-start downloads
+    /// ship, so each must validate as its own kind and be rejected as the
+    /// other. Skips when the files are not present.
+    #[test]
+    fn bundled_databases_validate_as_their_own_kind_only() {
+        let cli_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../temps-cli");
+        let (Ok(city), Ok(asn)) = (
+            std::fs::read(cli_dir.join(CITY_DB_FILENAME)),
+            std::fs::read(cli_dir.join(ASN_DB_FILENAME)),
+        ) else {
+            println!("Bundled GeoLite2 databases not present, skipping");
+            return;
+        };
+
+        assert!(validate_mmdb_bytes_for(GeoDatabaseKind::City, &city, "test").is_ok());
+        assert!(validate_mmdb_bytes_for(GeoDatabaseKind::Asn, &asn, "test").is_ok());
+
+        let wrong = validate_mmdb_bytes_for(GeoDatabaseKind::Asn, &city, "test")
+            .expect_err("a City file is not an ASN database");
+        assert!(wrong.to_string().contains("expected a ASN database"));
+        assert!(validate_mmdb_bytes_for(GeoDatabaseKind::City, &asn, "test").is_err());
     }
 
     #[test]
@@ -1406,7 +1660,7 @@ mod tests {
     ) {
         let row = temps_entities::settings::Model {
             id: 1,
-            data: temps_core::AppSettings::default().to_json(),
+            data: temps_config::AppSettings::default().to_json(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -1496,6 +1750,14 @@ mod tests {
             .clone()
     }
 
+    fn bundled_asn_db() -> Option<std::sync::Arc<Vec<u8>>> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("temps-cli")
+            .join(ASN_DB_FILENAME);
+        std::fs::read(path).ok().map(std::sync::Arc::new)
+    }
+
     fn build_epoch_of(bytes: &[u8]) -> u64 {
         maxminddb::Reader::from_source(bytes)
             .expect("the fixture must be a readable database")
@@ -1573,8 +1835,12 @@ mod tests {
         assert_eq!(proxy.build_epoch(), Some(initial_epoch));
 
         // Short poll so the test does not wait a real minute.
-        let _watcher = spawn_db_file_watcher_every(&proxy, path.clone(), Duration::from_millis(25))
-            .expect("start the watcher");
+        let _watcher = spawn_db_file_watcher_every(
+            &proxy,
+            vec![(GeoDatabaseKind::City, path.clone())],
+            Duration::from_millis(25),
+        )
+        .expect("start the watcher");
 
         // The console process refreshes: the file is replaced and *its* reader
         // is swapped. Nothing tells the proxy's reader anything.
@@ -1606,6 +1872,212 @@ mod tests {
         drop(proxy);
     }
 
+    /// A server that started without the database picks it up from the file
+    /// alone: no restart, no license key, no download of its own.
+    #[tokio::test]
+    async fn the_file_watcher_loads_a_database_a_degraded_server_was_missing() {
+        let Some(base) = bundled_city_db() else {
+            println!("{} is not in this checkout; skipping", CITY_DB_FILENAME);
+            return;
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(CITY_DB_FILENAME);
+        let service = std::sync::Arc::new(GeoIpService::MaxMind(std::sync::Arc::new(
+            crate::geoip_service::MaxMindGeoIpService::load(
+                &path,
+                &dir.path().join("GeoLite2-ASN.mmdb"),
+            )
+            .expect("a missing file must not fail startup"),
+        )));
+        assert_eq!(service.build_epoch(), None);
+
+        let _watcher = spawn_db_file_watcher_every(
+            &service,
+            vec![(GeoDatabaseKind::City, path.clone())],
+            Duration::from_millis(25),
+        )
+        .expect("start the watcher");
+
+        write_mmdb_atomically(&path, shared(base.to_vec()))
+            .await
+            .expect("provide the database");
+
+        let expected = Some(build_epoch_of(&base));
+        let picked_up = tokio::time::timeout(Duration::from_secs(20), async {
+            while service.build_epoch() != expected {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await;
+        assert!(
+            picked_up.is_ok(),
+            "the database file appeared but the degraded server never loaded it"
+        );
+
+        drop(service);
+    }
+
+    /// Startup stops waiting for a slow download, so the ASN database can arrive
+    /// long after the service looked for it. Hosting classification must turn on
+    /// when it does, or datacenter traffic counts as human until a restart.
+    #[tokio::test]
+    async fn the_file_watcher_loads_an_asn_database_that_arrives_after_startup() {
+        let (Some(city), Some(asn)) = (bundled_city_db(), bundled_asn_db()) else {
+            println!("the bundled databases are not in this checkout; skipping");
+            return;
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let city_path = dir.path().join(CITY_DB_FILENAME);
+        let asn_path = dir.path().join(ASN_DB_FILENAME);
+        write_mmdb_atomically(&city_path, city)
+            .await
+            .expect("provide the city database");
+        let maxmind = std::sync::Arc::new(
+            crate::geoip_service::MaxMindGeoIpService::load(&city_path, &asn_path)
+                .expect("a missing ASN file must not fail startup"),
+        );
+        let service = std::sync::Arc::new(GeoIpService::MaxMind(maxmind.clone()));
+        let cloud_ip: std::net::IpAddr = "8.8.8.8".parse().unwrap();
+        assert!(!service.has_asn_database());
+        assert_eq!(
+            maxmind
+                .geolocate(cloud_ip)
+                .await
+                .unwrap()
+                .is_hosting_provider,
+            None
+        );
+
+        let _watcher = spawn_db_file_watcher_every(
+            &service,
+            vec![
+                (GeoDatabaseKind::City, city_path),
+                (GeoDatabaseKind::Asn, asn_path.clone()),
+            ],
+            Duration::from_millis(25),
+        )
+        .expect("start the watcher");
+
+        // A file that cannot be read yet is retried, not given up on.
+        std::fs::write(&asn_path, b"not a database").expect("write a broken file");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!service.has_asn_database());
+
+        let expected = Some(build_epoch_of(&asn));
+        write_mmdb_atomically(&asn_path, asn)
+            .await
+            .expect("provide the ASN database");
+        let picked_up = tokio::time::timeout(Duration::from_secs(20), async {
+            while service.asn_build_epoch() != expected {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await;
+        assert!(
+            picked_up.is_ok(),
+            "the ASN database arrived but the running server never loaded it"
+        );
+        assert!(maxmind
+            .geolocate(cloud_ip)
+            .await
+            .unwrap()
+            .is_hosting_provider
+            .is_some());
+
+        drop(service);
+    }
+
+    /// Downloads check a file's kind, but an operator can copy any file into
+    /// place. A City file saved under the ASN name decodes to empty records, which
+    /// classify every cloud address as "not hosting", and those verdicts get stored.
+    #[tokio::test]
+    async fn a_database_of_the_wrong_kind_never_replaces_the_loaded_one() {
+        let (Some(city), Some(asn)) = (bundled_city_db(), bundled_asn_db()) else {
+            println!("the bundled databases are not in this checkout; skipping");
+            return;
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let city_path = dir.path().join(CITY_DB_FILENAME);
+        let asn_path = dir.path().join(ASN_DB_FILENAME);
+        std::fs::write(&city_path, city.as_slice()).expect("seed the city database");
+        std::fs::write(&asn_path, asn.as_slice()).expect("seed the ASN database");
+        let service = GeoIpService::MaxMind(std::sync::Arc::new(
+            crate::geoip_service::MaxMindGeoIpService::load(&city_path, &asn_path)
+                .expect("load both databases"),
+        ));
+        let city_epoch = Some(build_epoch_of(&city));
+        let asn_epoch = Some(build_epoch_of(&asn));
+        assert_ne!(city_epoch, asn_epoch, "the swap guard must not hide this");
+
+        // Each file holds a readable database of the other kind.
+        let wrong_asn = service
+            .refresh_asn_from_path_if_changed(&city_path)
+            .expect_err("a City file is not an ASN database");
+        assert!(
+            matches!(
+                &wrong_asn,
+                GeoIpError::WrongDatabaseKind { path, expected, found }
+                    if path == &city_path.display().to_string()
+                        && *expected == ASN_DB_FILENAME
+                        && found.contains("City")
+            ),
+            "{wrong_asn:?}"
+        );
+        let wrong_city = service
+            .refresh_from_path_if_changed(&asn_path)
+            .expect_err("an ASN file is not a City database");
+        assert!(
+            matches!(
+                &wrong_city,
+                GeoIpError::WrongDatabaseKind { path, expected, found }
+                    if path == &asn_path.display().to_string()
+                        && *expected == CITY_DB_FILENAME
+                        && found.contains("ASN")
+            ),
+            "{wrong_city:?}"
+        );
+
+        // An unreadable file is a different failure, and stays one.
+        let unreadable = dir.path().join("broken.mmdb");
+        std::fs::write(&unreadable, b"not a database").expect("write a broken file");
+        assert!(matches!(
+            service.refresh_asn_from_path_if_changed(&unreadable),
+            Err(GeoIpError::ReloadFailed { .. })
+        ));
+
+        assert_eq!(service.asn_build_epoch(), asn_epoch);
+        assert_eq!(service.build_epoch(), city_epoch);
+
+        // A real replacement of the right kind still lands.
+        let newer = with_build_epoch(&asn, build_epoch_of(&asn) + 86_400);
+        std::fs::write(&asn_path, &newer).expect("replace the ASN database");
+        assert_eq!(
+            service
+                .refresh_asn_from_path_if_changed(&asn_path)
+                .expect("a newer ASN database"),
+            Some(build_epoch_of(&newer))
+        );
+    }
+
+    /// The same file at startup must not turn detection "on" with nothing behind it.
+    #[test]
+    fn startup_treats_a_wrong_kind_of_asn_file_as_missing() {
+        let Some(city) = bundled_city_db() else {
+            println!("{} is not in this checkout; skipping", CITY_DB_FILENAME);
+            return;
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let city_path = dir.path().join(CITY_DB_FILENAME);
+        let asn_path = dir.path().join(ASN_DB_FILENAME);
+        std::fs::write(&city_path, city.as_slice()).expect("seed the city database");
+        std::fs::write(&asn_path, city.as_slice()).expect("save it under the ASN name");
+
+        let service = crate::geoip_service::MaxMindGeoIpService::load(&city_path, &asn_path)
+            .expect("an optional database must not fail startup");
+
+        assert!(!service.has_asn_database());
+    }
+
     /// The poll exists to notice an out-of-process write quickly; it must stay
     /// far below any download cadence rather than track it.
     #[test]
@@ -1614,7 +2086,7 @@ mod tests {
         assert!(
             DB_FILE_WATCH_INTERVAL
                 < Duration::from_secs(
-                    u64::from(temps_core::DEFAULT_GEO_REFRESH_INTERVAL_HOURS) * 3600
+                    u64::from(temps_config::DEFAULT_GEO_REFRESH_INTERVAL_HOURS) * 3600
                 )
         );
     }

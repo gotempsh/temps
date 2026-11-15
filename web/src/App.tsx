@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { RedirectWithQuery } from '@/components/routing/RedirectWithQuery'
+import { RetiredAiWorkspaceRedirect } from '@/components/routing/RetiredAiWorkspaceRedirect'
 import { CommandPalette } from '@/components/command/CommandPalette'
 import {
   CompactErrorFallback,
@@ -30,6 +31,7 @@ import { lazy, Suspense, useEffect } from 'react'
 import { BrowserRouter, Route, Routes, useLocation } from 'react-router'
 import { toast, Toaster } from 'sonner'
 import { gitProviderSetupPath, problemSetupPath } from '@/lib/api-problem'
+import { useScrollToLinkedSection } from '@/hooks/useOpenSectionFromHash'
 import {
   nodeCapabilityQueryKey,
   type NodeCapability,
@@ -114,9 +116,33 @@ const ProjectGroupDetail = lazy(() =>
 const Revenue = lazy(() =>
   import('./pages/Revenue').then((m) => ({ default: m.Revenue }))
 )
+const StatusPages = lazy(() =>
+  import('./pages/StatusPages').then((m) => ({ default: m.StatusPages }))
+)
+const NewStatusPagePage = lazy(() =>
+  import('./pages/StatusPages').then((m) => ({ default: m.NewStatusPagePage }))
+)
+const StatusPageDetailPage = lazy(() =>
+  import('./pages/StatusPages').then((m) => ({
+    default: m.StatusPageDetailPage,
+  }))
+)
 const Sandboxes = lazy(() => import('./pages/Sandboxes'))
 const WorkspaceDetail = lazy(() => import('./pages/WorkspaceDetail'))
 const SandboxDetail = lazy(() => import('./pages/SandboxDetail'))
+const AccessSessionCreatePage = lazy(
+  () => import('./pages/AccessSessionCreatePage')
+)
+const AccessSessionDetailPage = lazy(
+  () => import('./pages/AccessSessionDetailPage')
+)
+const AccessBundleDetailPage = lazy(
+  () => import('./pages/AccessBundleDetailPage')
+)
+const AccessBundlePage = lazy(() => import('./pages/AccessBundlePage'))
+const VaultDetailPage = lazy(() => import('./pages/VaultDetailPage'))
+const VaultPage = lazy(() => import('./pages/VaultPage'))
+const AccessServicePage = lazy(() => import('./pages/AccessServicePage'))
 const Storage = lazy(() =>
   import('./pages/Storage').then((m) => ({ default: m.Storage }))
 )
@@ -231,6 +257,20 @@ const TunnelDomainDetail = lazy(() =>
 const Certificates = lazy(() =>
   import('./pages/Certificates').then((m) => ({ default: m.Certificates }))
 )
+const ProjectWorkflowKeys = lazy(() => import('./pages/workflows/ProjectWorkflowKeys').then((m) => ({ default: m.ProjectWorkflowKeys })))
+const WorkflowSettings = lazy(() => import('./pages/workflows/WorkflowSettings').then((m) => ({ default: m.WorkflowSettings })))
+const WorkflowGrants = lazy(() => import('./pages/workflows/WorkflowGrants').then((m) => ({ default: m.WorkflowGrants })))
+const AllWorkflows = lazy(() =>
+  import('./pages/workflows/AllWorkflows').then((m) => ({
+    default: m.AllWorkflows,
+  }))
+)
+const WorkflowDetail = lazy(() => import('./pages/workflows/WorkflowDetail').then((m) => ({ default: m.WorkflowDetail })))
+const WorkflowRunDetail = lazy(() =>
+  import('./pages/workflows/WorkflowRunDetail').then((m) => ({
+    default: m.WorkflowRunDetail,
+  }))
+)
 const Backups = lazy(() =>
   import('./pages/Backups').then((m) => ({ default: m.Backups }))
 )
@@ -269,7 +309,9 @@ const ImportProject = lazy(() =>
 )
 const Import = lazy(() => import('./pages/Import'))
 const ProjectDetail = lazy(() =>
-  import('./pages/ProjectDetail').then((m) => ({ default: m.ProjectDetail }))
+  import('./pages/ProjectDetail').then((m) => ({
+    default: m.ProjectDetail,
+  }))
 )
 const Settings = lazy(() =>
   import('./pages/Settings').then((m) => ({ default: m.Settings }))
@@ -308,6 +350,9 @@ const AuditLogs = lazy(() =>
 )
 const CliLogin = lazy(() =>
   import('./pages/CliLogin').then((m) => ({ default: m.CliLogin }))
+)
+const IngressLogin = lazy(() =>
+  import('./pages/IngressLogin').then((m) => ({ default: m.IngressLogin }))
 )
 const ProxyLogs = lazy(() => import('./pages/ProxyLogs'))
 const ProxyMetrics = lazy(() => import('./pages/ProxyMetrics'))
@@ -378,6 +423,11 @@ const RequestTimeoutsPage = lazy(() =>
     default: m.RequestTimeoutsPage,
   }))
 )
+const ServiceHealthchecksPage = lazy(() =>
+  import('./pages/settings/ServiceHealthchecksPage').then((m) => ({
+    default: m.ServiceHealthchecksPage,
+  }))
+)
 const OnDemandTlsPage = lazy(() =>
   import('./pages/settings/OnDemandTlsPage').then((m) => ({
     default: m.OnDemandTlsPage,
@@ -436,6 +486,16 @@ const McpServerPage = lazy(() =>
 const TelemetrySettingsPage = lazy(() =>
   import('./pages/settings/TelemetrySettingsPage').then((m) => ({
     default: m.TelemetrySettingsPage,
+  }))
+)
+const DnsPage = lazy(() =>
+  import('./pages/settings/DnsPage').then((m) => ({
+    default: m.DnsPage,
+  }))
+)
+const NetworkPolicyPage = lazy(() =>
+  import('./pages/settings/NetworkPolicyPage').then((m) => ({
+    default: m.NetworkPolicyPage,
   }))
 )
 const IngressSetupPage = lazy(() =>
@@ -508,6 +568,8 @@ const FullAppRoutes = () => {
   const focusMode = useLocation().pathname === '/chat'
   // On a phone the keyboard must not push the header off screen.
   useVisualViewportFit(focusMode)
+  // A link to a setting lands on that setting, on every page.
+  useScrollToLinkedSection()
 
   // Lock the document to the viewport while the app shell is mounted. The shell
   // is a fixed-height (`dvh`) layout whose content scrolls in inner containers,
@@ -632,6 +694,7 @@ const FullAppRoutes = () => {
                     the screen. Anything sized to 100% of it — a plugin
                     iframe, say — lost its last rows off-screen. */}
                 <div
+                  data-console-scroll
                   className={
                     focusMode
                       ? 'flex-1 min-h-0 overflow-hidden flex flex-col'
@@ -687,6 +750,84 @@ const FullAppRoutes = () => {
                           }
                         />
                         <Route path="/revenue" element={<Revenue />} />
+                        <Route path="/status-pages" element={<StatusPages />} />
+                        <Route
+                          path="/status-pages/new"
+                          element={<NewStatusPagePage />}
+                        />
+                        <Route
+                          path="/status-pages/:statusPageId"
+                          element={<StatusPageDetailPage />}
+                        />
+                        <Route
+                          path="/access-services/new"
+                          element={<AccessServicePage />}
+                        />
+                        <Route
+                          path="/access-services/:serviceId/edit"
+                          element={<AccessServicePage />}
+                        />
+                        <Route
+                          path="/vault/vaults/:vaultId/bundles/new"
+                          element={<AccessBundlePage />}
+                        />
+                        <Route
+                          path="/vault/vaults/:vaultId/bundles/:bundleId/edit"
+                          element={<AccessBundlePage />}
+                        />
+                        <Route
+                          path="/vault/vaults/:vaultId/bundles/:bundleId/sessions/new"
+                          element={<AccessSessionCreatePage />}
+                        />
+                        <Route
+                          path="/vault/vaults/:vaultId/sessions/:sessionId"
+                          element={<AccessSessionDetailPage />}
+                        />
+                        <Route
+                          path="/vault/vaults/:vaultId/bundles/:bundleId"
+                          element={<AccessBundleDetailPage />}
+                        />
+                        <Route
+                          path="/projects/:projectId/access-services/new"
+                          element={<AccessServicePage />}
+                        />
+                        <Route
+                          path="/projects/:projectId/access-services/:serviceId/edit"
+                          element={<AccessServicePage />}
+                        />
+                        <Route
+                          path="/vault/projects/:projectId/vaults/:vaultId/bundles/new"
+                          element={<AccessBundlePage />}
+                        />
+                        <Route
+                          path="/vault/projects/:projectId/vaults/:vaultId/bundles/:bundleId/edit"
+                          element={<AccessBundlePage />}
+                        />
+                        <Route
+                          path="/vault/projects/:projectId/vaults/:vaultId/bundles/:bundleId/sessions/new"
+                          element={<AccessSessionCreatePage />}
+                        />
+                        <Route
+                          path="/vault/projects/:projectId/vaults/:vaultId/sessions/:sessionId"
+                          element={<AccessSessionDetailPage />}
+                        />
+                        <Route
+                          path="/vault/projects/:projectId/vaults/:vaultId/bundles/:bundleId"
+                          element={<AccessBundleDetailPage />}
+                        />
+                        <Route
+                          path="/vault/projects/:projectId/vaults/:vaultId"
+                          element={<VaultDetailPage />}
+                        />
+                        <Route path="/vault" element={<VaultPage />} />
+                        <Route
+                          path="/vault/vaults/:vaultId"
+                          element={<VaultDetailPage />}
+                        />
+                        <Route
+                          path="/vault/projects/:projectId"
+                          element={<VaultPage />}
+                        />
                         <Route path="/sandboxes" element={<Sandboxes />} />
                         <Route
                           path="/workspaces"
@@ -765,6 +906,12 @@ const FullAppRoutes = () => {
                     visitors get bounced through /login and the
                     captureReturnTo() infrastructure brings them back. */}
                         <Route path="/cli-login" element={<CliLogin />} />
+                        {/* Temps login hand-off for environments that require
+                    it (ADR-055 §11); protected for the same reason. */}
+                        <Route
+                          path="/ingress/login"
+                          element={<IngressLogin />}
+                        />
                         <Route
                           path="/cli-login/:userCode"
                           element={<CliLogin />}
@@ -862,6 +1009,10 @@ const FullAppRoutes = () => {
                             element={<RequestTimeoutsPage />}
                           />
                           <Route
+                            path="service-healthchecks"
+                            element={<ServiceHealthchecksPage />}
+                          />
+                          <Route
                             path="on-demand-tls"
                             element={<OnDemandTlsPage />}
                           />
@@ -883,6 +1034,10 @@ const FullAppRoutes = () => {
                             path="nodes/:nodeId"
                             element={<NodeDetailPage />}
                           />
+                          <Route
+                            path="nodes/:nodeId/:section"
+                            element={<NodeDetailPage />}
+                          />
                           <Route path="plugins" element={<PluginsPage />} />
                           <Route
                             path="plugins/install"
@@ -895,6 +1050,11 @@ const FullAppRoutes = () => {
                           <Route
                             path="traefik-discovery"
                             element={<TraefikDiscoveryPage />}
+                          />
+                          <Route path="dns" element={<DnsPage />} />
+                          <Route
+                            path="network-policy"
+                            element={<NetworkPolicyPage />}
                           />
                           <Route
                             path="mcp-server"
@@ -1002,9 +1162,11 @@ const FullAppRoutes = () => {
                           element={<RedirectWithQuery to="/ai-gateway" />}
                         />
                         <Route path="/chat" element={<AiChat />} />
+                        {/* The AI workspace page was retired; old links
+                            land on the workspace they named. */}
                         <Route
                           path="/ai-first"
-                          element={<RedirectWithQuery to="/chat" />}
+                          element={<RetiredAiWorkspaceRedirect />}
                         />
                         <Route
                           path="/ai-workflows"
@@ -1076,6 +1238,15 @@ const FullAppRoutes = () => {
                         <Route
                           path="/dns-providers/:id"
                           element={<DnsProviderDetail />}
+                        />
+                        <Route path="/workflows" element={<AllWorkflows />} />
+                        <Route path="/workflows/:projectId/:environmentId" element={<WorkflowDetail />} />
+                        <Route path="/workflows/:projectId/keys" element={<ProjectWorkflowKeys />} />
+                        <Route path="/workflows/:projectId/:environmentId/settings" element={<WorkflowSettings />} />
+                        <Route path="/workflows/:projectId/:environmentId/grants" element={<WorkflowGrants />} />
+                        <Route
+                          path="/workflows/:projectId/:environmentId/runs/:runId"
+                          element={<WorkflowRunDetail />}
                         />
                         <Route path="/backups" element={<Backups />} />
                         <Route
@@ -1318,7 +1489,9 @@ const queryClient = new QueryClient({
       // `meta` and `mutationKey` arrive in the fourth argument; the third is
       // the `onMutate` result, which is `undefined` for these mutations.
       onError: (error: unknown, _variables, _onMutateResult, context) => {
-        const problemDetails = error as ProblemDetails
+        const problemDetails = error as ProblemDetails & {
+          extensions?: Record<string, unknown>
+        }
 
         // Sensitive mutations own this response: they open a step-up dialog
         // and retry after verification. A global error toast would be both

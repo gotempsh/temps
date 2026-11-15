@@ -200,7 +200,7 @@ test zone; local fake-provider tests must not access real provider credentials.
 From the Rust workspace root:
 
 ```sh
-cargo check --lib -p temps-dns -p temps-core -p temps-agents
+cargo check --lib -p temps-dns -p temps-core -p temps-ai-agents
 cargo test --lib -p temps-dns
 cargo test -p temps-dns --test domain_delivery_integration -- --nocapture
 ```

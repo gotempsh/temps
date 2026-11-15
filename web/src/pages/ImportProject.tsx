@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { dockerfileCreationConfig } from '@/lib/container-runtime-overrides'
 import {
   createProjectMutation,
   getBranchesByRepositoryIdOptions,
@@ -273,8 +274,8 @@ export function ImportProject() {
                           })
                         ),
                         preset_config:
-                          data.preset === 'dockerfile' && data.dockerfilePath
-                            ? { dockerfilePath: data.dockerfilePath }
+                          data.preset === 'dockerfile'
+                            ? dockerfileCreationConfig(data)
                             : data.preset === 'docker-compose'
                               ? {
                                   composePath:

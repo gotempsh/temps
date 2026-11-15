@@ -13,7 +13,7 @@
  * to get wrong and expensive to get wrong — exists in exactly one place.
  */
 
-import { totp, waitForFreshWindow } from "./totp.ts";
+import { totp, waitForFreshWindow, waitForNextWindow } from "./totp.ts";
 
 /** The caller's authenticated JSON helper, already carrying a session cookie. */
 export type ApiFn = <T>(path: string, init?: RequestInit) => Promise<T>;
@@ -23,8 +23,16 @@ interface MfaSetup {
   recovery_codes?: string[];
 }
 
-export async function mintApiKey(api: ApiFn, name: string): Promise<string> {
-  const setup = await api<MfaSetup>("/users/me/mfa/setup", { method: "POST" });
+export async function mintApiKey(
+  api: ApiFn,
+  name: string,
+  /** Enrolling MFA on an account with a local password requires that password. */
+  currentPassword?: string,
+): Promise<string> {
+  const setup = await api<MfaSetup>("/users/me/mfa/setup", {
+    method: "POST",
+    body: JSON.stringify({ current_password: currentPassword }),
+  });
   const secret = setup.secret_key;
 
   try {
@@ -34,6 +42,8 @@ export async function mintApiKey(api: ApiFn, name: string): Promise<string> {
       body: JSON.stringify({ code: await totp(secret) }),
     });
 
+    // verify consumed this window's code; step-up needs a fresh one.
+    await waitForNextWindow();
     await api("/auth/step-up", {
       method: "POST",
       body: JSON.stringify({ code: await totp(secret) }),
@@ -63,7 +73,7 @@ async function disableMfa(
   recoveryCodes: string[],
 ): Promise<void> {
   try {
-    await waitForFreshWindow();
+    await waitForNextWindow();
     await api<void>("/users/me/mfa", {
       method: "DELETE",
       body: JSON.stringify({ code: await totp(secret) }),

@@ -10,7 +10,7 @@
 
 use thiserror::Error;
 
-use temps_agents::error::AgentError;
+use temps_agent_core::error::AgentError;
 
 /// Typed errors for the snapshot sub-API (ADR-037).
 ///
@@ -285,6 +285,14 @@ pub enum SandboxError {
         feature: String,
     },
 
+    /// The sandbox's backend cannot enforce a `restricted` egress policy
+    /// (only Docker sandboxes can). The request is well-formed; it just
+    /// cannot be honoured where the sandbox runs. Mapped to HTTP 422.
+    #[error(
+        "Sandbox {sandbox_id} runs on the {backend} backend, which cannot restrict egress to an allow-list of hosts and CIDR blocks. Use egress mode 'internet' for it, or create the sandbox on the docker backend."
+    )]
+    EgressPolicyUnsupported { sandbox_id: String, backend: String },
+
     /// The sandbox's worker node refused the operation because it would
     /// replace a live sandbox there (ADR-048). Mapped to HTTP 409.
     #[error("Sandbox {sandbox_id} conflicts with existing state on its worker node: {reason}")]
@@ -504,7 +512,7 @@ pub fn from_agent_error(sandbox_id: &str, err: AgentError) -> SandboxError {
         let reason = if reason.contains("default-address-pools") {
             reason.to_string()
         } else {
-            temps_agents::error::network_pool_exhausted_reason(sandbox_id, reason)
+            temps_agent_core::error::network_pool_exhausted_reason(sandbox_id, reason)
         };
         return SandboxError::NetworkCapacityExhausted {
             sandbox_id: sandbox_id.to_string(),
@@ -551,6 +559,14 @@ pub fn from_agent_error(sandbox_id: &str, err: AgentError) -> SandboxError {
             node_name,
             feature,
         },
+        // A restricted egress policy on a backend that cannot enforce one: a
+        // 422 naming the backend, never a silently wider policy.
+        AgentError::SandboxEgressPolicyUnsupported { backend, .. } => {
+            SandboxError::EgressPolicyUnsupported {
+                sandbox_id: sandbox_id.to_string(),
+                backend,
+            }
+        }
         // ADR 063: this host runs nothing; a 409 with what is possible instead.
         no_host @ AgentError::NoLocalSandboxHost { .. } => SandboxError::NoLocalHost {
             message: no_host.to_string(),
@@ -579,6 +595,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn an_unenforceable_egress_policy_is_a_422_naming_the_backend() {
+        let err = from_agent_error(
+            "sbx_abc",
+            AgentError::SandboxEgressPolicyUnsupported {
+                sandbox: "temps-sandbox-abc".into(),
+                backend: "firecracker".into(),
+            },
+        );
+        assert!(
+            matches!(&err, SandboxError::EgressPolicyUnsupported { sandbox_id, backend }
+                if sandbox_id == "sbx_abc" && backend == "firecracker"),
+            "{err:?}"
+        );
+        let text = err.to_string();
+        assert!(
+            text.contains("sbx_abc") && text.contains("firecracker"),
+            "{text}"
+        );
+        let problem = temps_core::problemdetails::Problem::from(err);
+        assert_eq!(
+            problem.status_code,
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+
+    #[test]
     fn worker_conflicts_are_409s_not_failures() {
         let err = from_agent_error(
             "sbx_abc",
@@ -604,7 +646,7 @@ mod tests {
             AgentError::SandboxCreationFailed {
                 run_id: 3,
                 provider: "docker".into(),
-                reason: temps_agents::error::image_pull_failure_reason(
+                reason: temps_agent_core::error::image_pull_failure_reason(
                     "registry.example.test/team/img:9.9.9",
                     "manifest unknown",
                 ),
@@ -890,7 +932,7 @@ mod tests {
         assert_eq!(problem.status_code, axum::http::StatusCode::CONFLICT);
         assert_eq!(
             problem.body["error_code"],
-            temps_agents::error::NO_LOCAL_SANDBOX_HOST_ERROR_CODE
+            temps_agent_core::error::NO_LOCAL_SANDBOX_HOST_ERROR_CODE
         );
         assert!(!problem.body.contains_key("setup_path"));
 
@@ -955,7 +997,7 @@ mod tests {
             SandboxError::NetworkCapacityExhausted { sandbox_id, reason } => {
                 assert_eq!(sandbox_id, "sbx_abc");
                 assert!(reason.contains("default-address-pools"), "{reason}");
-                assert!(reason.contains("Delete sandboxes"), "{reason}");
+                assert!(reason.contains("Stop sandboxes"), "{reason}");
             }
             other => panic!("expected NetworkCapacityExhausted, got {other:?}"),
         }
@@ -963,7 +1005,7 @@ mod tests {
 
     #[test]
     fn provider_reason_that_already_carries_guidance_is_not_wrapped_twice() {
-        let reason = temps_agents::error::network_pool_exhausted_reason(
+        let reason = temps_agent_core::error::network_pool_exhausted_reason(
             "temps-sandbox-abc",
             "all predefined address pools have been fully subnetted",
         );

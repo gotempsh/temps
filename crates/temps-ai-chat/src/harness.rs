@@ -429,19 +429,19 @@ mod tests {
     fn connect_playbook_names_variables_the_providers_set() {
         let providers: &[(&str, &str)] = &[
             (
-                include_str!("../../temps-providers/src/externalsvc/postgres.rs"),
+                include_str!("../../temps-providers-postgres/src/postgres/lifecycle.rs"),
                 "POSTGRES_URL POSTGRES_HOST POSTGRES_PORT POSTGRES_DB POSTGRES_USER POSTGRES_PASSWORD",
             ),
             (
-                include_str!("../../temps-providers/src/externalsvc/redis.rs"),
+                include_str!("../../temps-providers-redis/src/redis.rs"),
                 "REDIS_URL REDIS_HOST REDIS_PORT REDIS_PASSWORD",
             ),
             (
-                include_str!("../../temps-providers/src/externalsvc/mongodb.rs"),
+                include_str!("../../temps-providers-mongodb/src/mongodb.rs"),
                 "MONGODB_HOST MONGODB_PORT MONGODB_DATABASE MONGODB_USERNAME MONGODB_PASSWORD",
             ),
             (
-                include_str!("../../temps-providers/src/externalsvc/s3.rs"),
+                include_str!("../../temps-providers-s3/src/s3.rs"),
                 "S3_ENDPOINT S3_BUCKET S3_ACCESS_KEY S3_SECRET_KEY S3_REGION",
             ),
         ];
@@ -461,6 +461,93 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn connect_playbook_grants_internal_access_only_with_human_consent() {
+        let playbook = all()
+            .iter()
+            .find(|p| p.name == "connect-a-service")
+            .unwrap();
+        let allowlists = include_str!("../../temps-ai-api-tools/src/allowlists.rs");
+        for operation in [
+            "list_sandbox_internal_addresses",
+            "list_internal_access_sandbox_grants",
+            "list_internal_access_grants",
+            "create_internal_access_sandbox_grant",
+            "create_internal_access_grant",
+            "delete_internal_access_sandbox_grant",
+            "delete_internal_access_grant",
+        ] {
+            assert!(playbook.body.contains(operation), "{operation}");
+            assert!(
+                allowlists.contains(&format!("\"{operation}\"")),
+                "{operation} must be available to chat"
+            );
+        }
+        // The playbook starts from the sandbox's 403, as the node agent
+        // words it, and holds the grant to the person's own confirmation.
+        let refusal = include_str!("../../temps-node-agent/src/internal_access.rs");
+        assert!(refusal.contains("internal route is not accessible from sandbox"));
+        assert!(playbook
+            .body
+            .contains("internal route is not accessible from sandbox"));
+        let words = playbook
+            .body
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(words.contains(
+            "The person must confirm that pending action in the console, including in Auto mode"
+        ));
+        assert!(playbook.description.contains("*.temps.local"));
+    }
+
+    #[test]
+    fn connect_playbook_supports_chat_only_vault_consent() {
+        let playbook = all()
+            .iter()
+            .find(|p| p.name == "connect-a-service")
+            .unwrap();
+        for operation in [
+            "sandbox_access_vaults",
+            "list_access_bundles_general",
+            "get_access_vault_general",
+            "create_vault_link",
+            "create_access_bundle_general",
+            "create_access_session_general",
+            "get_access_session_general",
+            "revoke_access_session_general",
+        ] {
+            assert!(playbook.body.contains(operation));
+            let allowlists = include_str!("../../temps-ai-api-tools/src/allowlists.rs");
+            assert!(
+                allowlists.contains(operation),
+                "{operation} must be available to chat"
+            );
+        }
+        // An ordinary sandbox owner may read their sandbox's vaults but not
+        // the instance-wide service list, so the match starts from the vaults.
+        let vaults = playbook.body.find("sandbox_access_vaults").unwrap();
+        let all_services = playbook.body.find("list_access_services_general").unwrap();
+        assert!(
+            vaults < all_services,
+            "the playbook must start from the sandbox's vaults"
+        );
+        assert!(playbook.body.contains("anyone else gets a 403"));
+        assert!(playbook
+            .body
+            .contains("Service access is unavailable for this sandbox"));
+        assert!(playbook.body.contains("is not retryable"));
+        assert!(playbook.body.contains("authorization header"));
+        assert!(playbook.description.contains("Notion"));
+        assert!(playbook.body.contains(r#""kind":"sandbox""#));
+        assert!(playbook.body.contains("is not the vault id"));
+        assert!(playbook.body.contains("/bundles/new"));
+        assert!(playbook.body.contains("allows the method and path"));
+        assert!(playbook.body.contains("explicitly confirm"));
+        assert!(playbook.body.contains("does not need a project"));
+        assert!(playbook.body.contains("including in Auto mode"));
     }
 
     /// The variables the observability playbook tells the model to read are

@@ -26,6 +26,7 @@ import {
 } from '@/components/ui/select'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useEffect, useState } from 'react'
+import { Loader2 } from 'lucide-react'
 import { toast } from 'sonner'
 
 /**
@@ -79,32 +80,39 @@ export function EnvironmentPortOverrideCard({
     meta: { errorTitle: 'Failed to update port override' },
   })
 
+  const savedPort =
+    selectedEnvironment?.deployment_config?.exposedPort?.toString() ?? ''
+  const changed = portInput.trim() !== savedPort
+
+  // `toast.promise` returns a toast handle, not the request: await the
+  // mutation itself so the refresh sees the saved port.
   const handleSave = async () => {
     if (!selectedEnvId) return
-    await toast.promise(
-      updateSettings.mutateAsync({
+    try {
+      await updateSettings.mutateAsync({
         path: { project_id: project.id, env_id: selectedEnvId },
         body: {
           exposed_port:
             portInput.trim() !== '' ? parseInt(portInput, 10) : null,
         },
-      }),
-      {
-        loading: 'Updating port override...',
-        success: 'Port override updated successfully',
-      }
+      })
+    } catch {
+      // The mutation's errorTitle already explains the failure.
+      return
+    }
+    toast.success(
+      `Port for ${selectedEnvironment?.name ?? 'the environment'} saved`
     )
     queryClient.invalidateQueries({ queryKey: ['environments'] })
     queryClient.invalidateQueries({ queryKey: ['environment'] })
   }
 
   return (
-    <Card className="bg-background text-foreground">
+    <Card id="setting-port-overrides" className="scroll-mt-4">
       <CardHeader>
-        <CardTitle>Environment Port Overrides</CardTitle>
+        <CardTitle>Port per environment</CardTitle>
         <CardDescription>
-          Override the exposed port for a specific environment. Leave empty to
-          inherit the default port above.
+          Serve a different port in one environment.
         </CardDescription>
       </CardHeader>
       <CardContent>
@@ -135,13 +143,13 @@ export function EnvironmentPortOverrideCard({
             </Select>
           </div>
           <div className="space-y-2">
-            <Label htmlFor="env-port-override">Exposed Port (Override)</Label>
+            <Label htmlFor="env-port-override">Port</Label>
             <Input
               id="env-port-override"
               type="number"
               min="1"
               max="65535"
-              placeholder="Auto-detected from image"
+              placeholder="Default port"
               value={portInput}
               onChange={(e) => setPortInput(e.target.value)}
               disabled={!selectedEnvId}
@@ -150,11 +158,16 @@ export function EnvironmentPortOverrideCard({
         </div>
       </CardContent>
       <CardFooter>
+        <p>Leave it empty to use the default port.</p>
         <Button
+          size="sm"
           onClick={handleSave}
-          disabled={updateSettings.isPending || !selectedEnvId}
+          disabled={updateSettings.isPending || !selectedEnvId || !changed}
         >
-          Save Override
+          {updateSettings.isPending && (
+            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+          )}
+          Save
         </Button>
       </CardFooter>
     </Card>

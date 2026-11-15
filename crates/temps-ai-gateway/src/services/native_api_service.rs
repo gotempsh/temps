@@ -1104,6 +1104,7 @@ impl NativeApiService {
                 false,
                 record.provider_key_id.is_none(),
                 crate::types::PromptTokensDetails::default(),
+                crate::services::usage_service::UsageCount::BatchTotal,
                 &context,
             )
             .await?;
@@ -1781,6 +1782,7 @@ mod tests {
             trace_id: None,
             project_id: None,
             token_id: None,
+            price_known: None,
         };
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)

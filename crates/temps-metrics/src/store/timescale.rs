@@ -1176,7 +1176,7 @@ mod tests {
     /// averaging.
     #[tokio::test]
     async fn range_query_sums_delta_counters_and_averages_gauges_on_real_db() {
-        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+        use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
@@ -1247,7 +1247,7 @@ mod tests {
 
     #[tokio::test]
     async fn parameterised_queries_round_trip_hostile_values_on_real_db() {
-        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+        use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,

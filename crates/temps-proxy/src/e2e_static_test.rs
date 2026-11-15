@@ -8,7 +8,7 @@ mod e2e_static_tests {
     use sea_orm::ActiveValue::Set;
     use std::fs as std_fs;
     use std::io::Write;
-    use temps_database::test_utils::TestDatabase;
+    use temps_test_utils::TestDatabase;
 
     #[tokio::test]
     async fn test_end_to_end_static_file_deployment() -> Result<()> {

@@ -43,10 +43,14 @@
  * Two more things had to be confirmed by reading the actual production
  * auth path rather than assuming from names:
  *
- *   - The session cookie is named plain `session` (see
+ *   - The session cookie is named `__Host-session` over https and plain
+ *     `session` over plain HTTP, which is all a browser accepts the
+ *     host-only prefix with (see `crates/temps-auth/src/auth_cookies.rs`,
  *     `AuthService::create_session_cookie` and
  *     `AuthMiddleware::extract_user_session_from_cookies`, the middleware
- *     actually wired into the router via the plugin system). A same-named
+ *     actually wired into the router via the plugin system). Either name
+ *     authenticates, so this scenario echoes back whichever the server
+ *     issued. A same-named
  *     `SESSION_ID_COOKIE_NAME = "_temps_sid"` constant exists in
  *     `crates/temps-auth/src/middleware.rs`, but that file's
  *     `auth_middleware` free function is NOT the one registered as
@@ -55,7 +59,7 @@
  *     `packages/api` -- `X-Temps-...` / `_temps_visitor_id` analytics
  *     docs), an unrelated feature that happens to reuse the string
  *     "session". Sending `Cookie: _temps_sid=...` to the console API does
- *     nothing; only `Cookie: session=...` authenticates.
+ *     nothing; only the session cookie above authenticates.
  *   - The cookie-vs-bearer branches are mutually exclusive at the
  *     middleware level: an `Authorization` header of ANY kind (even one
  *     that fails to parse as `tk_`/`dt_`) skips the cookie-session branch
@@ -111,15 +115,22 @@ interface CreateApiKeyHttpResponse {
   created_at: string
 }
 
-/** Extract the `session=...` cookie value pair from a Set-Cookie response header set. */
+/**
+ * Extract the session cookie `name=value` pair from a Set-Cookie response
+ * header set, under whichever name the server issued it: `__Host-session`
+ * over https, plain `session` over plain HTTP (browsers only accept the
+ * host-only prefix with `Secure`). The prefixed name is preferred, the same
+ * way the server resolves it.
+ */
 function extractSessionCookie(setCookieValues: string[]): string {
-  for (const raw of setCookieValues) {
-    // Each Set-Cookie header value looks like `session=<value>; Path=/; ...`
-    const match = /^session=([^;]+)/.exec(raw.trim())
-    if (match) return `session=${match[1]}`
-  }
+  const pairs = setCookieValues
+    .map((raw) => /^(__Host-session|session)=([^;]+)/.exec(raw.trim()))
+    .filter((match): match is RegExpExecArray => match !== null)
+  const match =
+    pairs.find((candidate) => candidate[1] === '__Host-session') ?? pairs[0]
+  if (match) return `${match[1]}=${match[2]}`
   throw new Error(
-    `no "session" cookie found in login response Set-Cookie headers: ${JSON.stringify(setCookieValues)}`,
+    `no session cookie found in login response Set-Cookie headers: ${JSON.stringify(setCookieValues)}`,
   )
 }
 

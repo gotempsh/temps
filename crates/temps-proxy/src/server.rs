@@ -30,7 +30,7 @@ use temps_config::ServerConfig;
 use temps_core::plugin::{ServiceRegistrationContext, TempsPlugin};
 use temps_database::DbConnection;
 use temps_routes::CachedPeerTable;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use async_trait::async_trait;
 use std::future::Future;
@@ -73,13 +73,14 @@ fn apply_forwarded_ip_trust_refresh(
 /// ignored and loopback is used as the client IP for IP-based controls.
 async fn load_initial_forwarded_ip_trust(
     config_service: &temps_config::ConfigService,
-) -> Result<(bool, Option<Arc<HeaderName>>)> {
+) -> Result<(bool, Option<Arc<HeaderName>>, bool)> {
     let settings = config_service.get_settings().await.map_err(|error| {
         anyhow::anyhow!("Cannot start proxy: failed to load forwarded-IP trust setting: {error}")
     })?;
     Ok((
         settings.trust_loopback_forwarded_ip(),
         loopback_ja4_header(&settings),
+        settings.expose_platform_identity(),
     ))
 }
 
@@ -88,6 +89,7 @@ async fn load_initial_forwarded_ip_trust(
 #[derive(Debug)]
 struct LoopbackTrust {
     forwarded_ip: Arc<AtomicBool>,
+    expose_platform_identity: Arc<AtomicBool>,
     /// The header such a peer sends the visitor's JA4 in (ADR 066, D4).
     ja4_header: Arc<ArcSwapOption<HeaderName>>,
 }
@@ -96,9 +98,9 @@ struct LoopbackTrust {
 /// can be written by other means; a name the rule refuses is ignored rather
 /// than trusted, so the proxy never strips a header such as `Authorization`
 /// from every request.
-fn loopback_ja4_header(settings: &temps_core::AppSettings) -> Option<Arc<HeaderName>> {
+fn loopback_ja4_header(settings: &temps_config::AppSettings) -> Option<Arc<HeaderName>> {
     let stored = settings.loopback_ja4_header.as_deref()?;
-    let name = match temps_core::normalize_loopback_ja4_header(Some(stored)) {
+    let name = match temps_config::normalize_loopback_ja4_header(Some(stored)) {
         Ok(name) => name?,
         Err(error) => {
             tracing::warn!(%error, "Ignoring the stored loopback JA4 header");
@@ -130,7 +132,7 @@ fn start_forwarded_ip_trust_refresh(
     // (the outer runtime is only driving synchronous setup at this point), but this
     // adds to the same "runtime nesting" issue `integration_test.rs` is `#[ignore]`d
     // for — worth knowing before attempting to un-ignore those tests.
-    let (initial, initial_ja4_header) =
+    let (initial, initial_ja4_header, initial_identity) =
         runtime.block_on(load_initial_forwarded_ip_trust(&config_service))?;
     info!(
         enabled = initial,
@@ -138,9 +140,11 @@ fn start_forwarded_ip_trust_refresh(
         "Loaded loopback forwarded-IP trust before proxy startup"
     );
     let trust = LoopbackTrust {
+        expose_platform_identity: Arc::new(AtomicBool::new(initial_identity)),
         forwarded_ip: Arc::new(AtomicBool::new(initial)),
         ja4_header: Arc::new(ArcSwapOption::new(initial_ja4_header)),
     };
+    let identity = Arc::downgrade(&trust.expose_platform_identity);
     let snapshot = Arc::downgrade(&trust.forwarded_ip);
     let ja4_header = Arc::downgrade(&trust.ja4_header);
     runtime.spawn(async move {
@@ -159,6 +163,9 @@ fn start_forwarded_ip_trust_refresh(
                 info!(enabled, "Updated loopback forwarded-IP trust from platform settings");
             }
             if let Some(settings) = &settings {
+                if let Some(identity) = identity.upgrade() {
+                    identity.store(settings.expose_platform_identity(), Ordering::Relaxed);
+                }
                 let header = loopback_ja4_header(settings);
                 let name = header.as_deref().map(HeaderName::as_str).map(str::to_owned);
                 if apply_loopback_ja4_header_refresh(&ja4_header, header) {
@@ -371,7 +378,7 @@ async fn setup_proxy_plugins(
     context.register_service(db.clone());
 
     // Register ConfigPlugin for configuration services
-    let config_plugin = Box::new(temps_config::ConfigPlugin::new(config.clone()));
+    let config_plugin = Box::new(temps_config_handlers::ConfigPlugin::new(config.clone()));
     config_plugin
         .register_services(&context)
         .await
@@ -488,6 +495,50 @@ fn shared_runtime(
     }
 }
 
+/// Run startup work that may use the shared pool on a runtime that lasts as
+/// long as the process.
+///
+/// A connection stays registered with the runtime that opened it, and goes back
+/// into the pool when released. Had this work run on a temporary runtime, a
+/// connection it opened would outlive that runtime, and the next acquire to pick
+/// it would hang on its health check until the acquire timeout. Whether that
+/// happens depends on whether the console has left an idle connection at that
+/// moment, so it shows up as an occasional failed startup.
+///
+/// Anything the work spawns also keeps running, such as the `settings_change`
+/// listener `ConfigPlugin` starts, which stops when its `ConfigService` is dropped.
+fn block_on_refresh_runtime<F: Future>(future: F) -> Result<F::Output> {
+    Ok(refresh_runtime()?.block_on(future))
+}
+
+/// Loads every project's edge rules (ADR-089) and starts the loops that keep
+/// them current and record their match counts. The initial load must
+/// succeed: serving a project without the rules its operator saved would
+/// silently drop its protections.
+fn start_edge_rules(
+    db: Arc<DbConnection>,
+) -> Result<(
+    Arc<crate::edge_rules::EdgeRuleGate>,
+    Option<Arc<temps_geo::GeoIpService>>,
+)> {
+    let gate = crate::edge_rules::EdgeRuleGate::start_blocking(db, &security_refresh_runtime()?)
+        .map_err(|e| anyhow::anyhow!("Failed to load project edge rules at startup: {e}"))?;
+    // The same process-wide database the request log's enrichment uses; a
+    // missing one only means geography conditions never match.
+    let geo = match temps_geo::GeoIpService::new() {
+        Ok(geo) => Some(Arc::new(geo)),
+        Err(e) => {
+            warn!(
+                error = %e,
+                "No GeoIP database for edge rules; country, continent, ASN and hosting \
+                 network conditions will not match"
+            );
+            None
+        }
+    };
+    Ok((gate, geo))
+}
+
 /// Setup and configure the proxy server with all services
 #[allow(clippy::too_many_arguments)]
 pub fn setup_proxy_server(
@@ -533,21 +584,7 @@ pub fn setup_proxy_server(
     preflight_check_listen_addresses(&proxy_config)?;
 
     // Setup plugin system (async operation in sync context)
-    // A `current_thread` runtime is enough here: plugin registration awaits a
-    // bounded file-existence poll and otherwise does sync work, so a worker
-    // thread per core would be stood up and torn down purely to drive that.
-    //
-    // Registration is not entirely free of spawns: `ConfigPlugin` starts the
-    // `settings_change` LISTEN/NOTIFY task with `tokio::spawn`. That task does
-    // not survive this runtime being dropped at the end of the statement, and
-    // did not survive the previous multi-threaded one either -- the settings
-    // cache falls back to its 5s TTL, which is the documented non-fatal
-    // behaviour. This is pre-existing and unchanged here; it is called out so
-    // the lifetime is not mistaken for something this runtime guarantees.
-    let context = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?
-        .block_on(setup_proxy_plugins(db.clone(), config.clone()))?;
+    let context = block_on_refresh_runtime(setup_proxy_plugins(db.clone(), config.clone()))??;
 
     // Create service implementations
     let lb_service = Arc::new(LbService::new(db.clone()));
@@ -599,12 +636,18 @@ pub fn setup_proxy_server(
     let proxy_log_writer = proxy_log_writer.with_metrics(proxy_metrics.clone());
     let proxy_log_handle = proxy_log_handle.with_metrics(proxy_metrics.clone());
 
-    // Spawn the batch writer background task
+    // Spawn the batch writer background task. The runtime is built here so a
+    // failure stops startup with an error instead of panicking the thread.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to create tokio runtime for proxy log batch writer: {}",
+                e
+            )
+        })?;
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to create tokio runtime for proxy log batch writer");
         rt.block_on(proxy_log_writer.run());
     });
 
@@ -630,6 +673,7 @@ pub fn setup_proxy_server(
     // and the event store, written in batches off the request path.
     let shield_lists = Arc::new(crate::shield::ShieldLists::default());
     shield_lists.spawn_loader(db.clone(), &security_refresh_runtime()?);
+    let (edge_rules, edge_geo) = start_edge_rules(db.clone())?;
     let shield_bypass = Arc::new(crate::shield::BypassTokens::default());
     shield_bypass.spawn(db.clone(), &security_refresh_runtime()?);
     let shield_events = spawn_shield_event_store(&config, db.clone(), &config_service)?;
@@ -703,11 +747,13 @@ pub fn setup_proxy_server(
         cert_host_cache,
         disable_https_redirect,
     )
+    .with_expose_platform_identity(loopback_trust.expose_platform_identity)
     .with_trust_loopback_forwarded_ip(loopback_trust.forwarded_ip)
     .with_loopback_ja4_header(loopback_trust.ja4_header)
     .with_proxy_metrics(proxy_metrics.clone())
     .with_request_policy_gate(request_policy_gate)
     .with_shield_lists(shield_lists)
+    .with_edge_rules(edge_rules, edge_geo)
     .with_shield_bypass_tokens(shield_bypass)
     .with_shield_events(shield_events)
     .with_netwatch(spawn_netwatch()?)
@@ -778,11 +824,16 @@ pub fn setup_proxy_server(
         } else {
             temps_metrics::NodeMetricsScope::Process
         };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to create tokio runtime for proxy metrics sampler: {}",
+                    e
+                )
+            })?;
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("Failed to create tokio runtime for proxy metrics sampler");
             rt.block_on(async move {
                 let store = crate::service::metrics_sampler::build_metrics_store(
                     &sampler_config_service,
@@ -1023,14 +1074,7 @@ pub fn create_proxy_service(
     project_ip_gate: Arc<dyn temps_core::ProjectIpGate>,
 ) -> Result<LoadBalancer> {
     // Setup plugin system (async operation in sync context)
-    // A `current_thread` runtime is enough here: plugin registration awaits a
-    // bounded file-existence poll and does sync work, and it spawns nothing
-    // that outlives this call. `Runtime::new()` would stand up (and tear down)
-    // one worker thread per core purely to drive that.
-    let context = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?
-        .block_on(setup_proxy_plugins(db.clone(), config.clone()))?;
+    let context = block_on_refresh_runtime(setup_proxy_plugins(db.clone(), config.clone()))??;
 
     // Create service implementations
     let lb_service = Arc::new(LbService::new(db.clone()));
@@ -1077,12 +1121,18 @@ pub fn create_proxy_service(
     let proxy_log_writer = proxy_log_writer.with_metrics(proxy_metrics.clone());
     let proxy_log_handle = proxy_log_handle.with_metrics(proxy_metrics.clone());
 
-    // Spawn the batch writer background task
+    // Spawn the batch writer background task. The runtime is built here so a
+    // failure stops startup with an error instead of panicking the thread.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to create tokio runtime for proxy log batch writer: {}",
+                e
+            )
+        })?;
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to create tokio runtime for proxy log batch writer");
         rt.block_on(proxy_log_writer.run());
     });
 
@@ -1106,6 +1156,7 @@ pub fn create_proxy_service(
     ));
     let shield_lists = Arc::new(crate::shield::ShieldLists::default());
     shield_lists.spawn_loader(db.clone(), &security_refresh_runtime()?);
+    let (edge_rules, edge_geo) = start_edge_rules(db.clone())?;
     let shield_bypass = Arc::new(crate::shield::BypassTokens::default());
     shield_bypass.spawn(db.clone(), &security_refresh_runtime()?);
     let shield_events = spawn_shield_event_store(&config, db.clone(), &config_service)?;
@@ -1132,10 +1183,12 @@ pub fn create_proxy_service(
         cert_host_cache,
         disable_https_redirect,
     )
+    .with_expose_platform_identity(loopback_trust.expose_platform_identity)
     .with_trust_loopback_forwarded_ip(loopback_trust.forwarded_ip)
     .with_loopback_ja4_header(loopback_trust.ja4_header)
     .with_proxy_metrics(proxy_metrics)
     .with_shield_lists(shield_lists)
+    .with_edge_rules(edge_rules, edge_geo)
     .with_shield_bypass_tokens(shield_bypass)
     .with_shield_events(shield_events)
     .with_netwatch(spawn_netwatch()?);
@@ -1144,11 +1197,53 @@ pub fn create_proxy_service(
 }
 
 #[cfg(test)]
+mod plugin_setup_runtime_tests {
+    use super::*;
+
+    #[test]
+    fn a_connection_opened_during_setup_stays_usable_afterwards() {
+        let other_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _context = other_runtime.enter();
+        let database = match other_runtime.block_on(temps_test_utils::TestDatabase::new()) {
+            Ok(database) => database,
+            Err(error)
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+            {
+                eprintln!("Skipping plugin setup runtime test: Docker unavailable: {error}");
+                return;
+            }
+            Err(error) => panic!("plugin setup runtime test database failed: {error}"),
+        };
+        // One connection, so the acquire below must get the one setup opened.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(3))
+            .connect_lazy(&database.database_url)
+            .unwrap();
+
+        let setup_pool = pool.clone();
+        block_on_refresh_runtime(async move {
+            drop(setup_pool.acquire().await.unwrap());
+            // Gives the connection time to go back into the pool.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        })
+        .unwrap();
+
+        other_runtime
+            .block_on(pool.acquire())
+            .expect("a connection opened during setup must stay usable");
+    }
+}
+
+#[cfg(test)]
 mod preflight_bind_tests {
     use super::*;
     use chrono::Utc;
     use sea_orm::{DatabaseBackend, DbErr, MockDatabase};
-    use temps_core::AppSettings;
+    use temps_config::AppSettings;
     use temps_entities::settings;
 
     fn test_config() -> Arc<ServerConfig> {
@@ -1211,6 +1306,7 @@ mod preflight_bind_tests {
     fn initial_forwarded_ip_trust_loads_saved_admin_choice() {
         let settings = AppSettings {
             trust_loopback_forwarded_ip: Some(true),
+            expose_platform_identity: Some(true),
             ..AppSettings::default()
         };
         let row = settings::Model {
@@ -1230,6 +1326,7 @@ mod preflight_bind_tests {
         let trust = start_forwarded_ip_trust_refresh(service)
             .expect("saved admin opt-in must apply at startup");
         assert!(trust.forwarded_ip.load(Ordering::Relaxed));
+        assert!(trust.expose_platform_identity.load(Ordering::Relaxed));
         assert!(
             trust.ja4_header.load().is_none(),
             "no JA4 header configured"

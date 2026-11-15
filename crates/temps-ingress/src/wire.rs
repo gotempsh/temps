@@ -5,7 +5,7 @@
 //!
 //! The control plane says *what* a node runs; the node's agent decides *how*
 //! from the [`DriverChoice`] list, taking the first driver it supports. The
-//! agent mirrors these types in `temps_agent::connectors::wire`.
+//! agent mirrors these types in `temps_node_agent::connectors::wire`.
 //!
 //! Strings in a driver spec may contain placeholders the agent fills in:
 //! `{edge_addr}` (the node's tunnel origin listener), `{metrics_addr}` (a

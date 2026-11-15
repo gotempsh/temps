@@ -157,23 +157,41 @@ fn bound_error_message(message: &str) -> String {
 
 /// `scheme://user:PASSWORD@host` -- keeps the scheme/user/host, drops the
 /// password. Covers postgres/mysql/s3-style connection strings.
+#[allow(
+    clippy::expect_used,
+    reason = "Regex::new on a compile-time literal only fails if the pattern is malformed, \
+              which the redact_* unit tests would catch on first use"
+)]
 static CONN_STR_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?P<scheme>[a-zA-Z][a-zA-Z0-9+.-]*://[^:/@\s]+:)[^@\s]+(?P<host>@)").unwrap()
+    Regex::new(r"(?P<scheme>[a-zA-Z][a-zA-Z0-9+.-]*://[^:/@\s]+:)[^@\s]+(?P<host>@)")
+        .expect("CONN_STR_RE is a valid literal regex")
 });
 
 /// `user:PASSWORD@tcp(host:port)/db` -- the DSN form WAL-G's Go MySQL driver
 /// uses for MariaDB (`WALG_MYSQL_DATASOURCE_NAME`). It has no URL scheme, so
 /// `CONN_STR_RE` does not match it.
-static MYSQL_DSN_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?P<user>[^:/@\s]+):[^@\s]+(?P<at>@tcp\()").unwrap());
+#[allow(
+    clippy::expect_used,
+    reason = "Regex::new on a compile-time literal only fails if the pattern is malformed, \
+              which the redact_* unit tests would catch on first use"
+)]
+static MYSQL_DSN_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?P<user>[^:/@\s]+):[^@\s]+(?P<at>@tcp\()")
+        .expect("MYSQL_DSN_RE is a valid literal regex")
+});
 
 /// `KEY=value` / `KEY: value` for known credential env-var names, in either
 /// case. Value runs until whitespace or a shell/URL delimiter.
+#[allow(
+    clippy::expect_used,
+    reason = "Regex::new on a compile-time literal only fails if the pattern is malformed, \
+              which the redact_* unit tests would catch on first use"
+)]
 static ENV_KEY_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"(?i)(?P<key>AWS_SECRET_ACCESS_KEY|AWS_ACCESS_KEY_ID|AWS_SESSION_TOKEN|PGPASSWORD|S3_SECRET_KEY|S3_SECRET_ACCESS_KEY|WALG_MYSQL_DATASOURCE_NAME)(?P<sep>\s*[:=]\s*)(?P<value>[^\s&]+)",
     )
-    .unwrap()
+    .expect("ENV_KEY_RE is a valid literal regex")
 });
 
 /// Catch-all: a `secret`/`password`/`passwd`/`token`/`key` keyword directly
@@ -182,8 +200,14 @@ static ENV_KEY_RE: LazyLock<Regex> = LazyLock::new(|| {
 /// they are error text describing a rejected credential. The value charset
 /// includes common generated-password punctuation (`!#$%^&*~`) in addition to
 /// base64/hex characters -- narrower classes miss passwords like `Zx9!Qw8#Mn7$Rt4^`.
+#[allow(
+    clippy::expect_used,
+    reason = "Regex::new on a compile-time literal only fails if the pattern is malformed, \
+              which the redact_* unit tests would catch on first use"
+)]
 static GENERIC_CRED_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(?:secret|password|passwd|token|key)\b(?P<sep>\s*[:=]\s*)(?P<value>[A-Za-z0-9+/_=!#$%^&*~-]{16,})").unwrap()
+    Regex::new(r"(?i)\b(?:secret|password|passwd|token|key)\b(?P<sep>\s*[:=]\s*)(?P<value>[A-Za-z0-9+/_=!#$%^&*~-]{16,})")
+        .expect("GENERIC_CRED_RE is a valid literal regex")
 });
 
 /// Scrub known credential shapes out of raw engine error text before it is

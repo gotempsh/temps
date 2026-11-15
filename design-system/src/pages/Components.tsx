@@ -15,6 +15,7 @@ import {
   DataTable,
   Field,
   SettingsSection,
+  Settings,
   FormErrors,
   Kbd,
   LogLine,
@@ -53,6 +54,8 @@ function Block({ title, children }: { title: string; children: ReactNode }) {
 }
 
 export default function Components() {
+  const [sampleDays, setSampleDays] = useState("30")
+  const [savedDays, setSavedDays] = useState("30")
   const [busy, setBusy] = useState(false)
   const [echoOpen, setEchoOpen] = useState(false)
   const [picked, setPicked] = useState<string>()
@@ -92,6 +95,12 @@ export default function Components() {
           <TabsContent value="history">Variable changes and verification runs.</TabsContent>
         </Tabs>
       </Block>
+
+      <Settings embedded title="Embedded settings" description="Interactive sample · changes stay in this example" dirty={sampleDays !== savedDays} onSubmit={(event) => { event.preventDefault(); setSavedDays(sampleDays) }}>
+        <Field label="Renew before expiry (days)">
+          {(props) => <Input {...props} className="max-w-xs" type="number" min={1} max={90} value={sampleDays} onChange={(event) => setSampleDays(event.target.value)} />}
+        </Field>
+      </Settings>
 
       <Block title="Settings sections">
         <div className="w-full">

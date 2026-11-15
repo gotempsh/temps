@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import { PageTitle } from '@temps-sdk/ds'
 import { HighlightedCode } from '@/components/ui/code-block'
+import { FixErrorWithAgentButton } from '@/components/ai/FixErrorWithAgentButton'
 
 import {
   ErrorEventResponse,
@@ -11,7 +13,9 @@ import {
 import {
   getEnvironmentsOptions,
   getErrorGroupOptions,
+  getErrorGroupQueryKey,
   listErrorEventsOptions,
+  listErrorEventsQueryKey,
   listUsersOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { AutofixIncidentCard } from '@/components/autofix/AutofixIncidentCard'
@@ -21,6 +25,8 @@ import { updateErrorGroupMutation } from '@/api/client/@tanstack/react-query.gen
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { Badge } from '@/components/ui/badge'
+import { RefreshButton } from '@/components/ui/refresh-button'
+import { queryKeyPrefix } from '@/lib/refresh'
 import { Button } from '@/components/ui/button'
 import {
   Card,
@@ -55,6 +61,8 @@ import {
   ArrowLeft,
   Check,
   EyeOff,
+  Home,
+  List,
   MoreVertical,
   RotateCcw,
   UserRound,
@@ -169,7 +177,7 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
       setBreadcrumbs([
         { label: 'Projects', href: '/projects' },
         { label: projectSlug, href: `/projects/${projectSlug}` },
-        { label: 'Error Tracking', href: `/projects/${projectSlug}/errors` },
+        { label: 'Error tracking', href: `/projects/${projectSlug}/errors` },
         { label: errorGroup.title || 'Error Details' },
       ])
     }
@@ -203,7 +211,7 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
 
   if (isLoadingGroup || isLoadingEvents) {
     return (
-      <div className="space-y-6 p-4 sm:p-6">
+      <div className="space-y-6">
         <div className="flex items-center justify-between">
           <Skeleton className="h-8 w-64" />
           <div className="flex gap-2">
@@ -254,7 +262,7 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
             onClick={() => navigate(`/projects/${project.slug}/errors`)}
           >
             <ArrowLeft className="mr-2 h-4 w-4" />
-            Back to Error Tracking
+            Back to error tracking
           </Button>
         </div>
       </div>
@@ -272,11 +280,12 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
     )
   }
 
+  const groupPath = { group_id: errorGroup.id, project_id: project.id }
   const latestEvent = errorEvents?.data?.[0] as ErrorEventResponse | undefined
   const sentryEvent = latestEvent ? extractSentryEvent(latestEvent.data) : null
 
   return (
-    <div className="p-4 sm:p-6">
+    <div>
       {/* Error Title Bar with Back Button */}
       <div className="mb-6 space-y-3">
         <div className="flex flex-wrap items-center gap-2">
@@ -315,12 +324,14 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
           )}
         </div>
 
-        <h1 className="text-lg sm:text-xl md:text-2xl font-semibold break-words">
+        <PageTitle className="text-lg sm:text-xl md:text-2xl font-semibold break-words">
           {errorGroup.title}
-        </h1>
+        </PageTitle>
 
-        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-          <div className="flex flex-col gap-1 text-sm text-muted-foreground sm:flex-row sm:flex-wrap sm:items-center sm:gap-x-2 sm:gap-y-1">
+        {/* The actions stay one group: when they do not fit beside the
+            details they move below them together. */}
+        <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-3">
+          <div className="flex min-w-0 flex-col gap-1 text-sm text-muted-foreground sm:flex-row sm:flex-wrap sm:items-center sm:gap-x-2 sm:gap-y-1">
             <span>{errorGroup.total_count || 0} occurrences</span>
             <span className="hidden sm:inline">•</span>
             <span>
@@ -332,7 +343,37 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
             </span>
           </div>
 
-          <div className="flex items-center gap-2">
+          <div
+            role="group"
+            aria-label="Error actions"
+            className="flex shrink-0 items-center gap-2"
+          >
+            <RefreshButton
+              queryKeys={[
+                getErrorGroupQueryKey({ path: groupPath }),
+                queryKeyPrefix(listErrorEventsQueryKey, { path: groupPath }),
+              ]}
+            />
+            {(errorGroup as any).status !== 'resolved' && (
+              <FixErrorWithAgentButton
+                error={{
+                  id: errorGroup.id,
+                  title: errorGroup.title,
+                  error_type: errorGroup.error_type,
+                  environment_name:
+                    errorGroup.environment_id != null
+                      ? environments?.find(
+                          (e) => e.id === errorGroup.environment_id
+                        )?.name
+                      : undefined,
+                  project: {
+                    id: project.id,
+                    slug: project.slug,
+                    name: project.name,
+                  },
+                }}
+              />
+            )}
             <AssigneeControl
               assignedTo={errorGroup.assigned_to}
               userByIdentity={userByIdentity}
@@ -341,83 +382,85 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
               onAssign={assign}
               isPending={assigneeMutation.isPending}
             />
-          </div>
 
-          {/* Desktop: full action buttons */}
-          <div className="hidden gap-2 sm:flex sm:flex-wrap">
-            {(errorGroup as any).status !== 'resolved' && (
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => updateStatus('resolved')}
-                disabled={statusMutation.isPending}
-              >
-                <Check className="h-4 w-4 mr-1.5" />
-                Resolve
-              </Button>
-            )}
-            {(errorGroup as any).status !== 'ignored' &&
-              (errorGroup as any).status !== 'resolved' && (
+            {/* Desktop: full action buttons */}
+            <div className="hidden items-center gap-2 sm:flex">
+              {(errorGroup as any).status !== 'resolved' && (
                 <Button
                   variant="outline"
                   size="sm"
-                  onClick={() => updateStatus('ignored')}
+                  onClick={() => updateStatus('resolved')}
                   disabled={statusMutation.isPending}
                 >
-                  <EyeOff className="h-4 w-4 mr-1.5" />
-                  Ignore
+                  <Check className="h-4 w-4 mr-1.5" />
+                  Resolve
                 </Button>
               )}
-            {((errorGroup as any).status === 'resolved' ||
-              (errorGroup as any).status === 'ignored') && (
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => updateStatus('unresolved')}
-                disabled={statusMutation.isPending}
-              >
-                <RotateCcw className="h-4 w-4 mr-1.5" />
-                Unresolve
-              </Button>
-            )}
-          </div>
-
-          {/* Mobile: actions collapsed behind a kebab menu */}
-          <div className="sm:hidden">
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
+              {(errorGroup as any).status !== 'ignored' &&
+                (errorGroup as any).status !== 'resolved' && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => updateStatus('ignored')}
+                    disabled={statusMutation.isPending}
+                  >
+                    <EyeOff className="h-4 w-4 mr-1.5" />
+                    Ignore
+                  </Button>
+                )}
+              {((errorGroup as any).status === 'resolved' ||
+                (errorGroup as any).status === 'ignored') && (
                 <Button
                   variant="outline"
-                  size="icon"
+                  size="sm"
+                  onClick={() => updateStatus('unresolved')}
                   disabled={statusMutation.isPending}
-                  aria-label="Error actions"
                 >
-                  <MoreVertical className="h-4 w-4" />
+                  <RotateCcw className="h-4 w-4 mr-1.5" />
+                  Unresolve
                 </Button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="end">
-                {(errorGroup as any).status !== 'resolved' && (
-                  <DropdownMenuItem onClick={() => updateStatus('resolved')}>
-                    <Check className="mr-2 h-4 w-4" />
-                    Resolve
-                  </DropdownMenuItem>
-                )}
-                {(errorGroup as any).status !== 'ignored' &&
-                  (errorGroup as any).status !== 'resolved' && (
-                    <DropdownMenuItem onClick={() => updateStatus('ignored')}>
-                      <EyeOff className="mr-2 h-4 w-4" />
-                      Ignore
+              )}
+            </div>
+
+            {/* Mobile: actions collapsed behind a kebab menu */}
+            <div className="sm:hidden">
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    variant="outline"
+                    size="icon"
+                    disabled={statusMutation.isPending}
+                    aria-label="Error actions"
+                  >
+                    <MoreVertical className="h-4 w-4" />
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end">
+                  {(errorGroup as any).status !== 'resolved' && (
+                    <DropdownMenuItem onClick={() => updateStatus('resolved')}>
+                      <Check className="mr-2 h-4 w-4" />
+                      Resolve
                     </DropdownMenuItem>
                   )}
-                {((errorGroup as any).status === 'resolved' ||
-                  (errorGroup as any).status === 'ignored') && (
-                  <DropdownMenuItem onClick={() => updateStatus('unresolved')}>
-                    <RotateCcw className="mr-2 h-4 w-4" />
-                    Unresolve
-                  </DropdownMenuItem>
-                )}
-              </DropdownMenuContent>
-            </DropdownMenu>
+                  {(errorGroup as any).status !== 'ignored' &&
+                    (errorGroup as any).status !== 'resolved' && (
+                      <DropdownMenuItem onClick={() => updateStatus('ignored')}>
+                        <EyeOff className="mr-2 h-4 w-4" />
+                        Ignore
+                      </DropdownMenuItem>
+                    )}
+                  {((errorGroup as any).status === 'resolved' ||
+                    (errorGroup as any).status === 'ignored') && (
+                    <DropdownMenuItem
+                      onClick={() => updateStatus('unresolved')}
+                    >
+                      <RotateCcw className="mr-2 h-4 w-4" />
+                      Unresolve
+                    </DropdownMenuItem>
+                  )}
+                </DropdownMenuContent>
+              </DropdownMenu>
+            </div>
           </div>
         </div>
       </div>
@@ -434,9 +477,15 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
       {/* Tabs for different views */}
       <Tabs value={selectedTab} onValueChange={setSelectedTab}>
         <TabsList className="grid w-full max-w-[400px] grid-cols-2">
-          <TabsTrigger value="overview">Overview</TabsTrigger>
-          <TabsTrigger value="events">
-            Events ({errorEvents?.data?.length || 0})
+          <TabsTrigger value="overview" icon={Home}>
+            Overview
+          </TabsTrigger>
+          <TabsTrigger
+            value="events"
+            icon={List}
+            count={errorEvents?.data?.length || 0}
+          >
+            Events
           </TabsTrigger>
         </TabsList>
 
@@ -451,7 +500,7 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
           ) : latestEvent ? (
             <Card>
               <CardHeader>
-                <CardTitle>Latest Event</CardTitle>
+                <CardTitle>Latest event</CardTitle>
                 <CardDescription>
                   {format(new Date(latestEvent.timestamp), 'PPpp')}
                 </CardDescription>

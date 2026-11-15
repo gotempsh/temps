@@ -37,7 +37,7 @@ async fn connect_with_retries(database_url: &str) -> anyhow::Result<DatabaseConn
 
 /// Test database setup with unique container per test
 pub struct TestDatabase {
-    #[allow(dead_code)]
+    #[allow(dead_code)] // held so the container is stopped on drop
     container: ContainerAsync<GenericImage>,
     pub db: Arc<DatabaseConnection>,
     pub database_url: String,

@@ -1,14 +1,13 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { containerMetricsGetHistoryOptions } from '@/api/client/@tanstack/react-query.gen'
 import { MetricSparkline } from '@/components/charts/metric-sparkline'
 import { cn } from '@/lib/utils'
-import { useQuery } from '@tanstack/react-query'
 import {
   buildMetricHistorySeries,
   hasMetricHistory,
 } from './container-metric-history'
+import { useContainerMetricHistory } from './use-container-metric-history'
 
 interface ContainerMetricHistoryProps {
   projectId: number
@@ -18,6 +17,8 @@ interface ContainerMetricHistoryProps {
   label: string
   format: (value: number) => string
   currentValue?: number | null
+  /** The full reading, with its limit, shown on hover. */
+  detail?: string
   hideWithoutHistory?: boolean
   enabled?: boolean
   className?: string
@@ -32,24 +33,17 @@ export function ContainerMetricHistory({
   label,
   format,
   currentValue,
+  detail,
   hideWithoutHistory = false,
   enabled = true,
   className,
 }: ContainerMetricHistoryProps) {
-  const { data } = useQuery({
-    ...containerMetricsGetHistoryOptions({
-      path: {
-        project_id: projectId,
-        environment_id: environmentId,
-        container_id: containerId,
-      },
-      query: { metric, range: '1h' },
-    }),
-    staleTime: 30_000,
-    refetchInterval: 30_000,
+  const { data } = useContainerMetricHistory({
+    projectId,
+    environmentId,
+    containerId,
+    metric,
     enabled,
-    // Metrics store disabled -> the endpoint returns 503; avoid retry spam.
-    retry: false,
   })
 
   if (!enabled) return null
@@ -65,6 +59,7 @@ export function ContainerMetricHistory({
         className
       )}
       role="img"
+      title={detail}
       aria-label={`${label} usage over the last hour`}
     >
       <MetricSparkline data={values} height={16} />

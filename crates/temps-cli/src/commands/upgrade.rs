@@ -193,6 +193,15 @@ pub struct UpgradeCommand {
     /// Defaults to `$TEMPS_DATA_DIR` or `~/.temps`.
     #[arg(long, env = "TEMPS_DATA_DIR")]
     pub data_dir: Option<PathBuf>,
+
+    /// Database URL, to warn before installing when PostgreSQL's lock table is
+    /// too small for the instance's TimescaleDB chunk count (a migration that
+    /// changes hypertable constraints would fail with "out of shared
+    /// memory"). Optional: without it the check is skipped. Prefer
+    /// TEMPS_DATABASE_URL: the flag form puts the password in the process
+    /// command line
+    #[arg(long, env = "TEMPS_DATABASE_URL", hide_env_values = true)]
+    pub database_url: Option<String>,
 }
 
 #[derive(Clone, Deserialize, Debug)]
@@ -212,6 +221,20 @@ pub struct GitHubAsset {
 }
 
 impl UpgradeCommand {
+    /// Where a running `temps serve` says its data is. A shell inherits none of
+    /// the server's environment, so this finds a server's directory that it
+    /// could not otherwise know. It is read from another process's arguments, so
+    /// it decides what this upgrade tells the operator, never where it writes.
+    fn discover_data_dir(&self) -> super::data_dir_discovery::ResolvedDataDir {
+        let home = dirs::home_dir();
+        let discovered =
+            super::data_dir_discovery::resolve(self.data_dir.as_deref(), home.as_deref());
+        for warning in data_dir_warnings(&discovered) {
+            println!("  Note: {warning}");
+        }
+        discovered
+    }
+
     pub fn execute(self) -> anyhow::Result<()> {
         let rt = tokio::runtime::Runtime::new()?;
         rt.block_on(self.run())
@@ -351,6 +374,7 @@ impl UpgradeCommand {
         println!("    Size:     {:.1} MB", size_mb);
         println!("    Release:  {}", release.html_url);
         println!();
+        print_lock_capacity_warning(self.database_url.as_deref()).await;
 
         if self.check {
             println!("Run `temps upgrade` to install this update.");
@@ -440,6 +464,8 @@ impl UpgradeCommand {
         finalize_staged_binary(&binary_path, staged_path)?;
         install_vm_agent_reporting(staged_agent);
         install_pty_agent_reporting(staged_pty_agent);
+        print_launcher_refresh_reminder();
+        print_microsandbox_refresh_reminder(&binary_path, &self.discover_data_dir().dir);
 
         println!();
         println!(
@@ -546,6 +572,7 @@ impl UpgradeCommand {
             api, version, asset
         );
         println!();
+        print_lock_capacity_warning(self.database_url.as_deref()).await;
 
         if self.check {
             println!("  Run without --check to install.");
@@ -615,11 +642,18 @@ impl UpgradeCommand {
         finalize_staged_binary(&binary_path, staged_path)?;
         install_vm_agent_reporting(staged_agent);
         install_pty_agent_reporting(staged_pty_agent);
+        print_launcher_refresh_reminder();
+
+        let discovered = self.discover_data_dir();
+        print_microsandbox_refresh_reminder(&binary_path, &discovered.dir);
 
         // Install the license into the data dir so the binary finds it.
         let data_dir = resolve_data_dir(&self.data_dir)?;
         let installed_license = install_license(&data_dir, &license_jwt)?;
         println!("  License installed at {}", installed_license.display());
+        if let Some(note) = license_location_note(&data_dir, &discovered) {
+            println!("  Note: {note}");
+        }
 
         // Best-effort: point the systemd unit at the license so restarts
         // keep working without re-passing --license-path.
@@ -695,29 +729,79 @@ fn restart_guidance(split: bool) -> String {
 /// Extract the clean version tag from the compiled TEMPS_VERSION string.
 /// TEMPS_VERSION format: "v1.0.0 (abc1234) built 2025-01-25 12:34:56 UTC"
 /// or: "v1.0.0-abc1234 built 2025-01-25 12:34:56 UTC"
+///
+/// The parsing lives in `temps_core::worker_install::version_tag`, so the
+/// server's worker commands pin the same version this reports.
 pub fn current_version_tag() -> String {
-    let full_version = env!("TEMPS_VERSION");
+    temps_core::worker_install::version_tag(env!("TEMPS_VERSION"))
+}
 
-    // If it contains a space, take everything before the first space
-    // Then strip any "-commitsha" suffix (non-tag builds)
-    let version = full_version
-        .split_whitespace()
-        .next()
-        .unwrap_or(full_version);
+/// How long the pre-update lock capacity check may take. It is advisory and
+/// must never hold up an upgrade.
+const LOCK_CAPACITY_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-    // For "v1.0.0-abc1234" (not on a tag), strip the commit hash suffix
-    // A tag looks like "v1.0.0" or "v1.0.0-beta.1", a non-tag looks like "v1.0.0-abc1234"
-    // We identify commit hashes as short hex strings after the last dash
-    if let Some(last_dash_pos) = version.rfind('-') {
-        let suffix = &version[last_dash_pos + 1..];
-        // If suffix looks like a commit hash (all hex, 7-12 chars), strip it
-        if suffix.len() >= 7 && suffix.len() <= 12 && suffix.chars().all(|c| c.is_ascii_hexdigit())
-        {
-            return version[..last_dash_pos].to_string();
+/// The pre-update warning for an instance whose PostgreSQL lock table is too
+/// small for its TimescaleDB chunk count, `Ok(None)` when it fits. `Err` is
+/// why the check could not run.
+pub(crate) async fn lock_capacity_warning(database_url: &str) -> Result<Option<String>, String> {
+    let mut options = temps_database::connect_options(database_url);
+    options
+        .max_connections(1)
+        .min_connections(0)
+        .connect_timeout(LOCK_CAPACITY_CHECK_TIMEOUT);
+    let check = async {
+        let db = sea_orm::Database::connect(options)
+            .await
+            .map_err(|error| format!("could not connect to the database: {error}"))?;
+        let capacity = temps_schema::read_lock_capacity(db.get_postgres_connection_pool()).await;
+        let _ = db.close().await;
+        capacity.map_err(|error| format!("could not read the lock settings: {error}"))
+    };
+    let capacity = tokio::time::timeout(LOCK_CAPACITY_CHECK_TIMEOUT, check)
+        .await
+        .map_err(|_| format!("timed out after {}s", LOCK_CAPACITY_CHECK_TIMEOUT.as_secs()))??;
+    Ok(lock_capacity_warning_for(&capacity))
+}
+
+/// [`lock_capacity_warning`] for capacity already read.
+pub(crate) fn lock_capacity_warning_for(capacity: &temps_schema::LockCapacity) -> Option<String> {
+    capacity.at_risk().then(|| {
+        format!(
+            "PostgreSQL may run out of lock slots while the new release migrates: {}. {} Do it \
+             before upgrading: a migration that runs out is rolled back and the upgrade stops \
+             there until the setting is raised.",
+            capacity.describe(),
+            capacity.remedy()
+        )
+    })
+}
+
+/// Print the lock capacity warning under the upgrade plan, before anything
+/// is downloaded or replaced. Without a database URL there is nothing to
+/// check; a failed check is noted and does not stop the upgrade.
+async fn print_lock_capacity_warning(database_url: Option<&str>) {
+    let database = match crate::database_url_source::resolve_database_url(
+        database_url,
+        crate::database_url_source::UrlDiscovery::InstalledService,
+    ) {
+        Ok(database) => database,
+        Err(not_found) => {
+            debug!("Skipping the pre-update lock capacity check: {not_found}");
+            return;
+        }
+    };
+    database.announce_discovery();
+    match lock_capacity_warning(database.url()).await {
+        Ok(None) => debug!("PostgreSQL lock table fits this instance's chunk count"),
+        Ok(Some(warning)) => {
+            println!("  Warning: {warning}");
+            println!();
+        }
+        Err(reason) => {
+            println!("  Note: could not check PostgreSQL lock capacity ({reason}).");
+            println!();
         }
     }
-
-    version.to_string()
 }
 
 /// How long a single background update check may take before it's abandoned.
@@ -1766,7 +1850,7 @@ impl StagedVmAgent {
 /// setup` stage it from the directory of the running executable, so an
 /// upgrade refreshes it with the host binary; a missing one only costs
 /// `temps sandbox shell`, never the sandbox itself.
-pub(crate) const PTY_AGENT_BINARY_NAME: &str = temps_agents::sandbox::PTY_AGENT_BINARY_NAME;
+pub(crate) const PTY_AGENT_BINARY_NAME: &str = temps_sandbox_providers::PTY_AGENT_BINARY_NAME;
 
 const PTY_AGENT_MANUAL_INSTALL_HINT: &str = "To refresh it, extract temps-pty-agent from this \
      release's temps-linux-<arch>.tar.gz and pass it to \
@@ -2066,6 +2150,19 @@ fn install_agent_reporting(agent: &ShippedAgent, staged: Option<StagedVmAgent>) 
                 agent.label, agent.manual_hint
             );
         }
+    }
+}
+
+fn print_microsandbox_refresh_reminder(upgraded_binary: &Path, data_dir: &Path) {
+    if let Some(reminder) = super::microsandbox::runtime_refresh_reminder(upgraded_binary, data_dir)
+    {
+        println!("  Note: {reminder}");
+    }
+}
+
+fn print_launcher_refresh_reminder() {
+    if let Some(reminder) = super::firecracker::launcher_refresh_reminder() {
+        println!("  Note: {reminder}");
     }
 }
 
@@ -2445,7 +2542,10 @@ async fn download_ee_asset_to_file(
     stream_response_to_file(resp, dest, dest_path).await
 }
 
-/// Resolve the data dir: explicit flag/env > `~/.temps`.
+/// Data dir that receives the license: the one the operator named (flag or
+/// `TEMPS_DATA_DIR`), or `~/.temps`. Never one discovered from a running process: any local user can start
+/// a process claiming any directory, and a privileged upgrade would then write the
+/// license into a directory, and possibly a file, that user owns.
 fn resolve_data_dir(explicit: &Option<PathBuf>) -> anyhow::Result<PathBuf> {
     if let Some(p) = explicit {
         return Ok(p.clone());
@@ -2453,6 +2553,37 @@ fn resolve_data_dir(explicit: &Option<PathBuf>) -> anyhow::Result<PathBuf> {
     let home = dirs::home_dir()
         .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory for data dir"))?;
     Ok(home.join(".temps"))
+}
+
+/// The warnings worth showing during an upgrade: only when a running server
+/// contradicts the chosen directory. On its own, "this directory holds no Temps
+/// data" is normal on a host that only runs the CLI.
+fn data_dir_warnings(discovered: &super::data_dir_discovery::ResolvedDataDir) -> &[String] {
+    if discovered.server_disagrees {
+        &discovered.warnings
+    } else {
+        &[]
+    }
+}
+
+/// What to tell the operator when a running server reports a different data
+/// directory from the one that received the license, or `None` when they agree.
+fn license_location_note(
+    license_dir: &Path,
+    discovered: &super::data_dir_discovery::ResolvedDataDir,
+) -> Option<String> {
+    let super::data_dir_discovery::DataDirSource::RunningServer { pid } = discovered.source else {
+        return None;
+    };
+    (!super::data_dir_discovery::same_path(license_dir, &discovered.dir)).then(|| {
+        format!(
+            "The running `temps serve` (pid {pid}) reports {} as its data directory, but the \
+             license went to {}. If that server is yours, re-run with `--data-dir {}`.",
+            discovered.dir.display(),
+            license_dir.display(),
+            super::data_dir_discovery::quoted_for_shell(&discovered.dir)
+        )
+    })
 }
 
 /// Install the license JWT at `<data_dir>/data/license.jwt` (mode 0600).
@@ -2526,6 +2657,98 @@ fn update_systemd_license_env(license_path: &std::path::Path) -> anyhow::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_running_server_elsewhere_gets_a_note_and_not_the_license() {
+        let home = tempfile::tempdir().unwrap();
+        let server_dir = tempfile::tempdir().unwrap();
+        let license_dir = tempfile::tempdir().unwrap();
+        let discovered = super::super::data_dir_discovery::resolve_with(
+            None,
+            Some(home.path()),
+            Some((42, server_dir.path().to_path_buf())),
+        );
+
+        let note = license_location_note(license_dir.path(), &discovered)
+            .expect("the server reports another directory");
+
+        assert!(
+            note.contains(&server_dir.path().display().to_string()),
+            "{note}"
+        );
+        assert!(note.contains("--data-dir"), "{note}");
+    }
+
+    #[test]
+    fn the_directory_in_the_note_cannot_run_a_command() {
+        let home = tempfile::tempdir().unwrap();
+        let license_dir = tempfile::tempdir().unwrap();
+        let discovered = super::super::data_dir_discovery::resolve_with(
+            None,
+            Some(home.path()),
+            Some((42, PathBuf::from("/tmp/$(touch pwned)"))),
+        );
+
+        let note = license_location_note(license_dir.path(), &discovered)
+            .expect("the server reports another directory");
+
+        assert!(
+            note.contains("`--data-dir '/tmp/$(touch pwned)'`"),
+            "{note}"
+        );
+    }
+
+    #[test]
+    fn no_note_when_the_license_is_where_the_server_reads() {
+        let home = tempfile::tempdir().unwrap();
+        let server_dir = tempfile::tempdir().unwrap();
+        let discovered = super::super::data_dir_discovery::resolve_with(
+            None,
+            Some(home.path()),
+            Some((42, server_dir.path().to_path_buf())),
+        );
+
+        assert_eq!(license_location_note(server_dir.path(), &discovered), None);
+    }
+
+    #[test]
+    fn a_chosen_directory_a_running_server_does_not_use_is_reported() {
+        let home = tempfile::tempdir().unwrap();
+        let chosen = tempfile::tempdir().unwrap();
+        let server_dir = tempfile::tempdir().unwrap();
+        let discovered = super::super::data_dir_discovery::resolve_with(
+            Some(chosen.path()),
+            Some(home.path()),
+            Some((42, server_dir.path().to_path_buf())),
+        );
+
+        let warnings = data_dir_warnings(&discovered).join("\n");
+
+        assert!(
+            warnings.contains(&server_dir.path().display().to_string()),
+            "{warnings}"
+        );
+    }
+
+    #[test]
+    fn a_host_with_no_server_is_not_warned_about_an_empty_directory() {
+        let home = tempfile::tempdir().unwrap();
+        let discovered =
+            super::super::data_dir_discovery::resolve_with(None, Some(home.path()), None);
+
+        assert!(!discovered.warnings.is_empty(), "the resolver does warn");
+        assert!(data_dir_warnings(&discovered).is_empty());
+    }
+
+    #[test]
+    fn no_note_without_a_running_server() {
+        let home = tempfile::tempdir().unwrap();
+        let license_dir = tempfile::tempdir().unwrap();
+        let discovered =
+            super::super::data_dir_discovery::resolve_with(None, Some(home.path()), None);
+
+        assert_eq!(license_location_note(license_dir.path(), &discovered), None);
+    }
 
     #[test]
     fn test_current_version_tag_exact_tag() {
@@ -3825,25 +4048,9 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("not found"));
     }
 
-    /// Helper to parse version tag from a TEMPS_VERSION-like string,
-    /// replicating the logic from `current_version_tag()` but on arbitrary input.
+    /// The parser `current_version_tag()` applies to `TEMPS_VERSION`.
     fn parse_version_tag(full_version: &str) -> String {
-        let version = full_version
-            .split_whitespace()
-            .next()
-            .unwrap_or(full_version);
-
-        if let Some(last_dash_pos) = version.rfind('-') {
-            let suffix = &version[last_dash_pos + 1..];
-            if suffix.len() >= 7
-                && suffix.len() <= 12
-                && suffix.chars().all(|c| c.is_ascii_hexdigit())
-            {
-                return version[..last_dash_pos].to_string();
-            }
-        }
-
-        version.to_string()
+        temps_core::worker_install::version_tag(full_version)
     }
 
     // ── Startup update notifier ──────────────────────────────────────────
@@ -4333,6 +4540,7 @@ mod tests {
             license_path: None,
             ee_api: None,
             data_dir: None,
+            database_url: None,
         };
         assert_eq!(cmd.resolved_channel(), UpgradeChannel::Stable);
     }
@@ -4354,6 +4562,7 @@ mod tests {
             license_path: None,
             ee_api: None,
             data_dir: None,
+            database_url: None,
         };
         assert_eq!(cmd.resolved_channel(), UpgradeChannel::Stable);
     }
@@ -4375,6 +4584,7 @@ mod tests {
             license_path: None,
             ee_api: None,
             data_dir: None,
+            database_url: None,
         };
         assert_eq!(cmd.resolved_channel(), UpgradeChannel::Beta);
     }
@@ -4394,11 +4604,32 @@ mod tests {
             license_path: None,
             ee_api: None,
             data_dir: None,
+            database_url: None,
         };
         assert_eq!(cmd.resolved_channel(), UpgradeChannel::Beta);
     }
 
     // ── EE tier + license logic ──────────────────────────────────────────
+
+    #[test]
+    fn lock_capacity_warning_only_when_the_lock_table_is_too_small() {
+        let capacity = |max_locks: i64, chunks: i64| temps_schema::LockCapacity {
+            max_locks_per_transaction: max_locks,
+            max_connections: 100,
+            max_prepared_transactions: 0,
+            timescaledb: true,
+            hypertables: vec![temps_schema::lock_capacity::HypertableChunks {
+                hypertable: "events".to_string(),
+                chunks,
+            }],
+        };
+        assert_eq!(lock_capacity_warning_for(&capacity(64, 200)), None);
+        let warning = lock_capacity_warning_for(&capacity(64, 2_000))
+            .expect("2 000 chunks need more than the default lock table");
+        assert!(warning.contains("at least 256"), "{warning}");
+        assert!(warning.contains("restart PostgreSQL"), "{warning}");
+        assert!(warning.contains("before upgrading"), "{warning}");
+    }
 
     fn cmd_with_tier(tier: Option<UpgradeTier>) -> UpgradeCommand {
         UpgradeCommand {
@@ -4413,6 +4644,7 @@ mod tests {
             license_path: None,
             ee_api: None,
             data_dir: None,
+            database_url: None,
         }
     }
 

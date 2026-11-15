@@ -6,6 +6,14 @@
 //! These tests require a Docker-accessible TimescaleDB instance.
 //! They skip gracefully when Docker is unavailable (no `#[ignore]`).
 
+// Test-only helpers outside `#[test]` fns (fixtures, mock servers, setup):
+// a panic there is the test failure, which is what we want.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test helpers: panicking is how a test fails"
+)]
+
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Duration, Timelike, Utc};
@@ -19,8 +27,8 @@ use temps_otel::types::*;
 ///
 /// Uses `TestDatabase::with_migrations()` which acquires a global lock to avoid
 /// concurrent extension creation conflicts on the shared container.
-async fn setup_storage() -> Option<(temps_database::test_utils::TestDatabase, TimescaleDbStorage)> {
-    let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+async fn setup_storage() -> Option<(temps_test_utils::TestDatabase, TimescaleDbStorage)> {
+    let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
         Ok(db) => db,
         Err(e) => {
             println!("Docker/TestDatabase not available, skipping test: {}", e);
@@ -38,8 +46,8 @@ async fn setup_storage() -> Option<(temps_database::test_utils::TestDatabase, Ti
 /// `facets` maps attribute key -> slot (1..=20).
 async fn setup_storage_with_facets(
     facets: &[(&str, u8)],
-) -> Option<(temps_database::test_utils::TestDatabase, TimescaleDbStorage)> {
-    let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+) -> Option<(temps_test_utils::TestDatabase, TimescaleDbStorage)> {
+    let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
         Ok(db) => db,
         Err(e) => {
             println!("Docker/TestDatabase not available, skipping test: {}", e);
@@ -856,8 +864,8 @@ async fn test_trace_summary_reconciliation_handles_out_of_order_commit() {
             .expect("lower-ID transaction commits after reconciliation starts");
     };
     let (reconciliation, competing_reconciliation, ()) = tokio::join!(
-        temps_database::reconcile_otel_trace_summaries(&reconcile_db),
-        temps_database::reconcile_otel_trace_summaries(&competing_db),
+        temps_schema::reconcile_otel_trace_summaries(&reconcile_db),
+        temps_schema::reconcile_otel_trace_summaries(&competing_db),
         release_held,
     );
     reconciliation.expect("reconciliation succeeds");

@@ -5,10 +5,14 @@ import {
   adminListNodesOptions,
   nodeMetricsGetReportingOptions,
 } from '@/api/client/@tanstack/react-query.gen'
-import { metricNodeOptions, resolveNodeScope } from '@/lib/node-scope'
+import {
+  metricNodeOptions,
+  resolveNodeScope,
+  scopeValue,
+} from '@/lib/node-scope'
 import { refetchUnlessRefused } from '@/lib/query-retry'
 import { useQuery } from '@tanstack/react-query'
-import { useCallback, useMemo } from 'react'
+import { useCallback, useEffect, useMemo } from 'react'
 import { useSearchParams } from 'react-router'
 
 /**
@@ -16,7 +20,10 @@ import { useSearchParams } from 'react-router'
  * loads, so metric queries are only sent for the scope that will be shown.
  * A failed node list leaves the page on the control plane.
  */
-export function useMetricNodeScope(enabled: boolean) {
+export function useMetricNodeScope(
+  enabled: boolean,
+  defaultScope: 'all' | 'first' = 'all'
+) {
   const [searchParams, setSearchParams] = useSearchParams()
   const nodesQ = useQuery({
     ...adminListNodesOptions(),
@@ -30,8 +37,8 @@ export function useMetricNodeScope(enabled: boolean) {
   )
   const param = searchParams.get('node')
   const scope = useMemo(
-    () => resolveNodeScope(param, options),
-    [param, options]
+    () => resolveNodeScope(param, options, defaultScope),
+    [param, options, defaultScope]
   )
   const multiNode = options.length > 1
   const reportingQ = useQuery({
@@ -53,6 +60,16 @@ export function useMetricNodeScope(enabled: boolean) {
       ),
     [setSearchParams]
   )
+  useEffect(() => {
+    if (
+      enabled &&
+      nodesQ.isSuccess &&
+      defaultScope === 'first' &&
+      param == null
+    ) {
+      setScope(scopeValue(scope))
+    }
+  }, [enabled, nodesQ.isSuccess, defaultScope, param, scope, setScope])
   return {
     scope,
     options,

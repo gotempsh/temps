@@ -28,7 +28,12 @@
 //! ```rust,no_run
 //! use temps_plugin_sdk::prelude::*;
 //!
+//! #[derive(Default)]
 //! struct MyPlugin;
+//!
+//! async fn list_items() -> &'static str {
+//!     "[]"
+//! }
 //!
 //! impl ExternalPlugin for MyPlugin {
 //!     fn manifest(&self) -> PluginManifest {
@@ -88,7 +93,12 @@ pub mod prelude {
 
     // Re-export common dependencies for convenience
     pub use axum;
-    pub use temps_core;
+
+    /// The path plugins have always named the protocol types by. The SDK no
+    /// longer depends on `temps-core`, so this is the only part of it left.
+    pub mod temps_core {
+        pub use temps_plugin_protocol as external_plugin;
+    }
 }
 
 /// The trait that external plugin binaries implement.
@@ -115,8 +125,9 @@ pub trait ExternalPlugin: Send + Sync + 'static {
 
     /// Returns embedded UI assets as a tar.gz bundle, if any.
     ///
-    /// Use `include_bytes!` in your `build.rs` to embed the UI bundle:
-    /// ```rust,no_run
+    /// Use `include_bytes!` in your `build.rs` to embed the UI bundle (not
+    /// compiled here: `OUT_DIR` comes from the plugin's own build script):
+    /// ```rust,ignore
     /// fn ui_assets(&self) -> Option<&'static [u8]> {
     ///     Some(include_bytes!(concat!(env!("OUT_DIR"), "/ui.tar.gz")))
     /// }
@@ -150,7 +161,7 @@ pub trait ExternalPlugin: Send + Sync + 'static {
     ///
     /// The default implementation does nothing. Override this to react to
     /// platform events (e.g., run an audit after a deployment succeeds).
-    fn on_event(&self, _ctx: &PluginContext, _event: temps_core::external_plugin::PluginEvent) {
+    fn on_event(&self, _ctx: &PluginContext, _event: temps_plugin_protocol::PluginEvent) {
         // Default: no-op
     }
 }
@@ -170,12 +181,13 @@ pub trait ExternalPlugin: Send + Sync + 'static {
 /// ```rust,no_run
 /// use temps_plugin_sdk::prelude::*;
 ///
+/// #[derive(Default)]
 /// struct MyPlugin;
 /// impl ExternalPlugin for MyPlugin {
 ///     fn manifest(&self) -> PluginManifest {
 ///         PluginManifest::builder("my-plugin", "1.0.0").build()
 ///     }
-///     fn router(&self, ctx: PluginContext) -> axum::Router {
+///     fn router(&self, _ctx: PluginContext) -> axum::Router {
 ///         axum::Router::new()
 ///     }
 /// }
@@ -194,4 +206,28 @@ macro_rules! main {
             $crate::runtime::run_plugin($plugin_expr);
         }
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prelude::*;
+
+    /// Plugins name these types through the prelude's `temps_core` path; the
+    /// example plugins do too. Both spellings must stay the one protocol type.
+    #[test]
+    fn prelude_keeps_the_protocol_path_plugins_already_use() {
+        fn same_type(event: temps_core::external_plugin::PluginEvent) -> PluginEvent {
+            event
+        }
+        let manifest: temps_core::external_plugin::manifest::PluginManifest =
+            PluginManifest::builder("demo", "0.1.0").build();
+        assert_eq!(manifest.name, "demo");
+        let event = same_type(
+            serde_json::from_str(
+                r#"{"id":"evt-1","event_type":"project.created","timestamp":"2026-01-02T03:04:05Z","project_id":null,"data":{}}"#,
+            )
+            .unwrap(),
+        );
+        assert_eq!(event.id, "evt-1");
+    }
 }

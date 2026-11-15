@@ -10,6 +10,9 @@ import {
   buildSlackConfigUpdate,
   buildEmailConfigUpdate,
   buildWebhookConfigUpdate,
+  collectHeaderFlag,
+  parseHeaderFlags,
+  withHeaderHint,
   parseProviderIds,
 } from './index.js'
 
@@ -46,6 +49,7 @@ describe('hasSlackConfigChanges / hasEmailConfigChanges / hasWebhookConfigChange
     expect(hasWebhookConfigChanges({})).toBe(false)
     expect(hasWebhookConfigChanges({ url: 'https://example.com/hook' })).toBe(true)
     expect(hasWebhookConfigChanges({ method: 'PUT' })).toBe(true)
+    expect(hasWebhookConfigChanges({ header: ['X-Foo: bar'] })).toBe(true)
   })
 
   test('name/enabled-only updates are correctly detected as "no type-specific config"', () => {
@@ -144,6 +148,99 @@ describe('buildWebhookConfigUpdate', () => {
       headers: {},
       timeout_secs: 30,
     })
+  })
+
+  test('supplied headers replace the stored ones', () => {
+    expect(buildWebhookConfigUpdate(
+      { url: 'https://other.example.net/hook', headers: { Authorization: 'Bearer new' } },
+      { url: 'https://example.com/hook', method: 'POST', headers: { Authorization: '***' }, timeout_secs: 30 },
+    ).headers).toEqual({ Authorization: 'Bearer new' })
+  })
+
+  test('without supplied headers the stored (hidden) ones are sent back unchanged', () => {
+    expect(buildWebhookConfigUpdate(
+      { method: 'PUT' },
+      { url: 'https://example.com/hook', method: 'POST', headers: { Authorization: '***' }, timeout_secs: 30 },
+    ).headers).toEqual({ Authorization: '***' })
+  })
+})
+
+describe('collectHeaderFlag / parseHeaderFlags', () => {
+  test('commander collector accumulates repeated flags', () => {
+    expect(collectHeaderFlag('A: 1', collectHeaderFlag('B: 2'))).toEqual(['B: 2', 'A: 1'])
+  })
+
+  test('no flag leaves headers untouched', () => {
+    expect(parseHeaderFlags(undefined)).toEqual({ headers: undefined })
+  })
+
+  test('trims spaces and tabs around the name and value', () => {
+    expect(parseHeaderFlags(['  X-Foo \t:  \tbar baz \t '])).toEqual({ headers: { 'X-Foo': 'bar baz' } })
+  })
+
+  test('parses "Name: value", keeping colons inside the value', () => {
+    expect(parseHeaderFlags(['Authorization: Bearer abc', 'X-Url:https://x.example/a:b'])).toEqual({
+      headers: { Authorization: 'Bearer abc', 'X-Url': 'https://x.example/a:b' },
+    })
+  })
+
+  test('rejects a flag without a colon, a bad name, an empty value or a duplicate name', () => {
+    expect(parseHeaderFlags(['Authorization'])).toHaveProperty('error')
+    expect(parseHeaderFlags(['Bad Name: x'])).toHaveProperty('error')
+    expect(parseHeaderFlags(['X-Foo:   '])).toHaveProperty('error')
+    expect(parseHeaderFlags(['X-Foo: 1', 'x-foo: 2'])).toHaveProperty('error')
+  })
+
+  test('rejects control characters in a value, but allows tabs, spaces and non-ASCII text', () => {
+    expect(parseHeaderFlags(['X-Foo: a\nb'])).toHaveProperty('error')
+    expect(parseHeaderFlags(['X-Foo: a\u0000b'])).toHaveProperty('error')
+    expect(parseHeaderFlags(['X-Foo: a\u007fb'])).toHaveProperty('error')
+    // A CR/LF at the edge is rejected, not silently trimmed away.
+    expect(parseHeaderFlags(['X-Foo: value\n'])).toHaveProperty('error')
+    expect(parseHeaderFlags(['X-Foo: \rvalue'])).toHaveProperty('error')
+    expect(parseHeaderFlags(['\nX-Foo: value'])).toHaveProperty('error')
+    expect(parseHeaderFlags(['X-Foo: a\tb c'])).toEqual({ headers: { 'X-Foo': 'a\tb c' } })
+    expect(parseHeaderFlags(['X-Foo: caf\u00e9'])).toEqual({ headers: { 'X-Foo': 'caf\u00e9' } })
+  })
+
+  test('errors never repeat the raw flag, which may contain a credential', () => {
+    for (const bad of [
+      'Bad Name: secret-token',
+      'Authorization Bearer secret-token',
+      'secret-token:',
+      'secret-token: ***',
+      'secret-token: a\nb',
+    ]) {
+      const result = parseHeaderFlags([bad])
+      expect(result).toHaveProperty('error')
+      expect(JSON.stringify(result)).not.toContain('secret-token')
+    }
+    const duplicate = parseHeaderFlags(['secret-token: 1', 'Secret-Token: 2'])
+    expect(duplicate).toHaveProperty('error')
+    expect(JSON.stringify(duplicate)).not.toContain('ecret-')
+  })
+
+  test('keeps a header named __proto__ as an own property', () => {
+    const result = parseHeaderFlags(['__proto__: x'])
+    expect('headers' in result && Object.keys(result.headers ?? {})).toEqual(['__proto__'])
+    expect('headers' in result && JSON.stringify(result.headers)).toBe('{"__proto__":"x"}')
+  })
+
+  test('rejects the hidden placeholder as a real value', () => {
+    expect(parseHeaderFlags(['Authorization: ***'])).toHaveProperty('error')
+  })
+})
+
+describe('withHeaderHint', () => {
+  const refusal = "'url' was changed, so the masked value at 'headers.Authorization' must be entered again instead of '***'"
+
+  test('points at --header when the server refuses to restore hidden headers', () => {
+    expect(withHeaderHint(refusal, {})).toBe(`${refusal}. Pass each header again with --header "Name: value".`)
+  })
+
+  test('leaves other errors, and updates that already pass --header, alone', () => {
+    expect(withHeaderHint('Provider not found', {})).toBe('Provider not found')
+    expect(withHeaderHint(refusal, { header: ['A: b'] })).toBe(refusal)
   })
 })
 

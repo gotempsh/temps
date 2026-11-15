@@ -977,7 +977,9 @@ impl ProxyLogService {
             || async { paginator.num_items().await },
         )
         .await?;
-        let items = paginator.fetch_page(page - 1).await?;
+        let items = paginator
+            .fetch_page(temps_core::config::page_index(page))
+            .await?;
 
         Ok((items, total))
     }
@@ -1189,7 +1191,7 @@ impl ProxyLogService {
         if let Some(storage) = &self.storage {
             return storage.get_today_count(filters).await;
         }
-        let today_start = Utc::now().date_naive().and_hms_opt(0, 0, 0).unwrap();
+        let today_start = Utc::now().date_naive().and_time(chrono::NaiveTime::MIN);
         let today_start = chrono::DateTime::<Utc>::from_naive_utc_and_offset(today_start, Utc);
 
         let mut query = proxy_logs::Entity::find();
@@ -3812,7 +3814,7 @@ mod tests {
     /// Postgres is available, per the repo's Docker-test convention.
     #[tokio::test]
     async fn test_stats_served_from_cagg_match_raw_path() {
-        use temps_database::test_utils::TestDatabase;
+        use temps_test_utils::TestDatabase;
 
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
@@ -4010,7 +4012,7 @@ mod tests {
     /// Postgres is available, per the repo's Docker-test convention.
     #[tokio::test]
     async fn test_get_ai_status_breakdown_classifies_101_as_1xx() {
-        use temps_database::test_utils::TestDatabase;
+        use temps_test_utils::TestDatabase;
 
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,

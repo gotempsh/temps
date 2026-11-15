@@ -23,7 +23,7 @@ use temps_analytics::ingest_keys::{
     stamp_retry_after_on_rate_limited, wildcard_ingest_cors, IngestBranch, IngestJson,
     KeyedIngestCors,
 };
-use temps_auth::{
+use temps_authz::{
     deny_deployment_token, permission_guard, project_access_guard, project_scope_guard, RequireAuth,
 };
 use temps_core::error_builder::ErrorBuilder;
@@ -1209,7 +1209,7 @@ mod tests {
     use base64::Engine;
     use sea_orm::{ActiveModelTrait, ActiveValue::Set, EntityTrait};
     use temps_analytics::ingest_keys::{AnalyticsIngestKeyService, AnalyticsIngestRateLimiter};
-    use temps_database::test_utils::TestDatabase;
+    use temps_test_utils::TestDatabase;
     use tower::ServiceExt;
 
     /// A syntactically valid key that is guaranteed not to exist.
@@ -1273,7 +1273,7 @@ mod tests {
         async fn create_audit_log(
             &self,
             _operation: &dyn temps_core::AuditOperation,
-        ) -> anyhow::Result<()> {
+        ) -> temps_core::AuditResult<()> {
             Ok(())
         }
     }

@@ -20,9 +20,11 @@
 /// only ever narrow what the console serves, never widen it.
 pub const STATUS_HOST_HEADER: &str = "x-temps-status-host";
 
-/// `Content-Security-Policy` for every public status-page response.
+/// `Content-Security-Policy` for every public status-page response. No
+/// scripts at all; images only over HTTPS, for the logo an admin may set
+/// (sent with `no-referrer`, so the image host never learns the page URL).
 pub const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; style-src 'unsafe-inline'; \
-     img-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+     img-src https:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
 /// Headers sent with every public status-page response, hit or miss.
 pub const SECURITY_HEADERS: [(&str, &str); 6] = [

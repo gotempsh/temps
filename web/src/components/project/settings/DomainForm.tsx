@@ -318,7 +318,7 @@ export function DomainForm({
             name="serviceName"
             render={({ field }) => (
               <FormItem>
-                <FormLabel>Compose Service</FormLabel>
+                <FormLabel>Compose service</FormLabel>
                 <Select
                   onValueChange={(val) =>
                     field.onChange(val === '_all_' ? '' : val)
@@ -412,8 +412,8 @@ export function DomainForm({
                 )}
               </div>
               <FormDescription>
-                Visitors keep the page they asked for: /pricing?plan=pro on
-                this domain goes to /pricing?plan=pro on the target.
+                Visitors keep the page they asked for: /pricing?plan=pro on this
+                domain goes to /pricing?plan=pro on the target.
               </FormDescription>
             </FormItem>
           )}
@@ -425,7 +425,7 @@ export function DomainForm({
             name="statusCode"
             render={({ field }) => (
               <FormItem>
-                <FormLabel>Redirect Status Code</FormLabel>
+                <FormLabel>Redirect status code</FormLabel>
                 <Select
                   onValueChange={(value) => field.onChange(parseInt(value))}
                   defaultValue={field.value?.toString()}

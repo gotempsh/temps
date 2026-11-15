@@ -19,10 +19,10 @@ pub enum OidcError {
     #[error("OIDC discovery failed for issuer {issuer}: {reason}")]
     DiscoveryFailed { issuer: String, reason: String },
 
-    #[error("OIDC login state not found: {state}")]
+    #[error("OIDC login attempt was not found or was already used")]
     StateNotFound { state: String },
 
-    #[error("OIDC login state expired: {state} (age {age_secs}s)")]
+    #[error("OIDC login attempt expired (age {age_secs}s)")]
     StateExpired { state: String, age_secs: i64 },
 
     #[error("OIDC token exchange failed (HTTP {status}): {body}")]
@@ -182,20 +182,18 @@ impl From<OidcError> for Problem {
                     .with_title("OIDC Provider Unreachable")
                     .with_detail(discovery_failed_detail(&issuer))
             }
-            OidcError::StateNotFound { state } => problem_new(StatusCode::BAD_REQUEST)
+            OidcError::StateNotFound { .. } => problem_new(StatusCode::BAD_REQUEST)
                 .with_title("Invalid OIDC State")
-                .with_detail(format!(
-                    "OIDC login state {state} was not found or was already used"
-                )),
+                .with_detail("OIDC login attempt was not found or was already used"),
             OidcError::CredentialsChanged { .. } => problem_new(StatusCode::CONFLICT)
                 .with_title("Sign-in Interrupted")
                 .with_detail(
                     "Your password was reset by an administrator while you were signing in. Start sign-in again.",
                 ),
-            OidcError::StateExpired { state, age_secs } => problem_new(StatusCode::BAD_REQUEST)
+            OidcError::StateExpired { age_secs, .. } => problem_new(StatusCode::BAD_REQUEST)
                 .with_title("OIDC State Expired")
                 .with_detail(format!(
-                    "OIDC login state {state} expired after {age_secs}s. Please start login again."
+                    "OIDC login attempt expired after {age_secs}s. Please start login again."
                 )),
             OidcError::TokenExchangeFailed { status, body } => problem_new(StatusCode::BAD_GATEWAY)
                 .with_title("OIDC Token Exchange Failed")

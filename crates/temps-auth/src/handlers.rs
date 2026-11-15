@@ -25,7 +25,6 @@ use axum::{
     Json, Router,
 };
 use cookie;
-use cookie::Cookie;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
@@ -291,13 +290,14 @@ pub async fn logout(
 
     match auth_state.auth_service.logout(user.id, &headers).await {
         Ok(_) => {
+            // Both names: the browser may hold the host-only cookie this
+            // release issues or an unprefixed one from before it, and a
+            // sign-out that leaves either behind means the next request
+            // still presents a dead session.
             let mut headers = HeaderMap::new();
-            headers.insert(
-                SET_COOKIE,
-                "session=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Strict"
-                    .parse()
-                    .unwrap(),
-            );
+            for value in crate::auth_cookies::clearing_values(crate::auth_cookies::SESSION) {
+                headers.append(SET_COOKIE, value);
+            }
             (StatusCode::OK, headers, Json(json!({"status": "success"}))).into_response()
         }
         Err(e) => {
@@ -330,19 +330,12 @@ pub async fn verify_mfa_challenge(
     headers: HeaderMap,
     Json(verification): Json<MfaVerificationRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    // Extract and decrypt MFA session from cookie
-    let encrypted_mfa_session = headers
-        .get_all("Cookie")
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|cookie_str| Cookie::split_parse(cookie_str).filter_map(Result::ok))
-        .find_map(|cookie| {
-            if cookie.name() == "mfa_session" {
-                Some(cookie.value().to_string())
-            } else {
-                None
-            }
-        });
+    // Extract and decrypt MFA session from cookie, host-only name first.
+    let encrypted_mfa_session = crate::auth_cookies::read(
+        &headers,
+        crate::auth_cookies::MFA_SESSION,
+        metadata.is_secure,
+    );
     let encrypted_mfa_session = match encrypted_mfa_session {
         Some(session) => session,
         None => {
@@ -488,13 +481,13 @@ pub async fn verify_mfa_challenge(
                 .create_session_cookie(&session_token_encrypted, metadata.is_secure);
 
             // // Clear the MFA session cookie
-            let clear_mfa_cookie = Cookie::build(("mfa_session", ""))
-                .http_only(true)
-                .path("/")
-                .max_age(cookie::time::Duration::seconds(0))
-                .same_site(cookie::SameSite::Strict)
-                .secure(metadata.is_secure)
-                .build();
+            let clear_mfa_cookie = crate::auth_cookies::builder(
+                crate::auth_cookies::MFA_SESSION,
+                "",
+                metadata.is_secure,
+            )
+            .max_age(cookie::time::Duration::seconds(0))
+            .build();
             let clear_cookie_header = match clear_mfa_cookie.to_string().parse() {
                 Ok(cookie_header) => cookie_header,
                 Err(error) => {
@@ -795,10 +788,19 @@ pub async fn verify_step_up(
 )]
 pub struct AuthApiDoc;
 
+/// Per-IP budget for the OIDC login start and callback routes, which take no
+/// credentials (see `configure_routes`). The credential routes keep the default
+/// of 10 a minute.
+const OIDC_LOGIN_MAX_REQUESTS_PER_MINUTE: u32 = 120;
+
 pub fn configure_routes() -> Router<Arc<AuthState>> {
     use crate::rate_limit::{auth_rate_limit_middleware, AuthRateLimitConfig, AuthRateLimiter};
 
     let rate_limiter = AuthRateLimiter::new(AuthRateLimitConfig::default());
+    let oidc_rate_limiter = AuthRateLimiter::new(AuthRateLimitConfig {
+        max_requests: OIDC_LOGIN_MAX_REQUESTS_PER_MINUTE,
+        ..Default::default()
+    });
 
     // Auth-sensitive routes that are rate limited to prevent brute force attacks.
     // These are the public-facing endpoints that accept credentials or tokens.
@@ -816,13 +818,26 @@ pub fn configure_routes() -> Router<Arc<AuthState>> {
             "/auth/password-change-required",
             post(change_required_password),
         )
+        // `Extension` must be added last (outermost) so it runs before
+        // `auth_rate_limit_middleware` on the way in — Axum composes
+        // `.layer()` calls like an onion, and the layer added last wraps
+        // everything before it, seeing the request first.
+        .layer(axum::middleware::from_fn(auth_rate_limit_middleware))
+        .layer(axum::Extension(rate_limiter));
+
+    // OIDC login start and callback take no credentials: the start routes only
+    // redirect to the identity provider and the callback checks a signed
+    // `state`, so there is nothing to brute-force. They get a larger budget of
+    // their own because behind a container bridge or gateway every browser
+    // shares one peer IP, and ten redirects a minute would lock out everyone.
+    // Same layer order as above.
+    let oidc_login_routes = Router::new()
         .route(
             "/auth/oidc/login/{slug}",
             get(crate::oidc_handler::start_oidc_login_by_slug),
         )
         // Fixed address for the Cloud-managed provider (Cloud's "Open
-        // console" links here); rate-limited with the slug route because it
-        // is the same login start.
+        // console" links here); same login start as the slug route.
         .route(
             "/auth/oidc/cloud/login",
             get(crate::oidc_handler::start_managed_cloud_login),
@@ -831,12 +846,8 @@ pub fn configure_routes() -> Router<Arc<AuthState>> {
             "/auth/oidc/callback",
             get(crate::oidc_handler::oidc_callback),
         )
-        // `Extension` must be added last (outermost) so it runs before
-        // `auth_rate_limit_middleware` on the way in — Axum composes
-        // `.layer()` calls like an onion, and the layer added last wraps
-        // everything before it, seeing the request first.
         .layer(axum::middleware::from_fn(auth_rate_limit_middleware))
-        .layer(axum::Extension(rate_limiter));
+        .layer(axum::Extension(oidc_rate_limiter));
 
     // Device polling runs every few seconds for the whole login, so it has
     // its own budget instead of the brute-force limiter above; see
@@ -891,6 +902,7 @@ pub fn configure_routes() -> Router<Arc<AuthState>> {
         .route("/users/{user_id}/roles/{role_type}", delete(remove_role));
 
     rate_limited_auth_routes
+        .merge(oidc_login_routes)
         .merge(device_poll_routes)
         .merge(authenticated_routes)
 }
@@ -1148,14 +1160,13 @@ pub async fn login(
                             )
                     })?;
 
-                let password_change_cookie =
-                    Cookie::build(("password_change_session", encrypted_token))
-                        .http_only(true)
-                        .path("/")
-                        .max_age(cookie::time::Duration::minutes(15))
-                        .same_site(cookie::SameSite::Strict)
-                        .secure(metadata.is_secure)
-                        .build();
+                let password_change_cookie = crate::auth_cookies::builder(
+                    crate::auth_cookies::PASSWORD_CHANGE_SESSION,
+                    encrypted_token,
+                    metadata.is_secure,
+                )
+                .max_age(cookie::time::Duration::minutes(15))
+                .build();
                 let cookie_header =
                     password_change_cookie
                         .to_string()
@@ -1232,13 +1243,13 @@ pub async fn login(
 
                         // Create MFA cookie
                         let mut headers = HeaderMap::new();
-                        let mfa_cookie = cookie::Cookie::build(("mfa_session", encrypted_token))
-                            .http_only(true)
-                            .path("/")
-                            .max_age(cookie::time::Duration::minutes(5))
-                            .same_site(cookie::SameSite::Strict)
-                            .secure(metadata.is_secure)
-                            .build();
+                        let mfa_cookie = crate::auth_cookies::builder(
+                            crate::auth_cookies::MFA_SESSION,
+                            encrypted_token,
+                            metadata.is_secure,
+                        )
+                        .max_age(cookie::time::Duration::minutes(5))
+                        .build();
                         let cookie_header = match mfa_cookie.to_string().parse() {
                             Ok(cookie_header) => cookie_header,
                             Err(error) => {
@@ -1665,19 +1676,16 @@ pub async fn change_required_password(
     headers: HeaderMap,
     Json(request): Json<RequiredPasswordChangeRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    let encrypted_token = headers
-        .get_all("Cookie")
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|cookie_header| Cookie::split_parse(cookie_header).filter_map(Result::ok))
-        .find_map(|cookie| {
-            (cookie.name() == "password_change_session").then(|| cookie.value().to_string())
-        })
-        .ok_or_else(|| {
-            problem_new(StatusCode::UNAUTHORIZED)
-                .with_title("Password Change Session Required")
-                .with_detail("Log in again to restart the required password change.")
-        })?;
+    let encrypted_token = crate::auth_cookies::read(
+        &headers,
+        crate::auth_cookies::PASSWORD_CHANGE_SESSION,
+        metadata.is_secure,
+    )
+    .ok_or_else(|| {
+        problem_new(StatusCode::UNAUTHORIZED)
+            .with_title("Password Change Session Required")
+            .with_detail("Log in again to restart the required password change.")
+    })?;
 
     let token = state
         .cookie_crypto
@@ -1703,21 +1711,11 @@ pub async fn change_required_password(
     // Prepare the response cookie before changing the password. If header
     // construction fails, the temporary credential remains usable and the
     // user can safely retry instead of being locked out.
-    let clear_cookie = Cookie::build(("password_change_session", ""))
-        .http_only(true)
-        .path("/")
-        .max_age(cookie::time::Duration::seconds(0))
-        .same_site(cookie::SameSite::Strict)
-        .secure(metadata.is_secure)
-        .build();
-    let cookie_header = clear_cookie.to_string().parse().map_err(|error| {
-        error!(error = %error, "Failed to clear required password-change cookie");
-        problem_new(StatusCode::INTERNAL_SERVER_ERROR)
-            .with_title("Password Change Failed")
-            .with_detail("Could not prepare the password change. Please try again.")
-    })?;
     let mut response_headers = HeaderMap::new();
-    response_headers.append(SET_COOKIE, cookie_header);
+    for value in crate::auth_cookies::clearing_values(crate::auth_cookies::PASSWORD_CHANGE_SESSION)
+    {
+        response_headers.append(SET_COOKIE, value);
+    }
 
     let requires_mfa_enrollment = state
         .auth_service
@@ -1901,6 +1899,9 @@ impl From<UserServiceError> for Problem {
             UserServiceError::Validation(msg) => problem_new(StatusCode::BAD_REQUEST)
                 .with_title("Validation error")
                 .with_detail(msg),
+            UserServiceError::EmailTaken { .. } => problem_new(StatusCode::CONFLICT)
+                .with_title("Email already in use")
+                .with_detail(err.to_string()),
             UserServiceError::Encryption(msg) => {
                 error!("Encryption error: {}", msg);
                 problem_new(StatusCode::INTERNAL_SERVER_ERROR)
@@ -1939,6 +1940,13 @@ impl From<UserServiceError> for Problem {
                 retry_after_seconds,
                 ..
             } => mfa_locked_problem(retry_after_seconds),
+            e @ UserServiceError::IngressGrantRevocation { .. } => {
+                let message = e.to_string();
+                error!("{}", message);
+                problem_new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Access Revocation Failed")
+                    .with_detail(message)
+            }
             UserServiceError::PasswordResetOnDeletedUser { user_id } => {
                 problem_new(StatusCode::CONFLICT)
                     .with_title("User Deleted")
@@ -2988,19 +2996,12 @@ async fn change_password_self(
     // plaintext token (that's what the sessions table stores). Missing /
     // undecryptable cookie just means we don't know which session is
     // "current" — fine, the service falls back to revoking everything.
-    let current_session_token: Option<String> = headers
-        .get_all("Cookie")
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|s| Cookie::split_parse(s).filter_map(Result::ok))
-        .find_map(|c| {
-            if c.name() == "session" {
-                Some(c.value().to_string())
-            } else {
-                None
-            }
-        })
-        .and_then(|enc| app_state.cookie_crypto.decrypt(&enc).ok());
+    let current_session_token: Option<String> = crate::auth_cookies::read_sealed(
+        &headers,
+        crate::auth_cookies::SESSION,
+        metadata.is_secure,
+        &app_state.cookie_crypto,
+    );
 
     match app_state
         .auth_service
@@ -3169,6 +3170,16 @@ async fn disable_mfa(
 
 #[cfg(test)]
 mod tests {
+    /// The OIDC login start/callback routes carry no credentials and live
+    /// behind a shared proxy IP, so they get a bigger budget than the
+    /// brute-force limiter on the credential routes, which must stay strict.
+    #[test]
+    fn oidc_login_budget_is_larger_than_the_credential_budget() {
+        let credentials = crate::rate_limit::AuthRateLimitConfig::default().max_requests;
+        assert_eq!(credentials, 10, "credential routes must stay at 10/min");
+        assert!(super::OIDC_LOGIN_MAX_REQUESTS_PER_MINUTE > credentials);
+    }
+
     use super::{
         assign_role, authorize_admin_target, authorize_role_assignment, bounded_audit_identity,
         create_user, delete_user, login, normalized_login_email, parse_user_roles,
@@ -3253,7 +3264,7 @@ mod tests {
         async fn create_audit_log(
             &self,
             _operation: &dyn temps_core::audit::AuditOperation,
-        ) -> anyhow::Result<()> {
+        ) -> temps_core::AuditResult<()> {
             Ok(())
         }
     }
@@ -3284,8 +3295,9 @@ mod tests {
         async fn create_audit_log(
             &self,
             operation: &dyn temps_core::audit::AuditOperation,
-        ) -> anyhow::Result<()> {
-            let data = serde_json::from_str(&operation.serialize()?)?;
+        ) -> temps_core::AuditResult<()> {
+            let data = serde_json::from_str(&operation.serialize()?)
+                .expect("audit operation serializes to valid JSON");
             self.events
                 .lock()
                 .expect("recorded audit mutex is not poisoned")
@@ -3304,9 +3316,12 @@ mod tests {
     impl AuditLogger for FailingAuditLogger {
         async fn create_audit_log(
             &self,
-            _operation: &dyn temps_core::audit::AuditOperation,
-        ) -> anyhow::Result<()> {
-            anyhow::bail!("audit storage unavailable")
+            operation: &dyn temps_core::audit::AuditOperation,
+        ) -> temps_core::AuditResult<()> {
+            return Err(temps_core::AuditError::write(
+                operation.operation_type(),
+                "audit storage unavailable",
+            ));
         }
     }
 
@@ -3550,7 +3565,12 @@ mod tests {
     async fn invalid_credentials_are_audited_with_normalized_identity() {
         let audit = Arc::new(RecordingAuditLogger::default());
         let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // The email matches nothing...
             .append_query_results([Vec::<users::Model>::new()])
+            // ...and the per-account throttle is read anyway, against an id
+            // no row has, so its cost cannot tell an unknown address from a
+            // real one.
+            .append_query_results([Vec::<temps_entities::user_login_guards::Model>::new()])
             .into_connection();
         let state = auth_state_with_audit(db, audit.clone());
 
@@ -3581,10 +3601,14 @@ mod tests {
             .cookie_crypto
             .encrypt(session_token)
             .expect("test MFA session encrypts");
+        // `request_metadata()` describes an https console, which issues and
+        // reads only the host-only name. Through the shared helper so the
+        // fixture cannot drift from what the server looks for.
+        let name = crate::auth_cookies::issued_name(crate::auth_cookies::MFA_SESSION, true);
         let mut headers = HeaderMap::new();
         headers.insert(
             axum::http::header::COOKIE,
-            format!("mfa_session={encrypted}")
+            format!("{name}={encrypted}")
                 .parse()
                 .expect("test cookie header is valid"),
         );
@@ -4095,7 +4119,8 @@ mod tests {
             let mut enabled = pending.clone();
             enabled.mfa_enabled = true;
             // Lock the user, read the (empty) guard, upsert it, persist
-            // `mfa_enabled`, then revoke the user's other sessions.
+            // `mfa_enabled`, then revoke the user's other sessions and their
+            // ingress login grants.
             let db = MockDatabase::new(DatabaseBackend::Postgres)
                 .append_query_results([vec![pending]])
                 .append_query_results([Vec::<temps_entities::user_mfa_guards::Model>::new()])
@@ -4108,6 +4133,10 @@ mod tests {
                     sea_orm::MockExecResult {
                         last_insert_id: 0,
                         rows_affected: 2,
+                    },
+                    sea_orm::MockExecResult {
+                        last_insert_id: 0,
+                        rows_affected: 1,
                     },
                 ])
                 .into_connection();
@@ -4337,6 +4366,63 @@ mod tests {
         );
     }
 
+    /// Regression: the OIDC login start and callback shared the 10-per-minute
+    /// brute-force limiter, so behind a container bridge (one peer IP for every
+    /// browser) a few redirects locked the whole console out of SSO. Through
+    /// the real router: the callback takes its own 120-a-minute budget, is
+    /// still limited past it, and spending it leaves `/auth/login` untouched.
+    #[tokio::test]
+    async fn test_oidc_login_routes_have_their_own_budget() {
+        use tower::ServiceExt;
+
+        let app = super::configure_routes().with_state(admin_owner_state());
+        let peer: std::net::SocketAddr = "203.0.113.3:12345".parse().unwrap();
+        // No `RequestMetadata` extension and no body, so an allowed request is
+        // rejected by an extractor before the mock database is touched; only
+        // the rate-limit decision is under test.
+        let send = |app: axum::Router, method: &'static str, uri: &'static str| async move {
+            let mut request = axum::http::Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from("{}"))
+                .unwrap();
+            request
+                .extensions_mut()
+                .insert(axum::extract::ConnectInfo(peer));
+            app.oneshot(request).await.unwrap().status()
+        };
+
+        for i in 0..super::OIDC_LOGIN_MAX_REQUESTS_PER_MINUTE {
+            let status = send(app.clone(), "GET", "/auth/oidc/callback").await;
+            assert_ne!(
+                status,
+                StatusCode::TOO_MANY_REQUESTS,
+                "OIDC callback {i} was rate limited within its own budget"
+            );
+        }
+        assert_eq!(
+            send(app.clone(), "GET", "/auth/oidc/callback").await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "the OIDC routes must still be limited past their budget"
+        );
+
+        // The OIDC requests must not have spent the credential budget.
+        for i in 0..10 {
+            let status = send(app.clone(), "POST", "/auth/login").await;
+            assert_ne!(
+                status,
+                StatusCode::TOO_MANY_REQUESTS,
+                "login {i} was rate limited by OIDC traffic from the same IP"
+            );
+        }
+        assert_eq!(
+            send(app.clone(), "POST", "/auth/login").await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "credential routes keep the 10-a-minute limit"
+        );
+    }
+
     /// Regression: `/auth/cli/device/poll` used to share the 10-per-minute
     /// brute-force limiter, so `temps login` (polling every 2 s) got a 429
     /// about 20 s in, and the polls spent the login budget of the browser
@@ -4539,16 +4625,14 @@ mod tests {
         use axum::http::StatusCode;
         use chrono::Utc;
         use sea_orm::{ActiveModelTrait, ActiveValue::Set, DatabaseConnection};
-        use temps_database::test_utils::TestDatabase;
         use temps_entities::users;
+        use temps_test_utils::TestDatabase;
 
         async fn test_db() -> Option<TestDatabase> {
             match TestDatabase::with_migrations().await {
                 Ok(db) => Some(db),
                 Err(error)
-                    if temps_database::test_utils::is_container_runtime_unavailable(
-                        &error.to_string(),
-                    ) =>
+                    if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
                 {
                     println!("Docker not available, skipping test: {error}");
                     None
@@ -5114,6 +5198,132 @@ mod tests {
             assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
             assert_eq!(body["error_code"], "MFA_LOCKED");
             assert!(body["retry_after_seconds"].as_i64().unwrap() > 0);
+        }
+    }
+
+    /// Per-account login throttling driven through the real route, behind
+    /// the per-address limiter it exists to complement.
+    mod login_throttle_http {
+        use crate::http_test_support::{auth_state, router, send_with_headers};
+        use argon2::PasswordHasher;
+        use axum::http::StatusCode;
+        use sea_orm::{ActiveModelTrait, ActiveValue::Set, DatabaseConnection};
+        use temps_entities::users;
+        use temps_test_utils::TestDatabase;
+
+        const PASSWORD: &str = "Correct-Horse-9!";
+
+        async fn test_db() -> Option<TestDatabase> {
+            match TestDatabase::with_migrations().await {
+                Ok(db) => Some(db),
+                Err(error)
+                    if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+                {
+                    println!("Docker not available, skipping test: {error}");
+                    None
+                }
+                Err(error) => panic!("test database setup failed: {error}"),
+            }
+        }
+
+        async fn user_with_password(db: &DatabaseConnection, email: &str) -> users::Model {
+            let hash = argon2::Argon2::default()
+                .hash_password(PASSWORD.as_bytes())
+                .expect("hash the test password")
+                .to_string();
+            users::ActiveModel {
+                email: Set(email.to_string()),
+                name: Set(email.to_string()),
+                password_hash: Set(Some(hash)),
+                email_verified: Set(true),
+                mfa_enabled: Set(false),
+                ..Default::default()
+            }
+            .insert(db)
+            .await
+            .expect("insert the test user")
+        }
+
+        /// One `POST /auth/login`, as if from `address`.
+        ///
+        /// The harness connects from loopback, which is how the production
+        /// listener decides a forwarded address may be trusted, so this is
+        /// the same path a request through the proxy takes.
+        async fn attempt(
+            app: &axum::Router,
+            address: &str,
+            email: &str,
+            password: &str,
+        ) -> (StatusCode, serde_json::Value) {
+            send_with_headers(
+                app,
+                "POST",
+                "/auth/login",
+                &[("x-forwarded-for", address)],
+                Some(serde_json::json!({ "email": email, "password": password })),
+            )
+            .await
+        }
+
+        #[tokio::test]
+        async fn guessing_one_account_from_many_addresses_is_throttled() {
+            let Some(db) = test_db().await else { return };
+            let connection = db.connection_arc();
+            let state = auth_state(connection.clone());
+            user_with_password(connection.as_ref(), "target@example.com").await;
+            let app = router(state, connection);
+
+            // A fresh address every time, so the per-address limiter (10 a
+            // minute) never fires: before this change nothing slowed this
+            // down at all.
+            for number in 1..=crate::login_guard::LOCKOUT_THRESHOLD {
+                let (status, _) = attempt(
+                    &app,
+                    &format!("203.0.113.{number}"),
+                    "target@example.com",
+                    "Wrong-Password-1!",
+                )
+                .await;
+                assert_eq!(status, StatusCode::UNAUTHORIZED, "attempt {number}");
+            }
+
+            // From yet another address, with the right password.
+            let (throttled_status, throttled_body) =
+                attempt(&app, "198.51.100.9", "target@example.com", PASSWORD).await;
+            assert_eq!(throttled_status, StatusCode::UNAUTHORIZED);
+
+            // Indistinguishable from an account that does not exist: an
+            // attacker must not learn which addresses are worth guessing.
+            let (unknown_status, unknown_body) =
+                attempt(&app, "198.51.100.10", "nobody@example.com", PASSWORD).await;
+            assert_eq!(throttled_status, unknown_status);
+            assert_eq!(throttled_body, unknown_body, "{throttled_body}");
+        }
+
+        #[tokio::test]
+        async fn the_right_password_still_signs_in_below_the_threshold() {
+            let Some(db) = test_db().await else { return };
+            let connection = db.connection_arc();
+            let state = auth_state(connection.clone());
+            user_with_password(connection.as_ref(), "typist@example.com").await;
+            let app = router(state, connection);
+
+            // A person fixing a typo must never meet the throttle.
+            for number in 1..crate::login_guard::LOCKOUT_THRESHOLD {
+                let (status, _) = attempt(
+                    &app,
+                    &format!("203.0.113.{number}"),
+                    "typist@example.com",
+                    "Wrong-Password-1!",
+                )
+                .await;
+                assert_eq!(status, StatusCode::UNAUTHORIZED, "attempt {number}");
+            }
+
+            let (status, body) =
+                attempt(&app, "198.51.100.20", "typist@example.com", PASSWORD).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["success"], true);
         }
     }
 }

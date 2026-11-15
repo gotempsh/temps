@@ -25,6 +25,11 @@ interface InsightsPanelProps {
    * a stats-only panel.
    */
   aiContext?: AiInsightContext
+  /**
+   * The page still shows the previous window's data while a moved one loads:
+   * "Ask AI" stays on screen, disabled, until the stats match the window.
+   */
+  aiPending?: boolean
   project?: InsightsProject
   emptyText?: string
 }
@@ -124,6 +129,7 @@ export function InsightsPanel({
   insights,
   isLoading,
   aiContext,
+  aiPending = false,
   project,
   emptyText = 'Not enough data in this period to surface insights.',
 }: InsightsPanelProps) {
@@ -155,12 +161,12 @@ export function InsightsPanel({
       <CardHeader className="py-3">
         <div className="flex items-center justify-between gap-2">
           <CardTitle className="text-sm font-medium">Insights</CardTitle>
-          {askAi && (
+          {(askAi || (aiPending && project)) && (
             <Button
               variant="outline"
               size="sm"
               className="h-7 shrink-0 gap-1.5"
-              disabled={isLoading}
+              disabled={isLoading || !askAi}
               onClick={askAi}
             >
               <Sparkles className="size-4 shrink-0" />

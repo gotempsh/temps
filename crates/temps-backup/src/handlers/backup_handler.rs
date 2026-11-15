@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use crate::engines::dispatch::{resolve_engine_key, ResolveEngineError};
+use crate::engines::dispatch::ResolveEngineError;
 use crate::handlers::audit::{
     AuditContext, BackupDeletedAudit, BackupRetentionCleanupAudit, BackupRunAudit,
     BackupScheduleStatusChangedAudit, BackupScheduleUpdatedAudit, ExternalServiceBackupRunAudit,
@@ -52,6 +52,11 @@ impl From<ResolveEngineError> for Problem {
                     .with_title("Engine Detection Failed")
                     .with_detail(error.to_string())
             }
+            ResolveEngineError::LocalDockerUnavailable { .. } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Docker Unavailable")
+                    .with_detail(error.to_string())
+            }
         }
     }
 }
@@ -66,6 +71,10 @@ impl From<BackupError> for Problem {
             BackupError::Validation(ref msg) => problemdetails::new(StatusCode::BAD_REQUEST)
                 .with_title("Validation Error")
                 .with_detail(msg.clone()),
+
+            BackupError::InvalidS3Endpoint { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Invalid S3 Endpoint")
+                .with_detail(error.to_string()),
 
             BackupError::Schedule(ref msg) => problemdetails::new(StatusCode::BAD_REQUEST)
                 .with_title("Schedule Error")
@@ -272,10 +281,19 @@ pub struct CreateS3SourceRequest {
     /// provider; stored encrypted and never returned.
     pub secret_key: SecretString,
     pub region: String,
-    /// Optional endpoint URL for S3-compatible services like MinIO
+    /// Optional endpoint for S3-compatible services like MinIO or RustFS,
+    /// with or without a scheme. Stored with an explicit scheme: without
+    /// one, `use_tls` decides it (plain `http://` when that is unset too).
     #[schema(example = "http://minio.example.com:9000")]
     pub endpoint: Option<String>,
-    /// Whether to use path-style addressing (default: true)
+    /// Whether the endpoint is reached over TLS. Only needed for an endpoint
+    /// entered without a scheme; one that conflicts with the endpoint's
+    /// scheme is rejected.
+    #[serde(default)]
+    #[schema(example = false)]
+    pub use_tls: Option<bool>,
+    /// Whether to use path-style addressing (default: true). Forced on for
+    /// an IP-address endpoint and a Temps-managed object store.
     #[schema(example = true)]
     pub force_path_style: Option<bool>,
     /// When true, make this the default source (will swap out any existing default).
@@ -285,6 +303,41 @@ pub struct CreateS3SourceRequest {
     /// Managed RustFS/S3 service that supplies this destination. When set,
     /// schedules using this source can never target that service itself.
     pub backing_service_id: Option<i32>,
+    /// What a worker node receives when it backs up or restores one of its
+    /// services into this source. Default `scoped`.
+    #[serde(default)]
+    pub worker_credentials: Option<WorkerCredentialsPolicy>,
+}
+
+/// What a worker node may receive from an S3 source (ADR-102).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerCredentialsPolicy {
+    /// Only a credential limited to the job's own backup and operations.
+    /// A source that cannot mint one (no STS) refuses worker jobs.
+    Scoped,
+    /// The source's own credential when it cannot mint a scoped one. The
+    /// worker can then read and delete every object in the bucket.
+    AllowFull,
+}
+
+impl WorkerCredentialsPolicy {
+    pub fn as_column(self) -> &'static str {
+        match self {
+            Self::Scoped => temps_entities::s3_sources::WORKER_CREDENTIALS_SCOPED,
+            Self::AllowFull => temps_entities::s3_sources::WORKER_CREDENTIALS_ALLOW_FULL,
+        }
+    }
+
+    /// The stored value; anything but `allow_full` reads as `scoped`, the
+    /// safe one.
+    pub fn from_column(value: &str) -> Self {
+        if value == temps_entities::s3_sources::WORKER_CREDENTIALS_ALLOW_FULL {
+            Self::AllowFull
+        } else {
+            Self::Scoped
+        }
+    }
 }
 
 #[derive(Deserialize, ToSchema, Clone)]
@@ -301,12 +354,21 @@ pub struct UpdateS3SourceRequest {
     pub secret_key: Option<SecretString>,
     /// Optional new region
     pub region: Option<String>,
-    /// Optional new endpoint URL for S3-compatible services
+    /// Optional new endpoint for S3-compatible services, with or without a
+    /// scheme. An empty string clears it (AWS S3 itself).
     #[schema(example = "http://minio.example.com:9000")]
     pub endpoint: Option<String>,
+    /// Whether the endpoint is reached over TLS; decides the scheme of an
+    /// endpoint entered without one, and must agree with one entered with it.
+    #[serde(default)]
+    #[schema(example = false)]
+    pub use_tls: Option<bool>,
     /// Optional new path-style addressing setting
     #[schema(example = true)]
     pub force_path_style: Option<bool>,
+    /// Optional new worker credentials policy.
+    #[serde(default)]
+    pub worker_credentials: Option<WorkerCredentialsPolicy>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -622,12 +684,24 @@ pub struct S3SourceResponse {
     pub region: String,
     #[schema(example = "http://minio.example.com:9000")]
     pub endpoint: Option<String>,
+    /// The endpoint every client (WAL-G, restore and worker jobs) receives,
+    /// always with an explicit scheme. `None` for AWS S3 itself.
+    #[schema(example = "http://10.0.0.5:9000")]
+    pub effective_endpoint: Option<String>,
     pub force_path_style: Option<bool>,
+    /// Whether clients actually use path-style addressing.
+    pub effective_force_path_style: bool,
+    /// Why `effective_force_path_style` has its value: the source's own
+    /// setting, or forced because the endpoint is an IP address or a
+    /// Temps-managed object store.
+    pub path_style_reason: temps_core::s3_endpoint::PathStyleReason,
     pub is_default: bool,
     /// True when this source was auto-provisioned by a Temps Cloud link
     /// rather than entered by an operator. Managed sources cannot be edited
     /// or deleted from this API; disconnect Temps Cloud to remove one.
     pub managed_by_cloud: bool,
+    /// What a worker node receives from this source (ADR-102).
+    pub worker_credentials: WorkerCredentialsPolicy,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -659,8 +733,7 @@ pub struct BackupScheduleResponse {
     pub next_run: Option<i64>,
     pub last_run: Option<i64>,
     /// Per-schedule wall-clock timeout override for backup jobs (seconds).
-    /// `null` means the engine-family default is used. See
-    /// `temps_backup_core::timeouts::default_max_runtime_secs`.
+    /// `null` means the default of four hours (14400 seconds) is used.
     pub max_runtime_secs: Option<i64>,
     /// When `true`, the schedule auto-includes every external service on
     /// the host (and any future ones). When `false`, the schedule only
@@ -825,6 +898,10 @@ pub struct SourceBackupEntry {
 
 impl From<temps_entities::s3_sources::Model> for S3SourceResponse {
     fn from(source: temps_entities::s3_sources::Model) -> Self {
+        // `true` when unset: what every client building from this source
+        // assumes for a NULL `force_path_style`.
+        let path_style = source.effective_path_style(true);
+        let effective_endpoint = source.endpoint_url();
         Self {
             id: source.id,
             name: source.name,
@@ -834,10 +911,14 @@ impl From<temps_entities::s3_sources::Model> for S3SourceResponse {
             access_key_id: "***".to_string(),
             secret_key: "***".to_string(),
             region: source.region,
+            effective_endpoint,
+            effective_force_path_style: path_style.force_path_style,
+            path_style_reason: path_style.reason,
             endpoint: source.endpoint,
             force_path_style: source.force_path_style,
             is_default: source.is_default,
             managed_by_cloud: source.managed_by_cloud,
+            worker_credentials: WorkerCredentialsPolicy::from_column(&source.worker_credentials),
             created_at: source.created_at.timestamp_millis(),
             updated_at: source.updated_at.timestamp_millis(),
         }
@@ -1287,8 +1368,8 @@ async fn attach_schedule_services(
     }))
 }
 
-/// Detach a single external service from a backup schedule. Idempotent —
-/// returns `204` whether or not a row was actually removed.
+/// Detach a single external service from a backup schedule. Returns `204` when
+/// the service was detached, and `404` when it wasn't attached to the schedule.
 #[utoipa::path(
     tag = "Backups",
     delete,
@@ -1298,9 +1379,10 @@ async fn attach_schedule_services(
         ("service_id" = i32, Path, description = "External service ID"),
     ),
     responses(
-        (status = 204, description = "Service detached (or was not attached)"),
+        (status = 204, description = "Service detached"),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 404, description = "The service is not attached to this schedule", body = ProblemDetails),
         (status = 500, description = "Internal server error", body = ProblemDetails),
     ),
     security(("bearer_auth" = []))
@@ -1336,6 +1418,15 @@ async fn detach_schedule_service(
         .detach_service_from_schedule(id, service_id)
         .await
         .map_err(Problem::from)?;
+    // Nothing changed, so there is nothing to report as done or to audit.
+    if !removed {
+        return Err(temps_core::error_builder::not_found()
+            .title("Service Not Attached")
+            .detail(format!(
+                "External service {service_id} is not attached to backup schedule {id}"
+            ))
+            .build());
+    }
 
     let audit = ScheduleServiceDetachedAudit {
         context: AuditContext {
@@ -1642,6 +1733,7 @@ async fn create_s3_source(
         source_id: source.id,
         name: source.name.clone(),
         bucket_name: source.bucket_name.clone(),
+        worker_credentials: source.worker_credentials.clone(),
     };
 
     if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
@@ -1711,7 +1803,31 @@ async fn update_s3_source(
         .await
         .map_err(Problem::from)?;
 
-    // Create audit log with changed fields
+    let updated_fields = s3_source_updated_fields(&request);
+
+    let audit = S3SourceUpdatedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        source_id: source.id,
+        name: source.name.clone(),
+        bucket_name: source.bucket_name.clone(),
+        updated_fields,
+    };
+
+    if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
+        error!("Failed to create audit log: {}", e);
+    }
+
+    Ok(Json(S3SourceResponse::from(source)))
+}
+
+/// What an S3 source update changed, for its audit entry. Credentials are
+/// only ever "updated"; the worker credentials policy is recorded with its
+/// new value, since allowing full credentials is the change to audit.
+fn s3_source_updated_fields(request: &UpdateS3SourceRequest) -> HashMap<String, String> {
     let mut updated_fields = HashMap::new();
     if request.name.is_some() {
         updated_fields.insert("name".to_string(), "updated".to_string());
@@ -1736,23 +1852,13 @@ async fn update_s3_source(
         updated_fields.insert("region".to_string(), "updated".to_string());
     }
 
-    let audit = S3SourceUpdatedAudit {
-        context: AuditContext {
-            user_id: auth.user_id(),
-            ip_address: Some(metadata.ip_address.clone()),
-            user_agent: metadata.user_agent.clone(),
-        },
-        source_id: source.id,
-        name: source.name.clone(),
-        bucket_name: source.bucket_name.clone(),
-        updated_fields,
-    };
-
-    if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
-        error!("Failed to create audit log: {}", e);
+    if let Some(policy) = request.worker_credentials {
+        updated_fields.insert(
+            "worker_credentials".to_string(),
+            policy.as_column().to_string(),
+        );
     }
-
-    Ok(Json(S3SourceResponse::from(source)))
+    updated_fields
 }
 
 /// Delete an S3 source
@@ -2883,9 +2989,11 @@ async fn get_backup(
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, BackupsRead);
+    // The UUID, or the number a run returned (`backup_id` of an external
+    // service's run): both name the same backup.
     let scoped_backup = app_state
         .backup_service
-        .backup_with_access_scope_by_uuid(&id)
+        .backup_with_access_scope_by_reference(&id)
         .await?;
     require_backup_access(
         &app_state,
@@ -3240,14 +3348,12 @@ async fn run_external_service_backup(
     // 3. Return 202 immediately — the runner executes the backup asynchronously.
     // All three inserts are atomic: if any fails, the entire operation is rolled
     // back and the handler returns an error. No orphan rows are created.
-    let docker = bollard::Docker::connect_with_local_defaults().map_err(|e| {
-        error!(service_id = id, error = %e, "run_external_service_backup: failed to connect to Docker for engine resolution");
-        problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-            .with_title("Docker Unavailable")
-            .with_detail(format!("Could not connect to Docker to determine backup engine: {}", e))
-    })?;
-
-    let engine_key = resolve_engine_key(&service, &docker)
+    // Opens this host's Docker only when the choice inspects a local
+    // container: a database on a worker node is checked by its node's
+    // agent, and needs none.
+    let engine_key = app_state
+        .backup_service
+        .resolve_engine_key(&service)
         .await
         .map_err(|e| {
             error!(service_id = id, error = %e, "run_external_service_backup: engine resolution failed");
@@ -3383,15 +3489,9 @@ async fn external_service_backup_preflight(
         .get_external_service(id)
         .await
         .map_err(Problem::from)?;
-    let docker = bollard::Docker::connect_with_local_defaults().map_err(|e| {
-        problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-            .with_title("Docker Unavailable")
-            .with_detail(format!(
-                "Could not connect to Docker to determine the backup engine of service {}: {}",
-                id, e
-            ))
-    })?;
-    let engine_key = resolve_engine_key(&service, &docker)
+    let engine_key = app_state
+        .backup_service
+        .resolve_engine_key(&service)
         .await
         .map_err(Problem::from)?;
     let reason = app_state
@@ -3504,6 +3604,67 @@ async fn list_backup_alerts(
 mod tests {
     use super::*;
 
+    /// ADR-102: the worker credentials policy is a snake_case enum on the
+    /// wire, absent means unchanged, the stored column reads back safely, and
+    /// allowing full credentials is audited with its value.
+    #[test]
+    fn the_worker_credentials_policy_round_trips_and_is_audited() {
+        let update: UpdateS3SourceRequest =
+            serde_json::from_value(serde_json::json!({ "worker_credentials": "allow_full" }))
+                .expect("a policy-only update decodes");
+        assert_eq!(
+            update.worker_credentials,
+            Some(WorkerCredentialsPolicy::AllowFull)
+        );
+        let fields = s3_source_updated_fields(&update);
+        assert_eq!(
+            fields.get("worker_credentials").map(String::as_str),
+            Some("allow_full")
+        );
+        assert_eq!(fields.len(), 1, "{fields:?}");
+
+        let unchanged: UpdateS3SourceRequest =
+            serde_json::from_value(serde_json::json!({ "name": "renamed" })).expect("decodes");
+        assert_eq!(unchanged.worker_credentials, None);
+        assert!(!s3_source_updated_fields(&unchanged).contains_key("worker_credentials"));
+        assert!(serde_json::from_value::<UpdateS3SourceRequest>(
+            serde_json::json!({ "worker_credentials": "full" })
+        )
+        .is_err());
+
+        for policy in [
+            WorkerCredentialsPolicy::Scoped,
+            WorkerCredentialsPolicy::AllowFull,
+        ] {
+            assert_eq!(
+                WorkerCredentialsPolicy::from_column(policy.as_column()),
+                policy
+            );
+        }
+        assert_eq!(
+            WorkerCredentialsPolicy::from_column("unexpected"),
+            WorkerCredentialsPolicy::Scoped
+        );
+    }
+
+    #[test]
+    fn refused_backup_delete_problem_hides_the_audit_failure_text() {
+        let audit_error =
+            temps_core::AuditError::write("BACKUP_DELETED", "connection to audit store refused");
+        let problem = Problem::from(BackupError::Internal {
+            message: format!(
+                "Refusing to delete backup 7 because the audit attempt could not be recorded: {audit_error}"
+            ),
+        });
+
+        assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(problem.body["title"], "Internal Server Error");
+        assert_eq!(
+            problem.body["detail"],
+            "The backup operation could not be completed"
+        );
+    }
+
     /// The secret key an operator (or the assistant, through a secret slot)
     /// supplies is published as a flagged credential, so tooling in front of
     /// the API can tell it from an ordinary string without a hand-kept list.
@@ -3558,6 +3719,7 @@ mod tests {
             managed_by_cloud: false,
             lifecycle_reconcile_failed_at: None,
             lifecycle_reconcile_generation: 0,
+            worker_credentials: "scoped".to_string(),
             created_at: now,
             updated_at: now,
             backing_service_id: None,

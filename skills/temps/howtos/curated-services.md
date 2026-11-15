@@ -15,7 +15,7 @@ from the managed databases, caches, and object stores in `services` /
 2. Inspect the live catalog and matching template: image, entrypoint, health
    path, resources, variables, secret generators, and database bindings. Prefer
    available connected Temps tools. The API exposes `GET /templates` and
-   `GET /templates/{slug}`; the pinned CLI exposes `templates list --kind app`.
+   `GET /templates/{slug}`; the current CLI exposes `templates list --kind app`.
    Read [the CLI safety contract](../references/cli-runtime.md) and
    [template commands](../references/commands/templates.md) when using the CLI;
    runtime help is authoritative.

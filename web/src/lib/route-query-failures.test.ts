@@ -5,9 +5,11 @@ import { describe, expect, test } from 'bun:test'
 import { QueryClient, QueryObserver } from '@tanstack/react-query'
 import {
   ROUTE_FAILURE_IGNORE,
+  ROUTE_FAILURE_IGNORE_REFUSAL,
   collectRouteQueryFailures,
   isReportableReadFailure,
   markReadFailureHandled,
+  markReadFailureRetained,
   representativeFailure,
   subscribeToHandledReadFailures,
 } from './route-query-failures'
@@ -60,6 +62,18 @@ describe('collectRouteQueryFailures', () => {
     stop()
   })
 
+  test('reports a failed read whose page keeps earlier data, marked as kept', async () => {
+    const client = new QueryClient()
+    const error = problem(500)
+    const stop = await failedQuery(client, 'moved-window', error)
+    expect(collectRouteQueryFailures(client)[0].retained).toBe(false)
+    markReadFailureRetained(error)
+    expect(collectRouteQueryFailures(client)).toEqual([
+      { queryHash: '["moved-window"]', error, retained: true },
+    ])
+    stop()
+  })
+
   test('ignores a failed read nothing is observing any more', async () => {
     const client = new QueryClient()
     const stop = await failedQuery(client, 'left-page', problem(500))
@@ -80,6 +94,35 @@ describe('collectRouteQueryFailures', () => {
     expect(client.getQueryState(['optional-banner'])?.status).toBe('error')
     expect(collectRouteQueryFailures(client)).toHaveLength(0)
     stop()
+  })
+
+  test('ignores a refusal on a read that opted out of refusals, but still reports a real failure', async () => {
+    const client = new QueryClient()
+    const observe = async (key: string, error: unknown) => {
+      const observer = new QueryObserver(client, {
+        queryKey: [key],
+        queryFn: () => Promise.reject(error),
+        retry: false,
+        meta: { routeFailure: ROUTE_FAILURE_IGNORE_REFUSAL },
+      })
+      const stop = observer.subscribe(() => {})
+      await observer.refetch().catch(() => {})
+      return stop
+    }
+    const stopRefused = await observe('refused', problem(403, 'Forbidden'))
+    expect(collectRouteQueryFailures(client)).toHaveLength(0)
+    // A 403 whose body names neither a status nor a title is still a refusal.
+    const stopBare = await observe(
+      'refused-bare',
+      Object.assign(new Error('denied'), { status: 403 })
+    )
+    expect(collectRouteQueryFailures(client)).toHaveLength(0)
+    // A server error on the same kind of read is not swallowed.
+    const stopBroken = await observe('broken', problem(500))
+    expect(collectRouteQueryFailures(client)).toHaveLength(1)
+    stopRefused()
+    stopBare()
+    stopBroken()
   })
 
   test('ignores a failed refetch that still has data to show', async () => {
@@ -130,8 +173,12 @@ describe('collectRouteQueryFailures', () => {
 
 describe('representativeFailure', () => {
   test('prefers a failure a retry can fix over a refusal', () => {
-    const refusal = { queryHash: 'a', error: problem(403, 'Forbidden') }
-    const outage = { queryHash: 'b', error: problem(500) }
+    const refusal = {
+      queryHash: 'a',
+      error: problem(403, 'Forbidden'),
+      retained: false,
+    }
+    const outage = { queryHash: 'b', error: problem(500), retained: false }
     expect(representativeFailure([refusal, outage])).toBe(outage)
     expect(representativeFailure([refusal])).toBe(refusal)
     expect(representativeFailure([])).toBeUndefined()

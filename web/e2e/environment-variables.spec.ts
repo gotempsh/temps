@@ -373,20 +373,21 @@ test('environment failure keeps manual variable management and preserves an expl
   await expect(row(page, 'SHARED_VALUE')).toBeVisible()
   await expect(row(page, 'PROD_ONLY')).toHaveCount(0)
   await expect(
-    page.getByRole('button', { name: /^Add Variable/ })
+    page.getByRole('button', { name: /^Add variable/ })
   ).toBeDisabled()
   await expect(
-    page.getByRole('button', { name: 'Import .env', exact: true })
+    page.getByRole('button', { name: 'Import or edit as .env', exact: true })
   ).toBeDisabled()
   await row(page, 'SHARED_VALUE')
-    .getByRole('button', { name: 'Edit', exact: true })
+    .getByRole('button', { name: 'Actions for SHARED_VALUE', exact: true })
     .click()
+  await page.getByRole('menuitem', { name: 'Edit', exact: true }).click()
   await expect(page.getByRole('dialog')).toContainText(
     'Saving keeps the current assignments'
   )
   await page
     .getByRole('dialog')
-    .getByRole('button', { name: 'Save Changes', exact: true })
+    .getByRole('button', { name: 'Save', exact: true })
     .click()
   await expect.poll(() => saved.length).toBe(1)
   expect(saved[0].environment_ids).toEqual([1, 2])
@@ -401,8 +402,9 @@ test('environment failure keeps manual variable management and preserves an expl
     .fill('shared')
   await expect(row(page, 'WRITE_ONLY')).toHaveCount(0)
   await row(page, 'SHARED_VALUE')
-    .getByRole('button', { name: 'Delete', exact: true })
+    .getByRole('button', { name: 'Actions for SHARED_VALUE', exact: true })
     .click()
+  await page.getByRole('menuitem', { name: 'Delete', exact: true }).click()
   await page
     .getByRole('alertdialog')
     .getByRole('button', { name: 'Delete', exact: true })
@@ -422,7 +424,7 @@ test('environment failure keeps manual variable management and preserves an expl
     page.getByRole('button', { name: 'Retry environments' })
   ).toHaveCount(0)
   await expect(
-    page.getByRole('button', { name: /^Add Variable/ })
+    page.getByRole('button', { name: /^Add variable/ })
   ).toBeEnabled()
   await expect(page.getByLabel('Environment', { exact: true })).toContainText(
     'preview'
@@ -526,7 +528,7 @@ test('a pending environments request never broadens an explicit variable scope',
     await expect(row(page, 'PROD_ONLY')).toHaveCount(0)
     await expect(row(page, 'PREVIEW_DEFAULT')).toHaveCount(0)
     await expect(
-      page.getByRole('button', { name: /^Add Variable/ })
+      page.getByRole('button', { name: /^Add variable/ })
     ).toBeDisabled()
   } finally {
     release()
@@ -549,7 +551,7 @@ for (const mode of ['Add', 'Import'] as const) {
     await page.goto(path)
     await expect(row(page, 'SHARED_VALUE')).toBeVisible()
     if (mode === 'Add') {
-      await page.getByRole('button', { name: /^Add Variable/ }).click()
+      await page.getByRole('button', { name: /^Add variable/ }).click()
       await page
         .getByPlaceholder('DATABASE_URL', { exact: true })
         .fill('NEW_KEY')
@@ -560,14 +562,15 @@ for (const mode of ['Add', 'Import'] as const) {
         .fill('example-value')
     } else {
       await page
-        .getByRole('button', { name: 'Import .env', exact: true })
+        .getByRole('button', { name: 'Import or edit as .env', exact: true })
         .click()
+      await page.getByRole('menuitem', { name: /^Import \.env/ }).click()
       await page
         .getByRole('dialog')
         .getByRole('textbox')
         .fill('NEW_KEY=example-value')
       await page
-        .getByRole('button', { name: 'Parse Content', exact: true })
+        .getByRole('button', { name: 'Parse content', exact: true })
         .click()
     }
     await page.route('**/api/projects/1/environments', (route) =>
@@ -586,7 +589,7 @@ for (const mode of ['Add', 'Import'] as const) {
     )
     await expect(
       dialog.getByRole('button', {
-        name: mode === 'Add' ? 'Save Variable' : 'Import 1 Variable',
+        name: mode === 'Add' ? 'Save variable' : 'Import 1 Variable',
         exact: true,
       })
     ).toBeDisabled()

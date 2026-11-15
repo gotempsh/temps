@@ -13,13 +13,16 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { Switch } from '@/components/ui/switch'
 import { useSettings, useUpdateSettings } from '@/hooks/useSettings'
 import { AlertTriangle, Globe } from 'lucide-react'
+import { ClusterDnsCoverageSection } from './ClusterDnsCoverage'
 import { toast } from 'sonner'
 
 /**
  * Cluster DNS (ADR-024, experimental beta) toggle.
  *
- * Off by default. Operators who need `*.temps.local` service-to-service
- * resolution inside containers must explicitly opt in here.
+ * Off on a single host; turned on automatically when the first worker joins,
+ * unless an operator has already chosen here. Switching it takes effect
+ * without a restart, for containers created from then on; the applications
+ * still running without it are listed with a redeploy action.
  */
 export function ClusterDnsCard() {
   const { data: settings, isLoading, error } = useSettings()
@@ -89,11 +92,10 @@ export function ClusterDnsCard() {
           </span>
         </CardTitle>
         <CardDescription>
-          Lets deployed containers resolve <code>*.temps.local</code> hostnames
-          — required for service-to-service traffic such as reaching a managed
-          Postgres cluster by hostname (e.g.{' '}
-          <code>primary.pg-orders.temps.local</code>) from a single
-          control-plane node with no worker agent of its own.
+          Lets applications reach other services by their{' '}
+          <code>*.temps.local</code> names, on any node — for example a managed
+          Postgres cluster at <code>primary.pg-orders.temps.local</code>,
+          wherever its members run.
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
@@ -113,8 +115,12 @@ export function ClusterDnsCard() {
               Enable cluster DNS
             </Label>
             <p className="text-xs text-muted-foreground max-w-prose">
-              Starts the control-plane Hickory resolver and injects it as the
-              first nameserver into every deployed container.
+              Starts the resolver on every node and makes it the first
+              nameserver of each application container created from now on. No
+              restart is needed. Running applications keep their nameservers
+              until redeployed; databases do not need it. Turned on
+              automatically when the first worker joins, unless you have already
+              chosen here.
             </p>
           </div>
           <Switch
@@ -124,6 +130,8 @@ export function ClusterDnsCard() {
             onCheckedChange={onCheckedChange}
           />
         </div>
+
+        <ClusterDnsCoverageSection />
       </CardContent>
     </Card>
   )

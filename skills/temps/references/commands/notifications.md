@@ -51,6 +51,7 @@ Add a new notification provider
 | `--to-addresses <addresses>` | Comma-separated recipient addresses (for email) | - | No |
 | `--url <url>` | Webhook URL (for webhook) | - | No |
 | `--method <method>` | HTTP method: POST, PUT, PATCH (for webhook, default: POST) | - | No |
+| `--header <header>` | Request header "Name: value" (for webhook, repeatable) | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `notifications update`
@@ -75,6 +76,7 @@ Update a notification provider
 | `--to-addresses <addresses>` | Comma-separated recipient addresses (for email) | - | No |
 | `--url <url>` | Webhook URL (for webhook) | - | No |
 | `--method <method>` | HTTP method: POST, PUT, PATCH (for webhook) | - | No |
+| `--header <header>` | Request header "Name: value" (for webhook, repeatable; replaces the stored headers) | - | No |
 | `--json` | Output in JSON format | - | No |
 | `-y, --yes` | Skip confirmation prompts | - | No |
 

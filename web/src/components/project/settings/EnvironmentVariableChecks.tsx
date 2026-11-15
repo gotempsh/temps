@@ -15,12 +15,13 @@ import {
   PopoverTrigger,
 } from '@/components/ui/popover'
 import { Button } from '@/components/ui/button'
+import { CHECK_STATUS_PRIORITY, type CheckStatus } from './http-checks'
 
 /** Presentation model for HTTP check results; independent of credential providers. */
 export interface EnvironmentVariableCheck {
   provider?: string | null
   id: string
-  status: 'healthy' | 'warning' | 'error' | 'pending' | 'unknown'
+  status: CheckStatus
   label: string
   detail: string
 }
@@ -36,24 +37,21 @@ const appearance = {
   unknown: { icon: CircleHelp, color: 'text-muted-foreground' },
 }
 
-const priority: Record<EnvironmentVariableCheck['status'], number> = {
-  healthy: 0,
-  pending: 1,
-  unknown: 2,
-  warning: 3,
-  error: 4,
-}
-
 export function EnvironmentVariableChecks({
   checks = [],
   onManage,
+  compact = false,
 }: {
   checks?: readonly EnvironmentVariableCheck[]
   onManage?: () => void
+  /** Icon only, for dense tables; the label moves to the tooltip. */
+  compact?: boolean
 }) {
   const mostSevere = checks.reduce<EnvironmentVariableCheck | undefined>(
     (current, check) =>
-      !current || priority[check.status] > priority[current.status]
+      !current ||
+      CHECK_STATUS_PRIORITY[check.status] >
+        CHECK_STATUS_PRIORITY[current.status]
         ? check
         : current,
     undefined
@@ -77,12 +75,13 @@ export function EnvironmentVariableChecks({
           type="button"
           className={`inline-flex min-h-9 items-center gap-2 rounded-md text-sm whitespace-nowrap underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-ring focus-visible:outline-offset-4 ${color}`}
           aria-label={`Checks: ${label}`}
+          title={compact ? label : undefined}
         >
           <Icon className="size-4 shrink-0" aria-hidden="true" />
           {mostSevere?.provider && (
             <CredentialProviderMark provider={mostSevere.provider} />
           )}
-          <span>{label}</span>
+          {!compact && <span>{label}</span>}
         </button>
       </PopoverTrigger>
       <PopoverContent align="start" className="w-72 max-w-[calc(100vw-2rem)]">

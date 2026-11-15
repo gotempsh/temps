@@ -11,7 +11,7 @@ The Firecracker backend is the right ceiling for hostile multi-tenant code, but 
 
 1. **No jailer.** The VMM runs as the server's own user (`firecracker.rs` module docs). KVM still isolates the guest, but a VMM escape lands with the server's privileges.
 2. **No egress credential proxy.** ADR-013 is unimplemented, so `network_mode: "restricted"` fails closed to *no network at all* — there is no middle ground between "open internet" and "nothing".
-3. **No memory-snapshot warm boot.** Snapshots (ADR-037) rebuild a sanitized ext4; every boot is a cold boot.
+3. **No memory-snapshot warm boot.** Snapshots (ADR-074) rebuild a sanitized ext4; every boot is a cold boot.
 4. **Docker is still the image toolchain.** Pull/export go through bollard; a Firecracker-only host can't exist.
 5. **Root network setup.** TAP pool + bridge + NAT need `sudo temps firecracker setup --network-only`.
 6. **Linux-only.** Developer machines (macOS) can only exercise the Docker path, so microVM behaviour is untested where most development happens.
@@ -63,7 +63,7 @@ All SDK state lives under a Temps-owned home, never the user's `~/.microsandbox`
 ```
 <data_dir>/microsandbox/      0700
   config.json                 Temps-owned SDK config (absent = SDK defaults)
-  bin/msb, lib/libkrunfw.*    pinned runtime pair (v0.7.8)
+  bin/msb, lib/libkrunfw.*    pinned runtime pair (v0.7.11)
   db/ sandboxes/ cache/ …     SDK-managed
 ```
 
@@ -211,7 +211,7 @@ Terminals run the same `temps-pty-agent` as the Docker and Firecracker backends 
 ### Negative
 
 - +76 crates in the agents graph, including a second ORM stack (sea-orm 2 / sqlx 0.9 + SQLite) that the SDK uses only for its own bookkeeping. Compile time and binary size grow.
-- A pre-1.0 dependency (`=0.7.8`) whose crate version, runtime binary and `libkrunfw` ABI move in lockstep. Upgrades are deliberate: bump the pin, `MICROSANDBOX_VERSION`, and re-run setup.
+- A pre-1.0 dependency (`=0.7.11`) whose crate version, runtime binary and `libkrunfw` ABI move in lockstep. Upgrades are deliberate: bump the pin, `MICROSANDBOX_VERSION`, and re-run setup.
 - libkrun's shared guest/VMM security context means this backend is weaker than Firecracker against VMM-escape attacks. Mitigated by positioning and the confinement in §6, but not eliminated.
 - Two microVM backends double the microVM test matrix.
 
@@ -255,5 +255,5 @@ E2E tests (`TEMPS_DATA_DIR=<dir with runtime> cargo test --lib -p temps-agents s
 - ADR-036: Persistent Workspace Sandboxes
 - ADR-037: Sandbox Snapshots
 - ADR-048: Multi-Node Sandboxes
-- microsandbox: https://github.com/superradcompany/microsandbox (SDK crate `microsandbox` 0.7.8)
+- microsandbox: https://github.com/superradcompany/microsandbox (SDK crate `microsandbox` 0.7.11)
 - libkrun: https://github.com/containers/libkrun (security model section)

@@ -1079,6 +1079,7 @@ mod tests {
             trace_id: None,
             project_id: Some(7),
             token_id: Some(5),
+            price_known: None,
         }
     }
 

@@ -1,0 +1,25 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "libsqlite3-sys"
+version = "0.30.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "SQLx compatibility re-export of patched SQLite bindings"
+
+[dependencies]
+sqlite-patched = { package = "libsqlite3-sys", version = "=0.39.1", default-features = false }
+
+[features]
+default = ["sqlite-patched/default"]
+bundled = ["sqlite-patched/bundled"]
+pkg-config = ["sqlite-patched/pkg-config"]
+vcpkg = ["sqlite-patched/vcpkg"]
+unlock_notify = ["sqlite-patched/unlock_notify"]
+buildtime_bindgen = ["sqlite-patched/buildtime_bindgen"]
+preupdate_hook = ["sqlite-patched/preupdate_hook"]
+
+[lints]
+workspace = true

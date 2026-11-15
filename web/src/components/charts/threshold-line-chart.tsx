@@ -20,6 +20,11 @@ import {
 } from '@/components/ui/chart'
 import { cn } from '@/lib/utils'
 import {
+  PARTIAL_KEY,
+  partialTooltipEntries,
+  withPartialLastPoint,
+} from './partial-last-point'
+import {
   type AxisTickContext,
   buildYAxisTicks,
   formatAxisNumber,
@@ -142,6 +147,12 @@ interface ThresholdLineChartProps {
    * x value, so the panels need not share identical rows.
    */
   syncId?: string
+  /**
+   * The last point is still accumulating (the hour in progress), so its
+   * count is a partial one. Its segment is drawn dashed instead of as a drop
+   * to nothing, and its tooltip reads "so far". Single-series only.
+   */
+  lastPointPartial?: boolean
   className?: string
 }
 
@@ -236,10 +247,15 @@ export function ThresholdLineChart({
   onRangeSelect,
   selectedRange,
   syncId,
+  lastPointPartial = false,
   className,
 }: ThresholdLineChartProps) {
   const isMulti = Array.isArray(series)
   const seriesList = isMulti ? series : [series]
+  const partial = lastPointPartial && !isMulti && data.length >= 2
+  const firstKey = seriesList[0]?.dataKey
+  const plotted =
+    partial && firstKey ? withPartialLastPoint(data, firstKey) : data
   const [selectionStartX, setSelectionStartX] = useState<
     string | number | null
   >(null)
@@ -375,6 +391,7 @@ export function ThresholdLineChart({
           : SERIES_STROKE.primary,
     }
   })
+  if (partial) config[PARTIAL_KEY] = { ...config[seriesList[0].dataKey] }
 
   const validCounts = seriesList.map((s) =>
     data.reduce((n, p) => {
@@ -467,7 +484,7 @@ export function ThresholdLineChart({
       style={{ height }}
     >
       <ComposedChart
-        data={data}
+        data={plotted}
         syncId={syncId}
         syncMethod={syncId ? 'value' : undefined}
         margin={{ top: 12, right: 24, left: 8, bottom: 0 }}
@@ -541,8 +558,13 @@ export function ThresholdLineChart({
         />
         <ChartTooltip
           cursor={{ strokeDasharray: '3 3' }}
-          content={
+          content={(props) => (
             <ChartTooltipContent
+              active={props.active}
+              label={props.label}
+              payload={
+                partial ? partialTooltipEntries(props.payload) : props.payload
+              }
               indicator="line"
               formatter={(value, _name, item) => {
                 const num = value as number
@@ -563,6 +585,11 @@ export function ThresholdLineChart({
                         ? tooltipValueFormatter(num)
                         : num.toLocaleString()}
                     </span>
+                    {item?.dataKey === PARTIAL_KEY ? (
+                      <span className="text-[10px] text-muted-foreground">
+                        So far, still counting
+                      </span>
+                    ) : null}
                     {tooltipFooter ? (
                       <span className="text-[10px] text-muted-foreground">
                         {tooltipFooter(num)}
@@ -572,7 +599,7 @@ export function ThresholdLineChart({
                 )
               }}
             />
-          }
+          )}
         />
         {bands.map((b, idx) => (
           <ReferenceArea
@@ -667,6 +694,19 @@ export function ThresholdLineChart({
             isAnimationActive={false}
           />
         ))}
+        {partial && (
+          <Line
+            type="monotone"
+            dataKey={PARTIAL_KEY}
+            stroke={`var(--color-${PARTIAL_KEY})`}
+            strokeWidth={2}
+            strokeDasharray="4 4"
+            dot={false}
+            activeDot={{ r: 4, strokeWidth: 0 }}
+            connectNulls={false}
+            isAnimationActive={false}
+          />
+        )}
         {/* Breach markers: dots at the points that left the band — the anomaly
             itself. A stroke-less Line over the VALUE series with a custom dot
             that renders only where `breachKey` is set (recharts' Scatter plots

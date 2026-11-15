@@ -154,7 +154,7 @@ export function registerUsersCommands(program: Command): void {
   users
     .command('reset-mfa')
     .description(
-      "Remove another user's MFA (authenticator and recovery codes) after they lost both. The user is signed out of every session and signs in with their password to enroll again",
+      "Remove another user's MFA (authenticator and recovery codes) after they lost both. The user is signed out of every session. Password sign-in is blocked when require_mfa_for_admins applies; arrange SSO access or a temporary policy change before resetting MFA. Otherwise, sign in with a password to enroll again",
     )
     .requiredOption('--id <id>', 'User ID')
     .option('--json', 'Output in JSON format')
