@@ -3438,20 +3438,27 @@ mod client_fingerprint_tests {
 
     #[test]
     fn configured_proxy_suppresses_its_direct_tls_fingerprint() {
-        use temps_core::trusted_proxies::{set_trusted_proxy_ranges, TrustedProxyRanges};
-        struct Reset;
-        impl Drop for Reset {
-            fn drop(&mut self) {
-                set_trusted_proxy_ranges(TrustedProxyRanges::default());
-            }
+        use temps_core::trusted_proxies::TrustedProxyRanges;
+        let ranges = TrustedProxyRanges::parse(&["10.123.45.6/32".into()]).unwrap();
+        for (peer, expected) in [
+            ("10.123.45.6", (None, Ja4Source::Local)),
+            ("10.123.45.7", (Some(CURL_JA4.into()), Ja4Source::Direct)),
+        ] {
+            // Header contents do not affect whether this socket peer's own
+            // TLS fingerprint must be suppressed.
+            let result = super::resolve_client_fingerprint_with_proxy_trust(
+                Some(ip(peer)),
+                &headers(&[("x-forwarded-for", "malformed")]),
+                false,
+                None,
+                Some(ja4(CURL_JA4)),
+                |address| ranges.trusts_peer(address),
+            );
+            assert_eq!(
+                (result.ja4.map(|value| value.to_string()), result.source),
+                expected
+            );
         }
-        let _reset = Reset;
-        set_trusted_proxy_ranges(TrustedProxyRanges::parse(&["10.123.45.6/32".into()]).unwrap());
-        assert_eq!(resolve("10.123.45.6", &[], false), (None, Ja4Source::Local));
-        assert_eq!(
-            resolve("10.123.45.7", &[], false),
-            (Some(CURL_JA4.into()), Ja4Source::Direct)
-        );
     }
 
     /// Behind Cloudflare the TLS client is Cloudflare, so its `cf-ja4` is

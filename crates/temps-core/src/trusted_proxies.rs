@@ -85,6 +85,12 @@ impl TrustedProxyRanges {
         self.ranges.iter().map(ToString::to_string).collect()
     }
 
+    /// Whether the direct socket peer is explicitly trusted, without reading
+    /// forwarded headers or traversing the client-address chain.
+    pub fn trusts_peer(&self, peer: IpAddr) -> bool {
+        self.trusts(peer, false)
+    }
+
     fn trusts(&self, ip: IpAddr, loopback: bool) -> bool {
         let ip = canonical_ip(ip);
         (loopback && ip.is_loopback()) || self.ranges.iter().any(|range| range.contains(&ip))
@@ -136,6 +142,10 @@ static PROXY_RANGES: LazyLock<ArcSwap<TrustedProxyRanges>> =
 
 pub fn set_trusted_proxy_ranges(ranges: TrustedProxyRanges) {
     PROXY_RANGES.store(Arc::new(ranges));
+}
+
+pub fn is_trusted_proxy_peer(peer: IpAddr) -> bool {
+    PROXY_RANGES.load().trusts_peer(peer)
 }
 
 pub fn resolve_trusted_proxy_ip(
@@ -198,6 +208,15 @@ mod tests {
             resolve("::ffff:10.20.0.2", &[("x-forwarded-for", "198.51.100.7")]),
             Some("198.51.100.7".parse().unwrap())
         );
+    }
+
+    #[test]
+    fn peer_trust_needs_no_forwarded_header_chain() {
+        let ranges = TrustedProxyRanges::parse(&["10.20.0.0/16".into()]).unwrap();
+        assert!(ranges.trusts_peer("10.20.0.2".parse().unwrap()));
+        assert!(ranges.trusts_peer("::ffff:10.20.0.2".parse().unwrap()));
+        assert!(!ranges.trusts_peer("198.51.100.7".parse().unwrap()));
+        assert!(!ranges.trusts_peer("127.0.0.1".parse().unwrap()));
     }
 
     #[test]
