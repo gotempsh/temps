@@ -50,7 +50,8 @@ struct RouteLoadState {
     /// domain. They are placed only after every project and environment
     /// hostname is known (`apply_custom_routes`), so a custom route can never
     /// take a name the platform serves.
-    custom_route_candidates: Vec<(String, custom_routes::Model)>,
+    /// Each carries the addresses its upstream passed the check with.
+    custom_route_candidates: Vec<(String, custom_routes::Model, UpstreamAddresses)>,
     /// Status-page hostnames (phase 7).
     status_page_hosts: HashMap<String, StatusPageHostRoute>,
     /// One-label `*.temps.local` names another owner holds in the DNS
@@ -67,19 +68,44 @@ struct AssembledRoutes {
     environments_cache: HashMap<i32, Arc<environments::Model>>,
 }
 
+/// The pin for a custom route upstream, or `None` for an IP literal, which is
+/// dialled as written and has nothing to re-resolve.
+fn custom_route_pin(
+    host: &str,
+    port: i32,
+    addresses: UpstreamAddresses,
+) -> Option<Arc<PinnedUpstream>> {
+    let is_literal = host.starts_with('[') || host.parse::<std::net::IpAddr>().is_ok();
+    if is_literal {
+        return None;
+    }
+    // The port passed the check that produced `addresses`; a value that
+    // does not fit is refused rather than dialled.
+    let (port, addresses) = match u16::try_from(port) {
+        Ok(port) => (port, addresses),
+        Err(_) => (
+            0,
+            UpstreamAddresses::Refused(format!("port {port} is out of range")),
+        ),
+    };
+    Some(Arc::new(PinnedUpstream::new(host, port, addresses)))
+}
+
 /// How many upstream names are resolved at once while vetting custom routes.
 const UPSTREAM_VETTING_CONCURRENCY: usize = 8;
 
 /// Check every candidate's upstream, a few at a time, and return one verdict per
 /// candidate in the same order.
 ///
-/// A name that does not resolve is kept: route reloads are driven by database
-/// notifications only, so a route dropped on a transient resolver error would
-/// stay down until the next unrelated change. A name that resolves to a
-/// forbidden address, or any forbidden literal, is refused.
+/// A name that does not resolve is kept, as [`UpstreamAddresses::Pending`]:
+/// route reloads are driven by database notifications only, so a route
+/// dropped on a transient resolver error would stay down until the next
+/// unrelated change. It is not dialled until the pin's refresh resolves it. A
+/// name that resolves to a forbidden address, or any forbidden literal, is
+/// refused.
 async fn vet_custom_route_upstreams(
     candidates: &[(String, custom_routes::Model)],
-) -> Vec<Result<(), temps_core::route_policy::RouteUpstreamError>> {
+) -> Vec<Result<UpstreamAddresses, temps_core::route_policy::RouteUpstreamError>> {
     let mut verdicts = Vec::with_capacity(candidates.len());
     for chunk in candidates.chunks(UPSTREAM_VETTING_CONCURRENCY) {
         let mut set = tokio::task::JoinSet::new();
@@ -89,11 +115,11 @@ async fn vet_custom_route_upstreams(
             set.spawn(async move {
                 (
                     index,
-                    temps_core::route_policy::validate_upstream(&host, port).await,
+                    temps_core::route_policy::resolve_upstream(&host, port).await,
                 )
             });
         }
-        let mut chunk_verdicts: Vec<Option<Result<(), _>>> =
+        let mut chunk_verdicts: Vec<Option<Result<UpstreamAddresses, _>>> =
             (0..chunk.len()).map(|_| None).collect();
         while let Some(joined) = set.join_next().await {
             match joined {
@@ -101,12 +127,13 @@ async fn vet_custom_route_upstreams(
                     let verdict = match verdict {
                         Err(error) if error.is_unresolvable() => {
                             warn!(
-                                "Keeping a custom route whose upstream could not be checked: {}",
+                                "Keeping a custom route whose upstream could not be checked: {}. \
+                                 It is not served until its upstream resolves.",
                                 error
                             );
-                            Ok(())
+                            Ok(UpstreamAddresses::Pending)
                         }
-                        other => other,
+                        other => other.map(UpstreamAddresses::Allowed),
                     };
                     chunk_verdicts[index] = Some(verdict);
                 }
@@ -697,7 +724,11 @@ impl CachedPeerTable {
         let verdicts = vet_custom_route_upstreams(&candidates).await;
         for ((domain, custom_route), verdict) in candidates.into_iter().zip(verdicts) {
             match verdict {
-                Ok(()) => state.custom_route_candidates.push((domain, custom_route)),
+                Ok(addresses) => {
+                    state
+                        .custom_route_candidates
+                        .push((domain, custom_route, addresses))
+                }
                 Err(error) => warn!(
                     route_id = custom_route.id,
                     "Skipping custom route '{}' -> {}:{}: {}. The row is kept. Delete it, or, \
@@ -754,9 +785,10 @@ impl CachedPeerTable {
         // name would otherwise see each other as the platform's.
         let owners: Vec<Option<&'static str>> = candidates
             .iter()
-            .map(|(domain, _)| Self::platform_owner_of(state, domain))
+            .map(|(domain, _, _)| Self::platform_owner_of(state, domain))
             .collect();
-        for ((domain, custom_route), owner) in candidates.into_iter().zip(owners) {
+        let mut pins = Vec::new();
+        for ((domain, custom_route, addresses), owner) in candidates.into_iter().zip(owners) {
             if let Some(owner) = owner {
                 warn!(
                     route_id = custom_route.id,
@@ -781,9 +813,16 @@ impl CachedPeerTable {
             } = state;
 
             let backend_addr = format!("{}:{}", custom_route.host, custom_route.port);
+            // A name is dialled only at the addresses it passed the check
+            // with (see `PinnedUpstream`); a literal is its own address.
+            let pinned = custom_route_pin(&custom_route.host, custom_route.port, addresses);
+            if let Some(pin) = &pinned {
+                pins.push(Arc::downgrade(pin));
+            }
             let route_info = RouteInfo {
                 backend: BackendType::Upstream {
                     backends: vec![BackendEntry {
+                        pinned,
                         address: backend_addr.clone(),
                         container_id: None,
                         container_name: None,
@@ -829,6 +868,7 @@ impl CachedPeerTable {
             primary_route_hosts.remove(&domain);
             routes.insert(domain, route_info);
         }
+        super::pinned_upstream::spawn_refresher(pins);
     }
 
     /// Phase 3: `project_custom_domains` (custom domains with redirects or environment mapping).
@@ -2003,6 +2043,7 @@ impl CachedPeerTable {
                 RouteInfo {
                     backend: BackendType::Upstream {
                         backends: vec![BackendEntry {
+                            pinned: None,
                             address: address.clone(),
                             container_id: Some(discovered.target_container_id.clone()),
                             container_name: Some(discovered.target_container_name.clone()),
@@ -2890,6 +2931,53 @@ mod tests {
             Some("8.8.4.4:8443".to_string())
         );
         assert!(table.get_route_by_host("dual.example.net").is_some());
+
+        test_db.cleanup().await?;
+        Ok(())
+    }
+
+    /// A custom route upstream named by hostname is never handed to the proxy
+    /// as that name: the proxy would resolve it again when it connects, and
+    /// that second answer was never checked. A name with no checked address
+    /// (here one that cannot resolve, kept so a resolver hiccup does not drop
+    /// the route) is refused instead of dialled. A literal is dialled as is.
+    #[tokio::test]
+    async fn a_custom_route_upstream_name_is_never_dialled_unchecked(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(database) = database_or_skip().await else {
+            return Ok(());
+        };
+        let test_db = TestDBMockOperations::new(database.db.clone()).await?;
+        let db = test_db.db.as_ref();
+        // `.invalid` never resolves (RFC 2606).
+        insert_custom_route(
+            db,
+            "named.example.net",
+            "upstream.invalid",
+            8080,
+            RouteType::Http,
+        )
+        .await?;
+        insert_custom_route(db, "literal.example.net", "8.8.8.8", 8080, RouteType::Http).await?;
+
+        let table = CachedPeerTable::new(test_db.db.clone());
+        table.load_routes().await?;
+
+        let named = table
+            .get_route_by_host("named.example.net")
+            .expect("the route is kept while its upstream cannot be checked")
+            .select_backend();
+        assert!(
+            named.refused.is_some(),
+            "an unchecked name must not be dialled: {named:?}"
+        );
+
+        let literal = table
+            .get_route_by_host("literal.example.net")
+            .expect("literal route")
+            .select_backend();
+        assert_eq!(literal.address, "8.8.8.8:8080");
+        assert!(literal.refused.is_none());
 
         test_db.cleanup().await?;
         Ok(())

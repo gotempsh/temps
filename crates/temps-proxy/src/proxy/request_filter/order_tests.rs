@@ -284,6 +284,7 @@ fn deployment(id: i32, project_id: i32, environment_id: i32) -> deployments::Mod
 fn upstream() -> BackendType {
     BackendType::Upstream {
         backends: vec![BackendEntry {
+            pinned: None,
             address: "127.0.0.1:9".to_string(),
             container_id: None,
             container_name: None,

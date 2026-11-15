@@ -686,6 +686,7 @@ mod tests {
             RouteInfo {
                 backend: BackendType::Upstream {
                     backends: vec![BackendEntry {
+                        pinned: None,
                         address: "192.0.2.7:32000".to_string(),
                         container_id: None,
                         container_name: None,

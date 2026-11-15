@@ -9,7 +9,7 @@
 //! them again when it loads rows, because a row written by an older version, or
 //! by hand, never went through the console.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use thiserror::Error;
@@ -221,6 +221,19 @@ pub fn validate_upstream_host_literal(host: &str) -> Result<(), RouteUpstreamErr
 /// [`RouteUpstreamError::Unresolvable`] so the caller can choose between
 /// refusing (a save) and keeping a row the table already serves (a reload).
 pub async fn validate_upstream(host: &str, port: i32) -> Result<(), RouteUpstreamError> {
+    resolve_upstream(host, port).await.map(|_| ())
+}
+
+/// [`validate_upstream`], returning the addresses that passed: the literal
+/// itself, or every address the name resolved to.
+///
+/// A caller that connects must connect to these addresses, not resolve the
+/// name again: a second lookup can answer differently, so a check whose
+/// answer is thrown away does not constrain where the connection goes.
+pub async fn resolve_upstream(
+    host: &str,
+    port: i32,
+) -> Result<Vec<SocketAddr>, RouteUpstreamError> {
     let port = u16::try_from(port)
         .ok()
         .filter(|port| *port != 0)
@@ -228,9 +241,12 @@ pub async fn validate_upstream(host: &str, port: i32) -> Result<(), RouteUpstrea
 
     validate_upstream_host_literal(host)?;
 
-    let is_literal = host.starts_with('[') || host.parse::<Ipv4Addr>().is_ok();
-    if is_literal {
-        return Ok(());
+    let literal = match host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        Some(inner) => inner.parse::<Ipv6Addr>().ok().map(IpAddr::V6),
+        None => host.parse::<Ipv4Addr>().ok().map(IpAddr::V4),
+    };
+    if let Some(ip) = literal {
+        return Ok(vec![SocketAddr::new(ip, port)]);
     }
 
     let name = host.strip_suffix('.').unwrap_or(host);
@@ -240,7 +256,7 @@ pub async fn validate_upstream(host: &str, port: i32) -> Result<(), RouteUpstrea
     )
     .await
     {
-        Ok(Ok(_)) => Ok(()),
+        Ok(Ok(addresses)) => Ok(addresses),
         Ok(Err(UrlValidationError::DnsResolutionFailed(detail))) => {
             Err(RouteUpstreamError::Unresolvable {
                 host: host.to_string(),
@@ -407,6 +423,24 @@ mod tests {
             validate_upstream("169.254.169.254", 80).await,
             Err(RouteUpstreamError::Blocked { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn a_literal_upstream_resolves_to_itself() {
+        assert_eq!(
+            resolve_upstream("8.8.8.8", 443)
+                .await
+                .expect("public literal"),
+            vec!["8.8.8.8:443".parse::<SocketAddr>().expect("address")]
+        );
+        assert_eq!(
+            resolve_upstream("[2001:4860:4860::8888]", 443)
+                .await
+                .expect("public IPv6 literal"),
+            vec!["[2001:4860:4860::8888]:443"
+                .parse::<SocketAddr>()
+                .expect("address")]
+        );
     }
 
     #[tokio::test]

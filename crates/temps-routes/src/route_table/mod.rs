@@ -41,6 +41,8 @@ use temps_entities::{deployments, environments, nodes, projects};
 use tracing::{debug, error, info, warn};
 
 mod load;
+mod pinned_upstream;
+pub use pinned_upstream::{PinnedUpstream, UpstreamAddresses, REFRESH_INTERVAL};
 
 /// Look up the address a container's node publishes its ports on (see
 /// `nodes::Model::data_address`: the mesh address for a node that joined with
@@ -98,6 +100,7 @@ fn build_backend_entry(
         address,
         container_id: Some(container.container_id.clone()),
         container_name: Some(container.container_name.clone()),
+        pinned: None,
     })
 }
 
@@ -201,6 +204,7 @@ fn build_public_compose_backend_entry(
         address,
         container_id: Some(container.container_id.clone()),
         container_name: Some(container.container_name.clone()),
+        pinned: None,
     })
 }
 
@@ -444,6 +448,10 @@ pub struct BackendEntry {
     pub container_id: Option<String>,
     /// Human-readable container name (e.g., "my-app-abc123")
     pub container_name: Option<String>,
+    /// Set for a custom route upstream named by hostname: requests go to the
+    /// checked addresses held here, never to `address`, which is kept for
+    /// display. `None` for every platform backend.
+    pub pinned: Option<Arc<PinnedUpstream>>,
 }
 
 /// Result of selecting a backend via round-robin.
@@ -455,6 +463,10 @@ pub struct BackendSelection {
     pub container_id: Option<String>,
     /// Human-readable container name
     pub container_name: Option<String>,
+    /// Why this backend must not be dialled right now (a pinned upstream with
+    /// no allowed address). The caller fails the request instead of
+    /// connecting to `address`.
+    pub refused: Option<String>,
 }
 
 /// Backend type for a route
@@ -492,6 +504,7 @@ impl BackendType {
             } => {
                 if backends.is_empty() {
                     return Some(BackendSelection {
+                        refused: None,
                         address: "127.0.0.1:8080".to_string(),
                         container_id: None,
                         container_name: None,
@@ -509,10 +522,18 @@ impl BackendType {
                         .unwrap_or(&backends[index])
                 };
 
+                let (address, refused) = match &entry.pinned {
+                    None => (entry.address.clone(), None),
+                    Some(pin) => match pin.pick() {
+                        Ok(address) => (address.to_string(), None),
+                        Err(reason) => (entry.address.clone(), Some(reason)),
+                    },
+                };
                 Some(BackendSelection {
-                    address: entry.address.clone(),
+                    address,
                     container_id: entry.container_id.clone(),
                     container_name: entry.container_name.clone(),
+                    refused,
                 })
             }
             BackendType::StaticDir { .. } => None,
@@ -590,6 +611,7 @@ impl RouteInfo {
         self.backend
             .get_backend_avoiding(avoid)
             .unwrap_or_else(|| BackendSelection {
+                refused: None,
                 address: "127.0.0.1:8080".to_string(),
                 container_id: None,
                 container_name: None,
@@ -2753,11 +2775,55 @@ async fn load_tailnet_principals(
         .collect())
 }
 #[cfg(test)]
+mod pinned_backend_tests {
+    use super::*;
+
+    fn backend(pinned: UpstreamAddresses) -> BackendType {
+        BackendType::Upstream {
+            backends: vec![BackendEntry {
+                address: "upstream.example.net:443".to_string(),
+                container_id: None,
+                container_name: None,
+                pinned: Some(Arc::new(PinnedUpstream::new(
+                    "upstream.example.net",
+                    443,
+                    pinned,
+                ))),
+            }],
+            round_robin_counter: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    #[test]
+    fn a_pinned_backend_is_selected_at_its_checked_address_not_its_name() {
+        let selection = backend(UpstreamAddresses::Allowed(vec!["8.8.8.8:443"
+            .parse()
+            .expect("address")]))
+        .get_backend()
+        .expect("upstream");
+        assert_eq!(selection.address, "8.8.8.8:443");
+        assert!(selection.refused.is_none());
+    }
+
+    #[test]
+    fn a_pinned_backend_without_an_allowed_address_is_refused() {
+        for state in [
+            UpstreamAddresses::Pending,
+            UpstreamAddresses::Refused("resolves to 127.0.0.1".to_string()),
+        ] {
+            let selection = backend(state).get_backend().expect("upstream");
+            assert!(selection.refused.is_some(), "{selection:?}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod backend_avoiding_tests {
     use super::*;
 
     fn two_replicas() -> BackendType {
         let entry = |address: &str| BackendEntry {
+            pinned: None,
             address: address.to_string(),
             container_id: None,
             container_name: None,
@@ -2921,6 +2987,7 @@ mod tests {
             RouteInfo {
                 backend: BackendType::Upstream {
                     backends: vec![BackendEntry {
+                        pinned: None,
                         address: address.to_string(),
                         container_id: None,
                         container_name: None,
@@ -3103,6 +3170,7 @@ mod tests {
             RouteInfo {
                 backend: BackendType::Upstream {
                     backends: vec![BackendEntry {
+                        pinned: None,
                         address: address.to_string(),
                         container_id: None,
                         container_name: None,
@@ -3678,6 +3746,7 @@ mod tests {
         let route = RouteInfo {
             backend: BackendType::Upstream {
                 backends: vec![BackendEntry {
+                    pinned: None,
                     address: "127.0.0.1:8080".to_string(),
                     container_id: None,
                     container_name: None,
@@ -3705,6 +3774,7 @@ mod tests {
         let route = RouteInfo {
             backend: BackendType::Upstream {
                 backends: vec![BackendEntry {
+                    pinned: None,
                     address: "127.0.0.1:8080".to_string(),
                     container_id: None,
                     container_name: None,
@@ -3728,6 +3798,7 @@ mod tests {
         let route = RouteInfo {
             backend: BackendType::Upstream {
                 backends: vec![BackendEntry {
+                    pinned: None,
                     address: "192.168.1.100:3000".to_string(),
                     container_id: None,
                     container_name: None,
@@ -3755,16 +3826,19 @@ mod tests {
             backend: BackendType::Upstream {
                 backends: vec![
                     BackendEntry {
+                        pinned: None,
                         address: "127.0.0.1:8080".to_string(),
                         container_id: None,
                         container_name: None,
                     },
                     BackendEntry {
+                        pinned: None,
                         address: "127.0.0.1:8081".to_string(),
                         container_id: None,
                         container_name: None,
                     },
                     BackendEntry {
+                        pinned: None,
                         address: "127.0.0.1:8082".to_string(),
                         container_id: None,
                         container_name: None,
@@ -3811,11 +3885,13 @@ mod tests {
         let backend = BackendType::Upstream {
             backends: vec![
                 BackendEntry {
+                    pinned: None,
                     address: "127.0.0.1:8080".to_string(),
                     container_id: None,
                     container_name: None,
                 },
                 BackendEntry {
+                    pinned: None,
                     address: "127.0.0.1:8081".to_string(),
                     container_id: None,
                     container_name: None,
@@ -3870,6 +3946,7 @@ mod tests {
     fn test_backend_type_upstream_single_address() {
         let backend = BackendType::Upstream {
             backends: vec![BackendEntry {
+                pinned: None,
                 address: "192.168.1.100:3000".to_string(),
                 container_id: None,
                 container_name: None,
@@ -3917,6 +3994,7 @@ mod tests {
         let route = RouteInfo {
             backend: BackendType::Upstream {
                 backends: vec![BackendEntry {
+                    pinned: None,
                     address: "10.0.0.1:9000".to_string(),
                     container_id: None,
                     container_name: None,
