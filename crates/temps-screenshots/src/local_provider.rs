@@ -536,7 +536,7 @@ const CHROME_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 ///   `timeout` for the supervisor's report, not for the launch itself.
 async fn probe_chrome_launch<F>(
     lock: Arc<AsyncMutex<()>>,
-    status: &ChromeStatus,
+    status: &'static ChromeStatus,
     timeout: Duration,
     launch: F,
 ) -> ScreenshotResult<()>
@@ -570,6 +570,12 @@ where
     let (done_tx, done_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         let outcome = handle.await;
+        // A launch that worked is recorded before the lock is released: once
+        // it is, another caller may record a newer failure, which a late
+        // "available" here would otherwise erase.
+        if matches!(outcome, Ok(Ok(()))) {
+            report_chrome_available(status);
+        }
         drop(launch_guard);
         let _ = done_tx.send(outcome);
     });
@@ -579,8 +585,8 @@ where
 
     let reason = match check_result {
         Ok(Ok(Ok(Ok(())))) => {
+            // Already recorded by the supervisor, under the launch lock.
             debug!("Chrome browser is available");
-            report_chrome_available(status);
             return Ok(());
         }
         Ok(Ok(Ok(Err(e)))) => e,
@@ -695,11 +701,11 @@ mod tests {
     #[tokio::test]
     async fn a_launch_that_never_returns_is_reported_and_blocks_no_later_probe() {
         let lock = Arc::new(AsyncMutex::new(()));
-        let status = ChromeStatus::new();
+        let status: &'static ChromeStatus = Box::leak(Box::new(ChromeStatus::new()));
         let timeout = Duration::from_millis(200);
         let (launch, release) = stuck_launch();
 
-        let first = probe_chrome_launch(lock.clone(), &status, timeout, launch)
+        let first = probe_chrome_launch(lock.clone(), status, timeout, launch)
             .await
             .expect_err("a launch that does not report in time is a failure");
         assert!(
@@ -712,7 +718,7 @@ mod tests {
         // once, with the recorded reason, and launches nothing.
         let launched = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let started = std::time::Instant::now();
-        let second = probe_chrome_launch(lock.clone(), &status, Duration::from_secs(30), {
+        let second = probe_chrome_launch(lock.clone(), status, Duration::from_secs(30), {
             let launched = launched.clone();
             move || {
                 launched.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -732,14 +738,14 @@ mod tests {
     #[tokio::test]
     async fn a_busy_browser_that_is_not_failing_is_waited_for_then_probed() {
         let lock = Arc::new(AsyncMutex::new(()));
-        let status = ChromeStatus::new();
+        let status: &'static ChromeStatus = Box::leak(Box::new(ChromeStatus::new()));
         let capture = lock.clone().lock_owned().await;
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(100)).await;
             drop(capture);
         });
 
-        let result = probe_chrome_launch(lock, &status, Duration::from_secs(5), || Ok(())).await;
+        let result = probe_chrome_launch(lock, status, Duration::from_secs(5), || Ok(())).await;
         assert!(result.is_ok(), "{result:?}");
         assert!(!status.is_failing());
     }
@@ -747,11 +753,11 @@ mod tests {
     #[tokio::test]
     async fn a_long_capture_is_not_mistaken_for_a_broken_browser() {
         let lock = Arc::new(AsyncMutex::new(()));
-        let status = ChromeStatus::new();
+        let status: &'static ChromeStatus = Box::leak(Box::new(ChromeStatus::new()));
         let _capture = lock.clone().lock_owned().await;
         let launched = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        let result = probe_chrome_launch(lock, &status, Duration::from_millis(100), {
+        let result = probe_chrome_launch(lock, status, Duration::from_millis(100), {
             let launched = launched.clone();
             move || {
                 launched.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -766,8 +772,8 @@ mod tests {
     #[tokio::test]
     async fn a_failed_launch_names_the_reason_and_a_later_success_clears_it() {
         let lock = Arc::new(AsyncMutex::new(()));
-        let status = ChromeStatus::new();
-        let error = probe_chrome_launch(lock.clone(), &status, Duration::from_secs(5), || {
+        let status: &'static ChromeStatus = Box::leak(Box::new(ChromeStatus::new()));
+        let error = probe_chrome_launch(lock.clone(), status, Duration::from_secs(5), || {
             Err("Failed to launch Chrome browser: libnss3.so missing".to_string())
         })
         .await
@@ -777,7 +783,7 @@ mod tests {
             .failure_reason()
             .is_some_and(|reason| reason.contains("libnss3.so missing")));
 
-        probe_chrome_launch(lock, &status, Duration::from_secs(5), || Ok(()))
+        probe_chrome_launch(lock, status, Duration::from_secs(5), || Ok(()))
             .await
             .expect("Chrome launches again");
         assert_eq!(status.failure_reason(), None);
