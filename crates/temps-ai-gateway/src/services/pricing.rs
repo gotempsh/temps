@@ -5,6 +5,8 @@
 //!
 //! Prices are USD per 1M tokens. The usage service prices requests that were
 //! logged without a cost from this catalog, and the pricing endpoint serves it.
+//! Rates for models the `llm-prices` crate lists come from it, so they follow
+//! provider price changes with a dependency bump instead of a hand edit.
 
 use serde::Serialize;
 use utoipa::ToSchema;
@@ -114,8 +116,11 @@ impl PricingBuilder {
     }
 }
 
+/// The model catalog. A model `llm-prices` lists under the same provider takes
+/// its rates (see `apply_listed_price`); the rates written here apply to the
+/// rest: xAI, OpenRouter routes and models the crate does not list.
 pub fn build_pricing() -> Vec<ModelPricing> {
-    vec![
+    let mut models = vec![
         // ── Anthropic ───────────────────────────────────────────────────
         PricingBuilder::new("anthropic", "claude-opus-5", "Claude Opus 5", 5.0, 25.0)
             .cache(6.25, 10.0, 0.50)
@@ -369,7 +374,41 @@ pub fn build_pricing() -> Vec<ModelPricing> {
             0.42,
         )
         .build(),
-    ]
+    ];
+    for model in &mut models {
+        apply_listed_price(model);
+    }
+    models
+}
+
+/// The `llm-prices` row for a catalog model, when the crate lists that model
+/// under the same provider. The crate names Gemini's provider `google`.
+fn listed_price(provider: &str, model: &str) -> Option<&'static llm_prices::Price> {
+    let listed = llm_prices::lookup(model)?;
+    let same_provider = match provider {
+        "gemini" => listed.provider == "google",
+        other => listed.provider == other,
+    };
+    same_provider.then_some(listed)
+}
+
+/// Replace a catalog model's rates with the ones `llm-prices` lists for it.
+/// A rate the crate does not list keeps the value from the table.
+fn apply_listed_price(model: &mut ModelPricing) {
+    let Some(listed) = listed_price(&model.provider, &model.model) else {
+        return;
+    };
+    model.input_per_million = listed.input.unwrap_or(model.input_per_million);
+    model.output_per_million = listed.output.unwrap_or(model.output_per_million);
+    model.cache_write_5m_per_million = listed
+        .cache_write("5m")
+        .or(model.cache_write_5m_per_million);
+    model.cache_write_1h_per_million = listed
+        .cache_write("1h")
+        .or(model.cache_write_1h_per_million);
+    model.cache_hit_per_million = listed.cache_read.or(model.cache_hit_per_million);
+    model.batch_input_per_million = listed.batch_input.or(model.batch_input_per_million);
+    model.batch_output_per_million = listed.batch_output.or(model.batch_output_per_million);
 }
 
 // ============================================================================
@@ -407,19 +446,31 @@ fn rate_table() -> &'static RateTable {
     })
 }
 
+/// Rates `llm-prices` lists for a model, at its long-context prices when the
+/// prompt is over the model's long-context threshold.
+fn listed_rates(model: &str, input_tokens: i64) -> Option<(f64, f64)> {
+    let listed = llm_prices::lookup(model)?;
+    let prompt_tokens = u64::try_from(input_tokens).unwrap_or(0);
+    match listed.long_context {
+        Some(long) if prompt_tokens > long.threshold_tokens => Some((long.input?, long.output?)),
+        _ => Some((listed.input?, listed.output?)),
+    }
+}
+
 /// Estimate the provider cost of a request in microcents (1/10000 of a cent).
 ///
-/// Exact model ids win; otherwise the longest listed id the model extends at a
-/// `-`, `:` or `@` boundary applies (so a dated snapshot `gpt-4o-2025-01-01`
-/// is priced as `gpt-4o`). Unlisted models are charged at the most expensive
-/// listed rate. This is an estimate from list prices: it ignores cache
-/// discounts and batch pricing, so it errs on the high side.
+/// A model `llm-prices` lists (including its dated, Bedrock, Vertex and
+/// provider-prefixed ids) is priced from it, at long-context prices when the
+/// prompt is over the model's threshold. Otherwise exact model ids in the
+/// table win, then the longest listed id the model extends at a `-`, `:` or
+/// `@` boundary (so a dated snapshot `gpt-4o-2025-01-01` is priced as
+/// `gpt-4o`). Unlisted models are charged at the most expensive listed rate.
+/// This is an estimate from list prices: it ignores cache discounts and batch
+/// pricing, so it errs on the high side.
 pub fn estimate_cost_microcents(model: &str, input_tokens: i64, output_tokens: i64) -> i64 {
     let table = rate_table();
-    let (input_rate, output_rate) = table
-        .by_model
-        .get(model)
-        .copied()
+    let (input_rate, output_rate) = listed_rates(model, input_tokens)
+        .or_else(|| table.by_model.get(model).copied())
         .or_else(|| {
             table
                 .by_model
@@ -472,6 +523,73 @@ mod tests {
         assert_eq!(
             unlisted,
             (1_000.0 * table.worst_case.0 + 1_000.0 * table.worst_case.1).ceil() as i64
+        );
+    }
+
+    #[test]
+    fn catalog_takes_rates_from_llm_prices() {
+        let pricing = build_pricing();
+        let row = |id: &str| {
+            pricing
+                .iter()
+                .find(|p| p.model == id)
+                .expect("catalog lists the model")
+        };
+        for id in ["o3", "gpt-5.6-luna", "claude-haiku-4-5", "gemini-2.5-flash"] {
+            let listed = llm_prices::lookup(id).expect("llm-prices lists the model");
+            let model = row(id);
+            assert_eq!(Some(model.input_per_million), listed.input, "{id}");
+            assert_eq!(Some(model.output_per_million), listed.output, "{id}");
+            assert_eq!(model.cache_hit_per_million, listed.cache_read, "{id}");
+            assert_eq!(model.batch_input_per_million, listed.batch_input, "{id}");
+            assert_eq!(model.batch_output_per_million, listed.batch_output, "{id}");
+        }
+        let haiku = row("claude-haiku-4-5");
+        let listed = llm_prices::lookup("claude-haiku-4-5").expect("llm-prices lists Haiku 4.5");
+        assert_eq!(haiku.cache_write_5m_per_million, listed.cache_write("5m"));
+        assert_eq!(haiku.cache_write_1h_per_million, listed.cache_write("1h"));
+        // Models the crate does not list keep the table's rates.
+        assert_eq!(row("grok-4.5").input_per_million, 2.0);
+        assert_eq!(row("grok-4.5").output_per_million, 6.0);
+    }
+
+    #[test]
+    fn estimate_cost_prices_models_missing_from_the_table_from_llm_prices() {
+        let table = rate_table();
+        for id in ["claude-haiku-5-5", "gpt-6-sol"] {
+            assert!(!table.by_model.contains_key(id), "{id} is in the table");
+            let listed = llm_prices::lookup(id).expect("llm-prices lists the model");
+            let (input, output) = (
+                listed.input.expect("input price"),
+                listed.output.expect("output price"),
+            );
+            let expected = (1_000.0 * input + 100.0 * output).ceil() as i64;
+            assert_eq!(estimate_cost_microcents(id, 1_000, 100), expected, "{id}");
+            assert!(
+                expected < estimate_cost_microcents("totally-unlisted-model", 1_000, 100),
+                "{id} must not fall back to the worst case"
+            );
+        }
+        // Dated and provider-prefixed ids resolve to the same row.
+        assert_eq!(
+            estimate_cost_microcents("anthropic/claude-haiku-5-5", 1_000, 100),
+            estimate_cost_microcents("claude-haiku-5-5", 1_000, 100)
+        );
+    }
+
+    #[test]
+    fn estimate_cost_uses_long_context_rates_over_the_threshold() {
+        let listed = llm_prices::lookup("claude-haiku-5-5").expect("llm-prices lists Haiku 5.5");
+        let long = listed
+            .long_context
+            .expect("Haiku 5.5 has a long-context tier");
+        let over = i64::try_from(long.threshold_tokens).expect("threshold fits i64") + 1;
+        let expected = (over as f64 * long.input.expect("long-context input price")
+            + 100.0 * long.output.expect("long-context output price"))
+        .ceil() as i64;
+        assert_eq!(
+            estimate_cost_microcents("claude-haiku-5-5", over, 100),
+            expected
         );
     }
 
