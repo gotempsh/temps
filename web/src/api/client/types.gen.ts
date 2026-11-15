@@ -21263,9 +21263,11 @@ export type ModelUsage = {
     avg_latency_ms: number;
     /**
      * Sum of the recorded cost of the model's requests in the window, in
-     * microcents (1e-6 USD), as the spend caps and budgets count it. Clients
-     * show this rather than recomputing from list prices, which cannot see
-     * cache prices or long-context rates.
+     * microcents (1e-6 USD). Clients show this rather than recomputing from
+     * list prices, which cannot see cache prices or long-context rates. It
+     * includes requests made with a caller-supplied provider key, so it is
+     * not the figure a project's budget is measured against (that is
+     * `ProjectUsage::operator_cost_microcents`).
      */
     estimated_cost_microcents: number;
     input_tokens: number;
@@ -38143,6 +38145,14 @@ export type UsageSummary = {
     total_output_tokens: number;
     total_requests: number;
     total_tokens: number;
+    /**
+     * Requests that used tokens but have no recorded cost: logged before
+     * costs were estimated, or served by a model with no published price
+     * (a self-hosted server). `total_cost_microcents` leaves them out, so a
+     * client shows the total as partial, or unknown when every request is
+     * unpriced, rather than as free.
+     */
+    unpriced_requests: number;
 };
 
 export type UserResponse = {

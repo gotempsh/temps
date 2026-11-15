@@ -18,6 +18,8 @@
 use serde::Serialize;
 use utoipa::ToSchema;
 
+use crate::types::PromptTokensDetails;
+
 /// Pricing for a single model, all values in USD per 1M tokens.
 /// Fields are optional because not every provider supports every pricing tier.
 #[derive(Debug, Serialize, ToSchema)]
@@ -89,6 +91,12 @@ struct LongContext {
     above_input_tokens: i64,
     input: f64,
     output: f64,
+    /// Long-context cache-read rate; `None` bills cache reads as long-context
+    /// input.
+    cache_read: Option<f64>,
+    /// Long-context rate of the dearest cache-write tier; `None` bills cache
+    /// writes as long-context input.
+    cache_write: Option<f64>,
 }
 
 // ============================================================================
@@ -101,6 +109,10 @@ struct CatalogEntry {
     pricing: ModelPricing,
     provenance: Option<Provenance>,
     long_context: Option<LongContext>,
+    /// Rate of the dearest cache-write tier when the provider's tiers are not
+    /// the 5-minute / 1-hour ones `ModelPricing` publishes (OpenAI's 12-hour
+    /// write), so a written token is never estimated below what it bills.
+    cache_write_ceiling: Option<f64>,
 }
 
 struct PricingBuilder {
@@ -117,6 +129,7 @@ struct PricingBuilder {
     deprecated: bool,
     provenance: Option<Provenance>,
     long_context: Option<LongContext>,
+    cache_write_ceiling: Option<f64>,
 }
 
 impl PricingBuilder {
@@ -135,6 +148,7 @@ impl PricingBuilder {
             deprecated: false,
             provenance: None,
             long_context: None,
+            cache_write_ceiling: None,
         }
     }
 
@@ -164,7 +178,33 @@ impl PricingBuilder {
             above_input_tokens,
             input,
             output,
+            cache_read: None,
+            cache_write: None,
         });
+        self
+    }
+
+    /// Long-context cache-read rate. Call after `long_context`.
+    fn long_cache_read(mut self, rate: f64) -> Self {
+        if let Some(long) = self.long_context.as_mut() {
+            long.cache_read = Some(rate);
+        }
+        self
+    }
+
+    /// Long-context rate of the dearest cache-write tier. Call after
+    /// `long_context`.
+    fn long_cache_write(mut self, rate: f64) -> Self {
+        if let Some(long) = self.long_context.as_mut() {
+            long.cache_write = Some(rate);
+        }
+        self
+    }
+
+    /// Rate of the dearest cache-write tier, for a provider whose write tiers
+    /// are not the 5-minute / 1-hour ones (OpenAI's 12-hour write).
+    fn cache_write_ceiling(mut self, rate: f64) -> Self {
+        self.cache_write_ceiling = Some(rate);
         self
     }
 
@@ -211,6 +251,7 @@ impl PricingBuilder {
             },
             provenance: self.provenance,
             long_context: self.long_context,
+            cache_write_ceiling: self.cache_write_ceiling,
         }
     }
 }
@@ -352,6 +393,8 @@ fn anthropic_rows() -> Vec<CatalogEntry> {
         .cache(0.125, 0.20, 0.01)
         .batch(0.05, 0.25)
         .long_context(ANTHROPIC_HAIKU_LONG_CONTEXT, 0.50, 2.50)
+        .long_cache_read(0.05)
+        .long_cache_write(1.0)
         .checked(A, D)
         .build(),
         PricingBuilder::new(
@@ -378,63 +421,93 @@ fn openai_rows() -> Vec<CatalogEntry> {
             .cache_read(1.0)
             .batch(5.0, 25.0)
             .long_context(OPENAI_LONG_CONTEXT, 20.0, 75.0)
+            .long_cache_read(2.0)
+            .long_cache_write(50.0)
+            .cache_write_ceiling(25.0)
             .checked(O, D)
             .build(),
         PricingBuilder::new("openai", "gpt-6.1-sol", "GPT-6.1 Sol", 2.0, 10.0)
             .cache_read(0.10)
             .batch(1.0, 5.0)
             .long_context(OPENAI_LONG_CONTEXT, 4.0, 15.0)
+            .long_cache_read(0.2)
+            .long_cache_write(10.0)
+            .cache_write_ceiling(5.0)
             .checked(O, D)
             .build(),
         PricingBuilder::new("openai", "gpt-6.1-terra", "GPT-6.1 Terra", 1.0, 5.0)
             .cache_read(0.05)
             .batch(0.50, 2.50)
             .long_context(OPENAI_LONG_CONTEXT, 2.0, 7.50)
+            .long_cache_read(0.1)
+            .long_cache_write(5.0)
+            .cache_write_ceiling(2.5)
             .checked(O, D)
             .build(),
         PricingBuilder::new("openai", "gpt-6-sol", "GPT-6 Sol", 2.0, 10.0)
             .cache_read(0.20)
             .batch(1.0, 5.0)
             .long_context(OPENAI_LONG_CONTEXT, 4.0, 15.0)
+            .long_cache_read(0.4)
+            .long_cache_write(10.0)
+            .cache_write_ceiling(5.0)
             .checked(O, D)
             .build(),
         PricingBuilder::new("openai", "gpt-6-luna", "GPT-6 Luna", 0.10, 0.50)
             .cache_read(0.01)
             .batch(0.05, 0.25)
             .long_context(OPENAI_LONG_CONTEXT, 0.20, 0.75)
+            .long_cache_read(0.02)
+            .long_cache_write(0.5)
+            .cache_write_ceiling(0.25)
             .checked(O, D)
             .build(),
         // GPT-5.6 Sol is listed at a promotional $4 / $20 until 2026-11-30.
         // Its model page states that is a 20% input and 33% output reduction
         // from the standard price this row keeps, unconfirmed, and that
-        // prompts over 272K tokens bill 2x input and 1.5x output.
+        // prompts over 272K tokens bill 2x input and 1.5x output. Its cache
+        // rates keep the ratios the pricing page lists for the promotional
+        // price (read 0.1x input, 12-hour write 2.5x input).
         PricingBuilder::new("openai", "gpt-5.6-sol", "GPT-5.6 Sol", 5.0, 30.0)
             .cache_read(0.50)
             .long_context(OPENAI_LONG_CONTEXT, 10.0, 45.0)
+            .long_cache_read(1.0)
+            .long_cache_write(25.0)
+            .cache_write_ceiling(12.5)
             .unconfirmed(OPENAI_GPT_5_6_SOL, D)
             .build(),
         // The `gpt-5.6` alias routes to GPT-5.6 Sol.
         PricingBuilder::new("openai", "gpt-5.6", "GPT-5.6", 5.0, 30.0)
             .cache_read(0.50)
             .long_context(OPENAI_LONG_CONTEXT, 10.0, 45.0)
+            .long_cache_read(1.0)
+            .long_cache_write(25.0)
+            .cache_write_ceiling(12.5)
             .unconfirmed(OPENAI_GPT_5_6_SOL, D)
             .build(),
         PricingBuilder::new("openai", "gpt-5.6-terra", "GPT-5.6 Terra", 2.0, 12.0)
             .cache_read(0.20)
             .batch(1.0, 6.0)
             .long_context(OPENAI_LONG_CONTEXT, 4.0, 18.0)
+            .long_cache_read(0.4)
+            .long_cache_write(10.0)
+            .cache_write_ceiling(5.0)
             .checked(O, D)
             .build(),
         PricingBuilder::new("openai", "gpt-5.6-luna", "GPT-5.6 Luna", 0.20, 1.20)
             .cache_read(0.02)
             .batch(0.10, 0.60)
             .long_context(OPENAI_LONG_CONTEXT, 0.40, 1.80)
+            .long_cache_read(0.04)
+            .long_cache_write(1.0)
+            .cache_write_ceiling(0.5)
             .checked(O, D)
             .build(),
         PricingBuilder::new("openai", "gpt-5.5", "GPT-5.5", 5.0, 30.0)
             .cache(0.0, 0.0, 0.50)
             .batch(2.50, 15.0)
             .long_context(OPENAI_LONG_CONTEXT, 10.0, 45.0)
+            .long_cache_read(1.0)
             .checked(O, D)
             .build(),
         PricingBuilder::new("openai", "gpt-5.5-pro", "GPT-5.5 Pro", 30.0, 180.0)
@@ -446,6 +519,7 @@ fn openai_rows() -> Vec<CatalogEntry> {
             .cache(0.0, 0.0, 0.25)
             .batch(1.25, 7.50)
             .long_context(OPENAI_LONG_CONTEXT, 5.0, 22.50)
+            .long_cache_read(0.5)
             .checked(O, D)
             .build(),
         PricingBuilder::new("openai", "gpt-5.4-pro", "GPT-5.4 Pro", 30.0, 180.0)
@@ -565,21 +639,25 @@ fn xai_rows() -> Vec<CatalogEntry> {
         PricingBuilder::new("xai", "grok-4.7", "Grok 4.7", 2.0, 6.0)
             .cache(0.0, 0.0, 0.50)
             .long_context(XAI_LONG_CONTEXT, 4.0, 12.0)
+            .long_cache_read(1.0)
             .checked(X, D)
             .build(),
         PricingBuilder::new("xai", "grok-4.6", "Grok 4.6", 2.0, 6.0)
             .cache(0.0, 0.0, 0.50)
             .long_context(XAI_LONG_CONTEXT, 4.0, 12.0)
+            .long_cache_read(1.0)
             .checked(X, D)
             .build(),
         PricingBuilder::new("xai", "grok-4.5", "Grok 4.5", 2.0, 6.0)
             .cache(0.0, 0.0, 0.30)
             .long_context(XAI_LONG_CONTEXT, 4.0, 12.0)
+            .long_cache_read(0.6)
             .checked(X, D)
             .build(),
         PricingBuilder::new("xai", "grok-4.3", "Grok 4.3", 1.25, 2.50)
             .cache(0.0, 0.0, 0.20)
             .long_context(XAI_LONG_CONTEXT, 2.50, 5.0)
+            .long_cache_read(0.4)
             .checked(X, D)
             .build(),
         // The pricing page lists only the dated 0309 variants of Grok 4.20.
@@ -596,6 +674,7 @@ fn xai_rows() -> Vec<CatalogEntry> {
         )
         .cache(0.0, 0.0, 0.20)
         .long_context(XAI_LONG_CONTEXT, 2.50, 5.0)
+        .long_cache_read(0.4)
         .checked(X, D)
         .build(),
         PricingBuilder::new(
@@ -607,6 +686,7 @@ fn xai_rows() -> Vec<CatalogEntry> {
         )
         .cache(0.0, 0.0, 0.20)
         .long_context(XAI_LONG_CONTEXT, 2.50, 5.0)
+        .long_cache_read(0.4)
         .checked(X, D)
         .build(),
         PricingBuilder::new(
@@ -618,11 +698,13 @@ fn xai_rows() -> Vec<CatalogEntry> {
         )
         .cache(0.0, 0.0, 0.20)
         .long_context(XAI_LONG_CONTEXT, 2.50, 5.0)
+        .long_cache_read(0.4)
         .checked(X, D)
         .build(),
         PricingBuilder::new("xai", "grok-build-0.1", "Grok Build 0.1", 1.0, 2.0)
             .cache(0.0, 0.0, 0.20)
             .long_context(XAI_LONG_CONTEXT, 2.0, 4.0)
+            .long_cache_read(0.4)
             .checked(X, D)
             .build(),
         PricingBuilder::new(
@@ -734,6 +816,7 @@ fn gemini_rows() -> Vec<CatalogEntry> {
             .cache(0.0, 0.0, 0.20)
             .batch(1.0, 6.0)
             .long_context(GEMINI_LONG_CONTEXT, 4.0, 18.0)
+            .long_cache_read(0.4)
             .checked(G, D)
             .build(),
         PricingBuilder::new(
@@ -754,11 +837,16 @@ fn gemini_rows() -> Vec<CatalogEntry> {
             .checked(G, D)
             .build(),
         // Deprecated: from 2026-12-01 requests route to, and bill as,
-        // Gemini 3.8 Flash.
-        PricingBuilder::new("gemini", "gemini-2.5-pro", "Gemini 2.5 Pro", 1.25, 10.0)
-            .cache(0.0, 0.0, 0.125)
-            .batch(0.625, 5.0)
+        // Gemini 3.8 Flash, whose prices rise on 2027-01-01. Each price is the
+        // dearer of the model's own ($1.25 in, $10 out, $0.125 cache hit,
+        // $0.625 / $5 batch) and Gemini 3.8 Flash's from 2027-01-01 ($1.50,
+        // $7.50, $0.15, $0.75 / $3.75), so no period is undercounted. Gemini
+        // 3.8 Flash lists no long-context tier.
+        PricingBuilder::new("gemini", "gemini-2.5-pro", "Gemini 2.5 Pro", 1.50, 10.0)
+            .cache(0.0, 0.0, 0.15)
+            .batch(0.75, 5.0)
             .long_context(GEMINI_LONG_CONTEXT, 2.50, 15.0)
+            .long_cache_read(0.25)
             .deprecated()
             .checked(G, D)
             .build(),
@@ -876,20 +964,84 @@ fn openrouter_rows() -> Vec<CatalogEntry> {
 // Cost estimation
 // ============================================================================
 
-/// Per-token rates for one model.
+/// Per-token rates one request is billed at.
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct Rates {
+struct TierRates {
     input: f64,
     output: f64,
-    long_context: Option<LongContext>,
+    cache_read: f64,
+    cache_write: f64,
+}
+
+impl TierRates {
+    /// The dearer of `self` and `other` for every kind of token.
+    fn max(self, other: TierRates) -> TierRates {
+        TierRates {
+            input: self.input.max(other.input),
+            output: self.output.max(other.output),
+            cache_read: self.cache_read.max(other.cache_read),
+            cache_write: self.cache_write.max(other.cache_write),
+        }
+    }
+
+    /// No input token, cached or written, bills below ordinary input.
+    fn at_least_input(self) -> TierRates {
+        TierRates {
+            cache_read: self.cache_read.max(self.input),
+            cache_write: self.cache_write.max(self.input),
+            ..self
+        }
+    }
+}
+
+/// Per-token rates for one model: its base tier and, when the provider bills
+/// long prompts higher, the threshold and long-context tier.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Rates {
+    base: TierRates,
+    long_context: Option<(i64, TierRates)>,
 }
 
 impl Rates {
-    /// The (input, output) rates a request with `input_tokens` is billed at.
-    fn for_request(&self, input_tokens: i64) -> (f64, f64) {
+    fn from_entry(entry: &CatalogEntry) -> Self {
+        let pricing = &entry.pricing;
+        let input = pricing.input_per_million;
+        // A written token always bills at least as ordinary input; the
+        // dearest listed write tier applies because a request's usage does
+        // not say which tier it wrote to.
+        let cache_write = [
+            pricing.cache_write_5m_per_million,
+            pricing.cache_write_1h_per_million,
+            entry.cache_write_ceiling,
+        ]
+        .into_iter()
+        .flatten()
+        .fold(input, f64::max);
+        let base = TierRates {
+            input,
+            output: pricing.output_per_million,
+            cache_read: pricing.cache_hit_per_million.unwrap_or(input),
+            cache_write,
+        };
+        let long_context = entry.long_context.map(|long| {
+            (
+                long.above_input_tokens,
+                TierRates {
+                    input: long.input,
+                    output: long.output,
+                    cache_read: long.cache_read.unwrap_or(long.input),
+                    cache_write: long.cache_write.unwrap_or(long.input).max(long.input),
+                },
+            )
+        });
+        Rates { base, long_context }
+    }
+
+    /// The rates a request with `input_tokens` is billed at.
+    fn for_request(&self, input_tokens: i64) -> TierRates {
         match self.long_context {
-            Some(long) if input_tokens > long.above_input_tokens => (long.input, long.output),
-            _ => (self.input, self.output),
+            Some((above, long)) if input_tokens > above => long,
+            _ => self.base,
         }
     }
 }
@@ -900,36 +1052,86 @@ impl Rates {
 /// token in that unit: `$2.50 / 1M tokens` is `2.5` microcents per token.
 struct RateTable {
     by_model: std::collections::HashMap<String, Rates>,
-    /// Most expensive confirmed base rates, charged for models that are not
-    /// priced so an unlisted model can never be a way around a spend cap.
-    /// Rows whose prices are unconfirmed do not set it.
-    worst_case: (f64, f64),
+    /// Rates charged for models that are not priced, so an unlisted model can
+    /// never be a way around a spend cap: for any prompt length, no confirmed
+    /// row bills a token above them. The base tier is the dearest confirmed
+    /// base rate of each kind; above the lowest confirmed long-context
+    /// threshold, the long tier is the dearest confirmed rate of each kind
+    /// either tier lists. Every input token, cached or written, bills at no
+    /// less than the input rate. Rows whose prices are unconfirmed do not set
+    /// it.
+    worst_case: Rates,
 }
 
 impl RateTable {
     fn from_entries(entries: Vec<CatalogEntry>) -> Self {
+        let zero = TierRates {
+            input: 0.0,
+            output: 0.0,
+            cache_read: 0.0,
+            cache_write: 0.0,
+        };
         let mut by_model = std::collections::HashMap::new();
-        let mut worst_case = (0.0_f64, 0.0_f64);
+        let mut base = zero;
+        let mut long: Option<(i64, TierRates)> = None;
         for entry in entries {
-            let pricing = entry.pricing;
+            let rates = Rates::from_entry(&entry);
             if entry.provenance.is_some_and(|p| p.confirmed) {
-                worst_case.0 = worst_case.0.max(pricing.input_per_million);
-                worst_case.1 = worst_case.1.max(pricing.output_per_million);
+                base = base.max(rates.base);
+                if let Some((above, tier)) = rates.long_context {
+                    long = Some(match long {
+                        Some((lowest, worst)) => (lowest.min(above), worst.max(tier)),
+                        None => (above, tier),
+                    });
+                }
             }
-            by_model.insert(
-                pricing.model,
-                Rates {
-                    input: pricing.input_per_million,
-                    output: pricing.output_per_million,
-                    long_context: entry.long_context,
-                },
-            );
+            by_model.insert(entry.pricing.model.clone(), rates);
         }
+        let base = base.at_least_input();
+        let worst_case = Rates {
+            base,
+            long_context: long.map(|(above, tier)| (above, tier.max(base).at_least_input())),
+        };
         RateTable {
             by_model,
             worst_case,
         }
     }
+
+    /// Rates for `model`: its exact id, or else the longest listed id it
+    /// extends at a `-`, `:` or `@` boundary. `None` when it is not listed.
+    fn rates_for(&self, model: &str) -> Option<Rates> {
+        self.by_model.get(model).copied().or_else(|| {
+            self.by_model
+                .iter()
+                .filter(|(id, _)| {
+                    model.strip_prefix(id.as_str()).is_some_and(|rest| {
+                        rest.starts_with('-') || rest.starts_with(':') || rest.starts_with('@')
+                    })
+                })
+                .max_by_key(|(id, _)| id.len())
+                .map(|(_, rates)| *rates)
+        })
+    }
+}
+
+/// Cost of one request at `tier`, in microcents, rounded up.
+fn cost_at(
+    tier: TierRates,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache: PromptTokensDetails,
+) -> i64 {
+    let input_tokens = input_tokens.max(0);
+    let read = cache.cached_tokens.clamp(0, input_tokens);
+    let write = cache.cache_write_tokens.clamp(0, input_tokens - read);
+    let fresh = input_tokens - read - write;
+    let cost = fresh as f64 * tier.input
+        + read as f64 * tier.cache_read
+        + write as f64 * tier.cache_write
+        + output_tokens.max(0) as f64 * tier.output;
+    // Saturate rather than wrap on an absurd product.
+    cost.ceil().clamp(0.0, i64::MAX as f64) as i64
 }
 
 fn rate_table() -> &'static RateTable {
@@ -937,79 +1139,101 @@ fn rate_table() -> &'static RateTable {
     TABLE.get_or_init(|| RateTable::from_entries(catalog()))
 }
 
-/// Estimate the provider cost of a request in microcents (1/10000 of a cent).
+/// Estimate the provider cost of a request in microcents (1e-6 USD).
 ///
 /// Exact model ids win; otherwise the longest listed id the model extends at a
 /// `-`, `:` or `@` boundary applies (so a dated snapshot `gpt-4o-2025-01-01`
 /// is priced as `gpt-4o`). A model whose provider bills long prompts at a
-/// higher rate is charged that rate for the whole request once its input
-/// crosses the threshold. Unlisted models are charged at the most expensive
-/// confirmed rate. This is an estimate from list prices: it ignores cache
-/// discounts and batch pricing, so it errs on the high side.
-pub fn estimate_cost_microcents(model: &str, input_tokens: i64, output_tokens: i64) -> i64 {
+/// higher rate is charged that tier for the whole request once its input
+/// crosses the threshold. `input_tokens` is the whole prompt; the parts read
+/// from and written to the prompt cache (`cache`) are carved out of it and
+/// billed at the cache-read rate and at the dearest cache-write tier. Unlisted
+/// models are charged the worst case (see `RateTable::worst_case`), including
+/// its long-context tier. This is an estimate from list prices that ignores batch
+/// discounts, so it errs on the high side.
+pub fn estimate_cost_microcents(
+    model: &str,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache: PromptTokensDetails,
+) -> i64 {
     let table = rate_table();
-    let rates = table.by_model.get(model).copied().or_else(|| {
-        table
-            .by_model
-            .iter()
-            .filter(|(id, _)| {
-                model.strip_prefix(id.as_str()).is_some_and(|rest| {
-                    rest.starts_with('-') || rest.starts_with(':') || rest.starts_with('@')
-                })
-            })
-            .max_by_key(|(id, _)| id.len())
-            .map(|(_, rates)| *rates)
-    });
-    let (input_rate, output_rate) = match rates {
-        Some(rates) => rates.for_request(input_tokens),
-        None => table.worst_case,
-    };
-    let cost = input_tokens.max(0) as f64 * input_rate + output_tokens.max(0) as f64 * output_rate;
-    cost.ceil() as i64
+    let rates = table.rates_for(model).unwrap_or(table.worst_case);
+    cost_at(
+        rates.for_request(input_tokens.max(0)),
+        input_tokens,
+        output_tokens,
+        cache,
+    )
+}
+
+/// The listed long-context cost of a request whose prompt crosses its model's
+/// long-context threshold; `None` when the model is not listed, has no long
+/// tier, or the prompt is below it.
+///
+/// A synced model catalogue publishes one input and one output price and no
+/// tier, so a cost computed from it bills a long prompt at the base rate. The
+/// usage service records the higher of that figure and this one, so a long
+/// prompt to a tiered model is never recorded at the base rate.
+pub fn long_context_cost_microcents(
+    model: &str,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache: PromptTokensDetails,
+) -> Option<i64> {
+    let (above, tier) = rate_table().rates_for(model)?.long_context?;
+    (input_tokens > above).then(|| cost_at(tier, input_tokens, output_tokens, cache))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// A request with no prompt-cache activity.
+    fn estimate(model: &str, input_tokens: i64, output_tokens: i64) -> i64 {
+        estimate_cost_microcents(
+            model,
+            input_tokens,
+            output_tokens,
+            PromptTokensDetails::default(),
+        )
+    }
+
     #[test]
     fn estimate_cost_uses_listed_rates_in_microcents() {
         // gpt-4o: $2.50 in / $10 out per 1M tokens => 2.5 and 10 microcents per token.
-        assert_eq!(
-            estimate_cost_microcents("gpt-4o", 1_000, 100),
-            2_500 + 1_000
-        );
+        assert_eq!(estimate("gpt-4o", 1_000, 100), 2_500 + 1_000);
     }
 
     #[test]
     fn estimate_cost_prices_dated_snapshots_as_their_base_model() {
         assert_eq!(
-            estimate_cost_microcents("gpt-4o-2025-01-01", 1_000, 100),
-            estimate_cost_microcents("gpt-4o", 1_000, 100)
+            estimate("gpt-4o-2025-01-01", 1_000, 100),
+            estimate("gpt-4o", 1_000, 100)
         );
         // A longer listed id must win over a shorter prefix of it.
         assert_eq!(
-            estimate_cost_microcents("gpt-4o-mini-2025-01-01", 1_000, 0),
-            estimate_cost_microcents("gpt-4o-mini", 1_000, 0)
+            estimate("gpt-4o-mini-2025-01-01", 1_000, 0),
+            estimate("gpt-4o-mini", 1_000, 0)
         );
     }
 
     #[test]
     fn estimate_cost_charges_unlisted_models_at_worst_case() {
-        let unlisted = estimate_cost_microcents("totally-unlisted-model", 1_000, 1_000);
-        let cheapest = estimate_cost_microcents("gpt-4o-mini", 1_000, 1_000);
+        let unlisted = estimate("totally-unlisted-model", 1_000, 1_000);
+        let cheapest = estimate("gpt-4o-mini", 1_000, 1_000);
         assert!(unlisted > cheapest);
-        let table = rate_table();
+        let worst = rate_table().worst_case.base;
         assert_eq!(
             unlisted,
-            (1_000.0 * table.worst_case.0 + 1_000.0 * table.worst_case.1).ceil() as i64
+            (1_000.0 * worst.input + 1_000.0 * worst.output).ceil() as i64
         );
     }
 
     #[test]
     fn estimate_cost_is_zero_for_no_tokens_and_ignores_negatives() {
-        assert_eq!(estimate_cost_microcents("gpt-4o", 0, 0), 0);
-        assert_eq!(estimate_cost_microcents("gpt-4o", -5, -5), 0);
+        assert_eq!(estimate("gpt-4o", 0, 0), 0);
+        assert_eq!(estimate("gpt-4o", -5, -5), 0);
     }
 
     fn listed(model: &str) -> ModelPricing {
@@ -1154,7 +1378,7 @@ mod tests {
         // Before these rows existed, Claude Haiku 5.5 and the GPT-6 family
         // fell through to the worst-case rate, and Claude Opus 5.5 and
         // Sonnet 5.5 were priced as Opus 5 and Sonnet 5 by prefix.
-        let worst = estimate_cost_microcents("totally-unlisted-model", 1_000, 1_000);
+        let worst = estimate("totally-unlisted-model", 1_000, 1_000);
         for (model, input, output) in [
             ("claude-haiku-5-5", 0.10_f64, 0.50_f64),
             ("claude-opus-5-5", 4.0, 20.0),
@@ -1163,7 +1387,7 @@ mod tests {
             ("gpt-6-luna", 0.10, 0.50),
             ("gpt-6.1-sol", 2.0, 10.0),
         ] {
-            let cost = estimate_cost_microcents(model, 1_000, 1_000);
+            let cost = estimate(model, 1_000, 1_000);
             assert_eq!(
                 cost,
                 (1_000.0 * input + 1_000.0 * output).ceil() as i64,
@@ -1178,34 +1402,34 @@ mod tests {
         // Claude Haiku 5.5: $0.10 / $0.50 up to 100,000 prompt tokens,
         // $0.50 / $2.50 over.
         assert_eq!(
-            estimate_cost_microcents("claude-haiku-5-5", 100_000, 1_000),
+            estimate("claude-haiku-5-5", 100_000, 1_000),
             (100_000.0 * 0.10 + 1_000.0 * 0.50_f64).ceil() as i64
         );
         assert_eq!(
-            estimate_cost_microcents("claude-haiku-5-5", 100_001, 1_000),
+            estimate("claude-haiku-5-5", 100_001, 1_000),
             (100_001.0 * 0.50 + 1_000.0 * 2.50_f64).ceil() as i64
         );
         // OpenAI: over 272K input tokens.
         assert_eq!(
-            estimate_cost_microcents("gpt-5.4", 272_000, 0),
+            estimate("gpt-5.4", 272_000, 0),
             (272_000.0 * 2.50_f64).ceil() as i64
         );
         assert_eq!(
-            estimate_cost_microcents("gpt-5.4", 272_001, 10),
+            estimate("gpt-5.4", 272_001, 10),
             (272_001.0 * 5.0 + 10.0 * 22.50_f64).ceil() as i64
         );
         // xAI: at 200K prompt tokens and above.
         assert_eq!(
-            estimate_cost_microcents("grok-4.5", 199_999, 0),
+            estimate("grok-4.5", 199_999, 0),
             (199_999.0 * 2.0_f64).ceil() as i64
         );
         assert_eq!(
-            estimate_cost_microcents("grok-4.5", 200_000, 0),
+            estimate("grok-4.5", 200_000, 0),
             (200_000.0 * 4.0_f64).ceil() as i64
         );
         // Gemini: over 200K prompt tokens.
         assert_eq!(
-            estimate_cost_microcents("gemini-3.1-pro-preview", 200_001, 0),
+            estimate("gemini-3.1-pro-preview", 200_001, 0),
             (200_001.0 * 4.0_f64).ceil() as i64
         );
     }
@@ -1213,8 +1437,8 @@ mod tests {
     #[test]
     fn a_dated_snapshot_keeps_its_base_model_long_context_rate() {
         assert_eq!(
-            estimate_cost_microcents("gpt-5.4-2026-03-05", 300_000, 0),
-            estimate_cost_microcents("gpt-5.4", 300_000, 0)
+            estimate("gpt-5.4-2026-03-05", 300_000, 0),
+            estimate("gpt-5.4", 300_000, 0)
         );
     }
 
@@ -1234,9 +1458,102 @@ mod tests {
             .iter()
             .map(|row| row.output_per_million)
             .fold(0.0, f64::max);
-        assert_eq!(table.worst_case, (max_input, max_output));
+        let base = table.worst_case.base;
+        assert_eq!((base.input, base.output), (max_input, max_output));
         // GPT-5.4 Pro and GPT-5.5 Pro, at $30 / $180, are the dearest today.
-        assert_eq!(table.worst_case, (30.0, 180.0));
+        assert_eq!((base.input, base.output), (30.0, 180.0));
+        // Their long-context tier, $60 / $270, is the dearest long tier, and
+        // it starts at the lowest confirmed threshold (Claude Haiku 5.5's).
+        let (above, long) = table.worst_case.long_context.expect("a long tier");
+        assert_eq!(above, ANTHROPIC_HAIKU_LONG_CONTEXT);
+        assert_eq!((long.input, long.output), (60.0, 270.0));
+    }
+
+    #[test]
+    fn no_confirmed_row_bills_a_request_above_the_worst_case() {
+        let table = rate_table();
+        let cache = |read, write| PromptTokensDetails {
+            cached_tokens: read,
+            cache_write_tokens: write,
+        };
+        for entry in catalog()
+            .into_iter()
+            .filter(|entry| entry.provenance.is_some_and(|p| p.confirmed))
+        {
+            let rates = Rates::from_entry(&entry);
+            for input in [1_000, 150_000, 250_000, 300_000, 2_000_000] {
+                for details in [cache(0, 0), cache(input / 2, 0), cache(0, input / 2)] {
+                    let own = cost_at(rates.for_request(input), input, 1_000, details);
+                    let worst = cost_at(table.worst_case.for_request(input), input, 1_000, details);
+                    assert!(
+                        own <= worst,
+                        "{} bills {own} for {input} input tokens, above the worst case {worst}",
+                        entry.pricing.model
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unlisted_models_bill_long_prompts_at_the_worst_long_context_rate() {
+        // 300,000 input and 1,000 output tokens at $60 / $270 per 1M, the
+        // dearest confirmed long tier (GPT-5.4 Pro's), not the $30 / $180 base.
+        assert_eq!(
+            estimate("totally-unlisted-model", 300_000, 1_000),
+            300_000 * 60 + 1_000 * 270
+        );
+        assert!(
+            estimate("totally-unlisted-model", 300_000, 1_000)
+                >= estimate("gpt-5.4-pro", 300_000, 1_000)
+        );
+    }
+
+    #[test]
+    fn gemini_2_5_pro_never_bills_below_the_model_it_is_routed_to() {
+        // From 2026-12-01 its requests bill as Gemini 3.8 Flash, which rises to
+        // $1.50 input on 2027-01-01.
+        let own = Rates::from_entry(
+            &catalog()
+                .into_iter()
+                .find(|entry| entry.pricing.model == "gemini-2.5-pro")
+                .expect("gemini-2.5-pro is listed"),
+        );
+        let successor = Rates::from_entry(
+            &catalog()
+                .into_iter()
+                .find(|entry| entry.pricing.model == "gemini-3.8-flash")
+                .expect("gemini-3.8-flash is listed"),
+        );
+        assert_eq!(own.base.input, 1.50);
+        assert_eq!(own.base.max(successor.base), own.base);
+    }
+
+    #[test]
+    fn long_context_cost_is_given_only_for_a_listed_long_tier_the_prompt_crosses() {
+        let none = PromptTokensDetails::default();
+        // gpt-5.4 bills $5 / $22.50 per 1M above 272,000 input tokens.
+        assert_eq!(
+            long_context_cost_microcents("gpt-5.4", 300_000, 0, none),
+            Some(300_000 * 5)
+        );
+        assert_eq!(
+            long_context_cost_microcents("gpt-5.4-2026-03-05", 300_000, 0, none),
+            Some(300_000 * 5)
+        );
+        assert_eq!(
+            long_context_cost_microcents("gpt-5.4", 272_000, 0, none),
+            None
+        );
+        // gpt-4o has no long tier; an unlisted model has no listed tier.
+        assert_eq!(
+            long_context_cost_microcents("gpt-4o", 2_000_000, 0, none),
+            None
+        );
+        assert_eq!(
+            long_context_cost_microcents("totally-unlisted-model", 2_000_000, 0, none),
+            None
+        );
     }
 
     #[test]
@@ -1249,9 +1566,113 @@ mod tests {
                 .unconfirmed(OPENAI_PRICING, CHECKED_2026_11_15)
                 .build(),
         ]);
-        assert_eq!(table.worst_case, (1.0, 2.0));
+        let base = table.worst_case.base;
+        assert_eq!((base.input, base.output), (1.0, 2.0));
         // The unconfirmed row still prices its own model.
-        assert_eq!(table.by_model["stale"].for_request(1).0, 99.0);
+        assert_eq!(table.by_model["stale"].for_request(1).input, 99.0);
+    }
+
+    fn with_cache(model: &str, input: i64, output: i64, read: i64, write: i64) -> i64 {
+        estimate_cost_microcents(
+            model,
+            input,
+            output,
+            PromptTokensDetails {
+                cached_tokens: read,
+                cache_write_tokens: write,
+            },
+        )
+    }
+
+    #[test]
+    fn cache_writes_bill_at_the_dearest_write_tier() {
+        // Claude Haiku 5.5: input $0.10, 5-minute write $0.125, 1-hour
+        // write $0.20. Usage does not say which tier was written, so 1-hour.
+        assert_eq!(with_cache("claude-haiku-5-5", 50_000, 0, 0, 50_000), 10_000);
+        // Claude Opus 5.5: 10,000 fresh at $4 + 40,000 written at $8.
+        assert_eq!(
+            with_cache("claude-opus-5-5", 50_000, 0, 0, 40_000),
+            10_000 * 4 + 40_000 * 8
+        );
+        // GPT-6 Astra: 12-hour write $25, above its $10 input.
+        assert_eq!(with_cache("gpt-6-astra", 1_000, 0, 0, 1_000), 25_000);
+    }
+
+    #[test]
+    fn a_free_write_tier_still_bills_the_token_as_input() {
+        // GPT-4o lists no write surcharge ($0), so a written token is input.
+        assert_eq!(
+            with_cache("gpt-4o", 1_000, 0, 0, 1_000),
+            estimate("gpt-4o", 1_000, 0)
+        );
+    }
+
+    #[test]
+    fn cache_reads_bill_at_the_cache_hit_rate() {
+        // Claude Sonnet 5.5: 1,000 fresh at $2 + 9,000 read at $0.10.
+        assert_eq!(
+            with_cache("claude-sonnet-5-5", 10_000, 0, 9_000, 0),
+            1_000 * 2 + 900
+        );
+        // A row with no cache-hit price bills reads as input.
+        assert_eq!(
+            with_cache("gpt-5.4-pro", 1_000, 0, 1_000, 0),
+            estimate("gpt-5.4-pro", 1_000, 0)
+        );
+    }
+
+    #[test]
+    fn long_prompts_bill_cache_activity_at_long_context_rates() {
+        // Claude Haiku 5.5 over 100,000 tokens: input $0.50, read $0.05,
+        // 1-hour write $1.
+        assert_eq!(
+            with_cache("claude-haiku-5-5", 200_000, 0, 100_000, 50_000),
+            (50_000.0 * 0.50 + 100_000.0 * 0.05 + 50_000.0 * 1.0_f64).ceil() as i64
+        );
+        // GPT-5.4 over 272K: read $0.50; no write surcharge, so input ($5).
+        assert_eq!(
+            with_cache("gpt-5.4", 300_000, 0, 200_000, 100_000),
+            (200_000.0 * 0.50 + 100_000.0 * 5.0_f64).ceil() as i64
+        );
+    }
+
+    #[test]
+    fn unlisted_models_bill_cached_input_at_the_worst_case_input_rate() {
+        let input = rate_table().worst_case.base.input;
+        assert_eq!(
+            with_cache("totally-unlisted-model", 1_000, 0, 600, 400),
+            (1_000.0 * input).ceil() as i64
+        );
+    }
+
+    #[test]
+    fn cache_counts_are_clamped_to_the_prompt() {
+        // More cached and written tokens than the prompt holds, or negative
+        // counts, never bill beyond the prompt or below zero.
+        assert_eq!(
+            with_cache("claude-haiku-5-5", 1_000, 0, 5_000, 5_000),
+            with_cache("claude-haiku-5-5", 1_000, 0, 1_000, 0)
+        );
+        assert_eq!(
+            with_cache("claude-haiku-5-5", 1_000, 0, -5, -5),
+            estimate("claude-haiku-5-5", 1_000, 0)
+        );
+    }
+
+    #[test]
+    fn long_cache_rates_are_set_only_on_rows_with_a_long_context_tier() {
+        for entry in catalog() {
+            if let Some(long) = entry.long_context {
+                for rate in [long.cache_read, long.cache_write].into_iter().flatten() {
+                    assert!(rate > 0.0, "{}", entry.pricing.model);
+                }
+            }
+        }
+        // `long_cache_read` before `long_context` has nothing to attach to.
+        let entry = PricingBuilder::new("openai", "m", "M", 1.0, 2.0)
+            .long_cache_read(0.5)
+            .build();
+        assert!(entry.long_context.is_none());
     }
 
     #[test]

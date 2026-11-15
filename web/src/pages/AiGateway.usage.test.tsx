@@ -248,3 +248,48 @@ test('costs show what was recorded, not a recomputation from base list prices', 
   // Never the base-rate figure: 2,000,000 x $0.10 per 1M.
   expect(screen.queryByText('$0.200')).toBeNull()
 })
+
+function mockSummary(summary: Record<string, number>) {
+  globalThis.fetch = (async (input: Request | string | URL) => {
+    const url = new URL(String(input), 'http://localhost')
+    if (url.pathname === '/api/ai/usage/summary')
+      return json({
+        total_tokens: 0,
+        total_input_tokens: 0,
+        total_output_tokens: 0,
+        avg_latency_ms: 0,
+        error_count: 0,
+        streaming_count: 0,
+        byok_count: 0,
+        ...summary,
+      })
+    if (url.pathname === '/api/ai/usage/recent')
+      return json({ entries: [], total: 0 })
+    if (url.pathname.startsWith('/api/ai/usage/')) return json([])
+    return new Response('{}', { status: 404 })
+  }) as typeof fetch
+}
+
+test('a window whose requests have no recorded cost is not shown as free', async () => {
+  mockSummary({
+    total_requests: 3,
+    total_cost_microcents: 0,
+    unpriced_requests: 3,
+  })
+  renderUsage()
+
+  await screen.findByText('No recorded cost')
+  expect(screen.queryByText('$0.00')).toBeNull()
+})
+
+test('a total that leaves out unpriced requests says how many', async () => {
+  mockSummary({
+    total_requests: 5,
+    total_cost_microcents: 1_500_000,
+    unpriced_requests: 2,
+  })
+  renderUsage()
+
+  await screen.findByText('$1.50')
+  await screen.findByText('Excludes 2 unpriced requests')
+})

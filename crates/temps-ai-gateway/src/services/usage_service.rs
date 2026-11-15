@@ -58,6 +58,33 @@ pub(crate) fn cost_microcents_from_details(
     Some(cost.round().clamp(0.0, i64::MAX as f64) as i64)
 }
 
+/// The cost to record for a request the model catalogue priced.
+///
+/// The catalogue publishes one input and one output price, with no
+/// long-context tier, so a long prompt to a model the built-in price list
+/// bills higher above a threshold is raised to the listed long-context cost.
+/// A self-hosted server's model ids are the operator's own names and are
+/// never matched against vendor price lists.
+fn catalogue_cost_microcents(
+    provider: &str,
+    model: &str,
+    catalogue_cost: i64,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache: PromptTokensDetails,
+) -> i64 {
+    if crate::self_hosted::is_self_hosted(provider) {
+        return catalogue_cost;
+    }
+    crate::services::pricing::long_context_cost_microcents(
+        model,
+        input_tokens,
+        output_tokens,
+        cache,
+    )
+    .map_or(catalogue_cost, |long| catalogue_cost.max(long))
+}
+
 /// Cost of a request whose model the catalogue publishes no price for.
 ///
 /// A vendor model goes to the built-in price list, which charges a model it
@@ -72,11 +99,12 @@ fn unlisted_cost_microcents(
     model: &str,
     input_tokens: i64,
     output_tokens: i64,
+    cache: PromptTokensDetails,
 ) -> i64 {
     if crate::self_hosted::is_self_hosted(provider) {
         return 0;
     }
-    crate::services::pricing::estimate_cost_microcents(model, input_tokens, output_tokens)
+    crate::services::pricing::estimate_cost_microcents(model, input_tokens, output_tokens, cache)
 }
 
 // ============================================================================
@@ -94,6 +122,12 @@ pub struct UsageSummary {
     pub error_count: i64,
     pub streaming_count: i64,
     pub byok_count: i64,
+    /// Requests that used tokens but have no recorded cost: logged before
+    /// costs were estimated, or served by a model with no published price
+    /// (a self-hosted server). `total_cost_microcents` leaves them out, so a
+    /// client shows the total as partial, or unknown when every request is
+    /// unpriced, rather than as free.
+    pub unpriced_requests: i64,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -126,9 +160,11 @@ pub struct ModelUsage {
     pub total_tokens: i64,
     pub avg_latency_ms: f64,
     /// Sum of the recorded cost of the model's requests in the window, in
-    /// microcents (1e-6 USD), as the spend caps and budgets count it. Clients
-    /// show this rather than recomputing from list prices, which cannot see
-    /// cache prices or long-context rates.
+    /// microcents (1e-6 USD). Clients show this rather than recomputing from
+    /// list prices, which cannot see cache prices or long-context rates. It
+    /// includes requests made with a caller-supplied provider key, so it is
+    /// not the figure a project's budget is measured against (that is
+    /// `ProjectUsage::operator_cost_microcents`).
     pub estimated_cost_microcents: i64,
 }
 
@@ -287,6 +323,7 @@ struct SummaryRow {
     error_count: Option<i64>,
     streaming_count: Option<i64>,
     byok_count: Option<i64>,
+    unpriced_requests: Option<i64>,
 }
 
 #[derive(Debug, FromQueryResult)]
@@ -516,7 +553,8 @@ impl UsageService {
         // Callers that already priced the request keep their figure. Everything
         // else is priced here, once, so every path records the same estimate
         // and spend caps and per-project reports have a cost to work with:
-        // from the model catalogue first (it carries cache prices), then from
+        // from the model catalogue first (it carries cache prices; a long
+        // prompt is raised to the listed long-context cost), then from
         // the built-in price list (see `unlisted_cost_microcents`). BYOK
         // requests are priced too; reports separate them as non-operator cost.
         let estimated_cost_microcents = if estimated_cost_microcents > 0 {
@@ -526,8 +564,17 @@ impl UsageService {
                 .estimate_cost_microcents(connection, model, input_tokens, output_tokens, cache)
                 .await
             {
-                Some(cost) => cost,
-                None => unlisted_cost_microcents(provider, model, input_tokens, output_tokens),
+                Some(cost) => catalogue_cost_microcents(
+                    provider,
+                    model,
+                    cost,
+                    input_tokens,
+                    output_tokens,
+                    cache,
+                ),
+                None => {
+                    unlisted_cost_microcents(provider, model, input_tokens, output_tokens, cache)
+                }
             }
         };
         let record = ai_usage_logs::ActiveModel {
@@ -586,7 +633,11 @@ impl UsageService {
                 COALESCE(SUM(estimated_cost_microcents), 0)::INT8 as total_cost_microcents,
                 COUNT(*) FILTER (WHERE status >= 400) as error_count,
                 COUNT(*) FILTER (WHERE is_streaming = true) as streaming_count,
-                COUNT(*) FILTER (WHERE is_byok = true) as byok_count
+                COUNT(*) FILTER (WHERE is_byok = true) as byok_count,
+                COUNT(*) FILTER (
+                    WHERE estimated_cost_microcents <= 0
+                      AND (input_tokens > 0 OR output_tokens > 0)
+                ) as unpriced_requests
             FROM ai_usage_logs
             WHERE {}"#,
             where_clause
@@ -610,6 +661,7 @@ impl UsageService {
             error_count: Some(0),
             streaming_count: Some(0),
             byok_count: Some(0),
+            unpriced_requests: Some(0),
         });
 
         Ok(UsageSummary {
@@ -622,6 +674,7 @@ impl UsageService {
             error_count: row.error_count.unwrap_or(0),
             streaming_count: row.streaming_count.unwrap_or(0),
             byok_count: row.byok_count.unwrap_or(0),
+            unpriced_requests: row.unpriced_requests.unwrap_or(0),
         })
     }
 
@@ -1506,7 +1559,8 @@ mod tests {
                 crate::self_hosted::OPENAI_COMPATIBLE,
                 "local-flash",
                 7_000_000,
-                100_000
+                100_000,
+                PromptTokensDetails::default()
             ),
             0
         );
@@ -1514,11 +1568,27 @@ mod tests {
 
     #[test]
     fn an_unlisted_vendor_model_keeps_the_worst_case_price() {
+        let none = PromptTokensDetails::default();
         assert_eq!(
-            unlisted_cost_microcents("openrouter", "vendor/unknown", 1_000, 200),
-            crate::services::pricing::estimate_cost_microcents("vendor/unknown", 1_000, 200)
+            unlisted_cost_microcents("openrouter", "vendor/unknown", 1_000, 200, none),
+            crate::services::pricing::estimate_cost_microcents("vendor/unknown", 1_000, 200, none)
         );
-        assert!(unlisted_cost_microcents("openrouter", "vendor/unknown", 1_000, 200) > 0);
+        assert!(unlisted_cost_microcents("openrouter", "vendor/unknown", 1_000, 200, none) > 0);
+    }
+
+    #[test]
+    fn a_vendor_model_without_a_catalogue_price_bills_its_cache_writes() {
+        // Claude Haiku 5.5 lists $0.10 input and $0.20 for a 1-hour cache
+        // write per 1M tokens: 50,000 written tokens are 10,000 microcents,
+        // not the 5,000 they cost as ordinary input.
+        let cache = PromptTokensDetails {
+            cached_tokens: 0,
+            cache_write_tokens: 50_000,
+        };
+        assert_eq!(
+            unlisted_cost_microcents("anthropic", "claude-haiku-5-5", 50_000, 0, cache),
+            10_000
+        );
     }
 
     #[tokio::test]
@@ -1581,6 +1651,44 @@ mod tests {
         assert_eq!(projects[0].project_id, 7);
         assert_eq!(projects[0].estimated_cost_microcents, 900);
         assert_eq!(projects[0].operator_cost_microcents, 600);
+    }
+
+    #[tokio::test]
+    async fn the_summary_counts_requests_that_have_no_recorded_cost() {
+        use sea_orm::{MockDatabase, Transaction, Value};
+        let row = std::collections::BTreeMap::from([
+            ("total_requests".to_string(), Value::BigInt(Some(5))),
+            ("total_input_tokens".to_string(), Value::BigInt(Some(500))),
+            ("total_output_tokens".to_string(), Value::BigInt(Some(50))),
+            ("total_tokens".to_string(), Value::BigInt(Some(550))),
+            ("avg_latency_ms".to_string(), Value::Double(Some(10.0))),
+            (
+                "total_cost_microcents".to_string(),
+                Value::BigInt(Some(700)),
+            ),
+            ("error_count".to_string(), Value::BigInt(Some(0))),
+            ("streaming_count".to_string(), Value::BigInt(Some(0))),
+            ("byok_count".to_string(), Value::BigInt(Some(0))),
+            ("unpriced_requests".to_string(), Value::BigInt(Some(2))),
+        ]);
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![row]])
+                .into_connection(),
+        );
+        let service = UsageService::new(db.clone());
+        let now = chrono::Utc::now();
+        let summary = service.get_summary(now, now).await.unwrap();
+        assert_eq!(summary.total_cost_microcents, 700);
+        assert_eq!(summary.unpriced_requests, 2);
+
+        drop(service);
+        let log: Vec<Transaction> = Arc::try_unwrap(db).unwrap().into_transaction_log();
+        let sql = format!("{log:?}");
+        assert!(
+            sql.contains("estimated_cost_microcents <= 0"),
+            "the summary must count unpriced requests: {sql}"
+        );
     }
 
     #[tokio::test]
@@ -2083,6 +2191,72 @@ mod tests {
             "project/token must bind NULL: {sql}"
         );
         assert!(!sql.contains("Int(Some(7))"), "{sql}");
+    }
+
+    #[test]
+    fn a_catalogue_cost_for_a_long_prompt_is_raised_to_the_listed_long_context_cost() {
+        let none = PromptTokensDetails::default();
+        // gpt-5.4 at the catalogue's base $2.50 per 1M: 300,000 tokens are
+        // 750,000 microcents, but the price list bills them at $5 above
+        // 272,000 input tokens.
+        assert_eq!(
+            catalogue_cost_microcents("openai", "gpt-5.4", 750_000, 300_000, 0, none),
+            1_500_000
+        );
+        // Below the threshold, or for a model with no listed long tier, the
+        // catalogue's figure stands, even when it is lower than the list's.
+        assert_eq!(
+            catalogue_cost_microcents("openai", "gpt-5.4", 100_000, 200_000, 0, none),
+            100_000
+        );
+        assert_eq!(
+            catalogue_cost_microcents("openai", "vendor/model", 600_000, 300_000, 0, none),
+            600_000
+        );
+        // A catalogue figure above the listed long-context cost is kept.
+        assert_eq!(
+            catalogue_cost_microcents("openai", "gpt-5.4", 9_000_000, 300_000, 0, none),
+            9_000_000
+        );
+        // A self-hosted server's ids are not vendor models.
+        assert_eq!(
+            catalogue_cost_microcents(
+                crate::self_hosted::OPENAI_COMPATIBLE,
+                "gpt-5.4",
+                750_000,
+                300_000,
+                0,
+                none
+            ),
+            750_000
+        );
+    }
+
+    #[tokio::test]
+    async fn a_long_prompt_priced_from_the_catalogue_records_the_long_context_cost() {
+        use sea_orm::MockDatabase;
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![catalogue_row(Some(serde_json::json!({
+                    "input_price_per_million": 2.5,
+                    "output_price_per_million": 15.0
+                })))]])
+                .append_query_results([vec![usage_log_model(None, None)]])
+                .into_connection(),
+        );
+        let service = UsageService::new(db.clone());
+
+        service
+            .log_usage(
+                None, "openai", "gpt-5.4", 300_000, 0, 10, 0, 200, false, false,
+            )
+            .await
+            .expect("usage insert succeeds");
+
+        drop(service);
+        let sql = format!("{:?}", Arc::try_unwrap(db).unwrap().into_transaction_log());
+        assert!(sql.contains("BigInt(Some(1500000))"), "{sql}");
+        assert!(!sql.contains("BigInt(Some(750000))"), "{sql}");
     }
 
     #[tokio::test]

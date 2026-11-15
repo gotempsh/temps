@@ -243,6 +243,8 @@ interface UsageSummary {
   error_count: number
   streaming_count: number
   byok_count: number
+  /** Requests that used tokens but have no recorded cost. */
+  unpriced_requests: number
 }
 
 interface ProviderUsage {
@@ -950,6 +952,37 @@ function UsageStatFailed() {
   return <p className="text-sm text-destructive">Couldn&apos;t load</p>
 }
 
+/**
+ * The window's recorded spend. Requests with no recorded cost (logged before
+ * costs were estimated, or from a model with no published price) are not in
+ * the total, so it says so instead of reading as free.
+ */
+function EstimatedCostStat({ summary }: { summary: UsageSummary | undefined }) {
+  const requests = summary?.total_requests ?? 0
+  const unpriced = summary?.unpriced_requests ?? 0
+  if (requests > 0 && unpriced >= requests) {
+    return (
+      <>
+        <div className="text-2xl font-bold">—</div>
+        <p className="text-xs text-muted-foreground">No recorded cost</p>
+      </>
+    )
+  }
+  return (
+    <>
+      <div className="text-2xl font-bold">
+        {formatCost(microcentsToDollars(summary?.total_cost_microcents ?? 0))}
+      </div>
+      {unpriced > 0 && (
+        <p className="text-xs text-muted-foreground">
+          Excludes {formatTokenCount(unpriced)} unpriced{' '}
+          {unpriced === 1 ? 'request' : 'requests'}
+        </p>
+      )}
+    </>
+  )
+}
+
 function LogCostCell({ log }: { log: UsageLogEntry }) {
   const cost = microcentsToDollars(log.estimated_cost_microcents)
   return <>{cost > 0 ? formatCost(cost) : '—'}</>
@@ -1265,11 +1298,7 @@ export function UsageAnalytics() {
             ) : summaryFailed ? (
               <UsageStatFailed />
             ) : (
-              <div className="text-2xl font-bold">
-                {formatCost(
-                  microcentsToDollars(summary?.total_cost_microcents ?? 0)
-                )}
-              </div>
+              <EstimatedCostStat summary={summary} />
             )}
           </CardContent>
         </Card>

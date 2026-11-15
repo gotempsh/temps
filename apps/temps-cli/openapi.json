@@ -45944,7 +45944,7 @@
             "type": "number"
           },
           "estimated_cost_microcents": {
-            "description": "Sum of the recorded cost of the model's requests in the window, in\nmicrocents (1e-6 USD), as the spend caps and budgets count it. Clients\nshow this rather than recomputing from list prices, which cannot see\ncache prices or long-context rates.",
+            "description": "Sum of the recorded cost of the model's requests in the window, in\nmicrocents (1e-6 USD). Clients show this rather than recomputing from\nlist prices, which cannot see cache prices or long-context rates. It\nincludes requests made with a caller-supplied provider key, so it is\nnot the figure a project's budget is measured against (that is\n`ProjectUsage::operator_cost_microcents`).",
             "format": "int64",
             "type": "integer"
           },
@@ -81430,6 +81430,11 @@
           "total_tokens": {
             "format": "int64",
             "type": "integer"
+          },
+          "unpriced_requests": {
+            "description": "Requests that used tokens but have no recorded cost: logged before\ncosts were estimated, or served by a model with no published price\n(a self-hosted server). `total_cost_microcents` leaves them out, so a\nclient shows the total as partial, or unknown when every request is\nunpriced, rather than as free.",
+            "format": "int64",
+            "type": "integer"
           }
         },
         "required": [
@@ -81441,7 +81446,8 @@
           "total_cost_microcents",
           "error_count",
           "streaming_count",
-          "byok_count"
+          "byok_count",
+          "unpriced_requests"
         ],
         "type": "object"
       },
