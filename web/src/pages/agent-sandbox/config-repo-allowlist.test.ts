@@ -3,6 +3,7 @@
 
 import { expect, test } from 'bun:test'
 import {
+  configRepoAllowlistProblem,
   formatConfigRepoAllowlist,
   invalidConfigRepoEntries,
   parseConfigRepoAllowlist,
@@ -54,4 +55,10 @@ test('a GitHub URL for a repository is accepted, as the server accepts it', () =
     'https://example.com/org/config',
     'https://github.com/org/*',
   ])
+})
+
+test('an allow-list with an entry that can never match cannot be saved', () => {
+  expect(configRepoAllowlistProblem('org/config\nplatform/*')).toBeNull()
+  expect(configRepoAllowlistProblem('')).toBeNull()
+  expect(configRepoAllowlistProblem('org/config\norg')).toContain('org is not')
 })

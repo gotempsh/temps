@@ -33,6 +33,7 @@ import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
 import {
   formatConfigRepoAllowlist,
+  configRepoAllowlistProblem,
   invalidConfigRepoEntries,
   parseConfigRepoAllowlist,
 } from './config-repo-allowlist'
@@ -293,6 +294,13 @@ export function AgentSandboxSandboxPage() {
     const apiLimitValues = validateSandboxApiLimits(apiLimits)
     if (!apiLimitValues.ok) {
       toast.error(apiLimitValues.message)
+      return
+    }
+    // An entry the server would never match is a typo, not a choice: hold
+    // the save until it is fixed rather than storing it.
+    const allowlistProblem = configRepoAllowlistProblem(configRepoAllowlist)
+    if (allowlistProblem) {
+      toast.error(allowlistProblem)
       return
     }
     try {

@@ -69,3 +69,15 @@ export function invalidConfigRepoEntries(entries: string[]): string[] {
     return !isRepoRef(trimmed)
   })
 }
+
+/**
+ * Why the allow-list text cannot be saved, or `null` when every entry is one
+ * the server can match.
+ */
+export function configRepoAllowlistProblem(text: string): string | null {
+  const invalid = invalidConfigRepoEntries(parseConfigRepoAllowlist(text))
+  if (invalid.length === 0) return null
+  return `Fix the allowed config repositories before saving: ${invalid.join(', ')} ${
+    invalid.length === 1 ? 'is' : 'are'
+  } not owner/repo or owner/*.`
+}
