@@ -38,24 +38,9 @@ export interface PutOptions {
 
   /**
    * Add a random suffix to the filename to prevent collisions
-   * @default true
+   * @default false
    */
   addRandomSuffix?: boolean;
-
-  /**
-   * Custom cache control header
-   */
-  cacheControl?: string;
-
-  /**
-   * Content encoding (e.g., 'gzip')
-   */
-  contentEncoding?: string;
-
-  /**
-   * Content disposition (e.g., 'attachment; filename="file.txt"')
-   */
-  contentDisposition?: string;
 }
 
 /**

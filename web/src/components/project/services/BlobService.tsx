@@ -335,15 +335,11 @@ const storage = createClient({
   body: BlobBody,
   options?: {
     contentType?: string         // override auto-detection
-    addRandomSuffix?: boolean    // default: true — prevents collisions
-    cacheControl?: string        // Cache-Control header
-    contentEncoding?: string     // e.g., 'gzip'
-    contentDisposition?: string  // e.g., 'attachment; filename="x.txt"'
+    addRandomSuffix?: boolean    // default: false — set true to prevent collisions
   },
 ): Promise<BlobInfo>`}
                   example={`const result = await blob.put('images/avatar.png', imageBuffer, {
   contentType: 'image/png',
-  cacheControl: 'public, max-age=31536000, immutable',
 })
 
 console.log(result.url)         // https://your-instance.temps.dev/api/blob/...
@@ -517,7 +513,6 @@ export async function POST(request: Request) {
     {
       contentType: file.type,
       addRandomSuffix: false,
-      cacheControl: 'public, max-age=31536000, immutable',
     },
   )
 
@@ -561,7 +556,6 @@ async function uploadAsset(filePath: string) {
 
   const { url } = await blob.put(\`assets/\${hash}.\${ext}\`, content, {
     addRandomSuffix: false,
-    cacheControl: 'public, max-age=31536000, immutable',
   })
 
   return url

@@ -15,7 +15,7 @@ source-deployment workflow.
    `.temps.yaml`. Read [the runtime contract](../references/runtime-contract.md).
 2. Run the router's capability checkpoint. Offer missing observability once;
    continue when the user declines.
-3. Inspect the named target context and existing projects with the pinned CLI.
+3. Inspect the named target context and existing projects with the current CLI.
    A target context identifies a Temps server; it does not prove which project
    environment is production. Never guess the server, project, environment,
    branch, or commit.

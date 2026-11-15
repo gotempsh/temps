@@ -517,21 +517,43 @@ mod unmaintained_dependency_guard_tests {
             .collect()
     }
 
-    /// Advisory IDs in the cargo-audit step's `ignore:` input. Panics unless
-    /// the workflow has exactly one such line, so a second audit step or a
-    /// renamed input cannot make this guard compare the wrong list.
+    /// The value the cargo-audit step's `ignore:` input must have: the job's
+    /// `AUDIT_IGNORE` list, which the step that reports PR audits reads too.
+    const AUDIT_IGNORE_INPUT: &str = "${{ env.AUDIT_IGNORE }}";
+
+    /// Advisory IDs cargo-audit ignores: the job's `AUDIT_IGNORE:` list.
+    /// Panics unless the workflow has exactly one such list and exactly one
+    /// `ignore:` input, and that input reads the list, so a second audit step,
+    /// a renamed input or an input that stops using the list cannot make this
+    /// guard compare the wrong IDs.
     fn cargo_audit_ignored_advisories(workflow: &str) -> std::collections::BTreeSet<&str> {
-        let lines: Vec<_> = workflow
+        let inputs: Vec<_> = workflow
             .lines()
             .filter_map(|line| line.trim().strip_prefix("ignore:"))
+            .map(str::trim)
             .collect();
         assert_eq!(
-            lines.len(),
+            inputs.len(),
             1,
             "expected exactly one `ignore:` input in dependency-scan.yml, found {}",
-            lines.len()
+            inputs.len()
         );
-        lines[0]
+        assert_eq!(
+            inputs[0], AUDIT_IGNORE_INPUT,
+            "the cargo-audit step's `ignore:` input in dependency-scan.yml must be \
+             `{AUDIT_IGNORE_INPUT}` so it ignores the same list this guard checks"
+        );
+        let lists: Vec<_> = workflow
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("AUDIT_IGNORE:"))
+            .collect();
+        assert_eq!(
+            lists.len(),
+            1,
+            "expected exactly one `AUDIT_IGNORE:` list in dependency-scan.yml, found {}",
+            lists.len()
+        );
+        lists[0]
             .split(',')
             .map(str::trim)
             .filter(|id| !id.is_empty())
@@ -549,14 +571,30 @@ mod unmaintained_dependency_guard_tests {
                 .collect::<Vec<_>>(),
             vec!["RUSTSEC-1", "RUSTSEC-2"]
         );
-        let workflow = "      # ignore: commented out\n        with:\n          \
-                        ignore: RUSTSEC-2,RUSTSEC-1\n";
+        let workflow = "    env:\n      AUDIT_IGNORE: RUSTSEC-2,RUSTSEC-1\n      \
+                        # ignore: commented out\n        run: echo \"$AUDIT_IGNORE\"\n        \
+                        with:\n          ignore: ${{ env.AUDIT_IGNORE }}\n";
         assert_eq!(
             cargo_audit_ignored_advisories(workflow)
                 .into_iter()
                 .collect::<Vec<_>>(),
             vec!["RUSTSEC-1", "RUSTSEC-2"]
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "`ignore:` input in dependency-scan.yml must be")]
+    fn cargo_audit_parser_rejects_an_input_that_bypasses_the_list() {
+        let workflow = "    env:\n      AUDIT_IGNORE: RUSTSEC-1\n        with:\n          \
+                        ignore: RUSTSEC-1,RUSTSEC-2\n";
+        cargo_audit_ignored_advisories(workflow);
+    }
+
+    #[test]
+    #[should_panic(expected = "expected exactly one `AUDIT_IGNORE:` list")]
+    fn cargo_audit_parser_rejects_a_missing_list() {
+        let workflow = "        with:\n          ignore: ${{ env.AUDIT_IGNORE }}\n";
+        cargo_audit_ignored_advisories(workflow);
     }
 
     /// `deny.toml` says its advisory ignore list mirrors the cargo-audit step's

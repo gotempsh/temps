@@ -48,6 +48,12 @@ cleanup, resource limits, migrations) and a pre-PR checklist.
 - **Use `Option<T>` for a required dependency.** Use `Arc<T>` and fail at startup if it is missing.
 - **Use `get_service` for a required plugin dependency.** Use `require_service`, which fails fast with a clear error.
 - **Add runtime configuration as an environment variable** ([next section](#configuration-is-a-column-not-an-environment-variable)).
+- **Add a third-party library (Rust crate, npm package, Python package) unless it is needed and this project cannot reasonably implement the functionality itself.**
+  - *Prefer, in order*: the standard library, a dependency already in the workspace (`[workspace.dependencies]` in the root `Cargo.toml`, an existing `package.json` entry), then code written here.
+  - *Data that drives billing, limits, security or policy* (price tables, allowlists, rate cards) lives in this repository, where every change is reviewed, never in an external package (`crates/temps-ai-gateway/src/services/pricing/mod.rs`).
+  - *A library that is needed* must be established and maintained (real usage history, not a brand-new or single-maintainer package), under a licence `deny.toml` already allows, with few transitive dependencies and no network access at build time. Declare a Rust crate once in `[workspace.dependencies]` with a deliberate version and use it with `{ workspace = true }`.
+  - *A library the contributor maintains* meets the same bar, and the PR discloses that they maintain it.
+  - *The PR description justifies it*: what it does, why an in-repo implementation is not feasible, the alternatives considered, its maintainers, age and usage, licence, and the transitive dependencies it adds.
 - **Hand-edit `CHANGELOG.md`.** [git-cliff](https://git-cliff.org) generates it from commit subjects at release time (concurrent edits used to conflict constantly); preview with `scripts/changelog.sh --unreleased`.
 - **Pass `--no-verify`** unless the user explicitly asks. If a hook is broken, fix the hook.
 - **Mutate Docker resources you did not create.** A host may already run a live Temps instance or operator-owned resources: never stop, remove, prune, rebuild or retag existing containers, images, volumes or networks. Tests create uniquely named resources and clean up only their own.

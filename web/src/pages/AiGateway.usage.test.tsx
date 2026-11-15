@@ -177,3 +177,211 @@ test('Retry on a failed breakdown shows loading, never "No data", while it runs'
   await act(async () => releaseProviders!())
   await within(card).findByText('No data')
 })
+
+test('costs show what was recorded, not a recomputation from base list prices', async () => {
+  // A long-context request: billed at the higher rate, so recomputing it from
+  // the base $0.10 / $0.50 per 1M would show about a fifth of the spend.
+  const entry = {
+    id: 1,
+    timestamp: '2026-11-15T10:00:00Z',
+    provider: 'anthropic',
+    model: 'claude-haiku-5-5',
+    input_tokens: 2_000_000,
+    output_tokens: 0,
+    latency_ms: 12,
+    estimated_cost_microcents: 1_250_000,
+    unpriced: false,
+    status: 200,
+    is_streaming: false,
+    is_byok: false,
+  }
+  globalThis.fetch = (async (input: Request | string | URL) => {
+    const url = new URL(String(input), 'http://localhost')
+    if (url.pathname === '/api/ai/pricing')
+      return json({
+        models: [
+          {
+            model: 'claude-haiku-5-5',
+            provider: 'anthropic',
+            input_per_million: 0.1,
+            output_per_million: 0.5,
+          },
+        ],
+      })
+    if (url.pathname === '/api/ai/usage/summary')
+      return json({
+        total_requests: 1,
+        total_tokens: 2_000_000,
+        total_input_tokens: 2_000_000,
+        total_output_tokens: 0,
+        avg_latency_ms: 12,
+        total_cost_microcents: 3_500_000,
+        error_count: 0,
+        streaming_count: 0,
+        byok_count: 0,
+      })
+    if (url.pathname === '/api/ai/usage/top-models')
+      return json([
+        {
+          model: 'claude-haiku-5-5',
+          provider: 'anthropic',
+          request_count: 1,
+          input_tokens: 2_000_000,
+          output_tokens: 0,
+          total_tokens: 2_000_000,
+          avg_latency_ms: 12,
+          estimated_cost_microcents: 2_250_000,
+        },
+      ])
+    if (url.pathname === '/api/ai/usage/recent')
+      return json({ entries: [entry], total: 1 })
+    if (url.pathname.startsWith('/api/ai/usage/')) return json([])
+    return new Response('{}', { status: 404 })
+  }) as typeof fetch
+  renderUsage()
+
+  // Est. Cost card: the summary's recorded total, across every model.
+  await screen.findByText('$3.50')
+  // Top models: the model's recorded cost.
+  await screen.findByText('$2.25')
+  // Recent requests: the request's recorded cost.
+  await screen.findByText('$1.25')
+  // Never the base-rate figure: 2,000,000 x $0.10 per 1M.
+  expect(screen.queryByText('$0.200')).toBeNull()
+})
+
+function mockSummary(summary: Record<string, number>) {
+  globalThis.fetch = (async (input: Request | string | URL) => {
+    const url = new URL(String(input), 'http://localhost')
+    if (url.pathname === '/api/ai/usage/summary')
+      return json({
+        total_tokens: 0,
+        total_input_tokens: 0,
+        total_output_tokens: 0,
+        avg_latency_ms: 0,
+        error_count: 0,
+        streaming_count: 0,
+        byok_count: 0,
+        ...summary,
+      })
+    if (url.pathname === '/api/ai/usage/recent')
+      return json({ entries: [], total: 0 })
+    if (url.pathname.startsWith('/api/ai/usage/')) return json([])
+    return new Response('{}', { status: 404 })
+  }) as typeof fetch
+}
+
+test('a window whose requests have no recorded cost is not shown as free', async () => {
+  mockSummary({
+    total_requests: 3,
+    total_cost_microcents: 0,
+    unpriced_requests: 3,
+    priced_requests: 0,
+  })
+  renderUsage()
+
+  await screen.findByText('No recorded cost')
+  expect(screen.queryByText('$0.00')).toBeNull()
+})
+
+test('a failed request that used no tokens does not make an unpriced window read as free', async () => {
+  mockSummary({
+    total_requests: 4,
+    total_cost_microcents: 0,
+    unpriced_requests: 3,
+    priced_requests: 0,
+    error_count: 1,
+  })
+  renderUsage()
+
+  await screen.findByText('No recorded cost')
+  expect(screen.queryByText('$0.00')).toBeNull()
+})
+
+test('a window of free requests shows $0.00, not an unknown cost', async () => {
+  mockSummary({
+    total_requests: 2,
+    total_cost_microcents: 0,
+    unpriced_requests: 0,
+    priced_requests: 2,
+  })
+  renderUsage()
+
+  await screen.findByText('$0.00')
+  expect(screen.queryByText('No recorded cost')).toBeNull()
+  expect(screen.queryByText(/unpriced/)).toBeNull()
+})
+
+test('a total that leaves out unpriced requests says how many', async () => {
+  mockSummary({
+    total_requests: 5,
+    total_cost_microcents: 1_500_000,
+    unpriced_requests: 2,
+    priced_requests: 3,
+  })
+  renderUsage()
+
+  await screen.findByText('$1.50')
+  await screen.findByText('Excludes 2 unpriced requests')
+})
+
+test('the request log shows a free request as $0.00 and an unpriced one as unknown', async () => {
+  const entry = (id: number, model: string, unpriced: boolean) => ({
+    id,
+    timestamp: '2026-11-15T10:00:00Z',
+    provider: 'openrouter',
+    model,
+    input_tokens: 1_000,
+    output_tokens: 10,
+    latency_ms: 12,
+    estimated_cost_microcents: 0,
+    unpriced,
+    status: 200,
+    is_streaming: false,
+    is_byok: false,
+  })
+  globalThis.fetch = (async (input: Request | string | URL) => {
+    const url = new URL(String(input), 'http://localhost')
+    if (url.pathname === '/api/ai/usage/recent')
+      return json({
+        entries: [
+          entry(1, 'vendor/free-model', false),
+          entry(2, 'local-model', true),
+        ],
+        total: 2,
+      })
+    if (url.pathname.startsWith('/api/ai/usage/')) return json([])
+    return new Response('{}', { status: 404 })
+  }) as typeof fetch
+  renderUsage()
+
+  const free = (await screen.findByText('vendor/free-model')).closest('tr')!
+  const unpriced = screen.getByText('local-model').closest('tr')!
+  expect(within(free).getByText('$0.00')).toBeTruthy()
+  // No dollar figure at all: its cost cell reads "—".
+  expect(within(unpriced).queryByText(/\$/)).toBeNull()
+})
+
+test('a cost filter in dollars is sent in microcents, the unit costs are recorded in', async () => {
+  const recent: URLSearchParams[] = []
+  globalThis.fetch = (async (input: Request | string | URL) => {
+    const url = new URL(String(input), 'http://localhost')
+    if (url.pathname === '/api/ai/usage/recent') {
+      recent.push(url.searchParams)
+      return json({ entries: [], total: 0 })
+    }
+    if (url.pathname.startsWith('/api/ai/usage/')) return json([])
+    return new Response('{}', { status: 404 })
+  }) as typeof fetch
+  renderUsage()
+
+  fireEvent.click(await screen.findByRole('button', { name: 'Filters' }))
+  fireEvent.change(screen.getByLabelText('Filter by cost in dollars'), {
+    target: { value: '1.25' },
+  })
+
+  // $1.25 is 1,250,000 microcents, the figure a $1.25 request is recorded at.
+  await waitFor(() =>
+    expect(recent[recent.length - 1]?.get('cost_gte')).toBe('1250000')
+  )
+})

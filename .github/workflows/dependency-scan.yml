@@ -48,6 +48,8 @@ env:
 jobs:
   cargo-audit:
     name: Rust Dependency Audit (cargo-audit)
+    env:
+      AUDIT_IGNORE: RUSTSEC-2025-0134,RUSTSEC-2023-0071,RUSTSEC-2026-0235,RUSTSEC-2024-0436,RUSTSEC-2026-0173,RUSTSEC-2024-0388,RUSTSEC-2026-0253,RUSTSEC-2024-0449,RUSTSEC-2025-0141,RUSTSEC-2026-0381,RUSTSEC-2026-0387,RUSTSEC-2026-0459,RUSTSEC-2026-0440
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -268,11 +270,26 @@ jobs:
           tool: cargo-audit@0.22.2
           fallback: none
 
+      # PRs use the job status directly: audit-check's additional Check API
+      # reporting can fail even after a successful scan. Keep scheduled issue
+      # reporting, and preserve the same advisory policy on both paths.
+      - name: Audit pull request dependencies
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          IFS=',' read -r -a advisories <<< "$AUDIT_IGNORE"
+          args=()
+          for advisory in "${advisories[@]}"; do
+            args+=(--ignore "$advisory")
+          done
+          cargo audit --file Cargo.lock "${args[@]}"
+
       - name: Run cargo-audit
+        if: github.event_name != 'pull_request'
         uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          ignore: RUSTSEC-2025-0134,RUSTSEC-2023-0071,RUSTSEC-2026-0235,RUSTSEC-2024-0436,RUSTSEC-2026-0173,RUSTSEC-2024-0388,RUSTSEC-2026-0253,RUSTSEC-2024-0449,RUSTSEC-2025-0141,RUSTSEC-2026-0381,RUSTSEC-2026-0387,RUSTSEC-2026-0459,RUSTSEC-2026-0440
+          ignore: ${{ env.AUDIT_IGNORE }}
 
   cargo-deny:
     name: Rust Licences, Sources & Bans (cargo-deny)

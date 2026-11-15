@@ -47,6 +47,9 @@ if ! git diff-index --quiet HEAD --; then
     exit 1
 fi
 
+# Verify explicitly prepared SDK versions before preparing the server release.
+python3 scripts/sdk_release.py plan --tag "v${VERSION}" || exit 1
+
 # Run tests
 echo -e "${GREEN}Running tests...${NC}"
 if ! cargo test --workspace --lib; then
@@ -79,6 +82,11 @@ sed -i.bak "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml && rm Carg
 # Update temps-cli Cargo.toml
 sed -i.bak "s/^version = \".*\"/version = \"${VERSION}\"/" crates/temps-cli/Cargo.toml && rm crates/temps-cli/Cargo.toml.bak
 
+# Keep workspace package versions in the committed lockfile in sync.
+# --workspace retains locked third-party dependency versions.
+cargo update --workspace
+cargo check --lib
+
 # Show changes
 echo -e "${GREEN}Version updated in:${NC}"
 echo "  - Cargo.toml"
@@ -105,8 +113,8 @@ read -r
 
 # Commit version bump
 echo -e "${GREEN}Committing version bump...${NC}"
-git add Cargo.toml crates/temps-cli/Cargo.toml CHANGELOG.md
-git commit -m "chore: bump version to v${VERSION}"
+git add Cargo.toml crates/temps-cli/Cargo.toml Cargo.lock CHANGELOG.md
+git commit -s -m "chore: bump version to v${VERSION}"
 
 # Create tag
 echo -e "${GREEN}Creating tag v${VERSION}...${NC}"

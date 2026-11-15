@@ -147,4 +147,6 @@ answers to these questions in the PR:
       The one exception is a credential minted by the request itself, returned once
       in plaintext with `Cache-Control: no-store` (see AGENTS.md).
 - [ ] Reads and parallelism are bounded.
+- [ ] Any new third-party library meets the dependency rule in AGENTS.md, and the PR
+      description justifies it.
 - [ ] `cargo check`, clippy and the touched crates' tests pass, with no new warnings.

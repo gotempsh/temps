@@ -1736,6 +1736,7 @@ mod tests {
                         trace_id: None,
                         project_id: None,
                         token_id: None,
+                        price_known: None,
                     }]])
                     .into_connection(),
             );
@@ -1836,6 +1837,7 @@ mod tests {
                             trace_id: None,
                             project_id: None,
                             token_id: None,
+                            price_known: None,
                         }]])
                         .into_connection(),
                 );
