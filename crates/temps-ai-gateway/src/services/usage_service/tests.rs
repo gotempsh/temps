@@ -183,6 +183,7 @@ async fn a_logged_request_is_priced_from_the_newest_catalogue_entry_that_has_a_p
     let cost = service()
         .estimate_cost_microcents(
             &db,
+            "openrouter",
             "vendor/model",
             1_000,
             200,
@@ -202,6 +203,7 @@ async fn an_unlisted_model_has_no_catalogue_price() {
     let cost = service()
         .estimate_cost_microcents(
             &db,
+            "openrouter",
             "vendor/unknown",
             1_000,
             200,
@@ -276,6 +278,7 @@ async fn a_failed_price_lookup_is_treated_as_no_catalogue_price() {
     let cost = service()
         .estimate_cost_microcents(
             &db,
+            "openrouter",
             "vendor/model",
             1_000,
             200,
@@ -287,12 +290,105 @@ async fn a_failed_price_lookup_is_treated_as_no_catalogue_price() {
 }
 
 #[tokio::test]
+async fn the_catalogue_lookup_reads_only_the_serving_providers_entries() {
+    let db = sea_orm::MockDatabase::new(DatabaseBackend::Postgres)
+        .append_query_results([Vec::<ai_provider_models::Model>::new()])
+        .into_connection();
+    service()
+        .estimate_cost_microcents(
+            &db,
+            crate::self_hosted::OPENAI_COMPATIBLE,
+            "gpt-5.4",
+            1_000,
+            0,
+            PromptTokensDetails::default(),
+        )
+        .await;
+    let sql = format!("{:?}", db.into_transaction_log());
+    // Debug output escapes the quotes in the SQL text, not in bound values.
+    assert!(sql.contains(r#"INNER JOIN \"ai_provider_keys\""#), "{sql}");
+    assert!(
+        sql.contains(r#"\"ai_provider_keys\".\"provider\" = $1"#),
+        "{sql}"
+    );
+    assert!(
+        sql.contains(r#"String(Some("openai_compatible"))"#),
+        "{sql}"
+    );
+}
+
+#[tokio::test]
+async fn a_self_hosted_model_does_not_take_a_vendor_keys_catalogue_price_on_a_real_database() {
+    use sea_orm::ConnectionTrait;
+    // Skip only when no container runtime can be reached; a failed
+    // migration or schema check fails the test.
+    let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
+        Ok(db) => db,
+        Err(error) if temps_test_utils::is_container_runtime_unavailable(&format!("{error:#}")) => {
+            println!("Skipping: no container runtime for the PostgreSQL test database: {error:#}");
+            return;
+        }
+        Err(error) => panic!("test database setup failed: {error:#}"),
+    };
+    let db = test_db.connection_arc();
+    // A vendor key that prices `gpt-5.4`, and a self-hosted key whose server
+    // serves a model it also calls `gpt-5.4`, unpriced, plus one it prices.
+    db.execute_unprepared(
+        "INSERT INTO ai_provider_keys (id, provider, display_name, api_key_encrypted) VALUES \
+         (901, 'openai', 'Vendor', 'x'), (902, 'openai_compatible', 'Local', 'x')",
+    )
+    .await
+    .expect("keys inserted");
+    db.execute_unprepared(
+        "INSERT INTO ai_provider_models (provider_key_id, model_id, display_name, source, metadata) VALUES \
+         (901, 'gpt-5.4', 'GPT-5.4', 'discovered', \
+          '{\"input_price_per_million\": 2.5, \"output_price_per_million\": 15.0}'), \
+         (902, 'gpt-5.4', 'Local GPT', 'discovered', '{\"name\": \"local\"}'), \
+         (902, 'local-priced', 'Local priced', 'discovered', \
+          '{\"input_price_per_million\": 1.0, \"output_price_per_million\": 1.0}')",
+    )
+    .await
+    .expect("catalogue inserted");
+    let service = UsageService::new(db.clone());
+    let none = PromptTokensDetails::default();
+    let self_hosted = crate::self_hosted::OPENAI_COMPATIBLE;
+
+    assert_eq!(
+        service
+            .estimate_cost_microcents(db.as_ref(), self_hosted, "gpt-5.4", 1_000, 0, none)
+            .await,
+        None,
+        "a self-hosted model must not take the vendor key's price"
+    );
+    assert_eq!(
+        service
+            .estimate_cost_microcents(db.as_ref(), "openai", "gpt-5.4", 1_000, 0, none)
+            .await,
+        Some(2_500)
+    );
+    assert_eq!(
+        service
+            .estimate_cost_microcents(db.as_ref(), self_hosted, "local-priced", 1_000, 0, none)
+            .await,
+        Some(1_000),
+        "a self-hosted key's own priced entry still applies"
+    );
+}
+
+#[tokio::test]
 async fn a_request_with_no_tokens_skips_the_lookup() {
     // No query results queued: a lookup would error and return no price,
     // so `Some(0)` proves it returned early.
     let db = sea_orm::MockDatabase::new(DatabaseBackend::Postgres).into_connection();
     let cost = service()
-        .estimate_cost_microcents(&db, "vendor/model", 0, 0, PromptTokensDetails::default())
+        .estimate_cost_microcents(
+            &db,
+            "openrouter",
+            "vendor/model",
+            0,
+            0,
+            PromptTokensDetails::default(),
+        )
         .await;
     assert_eq!(cost, Some(0));
 }

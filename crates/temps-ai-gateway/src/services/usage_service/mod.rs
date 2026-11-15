@@ -8,7 +8,7 @@ use sea_orm::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use temps_entities::{ai_provider_models, ai_usage_logs};
+use temps_entities::{ai_provider_keys, ai_provider_models, ai_usage_logs};
 use utoipa::ToSchema;
 
 use crate::error::AiGatewayError;
@@ -550,13 +550,15 @@ impl UsageService {
         .await
     }
 
-    /// Estimate a request's cost from the model catalogue's published price.
+    /// Estimate a request's cost from the model catalogue's published price,
+    /// read from entries of the serving `provider`'s keys only.
     /// `None` when the catalogue publishes no price for the model. A failed
     /// lookup is logged and treated as no price: usage logging must never fail
     /// a request over a missing estimate.
     async fn estimate_cost_microcents<C: sea_orm::ConnectionTrait>(
         &self,
         connection: &C,
+        provider: &str,
         model: &str,
         input_tokens: i64,
         output_tokens: i64,
@@ -565,7 +567,14 @@ impl UsageService {
         if input_tokens <= 0 && output_tokens <= 0 {
             return Some(0);
         }
+        // Only the serving provider's catalogue entries: a self-hosted
+        // server's ids are the operator's own names, so its `gpt-5.4` must not
+        // take a vendor key's price (and be recorded as priced), while its own
+        // priced entries still apply. Scoped by provider rather than key so a
+        // request on the caller's own key is priced from its vendor's catalogue.
         let rows = ai_provider_models::Entity::find()
+            .inner_join(ai_provider_keys::Entity)
+            .filter(ai_provider_keys::Column::Provider.eq(provider))
             .filter(ai_provider_models::Column::ModelId.eq(model))
             .filter(ai_provider_models::Column::Metadata.is_not_null())
             .order_by_desc(ai_provider_models::Column::UpdatedAt)
@@ -621,7 +630,14 @@ impl UsageService {
             (estimated_cost_microcents, true)
         } else {
             match self
-                .estimate_cost_microcents(connection, model, input_tokens, output_tokens, cache)
+                .estimate_cost_microcents(
+                    connection,
+                    provider,
+                    model,
+                    input_tokens,
+                    output_tokens,
+                    cache,
+                )
                 .await
             {
                 Some(cost) => (
