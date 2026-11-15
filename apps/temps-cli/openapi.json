@@ -15880,7 +15880,7 @@
             "type": "integer"
           },
           "unpriced_requests": {
-            "description": "Requests that used tokens but were logged at zero cost because the\nmodel has no known price. When this is not zero, the cost is a floor.",
+            "description": "Requests that used tokens but whose model has no known price, so they\nwere logged at zero cost (the gateway's rule,\n`ai_usage_logs::UNPRICED_CONDITION`). A model with a published price\nof zero is priced. When this is not zero, the cost is a floor.",
             "format": "int64",
             "type": "integer"
           }

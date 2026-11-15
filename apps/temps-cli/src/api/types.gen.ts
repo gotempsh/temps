@@ -7583,8 +7583,10 @@ export type ConversationUsage = {
      */
     summarized_messages: number;
     /**
-     * Requests that used tokens but were logged at zero cost because the
-     * model has no known price. When this is not zero, the cost is a floor.
+     * Requests that used tokens but whose model has no known price, so they
+     * were logged at zero cost (the gateway's rule,
+     * `ai_usage_logs::UNPRICED_CONDITION`). A model with a published price
+     * of zero is priced. When this is not zero, the cost is a floor.
      */
     unpriced_requests: number;
 };

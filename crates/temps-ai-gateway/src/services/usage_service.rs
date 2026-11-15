@@ -70,11 +70,9 @@ pub(crate) enum UsageCount {
 }
 
 /// SQL condition for a usage row that used tokens but has no cost from a
-/// known price. A row from before `price_known` existed (NULL) is unpriced
-/// when its cost is not positive. Mirrors `is_unpriced`. It is never NULL
-/// (`IS FALSE`, not `= false`), so `NOT` of it selects the priced rows.
-const UNPRICED_SQL: &str = "(input_tokens > 0 OR output_tokens > 0) \
-     AND (price_known IS FALSE OR (price_known IS NULL AND estimated_cost_microcents <= 0))";
+/// known price, shared with every other report that counts them. Mirrors
+/// `is_unpriced`.
+const UNPRICED_SQL: &str = temps_entities::ai_usage_logs::UNPRICED_CONDITION;
 
 /// Whether a usage row used tokens but has no cost from a known price; the
 /// same rule as `UNPRICED_SQL`.

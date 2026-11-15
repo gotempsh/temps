@@ -50,6 +50,15 @@ pub struct Model {
     pub price_known: Option<bool>,
 }
 
+/// SQL condition for a row that used tokens but whose cost no known price
+/// gave: `price_known` is false (a self-hosted model no price list covers),
+/// or, for a row older than the column, its cost is not positive. A model
+/// with a published price of zero is priced. Every report that counts
+/// unpriced requests uses this, so they agree. It is never NULL (`IS FALSE`,
+/// not `= false`), so its negation selects exactly the other rows.
+pub const UNPRICED_CONDITION: &str = "((input_tokens > 0 OR output_tokens > 0) \
+     AND (price_known IS FALSE OR (price_known IS NULL AND estimated_cost_microcents <= 0)))";
+
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {}
 
