@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 # A breaking commit's `BREAKING CHANGE:` footer is printed after the marker so
 # the entry says how to migrate; a `!`-only commit has no footer, and git-cliff
 # then reports the subject as the description, so only the marker is shown.
+# The footer is joined onto one line so a wrapped footer stays in its list item.
+# An entry whose scope and text already appeared in its section is skipped: a
+# rebased branch merged together with its pre-rebase copy carries each commit
+# twice, and the second copy would print the same line again.
 body = """
 {% if version %}\
     ## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
@@ -24,9 +28,15 @@ body = """
 {% endif %}\
 {% for group, commits in commits | group_by(attribute="group") %}
     ### {{ group | upper_first }}
-    {% for commit in commits %}
+    {% set_global seen = [] %}\
+    {% for commit in commits %}\
+        {% set scope = commit.scope | default(value="") %}\
+        {% set entry = scope ~ "|" ~ commit.message %}\
+        {% if entry not in seen %}\
+        {% set_global seen = seen | concat(with=entry) %}
         - {% if commit.scope %}**{{commit.scope}}:** {% endif %}{{ commit.message | upper_first }}\
-          {% if commit.breaking %} [**BREAKING**]{% if commit.breaking_description != commit.message %}: {{ commit.breaking_description }}{% endif %}{% endif %}\
+          {% if commit.breaking %} [**BREAKING**]{% if commit.breaking_description != commit.message %}: {{ commit.breaking_description | split(pat="\n") | join(sep=" ") }}{% endif %}{% endif %}\
+        {% endif %}\
     {% endfor %}
 {% endfor %}\n
 """
