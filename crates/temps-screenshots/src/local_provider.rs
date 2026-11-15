@@ -146,6 +146,28 @@ const SANDBOX_WORKS: u8 = 1;
 const SANDBOX_UNAVAILABLE: u8 = 2;
 static SANDBOX_STATE: AtomicU8 = AtomicU8::new(SANDBOX_UNKNOWN);
 
+/// Why Chromium could not be started. The reasons carry the text of the
+/// browser library's own error, which is not a type this crate can name.
+#[derive(Debug, thiserror::Error)]
+enum ChromeLaunchError {
+    #[error("failed to build launch options: {reason}")]
+    InvalidOptions { reason: String },
+    /// `sandboxed` is whether the failure being reported was a start with
+    /// Chromium's own sandbox on (the first failure is reported when both
+    /// the sandboxed and the unsandboxed start fail).
+    #[error("failed to launch browser: {reason}")]
+    LaunchFailed { sandboxed: bool, reason: String },
+}
+
+/// Why the request filter could not be put on a tab.
+#[derive(Debug, thiserror::Error)]
+enum RequestFilterError {
+    #[error("failed to install the request filter: {reason}")]
+    InstallHandler { reason: String },
+    #[error("failed to enable request filtering: {reason}")]
+    EnableFetch { reason: String },
+}
+
 /// Launch Chromium with its own sandbox on, falling back to no sandbox when it
 /// cannot start (typically as root inside a container, or without the user
 /// namespaces it needs). The fallback is logged once at WARN, and remembered
@@ -161,7 +183,7 @@ fn launch_chrome(
     window_size: Option<(u32, u32)>,
     proxy_server: Option<&str>,
     extra_args: &[String],
-) -> Result<Browser, String> {
+) -> Result<Browser, ChromeLaunchError> {
     let mut proxy_args: Vec<&std::ffi::OsStr> = if proxy_server.is_some() {
         vec![
             std::ffi::OsStr::new("--proxy-bypass-list=<-loopback>"),
@@ -181,7 +203,9 @@ fn launch_chrome(
             .proxy_server(proxy_server)
             .args(proxy_args.clone())
             .build()
-            .map_err(|error| format!("failed to build launch options: {error}"))
+            .map_err(|error| ChromeLaunchError::InvalidOptions {
+                reason: error.to_string(),
+            })
     };
 
     if SANDBOX_STATE.load(Ordering::Relaxed) != SANDBOX_UNAVAILABLE {
@@ -207,12 +231,18 @@ fn launch_chrome(
                         Ok(browser)
                     }
                     // Not a sandbox problem: report the first, sandboxed, failure.
-                    Err(_) => Err(format!("failed to launch browser: {sandboxed_error}")),
+                    Err(_) => Err(ChromeLaunchError::LaunchFailed {
+                        sandboxed: true,
+                        reason: sandboxed_error.to_string(),
+                    }),
                 };
             }
         }
     }
-    Browser::new(options(false)?).map_err(|error| format!("failed to launch browser: {error}"))
+    Browser::new(options(false)?).map_err(|error| ChromeLaunchError::LaunchFailed {
+        sandboxed: false,
+        reason: error.to_string(),
+    })
 }
 
 /// Limit what the page in `tab` may request to its own address and public
@@ -222,7 +252,7 @@ fn restrict_page_requests(
     tab: &headless_chrome::Tab,
     policy: RequestPolicy,
     blocked: Arc<std::sync::atomic::AtomicUsize>,
-) -> Result<(), String> {
+) -> Result<(), RequestFilterError> {
     use headless_chrome::browser::tab::RequestPausedDecision;
     use headless_chrome::protocol::cdp::Fetch::{FailRequest, RequestPattern, RequestStage};
     use headless_chrome::protocol::cdp::Network::ErrorReason;
@@ -248,7 +278,9 @@ fn restrict_page_requests(
             }
         },
     ))
-    .map_err(|error| format!("failed to install the request filter: {error}"))?;
+    .map_err(|error| RequestFilterError::InstallHandler {
+        reason: error.to_string(),
+    })?;
     tab.enable_fetch(
         Some(&[RequestPattern {
             url_pattern: Some("*".to_string()),
@@ -257,7 +289,9 @@ fn restrict_page_requests(
         }]),
         None,
     )
-    .map_err(|error| format!("failed to enable request filtering: {error}"))?;
+    .map_err(|error| RequestFilterError::EnableFetch {
+        reason: error.to_string(),
+    })?;
     Ok(())
 }
 
@@ -381,9 +415,9 @@ impl ScreenshotProvider for LocalScreenshotProvider {
                     Some(&proxy_server),
                     &extra_args,
                 )
-                .map_err(|reason| {
-                    report_chrome_unavailable(&CHROME_UNAVAILABLE, &reason);
-                    ScreenshotError::ChromeError(format!("Failed to launch browser: {reason}"))
+                .map_err(|error| {
+                    report_chrome_unavailable(&CHROME_UNAVAILABLE, &error.to_string());
+                    ScreenshotError::ChromeError(format!("Failed to launch browser: {error}"))
                 })?;
 
                 report_chrome_available(&CHROME_UNAVAILABLE);
@@ -398,9 +432,9 @@ impl ScreenshotProvider for LocalScreenshotProvider {
                 // own address and public addresses, whatever it embeds or
                 // redirects to. Installed before the first navigation.
                 let blocked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-                restrict_page_requests(&tab, policy, blocked.clone()).map_err(|reason| {
-                    warn!("Not capturing {}: {}", url, reason);
-                    ScreenshotError::ChromeError(reason)
+                restrict_page_requests(&tab, policy, blocked.clone()).map_err(|error| {
+                    warn!("Not capturing {}: {}", url, error);
+                    ScreenshotError::ChromeError(error.to_string())
                 })?;
 
                 // Disable all CSS animations/transitions before navigation so they
@@ -505,7 +539,7 @@ impl ScreenshotProvider for LocalScreenshotProvider {
                 let chrome_path = chromium_executable().map_err(|e| e.to_string())?;
                 launch_chrome(chrome_path, Duration::from_secs(5), None, None, &[])
                     .map(|_| ())
-                    .map_err(|reason| format!("Failed to launch Chrome browser: {reason}"))
+                    .map_err(|error| format!("Failed to launch Chrome browser: {error}"))
             },
         )
         .await
@@ -627,6 +661,46 @@ fn still_running_message(reason: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launch_and_filter_failures_say_which_step_failed() {
+        let options = ChromeLaunchError::InvalidOptions {
+            reason: "bad path".into(),
+        };
+        assert_eq!(
+            options.to_string(),
+            "failed to build launch options: bad path"
+        );
+        let launch = ChromeLaunchError::LaunchFailed {
+            sandboxed: true,
+            reason: "no usable sandbox".into(),
+        };
+        assert_eq!(
+            launch.to_string(),
+            "failed to launch browser: no usable sandbox"
+        );
+        assert!(matches!(
+            launch,
+            ChromeLaunchError::LaunchFailed {
+                sandboxed: true,
+                ..
+            }
+        ));
+        let install = RequestFilterError::InstallHandler {
+            reason: "tab closed".into(),
+        };
+        assert_eq!(
+            install.to_string(),
+            "failed to install the request filter: tab closed"
+        );
+        let enable = RequestFilterError::EnableFetch {
+            reason: "tab closed".into(),
+        };
+        assert_eq!(
+            enable.to_string(),
+            "failed to enable request filtering: tab closed"
+        );
+    }
 
     #[tokio::test]
     async fn lock_outlives_a_timed_out_caller_until_the_blocking_work_ends() {

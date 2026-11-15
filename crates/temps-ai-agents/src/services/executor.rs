@@ -289,6 +289,48 @@ pub(crate) async fn sandbox_git_credential(
     }
 }
 
+/// Why [`clone_with_scoped_token`] did not produce a checkout.
+#[derive(Debug, thiserror::Error)]
+enum ScopedCloneError {
+    /// The owner, repository, branch or token holds characters that could
+    /// change the URL or the command line they are placed in. The value
+    /// itself is not echoed: for the token it would be the secret.
+    #[error(
+        "the {field} for {owner}/{repo} (branch {branch}) has unexpected characters, so it \
+         was not passed to git"
+    )]
+    UnexpectedCharacters {
+        field: &'static str,
+        owner: String,
+        repo: String,
+        branch: String,
+    },
+    #[error("git clone of {owner}/{repo} (branch {branch}) timed out after {seconds} seconds")]
+    TimedOut {
+        owner: String,
+        repo: String,
+        branch: String,
+        seconds: u64,
+    },
+    #[error("could not run git to clone {owner}/{repo} (branch {branch}): {source}")]
+    Spawn {
+        owner: String,
+        repo: String,
+        branch: String,
+        #[source]
+        source: std::io::Error,
+    },
+    /// Git's own message names no secret: the token never appears in a URL.
+    #[error("git clone of {owner}/{repo} (branch {branch}) exited with {status}: {stderr}")]
+    GitFailed {
+        owner: String,
+        repo: String,
+        branch: String,
+        status: std::process::ExitStatus,
+        stderr: String,
+    },
+}
+
 /// Clone `owner/repo` from GitHub with a read-only token limited to that
 /// repository. The token reaches git through the environment (a one-shot
 /// credential helper reads it), never the command line or a file.
@@ -298,7 +340,8 @@ async fn clone_with_scoped_token(
     branch: &str,
     target_dir: &std::path::Path,
     token: &str,
-) -> Result<(), String> {
+) -> Result<(), ScopedCloneError> {
+    const CLONE_TIMEOUT_SECONDS: u64 = 300;
     // Names are interpolated into a URL and a command line: only the
     // characters repository and branch names are made of.
     let plain = |value: &str| {
@@ -308,11 +351,24 @@ async fn clone_with_scoped_token(
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
     };
-    if !plain(owner) || !plain(repo) || !plain(branch) || !is_plain_token(token) {
-        return Err("the repository, branch or token has unexpected characters".to_string());
+    let unexpected = [
+        ("owner", plain(owner)),
+        ("repository name", plain(repo)),
+        ("branch name", plain(branch)),
+        ("token", is_plain_token(token)),
+    ]
+    .into_iter()
+    .find_map(|(field, ok)| (!ok).then_some(field));
+    if let Some(field) = unexpected {
+        return Err(ScopedCloneError::UnexpectedCharacters {
+            field,
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+            branch: branch.to_string(),
+        });
     }
     let output = tokio::time::timeout(
-        Duration::from_secs(300),
+        Duration::from_secs(CLONE_TIMEOUT_SECONDS),
         Command::new("git")
             .arg("clone")
             .arg("--quiet")
@@ -327,17 +383,28 @@ async fn clone_with_scoped_token(
             .output(),
     )
     .await
-    .map_err(|_| "git clone timed out after 300 seconds".to_string())?
-    .map_err(|error| format!("could not run git: {error}"))?;
+    .map_err(|_| ScopedCloneError::TimedOut {
+        owner: owner.to_string(),
+        repo: repo.to_string(),
+        branch: branch.to_string(),
+        seconds: CLONE_TIMEOUT_SECONDS,
+    })?
+    .map_err(|source| ScopedCloneError::Spawn {
+        owner: owner.to_string(),
+        repo: repo.to_string(),
+        branch: branch.to_string(),
+        source,
+    })?;
     if output.status.success() {
         Ok(())
     } else {
-        // Git's own message names no secret: the token never appears in a URL.
-        Err(format!(
-            "git clone exited with {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        ))
+        Err(ScopedCloneError::GitFailed {
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+            branch: branch.to_string(),
+            status: output.status,
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        })
     }
 }
 
@@ -1860,6 +1927,7 @@ impl AgentExecutor {
                 clone_with_scoped_token(owner, repo, branch, &clone_dir, &token)
                     .await
                     .err()
+                    .map(|error| error.to_string())
             }
             SandboxGitCredential::Withheld { reason } => Some(reason),
         };
@@ -4304,7 +4372,7 @@ fn skipped_overlay_entries_message(
 
 #[cfg(test)]
 mod scoped_token_git_env_tests {
-    use super::scoped_token_git_env;
+    use super::{clone_with_scoped_token, scoped_token_git_env, ScopedCloneError};
     use std::io::Write;
     use std::process::{Command, Stdio};
 
@@ -4343,6 +4411,68 @@ mod scoped_token_git_env_tests {
             .status
             .success()
             .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    #[tokio::test]
+    async fn a_scoped_clone_names_the_field_with_unexpected_characters() {
+        let dir = std::path::Path::new("/nonexistent-clone-target");
+        let token = "ghs_abcdef0123456789";
+        for (owner, repo, branch, token, field) in [
+            ("-bad", "repo", "main", token, "owner"),
+            ("acme", "re po", "main", token, "repository name"),
+            ("acme", "repo", "--upload-pack=x", token, "branch name"),
+            ("acme", "repo", "main", "tok en\n", "token"),
+        ] {
+            let error = clone_with_scoped_token(owner, repo, branch, dir, token)
+                .await
+                .expect_err("input with unexpected characters must be refused");
+            match &error {
+                ScopedCloneError::UnexpectedCharacters { field: got, .. } => {
+                    assert_eq!(*got, field, "{error}");
+                }
+                other => panic!("expected UnexpectedCharacters for {field}, got {other}"),
+            }
+            let message = error.to_string();
+            assert!(message.contains(field), "{message}");
+            assert!(
+                !message.contains("tok en"),
+                "the token is never echoed: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_scoped_clone_reports_the_repository_status_and_git_message() {
+        #[cfg(unix)]
+        let status = {
+            use std::os::unix::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(128 << 8)
+        };
+        #[cfg(unix)]
+        {
+            let message = ScopedCloneError::GitFailed {
+                owner: "acme".into(),
+                repo: "config".into(),
+                branch: "main".into(),
+                status,
+                stderr: "fatal: repository not found".into(),
+            }
+            .to_string();
+            assert!(message.contains("acme/config"), "{message}");
+            assert!(message.contains("branch main"), "{message}");
+            assert!(message.contains("fatal: repository not found"), "{message}");
+        }
+        let message = ScopedCloneError::TimedOut {
+            owner: "acme".into(),
+            repo: "config".into(),
+            branch: "main".into(),
+            seconds: 300,
+        }
+        .to_string();
+        assert!(
+            message.contains("acme/config") && message.contains("300 seconds"),
+            "{message}"
+        );
     }
 
     #[test]
