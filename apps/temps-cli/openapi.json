@@ -80588,12 +80588,17 @@
               "null"
             ]
           },
+          "security_update": {
+            "description": "A newer release explicitly marks security fixes for earlier versions.",
+            "type": "boolean"
+          },
           "update_available": {
             "description": "True when a newer release than the running binary has been published\non this install's channel.",
             "type": "boolean"
           }
         },
         "required": [
+          "security_update",
           "update_available",
           "docs_url"
         ],

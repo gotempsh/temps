@@ -206,11 +206,47 @@ pub struct UpgradeCommand {
 
 #[derive(Clone, Deserialize, Debug)]
 pub struct GitHubRelease {
+    /// Release-note metadata: <!-- temps-security-release --> marks a release
+    /// whose security fixes apply to earlier versions on this channel.
+    #[serde(
+        default,
+        rename = "body",
+        deserialize_with = "deserialize_security_release"
+    )]
+    pub security_release: bool,
+    #[serde(skip)]
+    pub security_fix_versions: Vec<String>,
     pub tag_name: String,
     pub prerelease: bool,
     pub draft: bool,
     pub assets: Vec<GitHubAsset>,
     pub html_url: String,
+}
+
+/// Retain only the metadata flag, not every historical release's full notes.
+fn deserialize_security_release<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let body = Option::<String>::deserialize(deserializer)?;
+    Ok(body.as_deref().is_some_and(|body| {
+        body.lines()
+            .any(|line| line.trim() == "<!-- temps-security-release -->")
+    }))
+}
+
+impl GitHubRelease {
+    pub fn is_security_update_for(&self, current: &str) -> bool {
+        is_newer_version(&self.tag_name, current)
+            && (self.is_security_release()
+                || self.security_fix_versions.iter().any(|fixed| {
+                    is_newer_version(fixed, current) && !is_newer_version(fixed, &self.tag_name)
+                }))
+    }
+
+    pub fn is_security_release(&self) -> bool {
+        self.security_release
+    }
 }
 
 #[derive(Clone, Deserialize, Debug)]
@@ -882,6 +918,7 @@ pub fn configured_update_check_interval() -> std::time::Duration {
 
 /// A newer release the background notifier found for this install's channel.
 pub struct UpdateNotice {
+    pub security_update: bool,
     pub current_version: String,
     pub latest_version: String,
     pub channel: UpgradeChannel,
@@ -1047,6 +1084,7 @@ pub async fn check_for_newer_release(configured_channel: Option<&str>) -> Option
 
     if is_newer_version(&release.tag_name, &current_version) {
         Some(UpdateNotice {
+            security_update: release.is_security_update_for(&current_version),
             current_version,
             latest_version: release.tag_name,
             channel,
@@ -1096,6 +1134,7 @@ pub async fn update_notifier_loop(
                 temps_core::UPGRADE_DOCS_URL
             );
             slot.set(temps_core::AvailableUpdate {
+                security_update: notice.security_update,
                 current_version: notice.current_version,
                 latest_version: notice.latest_version,
                 channel: notice.channel.as_str().to_string(),
@@ -1184,7 +1223,17 @@ async fn fetch_latest_release_in_channel_from(
         page += 1;
     }
 
-    pick_installable_release_for_channel(releases, channel, target).ok_or_else(|| match channel {
+    let security_fix_versions = releases
+        .iter()
+        .filter(|release| channel.includes(release) && release.is_security_release())
+        .map(|release| release.tag_name.clone())
+        .collect::<Vec<_>>();
+    let selected =
+        pick_installable_release_for_channel(releases, channel, target).map(|mut release| {
+            release.security_fix_versions = security_fix_versions;
+            release
+        });
+    selected.ok_or_else(|| match channel {
         UpgradeChannel::Stable => anyhow::anyhow!(
             "No stable releases with a temps-{}.tar.gz asset found. Try `--channel beta` to include prereleases.",
             target
@@ -3044,6 +3093,8 @@ mod tests {
 
     fn release_with_assets(tag: &str, names: &[&str]) -> GitHubRelease {
         GitHubRelease {
+            security_release: false,
+            security_fix_versions: Vec::new(),
             tag_name: tag.to_string(),
             prerelease: true,
             draft: false,
@@ -4276,6 +4327,8 @@ mod tests {
 
     fn release(tag: &str, prerelease: bool, draft: bool) -> GitHubRelease {
         GitHubRelease {
+            security_release: false,
+            security_fix_versions: Vec::new(),
             tag_name: tag.to_string(),
             prerelease,
             draft,
@@ -4741,5 +4794,31 @@ mod tests {
         // Signature segment is arbitrary — parse_license_summary never
         // verifies it (the EE binary does).
         format!("{header}.{payload}.{}", encode_base64url_for_test(b"sig"))
+    }
+}
+
+#[cfg(test)]
+mod security_release_tests {
+    use super::*;
+    #[test]
+    fn release_marker_is_explicit_and_backwards_compatible() {
+        let json = r#"{"tag_name":"v1.2.0","prerelease":false,"draft":false,"assets":[],"html_url":"https://example.invalid/notes"}"#;
+        let mut value: serde_json::Value = serde_json::from_str(json).unwrap();
+        let release: GitHubRelease = serde_json::from_value(value.clone()).unwrap();
+        assert!(!release.is_security_release());
+        value["body"] = serde_json::json!("Security improvements");
+        let release: GitHubRelease = serde_json::from_value(value.clone()).unwrap();
+        assert!(!release.is_security_release());
+        value["body"] = serde_json::json!("Release notes\n<!-- temps-security-release -->\n");
+        let mut release: GitHubRelease = serde_json::from_value(value).unwrap();
+        assert!(release.is_security_release());
+        assert!(release.is_security_update_for("v1.1.0"));
+        assert!(!release.is_security_update_for("v1.2.0"));
+        assert!(!release.is_security_update_for("v1.3.0"));
+        release.security_release = false;
+        release.tag_name = "v1.3.0".into();
+        release.security_fix_versions = vec!["v1.2.0".into()];
+        assert!(release.is_security_update_for("v1.1.0"));
+        assert!(!release.is_security_update_for("v1.2.0"));
     }
 }

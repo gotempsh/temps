@@ -37802,6 +37802,10 @@ export type UpdateStatusResponse = {
      */
     release_url?: string | null;
     /**
+     * A newer release explicitly marks security fixes for earlier versions.
+     */
+    security_update: boolean;
+    /**
      * True when a newer release than the running binary has been published
      * on this install's channel.
      */
