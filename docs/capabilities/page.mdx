@@ -71,7 +71,7 @@ All methods are described in [Installation](/docs/installation).
 | **Builder nodes** (Beta) | A node joined with `--labels temps.sh/role=builder` builds images but never hosts replicas, keeping build CPU and memory away from the proxy and running apps. Pick where each project or environment builds: control plane or worker node. | [Building from source](/docs/multi-node#control-plane-builds) |
 | **Dedicated nodes** (Beta) | A node joined with `--labels temps.sh/role=dedicated` runs only the environments that pin it, for GPU hosts or isolated machines. | [Dedicated nodes](/docs/multi-node#dedicated-nodes) |
 | **Control plane without workloads** (Beta) | `temps serve --profile control-plane` keeps the console, API, proxy and observability, runs no containers and needs no Docker daemon. | [Control-plane profile](/docs/multi-node#control-plane-profile) |
-| **Mixed architectures** (Beta) | amd64 and arm64 nodes in one cluster. A deployment that spans both builds one image per architecture, natively, on a node of each. | [Mixed architectures](/docs/multi-node#mixed-architectures) |
+| **Mixed architectures** (Beta) | amd64 and arm64 nodes in one cluster. With `--profile control-plane`, a deployment that spans both builds each architecture natively on a worker of that architecture. In the default `full` profile Temps builds one native image and skips nodes of other architectures, unless you enable `crossArchitectureBuilds` (emulated on the control plane, needs QEMU binfmt handlers). | [Mixed architectures](/docs/multi-node#mixed-architectures) |
 
 Known limits of multi-node (no bin-packing, which sandbox features run on workers, how draining works) are listed under [Current limitations](/docs/multi-node#limitations).
 
@@ -80,8 +80,8 @@ Known limits of multi-node (no bin-packing, which sandbox features run on worker
 ## What you can deploy {{ anchor: true, id: 'deploy-sources' }}
 
 - **Git repositories** from GitHub, GitLab, Bitbucket Cloud, Gitea (and Forgejo/Codeberg) or any HTTPS-cloneable Git server. See [Quickstart](/docs/quickstart).
-- **Auto-detected builds** for 20+ languages and framework presets, **your own Dockerfile**, **pre-built images** from any OCI registry, and **static files**. See [Supported languages, frameworks and build methods](/docs/supported-platforms).
-- **Local files**: a folder, an HTML file or a ZIP archive, without a Git account. See [Deploy from local files](/docs/deploy-from-local-files).
+- **Auto-detected builds** for 20+ languages and framework presets, **your own Dockerfile**, **pre-built images** from any OCI registry, and **static files** (Experimental). See [Supported languages, frameworks and build methods](/docs/supported-platforms).
+- **Local files**: a folder, an HTML file or a ZIP archive, without a Git account. A ZIP of a plain static site is published as a static bundle (Experimental). See [Deploy from local files](/docs/deploy-from-local-files).
 - **Preview deployments** per pull request. See [Preview deployments](/docs/set-up-preview-deployments).
 - **Rollbacks** to an earlier deployment. See [Rollbacks](/docs/rollbacks).
 
