@@ -1239,6 +1239,11 @@ impl RouteOwnershipSnapshot {
         !label.is_empty() && !base.is_empty() && self.wildcard_bases.contains(base)
     }
 
+    /// Whether an exact route or a reserved name owns `host`, not a wildcard.
+    fn owns_exactly(&self, host: &str) -> bool {
+        self.reserved_hosts.contains(host) || self.exact.contains(host)
+    }
+
     fn include(&mut self, other: &Self) {
         self.exact.extend(other.exact.iter().cloned());
         self.wildcard_bases
@@ -2191,7 +2196,19 @@ impl CachedPeerTable {
     /// `host`. This is a single lock-free snapshot load and does not clone a
     /// `RouteInfo`; it is intended for the per-request wake gate.
     pub fn owns_hostname(&self, host: &str) -> bool {
-        self.route_snapshot.load().ownership.owns(host)
+        let snapshot = self.route_snapshot.load();
+        if !snapshot.ownership.owns(host) {
+            return false;
+        }
+        if !snapshot.owned_hosts.contains(host) || snapshot.ownership.owns_exactly(host) {
+            return true;
+        }
+        // A platform hostname with no exact route (a sleeping or undeployed
+        // environment's) is claimed here only by a wildcard. A TLS wildcard
+        // never serves it (see `get_route_by_sni`), so it must not keep the
+        // environment from waking; an HTTP-side wildcard still does.
+        snapshot.http_wildcards.match_domain(host).is_some()
+            || snapshot.legacy.wildcards.match_domain(host).is_some()
     }
 
     /// Get current number of routes in the table
@@ -5021,6 +5038,73 @@ mod unavailable_route_tests {
             "the sleeping environment must still be handed to the wake path: {sleeping:?}"
         );
 
+        Ok(())
+    }
+
+    /// A sleeping environment whose hostname sits under a TLS wildcard custom
+    /// route still wakes: the wildcard never serves that hostname, so it must
+    /// not count as owning it either, or the request gets neither a route nor
+    /// a wake. Under an HTTP wildcard the hostname is still served by that
+    /// wildcard, as before.
+    #[tokio::test]
+    async fn a_sleeping_environment_under_a_tls_wildcard_still_wakes(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use temps_entities::environments;
+
+        let Some(database) = database_or_skip().await else {
+            return Ok(());
+        };
+        let test_db = TestDBMockOperations::new(database.db.clone()).await?;
+        let (_project, environment, deployment) = test_db
+            .create_test_project_with_domain("sleepy-tls.example.com")
+            .await?;
+        environments::ActiveModel {
+            id: Set(environment.id),
+            sleeping: Set(true),
+            ..Default::default()
+        }
+        .update(test_db.db.as_ref())
+        .await?;
+        insert_container(&test_db, deployment.id, "exited", Some(9705)).await?;
+        insert_environment_domain(&test_db, environment.id, "shop.tlssleep.example.com").await?;
+        insert_environment_domain(&test_db, environment.id, "shop.httpsleep.example.com").await?;
+        for (domain, route_type) in [
+            (
+                "*.tlssleep.example.com",
+                temps_entities::custom_routes::RouteType::Tls,
+            ),
+            (
+                "*.httpsleep.example.com",
+                temps_entities::custom_routes::RouteType::Http,
+            ),
+        ] {
+            custom_routes::ActiveModel {
+                domain: Set(domain.to_string()),
+                host: Set("8.8.4.4".to_string()),
+                port: Set(8443),
+                enabled: Set(true),
+                route_type: Set(route_type),
+                ..Default::default()
+            }
+            .insert(test_db.db.as_ref())
+            .await?;
+        }
+
+        let route_table = CachedPeerTable::new(test_db.db.clone());
+        route_table.load_routes().await?;
+
+        let host = "shop.tlssleep.example.com";
+        assert!(route_table.get_route_by_sni(host).is_none());
+        assert!(
+            !route_table.owns_hostname(host),
+            "the TLS wildcard must not keep the sleeping environment from waking"
+        );
+        // Another name under the same wildcard is still the wildcard's.
+        assert!(route_table.owns_hostname("other.tlssleep.example.com"));
+        // An HTTP wildcard still serves (and so owns) the name, as before.
+        assert!(route_table.owns_hostname("shop.httpsleep.example.com"));
+
+        test_db.cleanup().await?;
         Ok(())
     }
 
