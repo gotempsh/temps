@@ -10,12 +10,13 @@ export function LocalScreenshotNote() {
   return (
     <p id="screenshot-local-note" className="text-sm text-muted-foreground">
       The local service opens each deployment in a headless Chromium on this
-      server. A page can only reach its own address and public internet
-      addresses: requests to private, loopback and link-local addresses are
-      blocked. Chromium&apos;s own sandbox is used when the host allows it;
-      where it cannot start (for example as root in a container) it runs without
-      the sandbox and the server log says so. Use the external API if you would
-      rather not run a browser here.
+      server. A page can only reach its own address, public internet addresses
+      and the private networks you have marked as trusted: requests to other
+      private, loopback and link-local addresses are blocked. Chromium&apos;s
+      own sandbox is used when the host allows it; where it cannot start (for
+      example as root in a container) it runs without the sandbox and the server
+      log says so. Use the external API if you would rather not run a browser
+      here.
     </p>
   )
 }
