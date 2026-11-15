@@ -503,7 +503,10 @@ function CancelledReason({
   /** Opens the redeploy dialog, where a registry image can be edited. */
   onEditImage?: () => void
 }) {
-  const [isExpanded, setIsExpanded] = useState(false)
+  const [isExpanded, setIsExpanded] = useState(
+    deployment.failure?.code === 'container_exited' ||
+      deployment.failure?.code === 'out_of_memory'
+  )
   if (!deployment.cancelled_reason) return null
   const isCancelled = deployment.status === 'cancelled'
   const failureReason = deploymentFailureSummary(deployment.cancelled_reason)
@@ -1577,6 +1580,10 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
           environmentId={deployment.environment_id}
           deploymentId={deployment.id}
           deploymentStatus={deployment.status}
+          showLogsInitially={
+            deployment.failure?.code === 'container_exited' ||
+            deployment.failure?.code === 'out_of_memory'
+          }
         />
 
         <DeployFailureReport project={project} deployment={deployment} />

@@ -590,7 +590,7 @@ pub const fn guidance_for(code: DeploymentFailureCode) -> FailureGuidance {
         ),
         C::ContainerExited => (
             "Container exited during startup",
-            "The app process exited (or kept restarting) right after starting. Check the runtime logs for the crash, verify the start command and required environment variables, and that the image's entrypoint runs a long-lived server. If the logs report exec format error, use an image and application binaries built for the host CPU architecture, or publish a multi-architecture image.",
+            "The app process exited (or kept restarting) right after starting. Read the retained container logs below for the startup crash or a missing environment variable. Verify the start command runs a long-lived server, HOST is 0.0.0.0, and the listen port matches the deployment port. Exit 137 can mean the process was OOM-killed; check the memory limit and runtime logs before raising the limit. If the logs report exec format error, use an image and application binaries built for the host CPU architecture, or publish a multi-architecture image.",
             Some(S::EnvironmentVariables),
         ),
         C::ImageNotFound => (
@@ -1718,6 +1718,26 @@ mod tests {
     fn assert_class(reason: &str, stage: S, code: C) {
         let got = classify_failure_reason(Some(reason));
         assert_eq!((got.stage, got.code), (stage, code), "reason: {reason}");
+    }
+
+    #[test]
+    fn container_exit_guidance_covers_startup_diagnostics() {
+        let info = describe_failure(Some(
+            "Container exited during startup (exit code 1) after 2s",
+        ))
+        .unwrap();
+        assert_eq!(info.code, C::ContainerExited);
+        for hint in [
+            "retained container logs",
+            "environment variable",
+            "0.0.0.0",
+            "listen port",
+            "137",
+            "OOM",
+            "start command",
+        ] {
+            assert!(info.remediation.contains(hint), "missing hint: {hint}");
+        }
     }
 
     #[test]
