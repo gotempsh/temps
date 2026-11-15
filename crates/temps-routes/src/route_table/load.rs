@@ -722,6 +722,11 @@ impl CachedPeerTable {
         if state.routes.contains_key(domain) {
             return Some("a project or environment hostname");
         }
+        // An environment's stored address is its own whether or not a
+        // deployment is serving it right now.
+        if state.generated_hosts.contains(domain) {
+            return Some("an environment's generated hostname");
+        }
         let unavailable = match domain.strip_prefix("*.") {
             Some(base) => state.unavailable.wildcard_bases.contains_key(base),
             None => state.unavailable.exact.contains_key(domain),
@@ -744,8 +749,15 @@ impl CachedPeerTable {
     /// already serves is skipped and logged; the platform's route stays.
     fn apply_custom_routes(&self, state: &mut RouteLoadState) {
         let candidates = std::mem::take(&mut state.custom_route_candidates);
-        for (domain, custom_route) in candidates {
-            if let Some(owner) = Self::platform_owner_of(state, &domain) {
+        // Every owner is decided before any custom route is placed: placing
+        // one adds it to `routes`, and an HTTP and a TLS route for the same
+        // name would otherwise see each other as the platform's.
+        let owners: Vec<Option<&'static str>> = candidates
+            .iter()
+            .map(|(domain, _)| Self::platform_owner_of(state, domain))
+            .collect();
+        for ((domain, custom_route), owner) in candidates.into_iter().zip(owners) {
+            if let Some(owner) = owner {
                 warn!(
                     route_id = custom_route.id,
                     "Skipping custom route '{}' -> {}:{}: the name is already {}. The row is \
@@ -901,7 +913,7 @@ impl CachedPeerTable {
                         .and_then(|all| all.remove(&address.address_id))
                         .unwrap_or_default();
                 }
-                private_meta.insert(custom_domain.domain.clone(), address);
+                private_meta.insert(host.clone(), address);
             }
             // Fetch environment if not cached (skip soft-deleted)
             if !environments_cache.contains_key(&custom_domain.environment_id) {
@@ -925,7 +937,7 @@ impl CachedPeerTable {
                             .map(|c| c.wake_timeout_seconds)
                             .unwrap_or(30);
                         sleeping_environments.push(SleepingEnvironmentEntry {
-                            domain: custom_domain.domain.clone(),
+                            domain: host.clone(),
                             environment_id: environment.id,
                             project_id: environment.project_id,
                             deployment_id,
@@ -1025,16 +1037,16 @@ impl CachedPeerTable {
                                     "Custom domain has no live backend: {} (project={}, env={}, deploy={}, reason={})",
                                     custom_domain.domain, custom_domain.project_id, environment.id, deployment_id, route.reason.as_str()
                                 );
-                                unavailable.record(&custom_domain.domain, &route);
+                                unavailable.record(&host, &route);
                             }
                             continue;
                         };
 
                         // A custom domain may be pinned to any service, so
                         // it is never the environment's primary route.
-                        primary_route_hosts.remove(&custom_domain.domain);
+                        primary_route_hosts.remove(&host);
                         routes.insert(
-                            custom_domain.domain.clone(),
+                            host.clone(),
                             RouteInfo {
                                 backend: backend.clone(),
                                 redirect_to: custom_domain.redirect_to.clone(),
@@ -2740,6 +2752,114 @@ mod tests {
         assert!(
             table.get_route_by_sni(&generated).is_none(),
             "a TLS passthrough route must not capture the environment's SNI"
+        );
+
+        test_db.cleanup().await?;
+        Ok(())
+    }
+
+    /// An environment's stored address is its own even while nothing is
+    /// deployed to it: a custom route for that name is not served.
+    #[tokio::test]
+    async fn a_custom_route_cannot_take_an_undeployed_environments_hostname(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(database) = database_or_skip().await else {
+            return Ok(());
+        };
+        let test_db = TestDBMockOperations::new(database.db.clone()).await?;
+        let db = test_db.db.as_ref();
+        set_preview_domain(db).await?;
+        let (_, environment, _) = seed_environment(&test_db).await?;
+        environments::ActiveModel {
+            id: Set(environment.id),
+            current_deployment_id: Set(None),
+            ..Default::default()
+        }
+        .update(db)
+        .await?;
+        environment_domains::ActiveModel {
+            domain: Set("draft.example.net".to_string()),
+            environment_id: Set(environment.id),
+            ..Default::default()
+        }
+        .insert(db)
+        .await?;
+        insert_custom_route(db, "draft.example.net", "8.8.8.8", 8080, RouteType::Http).await?;
+        insert_custom_route(db, "draft.example.net", "8.8.4.4", 8443, RouteType::Tls).await?;
+
+        let table = CachedPeerTable::new(test_db.db.clone());
+        table.load_routes().await?;
+
+        assert!(
+            table.get_route_by_host("draft.example.net").is_none(),
+            "an undeployed environment's hostname must not be served by a custom route"
+        );
+        assert!(table.get_route_by_sni("draft.example.net").is_none());
+
+        test_db.cleanup().await?;
+        Ok(())
+    }
+
+    /// An HTTP and a TLS custom route for the same name both load: placing
+    /// the first must not make the second look like a platform hostname.
+    #[tokio::test]
+    async fn http_and_tls_custom_routes_for_one_name_both_load(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(database) = database_or_skip().await else {
+            return Ok(());
+        };
+        let test_db = TestDBMockOperations::new(database.db.clone()).await?;
+        let db = test_db.db.as_ref();
+        insert_custom_route(db, "dual.example.net", "8.8.8.8", 8080, RouteType::Http).await?;
+        insert_custom_route(db, "dual.example.net", "8.8.4.4", 8443, RouteType::Tls).await?;
+
+        let table = CachedPeerTable::new(test_db.db.clone());
+        table.load_routes().await?;
+
+        assert_eq!(
+            table
+                .get_route_by_sni("dual.example.net")
+                .map(|route| route.get_backend_addr()),
+            Some("8.8.4.4:8443".to_string())
+        );
+        assert!(table.get_route_by_host("dual.example.net").is_some());
+
+        test_db.cleanup().await?;
+        Ok(())
+    }
+
+    /// A project custom domain stored with capitals is indexed by its
+    /// normalised name, so it is found by lookups and still outranks an
+    /// operator route for the same name.
+    #[tokio::test]
+    async fn a_mixed_case_project_custom_domain_keeps_its_hostname(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(database) = database_or_skip().await else {
+            return Ok(());
+        };
+        let test_db = TestDBMockOperations::new(database.db.clone()).await?;
+        let db = test_db.db.as_ref();
+        set_preview_domain(db).await?;
+        let (project, environment, deployment) = seed_environment(&test_db).await?;
+        project_custom_domains::ActiveModel {
+            domain: Set("Mixed.Example.com".to_string()),
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            status: Set("active".to_string()),
+            ..Default::default()
+        }
+        .insert(db)
+        .await?;
+        insert_custom_route(db, "mixed.example.com", "8.8.8.8", 8080, RouteType::Http).await?;
+
+        let table = CachedPeerTable::new(test_db.db.clone());
+        table.load_routes().await?;
+
+        assert_eq!(
+            table
+                .get_route_by_host("mixed.example.com")
+                .and_then(|route| route.deployment.as_ref().map(|d| d.id)),
+            Some(deployment.id)
         );
 
         test_db.cleanup().await?;
