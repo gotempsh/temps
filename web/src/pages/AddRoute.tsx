@@ -26,7 +26,7 @@ import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { usePlatformCapabilities } from '@/hooks/usePlatformCapabilities'
-import { routeFieldProblem } from '@/lib/proxy-write-problems'
+import { reportRouteSaveError } from '@/lib/proxy-write-problems'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import {
@@ -151,15 +151,11 @@ export function AddRoute() {
       navigate('/settings/load-balancer')
     },
     // A refusal about the domain or the backend is shown on that field, where
-    // the operator can change it; anything else keeps the failure toast.
-    onError: (error) => {
-      const problem = routeFieldProblem(error)
-      if (problem) {
-        form.setError(problem.field, {
-          type: 'server',
-          message: problem.message,
-        })
-      }
+    // the operator can change it; anything else gets the failure toast.
+    onError: (error, _variables, _onMutateResult, context) => {
+      reportRouteSaveError(error, context, (field, message) =>
+        form.setError(field, { type: 'server', message })
+      )
     },
   })
 

@@ -9,6 +9,10 @@
  * server is waiting for, instead of showing one generic failure toast.
  */
 
+import {
+  announceMutationFailure,
+  type MutationErrorContext,
+} from '@/lib/mutation-error-toast'
 import { extractProblemDetails } from '@/utils/errorHandling'
 
 /** A refused custom route, tied to the field the operator has to change. */
@@ -36,6 +40,40 @@ export function routeFieldProblem(error: unknown): RouteFieldProblem | null {
     return { field: 'host', message }
   }
   return null
+}
+
+/**
+ * Report a failed route save: on the field it is about when there is one,
+ * otherwise with the failure toast. A mutation's own `onError` replaces the
+ * app-wide one, so without the fallback a 403, a 5xx or a network error
+ * would leave the form with no feedback at all.
+ */
+export function reportRouteSaveError(
+  error: unknown,
+  context: MutationErrorContext | undefined,
+  setFieldError: (field: RouteFieldProblem['field'], message: string) => void,
+  announce: typeof announceMutationFailure = announceMutationFailure
+): void {
+  const problem = routeFieldProblem(error)
+  if (problem) {
+    setFieldError(problem.field, problem.message)
+    return
+  }
+  const details = extractProblemDetails(error)
+  // A step-up challenge is not a failure: its dialog retries the save, and
+  // the app-wide handler stays silent for it too.
+  const errorCode =
+    (details as { error_code?: string } | null)?.error_code ??
+    (details?.extensions as { error_code?: string } | undefined)?.error_code
+  if (errorCode === 'STEP_UP_REQUIRED') return
+  announce(
+    {
+      title: details?.title,
+      detail:
+        details?.detail ?? (error instanceof Error ? error.message : undefined),
+    },
+    context
+  )
 }
 
 /** What an IP block rule save is waiting for the operator to confirm. */
