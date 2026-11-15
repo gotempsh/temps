@@ -13,10 +13,33 @@
 //! credential, so it is never recorded -- only the DSN row id, its project and
 //! its environment/deployment scope.
 
-use anyhow::Result;
 use serde::Serialize;
 pub use temps_core::AuditContext;
 use temps_core::AuditOperation;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SentryArtifactBundleUploadedAudit {
+    pub context: SentryCliAuditContext,
+    pub project_id: i32,
+    pub checksum: String,
+}
+impl AuditOperation for SentryArtifactBundleUploadedAudit {
+    fn operation_type(&self) -> String {
+        "SENTRY_ARTIFACT_BUNDLE_UPLOADED".into()
+    }
+    fn user_id(&self) -> Option<i32> {
+        None
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
+    }
+}
 
 /// Audit event for uploading a source file (native symbolication).
 #[derive(Debug, Clone, Serialize)]
@@ -67,9 +90,8 @@ impl AuditOperation for ErrorGroupUpdatedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation: {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -90,9 +112,8 @@ impl AuditOperation for SourceFileUploadedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation: {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -113,9 +134,8 @@ impl AuditOperation for SourceFilesDeletedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation: {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -140,10 +160,9 @@ macro_rules! impl_user_audit_operation {
                 &self.context.user_agent
             }
 
-            fn serialize(&self) -> Result<String> {
-                serde_json::to_string(self).map_err(|e| {
-                    anyhow::anyhow!("Failed to serialize {} audit operation: {}", $operation, e)
-                })
+            fn serialize(&self) -> temps_core::AuditResult<String> {
+                serde_json::to_string(self)
+                    .map_err(|source| temps_core::AuditError::serialize($operation, source))
             }
         }
     };
@@ -319,12 +338,11 @@ impl AuditOperation for SentryCliReleaseAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to serialize sentry-cli release audit for project {}: {}",
-                self.project_id,
-                e
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        serde_json::to_string(self).map_err(|source| {
+            temps_core::AuditError::serialize(
+                format!("sentry-cli release for project {}", self.project_id),
+                source,
             )
         })
     }
@@ -359,12 +377,11 @@ impl AuditOperation for SentryCliReleaseFileUploadedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to serialize sentry-cli release file audit for project {}: {}",
-                self.project_id,
-                e
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        serde_json::to_string(self).map_err(|source| {
+            temps_core::AuditError::serialize(
+                format!("sentry-cli release file for project {}", self.project_id),
+                source,
             )
         })
     }

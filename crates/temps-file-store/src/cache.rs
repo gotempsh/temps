@@ -57,6 +57,17 @@ pub const DEFAULT_BYTE_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
 /// [`DEFAULT_BYTE_CACHE_MAX_BYTES`] when unset or not a positive integer.
 /// Never fails startup over a malformed value — an operator-tuning knob
 /// should degrade to a safe default, not block boot.
+///
+/// Stays an environment variable on purpose: it is a per-process RAM budget
+/// for whichever process serves static assets (the console, or a standalone
+/// `temps proxy` on another host with a different amount of memory), and it
+/// only applies when the bootstrap `TEMPS_STATIC_STORAGE_BACKEND=s3` is set.
+/// A single settings row would impose one host's budget on every proxy.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "host-level per-process memory budget, sized to the RAM of the host running this \
+              proxy; read once at startup (see doc comment)"
+)]
 pub fn byte_cache_max_bytes_from_env() -> u64 {
     match std::env::var("TEMPS_STATIC_BYTE_CACHE_MAX_BYTES") {
         Ok(value) => match value.trim().parse::<u64>() {

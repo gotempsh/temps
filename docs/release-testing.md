@@ -444,6 +444,14 @@ test the supported WireGuard setup: an operator-run tunnel plus direct mode.
   - Without preview password set: anonymous access works
   - With preview password set: 401 challenge until correct password entered
   - With session expired: 409 NotConfigured page (not 404)
+  - `docker rm -f temps-preview-gateway temps-preview-gateway-ingress`: the
+    preview URL shows the "Preview Unavailable" page (not "check that your
+    deployment is running"), and the gateway is back within about a minute
+    without a restart
+  - Hold its host port (`python3 -m http.server 8090 --bind 127.0.0.1`) and
+    remove it again: **AI runtime settings → Preview Gateway** shows "Temps could
+    not set the gateway up" with Docker's "address already in use" and the
+    next retry time; freeing the port brings it back at that retry
 
 ### 5.4 Sandbox preview routing
 
@@ -614,7 +622,8 @@ test the supported WireGuard setup: an operator-run tunnel plus direct mode.
 - **Setup**: Production DB after migrations applied. Take a `pg_dump`. Roll back the binary one minor.
 - **Steps**: Old binary boots against the new schema.
 - **Pass**:
-  - Old binary either boots cleanly (forward-compatible schema) OR refuses to start with a clear "schema_version_ahead" error
+  - Old binary boots and logs a WARN that the database schema is newer than the binary, naming the unknown migrations and linking to the rollback docs
+  - The unknown migrations stay recorded in `seaql_migrations` (nothing is rolled back) and no migration error is raised
   - Never silently corrupts data
 
 ---
@@ -698,7 +707,7 @@ test the supported WireGuard setup: an operator-run tunnel plus direct mode.
     permissions, project scope, bounded expiry, and completion/cancellation
     revocation; it must never receive `FullAccess` by default.
 - **Existing regression coverage**: `crates/temps-error-tracking/src/handlers/handler.rs`
-  tests audit emission; `crates/temps-agents/src/services/executor.rs` tests
+  tests audit emission; `crates/temps-ai-agents/src/services/executor.rs` tests
   minimal run permissions, absent issuance, and token cleanup.
 
 ### 10.8 Metrics injection and alert capacity (#1210)
@@ -720,7 +729,7 @@ test the supported WireGuard setup: an operator-run tunnel plus direct mode.
   has SQL binding and real-DB hostile-value tests;
   `crates/temps-providers/src/handlers/metrics_handlers.rs` covers concurrent
   creation, built-in capacity and rollback;
-  `crates/temps-monitoring/src/evaluator.rs` tests the built-in rule catalog.
+  `crates/temps-alarms/src/default_rules.rs` tests the built-in rule catalog.
 
 ### 10.9 Dependency exception review and HA boundary (#1210)
 

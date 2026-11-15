@@ -75,6 +75,9 @@ impl TempsPlugin for MonitoringPlugin {
             //      via `service_context.get_service::<AlarmService>()`.
             //   2. `configure_routes` below can require it.
             context.register_service(alarm_service);
+            context.register_service(Arc::new(crate::cron_monitors::CronMonitorService::new(
+                db.clone(),
+            )));
             let checks = crate::http_checks::HttpChecksService::new(
                 db,
                 context.require_service::<temps_core::EncryptionService>(),
@@ -93,6 +96,9 @@ impl TempsPlugin for MonitoringPlugin {
         context: &'a PluginContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
         Box::pin(async move {
+            context
+                .require_service::<crate::cron_monitors::CronMonitorService>()
+                .start(context.require_service::<AlarmService>());
             context
                 .require_service::<crate::http_checks::HttpChecksService>()
                 .start();
@@ -122,12 +128,22 @@ impl TempsPlugin for MonitoringPlugin {
                     .get_service::<dyn temps_core::ProjectAccessChecker>(),
             },
         ));
-        Some(PluginRoutes::new(alarm_router.merge(checks)))
+        let crons = crate::cron_monitors::handlers::routes().with_state(Arc::new(
+            crate::cron_monitors::handlers::CronMonitorsState {
+                service: context.require_service::<crate::cron_monitors::CronMonitorService>(),
+                alarms: context.require_service::<AlarmService>(),
+                audit: context.require_service::<dyn temps_core::AuditLogger>(),
+                project_access_checker: context
+                    .get_service::<dyn temps_core::ProjectAccessChecker>(),
+            },
+        ));
+        Some(PluginRoutes::new(alarm_router.merge(checks).merge(crons)))
     }
 
     fn openapi_schema(&self) -> Option<OpenApi> {
         let mut api = <AlarmsApiDoc as OpenApiTrait>::openapi();
         api.merge(<crate::http_checks::handlers::HttpChecksApiDoc as OpenApiTrait>::openapi());
+        api.merge(<crate::cron_monitors::handlers::CronMonitorsApiDoc as OpenApiTrait>::openapi());
         Some(api)
     }
 }

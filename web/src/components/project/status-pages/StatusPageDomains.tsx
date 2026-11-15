@@ -198,8 +198,10 @@ function DomainRow({
         )
       }
     },
-    onError: async () => {
-      await refresh()
+    // Not onError: a local onError replaces the app-wide error toast, and a
+    // refusal the server did not store on the row would then go unannounced.
+    onSettled: async (_result, error) => {
+      if (error) await refresh()
     },
   })
   const renew = useMutation({
@@ -217,8 +219,10 @@ function DomainRow({
         )
       }
     },
-    onError: async () => {
-      await refresh()
+    // Not onError: a local onError replaces the app-wide error toast, and a
+    // refusal the server did not store on the row would then go unannounced.
+    onSettled: async (_result, error) => {
+      if (error) await refresh()
     },
   })
   const actions = domainActions(domain, page.is_published)

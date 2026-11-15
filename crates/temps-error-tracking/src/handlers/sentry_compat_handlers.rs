@@ -8,8 +8,18 @@
 //!
 //! ## Authentication
 //!
-//! These endpoints accept `Authorization: Bearer <dsn_public_key>` where the Bearer token
-//! is the DSN public key from a project DSN. This matches how sentry-cli sends auth tokens.
+//! These endpoints accept `Authorization: Bearer <deployment_token>` (a `dt_…`
+//! project deployment token), which is how sentry-cli sends `SENTRY_AUTH_TOKEN`.
+//! Temps injects a deployment token as `SENTRY_AUTH_TOKEN` into builds, so
+//! uploads from a Temps build work without configuration; for uploads from
+//! elsewhere (CI, a laptop), create a deployment token for the project and set
+//! it as `SENTRY_AUTH_TOKEN`.
+//!
+//! The DSN public key is **not** accepted here. It is embedded in client-side
+//! bundles by design (it only authorises event ingest), so anyone who reads a
+//! site's JavaScript has it; accepting it for writes would let them overwrite
+//! the project's source maps and releases. Event ingest (`/api/{id}/envelope/`
+//! and friends) still authenticates with the DSN key and is unaffected.
 //!
 //! ## Endpoint mapping
 //!
@@ -18,7 +28,7 @@
 //! | `POST /api/0/organizations/{org}/releases/` | `create_release` (stub) |
 //! | `POST /api/0/projects/{org}/{project}/releases/{version}/files/` | `upload_release_file` |
 //! | `GET /api/0/projects/{org}/{project}/releases/{version}/files/` | `list_release_files` |
-//! | `GET /api/0/organizations/{org}/chunk-upload/` | `chunk_upload_options` (stub) |
+//! | `GET /api/0/organizations/{org}/chunk-upload/` | `chunk_upload_options` |
 
 use axum::{
     extract::{DefaultBodyLimit, Multipart, Path, State},
@@ -28,11 +38,9 @@ use axum::{
     Extension, Json, Router,
 };
 use chrono::Utc;
-use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use temps_core::RequestMetadata;
-use temps_entities::{deployment_tokens, project_dsns, projects};
 use tracing::{debug, error, warn};
 use utoipa::{OpenApi, ToSchema};
 
@@ -40,7 +48,7 @@ use crate::handlers::audit::{
     SentryCliAuditContext, SentryCliCredential, SentryCliReleaseAction, SentryCliReleaseAudit,
     SentryCliReleaseFileUploadedAudit,
 };
-use crate::services::source_map_service::SourceMapService;
+use crate::services::source_map_service::{BuildCredentialError, SourceMapService};
 
 #[derive(OpenApi)]
 #[openapi(
@@ -51,12 +59,16 @@ use crate::services::source_map_service::SourceMapService;
         upload_release_file,
         list_release_files,
         chunk_upload_options,
+        upload_artifact_chunk,
+        assemble_artifact_bundle,
     ),
     components(schemas(
         SentryCreateReleaseRequest,
         SentryReleaseResponse,
         SentryReleaseFileResponse,
         SentryChunkUploadResponse,
+        ArtifactAssembleRequest,
+        crate::services::source_map_service::ArtifactAssembly,
     )),
     tags(
         (name = "sentry-compat", description = "Sentry CLI-compatible API endpoints for source map uploads")
@@ -67,7 +79,6 @@ pub struct SentryCompatApiDoc;
 #[derive(Clone)]
 pub struct SentryCompatAppState {
     pub source_map_service: Arc<SourceMapService>,
-    pub db: Arc<DatabaseConnection>,
     pub audit_service: Arc<dyn temps_core::AuditLogger>,
 }
 
@@ -124,14 +135,23 @@ pub struct SentryChunkUploadResponse {
     pub accept: Vec<String>,
 }
 
+#[derive(Deserialize, ToSchema)]
+pub struct ArtifactAssembleRequest {
+    pub checksum: String,
+    pub chunks: Vec<String>,
+    pub projects: Vec<String>,
+    pub version: Option<String>,
+    pub dist: Option<String>,
+}
+
 // --- Route configuration ---
 
 /// Maximum body size for the sentry-compat source map upload routes (50 MiB).
 ///
-/// DSN public keys are semi-public (embedded in browser bundles), so we cannot
-/// rely on authentication alone to prevent abuse. The outer body limit rejects
-/// oversized uploads before they reach the multipart reader. A per-field inline
-/// check (`MAX_SOURCE_MAP_BYTES`) provides additional defense-in-depth.
+/// Uploads require a secret deployment token (see [`authenticate_bearer`]),
+/// but the outer body limit still rejects oversized uploads before they reach
+/// the multipart reader. A per-field inline check (`MAX_SOURCE_MAP_BYTES`)
+/// provides additional defense-in-depth.
 pub const SENTRY_UPLOAD_BODY_LIMIT: usize =
     crate::services::source_map_service::MAX_SOURCE_MAP_BYTES;
 
@@ -152,6 +172,14 @@ pub fn configure_sentry_compat_routes() -> Router<Arc<SentryCompatAppState>> {
             post(upload_release_file).get(list_release_files),
         )
         .layer(DefaultBodyLimit::max(SENTRY_UPLOAD_BODY_LIMIT));
+    let artifact_routes = Router::new()
+        .route(
+            "/0/organizations/{org_slug}/chunk-upload/",
+            post(upload_artifact_chunk),
+        )
+        .layer(DefaultBodyLimit::max(
+            crate::services::source_map_service::CHUNK_BYTES + 65536,
+        ));
 
     Router::new()
         .route(
@@ -172,6 +200,11 @@ pub fn configure_sentry_compat_routes() -> Router<Arc<SentryCompatAppState>> {
             "/0/organizations/{org_slug}/chunk-upload/",
             get(chunk_upload_options),
         )
+        .route(
+            "/0/organizations/{org_slug}/artifactbundle/assemble/",
+            post(assemble_artifact_bundle),
+        )
+        .merge(artifact_routes)
         .merge(upload_routes)
 }
 
@@ -182,6 +215,13 @@ pub fn configure_sentry_compat_routes() -> Router<Arc<SentryCompatAppState>> {
 struct BearerPrincipal {
     project_id: i32,
     credential: SentryCliCredential,
+}
+
+/// The first 12 characters of a release version. Counted in characters because
+/// the version is caller-supplied text, and byte 12 can land inside one, which
+/// panics a byte slice.
+fn short_version(version: &str) -> String {
+    version.chars().take(12).collect()
 }
 
 fn sentry_cli_audit_context(
@@ -218,127 +258,103 @@ async fn record_release_audit(
     }
 }
 
-/// Extract project_id from Bearer token authentication.
-///
-/// sentry-cli sends `Authorization: Bearer <auth_token>`.
-/// We accept:
-///   1. DSN public key → resolves to project via `project_dsns` table
-///   2. Deployment token (`dt_*`) → resolves to project via `deployment_tokens` table
-///      (used when Temps injects SENTRY_AUTH_TOKEN during builds)
-async fn authenticate_bearer(
-    headers: &HeaderMap,
-    db: &DatabaseConnection,
-) -> Result<BearerPrincipal, (StatusCode, String)> {
-    let auth_header = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .ok_or((
-            StatusCode::UNAUTHORIZED,
-            "Missing Authorization header".to_string(),
-        ))?;
+/// Prefix every Temps deployment token carries.
+const DEPLOYMENT_TOKEN_PREFIX: &str = "dt_";
 
+/// Pull the credential out of the `Authorization` header and require it to be
+/// a deployment token.
+///
+/// Pure (no DB) so the credential policy is unit-testable. Anything that is
+/// not a `dt_…` token — notably a DSN public key, which ships in client JS and
+/// is therefore not a secret — is rejected here, before any lookup.
+fn extract_deployment_token(auth_header: &str) -> Result<&str, (StatusCode, String)> {
     let token = if let Some(token) = auth_header.strip_prefix("Bearer ") {
         token.trim()
-    } else if let Some(token) = auth_header.strip_prefix("DSN ") {
-        token.trim()
+    } else if auth_header.starts_with("DSN ") {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "DSN public keys cannot authorize release or source map uploads: they are \
+             embedded in client bundles and are not secret. Use a project deployment token \
+             (dt_...) as SENTRY_AUTH_TOKEN, sent as 'Authorization: Bearer <token>'."
+                .to_string(),
+        ));
     } else {
         return Err((
             StatusCode::UNAUTHORIZED,
-            "Invalid Authorization format. Expected 'Bearer <token>'".to_string(),
+            "Invalid Authorization format. Expected 'Bearer <deployment token>'".to_string(),
         ));
     };
 
-    // Deployment tokens start with "dt_" — validate via hash lookup
-    if token.starts_with("dt_") {
-        use sha2::{Digest, Sha256};
-        let token_hash = hex::encode(Sha256::digest(token.as_bytes()));
-        let token_prefix: String = token.chars().take(8).collect();
-
-        let dt = deployment_tokens::Entity::find()
-            .filter(deployment_tokens::Column::TokenHash.eq(&token_hash))
-            .filter(deployment_tokens::Column::TokenPrefix.eq(&token_prefix))
-            .filter(deployment_tokens::Column::IsActive.eq(true))
-            .one(db)
-            .await
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Database error: {}", e),
-                )
-            })?
-            .ok_or_else(|| {
-                (
-                    StatusCode::UNAUTHORIZED,
-                    "Invalid deployment token".to_string(),
-                )
-            })?;
-
-        return Ok(BearerPrincipal {
-            project_id: dt.project_id,
-            credential: SentryCliCredential::DeploymentToken(dt.id),
-        });
-    }
-
-    // Otherwise try DSN public key lookup
-    let dsn = project_dsns::Entity::find()
-        .filter(project_dsns::Column::PublicKey.eq(token))
-        .filter(project_dsns::Column::IsActive.eq(true))
-        .one(db)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Database error: {}", e),
-            )
-        })?
-        .ok_or_else(|| (StatusCode::UNAUTHORIZED, "Invalid auth token".to_string()))?;
-
-    Ok(BearerPrincipal {
-        project_id: dsn.project_id,
-        credential: SentryCliCredential::Dsn(dsn.id),
-    })
-}
-
-/// Resolve a project slug (or numeric ID) to a project_id.
-/// Also validates it matches the authenticated project.
-async fn resolve_project_slug(
-    project_slug: &str,
-    expected_project_id: i32,
-    db: &DatabaseConnection,
-) -> Result<i32, (StatusCode, String)> {
-    // Try numeric ID first
-    if let Ok(id) = project_slug.parse::<i32>() {
-        if id == expected_project_id {
-            return Ok(id);
-        }
-    }
-
-    // Try slug lookup
-    let project = projects::Entity::find()
-        .filter(projects::Column::Slug.eq(project_slug))
-        .one(db)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Database error: {}", e),
-            )
-        })?
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                format!("Project '{}' not found", project_slug),
-            )
-        })?;
-
-    if project.id != expected_project_id {
+    if !token.starts_with(DEPLOYMENT_TOKEN_PREFIX) || token.len() <= DEPLOYMENT_TOKEN_PREFIX.len() {
         return Err((
-            StatusCode::FORBIDDEN,
-            "Token does not have access to this project".to_string(),
+            StatusCode::UNAUTHORIZED,
+            "Release and source map uploads require a project deployment token (dt_...) as \
+             SENTRY_AUTH_TOKEN. DSN public keys are not accepted for uploads because they are \
+             embedded in client bundles and are not secret."
+                .to_string(),
         ));
     }
 
-    Ok(project.id)
+    Ok(token)
+}
+
+fn build_credential_problem(error: BuildCredentialError) -> (StatusCode, String) {
+    let status = match &error {
+        BuildCredentialError::Unauthorized | BuildCredentialError::InactiveProject { .. } => {
+            StatusCode::UNAUTHORIZED
+        }
+        BuildCredentialError::Forbidden { .. } => StatusCode::FORBIDDEN,
+        BuildCredentialError::ProjectNotFound { .. } => StatusCode::NOT_FOUND,
+        BuildCredentialError::Storage { .. } => {
+            tracing::error!(error = %error, "Build credential service failed");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Build credential lookup temporarily unavailable".into(),
+            );
+        }
+    };
+    (status, error.to_string())
+}
+/// Extract project_id from Bearer token authentication.
+///
+/// sentry-cli sends `Authorization: Bearer <auth_token>`. The only accepted
+/// credential is an active, unexpired project deployment token (`dt_*`),
+/// resolved via the `deployment_tokens` table — this is what Temps injects as
+/// `SENTRY_AUTH_TOKEN` during builds.
+///
+/// The DSN public key is deliberately NOT accepted: it is a write-only ingest
+/// credential that is public by design (embedded in browser bundles), so it
+/// must not authorize source map / release writes.
+async fn authenticate_bearer(
+    headers: &HeaderMap,
+    service: &SourceMapService,
+) -> Result<BearerPrincipal, (StatusCode, String)> {
+    let header = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .ok_or((
+            StatusCode::UNAUTHORIZED,
+            "Missing Authorization header".into(),
+        ))?;
+    let token = extract_deployment_token(header)?;
+    let credential = service
+        .authenticate_build_token(token)
+        .await
+        .map_err(build_credential_problem)?;
+    Ok(BearerPrincipal {
+        project_id: credential.project_id,
+        credential: SentryCliCredential::DeploymentToken(credential.token_id),
+    })
+}
+async fn resolve_project_slug(
+    slug: &str,
+    project: i32,
+    service: &SourceMapService,
+) -> Result<i32, (StatusCode, String)> {
+    service
+        .resolve_build_project(slug, project)
+        .await
+        .map_err(build_credential_problem)
 }
 
 // --- Handlers ---
@@ -369,7 +385,7 @@ async fn create_release(
     Json(request): Json<SentryCreateReleaseRequest>,
 ) -> impl IntoResponse {
     // Authenticate
-    let principal = match authenticate_bearer(&headers, state.db.as_ref()).await {
+    let principal = match artifact_principal(&headers, &state).await {
         Ok(principal) => principal,
         Err((status, msg)) => return (status, msg).into_response(),
     };
@@ -385,11 +401,7 @@ async fn create_release(
     .await;
 
     let now = Utc::now().to_rfc3339();
-    let short_version = if request.version.len() > 12 {
-        request.version[..12].to_string()
-    } else {
-        request.version.clone()
-    };
+    let short_version = short_version(&request.version);
 
     let project_refs: Vec<SentryReleaseProjectRef> = request
         .projects
@@ -439,14 +451,18 @@ async fn create_project_release(
     Json(request): Json<SentryCreateReleaseRequest>,
 ) -> impl IntoResponse {
     // Authenticate
-    let principal = match authenticate_bearer(&headers, state.db.as_ref()).await {
+    let principal = match artifact_principal(&headers, &state).await {
         Ok(principal) => principal,
         Err((status, msg)) => return (status, msg).into_response(),
     };
 
     // Validate project slug matches the authenticated token
-    if let Err((status, msg)) =
-        resolve_project_slug(&project_slug, principal.project_id, state.db.as_ref()).await
+    if let Err((status, msg)) = resolve_project_slug(
+        &project_slug,
+        principal.project_id,
+        state.source_map_service.as_ref(),
+    )
+    .await
     {
         return (status, msg).into_response();
     }
@@ -465,11 +481,7 @@ async fn create_project_release(
     .await;
 
     let now = Utc::now().to_rfc3339();
-    let short_version = if request.version.len() > 12 {
-        request.version[..12].to_string()
-    } else {
-        request.version.clone()
-    };
+    let short_version = short_version(&request.version);
 
     let project_refs = vec![SentryReleaseProjectRef {
         name: project_slug.clone(),
@@ -514,14 +526,18 @@ async fn finalize_project_release(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     // Authenticate
-    let principal = match authenticate_bearer(&headers, state.db.as_ref()).await {
+    let principal = match artifact_principal(&headers, &state).await {
         Ok(principal) => principal,
         Err((status, msg)) => return (status, msg).into_response(),
     };
 
     // Validate project slug matches the authenticated token
-    if let Err((status, msg)) =
-        resolve_project_slug(&project_slug, principal.project_id, state.db.as_ref()).await
+    if let Err((status, msg)) = resolve_project_slug(
+        &project_slug,
+        principal.project_id,
+        state.source_map_service.as_ref(),
+    )
+    .await
     {
         return (status, msg).into_response();
     }
@@ -540,11 +556,7 @@ async fn finalize_project_release(
     .await;
 
     let now = Utc::now().to_rfc3339();
-    let short_version = if version.len() > 12 {
-        version[..12].to_string()
-    } else {
-        version.clone()
-    };
+    let short_version = short_version(&version);
 
     let response = SentryReleaseResponse {
         version: version.clone(),
@@ -592,17 +604,22 @@ async fn upload_release_file(
     mut multipart: Multipart,
 ) -> impl IntoResponse {
     // Authenticate
-    let principal = match authenticate_bearer(&headers, state.db.as_ref()).await {
+    let principal = match artifact_principal(&headers, &state).await {
         Ok(principal) => principal,
         Err((status, msg)) => return (status, msg).into_response(),
     };
 
     // Resolve project slug
-    let project_id =
-        match resolve_project_slug(&project_slug, principal.project_id, state.db.as_ref()).await {
-            Ok(id) => id,
-            Err((status, msg)) => return (status, msg).into_response(),
-        };
+    let project_id = match resolve_project_slug(
+        &project_slug,
+        principal.project_id,
+        state.source_map_service.as_ref(),
+    )
+    .await
+    {
+        Ok(id) => id,
+        Err((status, msg)) => return (status, msg).into_response(),
+    };
 
     // Parse multipart form
     let mut file_data: Option<Vec<u8>> = None;
@@ -817,17 +834,22 @@ async fn list_release_files(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     // Authenticate
-    let principal = match authenticate_bearer(&headers, state.db.as_ref()).await {
+    let principal = match artifact_principal(&headers, &state).await {
         Ok(principal) => principal,
         Err((status, msg)) => return (status, msg).into_response(),
     };
 
     // Resolve project slug
-    let project_id =
-        match resolve_project_slug(&project_slug, principal.project_id, state.db.as_ref()).await {
-            Ok(id) => id,
-            Err((status, msg)) => return (status, msg).into_response(),
-        };
+    let project_id = match resolve_project_slug(
+        &project_slug,
+        principal.project_id,
+        state.source_map_service.as_ref(),
+    )
+    .await
+    {
+        Ok(id) => id,
+        Err((status, msg)) => return (status, msg).into_response(),
+    };
 
     match state
         .source_map_service
@@ -860,38 +882,176 @@ async fn list_release_files(
     }
 }
 
-/// Chunk upload options (stub for sentry-cli compatibility).
-///
-/// sentry-cli checks this endpoint to determine if chunk-based upload is supported.
-/// We return a response indicating that chunk upload is NOT supported, which forces
-/// sentry-cli to fall back to the standard file-by-file upload.
-#[utoipa::path(
-    tag = "sentry-compat",
-    get,
-    path = "/0/organizations/{org_slug}/chunk-upload/",
-    params(
-        ("org_slug" = String, Path, description = "Organization slug (ignored)")
-    ),
-    responses(
-        (status = 200, description = "Chunk upload options", body = SentryChunkUploadResponse),
-    ),
-)]
-async fn chunk_upload_options(Path(_org_slug): Path<String>) -> impl IntoResponse {
-    // Return options that effectively disable chunk upload
-    // sentry-cli will fall back to file-by-file upload
-    let response = SentryChunkUploadResponse {
-        url: String::new(),
-        chunk_size: 8 * 1024 * 1024, // 8MB
-        chunks_per_request: 64,
-        max_file_size: 50 * 1024 * 1024, // 50MB
-        max_request_size: 50 * 1024 * 1024,
+/// Negotiates only the artifact capability implemented here. Build credentials
+/// are required; browser DSN public keys cannot upload or read source artifacts.
+#[utoipa::path(get, path="/0/organizations/{org_slug}/chunk-upload/",tag="sentry-compat",
+    params(("org_slug"=String,Path)), responses((status=200,body=SentryChunkUploadResponse),(status=401),(status=403)))]
+async fn chunk_upload_options(
+    State(state): State<Arc<SentryCompatAppState>>,
+    Path(org): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<SentryChunkUploadResponse>, (StatusCode, String)> {
+    artifact_principal(&headers, &state).await?;
+    if org.is_empty()
+        || org.len() > 128
+        || !org
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+    {
+        return Err((StatusCode::BAD_REQUEST, "Invalid organization path".into()));
+    }
+    Ok(Json(SentryChunkUploadResponse {
+        url: format!("/organizations/{org}/chunk-upload/"),
+        chunk_size: 8 * 1024 * 1024,
+        chunks_per_request: 1,
+        max_file_size: 50 * 1024 * 1024,
+        max_request_size: 8 * 1024 * 1024 + 65536,
         concurrency: 1,
-        hash_algorithm: "sha1".to_string(),
-        compression: vec!["gzip".to_string()],
-        accept: vec![], // Empty accept = no chunk upload support
-    };
-
-    Json(response)
+        hash_algorithm: "sha1".into(),
+        compression: vec![],
+        accept: vec!["artifact_bundles".into(), "artifact_bundles_v2".into()],
+    }))
+}
+async fn artifact_principal(
+    headers: &HeaderMap,
+    state: &SentryCompatAppState,
+) -> Result<BearerPrincipal, (StatusCode, String)> {
+    let principal = authenticate_bearer(headers, &state.source_map_service).await?;
+    if !matches!(
+        principal.credential,
+        SentryCliCredential::DeploymentToken(_)
+    ) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Artifact uploads require a project deployment token; public DSNs are ingestion-only"
+                .into(),
+        ));
+    }
+    Ok(principal)
+}
+fn artifact_error(
+    error: crate::services::source_map_service::ArtifactUploadError,
+) -> (StatusCode, String) {
+    use crate::services::source_map_service::ArtifactUploadError;
+    match error {
+        ArtifactUploadError::Invalid { .. } => (StatusCode::BAD_REQUEST, error.to_string()),
+        ArtifactUploadError::Quota(_) => (StatusCode::TOO_MANY_REQUESTS, error.to_string()),
+        _ => {
+            error!(error_class = "artifact_storage", "Artifact upload failed");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Artifact storage temporarily unavailable".into(),
+            )
+        }
+    }
+}
+#[utoipa::path(post,path="/0/organizations/{org_slug}/chunk-upload/",tag="sentry-compat",
+    params(("org_slug"=String,Path)),responses((status=200),(status=400),(status=401),(status=403),(status=429)))]
+async fn upload_artifact_chunk(
+    State(state): State<Arc<SentryCompatAppState>>,
+    Path(_org): Path<String>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> Result<StatusCode, (StatusCode, String)> {
+    use crate::services::source_map_service::{ARTIFACT_WORKERS, CHUNK_BYTES};
+    let principal = artifact_principal(&headers, &state).await?;
+    let _permit = ARTIFACT_WORKERS.try_acquire().map_err(|_| {
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            "Artifact upload busy; retry shortly".into(),
+        )
+    })?;
+    let mut chunks = Vec::new();
+    while let Some(mut field) = multipart.next_field().await.map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            "Invalid chunk multipart request".into(),
+        )
+    })? {
+        if !chunks.is_empty() || field.name() != Some("file") {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Expected one uncompressed file chunk".into(),
+            ));
+        }
+        let checksum = field
+            .file_name()
+            .ok_or((StatusCode::BAD_REQUEST, "Missing chunk checksum".into()))?
+            .to_owned();
+        let mut bytes = Vec::new();
+        while let Some(part) = field
+            .chunk()
+            .await
+            .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid chunk body".into()))?
+        {
+            if bytes.len() + part.len() > CHUNK_BYTES {
+                return Err((StatusCode::PAYLOAD_TOO_LARGE, "Chunk exceeds 8 MiB".into()));
+            }
+            bytes.extend_from_slice(&part);
+        }
+        chunks.push((checksum, bytes));
+    }
+    state
+        .source_map_service
+        .stage_artifact_chunks(principal.project_id, chunks)
+        .await
+        .map_err(artifact_error)?;
+    Ok(StatusCode::OK)
+}
+#[utoipa::path(post,path="/0/organizations/{org_slug}/artifactbundle/assemble/",tag="sentry-compat",
+    params(("org_slug"=String,Path)),request_body=ArtifactAssembleRequest,
+    responses((status=200,body=crate::services::source_map_service::ArtifactAssembly),(status=400),(status=401),(status=403),(status=429)))]
+async fn assemble_artifact_bundle(
+    State(state): State<Arc<SentryCompatAppState>>,
+    Path(_org): Path<String>,
+    headers: HeaderMap,
+    Extension(metadata): Extension<RequestMetadata>,
+    Json(request): Json<ArtifactAssembleRequest>,
+) -> Result<Json<crate::services::source_map_service::ArtifactAssembly>, (StatusCode, String)> {
+    let principal = artifact_principal(&headers, &state).await?;
+    if request.projects.len() != 1 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Exactly one scoped project is required".into(),
+        ));
+    }
+    resolve_project_slug(
+        &request.projects[0],
+        principal.project_id,
+        &state.source_map_service,
+    )
+    .await?;
+    let _permit = crate::services::source_map_service::ARTIFACT_WORKERS
+        .try_acquire()
+        .map_err(|_| {
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                "Artifact assembly busy; retry shortly".into(),
+            )
+        })?;
+    let checksum = request.checksum.clone();
+    let result = state
+        .source_map_service
+        .assemble_artifact(
+            principal.project_id,
+            request.checksum,
+            request.chunks,
+            request.version,
+            request.dist,
+        )
+        .await
+        .map_err(artifact_error)?;
+    if result.state == "ok" {
+        let audit = crate::handlers::audit::SentryArtifactBundleUploadedAudit {
+            context: sentry_cli_audit_context(principal, &metadata),
+            project_id: principal.project_id,
+            checksum,
+        };
+        if let Err(error) = state.audit_service.create_audit_log(&audit).await {
+            error!(project_id=principal.project_id,%error,"Artifact upload audit failed");
+        }
+    }
+    Ok(Json(result))
 }
 
 #[cfg(test)]
@@ -899,37 +1059,68 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_bearer_token_extraction() {
-        // Test that auth header parsing logic is correct
-        let auth = "Bearer abc123def456";
-        let token = auth.strip_prefix("Bearer ").unwrap();
-        assert_eq!(token, "abc123def456");
+    fn test_bearer_deployment_token_is_accepted() {
+        assert_eq!(
+            extract_deployment_token("Bearer dt_abc123def456"),
+            Ok("dt_abc123def456")
+        );
+        assert_eq!(
+            extract_deployment_token("Bearer   dt_abc123  "),
+            Ok("dt_abc123")
+        );
+    }
+
+    /// F-010: a DSN public key (any non-`dt_` bearer) must never authorize an
+    /// upload — it is embedded in client bundles.
+    #[test]
+    fn test_dsn_public_key_is_rejected_as_bearer() {
+        let (status, detail) = extract_deployment_token("Bearer 0123456789abcdef0123456789abcdef")
+            .expect_err("a DSN public key must not authenticate uploads");
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(detail.contains("deployment token"), "{detail}");
     }
 
     #[test]
-    fn test_dsn_token_extraction() {
-        let auth = "DSN abc123def456";
-        let token = auth.strip_prefix("DSN ").unwrap();
-        assert_eq!(token, "abc123def456");
+    fn test_dsn_scheme_is_rejected() {
+        let (status, detail) = extract_deployment_token("DSN abc123def456")
+            .expect_err("the DSN auth scheme must not authenticate uploads");
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(detail.contains("DSN public keys"), "{detail}");
+        // Even if it carries something token-shaped.
+        assert!(extract_deployment_token("DSN dt_abc").is_err());
+    }
+
+    #[test]
+    fn test_malformed_authorization_is_rejected() {
+        for header in [
+            "",
+            "Bearer ",
+            "Bearer dt_",
+            "Basic dt_abc",
+            "dt_abc",
+            "bearer dt_abc",
+        ] {
+            let (status, _) = extract_deployment_token(header)
+                .expect_err("malformed Authorization must be rejected");
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{header:?}");
+        }
     }
 
     #[test]
     fn test_short_version() {
-        let version = "abc123def456789";
-        let short = if version.len() > 12 {
-            version[..12].to_string()
-        } else {
-            version.to_string()
-        };
-        assert_eq!(short, "abc123def456");
+        assert_eq!(short_version("abc123def456789"), "abc123def456");
+        assert_eq!(short_version("1.0.0"), "1.0.0");
+        assert_eq!(short_version(""), "");
+    }
 
-        let short_version = "1.0.0";
-        let short = if short_version.len() > 12 {
-            short_version[..12].to_string()
-        } else {
-            short_version.to_string()
-        };
-        assert_eq!(short, "1.0.0");
+    #[test]
+    fn short_version_does_not_split_a_multibyte_character() {
+        // Byte 12 falls inside the euro sign, which a byte slice panics on.
+        assert_eq!(short_version("aaaaaaaaaaa€bbb"), "aaaaaaaaaaa€");
+        assert_eq!(
+            short_version("日本語のリリース名前です長い"),
+            "日本語のリリース名前です"
+        );
     }
 
     // === Fix #4 — body-limit constant sanity checks ===

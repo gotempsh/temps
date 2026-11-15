@@ -51,6 +51,6 @@ test('REST onboarding links to the routed API Keys page', () => {
     createElement(MemoryRouter, null, createElement(SandboxRestIntro))
   )
   expect(html).toContain('href="/settings/keys"')
-  expect(html).toContain('API Keys')
+  expect(html).toContain('API keys')
   expect(html).not.toContain('href="/keys"')
 })

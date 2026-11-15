@@ -17,5 +17,8 @@ test('offers telemetry setup from the first-use logs state', () => {
   expect(markup).toContain(
     'href="/projects/example-project/traces#traces-setup"'
   )
-  expect(markup).toContain('Connect telemetry')
+  expect(markup).toContain('Set up OpenTelemetry')
+  expect(markup).toContain('href="/projects/example-project/errors/setup"')
+  expect(markup).toContain('Set up Sentry')
+  expect(markup).toContain('OpenTelemetry or a Sentry SDK')
 })

@@ -1,0 +1,86 @@
+# web/AGENTS.md
+
+Rules for the Temps console in `web/`. They add to the repository-wide rules in
+[`../AGENTS.md`](../AGENTS.md), which still apply (tests in the same PR, SPDX
+headers, Conventional Commits with sign-off, no real third-party names).
+
+React + TypeScript, TanStack Query, shadcn/ui, Tailwind CSS, Rsbuild; the package
+manager is `bun`.
+
+- **Design**: root [`DESIGN.md`](../DESIGN.md) is authoritative for existing console
+  UI: the route shell, not the page, picks the width (`form`, about 1024px and
+  centered with its header, for settings and forms; `full` for lists, tables,
+  dashboards and logs), with one `PageContainer` padding owner and no
+  `max-w-*`/`mx-auto` wrappers of a page's own; compact empty states, shared
+  tables and pagination, shadcn controls. `web/packages/ds` (`@temps-sdk/ds`) codifies it into page, record,
+  list and settings templates and a status vocabulary
+  (`web/packages/ds/docs/RULES.md`); migrating `web/src` onto it is tracked in
+  `web/packages/ds/docs/design-system-handoff.md`, not assumed. The
+  [`temps-design-system`](../.agents/skills/temps-design-system/SKILL.md) skill says
+  which applies. The "operator ink" prototype is retired and is no reference.
+- **React**: no IIFEs in JSX (extract a helper or component); no hooks after an
+  early return; no conditional mounting of stateful components (use `open` props).
+- **State**: React Query's `isPending`/`isLoading`/`isError`, never a `useState`
+  loading flag; React Hook Form + Zod for every form; invalidate queries after
+  mutations.
+- **UI**: visual feedback (toast, loading, error) for every user action;
+  `CopyButton` for copy-to-clipboard; cards over dropdowns for selections where
+  practical; `Skeleton` placeholders matching the real layout for content
+  loading, never centred `Loader2` spinners (inline spinners on mutation buttons
+  are fine); `ServiceIcon` for a project's icon anywhere one is listed, never a
+  hand-built initial or a media lookup of a page's own. Pages don't explain
+  themselves: no paragraph under a page or section title; at most one short
+  line the user needs to act (`DESIGN.md` "Pages don't explain themselves").
+- **Interactions**: minimise interactions to reach a goal. A primary action
+  does the whole job in one click, inline, and shows its result in place;
+  never turn a primary button into a "review"/"continue" link or send the user
+  to a configuration page to finish what the button promised. Ask only for
+  input that can't be inferred, inline. Advanced configuration stays reachable
+  as a secondary link. Reference: the reachability banner's Add domain
+  (`web/src/components/reachability/ReachabilityWarningBanner.tsx`).
+- **Mobile**: nothing scrolls sideways at any width. Tables show columns by
+  priority with container queries (`hidden @xl:table-cell`), keep the name,
+  state and actions, and move what a hidden column says that is needed to act
+  under the name (a column hides only if a detail view still shows it); see
+  `DESIGN.md` "No horizontal scrolling". Filter bars `flex flex-col gap-2 sm:flex-row
+  sm:flex-wrap` with `w-full sm:w-[Npx]` selects; grids `grid-cols-1
+  md:grid-cols-2 lg:grid-cols-3` (stat cards `grid-cols-2 md:grid-cols-4`); side
+  panels `flex-col lg:flex-row` with `w-full lg:w-[Npx]`; the shared `PageHeader`
+  (`web/src/components/layout/PageContainer.tsx`); icon-button labels
+  `max-sm:sr-only`, never `hidden sm:inline`; long identifiers break
+  (`[overflow-wrap:anywhere]`) instead of setting a `min-w-[Npx]` that forces
+  scrolling.
+- **Pagination** is the shared `ResponsivePagination`
+  (`web/src/components/ui/responsive-pagination.tsx`), never rebuilt per call
+  site. It measures its own width, so a narrow card gets what a phone gets: below
+  `@xl` one row with labelled Previous and Next around `{page} / {totalPages}`,
+  no page-size, first/last or direct-page controls; at `@xl` and up, "Showing
+  X–Y of Z" and the advanced controls.
+- **API calls** use the generated SDK in `web/src/api/client/`. Never write a
+  `fetch` shim under `web/src/lib/` (one once silently dropped a new field on
+  PATCH). A missing binding means the handler lacks `#[utoipa::path]` or `ApiDoc`
+  registration: fix it there, and ask for help rather than adding a shim.
+- Running Playwright or deployment tests needs credentials from a maintainer;
+  none are stored in the repository.
+
+- Tests are Bun tests beside the source they cover (`name.test.ts`/`.test.tsx` in
+  the same directory); never import `bun:test` into a production module.
+- After a backend API change, regenerate the SDK with `bun run openapi-ts` against
+  a restarted server ([`../AGENTS.md` → OpenAPI clients](../AGENTS.md#openapi-clients)).
+
+
+The left/right heading-and-controls layout is reserved for full settings forms.
+Never use `SettingsSection` or `SettingsGroup` as a wrapper for a read-only
+record, resource list, grant table, or operational panel. Detail and collection
+pages keep one consistent full-width content layout; link to a dedicated
+settings route for extensive editing. Small inline forms use `Field` and
+`FormErrors` in the surrounding layout without introducing settings columns.
+Vault owns Services, Access bundles, and Sessions. Services hold provider
+configuration and credentials; bundles define reusable service selections and
+access limits; sessions authorize identified consumers for a bounded lifetime.
+Session details expose the allowed consumers, effective restrictions, expiry,
+and revocation state. Sandbox detail pages show only that sandbox's access and
+link to the owning Vault sessions; a sandbox picker is not a Vault navigation tab.
+Keep session records distinct from individual grants and internal proxy tokens.
+Creation and editing use dedicated form pages; operational details use the
+full-width record layout.

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { useQuery } from '@tanstack/react-query'
+import type { PreviewDomainStatusResponse } from '@/api/client'
 import {
   listConnectionsOptions,
   listDomainsOptions,
@@ -14,6 +15,7 @@ import {
   listUsersOptions,
   getAiProviderStatusOptions,
   listApiKeysOptions,
+  getPreviewDomainStatusOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { useSettings } from './useSettings'
 import { useIsInstanceAdmin } from './useIsInstanceAdmin'
@@ -31,6 +33,11 @@ export interface ActivationSignals {
   gitConnected: boolean
   /** At least one active wildcard domain in the database */
   wildcardDomainReady: boolean
+  /**
+   * Apps get an address someone else can open (ADR 068 D5): the preview
+   * domain is usable, or a tunnel publishes environment hosts.
+   */
+  appsReachable: boolean
   /** At least one project created */
   hasProject: boolean
   /** At least one deployment has completed (an app went live) */
@@ -130,6 +137,14 @@ export function useActivationSignals(): ActivationSignals {
     enabled: isAdmin,
   })
 
+  // Platform settings, so instance administrators only, like the reads above.
+  const { data: previewStatus, isLoading: previewStatusLoading } = useQuery({
+    ...getPreviewDomainStatusOptions(),
+    retry: false,
+    enabled: isAdmin,
+    staleTime: 60_000,
+  })
+
   const { data: aiProviderStatus, isLoading: aiProviderStatusLoading } =
     useQuery({
       ...getAiProviderStatusOptions(),
@@ -154,6 +169,7 @@ export function useActivationSignals(): ActivationSignals {
       aiProviderConfigured: false,
       gitConnected: false,
       wildcardDomainReady: false,
+      appsReachable: false,
       hasProject: false,
       firstDeploySucceeded: false,
       externalUrlSet: false,
@@ -179,6 +195,7 @@ export function useActivationSignals(): ActivationSignals {
     !servicesLoading &&
     !backupSchedulesLoading &&
     !dnsProvidersLoading &&
+    !previewStatusLoading &&
     !usersLoading &&
     !aiProviderStatusLoading &&
     !apiKeysLoading
@@ -193,6 +210,12 @@ export function useActivationSignals(): ActivationSignals {
   const wildcardDomainReady =
     domainsData?.domains?.some((d) => d.is_wildcard && d.status === 'active') ??
     false
+
+  const appsReachable = appsReachableSignal(
+    isAdmin,
+    previewStatus,
+    wildcardDomainReady
+  )
 
   const hasProject = (projectsData?.projects?.length ?? 0) > 0
   const firstDeploySucceeded = hasCompletedDeployment(projectStatistics)
@@ -220,7 +243,7 @@ export function useActivationSignals(): ActivationSignals {
   const completed = [
     aiHarnessConfigured,
     gitConnected,
-    wildcardDomainReady,
+    appsReachable,
     hasProject,
     firstDeploySucceeded,
     externalUrlSet && !unreadable.externalUrl,
@@ -236,6 +259,7 @@ export function useActivationSignals(): ActivationSignals {
     aiProviderConfigured,
     gitConnected,
     wildcardDomainReady,
+    appsReachable,
     hasProject,
     firstDeploySucceeded,
     externalUrlSet,
@@ -249,4 +273,24 @@ export function useActivationSignals(): ActivationSignals {
     completedCount: completed,
     totalCount: TOTAL - unreadableCount,
   }
+}
+
+/**
+ * "Make your apps reachable" (ADR 068): done when the preview domain is
+ * usable or a tunnel gives every environment an address. Who cannot read
+ * the preview domain status keeps the wildcard-domain signal, the closest
+ * thing they can see.
+ */
+export function appsReachableSignal(
+  isAdmin: boolean,
+  previewStatus:
+    | Pick<PreviewDomainStatusResponse, 'status' | 'tunnel_environment_hosts'>
+    | undefined,
+  wildcardDomainReady: boolean
+): boolean {
+  if (!isAdmin) return wildcardDomainReady
+  return (
+    previewStatus?.status === 'usable' ||
+    !!previewStatus?.tunnel_environment_hosts
+  )
 }

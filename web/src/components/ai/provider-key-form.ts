@@ -3,7 +3,10 @@
 
 import { z } from 'zod'
 import type { CreateProviderKeyRequest } from '@/api/client'
-import { isSelfHostedProvider } from '@/lib/ai-providers'
+import {
+  SELF_HOSTED_PROVIDER_ID,
+  isSelfHostedProvider,
+} from '@/lib/ai-providers'
 import {
   DEFAULT_SELF_HOSTED_CAPABILITIES,
   selfHostedDiscoverySignature,
@@ -19,11 +22,15 @@ const capabilitiesSchema = z.object({
 
 /** Models a self-hosted server listed, and the inputs they were listed for. */
 const discoverySchema = z
-  .object({ signature: z.string(), models: z.array(z.string()) })
+  .object({
+    signature: z.string(),
+    models: z.array(z.string()),
+    names: z.record(z.string(), z.string()).optional(),
+  })
   .nullable()
 
 /**
- * The add-provider-key form. Self-hosted (OpenAI-compatible) providers need
+ * The add-provider-key form. OpenAI-compatible providers need
  * a base URL and a default model picked from the server's own listing, and
  * may omit the API key; every other provider needs an API key.
  */
@@ -184,6 +191,43 @@ export function selectProviderKeyFormProvider(
       ? values.display_name
       : defaultProviderKeyDisplayName(provider.name, existingKeyCount),
   }
+}
+
+/**
+ * Whether a vendor provider (OpenAI, Anthropic, ...) was given a custom base
+ * URL. That field only fits a proxy serving the vendor's own models: the key
+ * is verified, and its catalog seeded, with that vendor's model names, so
+ * another vendor's OpenAI-protocol API (DeepSeek, Groq, ...) fails there and
+ * belongs on an OpenAI-compatible provider instead.
+ */
+export function vendorHasCustomBaseUrl(
+  values: Pick<ProviderKeyFormValues, 'provider' | 'base_url'>
+): boolean {
+  return (
+    values.provider.trim() !== '' &&
+    !isSelfHostedProvider(values.provider) &&
+    values.base_url.trim() !== ''
+  )
+}
+
+/**
+ * Move what was typed for a vendor provider over to an OpenAI-compatible
+ * provider: the API key and base URL carry over (they are exactly what an
+ * OpenAI-compatible server needs), so does a display name the user typed.
+ */
+export function switchToOpenAiCompatible(
+  values: ProviderKeyFormValues,
+  compatibleName: string,
+  existingKeyCount: number,
+  knownProviderNames: readonly string[]
+): ProviderKeyFormValues {
+  const switched = selectProviderKeyFormProvider(
+    values,
+    { id: SELF_HOSTED_PROVIDER_ID, name: compatibleName },
+    existingKeyCount,
+    knownProviderNames
+  )
+  return { ...switched, api_key: values.api_key, base_url: values.base_url }
 }
 
 /** Submitting needs a chosen provider; the schema reports the rest. */

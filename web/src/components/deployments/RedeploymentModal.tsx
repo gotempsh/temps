@@ -3,6 +3,7 @@
 
 import {
   checkCommitExistsOptions,
+  getDeploymentOptions,
   getEnvironmentsOptions,
   getProjectBySlugOptions,
   getRepositoryByNameOptions,
@@ -39,16 +40,19 @@ import { toast } from 'sonner'
 import { branchCommitSha } from '@/lib/project-header-actions'
 import {
   defaultDeployEnvironment,
+  initialDeployBranch,
   projectDeploysImage,
 } from '@/lib/project-deploy-action'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { ScrollRegion } from '@/components/ui/scroll-region'
 import {
   AlertTriangle,
   CheckCircle2,
-  GitCommitHorizontal,
   GitBranch,
+  GitCommitHorizontal,
   Loader2,
   RefreshCw,
+  Tag,
   Tag as TagIcon,
 } from 'lucide-react'
 import { BranchSelector, type ResolvedBranch } from './BranchSelector'
@@ -106,9 +110,14 @@ function CommitDetailsCard({
         </div>
       </div>
       <div className="space-y-2.5 px-3 py-3">
-        <p className="max-h-24 overflow-y-auto whitespace-pre-wrap text-sm leading-relaxed">
-          {commit.message}
-        </p>
+        <ScrollRegion
+          className="max-h-24"
+          regionLabel="Commit message, scrollable"
+        >
+          <p className="whitespace-pre-wrap text-sm leading-relaxed">
+            {commit.message}
+          </p>
+        </ScrollRegion>
         <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
           <span className="font-medium text-foreground">{commit.author}</span>
           <span aria-hidden="true">·</span>
@@ -151,6 +160,11 @@ interface RedeploymentModalProps {
    * parent re-pulls this image instead of invoking the Git pipeline.
    */
   imageRef?: string | null
+  /**
+   * Start a new image deploy on the image the chosen environment runs now,
+   * rather than `imageRef`, which is only the fallback for one running nothing.
+   */
+  imageFromEnvironment?: boolean
   /** Stored bundle used to replay a static-files deployment. */
   staticBundleId?: number | null
 }
@@ -169,6 +183,7 @@ export function RedeploymentModal({
   mode = 'new',
   deploymentSourceType,
   imageRef,
+  imageFromEnvironment = false,
   staticBundleId,
 }: RedeploymentModalProps) {
   // A historical deployment can use a different source than the project's
@@ -202,18 +217,34 @@ export function RedeploymentModal({
     enabled: !!project.id && isOpen,
   })
 
-  // Compute initial branch value from query data or defaults using useMemo
-  const initialBranch = useMemo(() => {
-    if (defaultBranch) return defaultBranch
-    if (projectQuery.data?.main_branch) return projectQuery.data.main_branch
-    return ''
-  }, [defaultBranch, projectQuery.data?.main_branch])
-
   // Compute initial environment value from query data or defaults using useMemo
   const initialEnvironment = useMemo(() => {
     if (defaultEnvironment) return defaultEnvironment
     return defaultDeployEnvironment(environmentsQuery.data)?.id ?? null
   }, [defaultEnvironment, environmentsQuery.data])
+
+  // The branch the dialog starts on follows the environment it starts on,
+  // as it does when the user picks an environment, so the first thing it
+  // offers is what that environment deploys.
+  const initialBranch = useMemo(
+    () =>
+      initialDeployBranch(
+        isImageDeploy
+          ? undefined
+          : environmentsQuery.data?.find(
+              (environment) => environment.id === initialEnvironment
+            ),
+        defaultBranch,
+        projectQuery.data?.main_branch
+      ),
+    [
+      defaultBranch,
+      environmentsQuery.data,
+      initialEnvironment,
+      isImageDeploy,
+      projectQuery.data?.main_branch,
+    ]
+  )
 
   // State variables that use the computed initial values
   const [selectedBranch, setSelectedBranch] = useState('')
@@ -231,10 +262,9 @@ export function RedeploymentModal({
   >([])
   const [commitToCheck, setCommitToCheck] = useState('')
   const [tagToCheck, setTagToCheck] = useState('')
-  // Editable image reference for docker_image projects — defaults to the
-  // previous deployment's image but the user can change it (e.g. deploy a
-  // new tag) instead of always re-pulling the same one.
-  const [imageRefInput, setImageRefInput] = useState(imageRef || '')
+  // What the user typed over the default image for docker_image projects (e.g.
+  // a new tag), instead of always re-pulling the same one. Null until they do.
+  const [editedImageRef, setEditedImageRef] = useState<string | null>(null)
   const [submissionError, setSubmissionError] = useState<{
     message: string
     setupPath?: string
@@ -262,6 +292,36 @@ export function RedeploymentModal({
   // Derive effective values (either user-selected or initial/default)
   const effectiveBranch = selectedBranch !== '' ? selectedBranch : initialBranch
   const effectiveEnvironment = selectedEnvironment ?? initialEnvironment
+  const runningDeploymentId =
+    environmentsQuery.data?.find((env) => env.id === effectiveEnvironment)
+      ?.current_deployment_id ?? null
+  const readsRunningImage =
+    isOpen &&
+    imageFromEnvironment &&
+    isImageDeploy &&
+    mode !== 'redeploy' &&
+    runningDeploymentId != null
+  const environmentImage = useQuery({
+    ...getDeploymentOptions({
+      path: {
+        project_id: project.id,
+        deployment_id: runningDeploymentId ?? 0,
+      },
+    }),
+    enabled: readsRunningImage,
+    select: (deployment) => deployment.metadata?.externalImageRef ?? undefined,
+    retry: false,
+  })
+  // A disabled query still returns what is cached for its key, so redeploying
+  // an older image must not pick up the running deployment's from the cache.
+  const runningImage = readsRunningImage ? environmentImage.data : undefined
+  // The running deployment may not have come from an image at all.
+  const runningImageMissing =
+    readsRunningImage && environmentImage.isSuccess && !runningImage
+  const imageRefInput = editedImageRef ?? runningImage ?? imageRef ?? ''
+  const runningImageFallback = imageRef
+    ? "so this is the service's last deployed image. Check it before deploying."
+    : 'so enter the image to deploy.'
   const normalizedCommit = selectedCommit.trim()
   const normalizedTag = selectedTag.trim()
   const commitFormatIsValid = isValidCommitSha(normalizedCommit)
@@ -398,9 +458,9 @@ export function RedeploymentModal({
       setSelectedCommit(defaultCommit || '')
       setSelectedTag(defaultTag || '')
       setDeploymentType(defaultType || 'branch')
-      setImageRefInput(imageRef || '')
+      setEditedImageRef(null)
     }
-  }, [isOpen, defaultCommit, defaultTag, defaultType, imageRef])
+  }, [isOpen, defaultCommit, defaultTag, defaultType])
 
   const handleEnvironmentChange = (value: string) => {
     const environmentId = value ? parseInt(value) : null
@@ -597,7 +657,7 @@ export function RedeploymentModal({
 
   return (
     <Dialog open={isOpen} onOpenChange={(open) => !open && closeDialog()}>
-      <DialogContent className="sm:max-w-[640px]">
+      <DialogContent className="max-h-[90dvh] overflow-y-auto sm:max-w-[640px]">
         <DialogHeader>
           <DialogTitle>
             {mode === 'redeploy' ? 'Redeploy' : 'Deploy Service'}
@@ -636,9 +696,21 @@ export function RedeploymentModal({
                 placeholder="ghcr.io/org/app:v1.2.3"
                 value={imageRefInput}
                 disabled={isLoading}
-                onChange={(e) => setImageRefInput(e.target.value)}
+                onChange={(e) => setEditedImageRef(e.target.value)}
                 className="font-mono text-sm"
               />
+              {readsRunningImage && environmentImage.isError && (
+                <p role="status" className="text-sm text-muted-foreground">
+                  Could not load the image this environment runs now,{' '}
+                  {runningImageFallback}
+                </p>
+              )}
+              {runningImageMissing && (
+                <p role="status" className="text-sm text-muted-foreground">
+                  What this environment runs now records no image,{' '}
+                  {runningImageFallback}
+                </p>
+              )}
             </div>
             {mode === 'redeploy' ? (
               <div className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-2 rounded-md border bg-muted/50 p-4">
@@ -685,6 +757,7 @@ export function RedeploymentModal({
                 onClick={handleConfirm}
                 disabled={
                   isLoading ||
+                  environmentImage.isFetching ||
                   !imageRefInput.trim() ||
                   (mode === 'redeploy'
                     ? !defaultEnvironment
@@ -833,15 +906,21 @@ export function RedeploymentModal({
                   }
                 >
                   <TabsList className="grid w-full grid-cols-3">
-                    <TabsTrigger value="branch">Branch</TabsTrigger>
-                    <TabsTrigger value="commit">Commit</TabsTrigger>
-                    <TabsTrigger value="tag">Tag</TabsTrigger>
+                    <TabsTrigger value="branch" icon={GitBranch}>
+                      Branch
+                    </TabsTrigger>
+                    <TabsTrigger value="commit" icon={GitCommitHorizontal}>
+                      Commit
+                    </TabsTrigger>
+                    <TabsTrigger value="tag" icon={Tag}>
+                      Tag
+                    </TabsTrigger>
                   </TabsList>
                   <TabsContent value="branch" className="space-y-2">
                     {branchNotFound && (
-                      <Alert className="border-amber-200 bg-amber-50">
+                      <Alert className="border-amber-200 dark:border-amber-900 bg-amber-50 dark:bg-amber-950/30">
                         <AlertTriangle className="h-4 w-4 text-amber-700 dark:text-amber-600" />
-                        <AlertDescription className="text-amber-800">
+                        <AlertDescription className="text-amber-800 dark:text-amber-400">
                           The branch “{effectiveBranch}” for this environment
                           was not found in the repository. You can continue with
                           the current branch name, or switch to deploy by commit

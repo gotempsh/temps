@@ -33,6 +33,14 @@ pub struct Model {
     /// SHA256 checksum of the source map data
     pub checksum: Option<String>,
 
+    /// Immutable build identity supplied by modern JavaScript SDKs.
+    pub debug_id: Option<String>,
+
+    /// SHA1 of the CLI artifact bundle, for idempotent assembly receipts.
+    pub artifact_bundle: Option<String>,
+
+    pub artifact_bundle_count: Option<i32>,
+
     pub created_at: DBDateTime,
 }
 

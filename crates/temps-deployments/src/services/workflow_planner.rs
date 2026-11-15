@@ -8,9 +8,10 @@
 use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
 use serde_json;
 use std::sync::Arc;
-use temps_core::{canonical_managed_service_type, EncryptionService, SecretsManagerResolver};
+use temps_core::{EncryptionService, SecretsManagerResolver};
+use temps_deployment_logs::LogService;
 use temps_entities::{deployment_jobs, deployments, environments, projects, types::JobStatus};
-use temps_logs::LogService;
+use temps_presets::templates::canonical_managed_service_type;
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
@@ -1223,7 +1224,7 @@ impl WorkflowPlanner {
     /// substituting something that cannot be right.
     async fn resolve_control_plane_private_address(
         &self,
-        settings: &temps_core::AppSettings,
+        settings: &temps_config::AppSettings,
     ) -> Option<String> {
         if let Some(addr) = settings.multi_node.private_address.as_deref() {
             return Some(addr.to_string());
@@ -1262,7 +1263,7 @@ impl WorkflowPlanner {
         caller: temps_core::docker_socket_grant::DeployCaller,
     ) -> anyhow::Result<Vec<deployment_jobs::Model>> {
         // Get deployment, project, and environment info
-        let deployment = deployments::Entity::find_by_id(deployment_id)
+        let mut deployment = deployments::Entity::find_by_id(deployment_id)
             .one(self.db.as_ref())
             .await?
             .ok_or_else(|| anyhow::anyhow!("Deployment not found"))?;
@@ -1319,6 +1320,25 @@ impl WorkflowPlanner {
             "Planning workflow for deployment {} (project: {}, env: {})",
             deployment_id, project.name, environment.name
         );
+
+        // Freeze startup settings before creating jobs. Retries, rollback and
+        // promotion must not pick up a later edit to the project's command.
+        let mut metadata = deployment.metadata.clone().unwrap_or_default();
+        if metadata.runtime_overrides.is_none() {
+            metadata.runtime_overrides = Some(match project.preset_config.as_ref() {
+                Some(temps_entities::preset::PresetConfig::Dockerfile(config)) => {
+                    config.runtime.clone()
+                }
+                _ => Default::default(),
+            });
+            deployment = deployments::ActiveModel {
+                id: Set(deployment.id),
+                metadata: Set(Some(metadata)),
+                ..Default::default()
+            }
+            .update(self.db.as_ref())
+            .await?;
+        }
 
         // Determine jobs based on project configuration and deployment
         let job_definitions = self
@@ -1498,6 +1518,53 @@ impl WorkflowPlanner {
         // Keep as Manual - will cause a meaningful error in plan_jobs_for_project
         debug!("Could not determine deployment method for Manual project");
         SourceType::Manual
+    }
+
+    /// The runtime variables `deployment`'s containers get, recomputed the
+    /// way planning computes them: the gathered variables without the
+    /// reserved BuildKit namespace, plus the deployment-owned ones, and on a
+    /// worker the cross-node rewrite of linked-service addresses.
+    ///
+    /// A worker's `/agent/*` API never returns a container's variables, so
+    /// a job cron run beside a container on a worker takes them from here
+    /// rather than from `docker inspect`. Carries secret values: never log
+    /// the result.
+    pub(crate) async fn runtime_environment_variables(
+        &self,
+        project: &projects::Model,
+        environment: &environments::Model,
+        deployment: &deployments::Model,
+        on_worker: bool,
+    ) -> anyhow::Result<std::collections::HashMap<String, String>> {
+        let (mut env_vars, _) = self
+            .gather_environment_variables(project, environment, deployment)
+            .await?;
+        env_vars.remove(BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG);
+        let default_port = if project.preset == temps_entities::preset::Preset::DockerCompose {
+            None
+        } else {
+            Some(
+                self.resolve_exposed_port(environment, project, None)
+                    .await
+                    .into(),
+            )
+        };
+        super::env_resolver::apply_deployment_owned_variables(
+            &mut env_vars,
+            project.preset,
+            &deployment.slug,
+            default_port,
+        );
+        if on_worker {
+            if let Some(remote) = self
+                .build_remote_environment_variables(project, &env_vars)
+                .await
+                .variables
+            {
+                return Ok(remote);
+            }
+        }
+        Ok(env_vars)
     }
 
     /// Plan jobs based on project configuration and source type
@@ -2211,6 +2278,17 @@ impl WorkflowPlanner {
         // They run AFTER deployment is marked complete (via mark_deployment_complete job)
         // NOT required for deployment completion - if they fail, deployment still succeeds
         if has_git_info || is_uploaded_source {
+            jobs.push(JobDefinition {
+                job_id: "deployment_workflows".into(),
+                job_type: "DeploymentWorkflowsJob".into(),
+                name: "Start Deployment Workflows".into(),
+                description: Some(
+                    "Start deploymentWorkflows from .temps.yaml; retries reuse run IDs".into(),
+                ),
+                dependencies: vec!["mark_deployment_complete".into()],
+                job_config: Some(serde_json::json!({"download_job_id":source_job_id})),
+                required_for_completion: false,
+            });
             jobs.push(JobDefinition {
                 job_id: "configure_crons".to_string(),
                 job_type: "ConfigureCronsJob".to_string(),
@@ -2965,8 +3043,8 @@ mod tests {
 
     use temps_config::{ConfigService, ServerConfig};
     use temps_core::EncryptionService;
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::{preset::Preset, upstream_config::UpstreamList};
+    use temps_test_utils::TestDatabase;
 
     // ── Cross-node linking of external services ────────────────────────
     //
@@ -3100,7 +3178,7 @@ mod tests {
         assert!(described.contains("id 7"), "{described}");
         assert!(described.contains("Cluster DNS is disabled"), "{described}");
         assert!(described.contains("Enable cluster DNS"), "{described}");
-        assert_eq!(blocker.setup_path, "/settings/nodes");
+        assert_eq!(blocker.setup_path, "/settings/nodes#cluster-dns");
     }
 
     #[test]
@@ -3290,6 +3368,79 @@ mod tests {
         let deployment = deployment.insert(db).await?;
 
         Ok((project, environment, deployment))
+    }
+
+    #[tokio::test]
+    async fn dockerfile_planning_persists_startup_settings_across_replanning(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use temps_entities::preset::{ContainerRuntimeOverrides, DockerfileConfig, PresetConfig};
+
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error)
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+            {
+                eprintln!("Docker unavailable; skipping startup snapshot test: {error}");
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let db = test_db.connection_arc();
+        let logs = tempfile::tempdir()?;
+        let planner = WorkflowPlanner::new(
+            db.clone(),
+            Arc::new(LogService::new(logs.path().to_path_buf())),
+            create_test_external_service_manager(db.clone()),
+            create_test_config_service(db.clone()),
+            create_test_dsn_service(db.clone()),
+            create_test_encryption_service(),
+        );
+        let (project, _, deployment) = create_test_project(db.as_ref(), Preset::Dockerfile).await?;
+        let project_id = project.id;
+        let startup = ContainerRuntimeOverrides {
+            command: Some(vec!["python".into(), "-m".into(), "worker".into()]),
+            entrypoint: Some(vec![]),
+        };
+        let mut update: projects::ActiveModel = project.into();
+        update.preset_config = Set(Some(PresetConfig::Dockerfile(DockerfileConfig {
+            runtime: startup.clone(),
+            ..Default::default()
+        })));
+        update.update(db.as_ref()).await?;
+        let caller = temps_core::docker_socket_grant::DeployCaller::Platform;
+        planner
+            .create_deployment_jobs(deployment.id, caller)
+            .await?;
+        let stored = deployments::Entity::find_by_id(deployment.id)
+            .one(db.as_ref())
+            .await?
+            .unwrap();
+        assert_eq!(
+            stored.metadata.as_ref().unwrap().runtime_overrides,
+            Some(startup.clone())
+        );
+
+        // A later settings edit must not change the process a retry deploys.
+        projects::ActiveModel {
+            id: Set(project_id),
+            preset_config: Set(Some(PresetConfig::Dockerfile(DockerfileConfig::default()))),
+            ..Default::default()
+        }
+        .update(db.as_ref())
+        .await?;
+        deployment_jobs::Entity::delete_many()
+            .filter(deployment_jobs::Column::DeploymentId.eq(deployment.id))
+            .exec(db.as_ref())
+            .await?;
+        planner
+            .create_deployment_jobs(deployment.id, caller)
+            .await?;
+        let retried = deployments::Entity::find_by_id(deployment.id)
+            .one(db.as_ref())
+            .await?
+            .unwrap();
+        assert_eq!(retried.metadata.unwrap().container_runtime(), startup);
+        Ok(())
     }
 
     #[tokio::test]
@@ -3926,6 +4077,13 @@ mod tests {
             assert_eq!(alerts.job_type, "ConfigureMetricAlertsJob");
             assert_reads_temps_yaml_from(alerts, "prepare_source_bundle");
 
+            let workflows = planned_job(&jobs, "deployment_workflows")
+                .expect("deployment workflows must be planned");
+            assert_reads_temps_yaml_from(workflows, "prepare_source_bundle");
+            assert_eq!(
+                workflows.job_config.as_ref().unwrap()["_required_for_completion"],
+                false
+            );
             // Agent definitions are synced from a git repository only.
             assert!(planned_job(&jobs, "configure_agents").is_none());
         }
@@ -3962,7 +4120,11 @@ mod tests {
             .await?;
 
         assert!(planned_job(&jobs, "prepare_source_bundle").is_none());
-        for id in ["configure_crons", "configure_metric_alerts"] {
+        for id in [
+            "configure_crons",
+            "configure_metric_alerts",
+            "deployment_workflows",
+        ] {
             let job = planned_job(&jobs, id).unwrap_or_else(|| panic!("{id} must be planned"));
             assert_reads_temps_yaml_from(job, "download_repo");
         }

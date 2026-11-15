@@ -20,6 +20,14 @@
 //! Docker-dependent, and per CLAUDE.md must never be `#[ignore]`d: it detects an
 //! unavailable Docker at runtime and returns.
 
+// Test-only helpers outside `#[test]` fns (fixtures, mock servers, setup):
+// a panic there is the test failure, which is what we want.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test helpers: panicking is how a test fails"
+)]
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -85,11 +93,13 @@ async fn setup() -> Option<Harness> {
     };
 
     let url = format!("http://127.0.0.1:{host_port}");
-    let probe = ::clickhouse::Client::default()
-        .with_url(&url)
-        .with_database("spans_query_test")
-        .with_user("default")
-        .with_password("test");
+    let probe = temps_clickhouse::build_client(
+        &url,
+        "spans_query_test",
+        "default",
+        "test",
+        temps_clickhouse::ClickHouseCompression::Lz4,
+    );
 
     let mut last_err = String::new();
     for _ in 0..30 {
@@ -143,6 +153,7 @@ fn span(
 ) -> SpanRecord {
     let start = Utc::now() - Duration::minutes(minutes_ago);
     SpanRecord {
+        ingest_identity: None,
         project_id,
         deployment_id,
         resource: ResourceInfo {
@@ -899,7 +910,7 @@ async fn span_stats_agrees_between_clickhouse_and_timescaledb() {
     let Some((ch_storage, _probe, _c)) = setup().await else {
         return;
     };
-    let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+    let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
         Ok(db) => db,
         Err(e) => {
             eprintln!("Skipping cross-backend span-stats test: no TestDatabase ({e})");

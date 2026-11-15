@@ -18,6 +18,7 @@ import {
   listTeamsQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
 import type { TeamResponse } from '@/api/client/types.gen'
+import { PageHeader } from '@/components/layout/PageContainer'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
@@ -281,22 +282,18 @@ export function Teams() {
 
   return (
     <div className="w-full min-w-0 space-y-6">
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <div>
-          <h1 className="text-2xl font-semibold tracking-tight">Teams</h1>
-          <p className="mt-1 text-sm text-muted-foreground">
-            Group users, then grant each team access to the services it should
-            reach. Services with no grants stay open to everyone.
-          </p>
-        </div>
-        {canManageTeams && (
-          <CreateActionButton
-            onClick={() => setCreateOpen(true)}
-            label="Create team"
-            className="self-start"
-          />
-        )}
-      </div>
+      <PageHeader
+        title="Teams"
+        description="Group users, then grant each team access to the services it should reach. Services with no grants stay open to everyone."
+        actions={
+          canManageTeams ? (
+            <CreateActionButton
+              onClick={() => setCreateOpen(true)}
+              label="Create team"
+            />
+          ) : undefined
+        }
+      />
 
       {!canManageTeams && (
         <AdminOnlyNote action="create or delete teams" role={currentRole} />
@@ -318,6 +315,7 @@ export function Teams() {
             />
           ) : teams.length === 0 ? (
             <EmptyState
+              size="compact"
               icon={Users}
               title="No teams yet"
               description="Create a team, add members, then grant it access to a service from that service's Access tab."
@@ -364,19 +362,21 @@ export function Teams() {
                         <MemberCount teamId={team.id} />
                       </TableCell>
                       <TableCell className="text-right">
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          aria-label={`Delete team ${team.name}`}
-                          onClick={(e) => {
-                            // Don't trigger the row's navigate.
-                            e.stopPropagation()
-                            setTeamToDelete(team)
-                          }}
-                        >
-                          <Trash2 className="mr-2 h-4 w-4 text-destructive" />
-                          Delete
-                        </Button>
+                        {canManageTeams && (
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            aria-label={`Delete team ${team.name}`}
+                            onClick={(e) => {
+                              // Don't trigger the row's navigate.
+                              e.stopPropagation()
+                              setTeamToDelete(team)
+                            }}
+                          >
+                            <Trash2 className="mr-2 h-4 w-4 text-destructive" />
+                            Delete
+                          </Button>
+                        )}
                       </TableCell>
                     </TableRow>
                   ))}

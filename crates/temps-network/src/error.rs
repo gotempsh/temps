@@ -14,7 +14,7 @@ use uuid::Uuid;
 /// Errors returned by the `temps-network` crate.
 ///
 /// Variants are split by *what* failed and *where*. Callers (e.g. a future
-/// `temps-agent` integration) match on these to decide whether to retry, log
+/// `temps-node-agent` integration) match on these to decide whether to retry, log
 /// and continue, or propagate to the control plane.
 #[derive(Debug, Error)]
 pub enum NetworkError {
@@ -45,6 +45,18 @@ pub enum NetworkError {
     /// VXLAN device creation or FDB management failed.
     #[error("vxlan transport error on '{device}': {reason}")]
     Vxlan { device: String, reason: String },
+
+    /// Another VXLAN device on this host holds the network ID and port this
+    /// overlay needs (ADR 062). `diagnosis` names the holder, what is
+    /// attached to it, the commands that remove it and the alternative.
+    #[error("{diagnosis}")]
+    VxlanIdInUse {
+        device: String,
+        holder: String,
+        vni: u32,
+        port: u16,
+        diagnosis: String,
+    },
 
     // ----- routes -----
     /// Adding or removing a route failed.
@@ -102,8 +114,12 @@ pub enum NetworkError {
     /// The CIDR we were asked to use for our Docker network is already in use
     /// by a different Docker network on this host.
     #[error(
-        "requested cidr {cidr} overlaps {existing_cidr} used by docker network '{existing_network}'; \
-         refusing to create '{desired_network}' to avoid corruption"
+        "overlay subnet {cidr}, which this node routes, overlaps {existing_cidr} used by Docker \
+         network '{existing_network}', so '{desired_network}' cannot be set up here. Fix: change \
+         the cluster compute pool to a range this host does not use, while no node runs the \
+         overlay on it (console: Worker Nodes -> Cluster network, or `temps network \
+         setup-multi-node --compute-pool-cidr <cidr>` on the control plane), or recreate '{existing_network}' on another subnet. Until then this node runs without \
+         cross-node networking; its deployments keep working"
     )]
     DockerCidrCollision {
         cidr: Ipv4Net,
@@ -113,10 +129,15 @@ pub enum NetworkError {
     },
 
     #[error(
-        "compute pool {pool} overlaps host route {existing_cidr} on device '{device}'; choose a different cluster pool before enabling the overlay"
+        "overlay subnet {subnet}, which this node routes, overlaps host route {existing_cidr} on \
+         device '{device}'. Fix: change the cluster compute pool to a range this host does not use, \
+         while no node runs the overlay on it (console: Worker Nodes -> Cluster network, or `temps \
+         network setup-multi-node --compute-pool-cidr <cidr>` on the control plane), or move the network on '{device}' to another range. Until \
+         then this node runs without cross-node networking; its deployments keep working"
     )]
     HostRouteCollision {
-        pool: Ipv4Net,
+        /// The overlay subnet (own or a peer's) the route overlaps.
+        subnet: Ipv4Net,
         existing_cidr: Ipv4Net,
         device: String,
     },
@@ -132,6 +153,11 @@ pub enum NetworkError {
         existing_cidr: Ipv4Net,
         device: String,
     },
+
+    /// A macOS worker's operation in the Docker app's VM, run through the
+    /// mesh sidecar (ADR 090), failed or could not run.
+    #[error("'{operation}' in the Docker app's VM (mesh sidecar) failed: {reason}")]
+    VmExec { operation: String, reason: String },
 
     // ----- config / validation -----
     /// The provided config was internally inconsistent (e.g. peer CIDR

@@ -30,7 +30,10 @@ test.describe('authentication', () => {
     await page.waitForURL(URL_PROJECTS, { timeout: 30_000 })
     await expectAppMounted(page)
     await expect(
-      page.getByRole('heading', { name: /^(Projects|Deploy your first application)$/, exact: true })
+      page.getByRole('heading', {
+        name: /^(Projects|Deploy your first application)$/,
+        exact: true,
+      })
     ).toBeVisible()
 
     expect(consoleErrors).toEqual([])
@@ -42,7 +45,9 @@ test.describe('authentication', () => {
     // The failure must be visible to the user. Silently staying on the form
     // with no message is its own bug -- self-hosted users have nobody to ask
     // why nothing happened.
-    await expect(page.getByRole('button', { name: 'Sign in' })).toBeVisible()
+    await expect(
+      page.getByRole('button', { name: 'Sign in', exact: true })
+    ).toBeVisible()
     await expect(page).toHaveURL(URL_LOGIN)
 
     const feedback = page
@@ -67,7 +72,9 @@ test.describe('authentication', () => {
 
     // The login form is rendered in place rather than redirected to; see the
     // matching note in anonymous/console-boot.spec.ts.
-    await expect(page.getByRole('button', { name: 'Sign in' })).toBeVisible()
+    await expect(
+      page.getByRole('button', { name: 'Sign in', exact: true })
+    ).toBeVisible()
     await expect(
       page.getByRole('heading', { name: 'Databases', exact: true }),
       'protected content must not render for a signed-out visitor'
@@ -90,7 +97,10 @@ test.describe('authentication', () => {
 
     await page.waitForURL(URL_PROJECTS, { timeout: 30_000 })
     await expect(
-      page.getByRole('heading', { name: /^(Projects|Deploy your first application)$/, exact: true })
+      page.getByRole('heading', {
+        name: /^(Projects|Deploy your first application)$/,
+        exact: true,
+      })
     ).toBeVisible()
     await expect(page.getByText(/404\s*-\s*Page Not Found/i)).toHaveCount(0)
   })

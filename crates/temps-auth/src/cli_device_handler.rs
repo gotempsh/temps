@@ -1260,4 +1260,167 @@ mod tests {
             result.ok()
         );
     }
+
+    /// End-to-end over the production auth middleware and routes: an admin's
+    /// `temps login` (device flow) key and a hand-minted admin key must both
+    /// stop working as admin once the owner is demoted, while a key that
+    /// never exceeded the owner keeps working and CLI logout still revokes.
+    mod owner_demotion_http {
+        use super::*;
+        use crate::http_test_support::{auth_state, insert_user, router, send, session_cookie};
+        use temps_entities::types::RoleType;
+        use temps_test_utils::TestDatabase;
+
+        #[tokio::test]
+        async fn admin_and_cli_device_keys_lose_admin_access_after_demotion() {
+            let test_db = match TestDatabase::with_migrations().await {
+                Ok(db) => db,
+                Err(error)
+                    if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+                {
+                    println!("Docker not available, skipping test: {error}");
+                    return;
+                }
+                Err(error) => panic!("test database setup failed: {error}"),
+            };
+            let db = test_db.db.clone();
+            let state = auth_state(db.clone());
+            let app = router(state.clone(), db.clone());
+
+            state.user_service.initialize_roles().await.unwrap();
+            let actor =
+                insert_user(&db, &format!("actor-{}@example.com", uuid::Uuid::new_v4())).await;
+            let owner =
+                insert_user(&db, &format!("owner-{}@example.com", uuid::Uuid::new_v4())).await;
+            for (user_id, role) in [
+                (actor.id, RoleType::Admin),
+                (owner.id, RoleType::Admin),
+                (owner.id, RoleType::User),
+            ] {
+                state
+                    .user_service
+                    .assign_role_by_type(user_id, role)
+                    .await
+                    .unwrap();
+            }
+            let actor_cookie = session_cookie(&state, actor.id).await;
+            let owner_cookie = session_cookie(&state, owner.id).await;
+
+            // `temps login`: start, approve in the browser session, poll.
+            let (status, started) = send(
+                &app,
+                "POST",
+                "/auth/cli/device/start",
+                None,
+                Some(serde_json::json!({ "client_name": "test-host" })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "device start: {started}");
+            let (status, approved) = send(
+                &app,
+                "POST",
+                "/auth/cli/device/approve",
+                Some(("cookie", &owner_cookie)),
+                Some(serde_json::json!({ "user_code": started["user_code"] })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "device approve: {approved}");
+            let (status, polled) = send(
+                &app,
+                "POST",
+                "/auth/cli/device/poll",
+                None,
+                Some(serde_json::json!({ "device_code": started["device_code"] })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "device poll: {polled}");
+            assert_eq!(polled["status"], "approved");
+            assert_eq!(polled["role"], "admin");
+            let cli_key = format!("Bearer {}", polled["api_key"].as_str().unwrap());
+
+            let mint = |name: &str, role: &str| CreateApiKeyRequest {
+                name: name.to_string(),
+                role_type: role.to_string(),
+                permissions: None,
+                expires_at: None,
+            };
+            let admin_key = format!(
+                "Bearer {}",
+                state
+                    .api_key_service
+                    .create_api_key(owner.id, mint("admin-key", "admin"))
+                    .await
+                    .unwrap()
+                    .api_key
+            );
+            let user_key = format!(
+                "Bearer {}",
+                state
+                    .api_key_service
+                    .create_api_key(owner.id, mint("user-key", "user"))
+                    .await
+                    .unwrap()
+                    .api_key
+            );
+
+            // Admin-only listing works for both admin-role keys before demotion.
+            for key in [&cli_key, &admin_key] {
+                let (status, body) =
+                    send(&app, "GET", "/users", Some(("authorization", key)), None).await;
+                assert_eq!(status, StatusCode::OK, "before demotion: {body}");
+            }
+
+            let (status, body) = send(
+                &app,
+                "DELETE",
+                &format!("/users/{}/roles/admin", owner.id),
+                Some(("cookie", &actor_cookie)),
+                None,
+            )
+            .await;
+            assert!(status.is_success(), "demotion failed: {status} {body}");
+
+            for key in [&cli_key, &admin_key] {
+                let (status, body) =
+                    send(&app, "GET", "/users", Some(("authorization", key)), None).await;
+                assert_eq!(
+                    status,
+                    StatusCode::FORBIDDEN,
+                    "a demoted owner's admin key must lose admin access: {body}"
+                );
+            }
+
+            // The key that never exceeded the owner is unaffected, and every
+            // key still authenticates as the owner.
+            for key in [&user_key, &cli_key, &admin_key] {
+                let (status, body) =
+                    send(&app, "GET", "/user/me", Some(("authorization", key)), None).await;
+                assert_eq!(
+                    status,
+                    StatusCode::OK,
+                    "key must still authenticate: {body}"
+                );
+            }
+
+            // `temps logout` still revokes the (now capped) CLI key.
+            let (status, body) = send(
+                &app,
+                "POST",
+                "/auth/cli/logout",
+                Some(("authorization", &cli_key)),
+                None,
+            )
+            .await;
+            assert!(status.is_success(), "cli logout: {status} {body}");
+            let (status, _) = send(
+                &app,
+                "GET",
+                "/user/me",
+                Some(("authorization", &cli_key)),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+        }
+    }
 }

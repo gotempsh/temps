@@ -966,7 +966,7 @@ impl EmailService {
         };
 
         // If no provider, mark as captured and return success
-        if provider.is_none() {
+        let Some(provider) = provider else {
             let mut active_model: emails::ActiveModel = email_model.into();
             active_model.status = Set("captured".to_string());
             active_model.sent_at = Set(Some(Utc::now()));
@@ -984,9 +984,7 @@ impl EmailService {
                 status: "captured".to_string(),
                 provider_message_id: None,
             });
-        }
-
-        let provider = provider.unwrap();
+        };
 
         // An inactive provider must never be used for delivery.  Treat it
         // exactly like "no provider configured" so callers get a predictable
@@ -1530,7 +1528,9 @@ impl EmailService {
 
         let paginator = query.paginate(self.db.as_ref(), page_size);
         let total = paginator.num_items().await?;
-        let items = paginator.fetch_page(page - 1).await?;
+        let items = paginator
+            .fetch_page(temps_core::config::page_index(page))
+            .await?;
 
         Ok((items, total))
     }
@@ -1795,7 +1795,7 @@ mod tests {
     use crate::services::provider_service::{CreateProviderRequest, ProviderCredentials};
     use crate::services::TrackingService;
     use temps_core::EncryptionService;
-    use temps_database::test_utils::TestDatabase;
+    use temps_test_utils::TestDatabase;
 
     fn test_provider_send_request() -> ProviderSendRequest {
         ProviderSendRequest {
@@ -1928,8 +1928,7 @@ mod tests {
         let db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error) => {
-                if temps_database::test_utils::is_container_runtime_unavailable(&error.to_string())
-                {
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) {
                     eprintln!("Skipping Docker-dependent email test: {error}");
                     return None;
                 }

@@ -16,3 +16,9 @@ pub use error_ingestion_service::ErrorIngestionService;
 pub use error_tracking_service::ErrorTrackingService;
 pub use source_map_service::{SourceMapService, MAX_SOURCE_MAP_BYTES};
 pub use types::*;
+
+pub mod feedback_service;
+
+pub mod release_service;
+
+pub mod client_outcome_service;

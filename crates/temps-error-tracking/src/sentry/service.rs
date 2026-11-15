@@ -130,6 +130,8 @@ impl SentryIngestionService {
                         }
                     }
                 }
+                super::envelope::EnvelopeItem::Log(_)
+                | super::envelope::EnvelopeItem::Unsupported(_) => {}
                 super::envelope::EnvelopeItem::Session(_) => {
                     tracing::debug!("Received session item (not yet implemented)");
                 }

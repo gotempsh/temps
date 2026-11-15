@@ -6,6 +6,7 @@
 //! No business logic lives here.
 
 pub mod placement;
+pub mod preview_access;
 pub mod sandboxes;
 pub mod snapshots;
 pub mod terminal;
@@ -93,7 +94,9 @@ pub struct SandboxAppState {
         sandboxes::set_preview_password,
         sandboxes::create_preview_link,
         sandboxes::clear_preview_password,
+        preview_access::update_preview_access,
         sandboxes::resize_sandbox,
+        sandboxes::set_egress_policy,
         sandboxes::list_events,
         sandboxes::rootfs_report,
         sandboxes::rootfs_gc,
@@ -142,13 +145,19 @@ pub struct SandboxAppState {
         sandboxes::PreviewShareLinkBody,
         sandboxes::PreviewShareLinkResponse,
         sandboxes::SetPreviewPasswordResponse,
+        preview_access::UpdatePreviewAccessBody,
+        preview_access::PreviewAccessResponse,
+        temps_entities::ingress_mode::SandboxPreviewAccess,
         sandboxes::ResizeSandboxBody,
+        temps_sandbox_providers::SandboxEgressPolicy,
+        temps_sandbox_providers::EgressRule,
+        temps_sandbox_providers::EgressMode,
         sandboxes::SandboxEvent,
         sandboxes::SandboxEventsResponse,
-        temps_agents::sandbox::RootfsReport,
-        temps_agents::sandbox::RootfsCacheEntry,
-        temps_agents::sandbox::RootfsVmEntry,
-        temps_agents::sandbox::RootfsGcReport,
+        temps_sandbox_providers::RootfsReport,
+        temps_sandbox_providers::RootfsCacheEntry,
+        temps_sandbox_providers::RootfsVmEntry,
+        temps_sandbox_providers::RootfsGcReport,
         // Sandbox placement schemas (ADR-048)
         placement::SandboxPlacementResponse,
         placement::UpdateSandboxPlacementBody,
@@ -292,6 +301,7 @@ mod tests {
             "/v1/sandboxes/{id}/domain",
             "/v1/sandboxes/{id}/preview-password",
             "/v1/sandboxes/{id}/preview-link",
+            "/v1/sandboxes/{id}/preview-access",
             "/v1/sandboxes/{id}/events",
             "/v1/sandboxes/{id}/resize",
             "/v1/sandboxes/{id}/terminal",

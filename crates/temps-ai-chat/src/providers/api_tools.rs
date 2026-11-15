@@ -101,12 +101,10 @@ names and types, plus the row count. Enough to answer many questions on its own.
 Also supports `--offset`, `--sort_by`, `--sort_order`. Responses are capped at \
 100 rows — page with `--offset` instead of asking for more.
 
-Steps 1–6 are always available. **Step 7 is opt-in per service and off by \
-default**: rows can contain password hashes, tokens and personal data, so the \
-operator must enable AI data access for that service. If you get a 403 titled \
-\"AI Data Access Not Enabled\", tell the user plainly that row access is off for \
-that service and that they can turn it on from the service page — then answer as \
-far as you can from schema and row counts (steps 5–6), which still work.
+You read data with the user's own permissions, exactly as they can in the \
+console's data browser: any service they can open, you can read — no switch to \
+turn on first. When a question is about what is stored, read the rows rather \
+than guessing from the schema. Your reads are audited.
 
 Never present row data as more current than it is, and never echo values from \
 columns that look like credentials (password, hash, token, secret, key) even \
@@ -195,6 +193,12 @@ fn temps_schema(project_selector_scope: bool, _global_scope: bool) -> Value {
 
 #[async_trait]
 impl ConversationContextProvider for ApiToolsProvider {
+    fn api_tools_revision(&self) -> Option<String> {
+        self.handle
+            .get()
+            .and_then(|caller| caller.plugin_tools_revision())
+    }
+
     fn context_type(&self) -> &'static str {
         // This provider is special — it augments ALL contexts, not a specific
         // context_type.  We use a sentinel that is never stored in a conversation
@@ -228,7 +232,7 @@ impl ConversationContextProvider for ApiToolsProvider {
 
     async fn tools(&self, _project_id: Option<i32>, context_id: &str) -> Vec<ChatTool> {
         let application_scope = context_id.starts_with("app_") && context_id.contains(':');
-        let global_scope = context_id.starts_with("global_");
+        let global_scope = crate::provider::is_cross_project_context(context_id);
         vec![ChatTool {
             name: "temps".to_string(),
             description: "Read-only Temps MCP tool over the platform API. Invoke this registered \
@@ -332,7 +336,7 @@ impl ApiToolsProvider {
             None => None,
         };
         let application_scope = context_id.starts_with("app_") && context_id.contains(':');
-        let global_scope = context_id.starts_with("global_");
+        let global_scope = crate::provider::is_cross_project_context(context_id);
         let project_scope = if application_scope || global_scope {
             requested_project_id.map_or(ProjectSelectorScope::Unrestricted, |project_id| {
                 ProjectSelectorScope::Allowed(vec![project_id])
@@ -351,6 +355,8 @@ impl ApiToolsProvider {
         let scope = ApiCallScope {
             auth: auth.clone(),
             project_scope,
+            origin: None,
+            secrets: None,
         };
         caller.run_cli(command, &scope).await
     }

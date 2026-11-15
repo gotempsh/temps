@@ -5,6 +5,7 @@
 name = "temps-import"
 version.workspace = true
 edition.workspace = true
+description = "Import orchestrator: HTTP API and services that plan and run migrations of workloads into Temps from other platforms"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -12,6 +13,7 @@ homepage.workspace = true
 
 [dependencies]
 # Workspace dependencies
+temps-docker-util = { path = "../temps-docker-util" }
 temps-import-types = { path = "../temps-import-types" }
 temps-import-docker = { path = "../temps-import-docker" }
 temps-import-kubernetes = { path = "../temps-import-kubernetes" }
@@ -24,10 +26,8 @@ temps-core = { path = "../temps-core" }
 temps-entities = { path = "../temps-entities" }
 temps-deployments = { path = "../temps-deployments" }
 temps-projects = { path = "../temps-projects" }
-temps-auth = { path = "../temps-auth" }
-temps-audit = { path = "../temps-audit" }
+temps-authz = { path = "../temps-authz" }
 temps-git = { path = "../temps-git" }
-temps-presets = { path = "../temps-presets" }
 temps-providers = { path = "../temps-providers" }
 temps-config = { path = "../temps-config" }
 
@@ -41,14 +41,15 @@ axum = { workspace = true }
 utoipa = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-async-trait = { workspace = true }
 reqwest = { workspace = true }
 uuid = { workspace = true }
 bollard = { workspace = true }
 url = { workspace = true }
 percent-encoding = { workspace = true }
 futures-util = { workspace = true }
-anyhow = { workspace = true }
 
 [dev-dependencies]
 sea-orm = { workspace = true, features = ["mock"] }
+
+[lints]
+workspace = true

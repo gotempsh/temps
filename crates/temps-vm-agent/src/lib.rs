@@ -18,9 +18,50 @@
 
 pub mod logging;
 pub mod mounts;
+pub mod restart;
+pub mod stats;
+pub mod supervisor;
+pub mod workload_log;
+
+pub use restart::SpawnRestartPolicy;
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+/// Commit this crate was built from, or `unknown` without a git checkout
+/// (or when the build script did not run, as in a bundled container build).
+pub const BUILD_COMMIT: &str = match option_env!("TEMPS_AGENT_BUILD_COMMIT") {
+    Some(commit) => commit,
+    None => "unknown",
+};
+
+/// Prefix of the build marker embedded in every guest agent binary. The host
+/// finds it by scanning the file, so no agent has to be executed to learn
+/// which build it is.
+pub const BUILD_MARKER_PREFIX: &str = "TEMPS_GUEST_AGENT_BUILD=";
+
+const MARKER_LEN: usize = BUILD_MARKER_PREFIX.len() + 41;
+
+/// The marker: prefix, commit (at most 40 bytes), then NULs. Referenced from
+/// each agent's `main` so the linker keeps it.
+pub static BUILD_MARKER: [u8; MARKER_LEN] = build_marker(BUILD_COMMIT);
+
+const fn build_marker(commit: &str) -> [u8; MARKER_LEN] {
+    let mut out = [0u8; MARKER_LEN];
+    let prefix = BUILD_MARKER_PREFIX.as_bytes();
+    let commit = commit.as_bytes();
+    let mut i = 0;
+    while i < prefix.len() {
+        out[i] = prefix[i];
+        i += 1;
+    }
+    let mut j = 0;
+    while j < commit.len() && j < 40 {
+        out[prefix.len() + j] = commit[j];
+        j += 1;
+    }
+    out
+}
 
 /// Vsock port the agent listens on for exec/fs RPCs.
 pub const AGENT_PORT: u32 = 52;
@@ -39,7 +80,7 @@ pub const PTY_PORT: u32 = 5000;
 pub const PTY_AGENT_BIN: &str = "/sbin/temps-pty-agent";
 
 /// Control socket of the guest's PTY agent. Same path as the Docker sandboxes
-/// (`temps_agents::sandbox::PTY_AGENT_SOCKET`; a test there keeps the two in
+/// (`temps_sandbox_providers::PTY_AGENT_SOCKET`; a test there keeps the two in
 /// step) so a terminal behaves identically on every backend.
 pub const PTY_AGENT_SOCKET: &str = "/run/temps-pty/agent.sock";
 
@@ -88,8 +129,115 @@ pub enum Request {
         pattern: String,
         signal: i32,
     },
+    /// Start a long-running process and return at once (ADR-055 Phase 10:
+    /// a deployment's main process in a microVM). The agent pipes its
+    /// stdout/stderr into a size-bounded, rotating log at `log_path` (at
+    /// most `log_max_files` files of `log_max_bytes` each; defaults in
+    /// [`workload_log`]), restarts it per `restart`, and
+    /// [`Request::ProcessStatus`] reports on it. Every field after `cmd` is
+    /// optional so an older host keeps its old meaning (no restarts).
+    Spawn {
+        cmd: Vec<String>,
+        #[serde(default)]
+        env: HashMap<String, String>,
+        #[serde(default)]
+        cwd: Option<String>,
+        #[serde(default)]
+        uid: Option<u32>,
+        #[serde(default)]
+        gid: Option<u32>,
+        #[serde(default)]
+        log_path: Option<String>,
+        #[serde(default)]
+        restart: SpawnRestartPolicy,
+        #[serde(default)]
+        log_max_bytes: Option<u64>,
+        #[serde(default)]
+        log_max_files: Option<u32>,
+        #[serde(default)]
+        limits: SpawnLimits,
+    },
+    /// Whether a process [`Request::Spawn`] started still runs. `pid` is the
+    /// pid `Spawned` returned; it keeps naming the process across restarts.
+    ProcessStatus {
+        pid: u32,
+    },
+    /// The last `tail_lines` lines of a spawned process's log, read across
+    /// its rotated files. Needs no `tail` binary in the guest image.
+    ReadLog {
+        #[serde(default)]
+        path: Option<String>,
+        tail_lines: u32,
+    },
+    /// The log's complete lines after `cursor` (from the start of what is
+    /// still retained when `None`), at most `max_bytes` of them, read across
+    /// rotated files. The returned cursor goes into the next request, so a
+    /// reader sees every line once without the guest keeping any state.
+    /// A line still being written is held back until it ends, unless
+    /// `include_partial` asks for it.
+    ReadLogSince {
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        cursor: Option<LogCursor>,
+        #[serde(default)]
+        max_bytes: Option<u32>,
+        #[serde(default)]
+        include_partial: bool,
+    },
+    /// Cumulative CPU, memory, disk and network counters of the guest, with
+    /// CPU and memory taken from the tree of the process [`Request::Spawn`]
+    /// started as `pid` (every process when absent). The host turns two
+    /// samples into rates; the counters restart from zero when the supervised
+    /// process does.
+    ReadStats {
+        #[serde(default)]
+        pid: Option<u32>,
+    },
     Shutdown,
 }
+
+/// Resource ceilings a spawned process runs under, set with `setrlimit`
+/// after the user switch so they bind the workload and not the agent. A
+/// field left `None` keeps the guest kernel's default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpawnLimits {
+    /// `RLIMIT_NOFILE`: open file descriptors.
+    #[serde(default)]
+    pub max_open_files: Option<u64>,
+    /// `RLIMIT_NPROC`: processes and threads of the process's user. The
+    /// kernel does not apply it to root, so a workload that runs as root
+    /// is not bounded by it.
+    #[serde(default)]
+    pub max_processes: Option<u64>,
+}
+
+/// A position in a rotating log: the file (by inode, which survives the
+/// rename a rotation does) and the byte offset in it. Handed back by
+/// [`Response::LogChunk`] and passed to the next [`Request::ReadLogSince`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogCursor {
+    pub inode: u64,
+    pub offset: u64,
+}
+
+/// Most bytes one [`Request::ReadLogSince`] returns when the request names
+/// no limit.
+pub const DEFAULT_LOG_CHUNK_BYTES: u32 = 256 * 1024;
+
+/// Largest chunk honoured, so one request cannot build a frame the host
+/// would refuse ([`MAX_FRAME_BYTES`]).
+pub const MAX_LOG_CHUNK_BYTES: u32 = 4 * 1024 * 1024;
+
+/// Where a spawned process writes its output when the request names no path.
+pub const DEFAULT_SPAWN_LOG: &str = "/var/log/temps-workload.log";
+
+/// Most lines one [`Request::ReadLog`] returns.
+pub const MAX_READ_LOG_LINES: u32 = 10_000;
+
+/// Most processes [`Request::Spawn`] tracks at once: a workload VM runs one
+/// main process, so this only bounds a misbehaving host.
+pub const MAX_SPAWNED_PROCESSES: usize = 16;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
@@ -104,6 +252,45 @@ pub enum Response {
     File {
         data_hex: String,
     },
+    Spawned {
+        pid: u32,
+    },
+    ProcessStatus {
+        running: bool,
+        /// Set once the process exited (`-1` when killed by a signal); the
+        /// last run's code while a restart is pending.
+        #[serde(default)]
+        exit_code: Option<i32>,
+        /// Times the agent restarted the process under its restart policy.
+        #[serde(default)]
+        restart_count: u32,
+        /// The process exited and the agent will start it again once the
+        /// backoff has passed.
+        #[serde(default)]
+        restarting: bool,
+    },
+    /// The tail [`Request::ReadLog`] asked for (lossy UTF-8).
+    Log {
+        data: String,
+    },
+    /// What [`Request::ReadLogSince`] found.
+    LogChunk {
+        /// Complete lines (lossy UTF-8), oldest first.
+        data: String,
+        /// Where the next read starts; `None` when the log has no file yet.
+        #[serde(default)]
+        cursor: Option<LogCursor>,
+        /// The file the request's cursor named was rotated away before it
+        /// was read: lines between the cursor and the oldest retained file
+        /// are lost.
+        #[serde(default)]
+        skipped: bool,
+        /// More is already available: read again without waiting.
+        #[serde(default)]
+        more: bool,
+    },
+    /// What [`Request::ReadStats`] sampled.
+    Stats(stats::GuestStats),
     Err {
         message: String,
     },
@@ -356,6 +543,129 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn spawn_and_status_round_trip_on_the_wire() {
+        let request: Request = serde_json::from_str(
+            r#"{"op":"spawn","cmd":["/app/server","--port","8080"],"env":{"A":"b"},"uid":1000}"#,
+        )
+        .expect("spawn parses");
+        match request {
+            Request::Spawn {
+                cmd,
+                env,
+                uid,
+                gid,
+                log_path,
+                restart,
+                log_max_bytes,
+                log_max_files,
+                ..
+            } => {
+                assert_eq!(cmd, ["/app/server", "--port", "8080"]);
+                assert_eq!(env["A"], "b");
+                assert_eq!(uid, Some(1000));
+                assert_eq!(gid, None);
+                assert_eq!(log_path, None);
+                // An older host's request: no restarts, default log bounds.
+                assert_eq!(restart, SpawnRestartPolicy::Never);
+                assert_eq!((log_max_bytes, log_max_files), (None, None));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let status: Request =
+            serde_json::from_str(r#"{"op":"process_status","pid":42}"#).expect("status parses");
+        assert!(matches!(status, Request::ProcessStatus { pid: 42 }));
+        let response = serde_json::to_string(&Response::ProcessStatus {
+            running: false,
+            exit_code: Some(3),
+            restart_count: 2,
+            restarting: true,
+        })
+        .expect("serialises");
+        assert_eq!(
+            response,
+            r#"{"result":"process_status","running":false,"exit_code":3,"restart_count":2,"restarting":true}"#
+        );
+        // An older agent's status still parses on a newer host.
+        let old: Response = serde_json::from_str(r#"{"result":"process_status","running":true}"#)
+            .expect("old status parses");
+        assert!(matches!(
+            old,
+            Response::ProcessStatus {
+                running: true,
+                exit_code: None,
+                restart_count: 0,
+                restarting: false
+            }
+        ));
+    }
+
+    #[test]
+    fn a_spawn_with_a_restart_policy_and_log_bounds_round_trips() {
+        let request = Request::Spawn {
+            cmd: vec!["/app/server".into()],
+            env: HashMap::new(),
+            cwd: None,
+            uid: None,
+            gid: None,
+            log_path: None,
+            restart: SpawnRestartPolicy::UnlessStopped,
+            log_max_bytes: Some(10 * 1024 * 1024),
+            log_max_files: Some(3),
+            limits: SpawnLimits {
+                max_open_files: Some(4096),
+                max_processes: Some(512),
+            },
+        };
+        let json = serde_json::to_string(&request).expect("serialises");
+        assert!(
+            json.contains(r#""restart":{"policy":"unless_stopped"}"#),
+            "{json}"
+        );
+        let back: Request = serde_json::from_str(&json).expect("parses");
+        assert!(matches!(
+            back,
+            Request::Spawn {
+                restart: SpawnRestartPolicy::UnlessStopped,
+                log_max_bytes: Some(10485760),
+                log_max_files: Some(3),
+                ..
+            }
+        ));
+        let read_log: Request =
+            serde_json::from_str(r#"{"op":"read_log","tail_lines":50}"#).expect("parses");
+        assert!(matches!(
+            read_log,
+            Request::ReadLog {
+                path: None,
+                tail_lines: 50
+            }
+        ));
+    }
+
+    #[test]
+    fn read_stats_parses_with_and_without_a_pid() {
+        let all: Request = serde_json::from_str(r#"{"op":"read_stats"}"#).expect("parses");
+        assert!(matches!(all, Request::ReadStats { pid: None }));
+        let one: Request = serde_json::from_str(r#"{"op":"read_stats","pid":42}"#).expect("parses");
+        assert!(matches!(one, Request::ReadStats { pid: Some(42) }));
+    }
+
+    #[test]
+    fn a_stats_response_round_trips_with_its_result_tag() {
+        let stats = stats::GuestStats {
+            cpu_nanos: 5,
+            memory_bytes: 6,
+            pids: 2,
+            net_tx_bytes: 9,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&Response::Stats(stats)).expect("serializes");
+        assert!(json.contains(r#""result":"stats""#), "{json}");
+        let back: Response = serde_json::from_str(&json).expect("parses");
+        assert!(matches!(back, Response::Stats(s) if s == stats));
+    }
 
     #[test]
     fn relay_moves_bytes_both_ways_and_ends_when_the_host_closes() {

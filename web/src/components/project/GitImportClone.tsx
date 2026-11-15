@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { dockerfileCreationConfig } from '@/lib/container-runtime-overrides'
 import { useEffect, useState, useCallback } from 'react'
 import { useNavigate, useSearchParams } from 'react-router'
 import { useQuery, useMutation } from '@tanstack/react-query'
@@ -672,10 +673,8 @@ export function GitImportClone({
                         })
                       ),
                       preset_config:
-                        data.preset === 'dockerfile' && data.dockerfilePath
-                          ? {
-                              dockerfilePath: data.dockerfilePath,
-                            }
+                        data.preset === 'dockerfile'
+                          ? dockerfileCreationConfig(data)
                           : data.preset === 'docker-compose'
                             ? {
                                 composePath:
@@ -842,7 +841,7 @@ export function GitImportClone({
         <Card>
           <CardContent className="pt-6 space-y-4">
             <div className="space-y-2">
-              <Label htmlFor="git-url">Public Repository URL</Label>
+              <Label htmlFor="git-url">Public repository URL</Label>
               <Input
                 id="git-url"
                 type="url"

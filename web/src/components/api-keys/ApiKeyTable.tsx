@@ -99,6 +99,10 @@ function PermissionsDisplay({ apiKey }: { apiKey: ApiKeyResponse }) {
                 variant="ghost"
                 size="sm"
                 className="h-4 px-1"
+                aria-label={
+                  expanded ? 'Show fewer permissions' : 'Show all permissions'
+                }
+                aria-expanded={expanded}
                 onClick={() => setExpanded(!expanded)}
               >
                 {expanded ? (
@@ -172,7 +176,7 @@ export function ApiKeyTable({
             resources
           </p>
         </div>
-        <Button onClick={onCreateClick}>Create Your First API Key</Button>
+        <Button onClick={onCreateClick}>Create your first API key</Button>
       </div>
     )
   }

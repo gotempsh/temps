@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 import { HighlightedCode } from '@/components/ui/code-block'
 
+import { PageHeader } from '@/components/layout/PageContainer'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -107,7 +108,7 @@ export function GlobalSkillDetail() {
           className="inline-flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground mb-4"
         >
           <ArrowLeft className="h-4 w-4" />
-          Back to Skills
+          Back to skills
         </Link>
         <Card>
           <CardContent className="py-6">
@@ -153,77 +154,72 @@ export function GlobalSkillDetail() {
         className="inline-flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground mb-4"
       >
         <ArrowLeft className="h-4 w-4" />
-        Back to Skills
+        Back to skills
       </Link>
 
-      <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between mb-6">
-        <div className="flex items-start gap-3 flex-1 min-w-0">
-          <div className="mt-1">
-            <Wand2 className="h-6 w-6 text-muted-foreground" />
-          </div>
-          <div className="flex-1 min-w-0">
-            <div className="flex items-center gap-2 flex-wrap mb-1">
-              <h1 className="text-xl font-semibold truncate">{skill.name}</h1>
-              <Badge variant="secondary" className="font-mono text-xs">
-                {skill.slug}
-              </Badge>
-            </div>
-            {skill.description && (
-              <p className="text-sm text-muted-foreground">
-                {skill.description}
-              </p>
-            )}
-          </div>
+      <div className="mb-6 flex items-start gap-3">
+        <div className="mt-1">
+          <Wand2 className="h-6 w-6 text-muted-foreground" />
         </div>
-        <div className="flex gap-2">
-          {isEditing ? (
-            <>
-              <Button
-                variant="outline"
-                onClick={handleCancel}
-                disabled={updateMutation.isPending}
-              >
-                <X className="h-4 w-4 mr-2" />
-                Cancel
-              </Button>
-              <Button
-                onClick={handleSave}
-                disabled={
-                  updateMutation.isPending || !name.trim() || !content.trim()
-                }
-              >
-                {updateMutation.isPending ? (
-                  <Loader2 className="h-4 w-4 animate-spin mr-2" />
-                ) : (
-                  <Save className="h-4 w-4 mr-2" />
-                )}
-                Save
-              </Button>
-            </>
-          ) : (
-            <>
-              <Button variant="outline" onClick={() => setIsEditing(true)}>
-                <Pencil className="h-4 w-4 mr-2" />
-                Edit
-              </Button>
-              <Button
-                variant="outline"
-                className="text-destructive hover:text-destructive"
-                onClick={() => setConfirmDelete(true)}
-              >
-                <Trash2 className="h-4 w-4 mr-2" />
-                Delete
-              </Button>
-            </>
-          )}
-        </div>
+        <PageHeader
+          className="min-w-0 flex-1"
+          title={skill.name}
+          verdict={
+            <Badge variant="secondary" className="font-mono text-xs">
+              {skill.slug}
+            </Badge>
+          }
+          description={skill.description || undefined}
+          actions={
+            isEditing ? (
+              <>
+                <Button
+                  variant="outline"
+                  onClick={handleCancel}
+                  disabled={updateMutation.isPending}
+                >
+                  <X className="h-4 w-4 mr-2" />
+                  Cancel
+                </Button>
+                <Button
+                  onClick={handleSave}
+                  disabled={
+                    updateMutation.isPending || !name.trim() || !content.trim()
+                  }
+                >
+                  {updateMutation.isPending ? (
+                    <Loader2 className="h-4 w-4 animate-spin mr-2" />
+                  ) : (
+                    <Save className="h-4 w-4 mr-2" />
+                  )}
+                  Save
+                </Button>
+              </>
+            ) : (
+              <>
+                <Button variant="outline" onClick={() => setIsEditing(true)}>
+                  <Pencil className="h-4 w-4 mr-2" />
+                  Edit
+                </Button>
+                <Button
+                  variant="outline"
+                  className="text-destructive hover:text-destructive"
+                  onClick={() => setConfirmDelete(true)}
+                >
+                  <Trash2 className="h-4 w-4 mr-2" />
+                  Delete
+                </Button>
+              </>
+            )
+          }
+        />
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
         <Card className="lg:col-span-2">
           <CardHeader>
             <CardTitle className="text-base">
-              {isEditing ? 'Edit Skill' : 'Skill Content'}
+              {isEditing ? 'Edit skill' : 'Skill content'}
             </CardTitle>
           </CardHeader>
           <CardContent>

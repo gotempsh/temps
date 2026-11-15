@@ -11,21 +11,27 @@
 //!
 //! Uses a small public Next.js starter template for testing
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "integration test: reads fixture configuration from the environment"
+)]
 #[cfg(test)]
 mod public_repo_tests {
     use async_trait::async_trait;
     use bollard::Docker;
     use std::collections::HashMap;
     use std::sync::Arc;
-    use temps_core::{
-        LogWriter, WorkflowBuilder, WorkflowCancellationProvider, WorkflowError, WorkflowExecutor,
-        WorkflowTask,
-    };
     use temps_deployer::docker::DockerRuntime;
     use temps_deployer::{ContainerDeployer, ImageBuilder};
     use temps_deployments::jobs::{
         BuildImageJobBuilder, DeployImageJobBuilder, DeploymentTarget, DownloadRepoBuilder,
     };
+    use temps_deployments::workflow::LogWriter;
+    use temps_deployments::workflow::WorkflowBuilder;
+    use temps_deployments::workflow::WorkflowCancellationProvider;
+    use temps_deployments::workflow::WorkflowError;
+    use temps_deployments::workflow::WorkflowTask;
+    use temps_deployments::workflow_executor::WorkflowExecutor;
     use temps_git::{GitProviderManagerError, GitProviderManagerTrait, RepositoryInfo};
     use tokio::sync::Mutex;
 

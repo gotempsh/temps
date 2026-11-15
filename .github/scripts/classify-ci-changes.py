@@ -40,7 +40,7 @@ stays Rust because the scenario E2E suite builds it.
 
 Documentation means a file under `docs/` or a Markdown file at the repository
 root. Markdown elsewhere is not exempt: some of it is build or test input
-(`crates/temps-core/templates/README.md` is embedded into the binary, and test
+(`crates/temps-presets/templates/README.md` is embedded into the binary, and test
 fixtures carry their own READMEs).
 
 Some pages under `docs/` are test input as well. `scripts/test-compose-security.sh`

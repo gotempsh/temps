@@ -12,8 +12,12 @@ import {
 import {
   nextTrafficSort,
   trafficPageCount,
+  trafficPageInRange,
   trafficQueryNeedsCompatibilityRetry,
+  trafficTableQueryKey,
 } from '@/lib/api-traffic-sort'
+import { QueryClient } from '@tanstack/react-query'
+import { keepPreviousWindow, recordWindowMove } from '@/lib/refresh'
 
 describe('API traffic server-side sorting', () => {
   test('toggles an active metric from descending to ascending', () => {
@@ -183,5 +187,72 @@ describe('API traffic summary request gating', () => {
         consentEnabled: true,
       })
     ).toBe(true)
+  })
+})
+
+describe('API traffic tables on Refresh', () => {
+  const table = {
+    projectId: 7,
+    startIso: '2026-01-01T00:00:00.000Z',
+    endIso: '2026-01-02T00:00:00.000Z',
+    environmentId: 3,
+    kind: 'routes' as const,
+    page: 2,
+    sort: { metric: 'requests', direction: 'desc' as const },
+  }
+  const rows = { rows: ['GET /orders'] }
+  const shown = new QueryClient()
+  shown.setQueryData(trafficTableQueryKey(table), rows)
+
+  test('a moved window keeps the current routes on screen', () => {
+    const moved = trafficTableQueryKey({
+      ...table,
+      startIso: '2026-01-01T00:05:00.000Z',
+      endIso: '2026-01-02T00:05:00.000Z',
+    })
+    recordWindowMove(shown.getQueryCache(), trafficTableQueryKey(table), moved)
+    expect(
+      keepPreviousWindow(moved)(rows, {
+        queryKey: trafficTableQueryKey(table),
+      })
+    ).toBe(rows)
+  })
+
+  test('another page, sort or environment loads from scratch', () => {
+    for (const change of [
+      { page: 3 },
+      { sort: { metric: 'errors', direction: 'desc' as const } },
+      { environmentId: 4 },
+      { kind: 'callers' as const },
+    ]) {
+      const next = trafficTableQueryKey({ ...table, ...change })
+      recordWindowMove(shown.getQueryCache(), trafficTableQueryKey(table), next)
+      expect(
+        keepPreviousWindow(next)(rows, {
+          queryKey: trafficTableQueryKey(table),
+        })
+      ).toBeUndefined()
+    }
+  })
+})
+
+describe('API traffic pages after Refresh', () => {
+  const answer = (rows: number, totalPages: number) => ({
+    rows: Array.from({ length: rows }, (_, i) => i),
+    total_pages: totalPages,
+  })
+
+  test('keeps a page that still has rows', () => {
+    expect(trafficPageInRange(2, answer(20, 5))).toBe(2)
+    expect(trafficPageInRange(2, undefined)).toBe(2)
+  })
+
+  test('moves an empty page past the end to the last page', () => {
+    expect(trafficPageInRange(4, answer(0, 2))).toBe(1)
+  })
+
+  test('goes back to the first page when nothing is left', () => {
+    expect(trafficPageInRange(3, answer(0, 0))).toBe(0)
+    expect(trafficPageInRange(0, answer(0, 0))).toBe(0)
   })
 })

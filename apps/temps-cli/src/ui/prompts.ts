@@ -83,6 +83,16 @@ export async function promptPassword(options: PasswordPromptOptions): Promise<st
 }
 
 export async function promptConfirm(options: ConfirmPromptOptions): Promise<boolean> {
+  // Without a terminal on stdin the prompt can never be answered: Bun would
+  // exit 0 with nothing done and Node would report a force-closed prompt. Fail
+  // loudly so a pipeline step that skipped confirmation is not reported as a
+  // success. Only stdin has to be a terminal; output may be piped.
+  if (!process.stdin.isTTY) {
+    throw new Error(
+      `Cannot ask "${options.message}" because stdin is not an interactive terminal. ` +
+        'Run the command from a terminal, or pass --yes if the command supports it.'
+    )
+  }
   const result = await confirm({
     message: options.message,
     default: options.default ?? false,

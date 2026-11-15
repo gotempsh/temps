@@ -9,6 +9,7 @@ import {
   listProjectSecretsOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { Button } from '@/components/ui/button'
+import { PageHeader } from '@temps-sdk/ds'
 import { EmptyState } from '@/components/ui/empty-state'
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import {
@@ -100,37 +101,41 @@ export function SecretsSettings({ project }: SecretsSettingsProps) {
   const editingSecret: ProjectSecretResponse | null =
     secrets.find((s) => s.id === editingSecretId) ?? null
   const environments = environmentsQuery.data ?? []
+  const liveEnvironmentIds = useMemo(
+    () =>
+      environmentsQuery.data
+        ? new Set(environmentsQuery.data.map((environment) => environment.id))
+        : undefined,
+    [environmentsQuery.data]
+  )
   const composeServiceNames = composeServiceNamesFor(project)
   const isComposeProject = project.preset === 'docker-compose'
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
-        <div>
-          <p className="text-sm text-muted-foreground max-w-2xl">
-            Secrets are mounted into your containers as files at{' '}
-            <code className="text-xs bg-muted px-1.5 py-0.5 rounded">
+      <PageHeader
+        title="Secrets"
+        description={
+          <>
+            Mounted read-only at{' '}
+            <code className="rounded bg-muted px-1.5 py-0.5 text-xs">
               /run/secrets/&lt;KEY&gt;
             </code>{' '}
-            as a read-only mount. They are never visible via{' '}
-            <code className="text-xs bg-muted px-1.5 py-0.5 rounded">
+            in every container, never as environment variables or in{' '}
+            <code className="rounded bg-muted px-1.5 py-0.5 text-xs">
               docker inspect
-            </code>{' '}
-            and never injected as environment variables. Read with e.g.{' '}
-            <code className="text-xs bg-muted px-1.5 py-0.5 rounded">
-              fs.readFileSync(&apos;/run/secrets/DB_PASSWORD&apos;,
-              &apos;utf8&apos;)
             </code>
-            . Docker Compose services get the same mount in every container. A
-            redeploy is required for new or updated secrets to take effect.
-          </p>
-        </div>
-        <Button onClick={() => setIsCreateOpen(true)}>
-          <Plus className="h-4 w-4 mr-1" />
-          New secret
-          <KbdBadge keys={['N']} className="ml-2 hidden sm:inline-flex" />
-        </Button>
-      </div>
+            . Redeploy to apply changes.
+          </>
+        }
+        actions={
+          <Button onClick={() => setIsCreateOpen(true)}>
+            <Plus className="h-4 w-4 mr-1" />
+            New secret
+            <KbdBadge keys={['N']} className="ml-2 hidden sm:inline-flex" />
+          </Button>
+        }
+      />
 
       {secretsQuery.isPending ? (
         <div className="space-y-2">
@@ -139,25 +144,20 @@ export function SecretsSettings({ project }: SecretsSettingsProps) {
         </div>
       ) : secrets.length === 0 ? (
         <EmptyState
+          size="compact"
           icon={FileLock2}
           title="No secrets yet"
-          description="Secrets are mounted into your containers as read-only files. Add one to get started."
-          action={
-            <Button onClick={() => setIsCreateOpen(true)}>
-              <Plus className="h-4 w-4 mr-1" />
-              New secret
-              <KbdBadge keys={['N']} className="ml-2 hidden sm:inline-flex" />
-            </Button>
-          }
+          description="Read one in your app as a file, e.g. /run/secrets/DB_PASSWORD."
         />
       ) : (
-        <div className="border rounded-md divide-y">
+        <div className="divide-y border-y">
           {secrets.map((s) => (
             <SecretRow
               key={s.id}
               secret={s}
               projectId={project.id}
               detailPath={secretPath(s.id)}
+              liveEnvironmentIds={liveEnvironmentIds}
               checks={checksBySecret.get(s.id) ?? []}
               onEdit={() => {
                 setEditingSecretId(s.id)
@@ -206,6 +206,31 @@ export function SecretsSettings({ project }: SecretsSettingsProps) {
   )
 }
 
+/**
+ * Where a secret is mounted, for its list row. Bindings to deleted
+ * environments are kept by the server (a restored environment gets its secrets
+ * back) but mount nowhere. They still count as a scope: a secret bound only to
+ * deleted environments is not "All environments", which is what an empty
+ * binding list means.
+ */
+function secretScopeLabel(
+  environments: Array<{ id: number; name: string }>,
+  liveIds: ReadonlySet<number> | undefined
+): string {
+  if (environments.length === 0) return 'All environments'
+  const active = liveIds
+    ? environments.filter((environment) => liveIds.has(environment.id))
+    : environments
+  const deletedCount = environments.length - active.length
+  const deleted =
+    deletedCount === 0
+      ? ''
+      : `${deletedCount} deleted ${deletedCount === 1 ? 'environment' : 'environments'}`
+  if (active.length === 0) return `Only ${deleted} (not mounted anywhere)`
+  const names = active.map((environment) => environment.name).join(', ')
+  return deleted ? `${names} • ${deleted}` : names
+}
+
 /** A secret with no environments is mounted in every environment. */
 function secretScope(environments: Array<{ id: number }>): VariableChangeScope {
   return environments.length === 0
@@ -225,6 +250,8 @@ interface SecretRowProps {
   }
   projectId: number
   detailPath: string
+  /** Ids of the project's current environments; undefined while not loaded. */
+  liveEnvironmentIds: ReadonlySet<number> | undefined
   checks: EnvironmentVariableCheck[]
   onEdit: () => void
   onManageChecks: () => void
@@ -235,6 +262,7 @@ function SecretRow({
   secret,
   projectId,
   detailPath,
+  liveEnvironmentIds,
   checks,
   onEdit,
   onManageChecks,
@@ -268,9 +296,7 @@ function SecretRow({
           {secret.key}
         </Link>
         <div className="text-xs text-muted-foreground">
-          {secret.environments.length === 0
-            ? 'All environments'
-            : secret.environments.map((e) => e.name).join(', ')}
+          {secretScopeLabel(secret.environments, liveEnvironmentIds)}
           {secret.include_in_preview ? ' • preview enabled' : ''}
           {secret.compose_services && secret.compose_services.length > 0
             ? ` • only ${secret.compose_services.join(', ')}`

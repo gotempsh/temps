@@ -8,6 +8,7 @@ use std::pin::Pin;
 use std::time::Duration;
 use tokio_stream::Stream;
 
+use super::stream_text::{Utf8StreamDecoder, MAX_BUFFERED_STREAM_BYTES};
 use crate::error::AiGatewayError;
 use crate::providers::{AiProvider, ProviderCapability, ProviderHttpClient, ProviderInfo};
 use crate::types::*;
@@ -372,6 +373,7 @@ impl GeminiProvider {
             prompt_tokens: u.prompt_token_count,
             completion_tokens: u.candidates_token_count,
             total_tokens: u.total_token_count,
+            prompt_tokens_details: None,
         });
 
         let message_content = if text_content.is_empty() && !tool_calls.is_empty() {
@@ -511,6 +513,7 @@ impl GeminiProvider {
                     prompt_tokens: u.prompt_token_count,
                     completion_tokens: u.candidates_token_count,
                     total_tokens: u.total_token_count,
+                    prompt_tokens_details: None,
                 });
 
                 let chunk = ChatCompletionChunk {
@@ -623,14 +626,10 @@ impl AiProvider for GeminiProvider {
             });
         }
 
-        let gemini_response: GeminiResponse =
-            response
-                .json()
-                .await
-                .map_err(|e| AiGatewayError::TranslationError {
-                    provider: "gemini".to_string(),
-                    reason: format!("Failed to parse Gemini response: {}", e),
-                })?;
+        let gemini_response: GeminiResponse = response
+            .json()
+            .await
+            .map_err(|e| crate::error::response_body_error("gemini", "Gemini response", e))?;
 
         Self::translate_response(gemini_response, &request.model)
     }
@@ -685,12 +684,22 @@ impl AiProvider for GeminiProvider {
             // be presented to the caller as a completed reply.
             let mut saw_finish = false;
             let mut transport_failed = false;
+            let mut decoder = Utf8StreamDecoder::default();
 
             while let Some(chunk_result) = stream.next().await {
                 match chunk_result {
                     Ok(chunk) => {
-                        let text = String::from_utf8_lossy(&chunk);
-                        buffer.push_str(&text);
+                        decoder.decode_into(&chunk, &mut buffer);
+                        if buffer.len() > MAX_BUFFERED_STREAM_BYTES {
+                            transport_failed = true;
+                            yield Err(AiGatewayError::StreamError {
+                                model: model.clone(),
+                                reason: format!(
+                                    "upstream sent over {MAX_BUFFERED_STREAM_BYTES} bytes without ending an event"
+                                ),
+                            });
+                            break;
+                        }
 
                         while let Some(data_start) = buffer.find("data: ") {
                             let data_content_start = data_start + 6;
@@ -1248,11 +1257,13 @@ mod tests {
             content: Some(MessageContent::Parts(vec![
                 ContentPart {
                     r#type: "text".to_string(),
+                    cache_control: None,
                     text: Some("What's in this image?".to_string()),
                     image_url: None,
                 },
                 ContentPart {
                     r#type: "image_url".to_string(),
+                    cache_control: None,
                     text: None,
                     image_url: Some(serde_json::json!({
                         "url": "data:image/png;base64,iVBORw0KGgo="
@@ -1287,6 +1298,7 @@ mod tests {
             role: "user".to_string(),
             content: Some(MessageContent::Parts(vec![ContentPart {
                 r#type: "image_url".to_string(),
+                cache_control: None,
                 text: None,
                 image_url: Some(serde_json::json!({
                     "url": "https://example.com/photo.png"

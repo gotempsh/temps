@@ -12,6 +12,7 @@ import { httpStatusClass } from '@/lib/http-status-class'
 import { proxyLogDetailUrl } from '@/lib/proxy-log-navigation'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { ResponsivePagination } from '@/components/ui/responsive-pagination'
 import { Card, CardContent } from '@/components/ui/card'
 import { Checkbox } from '@/components/ui/checkbox'
 import { CopyButton } from '@/components/ui/copy-button'
@@ -39,18 +40,13 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import {
   AlertCircle,
   ArrowDown,
   ArrowUp,
   ChevronDown,
-  ChevronLeft,
-  ChevronRight,
   ChevronRight as ChevronExpand,
-  ChevronsLeft,
-  ChevronsRight,
   Columns,
   ExternalLink,
   Filter,
@@ -60,11 +56,20 @@ import {
 } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useSearchParams } from 'react-router'
+import { IpLink } from '@/components/data-display/IpLink'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
+import { usePageInRange } from '@/hooks/usePageInRange'
 
 interface ProxyLogsDataTableProps {
   projectId?: number
   environmentId?: number
   onRowClick?: (log: ProxyLogResponse) => void
+  /**
+   * When the page last asked for fresh rows. A preset window ("Last 24
+   * hours") is resolved again from this instant, so a refresh also moves the
+   * window's start instead of only reaching further past its end.
+   */
+  refreshedAt?: number
 }
 
 /**
@@ -316,6 +321,7 @@ export function ProxyLogsDataTable({
   projectId,
   environmentId,
   onRowClick,
+  refreshedAt,
 }: ProxyLogsDataTableProps) {
   const [searchParams, setSearchParams] = useSearchParams()
   const isInitialMount = useRef(true)
@@ -434,6 +440,8 @@ export function ProxyLogsDataTable({
    * render would make the query key unstable and refetch on every keystroke.
    */
   const timeWindow = useMemo(() => {
+    // `refreshedAt` is the page's Refresh: a new value re-reads the clock.
+    void refreshedAt
     if (timeRange === 'custom') {
       return {
         start: filters.start_date || null,
@@ -441,9 +449,9 @@ export function ProxyLogsDataTable({
       }
     }
     return { start: timeRangeToStartDate(timeRange), end: null }
-  }, [timeRange, filters.start_date, filters.end_date])
+  }, [timeRange, filters.start_date, filters.end_date, refreshedAt])
 
-  const { data, isLoading, error } = useQuery({
+  const { data, isLoading, error, isPlaceholderData } = useWindowQuery({
     ...getProxyLogsOptions({
       query: {
         project_id: scopedProjectId ?? null,
@@ -501,7 +509,18 @@ export function ProxyLogsDataTable({
       },
     }),
     staleTime: 1000 * 30, // 30 seconds
+    // A refresh moves the window, so the key changes: keep the current rows
+    // (and their count) on screen until the next ones arrive instead of
+    // collapsing the table into a spinner.
   })
+  // A moved window can hold fewer pages than the one on screen.
+  usePageInRange(
+    page,
+    data && !isPlaceholderData
+      ? { rows: data.logs.length, totalPages: data.total_pages }
+      : undefined,
+    setPage
+  )
 
   const handleSort = (column: string) => {
     if (sortBy === column) {
@@ -622,11 +641,11 @@ export function ProxyLogsDataTable({
       { key: 'routing_status', label: 'Routing', sortable: true },
       { key: 'request_source', label: 'Source', sortable: true },
       { key: 'client_ip', label: 'IP', sortable: true },
-      { key: 'response_time_ms', label: 'Response Time', sortable: true },
+      { key: 'response_time_ms', label: 'Response time', sortable: true },
       { key: 'device_type', label: 'Device', sortable: true },
       { key: 'browser', label: 'Browser', sortable: true },
       { key: 'is_bot', label: 'Bot', sortable: true },
-      { key: 'bot_name', label: 'Bot Name' },
+      { key: 'bot_name', label: 'Bot name' },
       { key: 'cache_status', label: 'Cache' },
       { key: 'upstream_host', label: 'Upstream' },
     ]
@@ -736,7 +755,7 @@ export function ProxyLogsDataTable({
 
       {/* Toolbar */}
       <div className="flex items-center justify-between gap-4 flex-wrap">
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           {/* Time range. The listing is always bounded (the API defaults to
               1h when no start_date is sent, and rejects a custom range wider
               than 7 days), so this control is the primary way to reach older
@@ -893,7 +912,7 @@ export function ProxyLogsDataTable({
               </div>
 
               <div>
-                <Label>Exact Path</Label>
+                <Label>Exact path</Label>
                 <Input
                   placeholder="/api/orders"
                   value={pendingFilters.path_exact || ''}
@@ -925,7 +944,7 @@ export function ProxyLogsDataTable({
 
               {/* Routing */}
               <div>
-                <Label>Routing Status</Label>
+                <Label>Routing status</Label>
                 <Select
                   value={pendingFilters.routing_status || 'all'}
                   onValueChange={(v) =>
@@ -950,7 +969,7 @@ export function ProxyLogsDataTable({
               </div>
 
               <div>
-                <Label>Request Source</Label>
+                <Label>Request source</Label>
                 <Select
                   value={pendingFilters.request_source || 'all'}
                   onValueChange={(v) =>
@@ -1023,7 +1042,7 @@ export function ProxyLogsDataTable({
               </div>
 
               <div>
-                <Label>Device Type</Label>
+                <Label>Device type</Label>
                 <Select
                   value={pendingFilters.device_type || 'all'}
                   onValueChange={(v) =>
@@ -1061,7 +1080,7 @@ export function ProxyLogsDataTable({
               </div>
 
               <div>
-                <Label>Operating System</Label>
+                <Label>Operating system</Label>
                 <Input
                   placeholder="Windows"
                   value={pendingFilters.operating_system || ''}
@@ -1076,7 +1095,7 @@ export function ProxyLogsDataTable({
               </div>
 
               <div>
-                <Label>User Agent</Label>
+                <Label>User agent</Label>
                 <Input
                   placeholder="Mozilla/5.0..."
                   value={pendingFilters.user_agent || ''}
@@ -1092,7 +1111,7 @@ export function ProxyLogsDataTable({
 
               {/* Bot Detection */}
               <div>
-                <Label>Bot Name</Label>
+                <Label>Bot name</Label>
                 <Input
                   placeholder="Googlebot"
                   value={pendingFilters.bot_name || ''}
@@ -1107,7 +1126,7 @@ export function ProxyLogsDataTable({
               </div>
 
               <div>
-                <Label>AI Provider</Label>
+                <Label>AI provider</Label>
                 <Select
                   value={pendingFilters.ai_provider || 'all'}
                   onValueChange={(v) =>
@@ -1133,7 +1152,7 @@ export function ProxyLogsDataTable({
               </div>
 
               <div>
-                <Label>AI Agent</Label>
+                <Label>AI agent</Label>
                 <Select
                   value={pendingFilters.ai_agent || 'all'}
                   onValueChange={(v) =>
@@ -1164,7 +1183,7 @@ export function ProxyLogsDataTable({
 
               {/* Infrastructure */}
               <div>
-                <Label>Cache Status</Label>
+                <Label>Cache status</Label>
                 <Input
                   placeholder="HIT"
                   value={pendingFilters.cache_status || ''}
@@ -1194,7 +1213,7 @@ export function ProxyLogsDataTable({
               </div>
 
               <div>
-                <Label>Upstream Host</Label>
+                <Label>Upstream host</Label>
                 <Input
                   placeholder="backend:8080"
                   value={pendingFilters.upstream_host || ''}
@@ -1301,7 +1320,7 @@ export function ProxyLogsDataTable({
                     })
                   }
                 />
-                <Label htmlFor="is-bot">Is Bot</Label>
+                <Label htmlFor="is-bot">Is bot</Label>
               </div>
 
               <div className="flex items-center space-x-2">
@@ -1315,7 +1334,7 @@ export function ProxyLogsDataTable({
                     })
                   }
                 />
-                <Label htmlFor="is-ai-agent">Is AI Agent</Label>
+                <Label htmlFor="is-ai-agent">Is AI agent</Label>
               </div>
 
               <div className="flex items-center space-x-2">
@@ -1329,7 +1348,7 @@ export function ProxyLogsDataTable({
                     })
                   }
                 />
-                <Label htmlFor="is-system">System Request</Label>
+                <Label htmlFor="is-system">System request</Label>
               </div>
 
               <div className="flex items-center space-x-2">
@@ -1357,17 +1376,17 @@ export function ProxyLogsDataTable({
                     })
                   }
                 />
-                <Label htmlFor="has-error">Has Error</Label>
+                <Label htmlFor="has-error">Has error</Label>
               </div>
             </div>
 
             {/* Apply Filters Button */}
-            <div className="flex items-center justify-between pt-4 border-t mt-4">
+            <div className="flex flex-wrap items-center justify-between gap-2 pt-4 border-t mt-4">
               <Button variant="outline" onClick={clearFilters}>
-                Clear All Filters
+                Clear all filters
               </Button>
               <Button onClick={applyFilters} disabled={!hasPendingChanges}>
-                Apply Filters
+                Apply filters
                 {hasPendingChanges && (
                   <Badge
                     variant="secondary"
@@ -1478,56 +1497,15 @@ export function ProxyLogsDataTable({
               </div>
 
               {/* Pagination */}
-              <div className="flex items-center justify-between px-4 py-4 border-t">
-                <div className="text-sm text-muted-foreground">
-                  Showing {(page - 1) * pageSize + 1} to{' '}
-                  {Math.min(page * pageSize, data.total)} of {data.total}{' '}
-                  results
-                </div>
-                <div className="flex items-center gap-2">
-                  <Button
-                    aria-label="First page"
-                    variant="outline"
-                    size="sm"
-                    onClick={() => setPage(1)}
-                    disabled={page === 1}
-                  >
-                    <ChevronsLeft className="h-4 w-4" />
-                  </Button>
-                  <Button
-                    aria-label="Previous page"
-                    variant="outline"
-                    size="sm"
-                    onClick={() => setPage(page - 1)}
-                    disabled={page === 1}
-                  >
-                    <ChevronLeft className="h-4 w-4" />
-                  </Button>
-                  <div className="flex items-center gap-2 px-2">
-                    <span className="text-sm">
-                      Page {page} of {data.total_pages}
-                    </span>
-                  </div>
-                  <Button
-                    aria-label="Next page"
-                    variant="outline"
-                    size="sm"
-                    onClick={() => setPage(page + 1)}
-                    disabled={page === data.total_pages}
-                  >
-                    <ChevronRight className="h-4 w-4" />
-                  </Button>
-                  <Button
-                    aria-label="Last page"
-                    variant="outline"
-                    size="sm"
-                    onClick={() => setPage(data.total_pages)}
-                    disabled={page === data.total_pages}
-                  >
-                    <ChevronsRight className="h-4 w-4" />
-                  </Button>
-                </div>
-              </div>
+              <ResponsivePagination
+                className="border-t px-4 py-4"
+                page={page}
+                pageSize={pageSize}
+                total={data.total}
+                totalPages={data.total_pages}
+                onPageChange={setPage}
+                ariaLabel="Proxy logs pagination"
+              />
             </>
           )}
         </CardContent>
@@ -1676,11 +1654,14 @@ function DetailField({
   value,
   mono,
   copyable,
+  ip,
 }: {
   label: string
   value: string | number | null | undefined
   mono?: boolean
   copyable?: boolean
+  /** The value is a client address: link it to its IP page. */
+  ip?: boolean
 }) {
   if (value === null || value === undefined || value === '') return null
   const display = String(value)
@@ -1692,7 +1673,7 @@ function DetailField({
           className={`text-sm truncate ${mono ? 'font-mono' : ''}`}
           title={display}
         >
-          {display}
+          {ip ? <IpLink ip={display} /> : display}
         </p>
         {copyable && (
           <CopyButton
@@ -1740,21 +1721,21 @@ function ProxyLogInlineDetail({ log }: { log: ProxyLogResponse }) {
           value={format(new Date(log.timestamp), 'PPpp')}
         />
         <DetailField
-          label="Response Time"
+          label="Response time"
           value={log.response_time_ms ? `${log.response_time_ms}ms` : null}
         />
         <DetailField
-          label="Request Size"
+          label="Request size"
           value={formatBytes(log.request_size_bytes)}
         />
         <DetailField
-          label="Response Size"
+          label="Response size"
           value={formatBytes(log.response_size_bytes)}
         />
         <DetailField label="Source" value={log.request_source} />
         <DetailField label="Routing" value={log.routing_status} />
 
-        <DetailField label="Client IP" value={log.client_ip} mono copyable />
+        <DetailField label="Client IP" value={log.client_ip} mono copyable ip />
         <DetailField label="Device" value={log.device_type} />
         <DetailField
           label="Browser"

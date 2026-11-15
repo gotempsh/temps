@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { PageTitle } from '@temps-sdk/ds'
 import { getProjectBySlugOptions } from '@/api/client/@tanstack/react-query.gen'
 import { ProjectResponse } from '@/api/client/types.gen'
 import { LiveVisitorsList } from '@/components/visitors/LiveVisitorsList'
@@ -37,7 +38,7 @@ export function LiveVisitors({ project: projectProp }: LiveVisitorsProps = {}) {
         <div className="p-4 sm:p-6 space-y-6">
           <Button variant="outline" size="sm" disabled>
             <ArrowLeft className="mr-2 h-4 w-4" />
-            Back to Service
+            Back to service
           </Button>
           <div className="space-y-4">
             <Skeleton className="h-8 w-48" />
@@ -55,7 +56,7 @@ export function LiveVisitors({ project: projectProp }: LiveVisitorsProps = {}) {
           <Button variant="outline" size="sm" asChild>
             <Link to="/projects">
               <ArrowLeft className="mr-2 h-4 w-4" />
-              Back to Projects
+              Back to projects
             </Link>
           </Button>
           <div className="text-center py-12">
@@ -72,12 +73,12 @@ export function LiveVisitors({ project: projectProp }: LiveVisitorsProps = {}) {
         <Button variant="outline" size="sm" asChild>
           <Link to={`/projects/${project.slug}`}>
             <ArrowLeft className="mr-2 h-4 w-4" />
-            Back to Service
+            Back to service
           </Link>
         </Button>
 
         <div>
-          <h1 className="text-3xl font-bold">Live Visitors</h1>
+          <PageTitle className="text-3xl font-bold">Live Visitors</PageTitle>
           <p className="text-muted-foreground mt-1">
             See who&apos;s currently browsing {project.name}
           </p>

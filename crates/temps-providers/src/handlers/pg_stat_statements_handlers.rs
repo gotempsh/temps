@@ -127,9 +127,8 @@ impl AuditOperation for PgStatStatementsEnabledAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation: {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -157,9 +156,8 @@ impl AuditOperation for PgStatStatementsResetAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation: {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -502,7 +500,7 @@ mod tests {
         async fn create_audit_log(
             &self,
             _operation: &dyn temps_core::AuditOperation,
-        ) -> Result<(), temps_core::anyhow::Error> {
+        ) -> temps_core::AuditResult<()> {
             Ok(())
         }
     }
@@ -559,6 +557,7 @@ mod tests {
             query_service: Arc::new(crate::QueryService::new(manager)),
             health_monitor: None,
             metrics_store: None,
+            worker_metrics_status: None,
             db: db.clone(),
             api_key_service: Arc::new(temps_auth::ApiKeyService::new(db)),
             config_service: None,

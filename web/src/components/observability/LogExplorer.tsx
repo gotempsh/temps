@@ -40,6 +40,8 @@ import {
 import { cn } from '@/lib/utils'
 import { logEnvironmentLabel } from '@/lib/log-environment'
 import { LogLevelBadge } from '@temps-sdk/ds'
+import { logFieldSummary } from './log-field-summary'
+import { bySeverityDesc } from './log-volume-series'
 
 import { Input } from '@/components/ui/input'
 import {
@@ -81,6 +83,24 @@ const mobileSnapshot = () =>
 const serverMobileSnapshot = () => false
 /** Row height guess for the virtualizer; real heights are measured on mount. */
 const ROW_ESTIMATE = 29
+
+/** Problem lines stand out while scrolling, before their badge is read. */
+function logRowTone(level: string) {
+  if (level === 'ERROR' || level === 'FATAL')
+    return 'bg-destructive/[0.06] hover:bg-destructive/10'
+  if (level === 'WARN' || level === 'WARNING')
+    return 'bg-warning/[0.07] hover:bg-warning/10'
+  return undefined
+}
+
+function logLevelDot(level: string) {
+  if (level === 'ERROR' || level === 'FATAL') return 'bg-destructive'
+  if (level === 'WARN' || level === 'WARNING') return 'bg-warning'
+  // Same colours as the volume chart's bars.
+  if (level === 'INFO') return 'bg-chart-1'
+  if (level === 'TRACE') return 'bg-muted-foreground/50'
+  return 'bg-muted-foreground'
+}
 
 type FacetSection = {
   title: string
@@ -148,7 +168,9 @@ export function LogExplorer({
       : params.get('lv') === 'service'
         ? 'service'
         : 'list'
-  const columns = (params.get('cols') ?? 'deployment').split(',')
+  // No extra column by default: a deployment id says little until the
+  // record is opened, where it is listed with the rest of the line's labels.
+  const columns = (params.get('cols') ?? '').split(',')
   const visibleColumns = columns.filter((column) =>
     EXTRA_COLUMNS.includes(column)
   )
@@ -232,7 +254,10 @@ export function LogExplorer({
     {
       title: 'Level',
       key: 'level',
-      values: map(facetValues(facets, 'level'), (value) => value),
+      values: map(
+        bySeverityDesc(facetValues(facets, 'level')),
+        (value) => value
+      ),
     },
     {
       title: 'Service',
@@ -280,7 +305,7 @@ export function LogExplorer({
       key: 'deploy_id',
       values: map(
         facetValues(facets, 'deploy_id'),
-        (value) => `Deployment ${value}`
+        (value) => `Deployment #${value}`
       ),
     },
   ]
@@ -355,6 +380,7 @@ export function LogExplorer({
               <Button
                 variant="ghost"
                 size="sm"
+                className="h-7 px-2 text-xs"
                 aria-expanded={showFacets && !line}
                 aria-controls="log-facets"
                 onClick={() => {
@@ -393,11 +419,12 @@ export function LogExplorer({
                 <DropdownMenuTrigger asChild>
                   <Button
                     variant="ghost"
-                    size="sm"
-                    className="h-7 px-2 text-xs"
+                    size="icon"
+                    className="size-7"
+                    aria-label="Columns"
+                    title="Columns"
                   >
-                    <Columns3 className="mr-1 size-3.5" />
-                    Columns
+                    <Columns3 className="size-3.5" />
                   </Button>
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="end">
@@ -423,12 +450,14 @@ export function LogExplorer({
 
               <Button
                 variant="ghost"
-                size="sm"
+                size="icon"
+                className="size-7"
+                aria-label="Wrap long lines"
+                title="Wrap long lines"
                 aria-pressed={wrap}
                 onClick={() => presentation('wrap', wrap ? '0' : '1')}
               >
-                <WrapText className="mr-1.5 size-3.5" />
-                Wrap
+                <WrapText className="size-3.5" />
               </Button>
               <CopyButton
                 value={window.location.href}
@@ -436,9 +465,15 @@ export function LogExplorer({
                 size="sm"
                 variant="ghost"
               />
-              <Button variant="ghost" size="sm" onClick={exportPage}>
-                <Download className="mr-1.5 size-3.5" />
-                Export page
+              <Button
+                variant="ghost"
+                size="icon"
+                className="size-7"
+                aria-label="Export loaded lines"
+                title="Export loaded lines (NDJSON)"
+                onClick={exportPage}
+              >
+                <Download className="size-3.5" />
               </Button>
             </div>
           </div>
@@ -505,12 +540,12 @@ export function LogExplorer({
                 <Table className="block w-full lg:table lg:table-fixed">
                   <TableHeader className="hidden bg-muted lg:sticky lg:top-0 lg:z-10 lg:table-header-group [&_th]:h-8 [&_th]:text-[10px] [&_th]:uppercase [&_th]:tracking-wide">
                     <TableRow>
-                      <TableHead className="hidden w-24 lg:table-cell">
-                        Time
+                      <TableHead className="hidden w-24 whitespace-nowrap lg:table-cell">
+                        Time (UTC)
                       </TableHead>
                       <TableHead className="w-16">Level</TableHead>
-                      <TableHead className="hidden w-32 lg:table-cell">
-                        Service / container
+                      <TableHead className="hidden w-36 lg:table-cell">
+                        Service
                       </TableHead>
                       <TableHead>Message</TableHead>
                       {visibleColumns.map((column) => (
@@ -540,7 +575,10 @@ export function LogExplorer({
                       return (
                         <TableRow
                           key={key}
-                          className="block px-3 py-2 lg:table-row lg:px-0 lg:py-0"
+                          className={cn(
+                            'block px-3 py-2 lg:table-row lg:px-0 lg:py-0',
+                            logRowTone(entry.level)
+                          )}
                           data-index={virtualRow.index}
                           ref={virtualizer.measureElement}
                           data-state={selected === key ? 'selected' : undefined}
@@ -562,11 +600,13 @@ export function LogExplorer({
                             </span>
                           </TableCell>
                           <TableCell className="hidden py-1.5 lg:table-cell">
+                            {/* The service name is what tells lines apart; the
+                                container is one hover (or the record) away. */}
                             <p
                               className="truncate text-xs"
                               title={`${entry.owner} / ${entry.service}`}
                             >
-                              {entry.owner} / {entry.service}
+                              {entry.owner}
                             </p>
                           </TableCell>
                           <TableCell className="block min-w-0 p-0 lg:table-cell lg:px-4 lg:py-0.5">
@@ -587,6 +627,19 @@ export function LogExplorer({
                               )}
                             >
                               <AnsiLogMessage message={entry.message} />
+                              {logFieldSummary(entry.fields, entry.message).map(
+                                (chip) => (
+                                  <span
+                                    key={chip.key}
+                                    className="ml-3 text-muted-foreground"
+                                  >
+                                    <span className="opacity-70">
+                                      {chip.key}=
+                                    </span>
+                                    {chip.value}
+                                  </span>
+                                )
+                              )}
                             </button>
                           </TableCell>
                           {visibleColumns.map((column) => (
@@ -722,10 +775,9 @@ export function LogExplorer({
             className="space-y-5 xl:sticky xl:top-4"
           >
             <div>
-              <h2 className="text-sm font-semibold">Facets</h2>
+              <h2 className="text-sm font-semibold">Filter by</h2>
               <p className="mt-1 text-xs text-muted-foreground">
-                Counts across the whole time range, not just the loaded lines.
-                Select a value to filter.
+                Counts cover the whole time range. Select a value to filter.
               </p>
             </div>
             {facets?.partial && (
@@ -806,8 +858,17 @@ export function LogExplorer({
                                 width: `${(item.count / facetTotal) * 100}%`,
                               }}
                             />
-                            <span className="relative truncate">
-                              {item.label}
+                            <span className="relative flex min-w-0 items-center gap-1.5">
+                              {facet.key === 'level' && (
+                                <span
+                                  aria-hidden="true"
+                                  className={cn(
+                                    'size-1.5 shrink-0 rounded-full',
+                                    logLevelDot(item.value)
+                                  )}
+                                />
+                              )}
+                              <span className="truncate">{item.label}</span>
                             </span>
                             <span className="relative flex gap-3 tabular-nums text-muted-foreground">
                               {item.count}

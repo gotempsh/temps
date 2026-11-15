@@ -5,6 +5,7 @@
 name = "temps-git-credential"
 version.workspace = true
 edition.workspace = true
+description = "In-sandbox git credential helper and daemon pair that mint per-operation scoped tokens without exposing them to user code"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -36,8 +37,10 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 reqwest = { workspace = true }
-chrono = { workspace = true }
-nix = { version = "0.31", features = ["socket", "user"] }
+nix = { workspace = true, features = ["socket", "user"] }
 
 [dev-dependencies]
-tempfile = "3.10"
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

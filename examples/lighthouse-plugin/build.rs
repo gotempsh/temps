@@ -1,6 +1,12 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::disallowed_methods,
+    reason = "build script: panicking is how a build script reports failure, and it reads the variables Cargo sets for it"
+)]
 use std::env;
 use std::path::Path;
 use std::process::Command;

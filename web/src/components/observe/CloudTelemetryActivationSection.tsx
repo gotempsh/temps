@@ -38,7 +38,6 @@ import type {
   BulkActivationProjectEstimateResponse,
   EstimateBulkActivationRequest,
 } from '@/api/client/types.gen'
-import { problemDetail } from '@/lib/api-problem'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -769,9 +768,27 @@ export function CloudTelemetryActivationSection({
     [nameByProjectId]
   )
 
-  const estimateMutation = useMutation(estimateBulkActivationMutation())
-  const createMutation = useMutation(createBulkActivationJobMutation())
-  const cancelMutation = useMutation(cancelBulkActivationJobMutation())
+  const estimateMutation = useMutation({
+    ...estimateBulkActivationMutation(),
+    meta: {
+      errorTitle:
+        'The instance could not quote this activation, so nothing was started',
+    },
+  })
+  const createMutation = useMutation({
+    ...createBulkActivationJobMutation(),
+    meta: {
+      errorTitle:
+        'The instance refused to queue this activation, so nothing was sent',
+    },
+  })
+  const cancelMutation = useMutation({
+    ...cancelBulkActivationJobMutation(),
+    meta: {
+      errorTitle:
+        'The instance could not record the cancellation. The activation is still running',
+    },
+  })
 
   const invalidateJobQueries = useCallback(
     (batchId?: string) => {
@@ -834,13 +851,8 @@ export function CloudTelemetryActivationSection({
           return null
         }
         return quote
-      } catch (error) {
-        toast.error(
-          problemDetail(
-            error,
-            'The instance could not quote this activation, so nothing was started.'
-          )
-        )
+      } catch {
+        // The app-wide mutation handler already toasts this failure.
         return null
       }
     },
@@ -908,12 +920,7 @@ export function CloudTelemetryActivationSection({
         return
       }
 
-      toast.error(
-        problemDetail(
-          error,
-          'The instance refused to queue this activation, so nothing was sent.'
-        )
-      )
+      // Any other refusal is toasted by the app-wide mutation handler.
     }
   }, [createMutation, estimate, invalidateJobQueries, requestQuote, scope])
 
@@ -934,13 +941,8 @@ export function CloudTelemetryActivationSection({
       toast.success(
         'Cancellation requested. The activation stops at the next chunk boundary; nothing already sent is re-sent when you resume.'
       )
-    } catch (error) {
-      toast.error(
-        problemDetail(
-          error,
-          'The instance could not record the cancellation. The activation is still running.'
-        )
-      )
+    } catch {
+      // The app-wide mutation handler already toasts this failure.
     } finally {
       setCancelOpen(false)
     }

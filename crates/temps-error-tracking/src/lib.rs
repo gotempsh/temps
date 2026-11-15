@@ -1,11 +1,19 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        reason = "tests read fixture configuration (database/service URLs) from the environment"
+    )
+)]
 pub mod handlers;
 pub mod plugin;
 pub mod providers;
 pub mod sentry;
 pub mod services;
+pub(crate) mod tokenizer;
 
 // Re-export main types but not the types modules to avoid ambiguity
 pub use handlers::handler;

@@ -145,4 +145,7 @@ pub enum BuilderError {
 
     #[error("Missing queue service")]
     MissingQueue,
+
+    #[error("Failed to build the TLS service DNS resolver (Cloudflare upstream): {reason}")]
+    DnsResolver { reason: String },
 }

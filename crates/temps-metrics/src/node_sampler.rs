@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use tracing::{debug, warn};
 
-use crate::collector::node::NodeMetricsCollector;
+use crate::collector::node::{NodeMetricsCollector, NodeMetricsScope};
 use crate::collector::{Collector, CollectorConfig};
 use crate::store::{MetricsStore, SourceKind};
 
@@ -54,8 +54,19 @@ impl NodeMetricsSampler {
         config_service: Arc<temps_config::ConfigService>,
         data_dir: PathBuf,
     ) -> Self {
+        Self::with_scope(store, config_service, data_dir, NodeMetricsScope::All)
+    }
+
+    /// A sampler that writes only `scope`'s series. See [`NodeMetricsScope`]
+    /// for which process owns which.
+    pub fn with_scope(
+        store: Arc<dyn MetricsStore>,
+        config_service: Arc<temps_config::ConfigService>,
+        data_dir: PathBuf,
+        scope: NodeMetricsScope,
+    ) -> Self {
         Self {
-            collector: NodeMetricsCollector::new(),
+            collector: NodeMetricsCollector::with_scope(scope),
             store,
             config_service,
             data_dir,
@@ -263,6 +274,49 @@ mod tests {
         if Path::new("/proc/sys/fs/file-nr").exists() {
             assert!(names.iter().any(|n| n == "node.fd_percent"));
         }
+        if Path::new("/proc/self/fd").exists() {
+            assert!(names.iter().any(|n| n == "node.process_open_fds"));
+        }
+    }
+
+    async fn sampled_names(scope: NodeMetricsScope) -> Vec<String> {
+        let store = Arc::new(SpyStore::recording());
+        let sampler = NodeMetricsSampler::with_scope(
+            store.clone() as Arc<dyn MetricsStore>,
+            test_config_service(),
+            PathBuf::from("/tmp"),
+            scope,
+        );
+        sampler.sample_once().await;
+        store.points().into_iter().map(|p| p.name).collect()
+    }
+
+    /// The console samples the host in split mode; it must not report its
+    /// own descriptors as if it were the proxy.
+    #[tokio::test]
+    async fn host_scope_writes_machine_series_and_no_process_series() {
+        let names = sampled_names(NodeMetricsScope::Host).await;
+
+        assert!(
+            names.iter().any(|n| n == "node.disk_percent"),
+            "statvfs-backed disk points are available on every unix, got {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.starts_with("node.process_")),
+            "host scope must not write process series, got {names:?}"
+        );
+    }
+
+    /// A split proxy reports only its own descriptors, so the host is never
+    /// written twice under the control-plane node.
+    #[tokio::test]
+    async fn process_scope_writes_only_process_series() {
+        let names = sampled_names(NodeMetricsScope::Process).await;
+
+        assert!(
+            names.iter().all(|n| n.starts_with("node.process_")),
+            "process scope must write only process series, got {names:?}"
+        );
         if Path::new("/proc/self/fd").exists() {
             assert!(names.iter().any(|n| n == "node.process_open_fds"));
         }

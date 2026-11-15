@@ -128,6 +128,7 @@ mod tests {
     fn span(parent: Option<&str>, status: SpanStatusCode, kind: SpanKind) -> SpanRecord {
         let now = Utc::now();
         SpanRecord {
+            ingest_identity: None,
             project_id: 7,
             deployment_id: None,
             resource: ResourceInfo {

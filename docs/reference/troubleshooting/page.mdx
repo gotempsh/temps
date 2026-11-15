@@ -153,6 +153,18 @@ TEMPS_DATABASE_URL=postgresql://... temps reset-admin-password
 
 This resets the password of the first user with the admin role, then prints a new generated password and asks you to confirm you saved it. Pass `--password` (or `TEMPS_ADMIN_PASSWORD`) to set a specific password non-interactively.
 
+### An admin lost their authenticator and recovery codes
+
+If another admin can still sign in, they reset the account's MFA from **Settings → Users** with **Reset MFA**. The account then signs in with its password and enrolls again.
+
+If no other admin can sign in, run this on the server:
+
+```bash
+TEMPS_DATABASE_URL=postgresql://... temps reset-admin-password --clear-mfa
+```
+
+On top of the password reset, this removes the admin's TOTP secret and recovery codes and signs out all of their sessions. If `require_mfa_for_admins` is on, it is turned off, because an admin without MFA could not sign in with a password otherwise. Enroll MFA again from the **Account** page, then turn the setting back on.
+
 ### The GeoLite2 database is missing
 
 ```
@@ -266,7 +278,7 @@ Temps issues certificates from Let's Encrypt.
 
 Certificates renew automatically within 30 days of expiry. Temps checks at startup and every day at 03:00 UTC. HTTP-01 certificates always renew automatically. DNS-01 certificates renew automatically only through a connected DNS provider. Otherwise Temps sends a notification asking you to renew from the domain's page.
 
-If certificates are issued but browsers do not trust them, check whether `LETSENCRYPT_MODE` is set in the server environment. Any value other than `production` makes Temps use the Let's Encrypt staging environment.
+If certificates are issued but browsers do not trust them, check **Settings > Certificates > Environment** (`letsencrypt.environment`). Any value other than `production` makes Temps use the Let's Encrypt staging environment. The `LETSENCRYPT_MODE` environment variable is deprecated: on startup Temps copies it into that setting once (when the setting is still `production`) and ignores it afterwards.
 
 With on-demand TLS, the first HTTPS request to a new hostname fails while the certificate is issued in the background. Plain HTTP requests in the meantime get `TLS certificate provisioning in progress. Retry in a few seconds.`
 
@@ -283,6 +295,8 @@ The CLI can help: `bunx @temps-sdk/cli domains status`, `domains renewal-attempt
 - the deployment is running (the project's deployments page, or `docker ps` on the host)
 - the container has not crashed or been OOM-killed (see the alarms and the container logs)
 - the app listens on `0.0.0.0` and the configured port
+
+**Preview Unavailable** on a sandbox preview URL (`ws-<id>-<port>.<domain>`) means the proxy could not reach the preview gateway, the container that routes previews into sandboxes. Temps sets it up in the background when it starts, retries on its own when that fails, and checks every minute that it is still running. The console's **AI runtime settings → Preview Gateway** tab (`/agent-sandbox/preview`) shows its state, why the last attempt to set it up failed (for example, its host port already in use), and when Temps tries again; **Restart** tries immediately.
 
 Environments that scale to zero return a 503 JSON body with `"status":"wake_pending"` and a `Retry-After` header while they start. `"status":"wake_failed"` means the environment could not be started; check its deployment and container logs.
 

@@ -5,8 +5,8 @@
  * Types for the Temps external plugin protocol.
  *
  * These types mirror the Rust definitions in:
- * - crates/temps-core/src/external_plugin/manifest.rs
- * - crates/temps-core/src/external_plugin/channel.rs
+ * - crates/temps-plugin-protocol/src/manifest.rs
+ * - crates/temps-plugin-protocol/src/channel.rs
  * - crates/temps-plugin-sdk/src/protocol.rs
  */
 
@@ -72,6 +72,7 @@ export interface ReadyMessage {
   protocol_version: 2;
   ready: boolean;
   has_ui: boolean;
+  openapi?: Record<string, unknown>;
 }
 
 export interface HelloMessage {
@@ -277,6 +278,8 @@ export type RequestHandler = (
 ) => void | Promise<void>;
 
 export interface TempsPlugin {
+  /** Optional OpenAPI document sent in the existing ready message. */
+  openapi?(): Record<string, unknown>;
   /** Plugin manifest describing capabilities, nav entries, and event subscriptions. */
   manifest(): PluginManifest;
 

@@ -30,6 +30,8 @@ import {
 import type { ProjectGroupResponse } from '@/api/client'
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Button } from '@/components/ui/button'
+import { PageHeader } from '@/components/layout/PageContainer'
+import { SaveRow } from '@temps-sdk/ds'
 import {
   Form,
   FormControl,
@@ -91,8 +93,14 @@ export function GroupSettingsPanel({
   })
   const varCount = vars.data?.length ?? 0
 
-  const remove = useMutation({ ...removeProjectFromGroupMutation() })
-  const destroy = useMutation({ ...deleteProjectGroupMutation() })
+  const remove = useMutation({
+    ...removeProjectFromGroupMutation(),
+    meta: { errorTitle: 'Could not remove the service from the project' },
+  })
+  const destroy = useMutation({
+    ...deleteProjectGroupMutation(),
+    meta: { errorTitle: 'The project could not be deleted' },
+  })
 
   const removeService = async () => {
     if (!removing) return
@@ -102,8 +110,8 @@ export function GroupSettingsPanel({
       })
       await invalidate()
       toast.success(`${removing.name} is now a standalone service`)
-    } catch (err) {
-      toast.error(getErrorMessage(err, `Could not remove ${removing.name}`))
+    } catch {
+      // The app-wide mutation handler already toasts this failure.
     } finally {
       setRemoving(null)
     }
@@ -117,8 +125,8 @@ export function GroupSettingsPanel({
         `Project “${group.name}” deleted; its services are standalone now`
       )
       navigate('/projects')
-    } catch (err) {
-      toast.error(getErrorMessage(err, 'The project could not be deleted.'))
+    } catch {
+      // The app-wide mutation handler already toasts this failure.
       setConfirmDelete(false)
     }
   }
@@ -244,9 +252,7 @@ export function GroupSettingsPanel({
       }))}
     >
       <div className="min-w-0 space-y-4">
-        <h1 className="text-xl font-semibold tracking-tight">
-          {SETTINGS_PAGES.find((p) => p.key === page)?.title}
-        </h1>
+        <PageHeader title={SETTINGS_PAGES.find((p) => p.key === page)?.title} />
         {/* Keyed so each page opens with its own sections' default state. */}
         <div key={page} className="space-y-4">
           {content[page]}
@@ -402,9 +408,7 @@ function GroupIdentityForm({ group }: { group: ProjectGroupResponse }) {
             {form.formState.errors.root.message}
           </p>
         )}
-        <Button type="submit" disabled={!dirty || update.isPending}>
-          {update.isPending ? 'Saving…' : 'Save changes'}
-        </Button>
+        <SaveRow dirty={dirty} saving={update.isPending} />
       </form>
     </Form>
   )

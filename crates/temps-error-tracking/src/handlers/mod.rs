@@ -7,3 +7,9 @@ pub mod handler;
 pub mod sentry_compat_handlers;
 pub mod source_map_handlers;
 pub mod types;
+
+pub mod feedback_handler;
+
+pub mod release_handler;
+
+pub mod client_outcome_handler;

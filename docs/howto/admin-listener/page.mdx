@@ -62,7 +62,7 @@ The admin gate (CIDR + Host allowlists) is layered on top of the admin listener 
 | `temps-email-tracking`          | `GET /api/t/pixel/...`, `GET /api/t/click/...`, `POST /api/t/webhook/ses`              | Recipient browsers + AWS SES |
 | `temps-revenue`, `temps-email`  | Stripe + email provider webhooks, `GET /api/emails/{id}/track/open`, `GET /api/emails/{id}/track/click/{n}` | External services + recipient mail clients |
 | `temps-git`                     | `POST /api/webhook/git/{github,gitlab,gitea}/events`, `POST /api/webhook/git/{bitbucket,generic}/events/{token}` | Git providers                |
-| `temps-agents`                  | `POST /api/agents/webhook/{webhook_id}`                                                | Whatever triggers the agent  |
+| `temps-ai-agents`                  | `POST /api/agents/webhook/{webhook_id}`                                                | Whatever triggers the agent  |
 | `temps-proxy`                   | `POST /api/_temps/captcha/verify`                                                      | Visitors of a protected app  |
 | Multi-node                      | `POST /api/internal/nodes/register`, `POST /api/internal/nodes/{id}/heartbeat`, route sync | Worker nodes                 |
 

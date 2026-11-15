@@ -3,7 +3,7 @@
 
 import { SettingsLoadFailure } from '@/components/settings/SettingsLoadFailure'
 import { isForbiddenRead } from '@/lib/read-failure'
-import { Button, Disclosure, Field, FormErrors } from '@temps-sdk/ds'
+import { Button, Disclosure, Field, FormErrors, SaveRow } from '@temps-sdk/ds'
 
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { SettingsSection } from '@/components/ui/settings-section'
@@ -28,20 +28,19 @@ import {
   type PlatformSettings,
 } from '@/hooks/useSettings'
 import { client } from '@/api/client/client.gen'
-import { getPublicIngressStatusQueryKey } from '@/api/client/@tanstack/react-query.gen'
 import {
-  AlertTriangle,
-  Loader2,
-  RefreshCw,
-  Save,
-  ShieldCheck,
-} from 'lucide-react'
+  getPreviewDomainStatusQueryKey,
+  getPublicIngressStatusQueryKey,
+} from '@/api/client/@tanstack/react-query.gen'
+import { PreviewDomainStatus } from '@/components/settings/PreviewDomainStatus'
+import { AlertTriangle, Loader2, RefreshCw, ShieldCheck } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { useForm, useWatch } from 'react-hook-form'
 import { useLocation } from 'react-router'
 import { toast } from 'sonner'
 import { PageHeader } from '@/components/layout/PageContainer'
+import { LocalScreenshotNote } from '@/components/settings/LocalScreenshotNote'
 
 type SettingsFormData = Pick<
   PlatformSettings,
@@ -227,13 +226,12 @@ export function Settings() {
       await queryClient.invalidateQueries({
         queryKey: getPublicIngressStatusQueryKey(),
       })
+      await queryClient.invalidateQueries({
+        queryKey: getPreviewDomainStatusQueryKey(),
+      })
       toast.success('Settings saved successfully')
-    } catch (err: any) {
-      const detail =
-        err?.body?.detail ||
-        err?.message ||
-        'Failed to save settings. Please try again.'
-      toast.error(detail)
+    } catch {
+      // useUpdateSettings already toasts this failure, with the server's reason.
     }
   }
 
@@ -337,7 +335,7 @@ export function Settings() {
             </div>
 
             <div className="space-y-2">
-              <Label htmlFor="preview-domain">Preview Domain</Label>
+              <Label htmlFor="preview-domain">Preview domain</Label>
               <Input
                 id="preview-domain"
                 type="text"
@@ -348,6 +346,7 @@ export function Settings() {
                 Deployments will be accessible at subdomain.
                 {settings?.preview_domain || 'localho.st'}
               </p>
+              <PreviewDomainStatus />
             </div>
             <SettingsSection
               title="Advanced networking"
@@ -453,7 +452,7 @@ export function Settings() {
           </h2>
           <div className="min-w-0 space-y-5">
             <div className="space-y-2">
-              <Label htmlFor="letsencrypt-email">Contact Email</Label>
+              <Label htmlFor="letsencrypt-email">Contact email</Label>
               <Input
                 id="letsencrypt-email"
                 type="email"
@@ -553,7 +552,7 @@ export function Settings() {
               <div className="flex items-center justify-between">
                 <div className="space-y-0.5">
                   <Label htmlFor="screenshots-enabled">
-                    Enable Screenshots
+                    Enable screenshots
                   </Label>
                   <p className="text-sm text-muted-foreground">
                     Generate screenshots of deployments for previews
@@ -587,14 +586,16 @@ export function Settings() {
                       </SelectTrigger>
                       <SelectContent>
                         <SelectItem value="local">
-                          Local Screenshot Service
+                          Local screenshot service
                         </SelectItem>
                         <SelectItem value="external">
-                          External Screenshot API
+                          External screenshot API
                         </SelectItem>
                       </SelectContent>
                     </Select>
                   </div>
+
+                  {screenshots.provider === 'local' && <LocalScreenshotNote />}
 
                   {screenshots.provider === 'external' && (
                     <div className="space-y-2">
@@ -680,32 +681,7 @@ export function Settings() {
           'Contact email': errors.letsencrypt?.email?.message,
         }}
       />
-      <div className="sticky bottom-0 bg-background border-t pt-4 pb-2">
-        <div className="flex flex-col gap-2 sm:flex-row sm:justify-between sm:items-center">
-          <p className="text-sm text-muted-foreground">
-            {isDirty ? 'You have unsaved changes' : 'All changes saved'}
-          </p>
-          <Button
-            type="submit"
-            busy={isSubmitting}
-            busyLabel="Saving…"
-            disabled={!isDirty && !isSubmitting}
-            className="w-full sm:w-auto"
-          >
-            {isSubmitting ? (
-              <>
-                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                Saving...
-              </>
-            ) : (
-              <>
-                <Save className="mr-2 h-4 w-4" />
-                Save Changes
-              </>
-            )}
-          </Button>
-        </div>
-      </div>
+      <SaveRow sticky dirty={isDirty} saving={isSubmitting} />
     </form>
   )
 }

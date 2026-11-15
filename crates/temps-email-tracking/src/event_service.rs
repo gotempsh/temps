@@ -288,7 +288,9 @@ impl EmailEventService {
 
         let paginator = query.paginate(self.db.as_ref(), page_size);
         let total = paginator.num_items().await?;
-        let items = paginator.fetch_page(page - 1).await?;
+        let items = paginator
+            .fetch_page(temps_core::config::page_index(page))
+            .await?;
 
         Ok((items, total))
     }
@@ -368,8 +370,8 @@ impl EmailEventService {
 mod tests {
     use super::*;
     use sea_orm::{ActiveModelTrait, ActiveValue::Set, ConnectionTrait};
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::{email_domains, email_providers, suppressed_recipients};
+    use temps_test_utils::TestDatabase;
 
     const TEST_TOPIC_ARN: &str = "arn:aws:sns:us-east-1:123456789012:temps-ses";
 

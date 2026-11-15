@@ -140,6 +140,36 @@ pub struct ProxyLogResponse {
     /// Upstream response headers, redacted on the same terms as
     /// [`Self::request_headers`].
     pub response_headers: Option<BTreeMap<String, String>>,
+    /// What Shield would have done with the request: `log`, `challenge` or
+    /// `block`. `None` when no reputation list holds the client.
+    #[schema(example = "block")]
+    pub shield_verdict: Option<String>,
+    /// The lists that hold the client, and the range on each.
+    #[schema(example = json!(["spamhaus_drop (192.0.2.0/24)"]))]
+    pub shield_reasons: Vec<String>,
+    /// The client's JA4 TLS fingerprint, when its source gives one.
+    #[schema(example = "t13d1516h2_8daaf6152771_e5627efa2ab1")]
+    pub ja4: Option<String>,
+    /// Where the JA4 came from: `direct`, `cloudflare`, `bunny`, `local` or
+    /// `edge`.
+    #[schema(example = "direct")]
+    pub ja4_source: Option<String>,
+}
+
+/// The stored reasons, a JSON array of strings; anything else reads as none.
+pub fn shield_reasons_from_json(value: Option<serde_json::Value>) -> Vec<String> {
+    match value {
+        Some(serde_json::Value::Array(reasons)) => reasons
+            .iter()
+            .filter_map(|reason| reason.as_str().map(str::to_string))
+            .collect(),
+        Some(_) | None => Vec::new(),
+    }
+}
+
+/// The reasons as stored: `None` when there are none.
+pub fn shield_reasons_to_json(reasons: &[String]) -> Option<serde_json::Value> {
+    (!reasons.is_empty()).then(|| serde_json::Value::from(reasons.to_vec()))
 }
 
 /// Convert a stored header blob into a typed, sorted map.
@@ -201,6 +231,10 @@ impl From<proxy_logs::Model> for ProxyLogResponse {
             cache_status: model.cache_status,
             request_headers: headers_from_json(model.request_headers),
             response_headers: headers_from_json(model.response_headers),
+            shield_verdict: model.shield_verdict,
+            shield_reasons: shield_reasons_from_json(model.shield_reasons),
+            ja4: model.ja4,
+            ja4_source: model.ja4_source,
         }
     }
 }
@@ -255,6 +289,22 @@ pub struct CreateProxyLogRequest {
     /// produced a captured exception. Lets the Observe row deep-link to the
     /// error group without an extra query.
     pub error_group_id: Option<i32>,
+    /// What Shield would have done with the request (ADR 066 D1): `log`,
+    /// `challenge` or `block`. `None` when no list holds the client.
+    #[serde(default)]
+    pub shield_verdict: Option<String>,
+    /// Why, e.g. `spamhaus_drop (192.0.2.0/24)`. Empty when
+    /// `shield_verdict` is `None`.
+    #[serde(default)]
+    pub shield_reasons: Vec<String>,
+    /// The client's JA4 TLS fingerprint (ADR 066 D4). `None` when its
+    /// source gives none: plain HTTP, a CDN without the header.
+    #[serde(default)]
+    pub ja4: Option<String>,
+    /// Where the JA4 came from: `direct`, `cloudflare`, `bunny`, `local` or
+    /// `edge`. `None` when the client could not be resolved.
+    #[serde(default)]
+    pub ja4_source: Option<String>,
 }
 
 pub struct ProxyLogService {
@@ -771,9 +821,17 @@ impl ProxyLogService {
             _ => proxy_logs::Column::Timestamp,
         };
 
+        // `id` is the unique tiebreaker. Without it, rows that share the sort
+        // value (a status code, a method, a host) come back in an unspecified
+        // order, so LIMIT/OFFSET pages overlap or skip rows and "Next page"
+        // shows the same rows again.
         query = match filters.sort_order.as_deref() {
-            Some("asc") => query.order_by_asc(sort_col),
-            _ => query.order_by_desc(sort_col),
+            Some("asc") => query
+                .order_by_asc(sort_col)
+                .order_by_asc(proxy_logs::Column::Id),
+            _ => query
+                .order_by_desc(sort_col)
+                .order_by_desc(proxy_logs::Column::Id),
         };
 
         (query, has_filters)
@@ -919,7 +977,9 @@ impl ProxyLogService {
             || async { paginator.num_items().await },
         )
         .await?;
-        let items = paginator.fetch_page(page - 1).await?;
+        let items = paginator
+            .fetch_page(temps_core::config::page_index(page))
+            .await?;
 
         Ok((items, total))
     }
@@ -1131,7 +1191,7 @@ impl ProxyLogService {
         if let Some(storage) = &self.storage {
             return storage.get_today_count(filters).await;
         }
-        let today_start = Utc::now().date_naive().and_hms_opt(0, 0, 0).unwrap();
+        let today_start = Utc::now().date_naive().and_time(chrono::NaiveTime::MIN);
         let today_start = chrono::DateTime::<Utc>::from_naive_utc_and_offset(today_start, Utc);
 
         let mut query = proxy_logs::Entity::find();
@@ -3135,6 +3195,47 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::{pg_exec_error, pg_query_error};
     use super::*;
+    use crate::handler::proxy_logs::ProxyLogsQuery;
+    use sea_orm::{DatabaseBackend, QueryTrait};
+
+    fn list_sql(sort_by: Option<&str>, sort_order: Option<&str>) -> String {
+        let filters = ProxyLogsQuery {
+            sort_by: sort_by.map(str::to_string),
+            sort_order: sort_order.map(str::to_string),
+            ..Default::default()
+        };
+        let (query, _) = ProxyLogService::build_list_query(None, None, filters);
+        query.build(DatabaseBackend::Postgres).to_string()
+    }
+
+    #[test]
+    fn list_order_breaks_ties_on_id_so_pages_do_not_overlap() {
+        // Sorting by a low-cardinality column must still be a total order,
+        // otherwise OFFSET pages repeat rows.
+        let sql = list_sql(Some("status_code"), Some("asc"));
+        assert!(
+            sql.contains(r#"ORDER BY "proxy_logs"."status_code" ASC, "proxy_logs"."id" ASC"#),
+            "unexpected ORDER BY in: {sql}"
+        );
+    }
+
+    #[test]
+    fn list_order_tiebreaker_follows_the_requested_direction() {
+        let sql = list_sql(Some("method"), Some("desc"));
+        assert!(
+            sql.contains(r#"ORDER BY "proxy_logs"."method" DESC, "proxy_logs"."id" DESC"#),
+            "unexpected ORDER BY in: {sql}"
+        );
+    }
+
+    #[test]
+    fn default_list_order_is_newest_first_with_id_tiebreaker() {
+        let sql = list_sql(None, None);
+        assert!(
+            sql.contains(r#"ORDER BY "proxy_logs"."timestamp" DESC, "proxy_logs"."id" DESC"#),
+            "unexpected ORDER BY in: {sql}"
+        );
+    }
 
     #[test]
     fn deadlock_detected_is_a_transient_write_conflict() {
@@ -3713,7 +3814,7 @@ mod tests {
     /// Postgres is available, per the repo's Docker-test convention.
     #[tokio::test]
     async fn test_stats_served_from_cagg_match_raw_path() {
-        use temps_database::test_utils::TestDatabase;
+        use temps_test_utils::TestDatabase;
 
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
@@ -3911,7 +4012,7 @@ mod tests {
     /// Postgres is available, per the repo's Docker-test convention.
     #[tokio::test]
     async fn test_get_ai_status_breakdown_classifies_101_as_1xx() {
-        use temps_database::test_utils::TestDatabase;
+        use temps_test_utils::TestDatabase;
 
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
@@ -4016,6 +4117,10 @@ mod tests {
             visitor_id: None,
             trace_id: None,
             error_group_id: None,
+            shield_verdict: None,
+            shield_reasons: None,
+            ja4: None,
+            ja4_source: None,
         }
     }
 

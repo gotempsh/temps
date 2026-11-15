@@ -26,8 +26,8 @@ unrelated, effort.
    user; matches `web/src/pages` structure.
 5. **Consumers**: this repo only for now — `web/packages/ds`, consumed by
    `web/src` (OSS) and EE within the `temps/` workspace. Kept publish-ready
-   (mirrors `@temps-sdk/ui`'s shape) but no cross-repo (vibetemps,
-   temps-fleet) commitment yet. Confirmed by user.
+   (mirrors `@temps-sdk/ui`'s shape) but no cross-repo commitment
+   yet. Confirmed by user.
 6. **Enforcement**: lint only for now — typecheck + a tokens-consistency
    check + a raw-Tailwind/hex-literal audit script on touched files. No
    Playwright visual-baseline suite yet (that was the old op package's

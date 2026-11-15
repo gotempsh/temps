@@ -6,7 +6,6 @@ import { toast } from 'sonner'
 import { clearGroupRepositoryMutation } from '@/api/client/@tanstack/react-query.gen'
 import type { ProjectGroupResponse } from '@/api/client'
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
-import { getErrorMessage } from '@/utils/errorHandling'
 import { useInvalidateGroups } from './useProjectGroups'
 
 interface DisconnectRepositoryDialogProps {
@@ -22,7 +21,10 @@ export function DisconnectRepositoryDialog({
   onOpenChange,
 }: DisconnectRepositoryDialogProps) {
   const invalidate = useInvalidateGroups()
-  const clear = useMutation({ ...clearGroupRepositoryMutation() })
+  const clear = useMutation({
+    ...clearGroupRepositoryMutation(),
+    meta: { errorTitle: 'Could not disconnect the repository' },
+  })
   const repo = group.repository
   const repoLabel = repo
     ? `${repo.repo_owner}/${repo.repo_name}`
@@ -35,8 +37,8 @@ export function DisconnectRepositoryDialog({
       toast.success(
         `${group.name} no longer has a repository; its services keep theirs`
       )
-    } catch (err) {
-      toast.error(getErrorMessage(err, 'Could not disconnect the repository'))
+    } catch {
+      // The app-wide mutation handler already toasts this failure.
     } finally {
       onOpenChange(false)
     }

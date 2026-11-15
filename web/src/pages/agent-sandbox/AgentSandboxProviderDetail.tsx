@@ -34,7 +34,11 @@ import {
   type ProviderCatalogResponse,
 } from '@/api/client'
 import { AiHarnessLogo } from '@/components/ui/ai-harness-logo'
-import { harnessSetupHref, workspaceReturnTo } from './harness-onboarding'
+import {
+  backToWorkspaceLabel,
+  harnessSetupHref,
+  workspaceReturnTo,
+} from './harness-onboarding'
 import { refreshAiProviderModelsMutation } from '@/api/client/@tanstack/react-query.gen'
 import { problemDetail } from '@/lib/api-problem'
 import { HarnessConnectionForm } from './HarnessConnectionForm'
@@ -122,7 +126,8 @@ export function AgentSandboxProviderDetail() {
 interface ProviderEditorProps {
   provider: ProviderCatalogDto
   isActive: boolean
-  returnTo?: string
+  /** The workspace page setup was opened from; no way back without one. */
+  returnTo?: string | null
   embedded?: boolean
   onVerificationPending?: (pending: boolean) => void
 }
@@ -130,7 +135,7 @@ interface ProviderEditorProps {
 export function ProviderEditor({
   provider,
   isActive,
-  returnTo = '/ai-first',
+  returnTo = null,
   embedded = false,
   onVerificationPending,
 }: ProviderEditorProps) {
@@ -155,9 +160,11 @@ export function ProviderEditor({
           <AiHarnessLogo providerId={provider.id} size={32} />
           <h2 className="text-lg font-semibold">{provider.name}</h2>
         </div>
-        <Button asChild variant="outline" size="sm">
-          <Link to={returnTo}>Back to workspace</Link>
-        </Button>
+        {returnTo && (
+          <Button asChild variant="outline" size="sm">
+            <Link to={returnTo}>{backToWorkspaceLabel(returnTo)}</Link>
+          </Button>
+        )}
       </div>
 
       <Card className="shadow-none">
@@ -233,7 +240,13 @@ function DefaultModelSetting({ provider }: { provider: ProviderCatalogDto }) {
       (initialModel !== '' && !provider.models.includes(initialModel))
   )
   const [savingModel, setSavingModel] = useState(false)
-  const refreshModelsMutation = useMutation(refreshAiProviderModelsMutation())
+  const refreshModelsMutation = useMutation({
+    ...refreshAiProviderModelsMutation(),
+    meta: {
+      errorTitle:
+        'Could not refresh the provider models. Check its credential and try again',
+    },
+  })
 
   useEffect(() => {
     const fresh = provider.default_model ?? ''
@@ -296,13 +309,8 @@ function DefaultModelSetting({ provider }: { provider: ProviderCatalogDto }) {
             'Temps kept the last known model list because live discovery did not complete.',
         })
       }
-    } catch (cause) {
-      toast.error(`Could not refresh ${provider.name} models`, {
-        description: problemDetail(
-          cause,
-          'The provider did not return a model catalog. Check its credential and try again.'
-        ),
-      })
+    } catch {
+      // The app-wide mutation handler already toasts this failure.
     }
   }
 

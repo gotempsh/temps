@@ -4,7 +4,7 @@
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router'
 import { formatDistanceToNow } from 'date-fns'
-import { Loader2, Terminal, Trash2 } from 'lucide-react'
+import { Info, Loader2, Terminal, Trash2 } from 'lucide-react'
 import {
   useMutation,
   useQueryClient,
@@ -46,6 +46,14 @@ import {
 import { useAuth } from '@/contexts/AuthContext-shared'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import { problemDetail } from '@/lib/api-problem'
+import { WORKER_NODES_URL } from '@/lib/worker-nodes'
+import { PlatformFeatureNotice } from '@/components/platform/PlatformFeatureNotice'
+import { WorkerNodeRequiredAlert } from './WorkerNodeRequiredBanner'
+import {
+  CONTROL_PLANE_RUNS_NO_SANDBOXES_MESSAGE,
+  isControlPlaneWithoutWorkloads,
+  nodeSandboxesFailure,
+} from './node-sandboxes-state'
 import {
   evictionReportFromProblem,
   evictionReportFromResponse,
@@ -70,6 +78,8 @@ export function NodeSandboxesPanel({
   query,
   page,
   onPageChange,
+  sandboxesAvailable = true,
+  sandboxesLocal,
 }: {
   /** Addressed by id: the server reads a digit-only name as an id. */
   nodeId: number
@@ -79,6 +89,17 @@ export function NodeSandboxesPanel({
   query: UseQueryResult<NodeSandboxesResponse, Error>
   page: number
   onPageChange: (page: number) => void
+  /**
+   * `PlatformFeatures.sandboxes`: the server serves the sandbox API at all.
+   * When false the page does not query it, and this says why.
+   */
+  sandboxesAvailable?: boolean
+  /**
+   * `PlatformFeatures.sandboxes_local`: the control plane runs sandboxes on
+   * its own host. `false` on a control plane that runs no workloads
+   * (ADR 063), where its node page explains that sandboxes run on workers.
+   */
+  sandboxesLocal?: boolean
 }) {
   const { user } = useAuth()
   const queryClient = useQueryClient()
@@ -195,6 +216,10 @@ export function NodeSandboxesPanel({
     )
   }
 
+  if (!sandboxesAvailable) {
+    return <PlatformFeatureNotice available={false} label="Sandboxes" />
+  }
+
   if (query.isLoading) {
     return <NodeSandboxesSkeleton />
   }
@@ -202,13 +227,19 @@ export function NodeSandboxesPanel({
   // A failed background refresh keeps showing the last good list (and any
   // open dialog); only a list that never loaded is replaced by the error.
   if (!query.data) {
+    const failure = nodeSandboxesFailure(query.error)
+    if (failure.kind === 'worker-node-required') {
+      return (
+        <WorkerNodeRequiredAlert
+          reason={failure.reason}
+          setupPath={failure.setupPath}
+        />
+      )
+    }
     return (
       <Alert variant="destructive">
         <AlertDescription className="flex items-center justify-between gap-2">
-          <span>
-            Could not load sandboxes on this node:{' '}
-            {problemDetail(query.error, 'Try again in a moment.')}
-          </span>
+          <span>Could not load sandboxes on this node: {failure.message}</span>
           <Button size="sm" variant="outline" onClick={() => query.refetch()}>
             Retry
           </Button>
@@ -218,6 +249,16 @@ export function NodeSandboxesPanel({
   }
 
   const { node, sandboxes } = query.data
+  // ADR 063: the control plane of a server that runs no workloads takes no
+  // sandboxes. That is a fact about the server, not an error, so the tab
+  // says it plainly and points at the workers.
+  const noLocalWorkloads = isControlPlaneWithoutWorkloads(
+    node.is_control_plane,
+    sandboxesLocal
+  )
+  const refreshFailure = query.isError
+    ? nodeSandboxesFailure(query.error)
+    : undefined
 
   return (
     <Card>
@@ -226,7 +267,9 @@ export function NodeSandboxesPanel({
           <div className="flex items-center justify-between gap-2 border-b px-4 py-2 text-xs text-destructive">
             <span>
               Could not refresh this list:{' '}
-              {problemDetail(query.error, 'Try again in a moment.')}
+              {refreshFailure?.kind === 'message'
+                ? refreshFailure.message
+                : refreshFailure?.reason}
             </span>
             <Button size="sm" variant="outline" onClick={() => query.refetch()}>
               Retry
@@ -241,17 +284,28 @@ export function NodeSandboxesPanel({
         )}
         <div className="flex flex-wrap items-center justify-between gap-2 border-b px-4 py-3 text-sm">
           <span className="text-muted-foreground">
-            {node.eligible
-              ? 'This node accepts new sandboxes.'
-              : `This node does not accept new sandboxes: ${node.reason ?? 'not eligible'}. Existing sandboxes keep running.`}
+            {noLocalWorkloads
+              ? CONTROL_PLANE_RUNS_NO_SANDBOXES_MESSAGE
+              : node.eligible
+                ? 'This node accepts new sandboxes.'
+                : `This node does not accept new sandboxes: ${node.reason ?? 'not eligible'}. Existing sandboxes keep running.`}
           </span>
           <div className="flex items-center gap-3">
-            <Link
-              to={SANDBOX_SETTINGS_URL}
-              className="text-sm underline underline-offset-2"
-            >
-              Sandbox placement settings
-            </Link>
+            {noLocalWorkloads ? (
+              <Link
+                to={WORKER_NODES_URL}
+                className="text-sm underline underline-offset-2"
+              >
+                Worker nodes
+              </Link>
+            ) : (
+              <Link
+                to={SANDBOX_SETTINGS_URL}
+                className="text-sm underline underline-offset-2"
+              >
+                Sandbox placement settings
+              </Link>
+            )}
             {total > 0 && (
               <Button
                 size="sm"
@@ -266,7 +320,21 @@ export function NodeSandboxesPanel({
           </div>
         </div>
 
-        {sandboxes.length === 0 ? (
+        {sandboxes.length === 0 && noLocalWorkloads ? (
+          <div className="flex flex-col items-center justify-center px-4 py-8 text-center">
+            <Info className="mb-2 h-8 w-8 text-muted-foreground" />
+            <p className="text-sm text-muted-foreground">
+              No sandboxes run on this control plane.
+            </p>
+            <p className="mt-1 text-xs text-muted-foreground">
+              A new sandbox is placed on a worker node:{' '}
+              <code className="font-mono">
+                bunx @temps-sdk/cli sandbox create
+              </code>
+              . Each worker&rsquo;s page lists the sandboxes on it.
+            </p>
+          </div>
+        ) : sandboxes.length === 0 ? (
           <div className="flex flex-col items-center justify-center px-4 py-8 text-center">
             <Terminal className="mb-2 h-8 w-8 text-muted-foreground" />
             <p className="text-sm text-muted-foreground">

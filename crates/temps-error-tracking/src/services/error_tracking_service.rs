@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use chrono::{DateTime, Utc};
-use sea_orm::{ActiveModelTrait, DatabaseConnection, EntityTrait, Set};
+use sea_orm::{DatabaseConnection, EntityTrait};
 use std::sync::Arc;
 use temps_core::UtcDateTime;
 use temps_entities::{environments, error_groups, projects};
@@ -34,9 +34,13 @@ pub struct ErrorTrackingService {
     pub crud: ErrorCRUDService,
     pub analytics: ErrorAnalyticsService,
     pub alerts: ErrorAlertService,
+    pub feedback: super::feedback_service::FeedbackService,
+    pub client_outcomes: super::client_outcome_service::ClientOutcomeService,
+    pub releases: super::release_service::ReleaseService,
     source_map_service: OnceCell<Arc<SourceMapService>>,
     notification_callback: OnceCell<NotificationCallback>,
     autopilot_callback: OnceCell<NotificationCallback>,
+    job_queue: OnceCell<Arc<dyn temps_core::JobQueue>>,
 }
 
 impl ErrorTrackingService {
@@ -46,10 +50,14 @@ impl ErrorTrackingService {
             ingestion: ErrorIngestionService::new(db.clone()),
             crud: ErrorCRUDService::new(db.clone()),
             analytics: ErrorAnalyticsService::new(db.clone()),
+            feedback: super::feedback_service::FeedbackService::new(db.clone()),
+            client_outcomes: super::client_outcome_service::ClientOutcomeService::new(db.clone()),
+            releases: super::release_service::ReleaseService::new(db.clone()),
             alerts: ErrorAlertService::new(db),
             source_map_service: OnceCell::new(),
             notification_callback: OnceCell::new(),
             autopilot_callback: OnceCell::new(),
+            job_queue: OnceCell::new(),
         }
     }
 
@@ -71,6 +79,37 @@ impl ErrorTrackingService {
     /// Only notifications with trigger_type "new_issue" or "regression" are forwarded.
     pub fn set_autopilot_callback(&self, callback: NotificationCallback) {
         let _ = self.autopilot_callback.set(callback);
+    }
+
+    /// Announce new and regressed groups on the job queue (ADR-054), so
+    /// autofix can act on them without depending on an alert rule.
+    pub fn set_job_queue(&self, queue: Arc<dyn temps_core::JobQueue>) {
+        let _ = self.job_queue.set(queue);
+    }
+
+    /// Publish [`temps_core::ErrorGroupOpenedJob`]. Only new groups and
+    /// regressions reach here, so ingest pays this once per issue, not per
+    /// event; a failed send is logged and never fails the ingest.
+    async fn announce_group_opened(&self, group: &error_groups::Model, regression: bool) {
+        let Some(queue) = self.job_queue.get() else {
+            return;
+        };
+        let job = temps_core::Job::ErrorGroupOpened(temps_core::ErrorGroupOpenedJob {
+            project_id: group.project_id,
+            error_group_id: group.id,
+            environment_id: group.environment_id,
+            regression,
+        });
+        if let Err(error) = queue.send(job).await {
+            tracing::warn!(
+                project_id = group.project_id,
+                error_group_id = group.id,
+                "failed to announce error group {} of project {}: {}",
+                group.id,
+                group.project_id,
+                error
+            );
+        }
     }
 
     /// Send notifications for alert results
@@ -126,8 +165,44 @@ impl ErrorTrackingService {
     /// After ingestion, evaluates alert rules and sends notifications.
     pub async fn process_error_event(
         &self,
-        mut error_data: CreateErrorEventData,
+        error_data: CreateErrorEventData,
     ) -> Result<i32, ErrorTrackingError> {
+        Ok(self
+            .process_error_event_with_receipt(error_data)
+            .await?
+            .group_id)
+    }
+
+    pub async fn cleanup_source_keys(&self) -> Result<u64, ErrorTrackingError> {
+        if let Some(source_maps) = self.source_map_service.get() {
+            if source_maps.cleanup_artifact_chunks().await.is_err() {
+                tracing::warn!(
+                    error_class = "artifact_chunk_cleanup",
+                    "Expired artifact chunk cleanup failed"
+                );
+            }
+        }
+        if temps_otel::storage::receipts::cleanup(self.db.as_ref())
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                error_class = "telemetry_receipt_cleanup",
+                "Telemetry retry receipt cleanup failed"
+            );
+        }
+        self.ingestion.cleanup_source_keys().await
+    }
+
+    pub async fn process_error_event_with_receipt(
+        &self,
+        error_data: CreateErrorEventData,
+    ) -> Result<super::types::ErrorIngestReceipt, ErrorTrackingError> {
+        let mut error_data = error_data.without_nul();
+        // Artifact availability and symbolication admission must never change
+        // the identity of the same SDK-submitted stack.
+        let submitted_fingerprint = (error_data.source.as_deref() == Some("sentry"))
+            .then(|| self.ingestion.generate_fingerprint(&error_data));
         // Symbolicate stack traces if source maps are available
         if let Some(sm_service) = self.source_map_service.get() {
             if let Err(e) = sm_service.symbolicate_error_event(&mut error_data).await {
@@ -142,31 +217,27 @@ impl ErrorTrackingService {
             || error_data.user_email.is_some()
             || error_data.visitor_id.is_some();
 
-        // Check if a group already exists for this fingerprint (before ingestion)
-        // Capture the pre-ingestion status for regression detection
-        let fingerprint = self.ingestion.generate_fingerprint(&error_data);
-        let existing_group_id = self
-            .ingestion
-            .find_group_by_fingerprint_public(&fingerprint, error_data.project_id)
-            .await;
-
-        // Capture pre-ingestion status so regression detection works correctly
-        // (ingestion doesn't change status, but we need the status before any re-open)
-        let pre_ingestion_status = if let Some(gid) = existing_group_id {
-            self.load_group(gid)
-                .await
-                .map(|g| g.status.clone())
-                .unwrap_or_default()
-        } else {
-            String::new()
-        };
-
         let project_id = error_data.project_id;
-        let group_id = self.ingestion.process_error_event(error_data).await?;
+        let outcome = match submitted_fingerprint {
+            Some(fingerprint) => {
+                self.ingestion
+                    .process_with_fingerprint(error_data, fingerprint)
+                    .await?
+            }
+            None => self.ingestion.process_with_outcome(error_data).await?,
+        };
+        let group_id = outcome.group_id;
+        if !outcome.inserted {
+            return Ok(super::types::ErrorIngestReceipt {
+                group_id,
+                stored: false,
+            });
+        }
+        let pre_ingestion_status = outcome.previous_status;
 
         // Evaluate alert rules (fire-and-forget, don't fail the ingestion)
         if let Some(group) = self.load_group(group_id).await {
-            let is_new_group = existing_group_id.is_none();
+            let is_new_group = outcome.created;
             let is_regression =
                 pre_ingestion_status == "resolved" || pre_ingestion_status == "ignored";
 
@@ -178,16 +249,10 @@ impl ErrorTrackingService {
                 is_regression
             );
 
-            // Re-open the group if it was resolved/ignored (regression)
-            if is_regression {
-                tracing::info!(
-                    "Regression detected: group {} was '{}', re-opening to 'unresolved'",
-                    group_id,
-                    pre_ingestion_status
-                );
-                if let Err(e) = self.reopen_group(group_id).await {
-                    tracing::error!("Failed to re-open group {}: {}", group_id, e);
-                }
+            // Ingestion reopens regressions in the same transaction as the
+            // event and count, so concurrent requests cannot each claim one.
+            if is_new_group || is_regression {
+                self.announce_group_opened(&group, is_regression).await;
             }
 
             let notifications = if is_new_group {
@@ -209,7 +274,10 @@ impl ErrorTrackingService {
             self.send_alert_notifications(enriched).await;
         }
 
-        Ok(group_id)
+        Ok(super::types::ErrorIngestReceipt {
+            group_id,
+            stored: true,
+        })
     }
 
     /// List error groups (delegates to CRUD service).
@@ -304,19 +372,38 @@ impl ErrorTrackingService {
         page: Option<u64>,
         page_size: Option<u64>,
     ) -> Result<(Vec<ErrorEventDomain>, u64), ErrorTrackingError> {
+        self.list_error_events_filtered(
+            group_id,
+            project_id,
+            page,
+            page_size,
+            &super::types::ErrorEventFilter::default(),
+        )
+        .await
+    }
+
+    pub async fn list_error_events_filtered(
+        &self,
+        group_id: i32,
+        project_id: i32,
+        page: Option<u64>,
+        page_size: Option<u64>,
+        filter: &super::types::ErrorEventFilter,
+    ) -> Result<(Vec<ErrorEventDomain>, u64), ErrorTrackingError> {
         let (mut events, total) = self
             .crud
-            .list_error_events(group_id, project_id, page, page_size)
+            .list_error_events_filtered(group_id, project_id, page, page_size, filter)
             .await?;
-
         if let Some(sm_service) = self.source_map_service.get() {
             for event in &mut events {
                 if let Some(data) = &mut event.data {
                     sm_service.symbolicate_stored_event(project_id, data).await;
+                    if let Some(frames) = data.get("stack_trace") {
+                        event.stack_trace = Some(frames.clone());
+                    }
                 }
             }
         }
-
         Ok((events, total))
     }
 
@@ -377,7 +464,7 @@ impl ErrorTrackingService {
     ///
     /// Performs on-the-fly symbolication if:
     /// - A source map service is configured
-    /// - The event has stored sentry data with a release version
+    /// - The event has Debug ID images or a release version
     /// - The stack frames haven't been symbolicated yet
     pub async fn get_error_event(
         &self,
@@ -394,24 +481,13 @@ impl ErrorTrackingService {
         if let Some(sm_service) = self.source_map_service.get() {
             if let Some(data) = &mut event.data {
                 sm_service.symbolicate_stored_event(project_id, data).await;
+                if let Some(frames) = data.get("stack_trace") {
+                    event.stack_trace = Some(frames.clone());
+                }
             }
         }
 
         Ok(event)
-    }
-
-    /// Re-open a resolved/ignored error group back to unresolved (regression)
-    async fn reopen_group(&self, group_id: i32) -> Result<(), ErrorTrackingError> {
-        let group = error_groups::Entity::find_by_id(group_id)
-            .one(self.db.as_ref())
-            .await?
-            .ok_or(ErrorTrackingError::GroupNotFound)?;
-
-        let mut update: error_groups::ActiveModel = group.into();
-        update.status = Set("unresolved".to_string());
-        update.updated_at = Set(chrono::Utc::now());
-        update.update(self.db.as_ref()).await?;
-        Ok(())
     }
 
     /// Enrich alert notifications with project/environment names for better emails

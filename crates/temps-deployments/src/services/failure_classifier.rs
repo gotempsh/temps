@@ -57,7 +57,11 @@ use utoipa::ToSchema;
 /// `build_node_unreachable`, and any other extraction or publish error is
 /// `static_deploy_failed`. A Docker archive download is no longer reported as a
 /// dependency download.
-pub const FAILURE_CLASSIFIER_VERSION: u8 = 6;
+///
+/// v7: a static bundle entry refused for its path (absolute, escaping the
+/// extraction directory, or a link) is `static_output_rejected` rather than
+/// `static_deploy_failed`.
+pub const FAILURE_CLASSIFIER_VERSION: u8 = 7;
 
 /// Marker Compose deployments put before embedded container log tails.
 const CONTAINER_LOGS_MARKER: &str = "container logs for unhealthy/stopped services:";
@@ -661,7 +665,7 @@ pub const fn guidance_for(code: DeploymentFailureCode) -> FailureGuidance {
         ),
         C::StaticOutputRejected => (
             "Static output cannot be published",
-            "The build produced files the platform refuses to publish as a static site: the output is larger than the static size or file-count limits, or it contains symbolic links, special files or sensitive files such as .env. Remove them from the output directory (or exclude them in the build), or point the output directory at the folder that holds only the site.",
+            "The build produced files the platform refuses to publish as a static site: the output is larger than the static size or file-count limits, or it contains symbolic links, special files, sensitive files such as .env, or entries whose paths are absolute or escape the output directory. Remove them from the output directory (or exclude them in the build), or point the output directory at the folder that holds only the site.",
             Some(S::Build),
         ),
         C::BuildNodeUnreachable => (
@@ -1025,6 +1029,27 @@ fn classify_lowercase(raw: &str) -> DeploymentFailureClassification {
     if contains_any(r, &["worker builds cannot", "worker builds do not support"]) {
         return make(S::Configuration, C::InvalidConfiguration);
     }
+    // A Compose stack's placement refused the deployment before anything
+    // ran: its home node is offline (stacks never fail over, their volumes
+    // live there), no node can take its first deployment, it links
+    // services a worker cannot reach, or it was moved or pinned elsewhere
+    // while this deployment ran. The remedy is in the message. These come
+    // from planning (no job yet) or the Compose job, never from build or
+    // container output, whose free text could otherwise contain a phrase.
+    if matches!(phase, None | Some(JobPhase::Compose))
+        && contains_any(
+            r,
+            &[
+                "will not start the stack anywhere else",
+                "no node can take the first deployment of compose environment",
+                "compose stacks on worker nodes cannot reach linked services",
+                "was moved while deployment",
+                "by another deployment while this one was starting",
+            ],
+        )
+    {
+        return make(S::Configuration, C::InvalidConfiguration);
+    }
 
     // ── Resources ───────────────────────────────────────────────────────
     if contains_any(r, &["out of memory", "oomkilled", "exit code 137"]) || contains_word(r, "oom")
@@ -1052,7 +1077,15 @@ fn classify_lowercase(raw: &str) -> DeploymentFailureClassification {
     {
         return make(S::Configuration, C::ComposePolicyRejected);
     }
-    if r.contains("docker compose v2 is unavailable") {
+    // The node cannot run Compose stacks (yet): no Compose plugin, or a
+    // worker still publishing on its public address before its mesh is up.
+    if contains_any(
+        r,
+        &[
+            "docker compose v2 is unavailable",
+            "a compose stack publishes its ports only on a private address",
+        ],
+    ) {
         return make(S::Platform, C::ComposeUnavailable);
     }
     if contains_any(
@@ -1364,6 +1397,9 @@ fn classify_lowercase(raw: &str) -> DeploymentFailureClassification {
                 "is not publishable",
                 "unsafe entry",
                 "path traversal",
+                // A bundle entry refused for its path or type: the message
+                // names the entry and what to change.
+                "rejected archive entry",
                 "did not resolve to a confined directory",
             ],
         ) {
@@ -2018,6 +2054,69 @@ mod tests {
         assert_class(&untouched, S::Image, C::ImageMissing);
     }
 
+    /// Compose placement refusals carry their remedy in the message and are
+    /// configuration outcomes. Built from the real errors, so rewording one
+    /// cannot silently change how its deployment failure is recorded.
+    #[test]
+    fn compose_placement_refusals_are_configuration_failures() {
+        use crate::services::compose_placement::ComposePlacementError as E;
+        let refusals = [
+            E::HomeNodeUnavailable {
+                environment_id: 2,
+                environment_name: "production".to_string(),
+                node_id: 3,
+                node_name: "worker-a".to_string(),
+                state: "offline".to_string(),
+            },
+            E::NoPlacement {
+                environment_id: 2,
+                environment_name: "production".to_string(),
+                reason: "no active node matches".to_string(),
+            },
+            E::PinnedConcurrently {
+                environment_id: 2,
+                pinned: "worker node #4".to_string(),
+                expected: "worker node #3".to_string(),
+            },
+            E::MovedConcurrently {
+                environment_id: 2,
+                deployment_id: 9,
+                expected: "worker node #3 (moving from the control plane)".to_string(),
+                current: "worker node #4 (moving from the control plane)".to_string(),
+            },
+        ];
+        for refusal in refusals {
+            assert_class(
+                &wrapped("deploy_compose", &refusal.to_string()),
+                S::Configuration,
+                C::InvalidConfiguration,
+            );
+            // Raised while planning, before any job ran.
+            assert_class(
+                &format!("Compose placement refused deployment 9: {refusal}"),
+                S::Configuration,
+                C::InvalidConfiguration,
+            );
+        }
+    }
+
+    /// A build whose own output happens to contain a placement refusal's
+    /// wording is still a build failure, not a placement refusal.
+    #[test]
+    fn placement_wording_in_build_output_is_not_a_placement_refusal() {
+        let reason = wrapped(
+            "build_image",
+            "Build failed: step 4/9 RUN ./check.sh: lock was taken by another deployment while \
+             this one was starting; exit code 1",
+        );
+        let got = classify_failure_reason(Some(&reason));
+        assert_ne!(
+            (got.stage, got.code),
+            (S::Configuration, C::InvalidConfiguration),
+            "{reason}"
+        );
+    }
+
     #[test]
     fn build_plan_failures_are_classified_before_building() {
         let missing = wrapped(
@@ -2175,6 +2274,14 @@ mod tests {
             "Compose prepare/pull failed: Docker Compose v2 is unavailable: failed to run `docker compose version`: No such file or directory. Install the Docker Compose CLI plugin",
         );
         assert_class(&unavailable, S::Platform, C::ComposeUnavailable);
+
+        // The worker agent's refusal while it still publishes on its public
+        // address (`AgentComposeError::PublicBindAddress`).
+        let off_mesh = wrapped(
+            "deploy_compose",
+            "Compose prepare/pull failed: worker node 'worker-a': This node publishes container ports on 203.0.113.10, a public address: it joined the cluster with a public address and is not on its WireGuard mesh yet. A Compose stack publishes its ports only on a private address, as the control plane keeps them on loopback, so project 'temps-1-2' was not prepared. Deploy again once the node is on the mesh (its mesh status is shown in the node list)",
+        );
+        assert_class(&off_mesh, S::Platform, C::ComposeUnavailable);
 
         let generic = wrapped(
             "deploy_compose",
@@ -2602,6 +2709,20 @@ mod tests {
             "❌ Failed to deploy static files: Static deployment source contains a symbolic link: /tmp/x/dist/link",
         );
         assert_class(&publish, S::Deploy, C::StaticOutputRejected);
+    }
+
+    #[test]
+    fn bundle_entries_refused_for_their_path_are_rejected_output() {
+        // The exact text `WorkflowError::InvalidArchiveEntry` renders, so a
+        // reworded error cannot silently fall back to `static_deploy_failed`.
+        let entry = crate::workflow::WorkflowError::InvalidArchiveEntry {
+            path: "../escape.txt".to_string(),
+            reason: "a '..' path component would write outside the extraction directory; use paths relative to the archive root".to_string(),
+        }
+        .to_string();
+        assert!(entry.contains("'../escape.txt'"), "{entry}");
+        let reason = wrapped("deploy_static_bundle", &entry);
+        assert_class(&reason, S::Deploy, C::StaticOutputRejected);
     }
 
     #[test]

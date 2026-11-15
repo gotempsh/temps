@@ -7,6 +7,11 @@
 //! Outputs container IDs, names, ports, and service names for
 //! MarkDeploymentCompleteJob to register in deployment_containers.
 
+use crate::workflow::JobResult;
+use crate::workflow::WorkflowCancellationProvider;
+use crate::workflow::WorkflowContext;
+use crate::workflow::WorkflowError;
+use crate::workflow::WorkflowTask;
 use async_trait::async_trait;
 use sea_orm::{
     sea_query::Expr, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QuerySelect, Set,
@@ -16,15 +21,19 @@ use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use temps_core::{
-    JobResult, WorkflowCancellationProvider, WorkflowContext, WorkflowError, WorkflowTask,
-};
 use temps_database::DbConnection;
 use temps_deployer::compose::{
-    ComposeDeployRequest, ComposeExecutor, ComposeOutputSink, EnvFileSource,
+    ComposeCheckInput, ComposeDeployRequest, ComposeError, ComposeExecutor, ComposeOutputSink,
+    EnvFileSource, ResolvedComposeConfiguration,
 };
+use temps_deployer::compose_translation::{
+    self, ComposeTranslation, ComposeTranslationInput, EnvFileContent,
+};
+use temps_deployment_logs::{LogLevel, LogService};
+use temps_entities::environment_workload_mode::EnvironmentWorkloadMode;
 use temps_entities::{deployment_containers, deployments, preset::ComposePublicPort};
-use temps_logs::{LogLevel, LogService};
+
+use super::compose_host::ComposeStackHost;
 use tracing::debug;
 
 fn route_binding_for_service<'a>(
@@ -95,6 +104,57 @@ fn health_check_path_for_public_route(
         .filter(|path| is_safe_health_check_path(path))
         .unwrap_or("/")
         .to_string())
+}
+
+/// The detected health check path as stored in the service snapshot, which
+/// is persisted on the project and returned to anyone who can read it.
+/// Variables are substituted before detection, so a healthcheck such as
+/// `curl localhost/ready/${TOKEN}` would otherwise persist the secret.
+/// Only a path the public route could use is kept (no query, fragment,
+/// userinfo or scheme), and only when it is written literally in the Compose
+/// `sources`: any other path was produced by substitution, and its values may
+/// come from the project, the repository `.env` or an include's env files, so
+/// none can be ruled out. The route then falls back to `/`, as it does for
+/// any unsafe path.
+/// The service list saved on the project for the settings page, from the
+/// resolved model so it shows what deploys. Readers of the project need not
+/// be allowed to reveal environment values, so nothing substituted reaches
+/// it: images pass through `redact`, and a health path is kept only when it
+/// is written literally (see [`snapshot_health_check_path`]). Detection runs
+/// on the resolved image first, so a masked image is still recognised.
+/// Best-effort: a parse failure yields an empty list rather than failing the
+/// deployment, since this only feeds a UI convenience.
+fn compose_service_snapshots(
+    resolved_content: &str,
+    override_content: Option<&str>,
+    health_path_sources: &[&str],
+    redact: impl Fn(&str) -> String,
+) -> Vec<temps_entities::preset::ComposeServiceSnapshot> {
+    temps_presets::list_compose_services_with_override(resolved_content, override_content)
+        .map(|services| {
+            services
+                .into_iter()
+                .map(|s| temps_entities::preset::ComposeServiceSnapshot {
+                    name: s.name,
+                    image: s.image.as_deref().map(&redact),
+                    looks_like_database: s.looks_like_database,
+                    detected_service_type: s.detected_service_type,
+                    ports: s.ports,
+                    health_check_path: snapshot_health_check_path(
+                        s.health_check_path,
+                        health_path_sources,
+                    ),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn snapshot_health_check_path(path: Option<String>, sources: &[&str]) -> Option<String> {
+    let path = path?;
+    (is_safe_health_check_path(&path)
+        && sources.iter().any(|source| source.contains(path.as_str())))
+    .then_some(path)
 }
 
 fn is_safe_health_check_path(path: &str) -> bool {
@@ -177,9 +237,33 @@ pub struct DeployComposeJob {
     /// at safe phase boundaries instead of dropping in-flight filesystem or
     /// Docker futures that could outlive cleanup.
     cancellation_requested: AtomicBool,
+    /// Whether this job has begun stopping the running stack. Until it has, a
+    /// failure must leave that stack alone: it is still serving, and
+    /// [`Self::cleanup`] would otherwise take it down with its secrets, for a
+    /// deployment that never got as far as replacing it. Stays set across
+    /// attempts, because the stack an earlier attempt stopped does not come back.
+    replacing_running_stack: AtomicBool,
+    /// The failed stack was stopped and recorded so its logs stay readable.
+    /// [`WorkflowTask::cleanup`] leaves it in place; the next attempt removes it.
+    retained_failed_stack: AtomicBool,
     /// Unique to this in-memory job construction, including a replay of the
     /// same durable deployment/workflow identifiers.
     secret_generation: String,
+    /// The environment's ADR-055 mode. `legacy` never translates; `shadow`
+    /// translates and logs how the result differs from the running stack;
+    /// `enforce` refuses a project the plane cannot express before the
+    /// running stack is touched.
+    workload_mode: EnvironmentWorkloadMode,
+    /// Where the stack runs: its pinned home (see `services::compose_placement`).
+    host: ComposeStackHost,
+    /// The host a requested move leaves: the stack is stopped there (volumes
+    /// kept) before it starts on `host`.
+    vacate_host: Option<ComposeStackHost>,
+    /// Pin `host` as the stack's home when this deployment reaches
+    /// `docker compose up`, the first moment it can hold data there.
+    pin_home: bool,
+    /// Target Nodes / Label Selectors no longer describe the home.
+    placement_drift: Option<String>,
 }
 
 pub struct DeployComposeJobBuilder {
@@ -205,6 +289,11 @@ pub struct DeployComposeJobBuilder {
     download_job_id: Option<String>,
     log_id: Option<String>,
     log_service: Option<Arc<LogService>>,
+    workload_mode: EnvironmentWorkloadMode,
+    host: ComposeStackHost,
+    vacate_host: Option<ComposeStackHost>,
+    pin_home: bool,
+    placement_drift: Option<String>,
 }
 
 impl Default for DeployComposeJobBuilder {
@@ -238,7 +327,41 @@ impl DeployComposeJobBuilder {
             download_job_id: None,
             log_id: None,
             log_service: None,
+            workload_mode: EnvironmentWorkloadMode::Legacy,
+            host: ComposeStackHost::ControlPlane,
+            vacate_host: None,
+            pin_home: false,
+            placement_drift: None,
         }
+    }
+
+    /// The environment's ADR-055 workload mode (default `legacy`).
+    pub fn workload_mode(mut self, mode: EnvironmentWorkloadMode) -> Self {
+        self.workload_mode = mode;
+        self
+    }
+
+    /// Where the stack runs. Defaults to the control plane.
+    pub fn host(mut self, host: ComposeStackHost) -> Self {
+        self.host = host;
+        self
+    }
+
+    /// Stop the stack on `host` first: a requested move leaves it.
+    pub fn vacate_host(mut self, host: Option<ComposeStackHost>) -> Self {
+        self.vacate_host = host;
+        self
+    }
+
+    /// Pin the host as the stack's home once it reaches `docker compose up`.
+    pub fn pin_home(mut self, pin: bool) -> Self {
+        self.pin_home = pin;
+        self
+    }
+
+    pub fn placement_drift(mut self, drift: Option<String>) -> Self {
+        self.placement_drift = drift;
+        self
     }
 
     pub fn job_id(mut self, id: String) -> Self {
@@ -378,10 +501,17 @@ impl DeployComposeJobBuilder {
                 .log_service
                 .ok_or_else(|| WorkflowError::JobValidationFailed("log_service required".into()))?,
             cancellation_requested: AtomicBool::new(false),
+            replacing_running_stack: AtomicBool::new(false),
+            retained_failed_stack: AtomicBool::new(false),
             secret_generation: secret_generation_for_attempt(
                 deployment_id,
                 &uuid::Uuid::new_v4().simple().to_string(),
             ),
+            workload_mode: self.workload_mode,
+            host: self.host,
+            vacate_host: self.vacate_host,
+            pin_home: self.pin_home,
+            placement_drift: self.placement_drift,
         })
     }
 }
@@ -568,9 +698,11 @@ impl DeployComposeJob {
                 deployment_id: Set(self.deployment_id),
                 container_id: Set(service.container_id.clone()),
                 container_name: Set(service.container_name.clone()),
-                container_port: Set(binding
-                    .map(|port| i32::from(port.container_port))
-                    .unwrap_or(0)),
+                container_port: Set(Some(
+                    binding
+                        .map(|port| i32::from(port.container_port))
+                        .unwrap_or(0),
+                )),
                 host_port: Set(binding.map(|port| i32::from(port.host_port))),
                 port_bindings: Set(Some(published_port_bindings(&service.ports))),
                 image_name: Set(Some(service.image_name.clone())),
@@ -580,7 +712,7 @@ impl DeployComposeJob {
                 deployed_at: Set(now),
                 ready_at: Set(None),
                 deleted_at: Set(None),
-                node_id: Set(None),
+                node_id: Set(self.host.node_id()),
                 ..Default::default()
             };
 
@@ -624,19 +756,21 @@ impl DeployComposeJob {
         let direct_error = if containers.is_empty() {
             None
         } else {
-            self.compose_executor
-                .remove_verified_containers(containers, expected_labels)
+            self.host
+                .remove_verified_containers(&self.compose_executor, containers, expected_labels)
                 .await
                 .err()
         };
         let compose_error = self
-            .compose_executor
-            .teardown_at(
+            .host
+            .teardown(
+                &self.compose_executor,
                 project_name,
                 repo_path,
                 Some(compose_file_name),
                 &self.environment_vars,
                 true,
+                None,
             )
             .await
             .err();
@@ -658,6 +792,146 @@ impl DeployComposeJob {
         }
     }
 
+    /// Stop the running stack to make way for this attempt's. Volumes are kept.
+    /// From here on a failure leaves nothing worth keeping, so
+    /// [`Self::cleanup`] removes what is left.
+    async fn stop_running_stack(
+        &self,
+        project_name: &str,
+        repo_path: Option<&Path>,
+        compose_file_name: &str,
+        secret_generation: &str,
+    ) -> Result<(), ComposeError> {
+        self.replacing_running_stack.store(true, Ordering::Release);
+        self.host
+            .teardown(
+                &self.compose_executor,
+                project_name,
+                repo_path,
+                Some(compose_file_name),
+                &self.environment_vars,
+                // Secrets must NOT be deleted here: prepare_and_pull() just
+                // materialized them and deploy_prepared() is about to bind-mount
+                // them into the new containers. Deleting them now would cause
+                // the new containers to start with missing or empty secrets.
+                false,
+                Some(secret_generation),
+            )
+            .await
+    }
+
+    /// Pin the stack's home (first start only) and, when a move is pending,
+    /// stop the stack on the host it leaves.
+    ///
+    /// Runs after the candidate is prepared and before the previous stack is
+    /// touched. Pinning here — not when the deployment was planned — means a
+    /// first deployment that fails to build leaves nothing pinned, while one
+    /// that reaches `docker compose up` (and may create volumes) always does.
+    /// The old host's `docker compose down` never removes volumes: that data
+    /// stays where it is, which is what the operator acknowledged by moving.
+    ///
+    /// A pinned stack is only started while its placement is still the one
+    /// this deployment planned against; a move requested since then fails
+    /// the deployment rather than start the stack where nothing would ever
+    /// stop it.
+    async fn pin_and_vacate(
+        &self,
+        project_name: &str,
+        compose_file_name: &str,
+    ) -> Result<(), WorkflowError> {
+        let placement =
+            crate::services::compose_placement::ComposePlacementService::new(self.db.clone());
+        let placement_error = |error: crate::services::compose_placement::ComposePlacementError| {
+            WorkflowError::JobExecutionFailed(error.to_string())
+        };
+        if !self.pin_home {
+            placement
+                .expect_placement(
+                    self.environment_id,
+                    self.deployment_id,
+                    self.host.node_id(),
+                    self.vacate_host.as_ref().map(ComposeStackHost::node_id),
+                )
+                .await
+                .map_err(placement_error)?;
+        }
+        if self.pin_home {
+            placement
+                .pin(self.environment_id, self.host.node_id())
+                .await
+                .map_err(placement_error)?;
+            if let Some(ref log_id) = self.log_id {
+                let _ = self
+                    .log_service
+                    .log_info(
+                        log_id,
+                        &format!(
+                            "Pinned this Compose stack to {}: later deployments return there \
+                             because its volumes live there",
+                            self.host.describe()
+                        ),
+                    )
+                    .await;
+            }
+        }
+        let Some(vacate_host) = self.vacate_host.as_ref() else {
+            return Ok(());
+        };
+        if let Some(ref log_id) = self.log_id {
+            let _ = self
+                .log_service
+                .log_warning(
+                    log_id,
+                    &format!(
+                        "Moving this Compose stack from {} to {}: stopping it on {} first. Its \
+                         volumes there are kept, but the stack starts on {} without them",
+                        vacate_host.describe(),
+                        self.host.describe(),
+                        vacate_host.describe(),
+                        self.host.describe()
+                    ),
+                )
+                .await;
+        }
+        vacate_host
+            .teardown(
+                &self.compose_executor,
+                project_name,
+                None,
+                Some(compose_file_name),
+                &self.environment_vars,
+                true,
+                None,
+            )
+            .await
+            .map_err(|error| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Failed to stop Compose stack {project_name} on {} while moving it to {} for \
+                     deployment {}: {error}. The stack keeps running on {}; retry the deployment \
+                     once that host is reachable",
+                    vacate_host.describe(),
+                    self.host.describe(),
+                    self.deployment_id,
+                    vacate_host.describe()
+                ))
+            })?;
+        // Conditional on the placement still being this move: a move requested
+        // while the old host was stopping keeps its own pending vacate, and
+        // this deployment fails (its candidate is discarded) instead of
+        // starting the stack where the placement no longer points. The old
+        // host is already stopped either way; a repeated `docker compose down`
+        // there is idempotent.
+        placement
+            .complete_vacate(
+                self.environment_id,
+                self.deployment_id,
+                self.host.node_id(),
+                vacate_host.node_id(),
+            )
+            .await
+            .map_err(placement_error)
+    }
+
     async fn compensate_if_cancelled(
         &self,
         project_name: &str,
@@ -668,19 +942,317 @@ impl DeployComposeJob {
         if !self.cancellation_requested.load(Ordering::Acquire) {
             return Ok(());
         }
-        self.compose_executor
-            .teardown_at(
+        self.host
+            .teardown(
+                &self.compose_executor,
                 project_name,
                 repo_path,
                 Some(compose_file_name),
                 &self.environment_vars,
                 true,
+                None,
             )
             .await
             .map_err(|error| WorkflowError::JobExecutionFailed(format!(
-                "Compose deployment was cancelled {phase}, but compensation failed for {project_name}: {error}"
+                "Compose deployment was cancelled {phase}, but compensation failed for {project_name} on {}: {error}",
+                self.host.describe()
             )))?;
         Err(WorkflowError::WorkflowCancelled)
+    }
+
+    /// Keep the project's stored Compose check current, so the settings page
+    /// stops (or starts) flagging it. Best-effort: the deployment outcome
+    /// never depends on this write.
+    async fn record_compose_check(
+        &self,
+        passed: bool,
+        error_class: Option<temps_presets::compose_check::ComposeCheckErrorClass>,
+        error: Option<String>,
+    ) {
+        if let Err(error) = crate::services::compose_check_service::store_validation_report(
+            self.db.as_ref(),
+            self.project_id,
+            passed,
+            error_class,
+            error,
+        )
+        .await
+        {
+            tracing::warn!(
+                project_id = self.project_id,
+                deployment_id = self.deployment_id,
+                "Failed to record the Compose configuration check: {error}"
+            );
+        }
+    }
+
+    /// Write a configuration-check failure to the deployment log: the error
+    /// class, and for a `docker compose config` failure the exact command,
+    /// its exit code and the sanitized Compose output.
+    async fn log_compose_check_failure(&self, error: &ComposeError) {
+        tracing::error!(
+            project_id = self.project_id,
+            environment_id = self.environment_id,
+            deployment_id = self.deployment_id,
+            error_class = %error.class(),
+            error = %error,
+            "Compose configuration check failed"
+        );
+        let Some(ref log_id) = self.log_id else {
+            return;
+        };
+        let _ = self
+            .log_service
+            .log_error(
+                log_id,
+                &format!(
+                    "Compose configuration check failed ({}): {error}",
+                    error.class()
+                ),
+            )
+            .await;
+        if let ComposeError::ConfigResolutionFailed { diagnostics, .. } = error {
+            let _ = self
+                .log_service
+                .log_error(
+                    log_id,
+                    &format!(
+                        "Command: {}\nExit code: {}\nCompose output (sanitized):\n{}",
+                        diagnostics.argv.join(" "),
+                        diagnostics
+                            .exit_code
+                            .map(|code| code.to_string())
+                            .unwrap_or_else(|| "none (terminated by signal)".to_string()),
+                        if diagnostics.stderr.is_empty() {
+                            "<empty>"
+                        } else {
+                            diagnostics.stderr.as_str()
+                        }
+                    ),
+                )
+                .await;
+        }
+    }
+
+    /// Say what the configuration check did, so a stack that boots with an
+    /// unexpected value can be traced back to a variable that was not set.
+    async fn log_compose_resolution(&self, resolution: &ResolvedComposeConfiguration) {
+        let Some(ref log_id) = self.log_id else {
+            return;
+        };
+        if let Some(command) = &resolution.command {
+            let _ = self
+                .log_service
+                .log_info(
+                    log_id,
+                    &format!(
+                        "Resolved Compose configuration ({}) with: {}",
+                        resolution.resolution_reasons.join(", "),
+                        command.argv.join(" ")
+                    ),
+                )
+                .await;
+        }
+        if !resolution.unset_variables.is_empty() {
+            let names: Vec<&str> = resolution
+                .unset_variables
+                .iter()
+                .map(String::as_str)
+                .collect();
+            let _ = self
+                .log_service
+                .log_warning(
+                    log_id,
+                    &format!(
+                        "Compose variable(s) {} are not set in this environment or the repository .env and have no default; they were replaced with empty strings, as Docker Compose does.",
+                        names.join(", ")
+                    ),
+                )
+                .await;
+        }
+        for note in &resolution.notes {
+            let _ = self.log_service.log_info(log_id, note).await;
+        }
+    }
+
+    async fn log_line(&self, level: LogLevel, message: &str) {
+        let Some(ref log_id) = self.log_id else {
+            return;
+        };
+        let result = match level {
+            LogLevel::Error => self.log_service.log_error(log_id, message).await,
+            LogLevel::Warning => self.log_service.log_warning(log_id, message).await,
+            _ => self.log_service.log_info(log_id, message).await,
+        };
+        if let Err(e) = result {
+            tracing::warn!(
+                deployment_id = self.deployment_id,
+                "could not write the deployment log: {e}"
+            );
+        }
+    }
+
+    /// ADR-055 §14: translate the checked model into one workload per
+    /// service. `legacy` does not translate. A refusal fails an `enforce`
+    /// deployment here, before the running stack is touched; in `shadow` it
+    /// is logged and the legacy deploy goes on.
+    #[allow(clippy::too_many_arguments)]
+    async fn plane_translation(
+        &self,
+        project_name: &str,
+        compose_file: &str,
+        content: &str,
+        override_content: Option<&str>,
+        repo_dir: Option<&Path>,
+        repository_env: Option<&str>,
+        labels: &HashMap<String, String>,
+    ) -> Result<Option<ComposeTranslation>, WorkflowError> {
+        if self.workload_mode == EnvironmentWorkloadMode::Legacy {
+            return Ok(None);
+        }
+        let mut env_files = std::collections::BTreeMap::new();
+        for plan in
+            ComposeExecutor::plan_env_files_for_compose_file(content, compose_file, repo_dir)
+        {
+            let file = match plan.source {
+                EnvFileSource::Repository(path) => match std::fs::read_to_string(&path) {
+                    Ok(text) => EnvFileContent::Dotenv(text),
+                    Err(e) => {
+                        let message = format!(
+                            "Compose translation could not read env file '{}' for project {}: {e}",
+                            plan.path, self.project_id
+                        );
+                        return self.translation_refused(message).await;
+                    }
+                },
+                EnvFileSource::ProjectEnvironment => EnvFileContent::ProjectEnvironment,
+            };
+            env_files.insert(plan.path, file);
+        }
+        let routed: Vec<String> = self
+            .public_ports
+            .iter()
+            .map(|port| port.service.clone())
+            .collect();
+        let result = compose_translation::translate(&ComposeTranslationInput {
+            project_name,
+            compose_file,
+            content,
+            override_content,
+            environment_vars: &self.environment_vars,
+            repository_env,
+            env_files: &env_files,
+            labels,
+            routed_services: &routed,
+            owner: temps_workload::WorkloadRef::new(
+                temps_workload::WorkloadKind::Deployment,
+                i64::from(self.deployment_id),
+            ),
+            temps_network: temps_core::NETWORK_NAME.as_str(),
+        });
+        match result {
+            Ok(translation) => {
+                let message = match self.workload_mode {
+                    EnvironmentWorkloadMode::Enforce => format!(
+                        "Compose translation (workload_mode: enforce) admitted {} service(s): {}. \
+                         The services run through the Docker Compose CLI.",
+                        translation.services.len(),
+                        translation.service_names().join(", ")
+                    ),
+                    _ => format!(
+                        "Compose translation (workload_mode: shadow) expresses {} service(s); \
+                         comparing with the running stack after deploy",
+                        translation.services.len()
+                    ),
+                };
+                self.log_line(LogLevel::Info, &message).await;
+                Ok(Some(translation))
+            }
+            Err(error) => self.translation_refused(error.to_string()).await,
+        }
+    }
+
+    async fn translation_refused(
+        &self,
+        reason: String,
+    ) -> Result<Option<ComposeTranslation>, WorkflowError> {
+        if self.workload_mode == EnvironmentWorkloadMode::Enforce {
+            let message = format!(
+                "The workload plane cannot run this Compose project (workload_mode: enforce): \
+                 {reason}. The running stack was not touched. Change the Compose file, or set \
+                 this environment's workload_mode back to legacy or shadow"
+            );
+            self.log_line(LogLevel::Error, &message).await;
+            return Err(WorkflowError::JobExecutionFailed(message));
+        }
+        tracing::info!(
+            deployment_id = self.deployment_id,
+            project_id = self.project_id,
+            environment_id = self.environment_id,
+            reason = %reason,
+            "compose shadow: the workload plane could not express this project"
+        );
+        self.log_line(
+            LogLevel::Warning,
+            &format!("Compose shadow: the workload plane could not express this project: {reason}"),
+        )
+        .await;
+        Ok(None)
+    }
+
+    /// `shadow`: compare the translation with the containers the legacy
+    /// path started and log every difference (variable names, never
+    /// values). Never fails the deployment.
+    async fn log_shadow_differences(
+        &self,
+        project_name: &str,
+        translation: &ComposeTranslation,
+        services: &[temps_deployer::compose::ComposeServiceResult],
+    ) {
+        let observed = match self
+            .compose_executor
+            .observe_services(project_name, services)
+            .await
+        {
+            Ok(observed) => observed,
+            Err(e) => {
+                tracing::warn!(
+                    deployment_id = self.deployment_id,
+                    "compose shadow comparison skipped: {e}"
+                );
+                return;
+            }
+        };
+        let differences = compose_translation::shadow_diff(translation, &observed);
+        tracing::info!(
+            deployment_id = self.deployment_id,
+            project_id = self.project_id,
+            environment_id = self.environment_id,
+            services = translation.services.len(),
+            differences = differences.len(),
+            "compose shadow comparison"
+        );
+        if differences.is_empty() {
+            self.log_line(
+                LogLevel::Info,
+                &format!(
+                    "Compose shadow: the translation matches the running stack ({} service(s))",
+                    translation.services.len()
+                ),
+            )
+            .await;
+            return;
+        }
+        for difference in &differences {
+            tracing::info!(
+                deployment_id = self.deployment_id,
+                service = %difference.service,
+                field = difference.field,
+                "compose shadow difference: {difference}"
+            );
+            self.log_line(LogLevel::Info, &format!("Compose shadow: {difference}"))
+                .await;
+        }
     }
 
     async fn execute_locked(
@@ -699,9 +1271,10 @@ impl DeployComposeJob {
         // `prepare_and_pull` instead of a job failure naming the actual
         // remedy up front. Mirrors `BuildImageJob::execute`'s
         // `local_workloads_enabled` guard.
-        if !self.compose_executor.docker_available() {
-            let message = "This control plane runs no local Compose deployments; run the \
-                full profile on a node with Docker"
+        if self.host.is_control_plane() && !self.compose_executor.docker_available() {
+            let message = "This control plane runs no local Compose deployments; pin the \
+                environment to a worker node in its Node scheduling settings, or run the full \
+                profile on a node with Docker"
                 .to_string();
             if let Some(ref log_id) = self.log_id {
                 let _ = self
@@ -718,9 +1291,16 @@ impl DeployComposeJob {
                 .log_service
                 .log_info(
                     log_id,
-                    &format!("Deploying Docker Compose stack (project: {})", project_name),
+                    &format!(
+                        "Deploying Docker Compose stack (project: {}) on {}",
+                        project_name,
+                        self.host.describe()
+                    ),
                 )
                 .await;
+            if let Some(drift) = self.placement_drift.as_deref() {
+                let _ = self.log_service.log_warning(log_id, drift).await;
+            }
         }
 
         // Build Temps labels for container discovery
@@ -836,49 +1416,85 @@ impl DeployComposeJob {
             }
         };
 
-        let (compose_content, compose_override) = self
-            .compose_executor
-            .resolve_security_configuration(
-                &project_name,
-                repo_path.as_deref(),
-                compose_file_name,
-                &compose_content,
-                self.compose_override.as_deref(),
-                &self.environment_vars,
-            )
-            .await
-            .map_err(|error| {
-                WorkflowError::JobExecutionFailed(format!(
-                    "Failed to resolve Compose policy for project {}: {error}",
-                    self.project_id
-                ))
-            })?;
+        if !self.excluded_services.is_empty() {
+            if let Some(ref log_id) = self.log_id {
+                let _ = self
+                    .log_service
+                    .log_info(
+                        log_id,
+                        &format!(
+                            "Excluding service(s) from deployment: {}",
+                            self.excluded_services.join(", ")
+                        ),
+                    )
+                    .await;
+            }
+        }
 
-        // Full service list from the raw compose file, *before* exclusion
-        // stripping — so excluded services still show up as re-includable
-        // options in the settings-page checklist. Best-effort: a parse
-        // failure degrades to an empty snapshot rather than failing the
-        // deploy, since this only feeds a UI convenience, not the deploy
-        // itself.
-        let compose_services: Vec<temps_entities::preset::ComposeServiceSnapshot> =
-            temps_presets::list_compose_services_with_override(
-                &compose_content,
-                compose_override.as_deref(),
-            )
-            .map(|services| {
-                services
-                    .into_iter()
-                    .map(|s| temps_entities::preset::ComposeServiceSnapshot {
-                        name: s.name,
-                        image: s.image,
-                        looks_like_database: s.looks_like_database,
-                        detected_service_type: s.detected_service_type,
-                        ports: s.ports,
-                        health_check_path: s.health_check_path,
-                    })
-                    .collect()
+        // Every configuration check, before Docker or database mutations and
+        // before the running stack is touched: variables are resolved first,
+        // then the security policy judges the values that will deploy.
+        // Rejecting after teardown would cause downtime on the running
+        // deployment for what is purely a configuration problem. "Run compose
+        // check" and the settings preview run this same function.
+        let checked = match self
+            .compose_executor
+            .check_configuration(&ComposeCheckInput {
+                project_name: &project_name,
+                project_dir: repo_path.as_deref(),
+                compose_file: compose_file_name,
+                content: &compose_content,
+                override_content: self.compose_override.as_deref(),
+                excluded_services: &self.excluded_services,
+                environment: &self.environment_vars,
+                repository_env: None,
+                filesystem_checks: repo_path.is_some(),
+                // A worker resolves anything the control plane cannot
+                // without a Docker CLI when it prepares the stack.
+                allow_cli: self.host.is_control_plane() || self.compose_executor.docker_available(),
+                defer_unknown_required: false,
             })
-            .unwrap_or_default();
+            .await
+        {
+            Ok(checked) => {
+                self.record_compose_check(true, None, None).await;
+                checked
+            }
+            Err(error) => {
+                self.log_compose_check_failure(&error).await;
+                self.record_compose_check(false, Some(error.class()), Some(error.to_string()))
+                    .await;
+                return Err(WorkflowError::JobExecutionFailed(format!(
+                    "Compose configuration check failed for project {} ({}): {error}",
+                    self.project_id,
+                    error.class()
+                )));
+            }
+        };
+        self.log_compose_resolution(&checked.resolution).await;
+
+        // Full service list, *before* exclusion stripping — so excluded
+        // services still show up as re-includable options in the
+        // settings-page checklist.
+        // The files as written, before substitution (including those pulled
+        // in by include/extends): a health path found there literally
+        // carries no variable value.
+        let health_path_sources: Vec<&str> = std::iter::once(compose_content.as_str())
+            .chain(self.compose_override.as_deref())
+            .chain(
+                checked
+                    .resolution
+                    .referenced_sources
+                    .iter()
+                    .map(String::as_str),
+            )
+            .collect();
+        let compose_services = compose_service_snapshots(
+            &checked.resolved_content,
+            checked.override_content.as_deref(),
+            &health_path_sources,
+            |text| checked.resolution.substituted_values.redact(text),
+        );
         // Resolve and validate before Docker or database mutations. Explicit
         // route configuration is authoritative; unsafe auto-detected paths
         // fall back to the secret-free deployment root.
@@ -908,6 +1524,7 @@ impl DeployComposeJob {
                 temps_entities::preset::ComposeServiceFamily::S3 => ("S3 / RustFS", "s3"),
             };
             if let Some(ref log_id) = self.log_id {
+                // Already masked; see `compose_service_snapshots`.
                 let image_suffix = service
                     .image
                     .as_deref()
@@ -929,41 +1546,15 @@ impl DeployComposeJob {
             }
         }
 
-        // Strip any user-excluded services (and references to them in other
-        // services' `depends_on`) before anything downstream — env-file
-        // planning, security preflight, and the actual `docker compose up` —
-        // ever sees them. Compose's own `-f` override merging can only
-        // add/replace fields on a service, never unset one, so this has to
-        // rewrite the base document rather than layer another override file.
-        let compose_content = if self.excluded_services.is_empty() {
-            compose_content
-        } else {
-            if let Some(ref log_id) = self.log_id {
-                let _ = self
-                    .log_service
-                    .log_info(
-                        log_id,
-                        &format!(
-                            "Excluding service(s) from deployment: {}",
-                            self.excluded_services.join(", ")
-                        ),
-                    )
-                    .await;
-            }
-            match self
-                .compose_executor
-                .strip_excluded_services(&compose_content, &self.excluded_services)
-            {
-                Ok(stripped) => stripped,
-                Err(e) => {
-                    let error_msg = format!("Failed to apply excluded services: {}", e);
-                    if let Some(ref log_id) = self.log_id {
-                        let _ = self.log_service.log_error(log_id, &error_msg).await;
-                    }
-                    return Err(WorkflowError::JobExecutionFailed(error_msg));
-                }
-            }
-        };
+        // Excluded services (and references to them in other services'
+        // `depends_on`) were removed by the check above, before env-file
+        // planning and the actual `docker compose up` see the model.
+        let compose_content = checked.content;
+        let compose_override = checked.override_content;
+        // Paths in the resolved model may embed substituted values
+        // (`env_file: ${TOKEN}.env`); the job log is readable without
+        // permission to see them.
+        let substituted_values = checked.resolution.substituted_values;
 
         // Read .env from repo if it exists
         let env_content = if let Some(selected_repo_dir) = repo_path.as_deref() {
@@ -998,17 +1589,17 @@ impl DeployComposeJob {
             let message = match plan.source {
                 EnvFileSource::Repository(_) => format!(
                     "Compose references env file '{}' — copied from the repository",
-                    plan.path
+                    substituted_values.redact(&plan.path)
                 ),
                 EnvFileSource::ProjectEnvironment if self.environment_vars.is_empty() => format!(
                     "Compose references env file '{}', which is not in the repository — created it empty. \
                      If the stack needs values, set them in the environment's variables and redeploy.",
-                    plan.path
+                    substituted_values.redact(&plan.path)
                 ),
                 EnvFileSource::ProjectEnvironment => format!(
                     "Compose references env file '{}', which is not in the repository — created it from \
                      this environment's {} variable(s)",
-                    plan.path,
+                    substituted_values.redact(&plan.path),
                     self.environment_vars.len()
                 ),
             };
@@ -1097,36 +1688,17 @@ impl DeployComposeJob {
             }
         }
 
-        // Validate the compose security policy BEFORE tearing down the existing
-        // stack. Rejecting after teardown would cause downtime on the running
-        // deployment for what is purely a configuration problem.
-        if let Err(error) = self
-            .compose_executor
-            .preflight_validate(&compose_content, compose_override.as_deref())
-        {
-            let error_msg = format!("Compose security policy rejected deployment: {error}");
-            tracing::error!(error = %error_msg, "Docker Compose preflight validation failed");
-            if let Some(ref log_id) = self.log_id {
-                let _ = self.log_service.log_error(log_id, &error_msg).await;
-            }
-            return Err(WorkflowError::JobExecutionFailed(error_msg));
-        }
-        if let Some(selected_repo_dir) = repo_path.as_deref() {
-            if let Err(e) = self.compose_executor.preflight_validate_filesystem(
-                selected_repo_dir,
+        let translation = self
+            .plane_translation(
+                &project_name,
                 compose_file_name,
                 &compose_content,
                 compose_override.as_deref(),
-            ) {
-                let error_msg =
-                    format!("Compose filesystem security policy rejected deployment: {e}");
-                tracing::error!(error = %error_msg, "Docker Compose filesystem preflight failed");
-                if let Some(ref log_id) = self.log_id {
-                    let _ = self.log_service.log_error(log_id, &error_msg).await;
-                }
-                return Err(WorkflowError::JobExecutionFailed(error_msg));
-            }
-        }
+                repo_path.as_deref(),
+                env_content.as_deref(),
+                &labels,
+            )
+            .await?;
 
         // Build the deploy request here so it is available to prepare_and_pull
         // BEFORE teardown. This is required for pull latency to fall outside the
@@ -1176,8 +1748,8 @@ impl DeployComposeJob {
         }
         let secret_generation = self.secret_generation.clone();
         let prepared = match self
-            .compose_executor
-            .prepare_and_pull_for_generation(&request, &secret_generation)
+            .host
+            .prepare(&self.compose_executor, &request, &secret_generation)
             .await
         {
             Ok(p) => p,
@@ -1198,13 +1770,26 @@ impl DeployComposeJob {
         // Images are already local at this point, so the actual downtime window
         // is now only: old-container-stop → new-container-healthy (no pull).
         if self.cancellation_requested.load(Ordering::Acquire) {
-            self.compose_executor
-                .cleanup_secret_generation(&project_name, &secret_generation)
+            self.host
+                .discard_generation(&self.compose_executor, &project_name, &secret_generation)
                 .await
                 .map_err(|error| WorkflowError::JobExecutionFailed(format!(
                     "Compose deployment was cancelled before teardown, but candidate secret cleanup failed for {project_name}: {error}"
                 )))?;
             return Err(WorkflowError::WorkflowCancelled);
+        }
+        if let Err(error) = self.pin_and_vacate(&project_name, compose_file_name).await {
+            self.host
+                .discard_generation(&self.compose_executor, &project_name, &secret_generation)
+                .await
+                .map_err(|cleanup_error| {
+                    WorkflowError::JobExecutionFailed(format!(
+                        "{error}; additionally failed to clean candidate generation '{}' on {}: {cleanup_error}",
+                        secret_generation,
+                        self.host.describe()
+                    ))
+                })?;
+            return Err(error);
         }
         if let Some(ref log_id) = self.log_id {
             let _ = self
@@ -1216,17 +1801,11 @@ impl DeployComposeJob {
                 .await;
         }
         if let Err(error) = self
-            .compose_executor
-            .teardown_at(
+            .stop_running_stack(
                 &project_name,
                 repo_path.as_deref(),
-                Some(compose_file_name),
-                &self.environment_vars,
-                // Secrets must NOT be deleted here: prepare_and_pull() just
-                // materialized them and deploy_prepared() is about to bind-mount
-                // them into the new containers. Deleting them now would cause
-                // the new containers to start with missing or empty secrets.
-                false,
+                compose_file_name,
+                &secret_generation,
             )
             .await
         {
@@ -1234,8 +1813,8 @@ impl DeployComposeJob {
             // not prune older generations unless teardown succeeded: a
             // partially-running previous stack can still have those files
             // bind-mounted and must keep them intact.
-            self.compose_executor
-                .cleanup_secret_generation(&project_name, &secret_generation)
+            self.host
+                .discard_generation(&self.compose_executor, &project_name, &secret_generation)
                 .await
                 .map_err(|cleanup_error| {
                     WorkflowError::JobExecutionFailed(format!(
@@ -1259,12 +1838,16 @@ impl DeployComposeJob {
         let candidate_secret_generation =
             (!request.secrets.is_empty()).then_some(secret_generation.as_str());
         if let Err(error) = self
-            .compose_executor
-            .prune_secret_generations(&project_name, candidate_secret_generation)
+            .host
+            .prune_secret_generations(
+                &self.compose_executor,
+                &project_name,
+                candidate_secret_generation,
+            )
             .await
         {
-            self.compose_executor
-                .cleanup_secret_generation(&project_name, &secret_generation)
+            self.host
+                .discard_generation(&self.compose_executor, &project_name, &secret_generation)
                 .await
                 .map_err(|cleanup_error| {
                     WorkflowError::JobExecutionFailed(format!(
@@ -1285,8 +1868,8 @@ impl DeployComposeJob {
         // teardown above (or `up --force-recreate` below) replaces any prior
         // candidate, including a retained failed stack from the last attempt.
         if let Err(error) = self.retire_previous_compose_container_records().await {
-            self.compose_executor
-                .cleanup_secret_generation(&project_name, &secret_generation)
+            self.host
+                .discard_generation(&self.compose_executor, &project_name, &secret_generation)
                 .await
                 .map_err(|cleanup_error| {
                     WorkflowError::JobExecutionFailed(format!(
@@ -1308,8 +1891,13 @@ impl DeployComposeJob {
         // Deploy (network + up + wait + discover + label). Images are already
         // local from prepare_and_pull so this is the live downtime window.
         let services = match self
-            .compose_executor
-            .deploy_prepared(prepared, &request)
+            .host
+            .deploy(
+                &self.compose_executor,
+                prepared,
+                &request,
+                &secret_generation,
+            )
             .await
         {
             Ok(s) => s,
@@ -1403,8 +1991,14 @@ impl DeployComposeJob {
                     false
                 } else {
                     match self
-                        .compose_executor
-                        .stop_at(&project_name, repo_path.as_deref(), Some(compose_file_name))
+                        .host
+                        .stop(
+                            &self.compose_executor,
+                            &project_name,
+                            repo_path.as_deref(),
+                            Some(compose_file_name),
+                            Some(&secret_generation),
+                        )
                         .await
                     {
                         Err(stop_error) => {
@@ -1445,6 +2039,7 @@ impl DeployComposeJob {
                 };
 
                 if retained {
+                    self.retained_failed_stack.store(true, Ordering::Release);
                     if let Some(ref log_id) = self.log_id {
                         let _ = self
                             .log_service
@@ -1498,8 +2093,9 @@ impl DeployComposeJob {
 
         if services.is_empty() {
             let _ = self
-                .compose_executor
-                .teardown_at(
+                .host
+                .teardown(
+                    &self.compose_executor,
                     &project_name,
                     repo_path.as_deref(),
                     Some(compose_file_name),
@@ -1508,6 +2104,7 @@ impl DeployComposeJob {
                     // credentials are not left on disk for a stack that
                     // is no longer running.
                     true,
+                    None,
                 )
                 .await;
             let error_msg = "No containers found after docker compose up".to_string();
@@ -1584,7 +2181,7 @@ impl DeployComposeJob {
         context.set_output(
             "deploy_container",
             "node_ids",
-            vec![None::<i32>; services.len()],
+            vec![self.host.node_id(); services.len()],
         )?;
 
         // Compose-specific outputs for MarkDeploymentCompleteJob
@@ -1629,6 +2226,13 @@ impl DeployComposeJob {
                 .await;
         }
 
+        if self.workload_mode == EnvironmentWorkloadMode::Shadow {
+            if let Some(ref translation) = translation {
+                self.log_shadow_differences(&project_name, translation, &services)
+                    .await;
+            }
+        }
+
         // Cancellation may arrive while final service/log metadata is being
         // persisted after startup. This is the last await boundary before the
         // synchronous success return, so compensate here while the outer task
@@ -1661,6 +2265,7 @@ impl WorkflowTask for DeployComposeJob {
 
     async fn execute(&self, context: WorkflowContext) -> Result<JobResult, WorkflowError> {
         self.cancellation_requested.store(false, Ordering::Release);
+        self.retained_failed_stack.store(false, Ordering::Release);
         let project_name = format!("temps-{}-{}", self.project_id, self.environment_id);
         let _lifecycle_guard = self
             .compose_executor
@@ -1710,7 +2315,10 @@ impl WorkflowTask for DeployComposeJob {
         }
     }
 
-    /// Tear down the compose stack when the workflow marks this job failed.
+    /// Tear down the compose stack when the workflow marks this job failed,
+    /// once this job has begun replacing what was running. A failure before
+    /// that point removes only this attempt's candidate files: the stack
+    /// already running is still the one serving.
     ///
     /// Without this, a stack that deployed successfully but was failed by a
     /// later job (health check, readiness wait) keeps running under its
@@ -1718,6 +2326,58 @@ impl WorkflowTask for DeployComposeJob {
     /// Docker keeps crash-looping the containers forever on the node.
     async fn cleanup(&self, context: &WorkflowContext) -> Result<(), WorkflowError> {
         let project_name = format!("temps-{}-{}", self.project_id, self.environment_id);
+        if self.retained_failed_stack.load(Ordering::Acquire) {
+            // Removing the stack now would undo the retention and leave its
+            // container records pointing at nothing. Stopped containers do not
+            // need the attempt's secret files, so those still go.
+            return self
+                .host
+                .discard_generation(
+                    &self.compose_executor,
+                    &project_name,
+                    &self.secret_generation,
+                )
+                .await
+                .map_err(|error| {
+                    WorkflowError::JobExecutionFailed(format!(
+                        "Failed to clean candidate generation '{}' of retained compose stack \
+                         {project_name} on {} after job failure: {error}",
+                        self.secret_generation,
+                        self.host.describe()
+                    ))
+                });
+        }
+        if !self.replacing_running_stack.load(Ordering::Acquire) {
+            // The deployment failed before touching the running stack (a bad
+            // image, a refused request, a cancelled pull). It keeps serving,
+            // with its secrets. Only this attempt's candidate files are ours.
+            if let Some(ref log_id) = self.log_id {
+                let _ = self
+                    .log_service
+                    .log_info(
+                        log_id,
+                        "This deployment failed before replacing the running compose stack, \
+                         so that stack was left running",
+                    )
+                    .await;
+            }
+            return self
+                .host
+                .discard_generation(
+                    &self.compose_executor,
+                    &project_name,
+                    &self.secret_generation,
+                )
+                .await
+                .map_err(|error| {
+                    WorkflowError::JobExecutionFailed(format!(
+                        "Failed to clean candidate generation '{}' of compose stack \
+                         {project_name} on {} after job failure: {error}",
+                        self.secret_generation,
+                        self.host.describe()
+                    ))
+                });
+        }
         if let Some(compose_path) = self.compose_path.as_deref() {
             validate_relative_path(compose_path, "compose_path")?;
         }
@@ -1757,8 +2417,9 @@ impl WorkflowTask for DeployComposeJob {
                 .await;
         }
 
-        self.compose_executor
-            .teardown_at(
+        self.host
+            .teardown(
+                &self.compose_executor,
                 &project_name,
                 cleanup_repo_path.as_deref(),
                 Some(compose_file_name),
@@ -1766,11 +2427,13 @@ impl WorkflowTask for DeployComposeJob {
                 // The workflow has failed and no subsequent deploy will consume
                 // the materialized secret files.
                 true,
+                None,
             )
             .await
             .map_err(|error| {
                 WorkflowError::JobExecutionFailed(format!(
-                    "Failed to clean up compose stack {project_name} after job failure: {error}"
+                    "Failed to clean up compose stack {project_name} on {} after job failure: {error}",
+                    self.host.describe()
                 ))
             })
     }
@@ -1972,6 +2635,95 @@ mod tests {
             .expect("complete builder should produce a deployment job")
     }
 
+    /// ADR-055 §14: `legacy` never translates; `shadow` translates and only
+    /// logs a refusal; `enforce` fails on a refusal, naming the service and
+    /// field, before anything touches the running stack.
+    #[tokio::test]
+    async fn the_compose_translation_gate_follows_the_workload_mode() {
+        let translatable = "services:\n  web:\n    image: nginx:1.27\n";
+        let refused = "services:\n  web:\n    image: nginx:1.27\n    pid: host\n";
+        let labels = HashMap::new();
+        let mut job = test_job_with_disabled_docker(test_db());
+
+        // legacy: nothing is translated, even what the plane would refuse.
+        job.workload_mode = EnvironmentWorkloadMode::Legacy;
+        let result = job
+            .plane_translation(
+                "temps-2-3",
+                "docker-compose.yml",
+                refused,
+                None,
+                None,
+                None,
+                &labels,
+            )
+            .await;
+        assert!(matches!(result, Ok(None)), "{result:?}");
+
+        // shadow: translated when expressible, a refusal is only logged.
+        job.workload_mode = EnvironmentWorkloadMode::Shadow;
+        let translated = job
+            .plane_translation(
+                "temps-2-3",
+                "docker-compose.yml",
+                translatable,
+                None,
+                None,
+                None,
+                &labels,
+            )
+            .await
+            .expect("shadow translates")
+            .expect("a translation");
+        assert_eq!(translated.service_names(), vec!["web"]);
+        let result = job
+            .plane_translation(
+                "temps-2-3",
+                "docker-compose.yml",
+                refused,
+                None,
+                None,
+                None,
+                &labels,
+            )
+            .await;
+        assert!(matches!(result, Ok(None)), "{result:?}");
+
+        // enforce: a refusal fails the job and names the service and field.
+        job.workload_mode = EnvironmentWorkloadMode::Enforce;
+        let error = job
+            .plane_translation(
+                "temps-2-3",
+                "docker-compose.yml",
+                refused,
+                None,
+                None,
+                None,
+                &labels,
+            )
+            .await
+            .expect_err("enforce refuses");
+        let message = error.to_string();
+        assert!(
+            message.contains("'web'") && message.contains("'pid'"),
+            "{message}"
+        );
+        assert!(message.contains("was not touched"), "{message}");
+        let admitted = job
+            .plane_translation(
+                "temps-2-3",
+                "docker-compose.yml",
+                translatable,
+                None,
+                None,
+                None,
+                &labels,
+            )
+            .await
+            .expect("enforce admits what it can express");
+        assert!(admitted.is_some());
+    }
+
     /// The control-plane profile (no Docker client constructed at all) must
     /// refuse a Compose deployment with a typed, actionable
     /// `LocalWorkloadsDisabled` error *before* reading the repo checkout,
@@ -2116,7 +2868,10 @@ mod tests {
             deployment_id: 6,
             container_id: "old-retained-id".to_string(),
             container_name: "temps-2-3-web-1".to_string(),
-            container_port: 8080,
+            container_port: Some(8080),
+            health_state: "unknown".to_string(),
+            health_checked_at: None,
+            health_detail: None,
             host_port: Some(18080),
             image_name: Some("example/web:old".to_string()),
             status: Some("retained:exited".to_string()),
@@ -2341,6 +3096,84 @@ mod tests {
             health_check_path_for_public_route(&[], &[]).expect("missing route should use root"),
             "/"
         );
+    }
+
+    #[test]
+    fn snapshot_health_paths_never_carry_substituted_secrets() {
+        // TOKEN may come from the repository .env or an include's env file,
+        // which the project's variables never see; the path is dropped
+        // because it is not written in any source.
+        let source = "healthcheck: {test: [CMD, curl, 'http://localhost/ready/${TOKEN}']}";
+        assert_eq!(
+            snapshot_health_check_path(Some("/ready/private-token".to_string()), &[source]),
+            None
+        );
+        // A query is never persisted, whatever it contains or wherever it
+        // is written.
+        assert_eq!(
+            snapshot_health_check_path(
+                Some("/ready?token=x".to_string()),
+                &["test: curl localhost/ready?token=x"]
+            ),
+            None
+        );
+        // A path partly built from a variable is not in the sources either.
+        assert_eq!(
+            snapshot_health_check_path(
+                Some("/v2/health".to_string()),
+                &["test: curl localhost/${API_VERSION}/health"]
+            ),
+            None
+        );
+        assert_eq!(snapshot_health_check_path(None, &[source]), None);
+    }
+
+    #[test]
+    fn literal_health_paths_are_kept_from_any_source() {
+        let source = "services:\n  web:\n    healthcheck:\n      test: [CMD, curl, -f, 'http://localhost:8080/api/health']\n";
+        assert_eq!(
+            snapshot_health_check_path(Some("/api/health".to_string()), &[source]),
+            Some("/api/health".to_string())
+        );
+        // The override and referenced files are sources too.
+        assert_eq!(
+            snapshot_health_check_path(
+                Some("/health".to_string()),
+                &[
+                    "services: {}",
+                    "services: {web: {healthcheck: {test: 'curl localhost/health'}}}"
+                ]
+            ),
+            Some("/health".to_string())
+        );
+    }
+
+    #[test]
+    fn service_snapshots_mask_substituted_images() {
+        let resolved = "services:\n  web:\n    image: registry.example.com/private-token/web:1\n  db:\n    image: postgres:16-private-tag\n";
+        let redact = |text: &str| {
+            text.replace("private-token", "***")
+                .replace("private-tag", "***")
+        };
+        let services = compose_service_snapshots(resolved, None, &[resolved], redact);
+        let image = |name: &str| {
+            services
+                .iter()
+                .find(|service| service.name == name)
+                .and_then(|service| service.image.clone())
+        };
+        assert_eq!(
+            image("web").as_deref(),
+            Some("registry.example.com/***/web:1")
+        );
+        assert_eq!(image("db").as_deref(), Some("postgres:16-***"));
+        // Detection saw the resolved image.
+        let db = services.iter().find(|service| service.name == "db");
+        assert_eq!(
+            db.and_then(|service| service.detected_service_type),
+            Some(temps_entities::preset::ComposeServiceFamily::Postgres)
+        );
+        assert!(compose_service_snapshots("not: [valid", None, &[], redact).is_empty());
     }
 
     #[test]
@@ -2681,5 +3514,378 @@ services:
             resolve_compose_file_name(None, Some(repo.path())),
             "docker-compose.yaml"
         );
+    }
+
+    use temps_deployer::compose_protocol::{
+        ComposeHostEvent, ComposeHostFailure, RemoteComposeError,
+    };
+    use temps_deployer::remote::RemoteNodeDeployer;
+
+    /// A worker agent that answers the Compose routes and records, in order,
+    /// which ones it was asked for.
+    struct FakeComposeAgent {
+        url: String,
+        routes: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl FakeComposeAgent {
+        fn routes(&self) -> Vec<String> {
+            self.routes.lock().unwrap().clone()
+        }
+    }
+
+    const PREPARE: &str = "/agent/compose/prepare";
+    const DISCARD: &str = "/agent/compose/discard";
+    const TEARDOWN: &str = "/agent/compose/teardown";
+    const DEPLOY: &str = "/agent/compose/deploy";
+    const STOP: &str = "/agent/compose/stop";
+
+    /// `prepare_event` is the line the agent streams for a prepare, and
+    /// `failing_route` answers 500.
+    async fn fake_compose_agent(
+        prepare_event: ComposeHostEvent,
+        failing_route: Option<&'static str>,
+    ) -> FakeComposeAgent {
+        fake_compose_agent_with_deploy(prepare_event, failing_route, None).await
+    }
+
+    /// Like [`fake_compose_agent`], and the deploy route answers with this event.
+    async fn fake_compose_agent_with_deploy(
+        prepare_event: ComposeHostEvent,
+        failing_route: Option<&'static str>,
+        deploy_event: Option<ComposeHostEvent>,
+    ) -> FakeComposeAgent {
+        let routes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = routes.clone();
+        let prepare_line = format!("{}\n", serde_json::to_string(&prepare_event).unwrap());
+        let deploy_line =
+            deploy_event.map(|event| format!("{}\n", serde_json::to_string(&event).unwrap()));
+        let app =
+            axum::Router::new().fallback(move |uri: axum::http::Uri, _: axum::body::Bytes| {
+                let recorded = recorded.clone();
+                let prepare_line = prepare_line.clone();
+                let deploy_line = deploy_line.clone();
+                async move {
+                    let path = uri.path().to_string();
+                    recorded.lock().unwrap().push(path.clone());
+                    if failing_route == Some(path.as_str()) {
+                        return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, String::new());
+                    }
+                    if path == PREPARE {
+                        return (axum::http::StatusCode::OK, prepare_line);
+                    }
+                    if let (DEPLOY, Some(deploy_line)) = (path.as_str(), deploy_line) {
+                        return (axum::http::StatusCode::OK, deploy_line);
+                    }
+                    (
+                        axum::http::StatusCode::OK,
+                        r#"{"success":true,"data":{"project_name":"temps-2-3"},"error":null}"#
+                            .to_string(),
+                    )
+                }
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        FakeComposeAgent { url, routes }
+    }
+
+    /// A deployment of an inline stack to that worker, from a control plane
+    /// with no Docker of its own.
+    fn job_on_worker(
+        db: Arc<DbConnection>,
+        agent: &FakeComposeAgent,
+        sealing: temps_core::sealed_request::NodeSealing,
+    ) -> DeployComposeJob {
+        let deployer = RemoteNodeDeployer::new(
+            agent.url.clone(),
+            "token".to_string(),
+            "worker-a".to_string(),
+        )
+        .unwrap()
+        .with_sealing(sealing);
+        let handle = Arc::new(temps_core::DockerHandle::disabled(
+            temps_core::PROFILE_CONTROL_PLANE,
+            temps_core::CONTROL_PLANE_DOCKER_REASON,
+        ));
+        DeployComposeJobBuilder::new()
+            .job_id("deploy_compose".to_string())
+            .deployment_id(7)
+            .project_id(2)
+            .environment_id(3)
+            .db(db)
+            .compose_executor(Arc::new(ComposeExecutor::new_with_handle(
+                handle,
+                std::env::temp_dir(),
+            )))
+            .host(ComposeStackHost::Worker {
+                node_id: 9,
+                node_name: "worker-a".to_string(),
+                deployer: Arc::new(deployer),
+                policy: temps_entities::compose_security::ComposeSecurityPolicy::default(),
+            })
+            .compose_content(Some(
+                "services:\n  web:\n    image: example/web:1\n".to_string(),
+            ))
+            .log_service(Arc::new(LogService::new(std::env::temp_dir())))
+            .build()
+            .expect("complete builder should produce a deployment job")
+    }
+
+    fn sealed_to_a_key() -> temps_core::sealed_request::NodeSealing {
+        let (_, public) = temps_core::worker_ingress::generate_ingress_key().unwrap();
+        temps_core::sealed_request::NodeSealing::Key(public)
+    }
+
+    /// The placement a deployment expects on that worker, so it goes on to
+    /// replace the running stack.
+    fn db_with_placement_on_worker() -> Arc<DbConnection> {
+        let now = chrono::Utc::now();
+        Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([vec![temps_entities::compose_placements::Model {
+                    environment_id: 3,
+                    node_id: Some(9),
+                    pinned_at: now,
+                    vacate_pending: false,
+                    vacate_node_id: None,
+                    updated_at: now,
+                }]])
+                // No earlier deployments whose container records need retiring.
+                .append_query_results([Vec::<deployments::Model>::new()])
+                .into_connection(),
+        )
+    }
+
+    fn context() -> WorkflowContext {
+        crate::test_utils::create_test_context("wf".to_string(), 7, 2, 3)
+    }
+
+    /// Run the job to its failure, then do what the workflow engine does next.
+    async fn fail_and_clean_up(job: &DeployComposeJob) -> WorkflowError {
+        let error = match job.execute(context()).await {
+            Err(error) => error,
+            Ok(_) => panic!("this deployment should fail"),
+        };
+        // Whether the cleanup itself succeeds depends on the case; the routes
+        // it reached are what each test asserts.
+        let _ = job.cleanup(&context()).await;
+        error
+    }
+
+    #[tokio::test]
+    async fn a_deployment_refused_for_a_node_with_no_key_leaves_the_running_stack_alone() {
+        let agent = fake_compose_agent(ComposeHostEvent::Prepared, None).await;
+        let job = job_on_worker(
+            test_db(),
+            &agent,
+            temps_core::sealed_request::NodeSealing::NoKey,
+        );
+
+        let error = fail_and_clean_up(&job).await;
+
+        assert!(error.to_string().contains("prepare/pull failed"), "{error}");
+        assert_eq!(agent.routes(), [DISCARD]);
+    }
+
+    #[tokio::test]
+    async fn an_image_that_cannot_be_pulled_leaves_the_running_stack_alone() {
+        let agent = fake_compose_agent(
+            ComposeHostEvent::Failed(ComposeHostFailure {
+                error: RemoteComposeError::from(&ComposeError::CommandFailed {
+                    project: "temps-2-3".to_string(),
+                    reason: "docker compose pull failed: image not found".to_string(),
+                }),
+                containers: Vec::new(),
+                cleanup_containers: Vec::new(),
+                retention_error: None,
+            }),
+            None,
+        )
+        .await;
+        let job = job_on_worker(test_db(), &agent, sealed_to_a_key());
+
+        let error = fail_and_clean_up(&job).await;
+
+        assert!(error.to_string().contains("prepare/pull failed"), "{error}");
+        assert_eq!(agent.routes(), [PREPARE, DISCARD]);
+    }
+
+    /// Prepared, but the placement could not be confirmed: nothing was stopped.
+    #[tokio::test]
+    async fn a_failure_after_prepare_but_before_stopping_leaves_the_running_stack_alone() {
+        let agent = fake_compose_agent(ComposeHostEvent::Prepared, None).await;
+        let job = job_on_worker(test_db(), &agent, sealed_to_a_key());
+
+        fail_and_clean_up(&job).await;
+
+        let routes = agent.routes();
+        assert_eq!(routes.first().map(String::as_str), Some(PREPARE));
+        assert!(routes.iter().any(|route| route == DISCARD), "{routes:?}");
+        assert!(!routes.iter().any(|route| route == TEARDOWN), "{routes:?}");
+    }
+
+    /// A partly stopped stack cannot be left as it is, so cleanup still removes it.
+    #[tokio::test]
+    async fn a_stack_that_failed_to_stop_is_still_cleaned_up() {
+        let agent = fake_compose_agent(ComposeHostEvent::Prepared, Some(TEARDOWN)).await;
+        let job = job_on_worker(db_with_placement_on_worker(), &agent, sealed_to_a_key());
+
+        let error = fail_and_clean_up(&job).await;
+
+        assert!(
+            error
+                .to_string()
+                .contains("stop the previous Compose stack"),
+            "{error}"
+        );
+        let routes = agent.routes();
+        assert_eq!(
+            routes.iter().filter(|route| *route == TEARDOWN).count(),
+            2,
+            "one to replace the stack and one from cleanup: {routes:?}"
+        );
+        assert_eq!(routes.last().map(String::as_str), Some(TEARDOWN));
+    }
+
+    /// A placement on that worker, and room to record the retained containers.
+    fn db_that_can_record_a_retained_stack() -> Arc<DbConnection> {
+        let now = chrono::Utc::now();
+        Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([vec![temps_entities::compose_placements::Model {
+                    environment_id: 3,
+                    node_id: Some(9),
+                    pinned_at: now,
+                    vacate_pending: false,
+                    vacate_node_id: None,
+                    updated_at: now,
+                }]])
+                .append_query_results([Vec::<deployments::Model>::new()])
+                // The job writes status updates as well as the container record.
+                .append_exec_results(std::iter::repeat_n(
+                    sea_orm::MockExecResult {
+                        last_insert_id: 1,
+                        rows_affected: 1,
+                    },
+                    4,
+                ))
+                .into_connection(),
+        )
+    }
+
+    fn failed_deploy_with_a_container() -> ComposeHostEvent {
+        ComposeHostEvent::Failed(ComposeHostFailure {
+            error: RemoteComposeError::from(&ComposeError::CommandFailed {
+                project: "temps-2-3".to_string(),
+                reason: "service web did not become healthy".to_string(),
+            }),
+            containers: vec![temps_deployer::compose::ComposeServiceResult {
+                container_id: "failed-web-id".to_string(),
+                container_name: "temps-2-3-web-1".to_string(),
+                service_name: "web".to_string(),
+                image_name: "example/web:1".to_string(),
+                ports: Vec::new(),
+                status: "exited".to_string(),
+            }],
+            cleanup_containers: Vec::new(),
+            retention_error: None,
+        })
+    }
+
+    /// Execute records the stack for log access, so cleanup must not remove it.
+    #[tokio::test]
+    async fn a_retained_failed_stack_survives_cleanup_and_loses_its_secret_files() {
+        let agent = fake_compose_agent_with_deploy(
+            ComposeHostEvent::Prepared,
+            None,
+            Some(failed_deploy_with_a_container()),
+        )
+        .await;
+        let job = job_on_worker(
+            db_that_can_record_a_retained_stack(),
+            &agent,
+            sealed_to_a_key(),
+        );
+
+        fail_and_clean_up(&job).await;
+
+        let routes = agent.routes();
+        let deployed = routes
+            .iter()
+            .position(|route| route == DEPLOY)
+            .unwrap_or_else(|| panic!("the stack must start: {routes:?}"));
+        let after_deploy = &routes[deployed + 1..];
+        assert_eq!(
+            after_deploy,
+            [STOP, DISCARD],
+            "the stack is stopped, its secret files go, and nothing removes it"
+        );
+    }
+
+    /// A stack that could not be recorded has no log access to keep it for.
+    #[tokio::test]
+    async fn a_failed_stack_that_could_not_be_recorded_is_removed() {
+        let agent = fake_compose_agent_with_deploy(
+            ComposeHostEvent::Prepared,
+            None,
+            Some(failed_deploy_with_a_container()),
+        )
+        .await;
+        // No exec result, so recording the containers fails.
+        let job = job_on_worker(db_with_placement_on_worker(), &agent, sealed_to_a_key());
+
+        fail_and_clean_up(&job).await;
+
+        let routes = agent.routes();
+        assert!(routes.iter().any(|route| route == STOP), "{routes:?}");
+        assert_eq!(
+            routes.last().map(String::as_str),
+            Some(TEARDOWN),
+            "{routes:?}"
+        );
+    }
+
+    /// Stopping also clears the restart policy. A stack where that failed could
+    /// come back when Docker restarts, so it must not be kept.
+    #[tokio::test]
+    async fn a_failed_stack_that_could_not_be_stopped_is_removed() {
+        let agent = fake_compose_agent_with_deploy(
+            ComposeHostEvent::Prepared,
+            Some(STOP),
+            Some(failed_deploy_with_a_container()),
+        )
+        .await;
+        let job = job_on_worker(
+            db_that_can_record_a_retained_stack(),
+            &agent,
+            sealed_to_a_key(),
+        );
+
+        fail_and_clean_up(&job).await;
+
+        let routes = agent.routes();
+        assert!(routes.iter().any(|route| route == STOP), "{routes:?}");
+        assert!(!job.retained_failed_stack.load(Ordering::Acquire));
+        assert_eq!(
+            routes.last().map(String::as_str),
+            Some(TEARDOWN),
+            "{routes:?}"
+        );
+    }
+
+    /// The old stack is gone by now, and what started in its place failed.
+    #[tokio::test]
+    async fn a_deployment_that_fails_after_replacing_the_stack_is_cleaned_up() {
+        let agent = fake_compose_agent(ComposeHostEvent::Prepared, Some(DEPLOY)).await;
+        let job = job_on_worker(db_with_placement_on_worker(), &agent, sealed_to_a_key());
+
+        fail_and_clean_up(&job).await;
+
+        let routes = agent.routes();
+        assert!(routes.iter().any(|route| route == DEPLOY), "{routes:?}");
+        assert_eq!(routes.last().map(String::as_str), Some(TEARDOWN));
     }
 }

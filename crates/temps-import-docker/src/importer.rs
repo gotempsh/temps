@@ -591,10 +591,7 @@ impl WorkloadImporter for DockerImporter {
         plan: ImportPlan,
         services: &dyn ImportServiceProvider,
     ) -> ImportResult<ImportOutcome> {
-        use sea_orm::{
-            ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, PaginatorTrait,
-            QueryFilter,
-        };
+        use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter};
         use std::time::Instant;
         use temps_entities::{
             deployment_containers, deployments, environments, prelude::DeploymentMetadata, projects,
@@ -747,21 +744,19 @@ impl WorkloadImporter for DockerImporter {
             environment.name, environment.id, project.id
         );
 
-        // Count existing deployments to generate sequential deployment number
-        let deployment_count = deployments::Entity::find()
-            .filter(deployments::Column::ProjectId.eq(project.id))
-            .paginate(db, 100)
-            .num_items()
+        let deployment_slug =
+            temps_entities::project_deployment_counters::allocate_deployment_slug(
+                db,
+                project.id,
+                &project.slug,
+            )
             .await
             .map_err(|e| {
                 temps_import_types::ImportError::ExecutionFailed(format!(
-                    "Failed to count deployments: {}",
-                    e
+                    "Failed to allocate the next deployment number for project {}: {}",
+                    project.id, e
                 ))
             })?;
-
-        let deployment_number = deployment_count + 1;
-        let deployment_slug = format!("{}-{}", project.slug, deployment_number);
 
         // Create typed deployment metadata
         let deployment_metadata = DeploymentMetadata {
@@ -816,7 +811,7 @@ impl WorkloadImporter for DockerImporter {
                 deployment_id: Set(deployment.id),
                 container_id: Set(plan.source_id.clone()),
                 container_name: Set(container_name.clone()),
-                container_port: Set(port_mapping.container_port as i32),
+                container_port: Set(Some(port_mapping.container_port as i32)),
                 host_port: Set(port_mapping.host_port.map(|p| p as i32)),
                 image_name: Set(Some(plan.deployment.image.clone())),
                 status: Set(Some("running".to_string())),
@@ -1002,12 +997,11 @@ impl DockerImporter {
                 mounts
                     .iter()
                     .map(|mount| {
-                        use bollard::models::MountPointTypeEnum;
                         use temps_import_types::VolumeType;
-                        let volume_type = match &mount.typ {
-                            Some(MountPointTypeEnum::BIND) => VolumeType::Bind,
-                            Some(MountPointTypeEnum::VOLUME) => VolumeType::Volume,
-                            Some(MountPointTypeEnum::TMPFS) => VolumeType::Tmpfs,
+                        let volume_type = match mount.typ.as_deref() {
+                            Some("bind") => VolumeType::Bind,
+                            Some("volume") => VolumeType::Volume,
+                            Some("tmpfs") => VolumeType::Tmpfs,
                             _ => VolumeType::Volume, // Default to volume
                         };
                         VolumeMount {
@@ -1415,7 +1409,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // Requires Docker - run with: cargo test -- --ignored
+    #[ignore = "known broken: MockServiceProvider::project_service returns a placeholder, so execute() fails with 'Failed to get ProjectService'; needs real service wiring"]
     async fn test_execute_with_valid_plan_creates_all_resources() {
         // Arrange
         let importer = create_test_importer();
@@ -1464,7 +1458,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // Requires Docker - run with: cargo test -- --ignored
+    #[ignore = "known broken: MockServiceProvider::project_service returns a placeholder, so execute() fails with 'Failed to get ProjectService'; needs real service wiring"]
     async fn test_execute_tracks_created_resources() {
         // Arrange
         let importer = create_test_importer();
@@ -1519,7 +1513,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // Requires Docker - run with: cargo test -- --ignored
+    #[ignore = "known broken: MockServiceProvider::project_service returns a placeholder, so execute() fails with 'Failed to get ProjectService'; needs real service wiring"]
     async fn test_execute_handles_multiple_port_mappings() {
         // Arrange
         let importer = create_test_importer();
@@ -1569,7 +1563,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // Requires Docker - run with: cargo test -- --ignored
+    #[ignore = "known broken: MockServiceProvider::project_service returns a placeholder, so execute() fails with 'Failed to get ProjectService'; needs real service wiring"]
     async fn test_execute_includes_warnings_for_unknown_preset() {
         // Arrange
         let importer = create_test_importer();
@@ -1699,7 +1693,7 @@ mod tests {
     /// Create a test database connection with migrations
     async fn create_test_database() -> std::sync::Arc<sea_orm::DatabaseConnection> {
         // Use TestDatabase from temps_database for integration tests
-        match temps_database::test_utils::TestDatabase::with_migrations().await {
+        match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(test_db) => test_db.db.clone(),
             Err(_) => {
                 // Fallback to disconnected database for environments without Docker

@@ -106,6 +106,12 @@ fn expected_sdk_paths() -> Vec<&'static str> {
         "/v1/sandboxes/placement",
         "/v1/sandboxes/placement/nodes/{node}",
         "/v1/sandboxes/placement/nodes/{node}/evict",
+        // Changing a sandbox's egress policy after it was created (temps
+        // extension, ADR-055).
+        "/v1/sandboxes/{id}/egress-policy",
+        // Directory listing and preview access checks (temps extensions).
+        "/v1/sandboxes/{id}/fs/list",
+        "/v1/sandboxes/{id}/preview-access",
     ]
 }
 
@@ -131,16 +137,19 @@ fn openapi_covers_every_sdk_path() {
 fn openapi_does_not_advertise_unknown_paths() {
     let api = SandboxApiDoc::openapi();
     let expected: std::collections::HashSet<_> = expected_sdk_paths().into_iter().collect();
-    let got = &api.paths.paths;
+    let mut unknown: Vec<_> = api
+        .paths
+        .paths
+        .keys()
+        .filter(|path| !expected.contains(path.as_str()))
+        .collect();
+    unknown.sort();
 
-    for path in got.keys() {
-        assert!(
-            expected.contains(path.as_str()),
-            "OpenAPI doc exposes path '{}' not in the Vercel SDK surface — \
-             add it to `expected_sdk_paths` with a comment, or remove it from `SandboxApiDoc::paths`.",
-            path
-        );
-    }
+    assert!(
+        unknown.is_empty(),
+        "OpenAPI doc exposes paths not in the Vercel SDK surface: {unknown:?} — \
+         add them to `expected_sdk_paths` with a comment, or remove them from `SandboxApiDoc::paths`.",
+    );
 }
 
 // ── DTO shape: request bodies the SDK sends ─────────────────────────────────
@@ -382,6 +391,7 @@ fn sandbox_response_matches_sdk_envelope() {
             id: "sbx_abc".into(),
             node_id: None,
             node_name: "control-plane".into(),
+            egress_policy: Default::default(),
             memory: 2048,
             vcpus: 2.0,
             region: "local".into(),
@@ -398,6 +408,8 @@ fn sandbox_response_matches_sdk_envelope() {
             disk_size_mb: None,
             preview_url_template: String::new(),
             preview_password_hint: None,
+            preview_access: Default::default(),
+            preview_allowed_cidrs: Vec::new(),
             agent_run_id: None,
             lifecycle: "ephemeral".to_string(),
             project_id: None,
@@ -463,6 +475,7 @@ fn sandbox_status_uses_sdk_enum_values() {
                 id: "x".into(),
                 node_id: None,
                 node_name: "control-plane".into(),
+                egress_policy: Default::default(),
                 memory: 0,
                 vcpus: 0.0,
                 region: "local".into(),
@@ -479,6 +492,8 @@ fn sandbox_status_uses_sdk_enum_values() {
                 disk_size_mb: None,
                 preview_url_template: String::new(),
                 preview_password_hint: None,
+                preview_access: Default::default(),
+                preview_allowed_cidrs: Vec::new(),
                 agent_run_id: None,
                 lifecycle: "ephemeral".to_string(),
                 project_id: None,

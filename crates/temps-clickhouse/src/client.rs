@@ -16,6 +16,10 @@
 //! text and still read fine, which is why the symptom looks like a missing
 //! table rather than a transport problem.
 //!
+//! The crate negotiates through `Accept-Encoding` from 0.15.3, so a current
+//! client no longer depends on that default. The pin stays because it says what
+//! the setting asks for, whichever way a future crate version negotiates.
+//!
 //! So the choice is made here, once, from the stored setting:
 //!
 //! | mode   | client                     | query setting                     |
@@ -303,30 +307,8 @@ mod tests {
             return;
         };
 
-        // Premise: this server really does reproduce the bug. A client that
-        // leaves the codec to the server default (what every client in the
-        // workspace used to do) cannot decode a row-returning query.
-        let unpinned = clickhouse::Client::default()
-            .with_url(&base.url)
-            .with_database(&base.database)
-            .with_user(&base.user)
-            .with_password(&base.password);
-        let broken = unpinned
-            .query("SELECT number FROM system.numbers LIMIT 3")
-            .fetch_all::<NumberRow>()
-            .await;
-        match broken {
-            Err(clickhouse::error::Error::Decompression(reason)) => {
-                assert!(reason.to_string().contains("magic number"), "{reason}")
-            }
-            other => panic!(
-                "premise failed: an unpinned client should hit a decompression error against a \
-                 ZSTD-default server, got {:?}",
-                other.map(|rows| rows.len())
-            ),
-        }
-
-        // The server really does answer ZSTD when asked the way the old
+        // Premise: this server really does default to ZSTD, which is what the
+        // old client could not decode. It answers ZSTD when asked the way that
         // client did, and LZ4 when the codec is pinned the way we now do.
         assert_eq!(
             raw_method(&base, false).await,

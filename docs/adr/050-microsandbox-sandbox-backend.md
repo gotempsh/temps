@@ -11,7 +11,7 @@ The Firecracker backend is the right ceiling for hostile multi-tenant code, but 
 
 1. **No jailer.** The VMM runs as the server's own user (`firecracker.rs` module docs). KVM still isolates the guest, but a VMM escape lands with the server's privileges.
 2. **No egress credential proxy.** ADR-013 is unimplemented, so `network_mode: "restricted"` fails closed to *no network at all* — there is no middle ground between "open internet" and "nothing".
-3. **No memory-snapshot warm boot.** Snapshots (ADR-037) rebuild a sanitized ext4; every boot is a cold boot.
+3. **No memory-snapshot warm boot.** Snapshots (ADR-074) rebuild a sanitized ext4; every boot is a cold boot.
 4. **Docker is still the image toolchain.** Pull/export go through bollard; a Firecracker-only host can't exist.
 5. **Root network setup.** TAP pool + bridge + NAT need `sudo temps firecracker setup --network-only`.
 6. **Linux-only.** Developer machines (macOS) can only exercise the Docker path, so microVM behaviour is untested where most development happens.
@@ -63,7 +63,7 @@ All SDK state lives under a Temps-owned home, never the user's `~/.microsandbox`
 ```
 <data_dir>/microsandbox/      0700
   config.json                 Temps-owned SDK config (absent = SDK defaults)
-  bin/msb, lib/libkrunfw.*    pinned runtime pair (v0.7.8)
+  bin/msb, lib/libkrunfw.*    pinned runtime pair (v0.7.11)
   db/ sandboxes/ cache/ …     SDK-managed
 ```
 
@@ -147,7 +147,7 @@ limits and account for image storage when allocating the sandbox.
 | `recover` / `recover_by_name` | SDK registry lookup by name; accepts bare labels |
 | `image_status` / `rebuild_image` | readiness + default image (`alpine:3.20`); no build step (images are pulled per sandbox) |
 
-VMs are created **detached**: they outlive the server process, like Firecracker VMs, and are recovered by name after a restart.
+VMs are created **detached**: they outlive the server process, like Firecracker VMs, and are recovered by name after a restart. "Outlive the process" does not cover a service manager that kills the unit's whole control group (systemd's default `KillMode=control-group` on `systemctl restart`) or a host reboot; in that case startup reconciliation moves the `running` rows whose VM is down to `stopped` (with a `vm_lost` event), `resume` boots them again, and exec/files/terminal on a down VM answer `409 Sandbox VM Not Running` instead of `404` (see ADR-029 §7). `KillMode=process` on the service unit keeps these VMs running across a restart; the worker unit sets it and `temps serve` warns at startup when its unit does not (ADR-029 §7).
 
 **`network_mode`** maps onto the host-side policy engine:
 
@@ -192,6 +192,7 @@ Terminals run the same `temps-pty-agent` as the Docker and Firecracker backends 
 - **Guest agent.** `temps microsandbox setup` stages a static Linux `temps-pty-agent` at `<data_dir>/microsandbox/guest/` (`--pty-agent-bin`, or a file next to the `temps` executable; it must match the guest architecture — the host's on Linux, aarch64 on Apple Silicon — and is built with `cargo build --release --target <arch>-unknown-linux-musl -p temps-pty-agent`; release archives ship the matching static `temps-pty-agent` next to `temps`, `scripts/install.sh` and `temps upgrade` install it beside the binary, and setup finds it there without `--pty-agent-bin`). On the first terminal for a sandbox the provider writes it into the guest through the SDK file API at `/usr/local/lib/temps/pty-agent-<sha256 prefix>`, root-owned `0755` in a root-owned directory (content-addressed, so a new build installs beside the old one). A VM that is recreated or restarted keeps it on its root disk.
 - **Staying current.** At startup the server compares the `temps-pty-agent` beside its own executable with the staged copy of every backend that has already been set up (its state directory exists) and replaces the staged copy atomically when the bytes differ (`sync_pty_agent_binary`). So `deploy.sh`, `install.sh` and `temps upgrade` — which all land the new agent beside `temps` — are enough; no `setup` re-run is needed after an upgrade. The comparison is by content, so a rollback also restores the older agent. Each writer uses a unique temporary file in the destination directory, so setup and startup refresh can safely overlap; only a complete file is renamed into place. A missing, foreign (non-Linux) or wrong-architecture source is rejected and the working staged copy is left alone; failures are logged and never block startup. Hosts that never ran a `setup` command get no new directories. The same sync keeps Firecracker's `temps-vm-agent` (ADR-029) current, and runs before backends are probed so a host set up before a release that ships the VM agent becomes available on the first start after upgrading.
 - **Fetching when absent.** When `temps microsandbox setup` / `temps firecracker setup` find no agent via the flag, beside the executable, or from an earlier staging, they download the release tarball that matches the running binary's own version, verify its published SHA-256 (fail closed, same pipeline as `temps upgrade`), and extract the missing agents from it. The step is announced, only fetches what is missing, and a failure (offline host, a release that predates the agents) falls back to the previous warning naming `--pty-agent-bin` / `--vm-agent-bin`. The version is pinned to the binary because the VM agent must agree with the host on the wire protocol.
+- **Outdated-agent warning.** Each guest agent (`temps-vm-agent`, `temps-pty-agent`) embeds a `TEMPS_GUEST_AGENT_BUILD=<commit>` marker recorded by its build script, and the server reads it out of the file (nothing is executed) after the startup sync, comparing it with the commit its own copy of the agent crate was built from. A different commit -- or an agent from before the marker existed -- logs a `warn` naming the agent, its path and both builds, with the fix; matching builds log at `debug`, and a build without git information (`unknown`) is never reported. The copy beside the `temps` executable is the one checked when it exists, since that is what `temps upgrade` replaces and the sync mirrors it into the data dir. The check is advisory: it never blocks startup and does not change which agent is used.
 - **Start.** The agent is started detached (`setsid`, `nohup` fallback) as the sandbox's **default exec user** — the same identity every `exec` runs as — with `/run/temps-pty` created `0700` for that uid. Every step is idempotent: a probe (`temps-pty-agent --probe`, which connects rather than testing for the socket file, since a crashed agent leaves a stale one) gates both installation and start, and the agent itself refuses to bind over a live socket, so concurrent first attaches cannot orphan each other's tabs.
 - **Attach.** `attach_pty` is an SDK streaming exec of `temps-pty-agent --relay` with stdin piped (`exec_stream_with(.., stdin_pipe())`). Exec stdout is the `output` stream; `input` is a bounded 64 KiB pipe pumped into the SDK's stdin sink and closed on drop, which ends the relay but not the agent. Relay stderr is surfaced as the attach error, never mixed into the frame stream.
 - **Shell.** The default tab command uses `bash -l` when the guest has bash and `sh -l` otherwise.
@@ -210,7 +211,7 @@ Terminals run the same `temps-pty-agent` as the Docker and Firecracker backends 
 ### Negative
 
 - +76 crates in the agents graph, including a second ORM stack (sea-orm 2 / sqlx 0.9 + SQLite) that the SDK uses only for its own bookkeeping. Compile time and binary size grow.
-- A pre-1.0 dependency (`=0.7.8`) whose crate version, runtime binary and `libkrunfw` ABI move in lockstep. Upgrades are deliberate: bump the pin, `MICROSANDBOX_VERSION`, and re-run setup.
+- A pre-1.0 dependency (`=0.7.11`) whose crate version, runtime binary and `libkrunfw` ABI move in lockstep. Upgrades are deliberate: bump the pin, `MICROSANDBOX_VERSION`, and re-run setup.
 - libkrun's shared guest/VMM security context means this backend is weaker than Firecracker against VMM-escape attacks. Mitigated by positioning and the confinement in §6, but not eliminated.
 - Two microVM backends double the microVM test matrix.
 
@@ -254,5 +255,5 @@ E2E tests (`TEMPS_DATA_DIR=<dir with runtime> cargo test --lib -p temps-agents s
 - ADR-036: Persistent Workspace Sandboxes
 - ADR-037: Sandbox Snapshots
 - ADR-048: Multi-Node Sandboxes
-- microsandbox: https://github.com/superradcompany/microsandbox (SDK crate `microsandbox` 0.7.8)
+- microsandbox: https://github.com/superradcompany/microsandbox (SDK crate `microsandbox` 0.7.11)
 - libkrun: https://github.com/containers/libkrun (security model section)

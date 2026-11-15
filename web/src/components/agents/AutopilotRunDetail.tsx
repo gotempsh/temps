@@ -30,9 +30,12 @@ import {
   ArrowLeft,
   ExternalLink,
   FileCode,
+  FileText,
   Hash,
+  Info,
   Loader2,
   RefreshCw,
+  ScrollText,
   Terminal,
   Webhook,
 } from 'lucide-react'
@@ -44,6 +47,7 @@ import {
 import type { AgentRunLogResponse as AgentRunLog } from '@/api/client/types.gen'
 import { AutopilotStatusBadge } from './AutopilotStatusBadge'
 import { AutofixRunConfigForm } from '@/components/autofixer/AutofixRunConfigForm'
+import { invalidateOperations } from '@/lib/operations'
 import {
   addContext,
   createPr,
@@ -51,6 +55,8 @@ import {
   retryRun,
   startFix,
 } from '@/api/client/sdk.gen'
+import { CancelRunButton } from './CancelRunButton'
+import { useCancelRun } from './useCancelRun'
 import { cn } from '@/lib/utils'
 import { toast } from 'sonner'
 import {
@@ -987,6 +993,11 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
   // Retry/start-over config dialog: prefilled from the run's stored config
   // so the user can change harness/model/turns/branch and add retry notes.
   const [showRetryConfig, setShowRetryConfig] = useState(false)
+  // Owned here, not by the button: the button unmounts when the run stops
+  // being active, which can happen while a cancel is still in flight.
+  const cancelMutation = useCancelRun(project.id, Number(runId), () =>
+    window.location.reload()
+  )
 
   const runQueryOptions = getRunWithLogsOptions({
     path: { project_id: project.id, run_id: Number(runId) },
@@ -996,6 +1007,9 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
     ...runQueryOptions,
     enabled: !!runId,
     refetchInterval: (query) => {
+      // Creating a PR is a synchronous push request. Keep observing the run
+      // until it settles, even while the cached phase is still fix_ready.
+      if (isCreatingPr) return 5000
       const run = query.state.data?.run
       if (!run) return false
       const phase = run.phase || ''
@@ -1006,6 +1020,10 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
   })
 
   const currentRun = data?.run
+  useEffect(() => {
+    if (currentRun?.status === 'pushing') void invalidateOperations(queryClient)
+  }, [currentRun?.status, queryClient])
+
   const isAutofixerRun = currentRun?.trigger_source_type === 'error_group'
   const errorGroupId = isAutofixerRun
     ? (currentRun?.trigger_source_id ?? null)
@@ -1059,6 +1077,7 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
       eventSource.close()
       setStoppedStreamKey(streamKey)
       queryClient.invalidateQueries({ queryKey: runQueryOptions.queryKey })
+      void invalidateOperations(queryClient)
     })
 
     eventSource.onerror = () => {
@@ -1162,6 +1181,7 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
       })
       setStreamLogs([])
       queryClient.invalidateQueries({ queryKey: runQueryOptions.queryKey })
+      void invalidateOperations(queryClient)
       toast.success('Fix generation started')
     } catch (e) {
       toast.error(e instanceof Error ? e.message : 'Failed to start fix')
@@ -1177,11 +1197,14 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
         path: { project_id: project.id, run_id: run.id },
         throwOnError: true,
       })
-      queryClient.invalidateQueries({ queryKey: runQueryOptions.queryKey })
       toast.success('Pull request created')
     } catch (e) {
       toast.error(e instanceof Error ? e.message : 'Failed to create PR')
     } finally {
+      // Refresh the run on errors too: the server may have entered pushing
+      // before a failed response, and its persisted state drives polling.
+      void queryClient.invalidateQueries({ queryKey: runQueryOptions.queryKey })
+      void invalidateOperations(queryClient)
       setIsCreatingPr(false)
     }
   }
@@ -1204,6 +1227,7 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
         })
       }
       queryClient.invalidateQueries({ queryKey: runQueryOptions.queryKey })
+      void invalidateOperations(queryClient)
     } catch (e) {
       toast.error(e instanceof Error ? e.message : 'Failed to send message')
     } finally {
@@ -1216,17 +1240,6 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
   const onStartOver = () => {
     if (!run.trigger_source_id) return
     setShowRetryConfig(true)
-  }
-
-  const onCancel = async () => {
-    try {
-      await fetch(`/api/projects/${project.id}/agents/runs/${run.id}/cancel`, {
-        method: 'POST',
-      })
-      window.location.reload()
-    } catch {
-      // ignore
-    }
   }
 
   const durationText = formatDuration(run.started_at, run.completed_at)
@@ -1287,9 +1300,10 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
         </Button>
       )}
       {isActive && (
-        <Button size="sm" variant="destructive" onClick={onCancel}>
-          Cancel
-        </Button>
+        <CancelRunButton
+          pending={cancelMutation.isPending}
+          onCancel={() => cancelMutation.mutate()}
+        />
       )}
     </>
   )
@@ -1351,7 +1365,7 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
               ) && (
                 <Button variant="outline" size="sm" onClick={onStartOver}>
                   <RefreshCw className="h-4 w-4 mr-2" />
-                  Start Over
+                  Start over
                 </Button>
               )}
               {(phase === 'analyzing' || phase === 'analyzed') && (
@@ -1377,7 +1391,7 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
                   ) : (
                     <Sparkles className="h-4 w-4 mr-2" />
                   )}
-                  Generate Fix
+                  Generate fix
                 </Button>
               )}
               {phase === 'fix_ready' && (
@@ -1421,6 +1435,7 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
           />
           <Button
             size="sm"
+            aria-label="Send context"
             onClick={onSendContext}
             disabled={!contextInput.trim() || isSendingContext}
           >
@@ -1816,24 +1831,28 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
           <TabsList className="h-auto bg-transparent p-0 gap-4 justify-start border-b border-border w-full rounded-none">
             <TabsTrigger
               value="conversation"
+              icon={MessageSquare}
               className="data-[state=active]:bg-transparent data-[state=active]:shadow-none data-[state=active]:border-b-2 data-[state=active]:border-foreground rounded-none px-0 pb-2 text-sm font-medium text-muted-foreground data-[state=active]:text-foreground"
             >
               Conversation
             </TabsTrigger>
             <TabsTrigger
               value="report"
+              icon={FileText}
               className="data-[state=active]:bg-transparent data-[state=active]:shadow-none data-[state=active]:border-b-2 data-[state=active]:border-foreground rounded-none px-0 pb-2 text-sm font-medium text-muted-foreground data-[state=active]:text-foreground"
             >
               Report
             </TabsTrigger>
             <TabsTrigger
               value="details"
+              icon={Info}
               className="data-[state=active]:bg-transparent data-[state=active]:shadow-none data-[state=active]:border-b-2 data-[state=active]:border-foreground rounded-none px-0 pb-2 text-sm font-medium text-muted-foreground data-[state=active]:text-foreground"
             >
               Details
             </TabsTrigger>
             <TabsTrigger
               value="logs"
+              icon={ScrollText}
               className="data-[state=active]:bg-transparent data-[state=active]:shadow-none data-[state=active]:border-b-2 data-[state=active]:border-foreground rounded-none px-0 pb-2 text-sm font-medium text-muted-foreground data-[state=active]:text-foreground"
             >
               Logs

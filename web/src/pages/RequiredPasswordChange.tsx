@@ -24,6 +24,7 @@ import {
   FormMessage,
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
+import { ScrollRegion } from '@/components/ui/scroll-region'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import {
   PASSWORD_REQUIREMENTS,
@@ -130,9 +131,14 @@ export function RequiredPasswordChange() {
             </div>
             <div className="space-y-2 text-sm">
               <div className="font-medium">Manual setup key</div>
-              <code className="block overflow-x-auto rounded-md bg-muted p-3 font-mono">
-                {mfaSetup.secret_key}
-              </code>
+              <ScrollRegion
+                className="rounded-md bg-muted p-3"
+                regionLabel="Manual setup key, scrollable"
+              >
+                <code className="block w-max font-mono">
+                  {mfaSetup.secret_key}
+                </code>
+              </ScrollRegion>
             </div>
             {mfaSetup.recovery_codes.length > 0 ? (
               <div className="space-y-2 text-sm">

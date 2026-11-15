@@ -144,6 +144,105 @@ Useful history metrics are `container.cpu_percent`, `container.memory_used_bytes
 
 ---
 
+## Application metrics from Sentry SDKs
+
+Official Sentry JavaScript 11.8.0 SDKs can send custom metrics to the same native metric service used by OpenTelemetry. Open **Monitoring → Metrics** to explore them. This also works for external applications with no Temps-hosted containers.
+
+```javascript
+// After initializing the official SDK with your public Temps DSN:
+Sentry.metrics.count('import.records', 42);
+Sentry.metrics.gauge('import.queue_depth', 7);
+Sentry.metrics.distribution('import.duration', 125, { unit: 'millisecond' });
+await Sentry.flush(5000);
+```
+
+Counters record increments, gauges record current values, and distributions record observations with units. Trace/span IDs become native exemplars when supplied by the SDK. Native metric aggregation uses floating-point values; original numeric text and typed attributes are retained as source metadata. These are batched `trace_metric` items, not legacy StatsD.
+
+A single time bucket has no trend to plot. If a card says **Not enough data to chart**, send observations over multiple aggregation buckets, use an appropriate time range and select **Refresh**. Do not create fake samples to fill the chart. An emitted metric name/value in a native query proves storage; verify multiple buckets to test the chart.
+
+Browser metrics are useful for aggregate frontend behavior such as checkout failures or operation durations. Browser logs explain individual diagnostic events. Keep both sampled and bounded, avoid personal information, and use server-side telemetry as the source of truth for billing or trusted business totals.
+
+---
+
+## Cron monitoring {{ anchor: true, id: 'cron-monitoring' }}
+
+Use cron monitoring for scheduled work that can fail silently: a nightly backup, an hourly import, a report generator, or queue maintenance. Uptime checks can tell you the server responds while one of these jobs has stopped running. Cron check-ins distinguish a reported failure, a job that never started, and a job that started but exceeded its runtime budget.
+
+Open your project, then **Monitoring → Cron jobs**. This is available for both hosted projects and external applications. Choose **Create monitor**, enter a stable slug, select the project or environment scope, and configure an interval or five-field crontab schedule. Crontab schedules support a timezone. Set a start grace period, maximum runtime, and consecutive failure/recovery thresholds.
+
+### Send check-ins from the official SDK
+
+Use the project's Temps DSN with the official Node SDK. The following pattern was verified with `@sentry/node@10.17.0` and `@sentry/node@11.8.0`:
+
+```javascript
+import * as Sentry from '@sentry/node';
+
+Sentry.init({
+  dsn: process.env.TEMPS_SENTRY_DSN,
+  release: 'scheduled-worker@1.0.0',
+  sendClientReports: false,
+});
+
+// Run this callback from your existing scheduler.
+try {
+  await Sentry.withMonitor('nightly-import', async () => {
+    await runImport();
+  });
+} finally {
+  await Sentry.flush(5000); // Allow a short-lived worker to deliver check-ins.
+}
+```
+
+`runImport` represents your own job function. `withMonitor` sends `in_progress` before the callback and `ok` or `error` afterwards. For separate start/finish processes, use `captureCheckIn` and pass the same `checkInId` on completion. A release and trace ID can link a run to its deployment metadata and native trace.
+
+The DSN determines project/environment/deployment ownership. A free-form SDK `environment` label does not grant access to an environment; an unscoped DSN uses the project scope. The monitor slug and DSN scope must match. Public DSNs can submit check-ins but cannot read or manage monitors.
+
+### Manage schedules and inspect runs
+
+Creating a monitor in Temps starts schedule evaluation even before its first check-in. Monitors created or edited in the console use Temps-managed configuration, which takes precedence over later SDK `monitor_config` values. Alternatively, the SDK can upsert an unconfigured monitor by including its schedule in a check-in. Check-ins without a schedule are stored, with a pending-configuration receipt, but missed-run/timeout detection requires configuration.
+
+Open a monitor to see health, next expected start, runtime limit, monitoring policy and paginated run history. Runs report `ok`, `error`, `missed` or `timeout`. Pause monitoring to suspend schedule evaluation and alarms while continuing to retain incoming check-ins. Resume to establish fresh deadlines. Delete removes the monitor and its retained runs; its linked native alarm is resolved.
+
+The deadline worker checks every 15 seconds while the Temps server is running. It marks overdue starts as missed and overdue active runs as timed out. Consecutive failure/recovery thresholds control health and the linked Temps alarm. After downtime, overdue starts are coalesced rather than creating one row per missed schedule occurrence. A completed terminal run is immutable: a late success does not rewrite a timeout or missed result.
+
+Limits are 100 monitors per project and up to 10,000 runs per monitor, retained for 30 days. Monitoring observes your existing scheduler; it does not launch jobs. Notification delivery requires a configured provider. The monitor page shows the missing configuration and links to delivery settings; **View native alarms** remains available without external delivery.
+
+### Native API
+
+Authenticated clients use Temps endpoints under `/api/projects/{project_id}/cron-monitors`: list/create, get/update/delete by monitor ID, and `/{monitor_id}/runs` for history. Lists default to 20 records and allow at most 100 per page. Read/write permissions and project access are enforced; writes are audit logged. These routes are part of the generated Temps API clients, not Sentry's monitor-management API.
+
+---
+
+## Server and Worker Resource Usage
+
+The machine running the control plane and every worker node report CPU, memory and disk usage, and the console draws them the same way.
+
+- **Control plane**: **Monitoring → Server**. The node sampler also records network and block I/O and Docker disk usage.
+- **Worker**: **Settings → Nodes**, then open the worker. The **Resource usage** section shows CPU, memory and disk over 1 hour, 6 hours, 24 hours or 7 days. Samples arrive with the agent's heartbeat, about every 30 seconds, so a newly joined worker fills in within a minute. Network and block I/O are not reported by workers.
+
+Workers do not need an agent upgrade for this: the control plane stores the capacity figures that every `temps agent` heartbeat already carries. An agent that includes this release also measures CPU over the heartbeat interval rather than at a single instant, so older agents report a CPU figure that is usually close to zero.
+
+### Alerts on disk, memory and CPU
+
+Each node (the control plane or a worker) can have one alert rule per metric on `node.cpu_percent`, `node.memory_percent` and `node.disk_percent`, with a threshold between 0 and 100. Add them from the **Alert rules** card on the node, or press **Add recommended alerts** to create CPU above 90%, memory above 90% and disk above 85%, each for 5 minutes as a warning. Nothing is created until you press it. A firing rule raises an alarm like any other metric alert and notifies through your configured notification routes.
+
+```bash
+# Current values and history for a worker (node id 3)
+curl -H "Authorization: Bearer $TEMPS_API_TOKEN" \
+  "https://your-temps-instance.com/api/nodes/3/metrics/latest"
+curl -H "Authorization: Bearer $TEMPS_API_TOKEN" \
+  "https://your-temps-instance.com/api/nodes/3/metrics?metric=node.disk_percent&range=24h"
+
+# Alert when the worker's disk is more than 90% full for 10 minutes
+curl -X POST -H "Authorization: Bearer $TEMPS_API_TOKEN" -H "Content-Type: application/json" \
+  "https://your-temps-instance.com/api/nodes/3/metrics/alert-rules" \
+  -d '{"name":"Disk almost full","metric_name":"node.disk_percent","comparator":">","threshold":90,"severity":"critical","for_duration_secs":600}'
+```
+
+Removing a worker also removes its alert rules. The control plane's own rules are re-seeded on every start, so deleting one is refused; disable it instead.
+
+---
+
 ## Health Checks
 
 Configure health checks to automatically monitor your application's availability:

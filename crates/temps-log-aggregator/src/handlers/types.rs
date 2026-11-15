@@ -8,7 +8,8 @@ use temps_core::AuditLogger;
 
 use crate::index::LineIndex;
 use crate::services::{
-    ChunkWriterService, LogMetadataService, LogSearchService, RetentionService, TailService,
+    ChunkWriterService, IngestBudget, LogMetadataService, LogSearchService, RetentionService,
+    TailService,
 };
 use crate::store::manifest::ManifestRepo;
 use crate::store::LogLineStore;
@@ -40,6 +41,9 @@ pub struct LogAggregatorAppState {
     /// Chunk writer, for the collection status the capabilities endpoint
     /// reports (WAL recovery state and deferred generations).
     pub chunk_writer: Arc<ChunkWriterService>,
+    /// Per-container ingestion budget, for the throttled containers the
+    /// capabilities endpoint reports.
+    pub ingest_budget: Arc<IngestBudget>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -53,6 +57,7 @@ pub async fn create_log_aggregator_app_state(
     db: Arc<DatabaseConnection>,
     line_index: Arc<dyn LineIndex>,
     chunk_writer: Arc<ChunkWriterService>,
+    ingest_budget: Arc<IngestBudget>,
 ) -> Arc<LogAggregatorAppState> {
     let manifests = Arc::new(ManifestRepo::new(db.clone()));
     Arc::new(LogAggregatorAppState {
@@ -67,5 +72,6 @@ pub async fn create_log_aggregator_app_state(
         line_index,
         manifests,
         chunk_writer,
+        ingest_budget,
     })
 }

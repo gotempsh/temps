@@ -14,6 +14,7 @@ use sea_orm::{
     TransactionTrait,
 };
 use std::sync::Arc;
+use temps_core::escape::escape_like;
 use tracing::{debug, error, warn};
 
 use super::{
@@ -296,10 +297,13 @@ impl TimescaleDbStorage {
     /// all nullable so the INSERT is safe on instances that have not yet run
     /// the migration — Postgres will error with "column does not exist" but
     /// the migration is always applied before ingest in production.
-    /// Not idempotent — see [`TimescaleDbStorage::batch_insert_spans`] for why
-    /// these tables cannot currently carry a unique key, and why retry safety
-    /// is enforced by the error classification instead.
-    async fn batch_insert_metrics(&self, points: &[MetricPoint]) -> StorageResult<u64> {
+    /// The caller claims optional adapter identities in the native transaction.
+    /// Unidentified OTLP records retain their existing at-least-once semantics.
+    async fn batch_insert_metrics<C: ConnectionTrait>(
+        &self,
+        db: &C,
+        points: &[MetricPoint],
+    ) -> StorageResult<u64> {
         if points.is_empty() {
             return Ok(0);
         }
@@ -419,8 +423,7 @@ impl TimescaleDbStorage {
             ]);
         }
 
-        let result = self
-            .db
+        let result = db
             .execute(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
                 &sql,
@@ -431,7 +434,7 @@ impl TimescaleDbStorage {
         Ok(result.rows_affected())
     }
 
-    /// # Not idempotent — callers must not retry on an unknown outcome
+    /// # Unidentified writes are not idempotent — no unknown-outcome retries
     ///
     /// This is a plain multi-row `INSERT` with no `ON CONFLICT` clause, so
     /// re-sending the same batch inserts every row a second time. There is no
@@ -702,10 +705,13 @@ impl TimescaleDbStorage {
         Ok(result.rows_affected())
     }
 
-    /// Not idempotent — see [`TimescaleDbStorage::batch_insert_spans`] for why
-    /// these tables cannot currently carry a unique key, and why retry safety
-    /// is enforced by the error classification instead.
-    async fn batch_insert_logs(&self, records: &[LogRecord]) -> StorageResult<u64> {
+    /// The caller claims optional adapter identities in the native transaction.
+    /// Unidentified OTLP records retain their existing at-least-once semantics.
+    async fn batch_insert_logs<C: ConnectionTrait>(
+        &self,
+        db: &C,
+        records: &[LogRecord],
+    ) -> StorageResult<u64> {
         if records.is_empty() {
             return Ok(0);
         }
@@ -714,7 +720,7 @@ impl TimescaleDbStorage {
             "INSERT INTO otel_log_events (
                 project_id, deployment_id, service_name, service_version,
                 deployment_environment, timestamp, observed_timestamp,
-                severity, severity_text, body, trace_id, span_id, attributes
+                severity, severity_text, body, trace_id, span_id, attributes, attribute_types
             ) VALUES ",
         );
 
@@ -726,7 +732,7 @@ impl TimescaleDbStorage {
                 sql.push_str(", ");
             }
             sql.push_str(&format!(
-                "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
+                "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
                 param_idx,
                 param_idx + 1,
                 param_idx + 2,
@@ -739,9 +745,10 @@ impl TimescaleDbStorage {
                 param_idx + 9,
                 param_idx + 10,
                 param_idx + 11,
-                param_idx + 12
+                param_idx + 12,
+                param_idx + 13
             ));
-            param_idx += 13;
+            param_idx += 14;
 
             let attrs_json = serde_json::to_value(&r.attributes).unwrap_or_default();
 
@@ -759,11 +766,13 @@ impl TimescaleDbStorage {
                 r.trace_id.clone().into(),
                 r.span_id.clone().into(),
                 attrs_json.into(),
+                serde_json::to_value(&r.attribute_types)
+                    .unwrap_or_default()
+                    .into(),
             ]);
         }
 
-        let result = self
-            .db
+        let result = db
             .execute(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
                 &sql,
@@ -843,12 +852,6 @@ struct DeployRow {
 }
 
 #[derive(Debug, FromQueryResult)]
-#[allow(dead_code)]
-struct QuotaRow {
-    total_bytes: i64,
-}
-
-#[derive(Debug, FromQueryResult)]
 struct P95Row {
     p95: f64,
 }
@@ -868,7 +871,23 @@ impl OtelStorage for TimescaleDbStorage {
         super::global_traces::postgres(self.db.clone(), &query).await
     }
     async fn store_metrics(&self, points: Vec<MetricPoint>) -> StorageResult<u64> {
-        self.batch_insert_metrics(&points).await
+        if !points.iter().any(|r| r.ingest_identity.is_some()) {
+            return self.batch_insert_metrics(self.db.as_ref(), &points).await;
+        }
+        let tx = self.db.begin().await?;
+        let indices = super::receipts::claim(
+            &tx,
+            "metrics",
+            &points
+                .iter()
+                .map(|r| (r.project_id, r.ingest_identity.as_ref()))
+                .collect::<Vec<_>>(),
+        )
+        .await?;
+        let accepted: Vec<_> = indices.into_iter().map(|i| points[i].clone()).collect();
+        let stored = self.batch_insert_metrics(&tx, &accepted).await?;
+        tx.commit().await?;
+        Ok(stored)
     }
 
     async fn store_spans(&self, spans: Vec<SpanRecord>) -> StorageResult<u64> {
@@ -877,6 +896,20 @@ impl OtelStorage for TimescaleDbStorage {
         }
 
         let transaction = self.db.begin().await?;
+        let spans = if spans.iter().any(|r| r.ingest_identity.is_some()) {
+            let indices = super::receipts::claim(
+                &transaction,
+                "spans",
+                &spans
+                    .iter()
+                    .map(|r| (r.project_id, r.ingest_identity.as_ref()))
+                    .collect::<Vec<_>>(),
+            )
+            .await?;
+            indices.into_iter().map(|i| spans[i].clone()).collect()
+        } else {
+            spans
+        };
         let result = async {
             let stored = self.batch_insert_spans(&transaction, &spans).await?;
             self.upsert_trace_summaries(&transaction, &spans).await?;
@@ -902,7 +935,23 @@ impl OtelStorage for TimescaleDbStorage {
     }
 
     async fn store_logs(&self, records: Vec<LogRecord>) -> StorageResult<u64> {
-        self.batch_insert_logs(&records).await
+        if !records.iter().any(|r| r.ingest_identity.is_some()) {
+            return self.batch_insert_logs(self.db.as_ref(), &records).await;
+        }
+        let tx = self.db.begin().await?;
+        let indices = super::receipts::claim(
+            &tx,
+            "logs",
+            &records
+                .iter()
+                .map(|r| (r.project_id, r.ingest_identity.as_ref()))
+                .collect::<Vec<_>>(),
+        )
+        .await?;
+        let accepted: Vec<_> = indices.into_iter().map(|i| records[i].clone()).collect();
+        let stored = self.batch_insert_logs(&tx, &accepted).await?;
+        tx.commit().await?;
+        Ok(stored)
     }
 
     async fn archive_logs(&self, records: Vec<LogRecord>) -> StorageResult<u64> {
@@ -1665,7 +1714,7 @@ impl OtelStorage for TimescaleDbStorage {
         }
         if let Some(ref pattern) = query.name_pattern {
             where_clauses.push(format!("name ILIKE ${}", param_idx));
-            values.push(format!("%{}%", escape_like_pattern(pattern)).into());
+            values.push(format!("%{}%", escape_like(pattern)).into());
             param_idx += 1;
         }
         if query.root_only {
@@ -2409,16 +2458,43 @@ impl OtelStorage for TimescaleDbStorage {
             param_idx += 1;
         }
 
+        if let Some(filter) = &query.attribute_filter {
+            filter.validate()?;
+            let key_param = param_idx;
+            values.push(filter.key.clone().into());
+            param_idx += 1;
+            if let Some(ty) = filter.ty {
+                where_clauses.push(format!(
+                    "attribute_types->>${key_param}::text = ${param_idx}"
+                ));
+                values.push(ty.as_str().into());
+                param_idx += 1;
+            }
+            let operator = filter.operator.sql();
+            if filter.ty.is_some_and(LogAttributeType::is_numeric) {
+                where_clauses.push(format!("temps_log_numeric(attributes->>${key_param}::text) {operator} temps_log_numeric(${param_idx}::text)"));
+            } else {
+                where_clauses.push(format!(
+                    "attributes->>${key_param}::text {operator} ${param_idx}::text"
+                ));
+            }
+            values.push(filter.value.clone().into());
+            param_idx += 1;
+        }
+
         let where_sql = where_clauses.join(" AND ");
 
         let sql = format!(
             r#"
             SELECT project_id, deployment_id, service_name, service_version,
                    deployment_environment, timestamp, observed_timestamp,
-                   severity, severity_text, body, trace_id, span_id, attributes
+                   severity, severity_text, body, trace_id, span_id, attributes, attribute_types
             FROM otel_log_events
             WHERE {where_sql}
-            ORDER BY timestamp DESC
+            ORDER BY timestamp DESC,
+                temps_log_numeric(attributes->>'temps.sentry.timestamp') DESC NULLS LAST,
+                temps_log_numeric(attributes->>'sentry.timestamp.sequence') DESC NULLS LAST,
+                id DESC
             LIMIT ${param_idx} OFFSET ${next_param}
             "#,
             next_param = param_idx + 1
@@ -3192,7 +3268,7 @@ impl TimescaleDbStorage {
         }
         if let Some(ref pattern) = query.name_pattern {
             where_clauses.push(format!("s.name ILIKE ${}", param_idx));
-            values.push(format!("%{}%", escape_like_pattern(pattern)).into());
+            values.push(format!("%{}%", escape_like(pattern)).into());
             param_idx += 1;
         }
 
@@ -3395,7 +3471,7 @@ impl TimescaleDbStorage {
         }
         if let Some(ref pattern) = query.name_pattern {
             where_clauses.push(format!("s.name ILIKE ${}", param_idx));
-            values.push(format!("%{}%", escape_like_pattern(pattern)).into());
+            values.push(format!("%{}%", escape_like(pattern)).into());
             param_idx += 1;
         }
 
@@ -3652,7 +3728,7 @@ impl TimescaleDbStorage {
         }
         if let Some(ref pattern) = query.name_pattern {
             where_clauses.push(format!("ts.root_span_name ILIKE ${param_idx}"));
-            values.push(format!("%{}%", escape_like_pattern(pattern)).into());
+            values.push(format!("%{}%", escape_like(pattern)).into());
             param_idx += 1;
         }
 
@@ -3881,21 +3957,6 @@ fn histogram_quantile(q: f64, bounds: &[f64], bucket_counts: &[u64]) -> Option<f
 
 // ── Like-pattern helpers ────────────────────────────────────────────────────
 
-/// Escape LIKE/ILIKE metacharacters in a user-supplied substring pattern.
-///
-/// PostgreSQL ILIKE uses backslash as the default escape character. We escape:
-/// - `\` → `\\`   (backslash itself, first)
-/// - `%` → `\%`   (wildcard: any sequence of chars)
-/// - `_` → `\_`   (wildcard: exactly one char)
-///
-/// The caller wraps the result with `%{escaped}%` for a substring match.
-fn escape_like_pattern(pattern: &str) -> String {
-    pattern
-        .replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
-}
-
 /// Whether a trace query needs a span-level filter the pre-aggregated
 /// `otel_trace_summaries` table can't satisfy, forcing the slower
 /// `GROUP BY trace_id` fallback over the spans hypertable.
@@ -3972,7 +4033,7 @@ fn build_span_stats_filters(query: &SpanStatsQuery) -> (String, Vec<sea_orm::Val
     }
     if let Some(ref pattern) = query.name_pattern {
         where_clauses.push(format!("s.name ILIKE ${param_idx}"));
-        values.push(format!("%{}%", escape_like_pattern(pattern)).into());
+        values.push(format!("%{}%", escape_like(pattern)).into());
         param_idx += 1;
     }
     if let Some(kind) = query.kind {
@@ -4245,6 +4306,7 @@ fn parse_span_row(row: &sea_orm::QueryResult) -> Result<SpanRecord, OtelError> {
     };
 
     Ok(SpanRecord {
+        ingest_identity: None,
         project_id: row.try_get("", "project_id").unwrap_or(0),
         deployment_id: row.try_get("", "deployment_id").ok(),
         resource: ResourceInfo {
@@ -4285,6 +4347,11 @@ fn parse_log_row(row: &sea_orm::QueryResult) -> Result<LogRecord, OtelError> {
     };
 
     Ok(LogRecord {
+        ingest_identity: None,
+        attribute_types: serde_json::from_value(
+            row.try_get("", "attribute_types").unwrap_or_default(),
+        )
+        .unwrap_or_default(),
         project_id: row.try_get("", "project_id").unwrap_or(0),
         deployment_id: row.try_get("", "deployment_id").ok(),
         resource: ResourceInfo {
@@ -4390,6 +4457,7 @@ mod tests {
         status: SpanStatusCode,
     ) -> SpanRecord {
         SpanRecord {
+            ingest_identity: None,
             project_id,
             deployment_id: Some(7),
             resource: ResourceInfo {

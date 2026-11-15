@@ -5,7 +5,6 @@ const PLATFORM_TOOL_PREFIXES = [
   '/tools',
   '/sandboxes',
   '/certificates',
-  '/email',
   '/ai-gateway',
   '/chat',
   '/ai-workflows',

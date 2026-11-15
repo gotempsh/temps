@@ -1,8 +1,10 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import { PageTitle } from '@temps-sdk/ds'
 import {
   getGenaiTraceOptions,
   queryGenaiTracesOptions,
+  queryGenaiTracesQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
 import type {
   GenAiSpanDetail,
@@ -22,9 +24,17 @@ import { problemDetail } from '@/lib/api-problem'
 import { AiProviderSelect } from '@/components/ai/AiProviderSelect'
 import { AiActivityEmptyState } from '@/components/ai/AiActivityEmptyState'
 import { DateTimeRange } from '@/components/ui/date-time-range'
+import { RefreshButton } from '@/components/ui/refresh-button'
+import { queryKeyPrefix } from '@/lib/refresh'
 import type { DateTimeRangeValue } from '@/lib/date-time-range'
 
-import { Fragment, useMemo, useState } from 'react'
+import {
+  Fragment,
+  useLayoutEffect,
+  useMemo,
+  useState,
+  type ChangeEvent,
+} from 'react'
 import { Link, useSearchParams } from 'react-router'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import {
@@ -137,6 +147,7 @@ import {
   Cpu,
   Hash,
   Info,
+  KeyRound,
   RefreshCw,
 } from 'lucide-react'
 import { toast } from 'sonner'
@@ -162,6 +173,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { useSettings } from '@/hooks/useSettings'
 import { ReadFailure } from '@/components/ui/read-failure'
+import { ReplaceProviderKeyDialog } from '@/components/ai/ReplaceProviderKeyDialog'
 import {
   aiProviderRowStatus,
   providerKeysUnknown,
@@ -174,7 +186,10 @@ import {
   aiProviderName,
   aiProviderModels,
   getAiProvider,
+  providerFromAddParam,
   isSelfHostedProvider,
+  providerKeyEndpoint,
+  SELF_HOSTED_PROVIDER_ID,
 } from '@/lib/ai-providers'
 import { SelfHostedProviderFields } from '@/components/ai/SelfHostedProviderFields'
 import { SelfHostedKeySettings } from '@/components/ai/SelfHostedKeySettings'
@@ -189,8 +204,11 @@ import {
   providerKeyFormSchema,
   providerKeyFormToRequest,
   selectProviderKeyFormProvider,
+  switchToOpenAiCompatible,
+  vendorHasCustomBaseUrl,
   type ProviderKeyFormValues,
 } from '@/components/ai/provider-key-form'
+import { VendorBaseUrlHint } from '@/components/ai/VendorBaseUrlHint'
 import { ProviderKeyProviderPicker } from '@/components/ai/ProviderKeyProviderPicker'
 import { useForm, useWatch } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
@@ -199,6 +217,7 @@ import {
   compareAiModelIdsByRelevance,
   sortAiModelIdsByRelevance,
 } from '@/lib/ai-model-ranking'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 // Mutation errors here are thrown ProblemDetails response bodies, not Error
 // instances -- String(error) on an object stringifies to "[object Object]"
@@ -265,6 +284,9 @@ interface UsageLogEntry {
   status: number
   is_streaming: boolean
   is_byok: boolean
+  /** Set when the call came from a deployment token; absent otherwise. */
+  project_id?: number
+  token_id?: number
 }
 
 interface UsageLogPage {
@@ -526,6 +548,7 @@ function ProviderKeyModelDetail({
       updateProviderKey({
         path: { id: providerKey.id },
         body: { default_model: modelId },
+        throwOnError: true,
       }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey })
@@ -834,6 +857,7 @@ type TimeRange = { label: string; hours: number }
 function useTimeRangeSelection(): [
   { range: TimeRange; endMs: number },
   (value: DateTimeRangeValue) => void,
+  () => void,
 ] {
   const [selection, setSelection] = useState(() => ({
     range: { label: '1d', hours: 24 },
@@ -849,6 +873,13 @@ function useTimeRangeSelection(): [
         },
         endMs: Date.parse(value.to),
       }),
+    // Refresh: a preset ("last 24 hours") ends now again; a custom range stays.
+    () =>
+      setSelection((current) =>
+        current.range.label === 'custom'
+          ? current
+          : { ...current, endMs: Date.now() }
+      ),
   ]
 }
 
@@ -879,6 +910,40 @@ function AiTimeRange({
 // pages, and the sandbox UI.
 const SUPPORTED_PROVIDERS = AI_PROVIDERS
 const providerName = aiProviderName
+
+/** A key's custom endpoint host, shown so keys of one provider differ. */
+function KeyEndpoint({ baseUrl }: { baseUrl?: string | null }) {
+  const endpoint = providerKeyEndpoint(baseUrl)
+  if (!endpoint) return null
+  return (
+    <Badge
+      variant="outline"
+      className="h-5 shrink-0 px-1.5 font-mono text-[10px]"
+      title={baseUrl ?? undefined}
+    >
+      {endpoint}
+    </Badge>
+  )
+}
+
+/**
+ * The models column of a provider row. An OpenAI-compatible provider lists
+ * the endpoints its keys point at, since that is what tells them apart.
+ */
+function providerRowModels(
+  provider: { id: string; models: string },
+  providerKeys: { base_url?: string | null }[]
+): string {
+  if (!isSelfHostedProvider(provider.id)) return provider.models
+  const endpoints = [
+    ...new Set(
+      providerKeys
+        .map((key) => providerKeyEndpoint(key.base_url))
+        .filter((endpoint): endpoint is string => endpoint !== null)
+    ),
+  ]
+  return endpoints.length > 0 ? endpoints.join(', ') : provider.models
+}
 const providerModels = aiProviderModels
 
 // ============================================================================
@@ -902,6 +967,32 @@ const providerChartConfig = {
   request_count: { label: 'Requests', color: 'var(--chart-1)' },
 } satisfies ChartConfig
 
+/**
+ * A usage read that failed with nothing loaded. Says so instead of showing
+ * zero or "no data", which would read as a quiet gateway.
+ */
+function UsageReadFailed({
+  label,
+  onRetry,
+}: {
+  label: string
+  onRetry: () => void
+}) {
+  return (
+    <div className="flex h-[200px] flex-col items-center justify-center gap-2 text-center text-sm">
+      <p className="text-destructive">Couldn&apos;t load {label}.</p>
+      <Button variant="outline" size="sm" onClick={onRetry}>
+        Retry
+      </Button>
+    </div>
+  )
+}
+
+/** A stat card's value when its read failed with nothing loaded. */
+function UsageStatFailed() {
+  return <p className="text-sm text-destructive">Couldn&apos;t load</p>
+}
+
 function LogCostCell({
   log,
   pricingMap,
@@ -919,7 +1010,8 @@ function LogCostCell({
 }
 
 export function UsageAnalytics() {
-  const [{ range: timeRange, endMs }, selectTimeRange] = useTimeRangeSelection()
+  const [{ range: timeRange, endMs }, selectTimeRange, moveToNow] =
+    useTimeRangeSelection()
 
   const timeParams = useMemo(() => {
     const to = new Date(endMs).toISOString()
@@ -928,21 +1020,34 @@ export function UsageAnalytics() {
     return { from, to, bucket }
   }, [endMs, timeRange])
 
-  const { data: summary, isLoading: summaryLoading } = useQuery({
-    queryKey: ['aiUsage', 'summary', timeParams.from, timeParams.to],
+  // The window is named in each key ({ from, to }), so a Refresh that moves
+  // it keeps the numbers on screen and picking another range does not.
+  const {
+    data: summary,
+    isLoading: summaryLoading,
+    isError: summaryError,
+  } = useWindowQuery({
+    queryKey: [
+      'aiUsage',
+      'summary',
+      { from: timeParams.from, to: timeParams.to },
+    ],
     queryFn: () =>
       fetchJson<UsageSummary>(
         buildUsageUrl('summary', { from: timeParams.from, to: timeParams.to })
       ),
   })
 
-  const { data: timeseries, isLoading: timeseriesLoading } = useQuery({
+  const {
+    data: timeseries,
+    isLoading: timeseriesLoading,
+    isError: timeseriesError,
+    refetch: refetchTimeseries,
+  } = useWindowQuery({
     queryKey: [
       'aiUsage',
       'timeseries',
-      timeParams.from,
-      timeParams.to,
-      timeParams.bucket,
+      { from: timeParams.from, to: timeParams.to, bucket: timeParams.bucket },
     ],
     queryFn: () =>
       fetchJson<TimeseriesBucket[]>(
@@ -954,8 +1059,17 @@ export function UsageAnalytics() {
       ),
   })
 
-  const { data: byProvider } = useQuery({
-    queryKey: ['aiUsage', 'by-provider', timeParams.from, timeParams.to],
+  const {
+    data: byProvider,
+    isLoading: byProviderLoading,
+    isError: byProviderError,
+    refetch: refetchByProvider,
+  } = useWindowQuery({
+    queryKey: [
+      'aiUsage',
+      'by-provider',
+      { from: timeParams.from, to: timeParams.to },
+    ],
     queryFn: () =>
       fetchJson<ProviderUsage[]>(
         buildUsageUrl('by-provider', {
@@ -965,8 +1079,17 @@ export function UsageAnalytics() {
       ),
   })
 
-  const { data: topModels } = useQuery({
-    queryKey: ['aiUsage', 'top-models', timeParams.from, timeParams.to],
+  const {
+    data: topModels,
+    isLoading: topModelsLoading,
+    isError: topModelsError,
+    refetch: refetchTopModels,
+  } = useWindowQuery({
+    queryKey: [
+      'aiUsage',
+      'top-models',
+      { from: timeParams.from, to: timeParams.to },
+    ],
     queryFn: () =>
       fetchJson<ModelUsage[]>(
         buildUsageUrl('top-models', {
@@ -1087,6 +1210,12 @@ export function UsageAnalytics() {
     )
   }, [topModels, pricingMap])
 
+  // Failed with nothing to show: never rendered as zero usage.
+  const summaryFailed = summaryError && !summary
+  const timeseriesFailed = timeseriesError && !timeseries
+  const byProviderFailed = byProviderError && !byProvider
+  const topModelsFailed = topModelsError && !topModels
+
   const chartTimeseries = useMemo(
     () =>
       (timeseries ?? []).map((b) => ({
@@ -1109,8 +1238,9 @@ export function UsageAnalytics() {
     <div className="space-y-4">
       {/* Time range selector */}
       <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-        <h3 className="text-lg font-semibold">Usage Analytics</h3>
-        <div className="flex gap-1">
+        <h3 className="text-lg font-semibold">Usage analytics</h3>
+        <div className="flex flex-wrap items-center gap-2">
+          <RefreshButton queryKeys={[['aiUsage']]} onRefresh={moveToNow} />
           <AiTimeRange
             range={timeRange}
             endMs={endMs}
@@ -1131,6 +1261,8 @@ export function UsageAnalytics() {
           <CardContent>
             {summaryLoading ? (
               <Skeleton className="h-7 w-16" />
+            ) : summaryFailed ? (
+              <UsageStatFailed />
             ) : (
               <div className="text-2xl font-bold">
                 {formatTokenCount(summary?.total_requests ?? 0)}
@@ -1142,12 +1274,14 @@ export function UsageAnalytics() {
           <CardHeader className="pb-2">
             <CardTitle className="text-sm font-medium flex items-center gap-2">
               <Zap className="h-4 w-4 text-muted-foreground" />
-              Total Tokens
+              Total tokens
             </CardTitle>
           </CardHeader>
           <CardContent>
             {summaryLoading ? (
               <Skeleton className="h-7 w-16" />
+            ) : summaryFailed ? (
+              <UsageStatFailed />
             ) : (
               <div className="text-2xl font-bold">
                 {formatTokenCount(summary?.total_tokens ?? 0)}
@@ -1159,12 +1293,14 @@ export function UsageAnalytics() {
           <CardHeader className="pb-2">
             <CardTitle className="text-sm font-medium flex items-center gap-2">
               <Clock className="h-4 w-4 text-muted-foreground" />
-              Avg Latency
+              Avg latency
             </CardTitle>
           </CardHeader>
           <CardContent>
             {summaryLoading ? (
               <Skeleton className="h-7 w-16" />
+            ) : summaryFailed ? (
+              <UsageStatFailed />
             ) : (
               <div className="text-2xl font-bold">
                 {Math.round(summary?.avg_latency_ms ?? 0)}ms
@@ -1176,12 +1312,14 @@ export function UsageAnalytics() {
           <CardHeader className="pb-2">
             <CardTitle className="text-sm font-medium flex items-center gap-2">
               <TrendingUp className="h-4 w-4 text-muted-foreground" />
-              Error Rate
+              Error rate
             </CardTitle>
           </CardHeader>
           <CardContent>
             {summaryLoading ? (
               <Skeleton className="h-7 w-16" />
+            ) : summaryFailed ? (
+              <UsageStatFailed />
             ) : (
               <div className="text-2xl font-bold">
                 {summary && summary.total_requests > 0
@@ -1199,8 +1337,10 @@ export function UsageAnalytics() {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            {summaryLoading ? (
+            {summaryLoading || topModelsLoading ? (
               <Skeleton className="h-7 w-16" />
+            ) : topModelsFailed ? (
+              <UsageStatFailed />
             ) : (
               <div className="text-2xl font-bold">
                 {formatCost(totalEstimatedCost)}
@@ -1213,11 +1353,16 @@ export function UsageAnalytics() {
       {/* Requests over time chart */}
       <Card>
         <CardHeader>
-          <CardTitle className="text-base">Requests Over Time</CardTitle>
+          <CardTitle className="text-base">Requests over time</CardTitle>
         </CardHeader>
         <CardContent>
           {timeseriesLoading ? (
             <Skeleton className="h-[200px] w-full" />
+          ) : timeseriesFailed ? (
+            <UsageReadFailed
+              label="requests over time"
+              onRetry={() => void refetchTimeseries()}
+            />
           ) : chartTimeseries.length === 0 ? (
             <EmptyState
               icon={Activity}
@@ -1254,11 +1399,16 @@ export function UsageAnalytics() {
       <div className="grid gap-4 md:grid-cols-2">
         <Card>
           <CardHeader>
-            <CardTitle className="text-base">Token Usage</CardTitle>
+            <CardTitle className="text-base">Token usage</CardTitle>
           </CardHeader>
           <CardContent>
             {timeseriesLoading ? (
               <Skeleton className="h-[200px] w-full" />
+            ) : timeseriesFailed ? (
+              <UsageReadFailed
+                label="usage over time"
+                onRetry={() => void refetchTimeseries()}
+              />
             ) : chartTimeseries.length === 0 ? (
               <div className="h-[200px] flex items-center justify-center text-sm text-muted-foreground">
                 No data
@@ -1305,11 +1455,16 @@ export function UsageAnalytics() {
 
         <Card>
           <CardHeader>
-            <CardTitle className="text-base">Avg Latency</CardTitle>
+            <CardTitle className="text-base">Avg latency</CardTitle>
           </CardHeader>
           <CardContent>
             {timeseriesLoading ? (
               <Skeleton className="h-[200px] w-full" />
+            ) : timeseriesFailed ? (
+              <UsageReadFailed
+                label="usage over time"
+                onRetry={() => void refetchTimeseries()}
+              />
             ) : chartTimeseries.length === 0 ? (
               <div className="h-[200px] flex items-center justify-center text-sm text-muted-foreground">
                 No data
@@ -1352,10 +1507,17 @@ export function UsageAnalytics() {
       <div className="grid gap-4 md:grid-cols-2">
         <Card>
           <CardHeader>
-            <CardTitle className="text-base">By Provider</CardTitle>
+            <CardTitle className="text-base">By provider</CardTitle>
           </CardHeader>
           <CardContent>
-            {!byProvider || byProvider.length === 0 ? (
+            {byProviderLoading ? (
+              <Skeleton className="h-[200px] w-full" />
+            ) : byProviderFailed ? (
+              <UsageReadFailed
+                label="usage by provider"
+                onRetry={() => void refetchByProvider()}
+              />
+            ) : !byProvider || byProvider.length === 0 ? (
               <div className="h-[200px] flex items-center justify-center text-sm text-muted-foreground">
                 No data
               </div>
@@ -1401,10 +1563,21 @@ export function UsageAnalytics() {
 
         <Card>
           <CardHeader>
-            <CardTitle className="text-base">Top Models</CardTitle>
+            <CardTitle className="text-base">Top models</CardTitle>
           </CardHeader>
           <CardContent>
-            {!topModels || topModels.length === 0 ? (
+            {topModelsLoading ? (
+              <div className="space-y-3">
+                {['a', 'b', 'c', 'd'].map((key) => (
+                  <Skeleton key={key} className="h-5 w-full" />
+                ))}
+              </div>
+            ) : topModelsFailed ? (
+              <UsageReadFailed
+                label="top models"
+                onRetry={() => void refetchTopModels()}
+              />
+            ) : !topModels || topModels.length === 0 ? (
               <div className="h-[200px] flex items-center justify-center text-sm text-muted-foreground">
                 No data
               </div>
@@ -1453,7 +1626,7 @@ export function UsageAnalytics() {
       <Card>
         <CardHeader className="gap-3">
           <div className="flex items-center justify-between gap-2">
-            <CardTitle className="text-base">Recent Requests</CardTitle>
+            <CardTitle className="text-base">Recent requests</CardTitle>
             <Button
               type="button"
               variant={recentFiltersOpen ? 'secondary' : 'outline'}
@@ -1607,6 +1780,7 @@ export function UsageAnalytics() {
                     <TableHead>Time</TableHead>
                     <TableHead>Provider</TableHead>
                     <TableHead>Model</TableHead>
+                    <TableHead>Caller</TableHead>
                     <TableHead className="hidden md:table-cell">
                       Tokens
                     </TableHead>
@@ -1633,6 +1807,11 @@ export function UsageAnalytics() {
                       </TableCell>
                       <TableCell className="font-mono text-xs">
                         {log.model}
+                      </TableCell>
+                      <TableCell className="text-muted-foreground text-xs whitespace-nowrap">
+                        {log.project_id === undefined
+                          ? '—'
+                          : `Project #${log.project_id}${log.token_id === undefined ? '' : ` · token #${log.token_id}`}`}
                       </TableCell>
                       <TableCell className="hidden md:table-cell text-muted-foreground">
                         {formatTokenCount(log.input_tokens + log.output_tokens)}
@@ -2455,7 +2634,7 @@ function SpanDetailSheet({
           {/* Identification */}
           <DetailSection title="Identification">
             <DetailRow label="Span ID" value={span.span_id} mono />
-            <DetailRow label="Parent Span" value={span.parent_span_id} mono />
+            <DetailRow label="Parent span" value={span.parent_span_id} mono />
             <DetailRow label="Kind" value={span.kind} />
             <DetailRow
               label="Duration"
@@ -2469,15 +2648,15 @@ function SpanDetailSheet({
 
           {/* Model */}
           <DetailSection title="Model">
-            <DetailRow label="Requested Model" value={span.gen_ai_model} mono />
+            <DetailRow label="Requested model" value={span.gen_ai_model} mono />
             <DetailRow
-              label="Response Model"
+              label="Response model"
               value={span.gen_ai_response_model}
               mono
             />
             <DetailRow label="Response ID" value={span.response_id} mono />
             <DetailRow
-              label="Finish Reasons"
+              label="Finish reasons"
               value={span.response_finish_reasons?.join(', ')}
             />
             <DetailRow
@@ -2488,32 +2667,32 @@ function SpanDetailSheet({
           </DetailSection>
 
           {/* Request Parameters */}
-          <DetailSection title="Request Parameters">
+          <DetailSection title="Request parameters">
             <DetailRow
               label="Temperature"
               value={span.request_temperature?.toString()}
             />
             <DetailRow
-              label="Max Tokens"
+              label="Max tokens"
               value={span.request_max_tokens?.toString()}
             />
             <DetailRow label="Top P" value={span.request_top_p?.toString()} />
             <DetailRow label="Top K" value={span.request_top_k?.toString()} />
             <DetailRow
-              label="Frequency Penalty"
+              label="Frequency penalty"
               value={span.request_frequency_penalty?.toString()}
             />
             <DetailRow
-              label="Presence Penalty"
+              label="Presence penalty"
               value={span.request_presence_penalty?.toString()}
             />
             <DetailRow
-              label="Stop Sequences"
+              label="Stop sequences"
               value={span.request_stop_sequences?.join(', ')}
             />
             <DetailRow label="Seed" value={span.request_seed?.toString()} />
             <DetailRow
-              label="Choice Count"
+              label="Choice count"
               value={span.request_choice_count?.toString()}
             />
           </DetailSection>
@@ -2530,8 +2709,8 @@ function SpanDetailSheet({
 
           {/* Tool */}
           {(span.tool_name || span.tool_call_id) && (
-            <DetailSection title="Tool Execution">
-              <DetailRow label="Tool Name" value={span.tool_name} />
+            <DetailSection title="Tool execution">
+              <DetailRow label="Tool name" value={span.tool_name} />
               <DetailRow label="Call ID" value={span.tool_call_id} mono />
               <DetailRow label="Type" value={span.tool_type} />
               <DetailRow label="Description" value={span.tool_description} />
@@ -2546,7 +2725,7 @@ function SpanDetailSheet({
                 value={span.embeddings_dimension_count.toString()}
               />
               <DetailRow
-                label="Encoding Formats"
+                label="Encoding formats"
                 value={span.request_encoding_formats?.join(', ')}
               />
             </DetailSection>
@@ -2555,7 +2734,7 @@ function SpanDetailSheet({
           {/* Retrieval */}
           {span.data_source_id && (
             <DetailSection title="Retrieval">
-              <DetailRow label="Data Source" value={span.data_source_id} mono />
+              <DetailRow label="Data source" value={span.data_source_id} mono />
             </DetailSection>
           )}
 
@@ -2572,18 +2751,18 @@ function SpanDetailSheet({
             span.openai_system_fingerprint ||
             span.aws_bedrock_guardrail_id ||
             span.azure_resource_provider_namespace) && (
-            <DetailSection title="Provider Specific">
-              <DetailRow label="OpenAI API Type" value={span.openai_api_type} />
+            <DetailSection title="Provider specific">
+              <DetailRow label="OpenAI API type" value={span.openai_api_type} />
               <DetailRow
-                label="Request Service Tier"
+                label="Request service tier"
                 value={span.openai_request_service_tier}
               />
               <DetailRow
-                label="Response Service Tier"
+                label="Response service tier"
                 value={span.openai_response_service_tier}
               />
               <DetailRow
-                label="System Fingerprint"
+                label="System fingerprint"
                 value={span.openai_system_fingerprint}
                 mono
               />
@@ -2598,7 +2777,7 @@ function SpanDetailSheet({
                 mono
               />
               <DetailRow
-                label="Azure Namespace"
+                label="Azure namespace"
                 value={span.azure_resource_provider_namespace}
               />
             </DetailSection>
@@ -2632,7 +2811,7 @@ function SpanDetailSheet({
               <Separator />
               <div>
                 <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-1">
-                  Tool Content
+                  Tool content
                 </h4>
                 <JsonBlock
                   label="Arguments"
@@ -3136,7 +3315,7 @@ function TraceDetailView({
             <div className="grid gap-3 grid-cols-2 md:grid-cols-4 lg:grid-cols-6">
               <Card className="p-3">
                 <div className="text-[10px] text-muted-foreground uppercase">
-                  Total Spans
+                  Total spans
                 </div>
                 <div className="text-xl font-bold">
                   {traceDetail.span_count}
@@ -3157,7 +3336,7 @@ function TraceDetailView({
               </Card>
               <Card className="p-3">
                 <div className="text-[10px] text-muted-foreground uppercase">
-                  Input Tokens
+                  Input tokens
                 </div>
                 <div className="text-xl font-bold tabular-nums">
                   {formatTokenCount(stats.totalInput)}
@@ -3170,7 +3349,7 @@ function TraceDetailView({
               </Card>
               <Card className="p-3">
                 <div className="text-[10px] text-muted-foreground uppercase">
-                  Output Tokens
+                  Output tokens
                 </div>
                 <div className="text-xl font-bold tabular-nums">
                   {formatTokenCount(stats.totalOutput)}
@@ -3179,7 +3358,7 @@ function TraceDetailView({
               {stats.tools.length > 0 && (
                 <Card className="p-3">
                   <div className="text-[10px] text-muted-foreground uppercase">
-                    Tool Calls
+                    Tool calls
                   </div>
                   <div className="text-xl font-bold">{stats.tools.length}</div>
                 </Card>
@@ -3203,8 +3382,7 @@ function TraceDetailView({
           {/* Invocations (default) + raw span tree */}
           <Tabs defaultValue="conversation" className="w-full">
             <TabsList>
-              <TabsTrigger value="conversation" className="gap-1.5">
-                <MessageSquare className="h-3.5 w-3.5" />
+              <TabsTrigger value="conversation" icon={MessageSquare}>
                 Conversation
                 {invocationCount > 0 && (
                   <span className="text-xs text-muted-foreground">
@@ -3212,8 +3390,7 @@ function TraceDetailView({
                   </span>
                 )}
               </TabsTrigger>
-              <TabsTrigger value="tree" className="gap-1.5">
-                <ListTree className="h-3.5 w-3.5" />
+              <TabsTrigger value="tree" icon={ListTree}>
                 Span tree
                 <span className="text-xs text-muted-foreground">
                   {traceDetail.span_count}
@@ -3324,7 +3501,8 @@ export function AgentActivity() {
   const [selectedProjectId, setSelectedProjectId] = useState<
     number | undefined
   >(projects[0]?.id)
-  const [{ range: timeRange, endMs }, selectTimeRange] = useTimeRangeSelection()
+  const [{ range: timeRange, endMs }, selectTimeRange, moveToNow] =
+    useTimeRangeSelection()
   const [systemFilter, setSystemFilter] = useState<string>('')
   const [selectedTraceId, setSelectedTraceId] = useState<string | null>(null)
   const [selectedTraceBounds, setSelectedTraceBounds] =
@@ -3346,7 +3524,7 @@ export function AgentActivity() {
     data: tracesResponse,
     isLoading: tracesLoading,
     error: tracesError,
-  } = useQuery({
+  } = useWindowQuery({
     ...queryGenaiTracesOptions({
       query: {
         project_id: projectId,
@@ -3392,7 +3570,7 @@ export function AgentActivity() {
     <div className="space-y-4">
       {/* Filters */}
       <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-        <h3 className="text-lg font-semibold">Agent Activity</h3>
+        <h3 className="text-lg font-semibold">Agent activity</h3>
         <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
           {projects.length > 0 && (
             <Select
@@ -3420,7 +3598,15 @@ export function AgentActivity() {
               setSystemFilter(value === 'all' ? '' : value)
             }
           />
-          <div className="flex gap-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <RefreshButton
+              queryKeys={[
+                queryKeyPrefix(queryGenaiTracesQueryKey, {
+                  query: { project_id: projectId },
+                }),
+              ]}
+              onRefresh={moveToNow}
+            />
             <AiTimeRange
               range={timeRange}
               endMs={endMs}
@@ -3664,7 +3850,8 @@ export function ProjectAgentActivity({
   projectId: number
   projectSlug: string
 }) {
-  const [{ range: timeRange, endMs }, selectTimeRange] = useTimeRangeSelection()
+  const [{ range: timeRange, endMs }, selectTimeRange, moveToNow] =
+    useTimeRangeSelection()
   const [systemFilter, setSystemFilter] = useState<string>('')
   const [searchParams, setSearchParams] = useSearchParams()
   const selectedTraceId = searchParams.get('trace') || null
@@ -3697,7 +3884,7 @@ export function ProjectAgentActivity({
     data: tracesResponse,
     isLoading: tracesLoading,
     error: tracesError,
-  } = useQuery({
+  } = useWindowQuery({
     ...queryGenaiTracesOptions({
       query: {
         project_id: projectId,
@@ -3741,7 +3928,7 @@ export function ProjectAgentActivity({
   return (
     <div className="space-y-4">
       <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-        <h3 className="text-lg font-semibold">AI Activity</h3>
+        <h3 className="text-lg font-semibold">AI activity</h3>
         <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
           <AiProviderSelect
             value={systemFilter || 'all'}
@@ -3749,7 +3936,15 @@ export function ProjectAgentActivity({
               setSystemFilter(value === 'all' ? '' : value)
             }
           />
-          <div className="flex gap-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <RefreshButton
+              queryKeys={[
+                queryKeyPrefix(queryGenaiTracesQueryKey, {
+                  query: { project_id: projectId },
+                }),
+              ]}
+              onRefresh={moveToNow}
+            />
             <AiTimeRange
               range={timeRange}
               endMs={endMs}
@@ -3959,6 +4154,9 @@ export function AiGatewayPage() {
   // provider is fixed. Opened from the header or the onboarding prompt, the
   // dialog shows a provider choice instead.
   const [providerPreselected, setProviderPreselected] = useState(false)
+  // The base URL as last left or pasted, so an OpenAI-compatible key's
+  // models load on their own without sending the key to a half-typed host.
+  const [committedBaseUrl, setCommittedBaseUrl] = useState('')
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false)
   const [selectedKey, setSelectedKey] = useState<ProviderKeyResponse | null>(
     null
@@ -3990,6 +4188,11 @@ export function AiGatewayPage() {
       shouldValidate: providerKeyForm.formState.isSubmitted,
     })
 
+  // `/ai-gateway?add=openrouter` is where the assistant's onboarding sends
+  // operators. Handled in an effect below, once the existing keys are known.
+  const [addSearchParams, setAddSearchParams] = useSearchParams()
+  const addProvider = addSearchParams.get('add')
+
   // Derive the gateway endpoint from platform settings
   const externalUrl = settings?.external_url || window.location.origin
   const gatewayEndpoint = `${externalUrl}/api/ai/v1`
@@ -4007,6 +4210,42 @@ export function AiGatewayPage() {
   const { data: keysData, isLoading } = keysQuery
 
   const keys = keysData ?? []
+
+  // Open the add-key dialog for the `?add=` provider exactly as its "Add key"
+  // button would (numbering the name after the keys it already has), then
+  // drop the parameter so a reload or a back-navigation does not reopen it.
+  // Waits for the key list so the pre-filled name is the right one. The
+  // dialog state is adjusted during render (the page can already be mounted
+  // when the link is followed); the form store is filled before paint.
+  const keysSettled = keysData !== undefined || keysQuery.isError
+  const [handledAddProvider, setHandledAddProvider] = useState<string | null>(
+    null
+  )
+  if (keysSettled && addProvider !== handledAddProvider) {
+    setHandledAddProvider(addProvider)
+    if (providerFromAddParam(addProvider)) {
+      setProviderPreselected(true)
+      setDialogOpen(true)
+    }
+  }
+  useLayoutEffect(() => {
+    if (addProvider === null || !keysSettled) return
+    const provider = providerFromAddParam(addProvider)
+    if (provider) {
+      const existing = (keysData ?? []).filter(
+        (key) => key.provider === provider.id
+      ).length
+      providerKeyForm.reset(providerKeyFormForProvider(provider, existing))
+    }
+    setAddSearchParams(
+      (params) => {
+        params.delete('add')
+        return params
+      },
+      { replace: true }
+    )
+  }, [addProvider, keysSettled, keysData, providerKeyForm, setAddSearchParams])
+
   const keysRead = { keys: keysData, isError: keysQuery.isError }
   const keysUnknown = providerKeysUnknown(keysRead)
 
@@ -4057,7 +4296,8 @@ export function AiGatewayPage() {
 
   // Delete mutation
   const deleteMutation = useMutation({
-    mutationFn: (id: number) => deleteProviderKey({ path: { id } }),
+    mutationFn: (id: number) =>
+      deleteProviderKey({ path: { id }, throwOnError: true }),
     meta: { errorTitle: 'Failed to delete provider key' },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['providerKeys'] })
@@ -4070,11 +4310,45 @@ export function AiGatewayPage() {
   // Toggle active mutation
   const toggleMutation = useMutation({
     mutationFn: ({ id, is_active }: { id: number; is_active: boolean }) =>
-      updateProviderKey({ path: { id }, body: { is_active } }),
+      updateProviderKey({
+        path: { id },
+        body: { is_active },
+        throwOnError: true,
+      }),
     meta: { errorTitle: 'Failed to update provider key' },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['providerKeys'] })
     },
+  })
+
+  // Replace a key's secret. The dialog keeps the key it was opened for while
+  // it animates closed, so `replaceOpen` is separate from `replacingKey`.
+  const [replacingKey, setReplacingKey] = useState<ProviderKeyResponse | null>(
+    null
+  )
+  const [replaceOpen, setReplaceOpen] = useState(false)
+  const replaceMutation = useMutation({
+    mutationFn: ({ id, apiKey }: { id: number; apiKey: string }) =>
+      updateProviderKey({
+        path: { id },
+        body: { api_key: apiKey },
+        throwOnError: true,
+      }),
+    onSuccess: (_, { id }) => {
+      queryClient.invalidateQueries({ queryKey: ['providerKeys'] })
+      queryClient.invalidateQueries({
+        queryKey: getAiProviderStatusQueryKey(),
+      })
+      setReplaceOpen(false)
+      toast.success('API key replaced', {
+        description: 'The new key was verified with the provider.',
+        action: {
+          label: 'Test key',
+          onClick: () => testKeyMutation.mutate(id),
+        },
+      })
+    },
+    // A refusal is shown in the dialog, which stays open for another try.
   })
 
   // Test existing key by ID
@@ -4139,6 +4413,17 @@ export function AiGatewayPage() {
         providerKeyForm.getValues(),
         provider,
         existingKeyCount,
+        SUPPORTED_PROVIDERS.map((p) => p.name)
+      )
+    )
+  }
+
+  const handleSwitchToOpenAiCompatible = () => {
+    providerKeyForm.reset(
+      switchToOpenAiCompatible(
+        providerKeyForm.getValues(),
+        providerName(SELF_HOSTED_PROVIDER_ID),
+        keys.filter((k) => k.provider === SELF_HOSTED_PROVIDER_ID).length,
         SUPPORTED_PROVIDERS.map((p) => p.name)
       )
     )
@@ -4269,14 +4554,16 @@ console.log(response.choices[0].message.content);`,
       {/* Page Header */}
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div>
-          <h1 className="text-2xl sm:text-3xl font-bold">AI Gateway</h1>
+          <PageTitle className="text-2xl sm:text-3xl font-bold">
+            AI Gateway
+          </PageTitle>
           <p className="text-muted-foreground mt-1 sm:mt-2 text-sm">
             Unified API for multiple AI providers with a single endpoint
           </p>
         </div>
         <Button onClick={openAddKeyDialog} className="w-full sm:w-auto">
           <Plus className="mr-2 h-4 w-4" />
-          Add Provider Key
+          Add provider key
         </Button>
       </div>
 
@@ -4493,7 +4780,7 @@ console.log(response.choices[0].message.content);`,
                         </TableCell>
                         <TableCell className="hidden lg:table-cell py-2 text-xs text-muted-foreground">
                           <span className="line-clamp-1">
-                            {provider.models}
+                            {providerRowModels(provider, providerKeys)}
                           </span>
                         </TableCell>
                         <TableCell className="hidden sm:table-cell py-2">
@@ -4573,6 +4860,7 @@ console.log(response.choices[0].message.content);`,
                                       Disabled
                                     </Badge>
                                   )}
+                                  <KeyEndpoint baseUrl={key.base_url} />
                                   <code className="text-xs text-muted-foreground truncate">
                                     {key.api_key_masked}
                                   </code>
@@ -4595,6 +4883,20 @@ console.log(response.choices[0].message.content);`,
                                     ) : (
                                       <Play className="h-4 w-4" />
                                     )}
+                                  </Button>
+                                  <Button
+                                    variant="ghost"
+                                    size="icon"
+                                    className="h-8 w-8"
+                                    onClick={() => {
+                                      replaceMutation.reset()
+                                      setReplacingKey(key)
+                                      setReplaceOpen(true)
+                                    }}
+                                    title="Replace API key"
+                                    aria-label={`Replace API key for ${key.display_name}`}
+                                  >
+                                    <KeyRound className="h-4 w-4" />
                                   </Button>
                                   <Button
                                     variant="ghost"
@@ -4672,7 +4974,12 @@ console.log(response.choices[0].message.content);`,
           }
         }}
       >
+        {/* Scrolls rather than grows: with the base-URL hint, a save error
+            or the self-hosted fields shown, the form is taller than a short
+            viewport, and a centred dialog would push its title and Close
+            button off the top of the screen. */}
         <DialogContent
+          className="max-h-[90dvh] overflow-y-auto"
           onInteractOutside={(event) => {
             if (createMutation.isPending) event.preventDefault()
           }}
@@ -4685,7 +4992,7 @@ console.log(response.choices[0].message.content);`,
               <DialogTitle>
                 {newProvider
                   ? `Configure ${providerName(newProvider)}`
-                  : 'Add Provider Key'}
+                  : 'Add provider key'}
               </DialogTitle>
               <DialogDescription>
                 Your key is encrypted at rest and used only to route requests
@@ -4738,7 +5045,7 @@ console.log(response.choices[0].message.content);`,
                   its discovery state mounted. */}
               <div className={newProvider ? 'grid gap-4' : 'hidden'}>
                 <div className="grid gap-2">
-                  <Label htmlFor="displayName">Display Name</Label>
+                  <Label htmlFor="displayName">Display name</Label>
                   <Input
                     id="displayName"
                     placeholder="Production API Key"
@@ -4754,7 +5061,7 @@ console.log(response.choices[0].message.content);`,
                 </div>
                 <div className="grid gap-2">
                   <Label htmlFor="apiKey">
-                    API Key
+                    API key
                     {newProviderIsSelfHosted && (
                       <>
                         {' '}
@@ -4798,12 +5105,25 @@ console.log(response.choices[0].message.content);`,
                     id="baseUrl"
                     placeholder={
                       newProviderIsSelfHosted
-                        ? 'http://10.0.0.5:8000/v1'
+                        ? 'https://api.deepseek.com/v1 or http://10.0.0.5:8000/v1'
                         : 'https://api.openai.com/v1'
                     }
                     disabled={createMutation.isPending}
                     aria-invalid={!!formErrors.base_url}
-                    {...providerKeyForm.register('base_url')}
+                    {...providerKeyForm.register('base_url', {
+                      onBlur: (event: ChangeEvent<HTMLInputElement>) =>
+                        setCommittedBaseUrl(event.target.value),
+                      onChange: (event: ChangeEvent<HTMLInputElement>) => {
+                        const { inputType } = event.nativeEvent as InputEvent
+                        // A paste or browser autofill arrives whole.
+                        if (
+                          inputType === 'insertFromPaste' ||
+                          inputType === 'insertReplacementText'
+                        ) {
+                          setCommittedBaseUrl(event.target.value)
+                        }
+                      },
+                    })}
                   />
                   {formErrors.base_url && (
                     <p className="text-xs text-destructive">
@@ -4812,13 +5132,20 @@ console.log(response.choices[0].message.content);`,
                   )}
                   <p className="text-xs text-muted-foreground">
                     {newProviderIsSelfHosted
-                      ? 'The OpenAI-compatible API root of your server, including /v1. Private addresses must be trusted first.'
-                      : 'Override the default API endpoint for this provider.'}
+                      ? 'The OpenAI-compatible API root, including /v1: a hosted API or a server on your network. Private addresses must be trusted first.'
+                      : `Only for a proxy or gateway that serves ${providerName(newProvider)}'s own models.`}
                   </p>
+                  <VendorBaseUrlHint
+                    open={vendorHasCustomBaseUrl(formValues)}
+                    providerName={providerName(newProvider)}
+                    onSwitch={handleSwitchToOpenAiCompatible}
+                    disabled={createMutation.isPending}
+                  />
                 </div>
                 <SelfHostedProviderFields
                   open={newProviderIsSelfHosted}
                   baseUrl={formValues.base_url}
+                  committedBaseUrl={committedBaseUrl}
                   apiKey={formValues.api_key}
                   trustPrivateAddress={formValues.trust_private_address}
                   onTrustPrivateAddressChange={(trusted) =>
@@ -4878,6 +5205,25 @@ console.log(response.choices[0].message.content);`,
         </DialogContent>
       </Dialog>
 
+      <ReplaceProviderKeyDialog
+        open={replaceOpen}
+        onOpenChange={setReplaceOpen}
+        keyName={replacingKey?.display_name ?? ''}
+        providerName={replacingKey ? providerName(replacingKey.provider) : ''}
+        pending={replaceMutation.isPending}
+        error={
+          replaceMutation.isError
+            ? apiErrorMessage(replaceMutation.error)
+            : null
+        }
+        onReplace={(apiKey) =>
+          replacingKey
+            ? replaceMutation.mutateAsync({ id: replacingKey.id, apiKey })
+            : Promise.reject(new Error('No provider key selected'))
+        }
+      />
+
+      {/* Delete Confirmation Dialog */}
       <ConfirmDeleteDialog
         open={deleteDialogOpen}
         onOpenChange={(open) => {

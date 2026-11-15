@@ -1,0 +1,33 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "temps-runtime-health"
+version.workspace = true
+edition.workspace = true
+description = "Node-local runtime health probes (process, HTTP, TCP) with bounded scheduling and lease-fenced assignments"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+nix = { workspace = true, features = ["fs", "user"] }
+async-trait = { workspace = true }
+futures = { workspace = true }
+parking_lot = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+utoipa = { workspace = true, features = ["uuid"] }
+uuid = { workspace = true, features = ["serde"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+bollard = { workspace = true }
+testcontainers = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

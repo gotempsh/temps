@@ -8,6 +8,8 @@ import {
   getProjectDeploymentsQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
 import {
+  acceptsSourceArchive,
+  canRedeployAnyInPlace,
   redeployCurrentDeployments,
   redeploySummary,
 } from '@/lib/service-link-redeploy'
@@ -30,9 +32,13 @@ const PROMPT_DURATION_MS = 20_000
  * that redeploys exactly those environments from their current source.
  */
 export function useVariableChangeRedeploy(
-  project: Pick<ProjectResponse, 'id' | 'source_type'>
+  project: Pick<
+    ProjectResponse,
+    'id' | 'source_type' | 'allow_alternate_sources'
+  >
 ) {
   const queryClient = useQueryClient()
+  const uploadAccepted = acceptsSourceArchive(project)
   return useCallback(
     async (title: string, scope: VariableChangeScope) => {
       let environments: EnvironmentResponse[]
@@ -51,6 +57,24 @@ export function useVariableChangeRedeploy(
       if (targets.length === 0) {
         // Nothing running uses it yet; the first deployment picks it up.
         toast.success(title)
+        return
+      }
+      if (
+        !(await canRedeployAnyInPlace(project.id, project.source_type, targets))
+      ) {
+        // Every running deployment was uploaded as an archive, which the
+        // console cannot rebuild: offering "Redeploy" would end in a refusal,
+        // so say what to do instead. A project that takes archives only
+        // while Other sources is on, and has it off, would refuse the upload
+        // too, so it is told to turn that on first.
+        toast.success(title, {
+          description: variableChangeRedeployMessage(
+            targets,
+            false,
+            uploadAccepted
+          ),
+          duration: PROMPT_DURATION_MS,
+        })
         return
       }
       const completed = new Set<number>()
@@ -94,6 +118,6 @@ export function useVariableChangeRedeploy(
         },
       })
     },
-    [project.id, project.source_type, queryClient]
+    [project.id, project.source_type, uploadAccepted, queryClient]
   )
 }

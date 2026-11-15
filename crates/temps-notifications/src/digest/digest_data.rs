@@ -60,7 +60,10 @@ pub struct ExecutiveSummary {
     pub total_deployments: i64,
     pub failed_deployments: i64,
     pub new_errors: i64,
-    pub uptime_percent: f64,
+    /// Share of the week's health checks that were operational. `None` when
+    /// no health check ran, so an unmonitored week is never reported as 100%.
+    #[serde(default)]
+    pub uptime_percent: Option<f64>,
 }
 
 /// Performance and analytics data
@@ -127,7 +130,10 @@ pub struct ErrorData {
     pub most_common_errors: Vec<CommonError>,
     pub affected_users: i64,
     pub error_trend: Vec<TrendPoint>,
-    pub uptime_percentage: f64,
+    /// Share of the week's health checks that were operational. `None` when
+    /// no health check ran during the week.
+    #[serde(default)]
+    pub uptime_percentage: Option<f64>,
     pub failed_health_checks: i64,
 }
 
@@ -200,7 +206,7 @@ impl WeeklyDigestData {
                 total_deployments: 0,
                 failed_deployments: 0,
                 new_errors: 0,
-                uptime_percent: 100.0,
+                uptime_percent: None,
             },
             performance: None,
             deployments: None,

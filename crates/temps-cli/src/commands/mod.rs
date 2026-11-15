@@ -2,11 +2,15 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 pub mod agent;
+pub mod agent_ingress;
+pub mod agent_labels;
+pub mod agent_launchd;
 pub mod agent_service;
 pub mod api_key;
 mod api_url;
 pub mod backfill;
 pub mod backup;
+mod backup_restore_sql;
 pub mod build;
 pub mod ch_backfill_domains;
 pub mod cloud_telemetry_backfill;
@@ -16,7 +20,9 @@ pub mod doctor;
 pub mod domain;
 pub mod edge;
 pub mod firecracker;
+pub mod host_preflight;
 pub mod join;
+pub mod mac_worker;
 pub mod microsandbox;
 pub mod migrate;
 pub mod network;
@@ -71,3 +77,5 @@ pub use serve::ServeCommand;
 pub use services::ServicesCommand;
 pub use setup::SetupCommand;
 pub use upgrade::UpgradeCommand;
+
+pub mod runner;

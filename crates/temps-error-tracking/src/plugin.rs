@@ -6,7 +6,8 @@ use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 
 use temps_core::plugin::{
-    PluginContext, PluginError, PluginRoutes, ServiceRegistrationContext, TempsPlugin,
+    PluginContext, PluginError, PluginRoutes, RequiredService, ServiceRegistrationContext,
+    TempsPlugin,
 };
 use temps_core::{Job, JobQueue, JobReceiver};
 use temps_monitoring::alarm_service::{AlarmService, AlarmSeverity, AlarmType, FireAlarmRequest};
@@ -66,11 +67,31 @@ impl ErrorTrackingPlugin {
     }
 
     /// Periodically clean up old alert fire records
-    async fn cleanup_loop(alert_service: Arc<ErrorAlertService>) {
+    async fn cleanup_loop(
+        alert_service: Arc<ErrorAlertService>,
+        tracking: Arc<ErrorTrackingService>,
+    ) {
         let retention_days = 30;
+        let mut ticks = 0_u32;
         loop {
-            tokio::time::sleep(tokio::time::Duration::from_secs(6 * 3600)).await;
-            alert_service.cleanup_old_fires(retention_days).await;
+            tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
+            if tracking.cleanup_source_keys().await.is_err() {
+                tracing::warn!(
+                    error_class = "source_key_cleanup",
+                    "Error ingest identity cleanup failed"
+                );
+            }
+            if tracking.client_outcomes.cleanup().await.is_err() {
+                tracing::warn!(
+                    error_class = "client_outcome_cleanup",
+                    "Client outcome retention cleanup failed"
+                );
+            }
+            ticks += 1;
+            if ticks == 1440 {
+                alert_service.cleanup_old_fires(retention_days).await;
+                ticks = 0;
+            }
         }
     }
 }
@@ -84,6 +105,14 @@ impl Default for ErrorTrackingPlugin {
 impl TempsPlugin for ErrorTrackingPlugin {
     fn name(&self) -> &'static str {
         "error-tracking"
+    }
+
+    fn required_services(&self) -> Vec<RequiredService> {
+        vec![
+            RequiredService::of::<temps_otel::OtelService>(),
+            RequiredService::of::<temps_analytics_session_replay::services::SessionReplayService>(),
+            RequiredService::of::<temps_monitoring::cron_monitors::CronMonitorService>(),
+        ]
     }
 
     fn register_services<'a>(
@@ -209,7 +238,7 @@ impl TempsPlugin for ErrorTrackingPlugin {
                                 .await
                                 .ok()
                                 .flatten()
-                                .map(|r| temps_core::AppSettings::from_json(r.data))
+                                .map(|r| temps_config::AppSettings::from_json(r.data))
                                 .and_then(|s| s.external_url);
                             if let Some(base_url) = base_url {
                                 let url = format!(
@@ -236,6 +265,7 @@ impl TempsPlugin for ErrorTrackingPlugin {
             // Wire up autopilot callback if JobQueue is available
             if let Some(queue) = context.get_service::<dyn JobQueue>() {
                 tracing::info!("Error tracking: autopilot callback wired successfully");
+                error_tracking_service.set_job_queue(queue.clone());
                 let q = queue.clone();
                 error_tracking_service.set_autopilot_callback(Arc::new(move |alert| {
                     let q = q.clone();
@@ -349,8 +379,9 @@ impl TempsPlugin for ErrorTrackingPlugin {
 
                 // Start periodic cleanup of old alert fire records
                 let alert_service_for_cleanup = alert_service.clone();
+                let tracking_for_cleanup = error_tracking_service.clone();
                 tokio::spawn(async move {
-                    Self::cleanup_loop(alert_service_for_cleanup).await;
+                    Self::cleanup_loop(alert_service_for_cleanup, tracking_for_cleanup).await;
                 });
             }
 
@@ -441,11 +472,18 @@ impl TempsPlugin for ErrorTrackingPlugin {
             .get_service::<dyn temps_core::telemetry::TelemetryReporter>()
             .unwrap_or_else(|| Arc::new(temps_core::telemetry::NoopTelemetryReporter));
 
-        let route_table = context.require_service::<temps_proxy::CachedPeerTable>();
+        let route_table = context.require_service::<temps_routes::CachedPeerTable>();
         let tunnel_dsn_service = context.require_service::<DSNService>();
 
         let sentry_state = Arc::new(crate::sentry::handlers::AppState {
             sentry_provider: sentry_provider.clone(),
+            // Routes are built after all service registration, including OTel.
+            session_replay_service: context
+                .require_service::<temps_analytics_session_replay::services::SessionReplayService>(
+            ),
+            otel_service: context.require_service::<temps_otel::OtelService>(),
+            cron_monitor_service: context
+                .require_service::<temps_monitoring::cron_monitors::CronMonitorService>(),
             error_tracking_service: error_tracking_service.clone(),
             audit_service: audit_service.clone(),
             ip_address_service,
@@ -457,12 +495,10 @@ impl TempsPlugin for ErrorTrackingPlugin {
         });
         let sentry_routes = crate::sentry::handlers::configure_routes().with_state(sentry_state);
 
-        // Public: sentry-cli compatible source map upload (used by CI/CD with DSN auth)
-        let db = context.require_service::<sea_orm::DatabaseConnection>();
+        // Public route with project-scoped build-token auth for sentry-cli uploads.
         let sentry_compat_state = Arc::new(
             crate::handlers::sentry_compat_handlers::SentryCompatAppState {
                 source_map_service: source_map_service.clone(),
-                db,
                 audit_service: audit_service.clone(),
             },
         );
@@ -477,6 +513,14 @@ impl TempsPlugin for ErrorTrackingPlugin {
     fn openapi_schema(&self) -> Option<OpenApi> {
         // Get base error tracking schema
         let mut schema = <crate::handlers::handler::ErrorTrackingApiDoc as OpenApiTrait>::openapi();
+
+        schema
+            .merge(<crate::handlers::feedback_handler::FeedbackApiDoc as OpenApiTrait>::openapi());
+        schema.merge(<crate::handlers::release_handler::ReleaseApiDoc as OpenApiTrait>::openapi());
+        schema.merge(
+            <crate::handlers::client_outcome_handler::ClientOutcomeApiDoc as OpenApiTrait>::openapi(
+            ),
+        );
 
         // Merge alert rules routes schema
         let alert_rules_schema =

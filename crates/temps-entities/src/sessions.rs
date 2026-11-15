@@ -28,6 +28,10 @@ pub struct Model {
     /// Password/SAML origins remain pending-only. SSO enforcement reads the
     /// normalized method through `AuthService::mfa_session_origin`.
     pub mfa_pending_origin: Option<String>,
+    /// Wrong second-factor codes submitted against this pending challenge.
+    /// The challenge is deleted once this reaches the per-challenge limit, so
+    /// a single first-factor success buys only a handful of guesses.
+    pub mfa_failed_attempts: i32,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

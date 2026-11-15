@@ -92,7 +92,6 @@ pub struct ResponseObject {
 
 /// `multipart/form-data` body of `POST /ai/v1/files`.
 #[derive(Debug, ToSchema)]
-#[allow(dead_code)] // documents the multipart form; parsed field by field
 pub struct UploadFileForm {
     /// A JSONL batch input file: one request per line, every line targeting
     /// the same model and endpoint. At most 200 MB and 50,000 requests.

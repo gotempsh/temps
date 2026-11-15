@@ -13,7 +13,6 @@ import {
   Cpu,
   Loader2,
   RefreshCw,
-  Save,
   XCircle,
 } from 'lucide-react'
 
@@ -27,15 +26,26 @@ import {
 } from '@/components/ui/card'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
+import { SaveRow } from '@temps-sdk/ds'
 import { Input } from '@/components/ui/input'
 import { NumberInput } from '@/components/ui/number-input'
 import { Label } from '@/components/ui/label'
+import { Textarea } from '@/components/ui/textarea'
+import {
+  formatConfigRepoAllowlist,
+  configRepoAllowlistProblem,
+  invalidConfigRepoEntries,
+  parseConfigRepoAllowlist,
+} from './config-repo-allowlist'
 import { useSettingsPage, useUpdateSettings } from '@/hooks/useSettings'
 import {
   CPU_LIMIT_RANGE,
   MEMORY_LIMIT_RANGE,
+  SANDBOX_API_LIMIT_FIELDS,
   WORKSPACE_FILE_LIMIT_FIELDS,
+  validateSandboxApiLimits,
   validateSandboxLimits,
+  type SandboxApiLimitsDraft,
   type WorkspaceFileLimitsDraft,
 } from './sandbox-limits'
 import { SandboxNodesCard } from '@/components/sandboxes/SandboxNodesCard'
@@ -92,7 +102,7 @@ const RUNTIME_PRESETS = [
   },
   {
     value: 'custom',
-    label: 'Custom Image',
+    label: 'Custom image',
     description: 'Your own Docker image',
     stacks: 'Any stack you pre-build',
   },
@@ -116,6 +126,13 @@ const DEFAULT_WORKSPACE_FILE_LIMITS: WorkspaceFileLimitsDraft = {
   max_download_size_mb: 32,
 }
 
+const NO_API_LIMITS: SandboxApiLimitsDraft = {
+  max_cpu_limit: undefined,
+  max_memory_limit_mb: undefined,
+  max_pids_limit: undefined,
+  max_sandboxes_per_user: undefined,
+}
+
 function getResourcePresetLabel(cpu: number, memory: number): string {
   const match = RESOURCE_PRESETS.find(
     (p) => p.cpu === cpu && p.memory === memory
@@ -124,7 +141,7 @@ function getResourcePresetLabel(cpu: number, memory: number): string {
 }
 
 export function AgentSandboxSandboxPage() {
-  usePageTitle('Sandbox Configuration')
+  usePageTitle('Sandbox configuration')
   const { data: settings, isLoading, error, refetch } = useSettingsPage()
   const updateSettings = useUpdateSettings()
 
@@ -135,15 +152,23 @@ export function AgentSandboxSandboxPage() {
   const [resourcePreset, setResourcePreset] = useState('Standard')
   const [globalConfigRepo, setGlobalConfigRepo] = useState('')
   const [globalConfigRepoBranch, setGlobalConfigRepoBranch] = useState('main')
+  const [configRepoAllowlist, setConfigRepoAllowlist] = useState('')
   const [defaultProvider, setDefaultProvider] = useState('claude_cli')
   const [sandboxBackend, setSandboxBackend] = useState('docker')
   const [workspaceFileLimits, setWorkspaceFileLimits] =
     useState<WorkspaceFileLimitsDraft>(DEFAULT_WORKSPACE_FILE_LIMITS)
+  const [apiLimits, setApiLimits] =
+    useState<SandboxApiLimitsDraft>(NO_API_LIMITS)
   const [isDirty, setIsDirty] = useState(false)
 
   const [rebuilding, setRebuilding] = useState(false)
   const [buildLog, setBuildLog] = useState<string[]>([])
-  const [loadedSettings, setLoadedSettings] = useState(settings)
+  // Starts empty so the first settings value hydrates the form, including
+  // one already in the shared query cache on mount. Starting from `settings`
+  // skipped that, and the next save sent the empty defaults back.
+  const [loadedSettings, setLoadedSettings] = useState<
+    typeof settings | undefined
+  >(undefined)
 
   const {
     data: sandboxStatus = null,
@@ -171,10 +196,19 @@ export function AgentSandboxSandboxPage() {
       setMemoryLimitMb(s.memory_limit_mb)
       setResourcePreset(getResourcePresetLabel(s.cpu_limit, s.memory_limit_mb))
       setSandboxBackend(s.sandbox_backend || 'docker')
+      setApiLimits({
+        max_cpu_limit: s.max_cpu_limit ?? undefined,
+        max_memory_limit_mb: s.max_memory_limit_mb ?? undefined,
+        max_pids_limit: s.max_pids_limit ?? undefined,
+        max_sandboxes_per_user: s.max_sandboxes_per_user ?? undefined,
+      })
     }
     if (settings?.ai_config) {
       setGlobalConfigRepo(settings.ai_config.config_repo || '')
       setGlobalConfigRepoBranch(settings.ai_config.config_repo_branch || 'main')
+      setConfigRepoAllowlist(
+        formatConfigRepoAllowlist(settings.ai_config.config_repo_allowlist)
+      )
     }
     if (settings?.ai_workspace_file_limits) {
       setWorkspaceFileLimits({
@@ -257,6 +291,18 @@ export function AgentSandboxSandboxPage() {
       toast.error(limits.message)
       return
     }
+    const apiLimitValues = validateSandboxApiLimits(apiLimits)
+    if (!apiLimitValues.ok) {
+      toast.error(apiLimitValues.message)
+      return
+    }
+    // An entry the server would never match is a typo, not a choice: hold
+    // the save until it is fixed rather than storing it.
+    const allowlistProblem = configRepoAllowlistProblem(configRepoAllowlist)
+    if (allowlistProblem) {
+      toast.error(allowlistProblem)
+      return
+    }
     try {
       // Per-provider credentials live on /agent-sandbox/providers/:id —
       // this mutation only touches platform-wide sandbox knobs. We pass
@@ -279,20 +325,20 @@ export function AgentSandboxSandboxPage() {
           auth_type: settings?.agent_sandbox?.auth_type ?? '',
           providers: settings?.agent_sandbox?.providers ?? {},
           sandbox_backend: sandboxBackend,
+          ...apiLimitValues.limits,
         },
         ai_config: {
           ...(settings?.ai_config ?? {}),
           config_repo: globalConfigRepo,
           config_repo_branch: globalConfigRepoBranch,
+          config_repo_allowlist: parseConfigRepoAllowlist(configRepoAllowlist),
         },
         ai_workspace_file_limits: limits.workspaceFileLimits,
       })
       setIsDirty(false)
       toast.success('Workflow sandbox settings saved')
-    } catch (cause) {
-      toast.error(
-        cause instanceof Error ? cause.message : 'Failed to save settings'
-      )
+    } catch {
+      // useUpdateSettings already toasts this failure, with the server's reason.
     }
   }
 
@@ -315,14 +361,12 @@ export function AgentSandboxSandboxPage() {
 
   return (
     <>
-      {/* Bottom padding leaves room for the sticky save bar so its drop
-          shadow never overlaps the last card. */}
-      <div className="space-y-6 pb-24">
+      <div className="space-y-6">
         <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
               <Bot className="h-5 w-5" />
-              Workflow Sandbox
+              Workflow sandbox
             </CardTitle>
             <CardDescription>
               When sandbox is enabled, workflows run inside isolated Docker
@@ -333,7 +377,7 @@ export function AgentSandboxSandboxPage() {
           <CardContent className="space-y-6">
             <div className="rounded-lg border p-4 space-y-3">
               <div className="flex items-center justify-between">
-                <h4 className="text-sm font-medium">Docker Status</h4>
+                <h4 className="text-sm font-medium">Docker status</h4>
                 <Button
                   variant="ghost"
                   size="sm"
@@ -474,7 +518,48 @@ export function AgentSandboxSandboxPage() {
 
         <Card>
           <CardHeader>
-            <CardTitle className="text-base">Isolation Backend</CardTitle>
+            <CardTitle className="text-base">Sandbox API limits</CardTitle>
+            <CardDescription>
+              Ceilings for sandboxes created through the API or SDK, whatever
+              the caller asks for. The CPU and memory above are only the
+              defaults for requests that leave them out. Leave a box empty for
+              the built-in maximum. For example, with 4096 MB as the memory
+              maximum, a request for 8192 MB is refused with a 400.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+            {SANDBOX_API_LIMIT_FIELDS.map((field) => (
+              <div className="space-y-2" key={field.key}>
+                <Label htmlFor={`api-limit-${field.key}`}>{field.label}</Label>
+                <NumberInput
+                  id={`api-limit-${field.key}`}
+                  max={field.max}
+                  min={field.min}
+                  inputMode={field.integer ? 'numeric' : 'decimal'}
+                  placeholder={field.empty}
+                  onValueChange={(value) => {
+                    setApiLimits((current) => ({
+                      ...current,
+                      [field.key]: value,
+                    }))
+                    setIsDirty(true)
+                  }}
+                  value={apiLimits[field.key]}
+                />
+              </div>
+            ))}
+            <p className="text-xs text-muted-foreground sm:col-span-2 lg:col-span-4">
+              On the control plane a sandbox also cannot be given more memory
+              than the host has. Sandboxes already created are not changed, and
+              the per-user cap counts a user&apos;s sandboxes that are not
+              destroyed; AI application workspaces and agent runs are exempt.
+            </p>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-base">Isolation backend</CardTitle>
             <CardDescription>
               Default sandbox isolation technology for new workflow runs.
               Firecracker provides stronger isolation via KVM microVMs;
@@ -588,7 +673,7 @@ export function AgentSandboxSandboxPage() {
 
             {runtime === 'custom' && (
               <div className="space-y-2 pt-2">
-                <Label htmlFor="custom-image">Docker Image</Label>
+                <Label htmlFor="custom-image">Docker image</Label>
                 <Input
                   id="custom-image"
                   placeholder="e.g. your-registry/custom-agent:latest"
@@ -693,7 +778,7 @@ export function AgentSandboxSandboxPage() {
         <Card>
           <CardHeader>
             <CardTitle className="text-base">
-              Global Config Repository
+              Global config repository
             </CardTitle>
             <CardDescription>
               A shared config repository applied to all workflow runs. Contains
@@ -720,6 +805,41 @@ export function AgentSandboxSandboxPage() {
               </p>
             </div>
             <div className="space-y-2">
+              <Label htmlFor="config-repo-allowlist">
+                Allowed workflow config repositories
+              </Label>
+              <Textarea
+                id="config-repo-allowlist"
+                rows={3}
+                placeholder={'org/claude-config\nplatform/*'}
+                value={configRepoAllowlist}
+                onChange={(e) => {
+                  setConfigRepoAllowlist(e.target.value)
+                  setIsDirty(true)
+                }}
+              />
+              <p className="text-xs text-muted-foreground">
+                A workflow can name its own config repository in{' '}
+                <code className="text-xs bg-muted px-1 rounded">
+                  .temps.yaml
+                </code>
+                . It is used only when it is the project&apos;s own repository
+                or listed here, one <code>owner/repo</code> (or{' '}
+                <code>owner/*</code>) per line. Any other repository is skipped
+                and the run log says so.
+              </p>
+              {invalidConfigRepoEntries(
+                parseConfigRepoAllowlist(configRepoAllowlist)
+              ).length > 0 && (
+                <p className="text-xs text-destructive" role="alert">
+                  Not a repository name, so it will never match:{' '}
+                  {invalidConfigRepoEntries(
+                    parseConfigRepoAllowlist(configRepoAllowlist)
+                  ).join(', ')}
+                </p>
+              )}
+            </div>
+            <div className="space-y-2">
               <Label htmlFor="global-config-branch">Branch</Label>
               <Input
                 id="global-config-branch"
@@ -733,32 +853,14 @@ export function AgentSandboxSandboxPage() {
             </div>
           </CardContent>
         </Card>
-      </div>
 
-      {/* Sticky save bar — only mounts when dirty so the layout doesn't have a
-          permanent footer competing with content. Slides in from the bottom
-          and auto-dismisses when the user saves successfully. */}
-      {isDirty && (
-        <div className="fixed bottom-0 left-0 right-0 border-t bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/80 shadow-lg z-30">
-          <div className="w-full px-4 sm:px-6 lg:px-8 py-3 flex items-center justify-between gap-3">
-            <p className="text-sm text-muted-foreground">
-              You have unsaved sandbox changes.
-            </p>
-            <Button
-              onClick={handleSave}
-              disabled={updateSettings.isPending}
-              size="sm"
-            >
-              {updateSettings.isPending ? (
-                <Loader2 className="h-4 w-4 animate-spin mr-2" />
-              ) : (
-                <Save className="h-4 w-4 mr-2" />
-              )}
-              Save Changes
-            </Button>
-          </div>
-        </div>
-      )}
+        <SaveRow
+          dirty={isDirty}
+          saving={updateSettings.isPending}
+          onSave={handleSave}
+          sticky
+        />
+      </div>
     </>
   )
 }

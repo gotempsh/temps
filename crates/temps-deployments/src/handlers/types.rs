@@ -15,7 +15,7 @@ use temps_core::AuditLogger;
 
 pub struct AppState {
     pub deployment_service: Arc<DeploymentService>,
-    pub log_service: Arc<temps_logs::LogService>,
+    pub log_service: Arc<temps_deployment_logs::LogService>,
     pub cron_service: Arc<DatabaseCronConfigService>,
     pub external_deployment_manager: Arc<ExternalDeploymentManager>,
     /// Starts on-demand screenshot captures (`take_screenshot` operation)
@@ -53,9 +53,6 @@ pub struct AppState {
     /// Resolved lazily via `.require()` at point of use so a control-plane
     /// process (no local daemon) fails typed rather than panicking at boot.
     pub docker: Arc<temps_core::DockerHandle>,
-    /// On-demand `docker system df` for the control-plane host (server
-    /// monitoring page). See [`crate::services::DockerDiskUsageService`].
-    pub docker_disk_usage: Arc<crate::services::DockerDiskUsageService>,
     /// Optional gate checked before manual-deploy handlers transition a
     /// deployment to `Running` (e.g. a plugin implementing manual
     /// approvals). `None` when no such plugin is registered — deploys
@@ -82,11 +79,6 @@ pub struct AppState {
     /// Builds and sends deploy-failure reports (redacted trace, user-edited,
     /// sent on request) -- see [`crate::services::failure_report_service`].
     pub failure_report_service: Arc<crate::services::FailureReportService>,
-    /// Single-use enrollment tokens that `temps join` redeems (ADR-020 WS-1.1).
-    pub enrollment_token_service: Arc<temps_config::EnrollmentTokenService>,
-    /// Starts and cancels node pairings (ADR 048 D2b); shared with the admin
-    /// pairing routes so SSH enrollment pairs nodes the same way.
-    pub node_pairing_admin: Arc<crate::services::node_pairing_admin::NodePairingAdminService>,
     /// Central policy evaluator for sensitive mutations (e.g. draining a
     /// node) -- challenges with MFA step-up when the acting user has one
     /// enrolled. See [`temps_core::SensitiveActionAuthorizer`].
@@ -304,6 +296,11 @@ pub struct DeploymentResponse {
     pub deployment_config: Option<temps_entities::deployment_config::DeploymentConfigSnapshot>,
     /// Deployment metadata (build info, git event, etc.)
     pub metadata: Option<temps_entities::prelude::DeploymentMetadata>,
+    /// ADR 068 D5: set on the environment's current, completed deployment
+    /// when nobody can open it, with the fixes that fit this install. The
+    /// deployment itself stays successful.
+    #[serde(default)]
+    pub reachability_warning: Option<temps_core::environment_address::ReachabilityWarning>,
 }
 
 // Add new struct for environment info in response
@@ -312,7 +309,15 @@ pub struct DeploymentEnvironmentResponse {
     pub id: i32,
     pub name: String,
     pub slug: String,
+    /// Best first: the primary address (ADR 068 D4) leads when it is known.
     pub domains: Vec<String>,
+    /// The environment's primary address as a URL. `null` while it is not
+    /// known, or when nobody can reach the environment.
+    #[serde(default)]
+    pub primary_url: Option<String>,
+    /// Why nobody can reach the environment; set only when Temps is sure.
+    #[serde(default)]
+    pub no_address_reason: Option<String>,
     /// Public URLs of this environment's Docker Compose services, one per
     /// configured public port. Empty for non-Compose projects.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -326,15 +331,25 @@ impl DeploymentResponse {
         } else {
             None
         };
+        let reachability_warning = if deployment.is_current
+            && matches!(deployment.status.as_str(), "completed" | "deployed")
+        {
+            deployment.environment.reachability_warning
+        } else {
+            None
+        };
         Self {
             id: deployment.id,
             project_id: deployment.project_id,
             environment_id: deployment.environment_id,
+            reachability_warning,
             environment: DeploymentEnvironmentResponse {
                 id: deployment.environment.id,
                 name: deployment.environment.name,
                 slug: deployment.environment.slug,
                 domains: deployment.environment.domains,
+                primary_url: deployment.environment.primary_url,
+                no_address_reason: deployment.environment.no_address_reason,
                 service_urls: Vec::new(),
             },
             status: deployment.status,
@@ -571,6 +586,13 @@ pub struct UpdateCustomDomainRequest {
     pub branch: Option<String>,
 }
 
+/// Result of purging cached static assets.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct AssetCachePurgeResponse {
+    /// How many cached asset entries were removed (0 when the cache was empty).
+    pub deleted: u64,
+}
+
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct DeploymentStateResponse {
     pub id: i32,
@@ -748,10 +770,23 @@ pub struct DeploymentJobsResponse {
 
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct ContainerInfoResponse {
+    #[serde(default)]
+    pub container_port: Option<i32>,
+    #[serde(default)]
+    pub health_state: String,
+    #[serde(default)]
+    pub health_checked_at: Option<String>,
+    #[serde(default)]
+    pub health_detail: Option<String>,
     pub container_id: String,
     pub container_name: String,
     pub image_name: String,
     pub status: String,
+    /// What runs this container: `docker` for a Docker container,
+    /// `firecracker` for a microVM replica (`micro_vm` isolation).
+    #[schema(example = "docker")]
+    #[serde(default = "default_container_runtime")]
+    pub runtime: String,
     #[schema(example = "2025-10-12T12:15:47.609192Z")]
     pub created_at: String,
     /// Node name where this container is running. None for local (single-node) deployments.
@@ -812,6 +847,10 @@ pub struct ServicePublicUrl {
     pub url: String,
 }
 
+fn default_container_runtime() -> String {
+    "docker".to_string()
+}
+
 impl ContainerInfoResponse {
     pub fn from_info(
         info: temps_deployer::ContainerInfo,
@@ -820,6 +859,14 @@ impl ContainerInfoResponse {
         service_urls: Vec<ServicePublicUrl>,
     ) -> Self {
         Self {
+            container_port: info
+                .ports
+                .first()
+                .map(|port| i32::from(port.container_port)),
+            health_state: "unknown".to_string(),
+            health_checked_at: None,
+            health_detail: None,
+            runtime: temps_deployer::container_runtime(&info.labels).to_string(),
             container_id: info.container_id,
             container_name: info.container_name,
             image_name: info.image_name,
@@ -874,7 +921,10 @@ pub struct ContainerDetailResponse {
     #[schema(nullable = true, example = "2025-10-12T12:16:47.609192Z")]
     pub ready_at: Option<String>,
     /// Port inside the container
-    pub container_port: i32,
+    pub container_port: Option<i32>,
+    pub health_state: String,
+    pub health_checked_at: Option<String>,
+    pub health_detail: Option<String>,
     /// Port on the host machine
     #[schema(nullable = true)]
     pub host_port: Option<i32>,
@@ -966,6 +1016,14 @@ pub struct ContainerMetricsResponse {
     pub network_rx_bytes: u64,
     /// Network bytes transmitted
     pub network_tx_bytes: u64,
+    /// Cumulative bytes read from block devices. Null when the runtime does
+    /// not report it.
+    #[schema(nullable = true)]
+    pub block_read_bytes: Option<u64>,
+    /// Cumulative bytes written to block devices. Null when the runtime does
+    /// not report it.
+    #[schema(nullable = true)]
+    pub block_write_bytes: Option<u64>,
     /// Timestamp of metrics collection
     #[schema(example = "2025-10-12T12:15:47.609192Z")]
     pub timestamp: String,
@@ -992,8 +1050,10 @@ pub struct ContainerMetricHistoryPoint {
     /// Bucket timestamp (ISO 8601 with `Z` suffix).
     #[schema(example = "2025-10-12T12:15:00+00:00")]
     pub time: String,
-    /// Averaged metric value for the bucket.
-    pub value: f64,
+    /// Averaged metric value for the bucket; `null` when the container
+    /// reported no sample in it (it was stopped, or the server was down), so
+    /// charts show a gap instead of interpolating across it.
+    pub value: Option<f64>,
 }
 
 /// One container that has ever run for an environment — current or replaced
@@ -1096,4 +1156,60 @@ pub struct ActivityDay {
     /// 0: No activity, 1: Low (1-2), 2: Medium (3-5), 3: High (6-10), 4: Very High (11+)
     #[schema(example = 2)]
     pub level: i32,
+}
+
+#[cfg(test)]
+mod health_probe_openapi_tests {
+    use utoipa::OpenApi;
+
+    #[test]
+    fn health_probe_openapi_contract() {
+        let doc = super::super::deployments::DeploymentsApiDoc::openapi();
+        let json = serde_json::to_value(&doc).unwrap();
+        for response in ["ContainerInfoResponse", "ContainerDetailResponse"] {
+            let properties = &json["components"]["schemas"][response]["properties"];
+            for field in [
+                "container_port",
+                "health_state",
+                "health_checked_at",
+                "health_detail",
+            ] {
+                assert!(
+                    !properties[field].is_null(),
+                    "{response}.{field} must be in OpenAPI"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_container_reports_docker_unless_the_plane_names_another_runtime() {
+        let docker = super::ContainerInfoResponse::from(temps_deployer::ContainerInfo::default());
+        assert_eq!(docker.runtime, "docker");
+
+        let labelled = |runtime: &str| temps_deployer::ContainerInfo {
+            labels: std::collections::HashMap::from([(
+                temps_deployer::RUNTIME_LABEL.to_string(),
+                runtime.to_string(),
+            )]),
+            ..Default::default()
+        };
+        assert_eq!(
+            super::ContainerInfoResponse::from(labelled("firecracker")).runtime,
+            "firecracker"
+        );
+        assert_eq!(
+            super::ContainerInfoResponse::from(labelled("")).runtime,
+            "docker",
+            "an empty label is no runtime"
+        );
+
+        let doc = super::super::deployments::DeploymentsApiDoc::openapi();
+        let json = serde_json::to_value(&doc).unwrap();
+        assert!(
+            !json["components"]["schemas"]["ContainerInfoResponse"]["properties"]["runtime"]
+                .is_null(),
+            "the console reads runtime from the OpenAPI client"
+        );
+    }
 }

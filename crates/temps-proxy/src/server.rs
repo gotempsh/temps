@@ -10,6 +10,8 @@ use crate::services::*;
 use crate::tls_cert_loader::CertificateLoader;
 use crate::traits::*;
 use anyhow::Result;
+use arc_swap::ArcSwapOption;
+use axum::http::HeaderName;
 use pingora::server::RunArgs;
 use pingora_core::apps::HttpServerOptions;
 use pingora_core::listeners::tls::TlsSettings;
@@ -28,7 +30,7 @@ use temps_config::ServerConfig;
 use temps_core::plugin::{ServiceRegistrationContext, TempsPlugin};
 use temps_database::DbConnection;
 use temps_routes::CachedPeerTable;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use async_trait::async_trait;
 use std::future::Future;
@@ -37,6 +39,23 @@ use std::pin::Pin;
 /// The settings cache has a five-second TTL in proxy processes. Polling every
 /// two seconds bounds the delay after an admin save without querying on traffic.
 const FORWARDED_IP_TRUST_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Apply setup's TLS ownership before accepting requests. External proxies
+/// reach the origin over HTTP even when the public origin is HTTPS. Reuse the
+/// global redirect gate so project overrides and cached certificates cannot
+/// send those requests back to the external proxy in a redirect loop.
+async fn load_https_redirect_policy(
+    config_service: &temps_config::ConfigService,
+    explicitly_disabled: bool,
+) -> Result<bool> {
+    let external_tls = config_service
+        .external_tls_enabled()
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!("Cannot start proxy: failed to load external TLS policy: {error}")
+        })?;
+    Ok(explicitly_disabled || external_tls)
+}
 
 /// `None` means the settings read failed. Keep the last known value until a
 /// successful read, so a transient database outage cannot change IP policy.
@@ -54,16 +73,58 @@ fn apply_forwarded_ip_trust_refresh(
 /// ignored and loopback is used as the client IP for IP-based controls.
 async fn load_initial_forwarded_ip_trust(
     config_service: &temps_config::ConfigService,
-) -> Result<bool> {
+) -> Result<(bool, Option<Arc<HeaderName>>, bool)> {
     let settings = config_service.get_settings().await.map_err(|error| {
         anyhow::anyhow!("Cannot start proxy: failed to load forwarded-IP trust setting: {error}")
     })?;
-    Ok(settings.trust_loopback_forwarded_ip())
+    Ok((
+        settings.trust_loopback_forwarded_ip(),
+        loopback_ja4_header(&settings),
+        settings.expose_platform_identity(),
+    ))
+}
+
+/// What the proxy trusts a loopback peer for, refreshed together from the
+/// platform settings.
+#[derive(Debug)]
+struct LoopbackTrust {
+    forwarded_ip: Arc<AtomicBool>,
+    expose_platform_identity: Arc<AtomicBool>,
+    /// The header such a peer sends the visitor's JA4 in (ADR 066, D4).
+    ja4_header: Arc<ArcSwapOption<HeaderName>>,
+}
+
+/// The settings handler only stores names its rule accepts, but the row
+/// can be written by other means; a name the rule refuses is ignored rather
+/// than trusted, so the proxy never strips a header such as `Authorization`
+/// from every request.
+fn loopback_ja4_header(settings: &temps_config::AppSettings) -> Option<Arc<HeaderName>> {
+    let stored = settings.loopback_ja4_header.as_deref()?;
+    let name = match temps_config::normalize_loopback_ja4_header(Some(stored)) {
+        Ok(name) => name?,
+        Err(error) => {
+            tracing::warn!(%error, "Ignoring the stored loopback JA4 header");
+            return None;
+        }
+    };
+    HeaderName::from_bytes(name.as_bytes()).ok().map(Arc::new)
+}
+
+/// Returns whether the header changed.
+fn apply_loopback_ja4_header_refresh(
+    snapshot: &ArcSwapOption<HeaderName>,
+    header: Option<Arc<HeaderName>>,
+) -> bool {
+    let changed = snapshot.load().as_deref() != header.as_deref();
+    if changed {
+        snapshot.store(header);
+    }
+    changed
 }
 
 fn start_forwarded_ip_trust_refresh(
     config_service: Arc<temps_config::ConfigService>,
-) -> Result<Arc<AtomicBool>> {
+) -> Result<LoopbackTrust> {
     let runtime = security_refresh_runtime()?;
     // `block_on` on `security_refresh_runtime` from within `create_proxy_service`'s
     // own caller runtime is a second nested `block_on` alongside the one
@@ -71,32 +132,54 @@ fn start_forwarded_ip_trust_refresh(
     // (the outer runtime is only driving synchronous setup at this point), but this
     // adds to the same "runtime nesting" issue `integration_test.rs` is `#[ignore]`d
     // for — worth knowing before attempting to un-ignore those tests.
-    let initial = runtime.block_on(load_initial_forwarded_ip_trust(&config_service))?;
+    let (initial, initial_ja4_header, initial_identity) =
+        runtime.block_on(load_initial_forwarded_ip_trust(&config_service))?;
     info!(
         enabled = initial,
+        ja4_header = initial_ja4_header.as_deref().map(HeaderName::as_str),
         "Loaded loopback forwarded-IP trust before proxy startup"
     );
-    let effective = Arc::new(AtomicBool::new(initial));
-    let snapshot = Arc::downgrade(&effective);
+    let trust = LoopbackTrust {
+        expose_platform_identity: Arc::new(AtomicBool::new(initial_identity)),
+        forwarded_ip: Arc::new(AtomicBool::new(initial)),
+        ja4_header: Arc::new(ArcSwapOption::new(initial_ja4_header)),
+    };
+    let identity = Arc::downgrade(&trust.expose_platform_identity);
+    let snapshot = Arc::downgrade(&trust.forwarded_ip);
+    let ja4_header = Arc::downgrade(&trust.ja4_header);
     runtime.spawn(async move {
-        while let Some(snapshot) = snapshot.upgrade() {
-            let settings_enabled = match config_service.get_settings().await {
-                Ok(settings) => Some(settings.trust_loopback_forwarded_ip()),
+        while let (Some(snapshot), Some(ja4_header)) = (snapshot.upgrade(), ja4_header.upgrade()) {
+            let settings = match config_service.get_settings().await {
+                Ok(settings) => Some(settings),
                 Err(error) => {
                     tracing::warn!(%error, "Could not refresh forwarded-IP trust; retaining the last known value");
                     None
                 }
             };
+            let settings_enabled = settings
+                .as_ref()
+                .map(|settings| settings.trust_loopback_forwarded_ip());
             if let Some(enabled) = apply_forwarded_ip_trust_refresh(&snapshot, settings_enabled) {
                 info!(enabled, "Updated loopback forwarded-IP trust from platform settings");
             }
-            // Release the task's strong reference before sleeping. If the
+            if let Some(settings) = &settings {
+                if let Some(identity) = identity.upgrade() {
+                    identity.store(settings.expose_platform_identity(), Ordering::Relaxed);
+                }
+                let header = loopback_ja4_header(settings);
+                let name = header.as_deref().map(HeaderName::as_str).map(str::to_owned);
+                if apply_loopback_ja4_header_refresh(&ja4_header, header) {
+                    info!(ja4_header = name, "Updated loopback JA4 header from platform settings");
+                }
+            }
+            // Release the task's strong references before sleeping. If the
             // LoadBalancer is dropped, the next weak upgrade ends this task.
             drop(snapshot);
+            drop(ja4_header);
             tokio::time::sleep(FORWARDED_IP_TRUST_REFRESH_INTERVAL).await;
         }
     });
-    Ok(effective)
+    Ok(trust)
 }
 
 /// TLS extension data stored in SslDigest via the new Pingora 0.8.0 SslDigestExtension.
@@ -107,6 +190,9 @@ fn start_forwarded_ip_trust_refresh(
 pub struct TlsExtensionData {
     /// SNI hostname captured during TLS handshake
     pub sni_hostname: String,
+    /// The client's JA4, from the ClientHello the pre-TLS hook read
+    /// (ADR 066, I6). `None` when it could not be read.
+    pub ja4: Option<temps_shield::ja4::Ja4>,
 }
 
 /// How the TLS callback treats an SNI hostname.
@@ -143,6 +229,9 @@ struct DynamicCertLoader {
     /// still returns `Ok(None)` immediately (Option B: fail-fast, do not block
     /// the handshake). `None` preserves the pre-ADR behavior exactly.
     on_demand_cert_manager: Option<Arc<crate::on_demand_cert::OnDemandCertManager>>,
+    /// Holds each connection's JA4 from the pre-TLS hook until the handshake
+    /// completes.
+    ja4_hook: Arc<crate::shield::Ja4Hook>,
 }
 
 #[async_trait]
@@ -263,7 +352,17 @@ impl TlsAccept for DynamicCertLoader {
 
         debug!("TLS handshake complete for SNI: {}", sni);
 
-        Some(Arc::new(TlsExtensionData { sni_hostname: sni }))
+        let mut random = [0u8; 32];
+        let ja4 = if ssl_ref.client_random(&mut random) == random.len() {
+            self.ja4_hook.take(&random).await
+        } else {
+            None
+        };
+
+        Some(Arc::new(TlsExtensionData {
+            sni_hostname: sni,
+            ja4,
+        }))
     }
 }
 
@@ -279,7 +378,7 @@ async fn setup_proxy_plugins(
     context.register_service(db.clone());
 
     // Register ConfigPlugin for configuration services
-    let config_plugin = Box::new(temps_config::ConfigPlugin::new(config.clone()));
+    let config_plugin = Box::new(temps_config_handlers::ConfigPlugin::new(config.clone()));
     config_plugin
         .register_services(&context)
         .await
@@ -396,6 +495,50 @@ fn shared_runtime(
     }
 }
 
+/// Run startup work that may use the shared pool on a runtime that lasts as
+/// long as the process.
+///
+/// A connection stays registered with the runtime that opened it, and goes back
+/// into the pool when released. Had this work run on a temporary runtime, a
+/// connection it opened would outlive that runtime, and the next acquire to pick
+/// it would hang on its health check until the acquire timeout. Whether that
+/// happens depends on whether the console has left an idle connection at that
+/// moment, so it shows up as an occasional failed startup.
+///
+/// Anything the work spawns also keeps running, such as the `settings_change`
+/// listener `ConfigPlugin` starts, which stops when its `ConfigService` is dropped.
+fn block_on_refresh_runtime<F: Future>(future: F) -> Result<F::Output> {
+    Ok(refresh_runtime()?.block_on(future))
+}
+
+/// Loads every project's edge rules (ADR-089) and starts the loops that keep
+/// them current and record their match counts. The initial load must
+/// succeed: serving a project without the rules its operator saved would
+/// silently drop its protections.
+fn start_edge_rules(
+    db: Arc<DbConnection>,
+) -> Result<(
+    Arc<crate::edge_rules::EdgeRuleGate>,
+    Option<Arc<temps_geo::GeoIpService>>,
+)> {
+    let gate = crate::edge_rules::EdgeRuleGate::start_blocking(db, &security_refresh_runtime()?)
+        .map_err(|e| anyhow::anyhow!("Failed to load project edge rules at startup: {e}"))?;
+    // The same process-wide database the request log's enrichment uses; a
+    // missing one only means geography conditions never match.
+    let geo = match temps_geo::GeoIpService::new() {
+        Ok(geo) => Some(Arc::new(geo)),
+        Err(e) => {
+            warn!(
+                error = %e,
+                "No GeoIP database for edge rules; country, continent, ASN and hosting \
+                 network conditions will not match"
+            );
+            None
+        }
+    };
+    Ok((gate, geo))
+}
+
 /// Setup and configure the proxy server with all services
 #[allow(clippy::too_many_arguments)]
 pub fn setup_proxy_server(
@@ -441,21 +584,7 @@ pub fn setup_proxy_server(
     preflight_check_listen_addresses(&proxy_config)?;
 
     // Setup plugin system (async operation in sync context)
-    // A `current_thread` runtime is enough here: plugin registration awaits a
-    // bounded file-existence poll and otherwise does sync work, so a worker
-    // thread per core would be stood up and torn down purely to drive that.
-    //
-    // Registration is not entirely free of spawns: `ConfigPlugin` starts the
-    // `settings_change` LISTEN/NOTIFY task with `tokio::spawn`. That task does
-    // not survive this runtime being dropped at the end of the statement, and
-    // did not survive the previous multi-threaded one either -- the settings
-    // cache falls back to its 5s TTL, which is the documented non-fatal
-    // behaviour. This is pre-existing and unchanged here; it is called out so
-    // the lifetime is not mistaken for something this runtime guarantees.
-    let context = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?
-        .block_on(setup_proxy_plugins(db.clone(), config.clone()))?;
+    let context = block_on_refresh_runtime(setup_proxy_plugins(db.clone(), config.clone()))??;
 
     // Create service implementations
     let lb_service = Arc::new(LbService::new(db.clone()));
@@ -508,12 +637,18 @@ pub fn setup_proxy_server(
     let proxy_log_writer = proxy_log_writer.with_metrics(proxy_metrics.clone());
     let proxy_log_handle = proxy_log_handle.with_metrics(proxy_metrics.clone());
 
-    // Spawn the batch writer background task
+    // Spawn the batch writer background task. The runtime is built here so a
+    // failure stops startup with an error instead of panicking the thread.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to create tokio runtime for proxy log batch writer: {}",
+                e
+            )
+        })?;
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to create tokio runtime for proxy log batch writer");
         rt.block_on(proxy_log_writer.run());
     });
 
@@ -532,9 +667,17 @@ pub fn setup_proxy_server(
     // owns the periodic refresh, alongside the IP block-list loop above.
     refresh_runtime()?.spawn(cert_host_cache.clone().run_refresh_loop());
 
-    let challenge_service = Arc::new(crate::service::challenge_service::ChallengeService::new(
-        db.clone(),
-    ));
+    let challenge_gate = Arc::new(crate::shield::challenge_gate(&encryption_service));
+
+    // ADR 066: the reputation lists, the built-in baseline until the loader
+    // finds a compiled snapshot in `shield_snapshots`; the bypass tokens;
+    // and the event store, written in batches off the request path.
+    let shield_lists = Arc::new(crate::shield::ShieldLists::default());
+    shield_lists.spawn_loader(db.clone(), &security_refresh_runtime()?);
+    let (edge_rules, edge_geo) = start_edge_rules(db.clone())?;
+    let shield_bypass = Arc::new(crate::shield::BypassTokens::default());
+    shield_bypass.spawn(db.clone(), &security_refresh_runtime()?);
+    let shield_events = spawn_shield_event_store(&config, db.clone(), &config_service)?;
 
     let project_context_resolver = Arc::new(ProjectContextResolverImpl::new(route_table.clone()))
         as Arc<dyn ProjectContextResolver>;
@@ -587,7 +730,10 @@ pub fn setup_proxy_server(
     };
 
     // Create the main load balancer
-    let trust_loopback_forwarded_ip = start_forwarded_ip_trust_refresh(config_service.clone())?;
+    let loopback_trust = start_forwarded_ip_trust_refresh(config_service.clone())?;
+    let disable_https_redirect = security_refresh_runtime()?.block_on(
+        load_https_redirect_policy(&config_service, proxy_config.disable_https_redirect),
+    )?;
     let mut lb = LoadBalancer::new(
         upstream_resolver,
         proxy_log_handle,
@@ -598,13 +744,30 @@ pub fn setup_proxy_server(
         config_service.clone(),
         ip_access_control_service,
         project_ip_gate,
-        challenge_service,
+        challenge_gate,
         cert_host_cache,
-        proxy_config.disable_https_redirect,
+        disable_https_redirect,
     )
-    .with_trust_loopback_forwarded_ip(trust_loopback_forwarded_ip)
+    .with_expose_platform_identity(loopback_trust.expose_platform_identity)
+    .with_trust_loopback_forwarded_ip(loopback_trust.forwarded_ip)
+    .with_loopback_ja4_header(loopback_trust.ja4_header)
     .with_proxy_metrics(proxy_metrics.clone())
-    .with_request_policy_gate(request_policy_gate);
+    .with_request_policy_gate(request_policy_gate)
+    .with_shield_lists(shield_lists)
+    .with_edge_rules(edge_rules, edge_geo)
+    .with_shield_bypass_tokens(shield_bypass)
+    .with_shield_events(shield_events)
+    .with_netwatch(spawn_netwatch()?)
+    // Signed-in addresses (ADR 065 D8). The proxy redeems sign-in codes in
+    // process, so it needs the database and the gate key's sealing key; in
+    // split topology both are available here as they are to the console.
+    .with_gate(Arc::new(crate::handler::gate::ProxyGate::new(
+        route_table.clone(),
+        Arc::new(temps_routes::gate::GateService::new(
+            db.clone(),
+            encryption_service.clone(),
+        )),
+    )));
     if let Some(gate) = admin_gate {
         lb = lb.with_admin_gate(gate);
     }
@@ -643,11 +806,13 @@ pub fn setup_proxy_server(
     // the store is the meeting point, never in-process state. Mirrors the
     // dedicated-thread pattern of the proxy-log batch writer above.
     //
-    // The same thread also runs `NodeMetricsSampler` (cpu/memory/disk/fd
-    // percent for the machine the proxy itself is running on) — this is the
-    // process most likely to be under connection-count stress, so it is the
-    // natural place to catch the machine approaching socket/fd exhaustion
-    // before it starts refusing new connections.
+    // The same thread also runs `NodeMetricsSampler`. Its process fd series
+    // always come from here — this is the process most likely to be under
+    // connection-count stress, so it is the natural place to catch it
+    // approaching its descriptor ceiling before it starts refusing new
+    // connections. The machine-wide series (cpu/memory/disk/network) are
+    // sampled here only when the console shares this process; in split
+    // topology the console samples them, so the host is written once.
     {
         let proxy_metrics = lb.proxy_metrics();
         let sampler_config_service = config_service.clone();
@@ -655,11 +820,21 @@ pub fn setup_proxy_server(
         let sampler_db = db.clone();
         let node_sampler_config_service = config_service.clone();
         let node_sampler_data_dir = config.data_dir.clone();
+        let node_sampler_scope = if proxy_config.host_metrics {
+            temps_metrics::NodeMetricsScope::All
+        } else {
+            temps_metrics::NodeMetricsScope::Process
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to create tokio runtime for proxy metrics sampler: {}",
+                    e
+                )
+            })?;
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("Failed to create tokio runtime for proxy metrics sampler");
             rt.block_on(async move {
                 let store = crate::service::metrics_sampler::build_metrics_store(
                     &sampler_config_service,
@@ -673,10 +848,11 @@ pub fn setup_proxy_server(
                     sampler_config_service,
                 )
                 .run();
-                let node_sampler = temps_metrics::NodeMetricsSampler::new(
+                let node_sampler = temps_metrics::NodeMetricsSampler::with_scope(
                     store,
                     node_sampler_config_service,
                     node_sampler_data_dir,
+                    node_sampler_scope,
                 )
                 .run();
                 tokio::join!(proxy_sampler, node_sampler);
@@ -737,10 +913,14 @@ pub fn setup_proxy_server(
         // taken from the proxy config; `None` keeps the legacy fail-fast-only
         // behavior. tls_cert_loader stays a pure DB lookup — the manager lives
         // only in DynamicCertLoader, never in the loader (ADR §7).
+        // ADR 066, I6: the JA4 is read from the raw ClientHello before
+        // OpenSSL sees it, and handed to the handshake callback.
+        let ja4_hook = Arc::new(crate::shield::Ja4Hook::default());
         let tls_callbacks: Box<dyn TlsAccept + Send + Sync> = Box::new(DynamicCertLoader {
             cert_loader,
             route_table: route_table.clone(),
             on_demand_cert_manager: proxy_config.on_demand_cert_manager.clone(),
+            ja4_hook: ja4_hook.clone(),
         });
 
         // Create TLS settings with dynamic certificate callback and HTTP/2 support
@@ -751,6 +931,8 @@ pub fn setup_proxy_server(
         tls_settings.enable_h2();
 
         proxy_service.add_tls_with_settings(tls_address, None, tls_settings);
+        // Runs only on TLS endpoints: Pingora calls it before the handshake.
+        proxy_service.endpoints().set_pre_tls_callback(ja4_hook);
         debug!(
             "TLS listener configured on {} with HTTP/2 support",
             tls_address
@@ -849,6 +1031,39 @@ fn bind_failure_message(
     }
 }
 
+/// The node's netwatch exchange (ADR 066 D12), on the shared refresh
+/// runtime. Off unless `TEMPS_NETWATCH` turns it on.
+fn spawn_netwatch() -> Result<temps_shield::netwatch::Netwatch> {
+    let config = temps_shield::netwatch::NetwatchConfig::from_env();
+    if config.enabled {
+        tracing::info!(
+            ?config,
+            "Shield: reading netwatch bans and reporting requests to it"
+        );
+    }
+    let runtime = security_refresh_runtime()?;
+    let _entered = runtime.enter();
+    Ok(temps_shield::netwatch::spawn(config))
+}
+
+/// The proxy's Shield event store (ADR 066, I8), writing on the shared
+/// refresh runtime: events arrive in batches and a slow write only drops
+/// events, never delays a request.
+fn spawn_shield_event_store(
+    config: &ServerConfig,
+    db: Arc<DbConnection>,
+    config_service: &temps_config::ConfigService,
+) -> Result<Arc<dyn temps_shield::EventSink>> {
+    let (store, writer) =
+        crate::shield::ShieldEventStore::new(crate::shield::EventBackend::from_config(
+            Some(config),
+            db,
+            config_service.clickhouse_compression(),
+        ));
+    refresh_runtime()?.spawn(writer.run());
+    Ok(store)
+}
+
 /// Create a proxy service with the given configuration
 pub fn create_proxy_service(
     db: Arc<DbConnection>,
@@ -860,14 +1075,7 @@ pub fn create_proxy_service(
     project_ip_gate: Arc<dyn temps_core::ProjectIpGate>,
 ) -> Result<LoadBalancer> {
     // Setup plugin system (async operation in sync context)
-    // A `current_thread` runtime is enough here: plugin registration awaits a
-    // bounded file-existence poll and does sync work, and it spawns nothing
-    // that outlives this call. `Runtime::new()` would stand up (and tear down)
-    // one worker thread per core purely to drive that.
-    let context = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?
-        .block_on(setup_proxy_plugins(db.clone(), config.clone()))?;
+    let context = block_on_refresh_runtime(setup_proxy_plugins(db.clone(), config.clone()))??;
 
     // Create service implementations
     let lb_service = Arc::new(LbService::new(db.clone()));
@@ -915,12 +1123,18 @@ pub fn create_proxy_service(
     let proxy_log_writer = proxy_log_writer.with_metrics(proxy_metrics.clone());
     let proxy_log_handle = proxy_log_handle.with_metrics(proxy_metrics.clone());
 
-    // Spawn the batch writer background task
+    // Spawn the batch writer background task. The runtime is built here so a
+    // failure stops startup with an error instead of panicking the thread.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to create tokio runtime for proxy log batch writer: {}",
+                e
+            )
+        })?;
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to create tokio runtime for proxy log batch writer");
         rt.block_on(proxy_log_writer.run());
     });
 
@@ -939,15 +1153,24 @@ pub fn create_proxy_service(
     // owns the periodic refresh, alongside the IP block-list loop above.
     refresh_runtime()?.spawn(cert_host_cache.clone().run_refresh_loop());
 
-    let challenge_service = Arc::new(crate::service::challenge_service::ChallengeService::new(
-        db.clone(),
+    let challenge_gate = Arc::new(crate::shield::challenge_gate(
+        &temps_core::EncryptionService::new(&config.encryption_key)?,
     ));
+    let shield_lists = Arc::new(crate::shield::ShieldLists::default());
+    shield_lists.spawn_loader(db.clone(), &security_refresh_runtime()?);
+    let (edge_rules, edge_geo) = start_edge_rules(db.clone())?;
+    let shield_bypass = Arc::new(crate::shield::BypassTokens::default());
+    shield_bypass.spawn(db.clone(), &security_refresh_runtime()?);
+    let shield_events = spawn_shield_event_store(&config, db.clone(), &config_service)?;
 
     let project_context_resolver = Arc::new(ProjectContextResolverImpl::new(route_table.clone()))
         as Arc<dyn ProjectContextResolver>;
 
     // Create the main load balancer
-    let trust_loopback_forwarded_ip = start_forwarded_ip_trust_refresh(config_service.clone())?;
+    let loopback_trust = start_forwarded_ip_trust_refresh(config_service.clone())?;
+    let disable_https_redirect = security_refresh_runtime()?.block_on(
+        load_https_redirect_policy(&config_service, proxy_config.disable_https_redirect),
+    )?;
     let lb = LoadBalancer::new(
         upstream_resolver,
         proxy_log_handle,
@@ -958,14 +1181,63 @@ pub fn create_proxy_service(
         config_service,
         ip_access_control_service,
         project_ip_gate,
-        challenge_service,
+        challenge_gate,
         cert_host_cache,
-        proxy_config.disable_https_redirect,
+        disable_https_redirect,
     )
-    .with_trust_loopback_forwarded_ip(trust_loopback_forwarded_ip)
-    .with_proxy_metrics(proxy_metrics);
+    .with_expose_platform_identity(loopback_trust.expose_platform_identity)
+    .with_trust_loopback_forwarded_ip(loopback_trust.forwarded_ip)
+    .with_loopback_ja4_header(loopback_trust.ja4_header)
+    .with_proxy_metrics(proxy_metrics)
+    .with_shield_lists(shield_lists)
+    .with_edge_rules(edge_rules, edge_geo)
+    .with_shield_bypass_tokens(shield_bypass)
+    .with_shield_events(shield_events)
+    .with_netwatch(spawn_netwatch()?);
 
     Ok(lb)
+}
+
+#[cfg(test)]
+mod plugin_setup_runtime_tests {
+    use super::*;
+
+    #[test]
+    fn a_connection_opened_during_setup_stays_usable_afterwards() {
+        let other_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _context = other_runtime.enter();
+        let database = match other_runtime.block_on(temps_test_utils::TestDatabase::new()) {
+            Ok(database) => database,
+            Err(error)
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+            {
+                eprintln!("Skipping plugin setup runtime test: Docker unavailable: {error}");
+                return;
+            }
+            Err(error) => panic!("plugin setup runtime test database failed: {error}"),
+        };
+        // One connection, so the acquire below must get the one setup opened.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(3))
+            .connect_lazy(&database.database_url)
+            .unwrap();
+
+        let setup_pool = pool.clone();
+        block_on_refresh_runtime(async move {
+            drop(setup_pool.acquire().await.unwrap());
+            // Gives the connection time to go back into the pool.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        })
+        .unwrap();
+
+        other_runtime
+            .block_on(pool.acquire())
+            .expect("a connection opened during setup must stay usable");
+    }
 }
 
 #[cfg(test)]
@@ -973,7 +1245,7 @@ mod preflight_bind_tests {
     use super::*;
     use chrono::Utc;
     use sea_orm::{DatabaseBackend, DbErr, MockDatabase};
-    use temps_core::AppSettings;
+    use temps_config::AppSettings;
     use temps_entities::settings;
 
     fn test_config() -> Arc<ServerConfig> {
@@ -988,10 +1260,55 @@ mod preflight_bind_tests {
         )
     }
 
+    #[tokio::test]
+    async fn external_tls_disables_origin_redirects_even_with_a_public_https_url() {
+        for (external_tls, explicit_disable, expected) in [
+            (true, false, true),
+            (true, true, true),
+            (false, false, false),
+            (false, true, true),
+        ] {
+            let row = settings::Model {
+                id: 1,
+                data: serde_json::json!({
+                    "external_url": "https://console.apps.example.com",
+                    "external_tls": external_tls,
+                }),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            };
+            let db = MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[row]])
+                .into_connection();
+            let service = temps_config::ConfigService::new(test_config(), Arc::new(db));
+            assert_eq!(
+                load_https_redirect_policy(&service, explicit_disable)
+                    .await
+                    .unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn external_tls_policy_must_be_loaded_before_the_proxy_starts() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors([DbErr::Custom("settings unavailable".to_string())])
+            .into_connection();
+        let service = temps_config::ConfigService::new(test_config(), Arc::new(db));
+        let error = load_https_redirect_policy(&service, false)
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Cannot start proxy: failed to load external TLS policy"));
+    }
+
     #[test]
     fn initial_forwarded_ip_trust_loads_saved_admin_choice() {
         let settings = AppSettings {
             trust_loopback_forwarded_ip: Some(true),
+            expose_platform_identity: Some(true),
             ..AppSettings::default()
         };
         let row = settings::Model {
@@ -1008,9 +1325,81 @@ mod preflight_bind_tests {
             Arc::new(db),
         ));
 
-        let snapshot = start_forwarded_ip_trust_refresh(service)
+        let trust = start_forwarded_ip_trust_refresh(service)
             .expect("saved admin opt-in must apply at startup");
-        assert!(snapshot.load(Ordering::Relaxed));
+        assert!(trust.forwarded_ip.load(Ordering::Relaxed));
+        assert!(trust.expose_platform_identity.load(Ordering::Relaxed));
+        assert!(
+            trust.ja4_header.load().is_none(),
+            "no JA4 header configured"
+        );
+    }
+
+    #[test]
+    fn initial_loopback_ja4_header_loads_saved_admin_choice() {
+        let settings = AppSettings {
+            trust_loopback_forwarded_ip: Some(true),
+            loopback_ja4_header: Some("x-ja4".into()),
+            ..AppSettings::default()
+        };
+        let row = settings::Model {
+            id: 1,
+            data: settings.to_json(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([[row]])
+            .into_connection();
+        let service = Arc::new(temps_config::ConfigService::new(
+            test_config(),
+            Arc::new(db),
+        ));
+
+        let trust = start_forwarded_ip_trust_refresh(service)
+            .expect("saved JA4 header must apply at startup");
+        assert_eq!(
+            trust.ja4_header.load().as_deref().map(HeaderName::as_str),
+            Some("x-ja4")
+        );
+    }
+
+    #[test]
+    fn loopback_ja4_header_refresh_reports_changes_only() {
+        let snapshot = ArcSwapOption::empty();
+        let header = || Some(Arc::new(HeaderName::from_static("x-ja4")));
+
+        assert!(apply_loopback_ja4_header_refresh(&snapshot, header()));
+        assert!(!apply_loopback_ja4_header_refresh(&snapshot, header()));
+        assert_eq!(
+            snapshot.load().as_deref().map(HeaderName::as_str),
+            Some("x-ja4")
+        );
+        assert!(apply_loopback_ja4_header_refresh(&snapshot, None));
+        assert!(snapshot.load().is_none());
+    }
+
+    /// A stored name the handler would refuse is ignored, never trusted:
+    /// the proxy strips the header it trusts from every request.
+    #[test]
+    fn invalid_stored_loopback_ja4_header_is_ignored() {
+        for stored in ["x ja4", "authorization", "cookie"] {
+            let settings = AppSettings {
+                loopback_ja4_header: Some(stored.into()),
+                ..AppSettings::default()
+            };
+            assert!(loopback_ja4_header(&settings).is_none(), "{stored}");
+        }
+        let settings = AppSettings {
+            loopback_ja4_header: Some(" X-JA4 ".into()),
+            ..AppSettings::default()
+        };
+        assert_eq!(
+            loopback_ja4_header(&settings)
+                .as_deref()
+                .map(HeaderName::as_str),
+            Some("x-ja4")
+        );
     }
 
     #[test]
@@ -1075,12 +1464,12 @@ mod preflight_bind_tests {
             Arc::new(db),
         ));
 
-        let snapshot =
+        let trust =
             start_forwarded_ip_trust_refresh(service).expect("initial settings load succeeds");
-        let weak = Arc::downgrade(&snapshot);
+        let weak = Arc::downgrade(&trust.forwarded_ip);
         assert!(weak.upgrade().is_some(), "still held by this test's Arc");
 
-        drop(snapshot);
+        drop(trust);
         assert!(
             weak.upgrade().is_none(),
             "once the LoadBalancer's Arc is dropped, the next loop iteration's \

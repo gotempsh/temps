@@ -174,6 +174,10 @@ impl TempsPlugin for BlobPlugin {
 
             // Register services
             context.register_service(rustfs_service);
+            // Offloaded workflow payloads (ADR-106 §5), ciphertext only.
+            context.register_service(Arc::new(crate::services::BlobPayloadStore::new(
+                blob_service.clone(),
+            )) as Arc<dyn temps_core::PayloadBlobStore>);
             context.register_service(blob_service);
 
             debug!("Blob plugin services registered successfully");

@@ -4,7 +4,7 @@
 import { Link, useSearchParams } from 'react-router'
 import { useQuery } from '@tanstack/react-query'
 import { ArrowRight } from 'lucide-react'
-import { RecordLink } from '@temps-sdk/ds'
+import { RecordLink, RecordRow } from '@temps-sdk/ds'
 import type { ProviderCatalogDto } from '@/api/client'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -24,6 +24,7 @@ import {
   harnessSetupHref,
   harnessSetupStatus,
   savedConnectionLabel,
+  backToWorkspaceLabel,
   workspaceReturnTo,
 } from './harness-onboarding'
 
@@ -42,11 +43,13 @@ export function AgentSandboxProvidersList() {
         <p className="text-sm text-muted-foreground">
           Connect one harness to start. You can add the others later.
         </p>
-        <Button asChild variant="outline" size="sm">
-          <Link to={returnTo}>
-            Back to workspace <ArrowRight className="size-4" />
-          </Link>
-        </Button>
+        {returnTo && (
+          <Button asChild variant="outline" size="sm">
+            <Link to={returnTo}>
+              {backToWorkspaceLabel(returnTo)} <ArrowRight className="size-4" />
+            </Link>
+          </Button>
+        )}
       </div>
       <div className="rounded-lg border bg-card text-card-foreground">
         {isError && !data ? (
@@ -110,14 +113,14 @@ export function HarnessSetupRow({
   returnTo,
 }: {
   provider: ProviderCatalogDto
-  returnTo: string
+  returnTo: string | null
 }) {
   const needsAttention = provider.credential_saved && !provider.workspace_ready
   const method = provider.credential_saved
     ? savedConnectionLabel(provider)
     : undefined
   return (
-    <TableRow>
+    <RecordRow>
       <TableCell>
         <div className="flex min-w-0 items-center gap-3">
           <AiHarnessLogo providerId={provider.id} size={20} />
@@ -157,6 +160,6 @@ export function HarnessSetupRow({
           )}
         </div>
       </TableCell>
-    </TableRow>
+    </RecordRow>
   )
 }

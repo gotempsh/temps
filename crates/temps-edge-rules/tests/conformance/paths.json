@@ -1,0 +1,52 @@
+{
+  "description": "Path normalization, case handling and first-match order",
+  "rules": [
+    {
+      "id": 1,
+      "expression": {
+        "combinator": "all",
+        "children": [
+          { "kind": "condition", "field": "path", "op": "glob", "values": ["/admin*"], "case_insensitive": true }
+        ]
+      },
+      "action": { "type": "block", "status": 403 }
+    },
+    {
+      "id": 2,
+      "expression": {
+        "combinator": "any",
+        "children": [
+          { "kind": "condition", "field": "path", "op": "glob", "values": ["/wp-*"], "case_insensitive": true },
+          { "kind": "condition", "field": "path", "op": "glob", "values": ["*.php"], "case_insensitive": true },
+          { "kind": "condition", "field": "path", "op": "glob", "values": ["/.env*"] },
+          { "kind": "condition", "field": "path", "op": "glob", "values": ["/.git*"] }
+        ]
+      },
+      "action": { "type": "block", "status": 404 }
+    },
+    {
+      "id": 3,
+      "expression": {
+        "combinator": "all",
+        "children": [
+          { "kind": "condition", "field": "raw_path", "op": "contains", "values": ["%2e%2e"], "case_insensitive": true }
+        ]
+      },
+      "action": { "type": "block", "status": 400 }
+    }
+  ],
+  "cases": [
+    { "name": "plain admin path", "request": { "url": "https://app.example.com/admin" }, "decision": { "kind": "block", "rule_id": 1, "status": 403 }, "trace": ["decided", "not_reached", "not_reached"] },
+    { "name": "double slash", "request": { "url": "https://app.example.com//admin/users" }, "decision": { "kind": "block", "rule_id": 1, "status": 403 } },
+    { "name": "encoded letter", "request": { "url": "/%61dmin" }, "decision": { "kind": "block", "rule_id": 1, "status": 403 } },
+    { "name": "dot segments", "request": { "url": "/static/../admin" }, "decision": { "kind": "block", "rule_id": 1, "status": 403 } },
+    { "name": "upper case with ignore case", "request": { "url": "/ADMIN" }, "decision": { "kind": "block", "rule_id": 1, "status": 403 } },
+    { "name": "administrator also matches the pattern", "request": { "url": "/administrator" }, "decision": { "kind": "block", "rule_id": 1, "status": 403 } },
+    { "name": "wordpress probe", "request": { "url": "/wp-login.php" }, "decision": { "kind": "block", "rule_id": 2, "status": 404 }, "trace": ["no_match", "decided", "not_reached"] },
+    { "name": "php anywhere", "request": { "url": "/cgi-bin/x.PHP?a=1" }, "decision": { "kind": "block", "rule_id": 2, "status": 404 } },
+    { "name": "env file is case sensitive", "request": { "url": "/.ENV" }, "decision": { "kind": "forward" } },
+    { "name": "env file", "request": { "url": "/.env.local" }, "decision": { "kind": "block", "rule_id": 2, "status": 404 } },
+    { "name": "encoded traversal is blocked by raw path", "request": { "url": "/assets/%2E%2E/x" }, "decision": { "kind": "block", "rule_id": 3, "status": 400 } },
+    { "name": "public page passes", "request": { "url": "https://app.example.com/pricing?plan=pro" }, "decision": { "kind": "forward" }, "trace": ["no_match", "no_match", "no_match"] }
+  ]
+}

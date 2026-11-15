@@ -144,7 +144,7 @@ fn zone_candidates(domain: &str) -> Result<Vec<String>, DnsError> {
 pub struct CloudflareProvider {
     client: Client,
     /// Stored credentials for reference (e.g., account_id)
-    #[allow(dead_code)]
+    #[allow(dead_code)] // injected but not used yet
     credentials: CloudflareCredentials,
 }
 
@@ -362,7 +362,12 @@ impl CloudflareProvider {
             content,
             ttl: record.ttl,
             proxied: record.proxied,
-            metadata: HashMap::new(),
+            // When it last changed: what tells a record edited after a plan
+            // was made (ADR 064 D4).
+            metadata: HashMap::from([(
+                crate::providers::METADATA_MODIFIED_ON.to_string(),
+                record.modified_on.to_rfc3339(),
+            )]),
         })
     }
 

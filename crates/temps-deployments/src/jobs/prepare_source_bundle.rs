@@ -3,14 +3,17 @@
 
 //! Prepare an uploaded source archive for the normal preset build pipeline.
 
+use crate::workflow::JobResult;
+use crate::workflow::WorkflowContext;
+use crate::workflow::WorkflowError;
+use crate::workflow::WorkflowTask;
 use async_trait::async_trait;
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use temps_core::drop_entries::{classify_drop_entry, DropEntryDisposition, DropSkipReport};
-use temps_core::{JobResult, WorkflowContext, WorkflowError, WorkflowTask};
-use temps_logs::{LogLevel, LogService};
+use temps_deployment_logs::{LogLevel, LogService};
 
 /// Entry name for diagnostics. This is the decoded name that `enclosed_name`
 /// and the classifier operate on (legacy CP437 names included), so an error
@@ -103,7 +106,7 @@ impl PrepareSourceBundleJob {
         {
             return Err(WorkflowError::InvalidArchiveEntry {
                 path: path.display().to_string(),
-                reason: "entry path escapes the source root".to_string(),
+                reason: "its path resolves outside the archive root; use paths relative to the archive root".to_string(),
             });
         }
         Ok(())
@@ -156,7 +159,7 @@ impl PrepareSourceBundleJob {
                     .enclosed_name()
                     .ok_or_else(|| WorkflowError::InvalidArchiveEntry {
                         path: entry_display_name(&entry),
-                        reason: "entry path escapes the source root".to_string(),
+                        reason: "its path resolves outside the archive root; use paths relative to the archive root".to_string(),
                     })?;
             Self::validate_path(&enclosed)?;
             match classify_drop_entry(&enclosed) {
@@ -186,7 +189,7 @@ impl PrepareSourceBundleJob {
             {
                 return Err(WorkflowError::InvalidArchiveEntry {
                     path: entry_display_name(&entry),
-                    reason: "symbolic links are not allowed".to_string(),
+                    reason: "symbolic links are not allowed; replace the link with the file or directory it points to".to_string(),
                 });
             }
             if entry.is_dir() {
@@ -402,7 +405,7 @@ mod tests {
     struct DiscardingLogWriter;
 
     #[async_trait]
-    impl temps_core::LogWriter for DiscardingLogWriter {
+    impl crate::workflow::LogWriter for DiscardingLogWriter {
         async fn write_log(&self, _message: String) -> Result<(), WorkflowError> {
             Ok(())
         }

@@ -795,6 +795,7 @@ Rollback to previous deployment
 | `-p, --project <project>` | Project slug or ID (required)      | -            | Yes      |
 | `-e, --environment <env>` | Target environment                 | `production` | Yes      |
 | `--to <deployment>`       | Rollback to specific deployment ID | -            | Yes      |
+| `-y, --yes`               | Skip confirmation                  | -            | No       |
 
 ### `deployments cancel`
 
@@ -1781,6 +1782,7 @@ Add a new notification provider
 | `--to-addresses <addresses>` | Comma-separated recipient addresses (for email)            | -       | Yes      |
 | `--url <url>`                | Webhook URL (for webhook)                                  | -       | Yes      |
 | `--method <method>`          | HTTP method: POST, PUT, PATCH (for webhook, default: POST) | -       | Yes      |
+| `--header <header>` | Request header "Name: value" (for webhook, repeatable) | -       | No       |
 | `-y, --yes`                  | Skip confirmation prompts (for automation)                 | -       | No       |
 
 ### `notifications update`
@@ -1805,6 +1807,7 @@ Update a notification provider
 | `--to-addresses <addresses>` | Comma-separated recipient addresses (for email) | -       | Yes      |
 | `--url <url>`                | Webhook URL (for webhook)                       | -       | Yes      |
 | `--method <method>`          | HTTP method: POST, PUT, PATCH (for webhook)     | -       | Yes      |
+| `--header <header>` | Request header "Name: value" (for webhook, repeatable; replaces the stored headers) | -       | No       |
 | `--json`                     | Output in JSON format                           | -       | No       |
 | `-y, --yes`                  | Skip confirmation prompts                       | -       | No       |
 

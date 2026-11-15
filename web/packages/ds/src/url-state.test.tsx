@@ -293,6 +293,37 @@ test('useUrlSearchText keeps fast typing, writes the key and resets page', async
   view.unmount()
 })
 
+// Appends each character to what the box *currently shows*, like a keystroke.
+// `typeFast` sends the cumulative expected string every time, so a character
+// the box dropped would be re-supplied by the next event and go unnoticed.
+const typeByKeystroke = (input: HTMLInputElement, value: string) => {
+  for (const char of value) {
+    fireEvent.change(input, { target: { value: input.value + char } })
+  }
+}
+
+test('useUrlSearchText keeps spaces and special characters exactly as typed', async () => {
+  const typed = ' my var: a&b=c %20 #x+y/z ü '
+  const view = render(
+    <MemoryRouter initialEntries={['/list']}>
+      <SearchTextBox />
+    </MemoryRouter>
+  )
+  const input = view.getByLabelText('search') as HTMLInputElement
+  typeByKeystroke(input, typed)
+  // Leading/trailing whitespace is not trimmed while typing.
+  expect(input.value).toBe(typed)
+  await waitFor(() => {
+    expect(view.getByTestId('committed').textContent).toBe(typed)
+  })
+  const params = new URLSearchParams(
+    view.getByTestId('search').textContent ?? ''
+  )
+  expect(params.get('q')).toBe(typed)
+  expect(input.value).toBe(typed)
+  view.unmount()
+})
+
 test('useUrlSearchText restores the text from the URL on a fresh mount', () => {
   const view = render(
     <MemoryRouter initialEntries={['/list?find=pages']}>

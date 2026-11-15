@@ -7,6 +7,11 @@
 
 use super::image_source::{DeployImageSource, ExpectedImageIdentity};
 use super::node_image::{copy_node_built_image, NodeImageCopy};
+use crate::workflow::JobResult;
+use crate::workflow::WorkflowCancellationProvider;
+use crate::workflow::WorkflowContext;
+use crate::workflow::WorkflowError;
+use crate::workflow::WorkflowTask;
 use async_trait::async_trait;
 use futures::StreamExt;
 use sea_orm::{sea_query::Expr, ColumnTrait, EntityTrait, QueryFilter, Set, TransactionTrait};
@@ -15,17 +20,26 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use temps_core::{
-    JobResult, WorkflowCancellationProvider, WorkflowContext, WorkflowError, WorkflowTask,
-};
 use temps_database::DbConnection;
 use temps_deployer::{
     ContainerDeployer, ContainerLogConfig, ContainerStatus as DeployerContainerStatus,
     DeployRequest, ImageBuilder, PortMapping, Protocol, ResourceLimits, RestartPolicy,
 };
+use temps_deployment_logs::{LogLevel, LogService};
 use temps_entities::deployment_containers;
-use temps_logs::{LogLevel, LogService};
+use temps_entities::environment_workload_mode::EnvironmentWorkloadMode;
 use tokio::time::{sleep, Duration};
+
+mod replica;
+
+/// An image a node holds under a tag, resolved for a platform the node does
+/// not run.
+struct NodeImagePlatformMismatch {
+    /// The platform the node resolves the tag to.
+    resolved: String,
+    /// The platform the node runs.
+    node: String,
+}
 
 fn verify_worker_image_platform(
     image: &str,
@@ -212,6 +226,10 @@ pub struct ReusedWorkerBuild {
     /// The id of each architecture's image as built; a reused tag is only
     /// fetched from a worker still holding exactly this image.
     pub image_ids_by_platform: HashMap<String, String>,
+    /// The image's configuration as the build node reported it. A rollback or
+    /// promotion has no workflow context from the original build and the
+    /// control plane may hold no copy to inspect, so the ports come from here.
+    pub image_config: Option<super::build_image::BuiltImageConfig>,
 }
 
 impl ReusedWorkerBuild {
@@ -265,6 +283,10 @@ impl ReusedWorkerBuild {
             builder_node_id: Some(builder_node_id),
             builder_node_ids_by_platform,
             image_ids_by_platform,
+            image_config: outputs
+                .get("image_config")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok()),
         })
     }
 
@@ -286,7 +308,7 @@ pub struct DeploymentOutput {
     /// List of all allocated host ports (one per replica)
     pub host_ports: Vec<u16>,
     /// The resolved container port (from image EXPOSE, config, or default)
-    pub container_port: u16,
+    pub container_port: Option<u16>,
     /// Node IDs for each replica (None = local node). Parallel to container_ids.
     #[serde(default)]
     pub node_ids: Vec<Option<i32>>,
@@ -503,6 +525,7 @@ pub struct DeploymentJobConfig {
     pub environment_variables: HashMap<String, String>,
     /// Optional command passed to the container image entrypoint.
     pub command: Option<Vec<String>>,
+    pub entrypoint: Option<Vec<String>>,
     /// Secret values (decrypted plaintext) mounted into the container as
     /// files under `/run/secrets/<KEY>` by the deployer. Never injected as
     /// environment variables; never visible via `docker inspect`.
@@ -523,6 +546,7 @@ pub struct DeploymentJobConfig {
     /// Maximum time to wait for the application to become ready (container
     /// start + health checks). Defaults to 300 seconds (5 minutes).
     pub health_check_timeout_secs: u64,
+    pub health: Option<temps_core::repo_config::HealthCheckConfig>,
     /// Optional list of node IDs to deploy to. When set, replicas are distributed
     /// only across these specific nodes. When None, all active nodes are eligible.
     pub target_nodes: Option<Vec<i32>>,
@@ -565,7 +589,7 @@ pub struct DeploymentJobConfig {
     ///
     /// A replica scheduled remotely with a non-empty list is failed instead
     /// of being handed a connection string that can never connect — see
-    /// [`temps_core::WorkflowError::CrossNodeServiceUnreachable`]. Local
+    /// [`crate::workflow::WorkflowError::CrossNodeServiceUnreachable`]. Local
     /// replicas ignore it entirely: they reach the service by container name
     /// over the shared bridge network exactly as before.
     pub cross_node_service_blockers: Vec<crate::services::CrossNodeServiceBlocker>,
@@ -577,6 +601,22 @@ pub struct DeploymentJobConfig {
     /// When anti-affinity is enabled, these nodes are excluded from scheduling
     /// to prevent new replicas from landing on the same nodes as old ones.
     pub exclude_node_ids: Vec<i32>,
+    /// The environment's ADR-055 mode. `Legacy` (the default) is today's
+    /// deploy path, unchanged; `Shadow` also asks the unified scheduler and
+    /// logs whether it agrees; `Enforce` places with the unified scheduler
+    /// and starts control-plane replicas through the workload plane.
+    pub workload_mode: temps_entities::environment_workload_mode::EnvironmentWorkloadMode,
+    /// The environment's attached volumes (ADR-055 Phase 9), sources
+    /// resolved. Empty for every environment without one, which deploys
+    /// exactly as before. Mounted only in `enforce`, one replica, on the
+    /// control plane; anything else fails the deployment with the reason.
+    pub volume_mounts: Vec<temps_workload::VolumeMount>,
+    /// Where those volumes pin the replica, when any has a node yet.
+    pub volume_pin: Option<temps_workload_volumes::VolumePin>,
+    /// What `enforce` replicas ask the plane for (ADR-055 Phase 10, the
+    /// environment's `workload_isolation`). `legacy` and `shadow` keep a
+    /// container whatever it says.
+    pub workload_isolation: temps_workload::Isolation,
 }
 
 /// One replica's placement, and the guarantee the scheduler attached to it.
@@ -611,6 +651,7 @@ impl Default for DeploymentJobConfig {
             configured_port: None,
             environment_variables: HashMap::new(),
             command: None,
+            entrypoint: None,
             secrets: HashMap::new(),
             resources: ResourceUsage::default(),
             health_check_path: Some("/".to_string()),
@@ -618,6 +659,7 @@ impl Default for DeploymentJobConfig {
             ingress_enabled: false,
             ingress_host: None,
             health_check_timeout_secs: 300,
+            health: None,
             target_nodes: None,
             target_labels: None,
             project_slug: None,
@@ -626,8 +668,23 @@ impl Default for DeploymentJobConfig {
             cross_node_service_blockers: Vec::new(),
             anti_affinity: true,
             exclude_node_ids: Vec::new(),
+            workload_mode: Default::default(),
+            volume_mounts: Vec::new(),
+            volume_pin: None,
+            workload_isolation: temps_workload::Isolation::Process,
         }
     }
+}
+
+/// What a `shadow` or `enforce` deployment needs (ADR-055 Phase 5): the
+/// unified scheduler's inputs, and the plane that runs control-plane
+/// replicas in `enforce`. Absent for `legacy`, which never touches either.
+#[derive(Clone)]
+pub struct WorkloadPlaneDeploy {
+    pub placement: Arc<crate::services::WorkloadPlacementService>,
+    /// `None` when this process did not start a plane; `enforce` then fails
+    /// with that reason instead of degrading to the legacy path.
+    pub plane: Option<Arc<temps_workload_plane::WorkloadPlane>>,
 }
 
 /// Target environment for deployment
@@ -649,6 +706,8 @@ pub struct DeployImageJob {
     /// Node scheduler for distributing replicas across the cluster.
     /// When None, all replicas deploy locally (single-node mode).
     node_scheduler: Option<Arc<crate::services::NodeScheduler>>,
+    /// ADR-055: set for `shadow`/`enforce` environments only.
+    workload_plane: Option<WorkloadPlaneDeploy>,
     log_id: Option<String>,
     log_service: Option<Arc<LogService>>,
     /// Container IDs stored as soon as containers are created for cleanup on failure
@@ -703,6 +762,13 @@ pub struct DeployImageJob {
     /// ([`DeployImageSource::Registry`]). `None` when the registry needs no
     /// auth, or when the image is control-plane-local and this path is unused.
     registry_credentials: Option<temps_deployer::remote::RemotePullCredentials>,
+    /// What each registry image's index offered, once asked: `Some` with its
+    /// platforms, or `None` when it could not be read or listed none (the
+    /// local store answers instead). Scheduling and every replica's node
+    /// check ask for the same tag; on a daemon without a local index each
+    /// lookup is a registry request, and an unreachable registry must not be
+    /// waited on again for every replica.
+    registry_index_platforms: Arc<Mutex<HashMap<String, Option<Vec<String>>>>>,
 }
 
 /// What the control plane's own Docker can tell a deploy job about an image.
@@ -723,7 +789,7 @@ enum ControlPlaneImage {
 struct FailedContainerCandidate {
     container_id: String,
     container_name: String,
-    container_port: u16,
+    container_port: Option<u16>,
     host_port: u16,
     image_name: String,
     node_id: Option<i32>,
@@ -1105,6 +1171,36 @@ struct ReadinessProbeState {
     last_was_request_error: bool,
 }
 
+fn http_probe_status_is_healthy(status: reqwest::StatusCode) -> bool {
+    status.is_success() || status.is_redirection() || matches!(status.as_u16(), 404 | 405)
+}
+
+/// A published-port proxy can complete the handshake before discovering that
+/// the application refuses connections. Reject that immediate EOF/reset rather
+/// than promoting a deployment whose only listener is the forwarding proxy.
+async fn confirm_tcp_probe_connection(
+    stream: &tokio::net::TcpStream,
+    deadline: tokio::time::Instant,
+) -> std::io::Result<()> {
+    let confirmation_deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+    let mut byte = [0_u8; 1];
+    match tokio::time::timeout_at(deadline.min(confirmation_deadline), stream.peek(&mut byte))
+        .await
+    {
+        Ok(Ok(0)) => Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "TCP connection closed before readiness was confirmed; check the application listener behind the published port",
+        )),
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(error)) => Err(error),
+        Err(_) if confirmation_deadline <= deadline => Ok(()),
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "TCP probe deadline expired before the connection could be confirmed",
+        )),
+    }
+}
+
 impl ReadinessProbeState {
     fn record_transport_error(&mut self, error: &reqwest::Error) {
         self.last_was_connect_error = error.is_connect();
@@ -1128,12 +1224,12 @@ impl ReadinessProbeState {
         if !self.responded && (self.last_was_connect_error || self.last_failure.is_none()) {
             format!(
                 "Application never accepted connections on port {port} within the readiness \
-                 limit of {limit_secs}s (waited {waited_secs}s; last check: {last} for {path})"
+                 limit of {limit_secs}s (waited {waited_secs}s; last check: {last} for {path}). This container did not open port {port}; if it is a background worker, set health.type: process"
             )
         } else if !self.responded && self.last_was_request_error {
             format!(
                 "Application never returned an HTTP response on port {port} within the readiness \
-                 limit of {limit_secs}s (waited {waited_secs}s; last check: {last} for {path})"
+                 limit of {limit_secs}s (waited {waited_secs}s; last check: {last} for {path}). If it is a background worker, set health.type: process"
             )
         } else {
             format!(
@@ -1142,6 +1238,208 @@ impl ReadinessProbeState {
                  {last} for {path})"
             )
         }
+    }
+}
+
+/// Control-plane polling only: one in-flight probe and at most 4 KiB of output
+/// per candidate. The deployment startup deadline bounds every external call.
+async fn wait_for_non_http_probe(
+    deployer: &dyn ContainerDeployer,
+    container_id: &str,
+    health: &temps_core::repo_config::HealthCheckConfig,
+    address: Option<&str>,
+    budget: Duration,
+    job_log: Option<(&DeployImageJob, &WorkflowContext)>,
+) -> Result<(), WorkflowError> {
+    health.validate().map_err(|reason| {
+        WorkflowError::JobValidationFailed(format!(
+            "Invalid probe for container {container_id}: {reason}"
+        ))
+    })?;
+    let kind = health.kind(address.is_some());
+    if !matches!(kind, "process" | "tcp" | "exec") {
+        return Err(WorkflowError::JobValidationFailed(format!(
+            "Unsupported health.type '{kind}' for container {container_id}"
+        )));
+    }
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut stable_since = tokio::time::Instant::now();
+    let mut last_restarts = None;
+    let mut was_running = false;
+    let mut last_failure = "no probe completed".to_string();
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(WorkflowError::JobExecutionFailed(format!("Container {container_id} health.type: {kind} exceeded startup timeout: {last_failure}")));
+        }
+        let info = tokio::time::timeout_at(deadline, deployer.get_container_info(container_id))
+            .await
+            .map_err(|_| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Container {container_id} inspection exceeded startup timeout"
+                ))
+            })?
+            .map_err(|error| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Cannot evaluate {kind} probe for container {container_id}: {error}"
+                ))
+            })?;
+        let restarts = info.restart_count.ok_or_else(|| WorkflowError::JobExecutionFailed(format!("Cannot evaluate {kind} probe for container {container_id}: RestartCount is unknown")))?;
+        if matches!(
+            info.status,
+            DeployerContainerStatus::Exited | DeployerContainerStatus::Dead
+        ) {
+            return Err(WorkflowError::JobExecutionFailed(
+                container_exit_failure_message(
+                    &info,
+                    budget
+                        .saturating_sub(
+                            deadline.saturating_duration_since(tokio::time::Instant::now()),
+                        )
+                        .as_secs(),
+                ),
+            ));
+        }
+        if restarts >= CRASH_LOOP_RESTART_THRESHOLD {
+            return Err(WorkflowError::JobExecutionFailed(
+                container_crash_loop_message(&info, restarts),
+            ));
+        }
+        if !was_running
+            || last_restarts.is_some_and(|previous| previous != restarts)
+            || info.status != DeployerContainerStatus::Running
+        {
+            stable_since = tokio::time::Instant::now();
+        }
+        last_restarts = Some(restarts);
+        was_running = info.status == DeployerContainerStatus::Running;
+        if info.status == DeployerContainerStatus::Running {
+            match kind {
+                "process" => {
+                    if stable_since.elapsed() >= Duration::from_secs(health.stable_for) {
+                        return Ok(());
+                    }
+                    last_failure = format!(
+                        "waiting for {}s continuously Running without restarts",
+                        health.stable_for
+                    );
+                }
+                "exec" => {
+                    let timeout = Duration::from_secs(health.timeout)
+                        .min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+                    // ExecTimeout fails immediately: Docker cannot kill only an exec;
+                    // the runtime stops the candidate to contain the command.
+                    let execution = tokio::time::timeout_at(
+                        deadline,
+                        deployer.exec_in_container(container_id, health.command.clone(), timeout),
+                    )
+                    .await
+                    .map_err(|_| {
+                        WorkflowError::JobExecutionFailed(format!(
+                            "Container {container_id} exec probe exceeded startup timeout"
+                        ))
+                    })?;
+                    let result = match execution {
+                        Ok(result) => result,
+                        Err(error) => {
+                            if let Some((job, context)) = job_log {
+                                let _ = tokio::time::timeout_at(deadline, job.log(context,
+                                    format!("Exec probe runtime error for container {container_id}: {error}"))).await;
+                            }
+                            // Runtime errors can contain command diagnostics too. Keep
+                            // those in the authorized log, never in a persisted reason.
+                            let reason = if matches!(
+                                error,
+                                temps_deployer::DeployerError::ExecTimeout { .. }
+                            ) {
+                                "timeout; candidate requires stop-only cleanup"
+                            } else {
+                                "runtime could not complete the command; inspect authorized job logs"
+                            };
+                            return Err(WorkflowError::JobExecutionFailed(format!(
+                                "Container {container_id} exec probe failed: {reason}"
+                            )));
+                        }
+                    };
+                    if let Some((job, context)) = job_log {
+                        // Captured output may contain credentials. Only authorized job logs
+                        // receive it; persisted health details contain an exit code only.
+                        tokio::time::timeout_at(deadline, job.log(
+                            context,
+                            format!("Exec probe exited {}: {}", result.exit_code, result.output),
+                        )).await.map_err(|_| WorkflowError::JobExecutionFailed(format!("Container {container_id} exec probe logging exceeded startup timeout")))?
+                            .map_err(|_| WorkflowError::JobExecutionFailed(format!("Container {container_id} exec probe log could not be written")))?;
+                    }
+                    if result.exit_code == 0 {
+                        let after = tokio::time::timeout_at(
+                            deadline,
+                            deployer.get_container_info(container_id),
+                        )
+                        .await
+                        .map_err(|_| {
+                            WorkflowError::JobExecutionFailed(format!(
+                                "Container {container_id} post-exec inspection timed out"
+                            ))
+                        })?
+                        .map_err(|e| {
+                            WorkflowError::JobExecutionFailed(format!(
+                                "Container {container_id} post-exec inspection failed: {e}"
+                            ))
+                        })?;
+                        if after.status == DeployerContainerStatus::Running
+                            && after.restart_count == Some(restarts)
+                        {
+                            return Ok(());
+                        }
+                        return Err(WorkflowError::JobExecutionFailed(format!(
+                            "Container {container_id} exited or restarted during its exec probe"
+                        )));
+                    }
+                    // Exit 126/127 means the configured executable cannot be run.
+                    if matches!(result.exit_code, 126 | 127) {
+                        return Err(WorkflowError::JobValidationFailed(format!(
+                            "Container {container_id} health.command could not execute (exit {})",
+                            result.exit_code
+                        )));
+                    }
+                    last_failure = format!("exec exited {}", result.exit_code);
+                }
+                "tcp" => {
+                    let address = address.ok_or_else(|| {
+                        WorkflowError::JobValidationFailed(format!(
+                            "Container {container_id} health.type: tcp requires a port"
+                        ))
+                    })?;
+                    let attempt_deadline = deadline
+                        .min(tokio::time::Instant::now() + Duration::from_secs(health.timeout));
+                    match tokio::time::timeout_at(
+                        attempt_deadline,
+                        tokio::net::TcpStream::connect(address),
+                    )
+                    .await
+                    {
+                        Ok(Ok(stream)) => {
+                            match confirm_tcp_probe_connection(&stream, attempt_deadline).await {
+                                Ok(()) => return Ok(()),
+                                Err(error) => last_failure = error.to_string(),
+                            }
+                        }
+                        Ok(Err(error)) => last_failure = error.to_string(),
+                        Err(_) => last_failure = "TCP connection timed out".to_string(),
+                    }
+                }
+                _ => {
+                    return Err(WorkflowError::JobValidationFailed(format!(
+                        "Unsupported health.type '{kind}' for container {container_id}"
+                    )))
+                }
+            }
+        }
+        let interval = if kind == "process" {
+            Duration::from_secs(1)
+        } else {
+            Duration::from_secs(health.interval)
+        };
+        tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + interval)).await;
     }
 }
 
@@ -1181,6 +1479,7 @@ impl DeployImageJob {
             config: DeploymentJobConfig::default(),
             container_deployer,
             node_scheduler: None,
+            workload_plane: None,
             log_id: None,
             log_service: None,
             container_ids: Arc::new(Mutex::new(Vec::new())),
@@ -1201,6 +1500,7 @@ impl DeployImageJob {
             config_service: None,
             image_builder: None,
             registry_credentials: None,
+            registry_index_platforms: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1256,6 +1556,11 @@ impl DeployImageJob {
 
     pub fn with_node_scheduler(mut self, scheduler: Arc<crate::services::NodeScheduler>) -> Self {
         self.node_scheduler = Some(scheduler);
+        self
+    }
+
+    pub fn with_workload_plane(mut self, workload_plane: WorkloadPlaneDeploy) -> Self {
+        self.workload_plane = Some(workload_plane);
         self
     }
 
@@ -1465,8 +1770,11 @@ impl DeployImageJob {
             return Vec::new();
         };
 
-        match image_builder.inspect_image(&image_output.image_tag).await {
-            Ok(info) => vec![info.platform],
+        match self
+            .deliverable_image_platforms(image_builder, &image_output.image_tag)
+            .await
+        {
+            Ok(platforms) => platforms,
             Err(e) => {
                 tracing::debug!(
                     image = %image_output.image_tag,
@@ -1474,6 +1782,80 @@ impl DeployImageJob {
                     e
                 );
                 Vec::new()
+            }
+        }
+    }
+
+    /// Every platform a node can obtain `image_tag` for, and so run it on.
+    ///
+    /// A registry image is pulled by each worker from its registry, which
+    /// hands it that worker's own architecture: the registry index decides
+    /// what is schedulable. The control plane's local store does not — its
+    /// pull downloaded only the control plane's architecture, so a
+    /// multi-platform tag would look single-platform and every other node
+    /// would be excluded (#1892). When the index cannot be read, the local
+    /// store is the fallback, as before.
+    ///
+    /// Any other image reaches a worker from a local store, so what that
+    /// store holds is the answer — every architecture of a multi-platform
+    /// image present there (#1789).
+    async fn deliverable_image_platforms(
+        &self,
+        image_builder: &Arc<dyn temps_deployer::ImageBuilder>,
+        image_tag: &str,
+    ) -> Result<Vec<String>, temps_deployer::BuilderError> {
+        if self.resolved_image_source(image_tag) == DeployImageSource::Registry {
+            let cached =
+                lock_deployment_state(&self.registry_index_platforms, "registry_index_platforms")
+                    .get(image_tag)
+                    .cloned();
+            let index = match cached {
+                Some(index) => index,
+                None => {
+                    let index = self.read_registry_index(image_builder, image_tag).await;
+                    lock_deployment_state(
+                        &self.registry_index_platforms,
+                        "registry_index_platforms",
+                    )
+                    .insert(image_tag.to_string(), index.clone());
+                    index
+                }
+            };
+            if let Some(platforms) = index {
+                return Ok(platforms);
+            }
+        }
+        image_builder.image_platforms(image_tag).await
+    }
+
+    /// The platforms `image_tag`'s registry index offers, or `None` — logged
+    /// once, with the reason — when it cannot be read or lists none.
+    async fn read_registry_index(
+        &self,
+        image_builder: &Arc<dyn temps_deployer::ImageBuilder>,
+        image_tag: &str,
+    ) -> Option<Vec<String>> {
+        match image_builder
+            .registry_image_platforms(image_tag, self.registry_credentials.clone())
+            .await
+        {
+            Ok(platforms) if !platforms.is_empty() => Some(platforms),
+            Ok(_) => {
+                tracing::warn!(
+                    image = %image_tag,
+                    "The registry index of this image lists no platforms; scheduling \
+                     on the platforms the control plane holds locally"
+                );
+                None
+            }
+            Err(error) => {
+                tracing::warn!(
+                    image = %image_tag,
+                    %error,
+                    "Could not read the registry index of this image; scheduling on \
+                     the platforms the control plane holds locally"
+                );
+                None
             }
         }
     }
@@ -1554,8 +1936,8 @@ impl DeployImageJob {
             return Ok(());
         };
 
-        let image_platform = match image_builder.inspect_image(image_tag).await {
-            Ok(info) => info.platform,
+        let image_platforms = match image_builder.image_platforms(image_tag).await {
+            Ok(platforms) => platforms,
             Err(e) => {
                 tracing::debug!(
                     image = %image_tag,
@@ -1566,9 +1948,13 @@ impl DeployImageJob {
             }
         };
 
-        if temps_deployer::platform::platforms_match(&image_platform, local_platform) {
+        if image_platforms
+            .iter()
+            .any(|platform| temps_deployer::platform::platforms_match(platform, local_platform))
+        {
             return Ok(());
         }
+        let image_platform = image_platforms.join(", ");
 
         let msg = format!(
             "Image '{}' is built for {} but the control plane runs {}. \
@@ -1605,8 +1991,11 @@ impl DeployImageJob {
             return Ok(());
         };
 
-        let image_platform = match image_builder.inspect_image(image_tag).await {
-            Ok(info) => info.platform,
+        let image_platforms = match self
+            .deliverable_image_platforms(image_builder, image_tag)
+            .await
+        {
+            Ok(platforms) => platforms,
             Err(e) => {
                 tracing::debug!(
                     image = %image_tag,
@@ -1616,6 +2005,7 @@ impl DeployImageJob {
                 return Ok(());
             }
         };
+        let image_platform = image_platforms.join(", ");
 
         let node_platform = match remote.platform() {
             Some(platform) => platform,
@@ -1637,7 +2027,10 @@ impl DeployImageJob {
             },
         };
 
-        if temps_deployer::platform::platforms_match(&image_platform, &node_platform) {
+        if image_platforms
+            .iter()
+            .any(|platform| temps_deployer::platform::platforms_match(platform, &node_platform))
+        {
             return Ok(());
         }
 
@@ -1797,9 +2190,8 @@ impl DeployImageJob {
         ) {
             (Some(config), Some(encryption)) => {
                 crate::cluster_ca::build_node_deployer(
-                    &node.address,
+                    &node,
                     token,
-                    node.name.clone(),
                     config.as_ref(),
                     encryption.as_ref(),
                 )
@@ -1809,7 +2201,8 @@ impl DeployImageJob {
                 node.address.clone(),
                 token,
                 node.name.clone(),
-            ),
+            )
+            .map(|remote| remote.with_sealing(node.request_sealing())),
         }
         .map_err(|error| {
             WorkflowError::JobExecutionFailed(format!(
@@ -1962,18 +2355,43 @@ impl DeployImageJob {
         self.verify_image_platform_for_node(image_tag, remote, node_name, context)
             .await?;
 
+        // Set when the node holds the tag for another architecture: an
+        // ordinary pull would hand that cached copy straight back.
+        let mut replacing_cached = false;
+
         // Check if image already exists on the remote node
         match remote.image_exists(image_tag).await {
             Ok(true) => {
-                self.log(
-                    context,
-                    format!(
-                        "Image '{}' already exists on node '{}'",
-                        image_tag, node_name
-                    ),
-                )
-                .await?;
-                return Ok(());
+                // The tag alone says nothing about the architecture: a node
+                // that cached it for another platform (an earlier single-arch
+                // push, a tag re-pointed since) would start the container
+                // only to fail with `exec format error`. Replace that copy.
+                match self.node_image_platform_mismatch(image_tag, remote).await {
+                    None => {
+                        self.log(
+                            context,
+                            format!(
+                                "Image '{}' already exists on node '{}'",
+                                image_tag, node_name
+                            ),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                    Some(mismatch) => {
+                        self.log_at(
+                            context,
+                            LogLevel::Warning,
+                            format!(
+                                "WARNING: Image '{}' already exists on node '{}' as {}, but the \
+                                 node runs {}; replacing it",
+                                image_tag, node_name, mismatch.resolved, mismatch.node
+                            ),
+                        )
+                        .await?;
+                        replacing_cached = true;
+                    }
+                }
             }
             Ok(false) => {
                 self.log(
@@ -2012,10 +2430,17 @@ impl DeployImageJob {
                 )
                 .await?;
 
-                let pull_error = match remote
-                    .pull_image_from_registry(image_tag, self.registry_credentials.clone())
-                    .await
-                {
+                let credentials = self.registry_credentials.clone();
+                let pulled = if replacing_cached {
+                    remote
+                        .pull_image_replacing_cached(image_tag, credentials)
+                        .await
+                } else {
+                    remote
+                        .pull_image_from_registry(image_tag, credentials)
+                        .await
+                };
+                let pull_error = match pulled {
                     Ok(_image_id) => {
                         self.log(
                             context,
@@ -2025,6 +2450,13 @@ impl DeployImageJob {
                             ),
                         )
                         .await?;
+                        if replacing_cached {
+                            return self
+                                .verify_replaced_image_platform(
+                                    image_tag, remote, node_name, context,
+                                )
+                                .await;
+                        }
                         return Ok(());
                     }
                     Err(e) => e,
@@ -2093,6 +2525,93 @@ impl DeployImageJob {
             .await
     }
 
+    /// After a control-plane image is imported on a worker, the image the
+    /// worker resolves for the tag must be one it can run.
+    ///
+    /// The check before the transfer accepts a multi-platform image that has
+    /// the node's architecture; this one catches an archive that did not carry
+    /// it (a daemon that exported only its own platform, a worker on the
+    /// classic image store), which would otherwise only show as `exec format
+    /// error` when the container starts. A worker that cannot say is let
+    /// through, as before.
+    async fn verify_imported_image_platform(
+        &self,
+        image_tag: &str,
+        remote: &Arc<temps_deployer::remote::RemoteNodeDeployer>,
+        node_name: &str,
+        context: &WorkflowContext,
+    ) -> Result<(), WorkflowError> {
+        let Some(NodeImagePlatformMismatch { resolved, node }) =
+            self.node_image_platform_mismatch(image_tag, remote).await
+        else {
+            return Ok(());
+        };
+        let msg = format!(
+            "Image '{image_tag}' was transferred to node '{node_name}', which runs \
+             {node}, but the node resolves it as {resolved}. The image's {node} \
+             variant did not arrive with it; push the image to a registry the node can pull \
+             from, or restrict this environment to {resolved} nodes with target nodes/labels."
+        );
+        self.log_at(context, LogLevel::Error, format!("ERROR: {msg}"))
+            .await?;
+        Err(WorkflowError::JobExecutionFailed(msg))
+    }
+
+    /// After pulling over a cached image for another architecture, the node
+    /// must now resolve the tag for its own. An agent that predates replacing
+    /// a cached image hands the old copy back, which is refused here rather
+    /// than started.
+    async fn verify_replaced_image_platform(
+        &self,
+        image_tag: &str,
+        remote: &Arc<temps_deployer::remote::RemoteNodeDeployer>,
+        node_name: &str,
+        context: &WorkflowContext,
+    ) -> Result<(), WorkflowError> {
+        let Some(NodeImagePlatformMismatch { resolved, node }) =
+            self.node_image_platform_mismatch(image_tag, remote).await
+        else {
+            return Ok(());
+        };
+        let msg = format!(
+            "Node '{node_name}' runs {node} but still resolves image '{image_tag}' as \
+             {resolved} after pulling it again. Its agent may be too old to replace a \
+             cached image: upgrade the node agent, or remove the image on the node, then \
+             redeploy."
+        );
+        self.log_at(context, LogLevel::Error, format!("ERROR: {msg}"))
+            .await?;
+        Err(WorkflowError::JobExecutionFailed(msg))
+    }
+
+    /// The platform the node resolves `image_tag` to, when it is not one the
+    /// node runs. `None` when they match, or when the node cannot report its
+    /// platform or inspect the image (an older agent), which is let through.
+    async fn node_image_platform_mismatch(
+        &self,
+        image_tag: &str,
+        remote: &Arc<temps_deployer::remote::RemoteNodeDeployer>,
+    ) -> Option<NodeImagePlatformMismatch> {
+        let node = match remote.platform() {
+            Some(platform) => platform,
+            None => remote.refresh_platform().await?,
+        };
+        let resolved = match remote.inspect_image(image_tag).await {
+            Ok(image) => image.platform,
+            Err(error) => {
+                tracing::debug!(
+                    image = %image_tag,
+                    node = %remote.node_name(),
+                    %error,
+                    "Could not inspect the image on the node to verify its platform"
+                );
+                return None;
+            }
+        };
+        (!temps_deployer::platform::platforms_match(&resolved, &node))
+            .then_some(NodeImagePlatformMismatch { resolved, node })
+    }
+
     /// Save `image_tag` from the control plane's Docker (`docker save`) and
     /// stream it to the remote agent (`POST /agent/images/import`), cleaning up
     /// the local tar afterward.
@@ -2100,6 +2619,9 @@ impl DeployImageJob {
     /// With `expected_image_id`, the exported archive itself must contain that
     /// image: the tag is re-resolved by `docker save`, so a re-point between
     /// verification and export would otherwise ship a different image.
+    ///
+    /// Every import ends with [`Self::verify_imported_image_platform`], so no
+    /// caller can deliver an image the node cannot run.
     async fn transfer_image_via_import(
         &self,
         image_tag: &str,
@@ -2193,7 +2715,8 @@ impl DeployImageJob {
         )
         .await?;
 
-        Ok(())
+        self.verify_imported_image_platform(image_tag, remote, node_name, context)
+            .await
     }
 
     /// Write log message to both job-specific log file and context log writer
@@ -2271,7 +2794,11 @@ impl DeployImageJob {
     ///
     /// This method inspects the built image and extracts exposed ports, but
     /// only when neither scope explicitly configures a port.
-    async fn resolve_container_port(&self, image_tag: &str, context: &WorkflowContext) -> u16 {
+    async fn resolve_container_port(
+        &self,
+        image_tag: &str,
+        context: &WorkflowContext,
+    ) -> Option<u16> {
         if let Some(configured) = self.config.configured_port {
             let _ = self
                 .log(
@@ -2282,7 +2809,29 @@ impl DeployImageJob {
                     ),
                 )
                 .await;
-            return configured;
+            return Some(configured);
+        }
+
+        // A worker build records the image's configuration as read from the
+        // node that owns it. It is authoritative: the control plane may hold
+        // no copy of the image to inspect, and a failed local inspection would
+        // otherwise silently fall back to a port the image does not listen on.
+        if let Some(config) = self.recorded_image_config(context) {
+            return match config.exposed_ports.first() {
+                Some(port) => {
+                    let _ = self
+                        .log(
+                            context,
+                            format!(
+                                "Detected EXPOSE directive in image (read from its build \
+                                 node): port {port}"
+                            ),
+                        )
+                        .await;
+                    Some(*port)
+                }
+                None => None,
+            };
         }
 
         // No explicit override — try to inspect the image and get exposed ports
@@ -2296,19 +2845,9 @@ impl DeployImageJob {
                                 format!("Detected EXPOSE directive in image: port {}", port),
                             )
                             .await;
-                        return port;
+                        return Some(port);
                     }
-                    Ok(None) => {
-                        let _ = self
-                            .log(
-                                context,
-                                format!(
-                                    "No EXPOSE directive found in image, using configured port: {}",
-                                    self.config.port
-                                ),
-                            )
-                            .await;
-                    }
+                    Ok(None) => return None,
                     Err(e) => {
                         let _ = self
                             .log(
@@ -2336,7 +2875,32 @@ impl DeployImageJob {
         }
 
         // Fallback to configured/default port
-        self.config.port as u16
+        Some(self.config.port as u16)
+    }
+
+    /// The image configuration the build job recorded from its build node.
+    /// `None` for an image built on the control plane, one deployed by
+    /// reference with no worker build behind it, and a node that did not
+    /// report it.
+    fn recorded_image_config(
+        &self,
+        context: &WorkflowContext,
+    ) -> Option<super::build_image::BuiltImageConfig> {
+        if self.external_image_tag.is_some() {
+            // A rollback or promotion: what the original build's node
+            // reported travels with the reused worker build.
+            return self
+                .reused_worker_build
+                .as_ref()
+                .and_then(|reused| reused.image_config.clone());
+        }
+        if self.build_job_id.is_empty() {
+            return None;
+        }
+        context
+            .get_output::<super::build_image::BuiltImageConfig>(&self.build_job_id, "image_config")
+            .ok()
+            .flatten()
     }
 
     /// Public getter for config to allow test access
@@ -2460,10 +3024,21 @@ impl DeployImageJob {
         lock_deployment_state(&self.container_ids, "container_ids").push(container_id);
     }
 
-    async fn stop_background_log_stream(
-        &self,
-        context: &WorkflowContext,
-    ) -> Result<(), WorkflowError> {
+    /// Write a progress line on a cleanup path. Cleanup has to finish whether or
+    /// not log storage works (a full disk fails every write), so a failed write
+    /// is reported here and never returned to stop the cleanup.
+    async fn log_best_effort(&self, context: &WorkflowContext, message: String) {
+        if let Err(error) = self.log(context, message).await {
+            tracing::warn!(
+                job_id = %self.job_id,
+                deployment_id = ?self.deployment_id,
+                error = %error,
+                "Failed to write a deployment cleanup log line; continuing cleanup"
+            );
+        }
+    }
+
+    async fn stop_background_log_stream(&self, context: &WorkflowContext) {
         let should_log = {
             let mut task_handle = lock_deployment_state(&self.log_stream_task, "log_stream_task");
             if let Some(handle) = task_handle.take() {
@@ -2475,16 +3050,14 @@ impl DeployImageJob {
         };
 
         if should_log {
-            self.log(context, "🧹 Stopped background log streaming".to_string())
-                .await?;
+            self.log_best_effort(context, "🧹 Stopped background log streaming".to_string())
+                .await;
         }
-
-        Ok(())
     }
 
     /// Remove all containers if they exist (called on timeout/failure/cancellation)
     async fn cleanup_container(&self, context: &WorkflowContext) -> Result<(), WorkflowError> {
-        self.stop_background_log_stream(context).await?;
+        self.stop_background_log_stream(context).await;
 
         // Then clean up all containers
         let container_ids = {
@@ -2494,15 +3067,15 @@ impl DeployImageJob {
 
         let mut cleanup_errors = Vec::new();
         if !container_ids.is_empty() {
-            self.log(
+            self.log_best_effort(
                 context,
                 format!("🧹 Cleaning up {} container(s)", container_ids.len()),
             )
-            .await?;
+            .await;
 
             for container_id in &container_ids {
-                self.log(context, format!("🧹 Removing container: {}", container_id))
-                    .await?;
+                self.log_best_effort(context, format!("🧹 Removing container: {}", container_id))
+                    .await;
 
                 // Use per-replica deployer if available, otherwise fall back to local
                 let deployer = {
@@ -2516,21 +3089,24 @@ impl DeployImageJob {
 
                 match deployer.remove_container(container_id).await {
                     Ok(()) | Err(temps_deployer::DeployerError::ContainerNotFound(_)) => {
-                        self.log(context, format!("✅ Container {} is absent", container_id))
-                            .await?;
                         lock_deployment_state(&self.replica_deployers, "replica_deployers")
                             .remove(container_id);
+                        self.log_best_effort(
+                            context,
+                            format!("✅ Container {} is absent", container_id),
+                        )
+                        .await;
                     }
                     Err(error) => {
                         cleanup_errors.push(format!("container {container_id}: {error}"));
-                        self.log(
+                        self.log_best_effort(
                             context,
                             format!(
                                 "⚠️  Warning: Failed to remove container {}: {}",
                                 container_id, error
                             ),
                         )
-                        .await?;
+                        .await;
                     }
                 }
             }
@@ -2584,7 +3160,7 @@ impl DeployImageJob {
             return self.cleanup_container(context).await;
         };
 
-        self.stop_background_log_stream(context).await?;
+        self.stop_background_log_stream(context).await;
         let replica_deployers =
             lock_deployment_state(&self.replica_deployers, "replica_deployers").clone();
         for candidate in &candidates {
@@ -2614,8 +3190,11 @@ impl DeployImageJob {
                 deployment_id: Set(deployment_id),
                 container_id: Set(candidate.container_id.clone()),
                 container_name: Set(candidate.container_name.clone()),
-                container_port: Set(i32::from(candidate.container_port)),
-                host_port: Set(Some(i32::from(candidate.host_port))),
+                container_port: Set(candidate.container_port.map(i32::from)),
+                health_state: Set("unhealthy".to_string()),
+                health_checked_at: Set(Some(now)),
+                health_detail: Set(context.get_output::<String>(&self.job_id, "health_detail")?.map(|s| s.chars().take(4096).collect())),
+                host_port: Set(candidate.container_port.map(|_| i32::from(candidate.host_port))),
                 image_name: Set(Some(candidate.image_name.clone())),
                 status: Set(Some("retained:stopped-after-failed-readiness".to_string())),
                 service_name: Set(Some(self.config.service_name.clone())),
@@ -2744,9 +3323,31 @@ impl DeployImageJob {
         // actually mounted the socket: a gated deployment the executing host
         // silently started *without* it is a service running with none of the
         // access it exists for, reported as healthy.
-        let (node_assignments, docker_socket_required) = if let Some(ref scheduler) =
-            self.node_scheduler
-        {
+        // ADR-055 `enforce`: the unified scheduler places (strict pins, the
+        // node reserve, enforced capacity, placements in flight) and the
+        // reservation is held until the replicas are started.
+        let enforce = self.config.workload_mode == EnvironmentWorkloadMode::Enforce;
+        // ADR-055 Phase 9: attached volumes are mounted only through the
+        // plane, by one replica, on the control plane. Anything else fails
+        // here with the fix, never deploys a replica without its data.
+        if !self.config.volume_mounts.is_empty() {
+            if let Some(message) = crate::services::workload_volumes::volumes_blocker(
+                context.environment_id,
+                self.config.workload_mode,
+                i32::try_from(self.config.replicas).unwrap_or(i32::MAX),
+                self.config.volume_pin.as_ref().map(|pin| pin.node_id),
+            ) {
+                self.log(context, format!("ERROR: {message}")).await?;
+                return Err(WorkflowError::JobExecutionFailed(message));
+            }
+        }
+        let mut _in_flight: Option<temps_workload_plane::inventory::InFlightGuard> = None;
+        let (node_assignments, docker_socket_required) = if enforce {
+            let (assignments, socket_required, guard) =
+                self.enforced_placement(image_output, context).await?;
+            _in_flight = Some(guard);
+            (assignments, socket_required)
+        } else if let Some(ref scheduler) = self.node_scheduler {
             // A node-built image is handed to each replica's node from its
             // builder, so the build location does not constrain placement;
             // the platform filter below does.
@@ -2758,24 +3359,28 @@ impl DeployImageJob {
             // match none of them are excluded from the pool instead of being
             // handed a container that cannot start.
             let image_platforms = self.available_image_platforms(image_output).await;
-            match scheduler
-                .schedule_placement(
-                    crate::services::node_scheduler::ReplicaPlacementRequest {
-                        replica_count: self.config.replicas,
-                        labels: target_labels,
-                        target_node_ids: target_ids,
-                        anti_affinity: self.config.anti_affinity,
-                        exclude_node_ids: &self.config.exclude_node_ids,
-                        image_platforms: &image_platforms,
-                        // ADR 045: lets the scheduler refuse, up front, to
-                        // place a socket-granted project on a host that does
-                        // not grant it.
-                        project_slug: self.config.project_slug.as_deref(),
-                        exclude_control_plane: false,
-                    },
-                )
-                .await
-            {
+            let placement_result = scheduler
+                .schedule_placement(crate::services::node_scheduler::ReplicaPlacementRequest {
+                    replica_count: self.config.replicas,
+                    labels: target_labels,
+                    target_node_ids: target_ids,
+                    anti_affinity: self.config.anti_affinity,
+                    exclude_node_ids: &self.config.exclude_node_ids,
+                    image_platforms: &image_platforms,
+                    // ADR 045: lets the scheduler refuse, up front, to
+                    // place a socket-granted project on a host that does
+                    // not grant it.
+                    project_slug: self.config.project_slug.as_deref(),
+                    exclude_control_plane: false,
+                })
+                .await;
+            // ADR-055 `shadow`: NodeScheduler still decides; the unified
+            // scheduler's answer for the same request is only logged.
+            if self.config.workload_mode == EnvironmentWorkloadMode::Shadow {
+                self.log_shadow_placement(scheduler, &placement_result, &image_platforms, context)
+                    .await;
+            }
+            match placement_result {
                 Ok(outcome) => {
                     // Say which nodes were passed over and why. The scheduler
                     // only had `tracing` for this, which the user never sees —
@@ -2963,6 +3568,15 @@ impl DeployImageJob {
             None => None,
         };
 
+        // `enforce`: every replica is created through the plane, pinned to
+        // the node chosen here; the product keeps the health check and
+        // blue/green around them.
+        let plane_deployer: Option<Arc<dyn ContainerDeployer>> = if enforce {
+            Some(self.plane_deployer(context, self.container_deployer.clone(), None)?)
+        } else {
+            None
+        };
+
         for (replica_index, assignment) in node_assignments.iter().enumerate() {
             // The tag this replica deploys. Reassigned below for remote nodes
             // whose architecture only becomes known after querying the agent.
@@ -3007,7 +3621,10 @@ impl DeployImageJob {
                         context,
                     )
                     .await?;
-                    self.container_deployer.clone()
+                    match plane_deployer.as_ref() {
+                        Some(plane_deployer) => plane_deployer.clone(),
+                        None => self.container_deployer.clone(),
+                    }
                 }
                 crate::services::NodeAssignment::Remote {
                     address,
@@ -3015,8 +3632,19 @@ impl DeployImageJob {
                     platform,
                     ..
                 } => {
-                    // Look up the node's token from the node service
-                    let token = self.get_node_token(assignment).await?;
+                    // The agent's deploy call carries no volumes: a replica
+                    // with volumes never starts there without its data.
+                    if !self.config.volume_mounts.is_empty() {
+                        let message = format!(
+                            "Replica {} was placed on node '{node_name}', but this environment \
+                             mounts volumes, which only control-plane replicas receive",
+                            replica_index + 1
+                        );
+                        self.log(context, format!("ERROR: {message}")).await?;
+                        return Err(WorkflowError::JobExecutionFailed(message));
+                    }
+                    // Look up the node and its token from the node service
+                    let (node, token) = self.get_remote_node(assignment).await?;
                     // Build the deployer via the shared factory so https:// nodes
                     // get mutual TLS (ADR-020 WS-2.1); falls back to plain HTTP
                     // when the cluster CA deps aren't wired in.
@@ -3026,9 +3654,8 @@ impl DeployImageJob {
                     ) {
                         (Some(cs), Some(es)) => {
                             crate::cluster_ca::build_node_deployer(
-                                address,
+                                &node,
                                 token,
-                                node_name.clone(),
                                 cs.as_ref(),
                                 es.as_ref(),
                             )
@@ -3038,7 +3665,8 @@ impl DeployImageJob {
                             address.clone(),
                             token,
                             node_name.clone(),
-                        ),
+                        )
+                        .map(|remote| remote.with_sealing(node.request_sealing())),
                     };
                     let remote = match build_result {
                         // Teach the deployer which architecture this node runs
@@ -3088,7 +3716,13 @@ impl DeployImageJob {
                     )
                     .await?;
 
-                    remote
+                    if enforce {
+                        // The worker's agent stays the deployer of every
+                        // operation after the create.
+                        self.plane_deployer(context, remote, assignment.node_id())?
+                    } else {
+                        remote
+                    }
                 }
             };
 
@@ -3112,7 +3746,7 @@ impl DeployImageJob {
                     all_node_ids.push(assignment.node_id());
                     all_image_names.push(replica_image_tag.clone());
                     // All replicas share the same container port
-                    resolved_container_port = Some(container_port);
+                    resolved_container_port = container_port;
                 }
                 Err(e) => {
                     self.log(
@@ -3165,7 +3799,7 @@ impl DeployImageJob {
             resources: self.config.resources.clone(),
             container_ids: all_container_ids,
             host_ports: all_host_ports,
-            container_port: resolved_container_port.unwrap_or(self.config.port as u16),
+            container_port: resolved_container_port,
             node_ids: all_node_ids,
             image_names: all_image_names,
         })
@@ -3176,6 +3810,17 @@ impl DeployImageJob {
         &self,
         assignment: &crate::services::NodeAssignment,
     ) -> Result<String, WorkflowError> {
+        self.get_remote_node(assignment)
+            .await
+            .map(|(_node, token)| token)
+    }
+
+    /// Load a remote assignment's node row and decrypt its agent token. The
+    /// row decides where its agent is dialed (`cluster_ca::node_agent_endpoint`).
+    async fn get_remote_node(
+        &self,
+        assignment: &crate::services::NodeAssignment,
+    ) -> Result<(temps_entities::nodes::Model, String), WorkflowError> {
         match assignment {
             crate::services::NodeAssignment::Local => Err(WorkflowError::JobExecutionFailed(
                 "Cannot get token for local node assignment".to_string(),
@@ -3200,7 +3845,7 @@ impl DeployImageJob {
                         ))
                     })?;
 
-                let encrypted_token = node.token_encrypted.ok_or_else(|| {
+                let encrypted_token = node.token_encrypted.clone().ok_or_else(|| {
                     WorkflowError::JobExecutionFailed(format!(
                         "Node '{}' (id={}) has no encrypted token — re-register the node",
                         node_name, node_id
@@ -3221,745 +3866,15 @@ impl DeployImageJob {
                         ))
                     })?;
 
-                String::from_utf8(decrypted_bytes).map_err(|e| {
+                let token = String::from_utf8(decrypted_bytes).map_err(|e| {
                     WorkflowError::JobExecutionFailed(format!(
                         "Decrypted token for node '{}' (id={}) is not valid UTF-8: {}",
                         node_name, node_id, e
                     ))
-                })
-            }
-        }
-    }
-
-    /// Deploy a single replica of the container
-    async fn deploy_single_replica(
-        &self,
-        // Tag resolved for the target node's architecture by the caller — on a
-        // multi-arch build this is the per-node tag, not the primary one.
-        image_tag: &str,
-        context: &WorkflowContext,
-        replica_index: u32,
-        health_check_override: Option<&str>,
-        deployer: &Arc<dyn ContainerDeployer>,
-        target: ReplicaTarget<'_>,
-    ) -> Result<(String, u16, u16), WorkflowError> {
-        let ReplicaTarget {
-            assignment,
-            docker_socket_required,
-        } = target;
-        // Prepare deployment request using temps-deployer types
-        self.log(context, "Deploying container image...".to_string())
-            .await?;
-
-        let log_path = std::env::temp_dir().join(format!("deploy_{}.log", self.job_id));
-
-        // Determine the actual container port to expose
-        // Priority: explicit environment/project override > Image EXPOSE directive > default
-        let container_port = self.resolve_container_port(image_tag, context).await;
-
-        // For local deployments, allocate a port on this host.
-        // For remote deployments, set host_port=0 so Docker on the agent picks an available port.
-        let host_port = if assignment.is_local() {
-            Self::find_available_port()?
-        } else {
-            0
-        };
-        self.log(
-            context,
-            format!(
-                "🔌 {} host port: {} → container port: {}",
-                if assignment.is_local() {
-                    "Allocated"
-                } else {
-                    "Requesting dynamic"
-                },
-                if host_port == 0 {
-                    "auto".to_string()
-                } else {
-                    host_port.to_string()
-                },
-                container_port
-            ),
-        )
-        .await?;
-
-        let host_ip = assignment
-            .private_address()
-            .map(private_remote_bind_address)
-            .transpose()?;
-        let port_mappings = vec![PortMapping {
-            host_port,
-            container_port,
-            protocol: Protocol::Tcp,
-            host_ip,
-        }];
-
-        // Convert k8s-style strings ("1000m", "512Mi", "2", "1Gi") into the
-        // numeric ResourceLimits the deployer feeds to bollard. The previous
-        // implementation called `parse::<f64>()` directly, which silently
-        // returned None for any value containing a unit suffix — so even the
-        // builder defaults ("1000m" / "512Mi") never made it to the container.
-        let resource_limits = ResourceLimits {
-            cpu_limit: self
-                .config
-                .resources
-                .cpu_limit
-                .as_ref()
-                .and_then(|s| parse_cpu_cores(s)),
-            memory_limit_mb: self
-                .config
-                .resources
-                .memory_limit
-                .as_ref()
-                .and_then(|s| parse_memory_mb(s)),
-            disk_limit_mb: None,
-        };
-
-        // Use remote environment variables for remote deployments (linked-service
-        // container names rewritten to their internal `*.temps.local` DNS names),
-        // fall back to local env vars.
-        let mut environment_vars = if !assignment.is_local() {
-            // Refuse to start a container that has been handed a connection
-            // string which cannot possibly connect. Managed service ports
-            // bind to 127.0.0.1 on their own host, so when the planner could
-            // not produce a resolvable name there is no working address at
-            // all — and a container that boots and then fails to reach its
-            // database forever is the exact silent failure this guards.
-            let node_name = match assignment {
-                crate::services::NodeAssignment::Remote { node_name, .. } => node_name.as_str(),
-                crate::services::NodeAssignment::Local => "control-plane",
-            };
-            if let Some(error) =
-                cross_node_unreachable_error(node_name, &self.config.cross_node_service_blockers)
-            {
-                tracing::error!("{}", error);
-                self.log(context, format!("❌ {}", error)).await?;
-                return Err(error);
-            }
-
-            if let Some(ref remote_vars) = self.config.remote_environment_variables {
-                tracing::info!(
-                    "Using REMOTE environment variables for non-local assignment (has {} remote vars)",
-                    remote_vars.len()
-                );
-                remote_vars.clone()
-            } else {
-                tracing::warn!(
-                    "Non-local assignment but no remote_environment_variables available, using local vars"
-                );
-                self.config.environment_variables.clone()
-            }
-        } else {
-            tracing::info!("Using LOCAL environment variables for local assignment");
-            self.config.environment_variables.clone()
-        };
-
-        // Inject this replica's node identity so the workload can report which
-        // node (and replica) is serving a given request — useful for debugging
-        // multi-node scheduling and load distribution. Set on every node, local
-        // or remote.
-        let (assigned_node_name, assigned_node_id) = match assignment {
-            crate::services::NodeAssignment::Remote {
-                node_name, node_id, ..
-            } => (node_name.clone(), node_id.to_string()),
-            crate::services::NodeAssignment::Local => {
-                ("control-plane".to_string(), "0".to_string())
-            }
-        };
-        let audited_node_name = assigned_node_name.clone();
-        environment_vars.insert("TEMPS_NODE_NAME".to_string(), assigned_node_name);
-        environment_vars.insert("TEMPS_NODE_ID".to_string(), assigned_node_id);
-        environment_vars.insert("TEMPS_REPLICA".to_string(), (replica_index + 1).to_string());
-
-        if let Some(previous) = align_port_env_with_container_port(
-            &mut environment_vars,
-            self.config.configured_port,
-            container_port,
-        ) {
-            self.log(
-                context,
-                format!(
-                    "Setting PORT={} to match the port detected from the image (was {})",
-                    container_port, previous
-                ),
-            )
-            .await?;
-        }
-
-        tracing::info!(
-            "Deploying container with {} env vars (Postgres host configured: {}, URL configured: {})",
-            environment_vars.len(),
-            environment_vars.contains_key("POSTGRES_HOST"),
-            environment_vars.contains_key("POSTGRES_URL")
-        );
-
-        // Create unique container name for each replica
-        let container_name = if self.config.replicas > 1 {
-            format!("{}-{}", self.config.service_name, replica_index + 1)
-        } else {
-            self.config.service_name.clone()
-        };
-
-        // Build Docker labels for the log aggregator to discover this container.
-        // The collector inspects these labels to enrich log lines with project/env/service context.
-        // `sh.temps.managed` marks this as a Temps-managed container for reconciliation.
-        let mut labels = HashMap::new();
-        labels.insert("sh.temps.managed".to_string(), "true".to_string());
-        labels.insert(
-            "sh.temps.project_id".to_string(),
-            context.project_id.to_string(),
-        );
-        labels.insert(
-            "sh.temps.environment".to_string(),
-            context.environment_id.to_string(),
-        );
-        labels.insert(
-            "sh.temps.service".to_string(),
-            self.config.service_name.clone(),
-        );
-        labels.insert(
-            "sh.temps.deploy_id".to_string(),
-            context.deployment_id.to_string(),
-        );
-
-        let deploy_request = DeployRequest {
-            image_name: image_tag.to_string(),
-            container_name,
-            environment_vars,
-            secrets: self.config.secrets.clone(),
-            port_mappings,
-            network_name: None,
-            extra_networks: Vec::new(),
-            resource_limits,
-            restart_policy: RestartPolicy::Always,
-            log_path,
-            command: self.config.command.clone(),
-            log_config: self.log_config.clone(),
-            labels,
-            // ADR 045: the slug, never an instruction. The executing host
-            // answers from its own environment whether this project gets
-            // `/var/run/docker.sock` — but it may only answer "yes" when the
-            // control plane also declared the project, which is what the
-            // second field carries. Both halves must agree.
-            project_slug: self.config.project_slug.clone(),
-            control_plane_grants_socket: self.config.control_plane_grants_socket,
-        };
-
-        let deploy_result = deployer
-            .deploy_container(deploy_request)
-            .await
-            .map_err(|e| {
-                WorkflowError::JobExecutionFailed(format!("Failed to deploy container: {}", e))
-            })?;
-
-        // Store both the ID and its owning deployer before status checks,
-        // startup log streaming, health checks, or ANY other fallible work —
-        // including the ADR-045 audit and logging below. A container that
-        // exists but is not tracked cannot be cleaned up, and the socket-
-        // mounted case is the worst one to leak: a transient log-write error
-        // would otherwise strand a running, root-equivalent container.
-        self.track_container(deploy_result.container_id.clone(), deployer.clone());
-
-        // ADR 045: the executing host reports back whether it actually mounted
-        // `/var/run/docker.sock`. Audited here rather than inferred from the
-        // control plane's view, because only that host knows its own grant —
-        // and this record is the only durable evidence that a given container
-        // was root-equivalent on a given machine.
-        if deploy_result.docker_socket_mounted {
-            self.audit_docker_socket_mount(context, &audited_node_name)
-                .await;
-            self.persist_docker_socket_mounted(context).await;
-            self.log(
-                context,
-                format!(
-                    "⚠️  Host Docker socket mounted into this container on '{}' — this \
-                     project is granted host Docker access there and is root-equivalent on \
-                     that machine (ADR 045)",
-                    audited_node_name
-                ),
-            )
-            .await?;
-        }
-
-        // ADR 045: the scheduler placed this replica here *because* the
-        // project requires the socket, and the host started it without one.
-        // Either that host's own `TEMPS_DOCKER_SOCKET_PROJECTS` disagrees with
-        // the control plane's declaration (a half-applied config change, or an
-        // agent that was never restarted) or the gate was bypassed. Accepting
-        // it would leave the workload running with none of the access it
-        // exists for, reported as healthy.
-        //
-        // Checked after `track_container` (above) so the container this
-        // rejects is torn down with the rest of the failed deployment rather
-        // than left running untracked.
-        if docker_socket_required && !deploy_result.docker_socket_mounted {
-            let error = WorkflowError::DockerSocketNotMounted {
-                node: audited_node_name.clone(),
-                project_slug: self
-                    .config
-                    .project_slug
-                    .clone()
-                    .unwrap_or_else(|| self.config.service_name.clone()),
-                env: temps_core::docker_socket_grant::DOCKER_SOCKET_PROJECTS_ENV,
-            };
-            tracing::error!(
-                node = %audited_node_name,
-                container_id = %deploy_result.container_id,
-                project_slug = self.config.project_slug.as_deref().unwrap_or("<unknown>"),
-                "Gated deployment started without the host Docker socket"
-            );
-            // The deploy log is the only place the user sees this.
-            self.log(context, format!("❌ {}", error)).await?;
-            return Err(error);
-        }
-
-        // A rolling-upgrade cluster may still have an older agent that ignores
-        // PortMapping.host_ip. Inspect what Docker actually published before
-        // this container becomes eligible for retention; fail closed if the
-        // worker cannot prove a private-only bind.
-        if let Some(expected_host_ip) = assignment.private_address() {
-            let private_host_ip = private_remote_bind_address(expected_host_ip)?;
-            let binding_is_private = deployer
-                .get_container_info(&deploy_result.container_id)
-                .await
-                .map(|info| {
-                    confirms_private_port_binding(
-                        &info.ports,
-                        deploy_result.container_port,
-                        deploy_result.host_port,
-                        &private_host_ip,
-                    )
-                })
-                .unwrap_or(false);
-            if !binding_is_private {
-                self.retention_forbidden.store(true, Ordering::Release);
-                return Err(WorkflowError::JobExecutionFailed(format!(
-                    "Worker did not confirm that container {} is bound only to private address {}; refusing to retain or route it. Upgrade the Temps agent on this node.",
-                    deploy_result.container_id, private_host_ip
-                )));
-            }
-        }
-        {
-            let mut candidates =
-                lock_deployment_state(&self.failed_candidates, "failed_candidates");
-            candidates.push(FailedContainerCandidate {
-                container_id: deploy_result.container_id.clone(),
-                container_name: deploy_result.container_name.clone(),
-                container_port: deploy_result.container_port,
-                host_port: deploy_result.host_port,
-                image_name: image_tag.to_string(),
-                node_id: assignment.node_id(),
-            });
-        }
-
-        self.log(
-            context,
-            format!("Deployment created: {}", deploy_result.container_id),
-        )
-        .await?;
-
-        // Wait for deployment to be ready (with timeout)
-        self.log(context, "Waiting for container to start...".to_string())
-            .await?;
-        let max_wait_time = std::time::Duration::from_secs(self.config.health_check_timeout_secs);
-        let start_time = std::time::Instant::now();
-
-        // Phase 1: Wait for container to be running
-        loop {
-            // Try to get container info, but don't fail hard if it can't be found
-            // (container might have been removed by Docker or other processes)
-            let container_info = match deployer
-                .get_container_info(&deploy_result.container_id)
-                .await
-            {
-                Ok(info) => info,
-                Err(e) => {
-                    // Container not found - might have been removed, but that's okay
-                    // Log a warning but don't fail the deployment
-                    tracing::warn!(
-                        "Cannot verify container {} during deployment - container may have been removed: {}",
-                        deploy_result.container_id,
-                        e
-                    );
-                    self.log(
-                        context,
-                        format!(
-                            "⏳ Container status check failed (may have been removed): {}",
-                            e
-                        ),
-                    )
-                    .await?;
-
-                    // Wait a bit and try again, but don't fail if we can't verify
-                    if start_time.elapsed() > max_wait_time {
-                        self.log(context, "Container verification timeout - proceeding anyway (container may be running)".to_string())
-                            .await?;
-                        break;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                    continue;
-                }
-            };
-
-            match container_info.status {
-                DeployerContainerStatus::Running => {
-                    self.log(context, "✅ Container is running".to_string())
-                        .await?;
-                    break;
-                }
-                DeployerContainerStatus::Exited | DeployerContainerStatus::Dead => {
-                    self.write_startup_log_excerpt(
-                        context,
-                        deployer.as_ref(),
-                        &deploy_result.container_id,
-                    )
-                    .await;
-                    let message = container_exit_failure_message(
-                        &container_info,
-                        start_time.elapsed().as_secs(),
-                    );
-                    self.log(context, format!("❌ {message}")).await?;
-                    return Err(WorkflowError::JobExecutionFailed(message));
-                }
-                DeployerContainerStatus::Created => {
-                    if start_time.elapsed() > max_wait_time {
-                        let message = format!(
-                            "Container took too long to start: still in Docker state 'created' \
-                             after waiting {}s (readiness limit of {}s)",
-                            start_time.elapsed().as_secs(),
-                            max_wait_time.as_secs()
-                        );
-                        self.log(context, format!("⏱️  {message}")).await?;
-                        return Err(WorkflowError::JobExecutionFailed(message));
-                    }
-                    self.log(
-                        context,
-                        format!("Container status: {:?}, waiting...", container_info.status),
-                    )
-                    .await?;
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                }
-                _ => {
-                    if start_time.elapsed() > max_wait_time {
-                        let message = format!(
-                            "Container took too long to start: still in Docker state '{:?}' \
-                             after waiting {}s (readiness limit of {}s)",
-                            container_info.status,
-                            start_time.elapsed().as_secs(),
-                            max_wait_time.as_secs()
-                        );
-                        self.log(context, format!("⏱️  {message}")).await?;
-                        return Err(WorkflowError::JobExecutionFailed(message));
-                    }
-                    self.log(
-                        context,
-                        format!("Container status: {:?}, waiting...", container_info.status),
-                    )
-                    .await?;
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                }
-            }
-        }
-
-        // Stream container logs in background (non-blocking)
-        // This runs concurrently with health checks
-        let container_id_for_logs = deploy_result.container_id.clone();
-        let log_id = self.log_id.clone();
-        let log_service = self.log_service.clone();
-        let context_for_logs = context.clone();
-        let deployer_for_logs = deployer.clone();
-
-        let log_task = tokio::spawn(async move {
-            // Helper macro to write logs in the background task
-            macro_rules! write_log {
-                ($level:expr, $msg:expr) => {
-                    if let (Some(ref log_id), Some(ref log_service)) = (&log_id, &log_service) {
-                        let _ = log_service
-                            .append_structured_log(log_id, $level, $msg.clone())
-                            .await;
-                    }
-                    let _ = context_for_logs.log(&$msg).await;
-                };
-            }
-
-            write_log!(
-                LogLevel::Info,
-                "📋 Streaming container logs for 15s...".to_string()
-            );
-
-            // Ask the selected deployer for logs. For worker assignments this
-            // streams through the worker agent instead of opening the control
-            // plane's local Docker socket.
-            let mut log_stream = match deployer_for_logs
-                .stream_container_logs(&container_id_for_logs)
-                .await
-            {
-                Ok(stream) => stream,
-                Err(e) => {
-                    write_log!(
-                        LogLevel::Warning,
-                        format!("⚠️  Cannot stream logs from the container's node: {}", e)
-                    );
-                    return;
-                }
-            };
-            let mut line_count = 0;
-            let max_lines = 100;
-            let timeout = tokio::time::sleep(std::time::Duration::from_secs(15));
-            tokio::pin!(timeout);
-
-            loop {
-                tokio::select! {
-                    _ = &mut timeout => {
-                        write_log!(LogLevel::Info,
-                            format!("📋 Log streaming complete ({} lines captured)", line_count));
-                        break;
-                    }
-                    log_result = log_stream.next() => {
-                        match log_result {
-                            Some(log_output) => {
-                                let clean_msg = log_output.trim().to_string();
-                                if !clean_msg.is_empty() {
-                                    write_log!(LogLevel::Info,
-                                        format!("🐳 {}", clean_msg));
-                                    line_count += 1;
-
-                                    if line_count >= max_lines {
-                                        write_log!(LogLevel::Info,
-                                            format!("📋 Log limit reached ({} lines), stopping stream...", max_lines));
-                                        break;
-                                    }
-                                }
-                            }
-                            None => {
-                                write_log!(LogLevel::Info,
-                                    format!("📋 Log streaming complete ({} lines captured)", line_count));
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        });
-
-        // Store the task handle for cleanup on cancellation
-        {
-            let mut task_handle = lock_deployment_state(&self.log_stream_task, "log_stream_task");
-            *task_handle = Some(log_task);
-        }
-
-        // Phase 2: Wait for application to be ready (connectivity check)
-        // When health_check_path is None, skip HTTP health checks entirely --
-        // the container running status from Phase 1 is sufficient (useful for
-        // rollbacks where the image was already verified, or services without
-        // an HTTP endpoint).
-        // Precedence (highest first):
-        //   1. explicit deploy-time override (config.health_check_path_override) —
-        //      set by image/static deploys that can't read .temps.yaml
-        //   2. .temps.yaml health.path (build job output, passed as health_check_override)
-        //   3. default config.health_check_path ("/" unless explicitly cleared)
-        let effective_health_path = self
-            .config
-            .health_check_path_override
-            .clone()
-            .or_else(|| health_check_override.map(String::from))
-            .or_else(|| self.config.health_check_path.clone());
-        if let Some(ref health_path) = effective_health_path {
-            self.log(
-                context,
-                "Waiting for application to be ready...".to_string(),
-            )
-            .await?;
-            // For remote nodes, health check via the node's private IP and host port
-            // since the control plane can't reach the container by Docker network name.
-            // For local deployments, use the standard container URL resolution.
-            let health_check_url = if let Some(private_addr) = assignment.private_address() {
-                format!(
-                    "http://{}:{}{}",
-                    private_addr, deploy_result.host_port, health_path
-                )
-            } else {
-                temps_core::DeploymentMode::build_container_url(
-                    &deploy_result.container_name,
-                    deploy_result.container_port,
-                    deploy_result.host_port,
-                    Some(health_path),
-                )
-            };
-            self.log(context, format!("Health check URL: {}", health_check_url))
-                .await?;
-
-            let client = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(5))
-                .build()
-                .map_err(|e| {
-                    WorkflowError::JobExecutionFailed(format!(
-                        "Failed to create HTTP client: {}",
-                        e
-                    ))
                 })?;
-
-            let mut consecutive_successes = 0;
-            let required_successes = 2; // Require 2 consecutive successful connections
-                                        // What the last failed probe saw, so a timeout can say *why* the
-                                        // app never became ready instead of a bare "timed out".
-            let mut probe = ReadinessProbeState::default();
-            let probe_port = deploy_result.container_port;
-
-            loop {
-                // Check for overall timeout
-                if start_time.elapsed() > max_wait_time {
-                    let message = probe.timeout_message(
-                        probe_port,
-                        health_path,
-                        max_wait_time.as_secs(),
-                        start_time.elapsed().as_secs(),
-                    );
-                    self.log(context, format!("⏱️  {message}")).await?;
-                    return Err(WorkflowError::JobExecutionFailed(message));
-                }
-
-                // Check if container is still running (it may have crashed).
-                // This prevents waiting the full timeout for a container that
-                // already exited — or that Docker keeps restarting, which
-                // `RestartPolicy::Always` reports as running between crashes.
-                if let Ok(container_info) = deployer
-                    .get_container_info(&deploy_result.container_id)
-                    .await
-                {
-                    let restarts = container_info.restart_count.unwrap_or(0);
-                    match container_info.status {
-                        DeployerContainerStatus::Exited | DeployerContainerStatus::Dead => {
-                            self.write_startup_log_excerpt(
-                                context,
-                                deployer.as_ref(),
-                                &deploy_result.container_id,
-                            )
-                            .await;
-                            let message = container_exit_failure_message(
-                                &container_info,
-                                start_time.elapsed().as_secs(),
-                            );
-                            self.log(context, format!("❌ {message}")).await?;
-                            return Err(WorkflowError::JobExecutionFailed(message));
-                        }
-                        _ if restarts >= CRASH_LOOP_RESTART_THRESHOLD => {
-                            self.write_startup_log_excerpt(
-                                context,
-                                deployer.as_ref(),
-                                &deploy_result.container_id,
-                            )
-                            .await;
-                            let message = container_crash_loop_message(&container_info, restarts);
-                            self.log(context, format!("❌ {message}")).await?;
-                            return Err(WorkflowError::JobExecutionFailed(message));
-                        }
-                        _ => {
-                            // Container is still running, continue with connectivity checks
-                        }
-                    }
-                }
-
-                match client.get(&health_check_url).send().await {
-                    Ok(response) => {
-                        let status = response.status();
-
-                        // Any HTTP response means the server is running.
-                        // 2xx, 3xx, 404, and 405 are all valid — the health check
-                        // path may not exist but the server is up and responding.
-                        // Only 5xx indicates a real problem.
-                        let is_healthy = status.is_success()
-                            || status.is_redirection()
-                            || status.as_u16() == 404
-                            || status.as_u16() == 405;
-                        probe.responded = true;
-                        if is_healthy {
-                            consecutive_successes += 1;
-
-                            let message = format!(
-                                "Health check passed - server healthy with status {} ({}/{})",
-                                status, consecutive_successes, required_successes
-                            );
-                            if let (Some(ref log_id), Some(ref log_service)) =
-                                (&self.log_id, &self.log_service)
-                            {
-                                log_service
-                                    .append_structured_log(
-                                        log_id,
-                                        LogLevel::Success,
-                                        message.clone(),
-                                    )
-                                    .await
-                                    .map_err(|e| {
-                                        WorkflowError::Other(format!("Failed to write log: {}", e))
-                                    })?;
-                            }
-                            context.log(&message).await?;
-
-                            if consecutive_successes >= required_successes {
-                                self.log(context, "Application is ready and healthy!".to_string())
-                                    .await?;
-                                break;
-                            }
-                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                        } else {
-                            // 4xx, 5xx = application error
-                            consecutive_successes = 0;
-                            probe.last_failure = Some(format!("HTTP {status}"));
-
-                            self.log(
-                                context,
-                                format!(
-                                    "Health check failed - server returned error status {} (not healthy), retrying... ({}/{}s)",
-                                    status, start_time.elapsed().as_secs(), max_wait_time.as_secs()
-                                ),
-                            )
-                            .await?;
-                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                        }
-                    }
-                    Err(e) => {
-                        consecutive_successes = 0; // Reset counter on connection error
-                        probe.record_transport_error(&e);
-                        self.log(
-                            context,
-                            format!("Connectivity check failed ({}), retrying...", e),
-                        )
-                        .await?;
-                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                    }
-                }
+                Ok((node, token))
             }
-        } else {
-            self.log(
-                context,
-                "Health check path not configured - skipping HTTP health checks (container is running)".to_string(),
-            )
-            .await?;
         }
-
-        let endpoint_url = if let Some(private_addr) = assignment.private_address() {
-            format!("http://{}:{}", private_addr, deploy_result.host_port)
-        } else {
-            temps_core::DeploymentMode::build_container_url(
-                &deploy_result.container_name,
-                deploy_result.container_port,
-                deploy_result.host_port,
-                None,
-            )
-        };
-        self.log(
-            context,
-            format!("✅ Replica {} ready at {}", replica_index + 1, endpoint_url),
-        )
-        .await?;
-
-        // Return container ID, host port, and container port
-        Ok((
-            deploy_result.container_id,
-            deploy_result.host_port,
-            deploy_result.container_port,
-        ))
     }
 
     async fn validate_deployment_config(
@@ -3982,6 +3897,17 @@ impl DeployImageJob {
             return Err(WorkflowError::JobValidationFailed(
                 "replicas must be greater than 0".to_string(),
             ));
+        }
+
+        // Saves refuse this now, but a row saved before that check existed
+        // still reaches here, and every later step allocates per replica.
+        let max_replicas = temps_entities::deployment_config::MAX_REPLICAS.unsigned_abs();
+        if self.config.replicas > max_replicas {
+            return Err(WorkflowError::JobValidationFailed(format!(
+                "replicas is {} for service '{}', above the maximum of {max_replicas}; \
+                 lower it in the environment settings and deploy again",
+                self.config.replicas, self.config.service_name
+            )));
         }
 
         self.log(context, "Deployment configuration is valid".to_string())
@@ -4107,6 +4033,12 @@ impl WorkflowTask for DeployImageJob {
             .health_check_path_override
             .clone()
             .or_else(|| health_override.clone())
+            .or_else(|| {
+                self.config
+                    .health
+                    .as_ref()
+                    .map(|health| health.path.clone())
+            })
             .or_else(|| self.config.health_check_path.clone());
         if let Some(ref effective) = effective_health_path {
             context.set_output(&self.job_id, "health_check_path", effective)?;
@@ -4119,6 +4051,7 @@ impl WorkflowTask for DeployImageJob {
         {
             Ok(output) => output,
             Err(deploy_error) => {
+                context.set_output(&self.job_id, "health_detail", deploy_error.to_string())?;
                 if let Err(retention_error) = self.retain_failed_containers(&context).await {
                     // A container without a committed ownership row would be
                     // unreachable through the authenticated API. Tear it down
@@ -4135,7 +4068,44 @@ impl WorkflowTask for DeployImageJob {
             }
         };
 
+        let repository_probe = context.get_output::<temps_core::repo_config::HealthCheckConfig>(
+            &self.build_job_id,
+            "health",
+        )?;
+        let probe_source = if repository_probe.is_some() {
+            "repository"
+        } else if self.config.health.is_some() {
+            "deployment_settings"
+        } else {
+            "automatic"
+        };
+        let effective_probe = repository_probe
+            .or_else(|| self.config.health.clone())
+            .unwrap_or_default();
+        let runtime_revision = crate::services::runtime_health::EffectiveProbeRevision::resolve(
+            &effective_probe,
+            deployment_output.container_port,
+            effective_health_path.as_deref(),
+            probe_source,
+            self.config.replicas,
+        );
+        context.set_output(&self.job_id, "runtime_health_revision", runtime_revision)?;
+
         // Set typed job outputs
+        context.set_output(
+            &self.job_id,
+            "portless",
+            deployment_output.container_port.is_none(),
+        )?;
+        context.set_output(
+            &self.job_id,
+            "health_state",
+            if deployment_output.container_port.is_some() && effective_health_path.is_none() {
+                "unknown"
+            } else {
+                "healthy"
+            },
+        )?;
         context.set_output(&self.job_id, "status", &deployment_output.status)?;
         context.set_output(&self.job_id, "replicas", deployment_output.replicas)?;
         context.set_output(
@@ -4162,7 +4132,7 @@ impl WorkflowTask for DeployImageJob {
             context.set_output(
                 &self.job_id,
                 "container_port",
-                deployment_output.container_port as i32,
+                deployment_output.container_port.map(i32::from),
             )?;
 
             // Set artifact for first container
@@ -4269,11 +4239,336 @@ impl WorkflowTask for DeployImageJob {
 
     async fn cleanup(&self, context: &WorkflowContext) -> Result<(), WorkflowError> {
         if self.retained_failure.load(Ordering::Acquire) {
-            return self.stop_background_log_stream(context).await;
+            self.stop_background_log_stream(context).await;
+            return Ok(());
         }
         // Use the stored container_id (set immediately after container creation)
         // This ensures cleanup works even if deployment fails before setting outputs
         self.cleanup_container(context).await
+    }
+}
+
+/// The job's resource settings as the plane's [`temps_workload::Resources`]:
+/// limits as limits, requests as requests, `0` MB memory as uncapped.
+fn workload_resources(usage: &ResourceUsage) -> temps_workload::Resources {
+    let cpu = |value: &Option<String>| {
+        value
+            .as_deref()
+            .and_then(parse_cpu_cores)
+            .filter(|cores| *cores > 0.0)
+            .map(|cores| (cores * 1000.0).ceil() as u32)
+    };
+    let memory = |value: &Option<String>| {
+        value
+            .as_deref()
+            .and_then(parse_memory_mb)
+            .filter(|mb| *mb > 0)
+            .map(|mb| u32::try_from(mb).unwrap_or(u32::MAX))
+    };
+    let amounts = |cpu_millis, memory_mb| {
+        let amounts = temps_workload::ResourceAmounts {
+            cpu_millis,
+            memory_mb,
+            disk_mb: None,
+            pids: None,
+            disk_io_mbps: None,
+            network_mbps: None,
+        };
+        (!amounts.is_empty()).then_some(amounts)
+    };
+    temps_workload::Resources {
+        requests: amounts(cpu(&usage.cpu_request), memory(&usage.memory_request)),
+        limits: amounts(cpu(&usage.cpu_limit), memory(&usage.memory_limit)),
+    }
+}
+
+impl DeployImageJob {
+    fn workload_placement_spec(
+        &self,
+    ) -> Result<temps_workload::PlacementSpec, crate::services::WorkloadPlacementError> {
+        crate::services::workload_placement::placement_spec_from_job(
+            self.config.target_nodes.as_deref(),
+            self.config.target_labels.as_ref(),
+            self.config.anti_affinity,
+            self.config.replicas,
+        )
+    }
+
+    /// `shadow`: ask the unified scheduler what it would do with the request
+    /// NodeScheduler just answered, and log the comparison. Never fails the
+    /// deployment: the legacy answer is the one that is used.
+    async fn log_shadow_placement(
+        &self,
+        scheduler: &crate::services::NodeScheduler,
+        legacy: &Result<
+            crate::services::node_scheduler::SchedulingOutcome,
+            crate::services::node_service::NodeError,
+        >,
+        image_platforms: &[String],
+        context: &WorkflowContext,
+    ) {
+        use crate::services::workload_placement::{describe_shadow, ShadowOutcome, ShadowRequest};
+        let Some(workload_plane) = self.workload_plane.as_ref() else {
+            tracing::warn!(
+                deployment_id = context.deployment_id,
+                "workload_mode is shadow but the placement service is not wired; comparison skipped"
+            );
+            return;
+        };
+        let placement = match self.workload_placement_spec() {
+            Ok(placement) => placement,
+            Err(e) => {
+                tracing::warn!(
+                    deployment_id = context.deployment_id,
+                    "shadow placement skipped: {e}"
+                );
+                let _ = self
+                    .log(
+                        context,
+                        format!("WARNING: workload plane shadow run skipped: {e}"),
+                    )
+                    .await;
+                return;
+            }
+        };
+        let resources = workload_resources(&self.config.resources);
+        let request = ShadowRequest {
+            placement: &placement,
+            target_labels: self.config.target_labels.as_ref(),
+            resources: &resources,
+            exclude_node_ids: &self.config.exclude_node_ids,
+            image_platforms,
+            project_slug: self.config.project_slug.as_deref(),
+        };
+        match workload_plane
+            .placement
+            .shadow_run(
+                scheduler,
+                Some(ShadowOutcome::from_legacy(legacy)),
+                &request,
+            )
+            .await
+        {
+            Ok(comparison) => {
+                if comparison.is_unexpected() {
+                    tracing::warn!(
+                        deployment_id = context.deployment_id,
+                        legacy = ?comparison.legacy,
+                        unified = ?comparison.unified,
+                        "workload plane shadow run: unexpected disagreement"
+                    );
+                } else {
+                    tracing::info!(
+                        deployment_id = context.deployment_id,
+                        agrees = comparison.agrees(),
+                        disagreement = ?comparison.disagreement,
+                        "workload plane shadow run"
+                    );
+                }
+                let _ = self.log(context, describe_shadow(&comparison)).await;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    deployment_id = context.deployment_id,
+                    "workload plane shadow run failed: {e}"
+                );
+                let _ = self
+                    .log(
+                        context,
+                        format!("WARNING: workload plane shadow run failed: {e}"),
+                    )
+                    .await;
+            }
+        }
+    }
+
+    fn enforce_unavailable(&self) -> Option<String> {
+        match self.workload_plane.as_ref() {
+            None => Some(
+                "This environment's workload_mode is enforce, but this process did not wire the \
+                 workload plane's placement service into the deploy job. Set workload_mode back \
+                 to legacy to deploy it"
+                    .to_string(),
+            ),
+            Some(WorkloadPlaneDeploy { plane: None, .. }) => Some(
+                "This environment's workload_mode is enforce, but the workload plane is not \
+                 running in this process (it needs an audit logger, and starts at boot). Set \
+                 workload_mode back to legacy to deploy it"
+                    .to_string(),
+            ),
+            Some(_) => None,
+        }
+    }
+
+    /// `enforce`: place every replica with the unified scheduler, strictly
+    /// (a pin that cannot be met fails the deployment, it is never moved),
+    /// and hold the placement's reservation until the replicas started.
+    async fn enforced_placement(
+        &self,
+        image_output: &BuildImageOutput,
+        context: &WorkflowContext,
+    ) -> Result<
+        (
+            Vec<crate::services::NodeAssignment>,
+            bool,
+            temps_workload_plane::inventory::InFlightGuard,
+        ),
+        WorkflowError,
+    > {
+        if let Some(message) = self.enforce_unavailable() {
+            self.log(context, format!("ERROR: {message}")).await?;
+            return Err(WorkflowError::JobExecutionFailed(message));
+        }
+        let (Some(workload_plane), Some(plane)) = (
+            self.workload_plane.as_ref(),
+            self.workload_plane.as_ref().and_then(|w| w.plane.clone()),
+        ) else {
+            return Err(WorkflowError::JobExecutionFailed(
+                "workload plane unavailable".to_string(),
+            ));
+        };
+        let mut placement = self.workload_placement_spec().map_err(|e| {
+            WorkflowError::JobExecutionFailed(format!("Cannot schedule this deployment: {e}"))
+        })?;
+        // A node-local volume pins the replica (§8, strict): to the
+        // volume's node, or to the control plane where an uncreated volume
+        // will be created.
+        if !self.config.volume_mounts.is_empty() {
+            let pin = self.config.volume_pin.clone().unwrap_or_else(|| {
+                temps_workload_volumes::VolumePin {
+                    node_id: temps_workload_plane::scheduler::CONTROL_PLANE_NODE_ID,
+                    volumes: self
+                        .config
+                        .volume_mounts
+                        .iter()
+                        .map(|m| m.volume.clone())
+                        .collect(),
+                }
+            });
+            placement.nodes = Some(vec![pin.node_id]);
+            self.log(context, format!("Replica {pin}")).await?;
+        }
+        let image_platforms = self.available_image_platforms(image_output).await;
+        let spec = temps_workload::WorkloadSpec {
+            owner: temps_workload::WorkloadRef::new(
+                temps_workload::WorkloadKind::Deployment,
+                i64::from(context.deployment_id),
+            ),
+            artifact: temps_workload::Artifact::oci(image_output.image_tag.clone()),
+            isolation: self.config.workload_isolation,
+            process: Default::default(),
+            env: Default::default(),
+            resources: workload_resources(&self.config.resources),
+            volumes: Vec::new(),
+            ports: Vec::new(),
+            network: Default::default(),
+            probes: Default::default(),
+            placement,
+            lifetime: temps_workload::Lifetime::LongRunning {
+                restart: temps_workload::RestartPolicy::UnlessStopped,
+            },
+            security: None,
+            labels: Default::default(),
+        };
+        let hints = temps_workload_plane::inventory::PlacementHints {
+            project_slug: self.config.project_slug.clone(),
+            image_platforms,
+            exclude_node_ids: self.config.exclude_node_ids.clone(),
+            affinity_nodes: Vec::new(),
+            exclude_control_plane: false,
+        };
+        self.log(
+            context,
+            format!(
+                "Placing replicas with the unified scheduler (workload_mode: enforce, \
+                 isolation: {})",
+                temps_workload_plane::scheduler::isolation_name(self.config.workload_isolation)
+            ),
+        )
+        .await?;
+        let name = format!("deployment-{}", context.deployment_id);
+        let (placed, guard) = match plane.schedule(&name, &spec, &hints).await {
+            Ok(placed) => placed,
+            Err(e) => {
+                let message = format!("Cannot schedule this deployment: {e}");
+                self.log(context, format!("ERROR: {message}")).await?;
+                return Err(WorkflowError::JobExecutionFailed(message));
+            }
+        };
+        for exclusion in &placed.exclusions {
+            let line = if exclusion.excluded {
+                format!("Skipping {exclusion}")
+            } else {
+                format!("WARNING: {exclusion}")
+            };
+            self.log(context, line).await?;
+        }
+        for warning in &placed.warnings {
+            self.log(context, format!("WARNING: {warning}")).await?;
+        }
+        let assignments = workload_plane
+            .placement
+            .assignments_for(&placed.nodes)
+            .await
+            .map_err(|e| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Cannot map the unified placement {:?} onto nodes: {e}",
+                    placed.nodes
+                ))
+            })?;
+        for (i, assignment) in assignments.iter().enumerate() {
+            let line = match assignment {
+                crate::services::NodeAssignment::Local => {
+                    format!("Replica {} scheduled on local node", i + 1)
+                }
+                crate::services::NodeAssignment::Remote {
+                    node_name, node_id, ..
+                } => format!(
+                    "Replica {} scheduled on node '{}' (id={})",
+                    i + 1,
+                    node_name,
+                    node_id
+                ),
+            };
+            self.log(context, line).await?;
+        }
+        Ok((assignments, placed.socket_required, guard))
+    }
+
+    /// The deployer `enforce` uses for replicas on `node_id` (`None`: the
+    /// control plane), with `node_deployer` for every operation after the
+    /// create.
+    fn plane_deployer(
+        &self,
+        context: &WorkflowContext,
+        node_deployer: Arc<dyn ContainerDeployer>,
+        node_id: Option<i32>,
+    ) -> Result<Arc<dyn ContainerDeployer>, WorkflowError> {
+        let plane = self
+            .workload_plane
+            .as_ref()
+            .and_then(|w| w.plane.clone())
+            .ok_or_else(|| {
+                WorkflowError::JobExecutionFailed(
+                    self.enforce_unavailable()
+                        .unwrap_or_else(|| "workload plane unavailable".to_string()),
+                )
+            })?;
+        let deployer = crate::services::plane_deployer::PlaneContainerDeployer::new(
+            plane,
+            node_deployer,
+            context.deployment_id,
+            Duration::from_secs(self.config.health_check_timeout_secs.max(30)),
+        )
+        .with_volumes(
+            self.config.volume_mounts.clone(),
+            crate::services::workload_volumes::environment_volume_owner(context.environment_id),
+        )
+        .with_isolation(self.config.workload_isolation);
+        Ok(Arc::new(match node_id {
+            Some(node_id) => deployer.on_node(node_id),
+            None => deployer,
+        }))
     }
 }
 
@@ -4284,6 +4579,7 @@ pub struct DeployImageJobBuilder {
     target: Option<DeploymentTarget>,
     config: DeploymentJobConfig,
     node_scheduler: Option<Arc<crate::services::NodeScheduler>>,
+    workload_plane: Option<WorkloadPlaneDeploy>,
     log_id: Option<String>,
     log_service: Option<Arc<LogService>>,
     external_image_tag: Option<String>,
@@ -4378,6 +4674,7 @@ impl DeployImageJobBuilder {
                 }
             },
             node_scheduler: None,
+            workload_plane: None,
             log_id: None,
             log_service: None,
             external_image_tag: None,
@@ -4449,6 +4746,11 @@ impl DeployImageJobBuilder {
         self
     }
 
+    pub fn entrypoint(mut self, entrypoint: Option<Vec<String>>) -> Self {
+        self.config.entrypoint = entrypoint;
+        self
+    }
+
     pub fn command(mut self, command: Option<Vec<String>>) -> Self {
         self.config.command = command;
         self
@@ -4474,8 +4776,10 @@ impl DeployImageJobBuilder {
     }
 
     /// Set the health check path. When `None`, HTTP health checks are skipped
-    /// entirely after the container reaches running state. Useful for rollbacks
-    /// or services without an HTTP endpoint.
+    /// entirely after the container reaches running state, so a container that
+    /// answers every request with an error still goes live. A service without
+    /// an HTTP endpoint does not need this: it has no port, or declares a
+    /// non-HTTP `health.type`, and is never HTTP-probed.
     pub fn health_check_path(mut self, path: Option<String>) -> Self {
         self.config.health_check_path = path;
         self
@@ -4492,6 +4796,11 @@ impl DeployImageJobBuilder {
 
     /// Set the maximum time (in seconds) to wait for the application to become
     /// ready. Defaults to 300 seconds (5 minutes).
+    pub fn health(mut self, health: Option<temps_core::repo_config::HealthCheckConfig>) -> Self {
+        self.config.health = health;
+        self
+    }
+
     pub fn health_check_timeout_secs(mut self, secs: u64) -> Self {
         self.config.health_check_timeout_secs = secs;
         self
@@ -4564,6 +4873,35 @@ impl DeployImageJobBuilder {
     /// Enable or disable anti-affinity (spread replicas across different nodes)
     pub fn anti_affinity(mut self, enabled: bool) -> Self {
         self.config.anti_affinity = enabled;
+        self
+    }
+
+    /// The environment's ADR-055 workload mode, and what `shadow` and
+    /// `enforce` need. `legacy` ignores `workload_plane`.
+    pub fn workload_mode(
+        mut self,
+        mode: temps_entities::environment_workload_mode::EnvironmentWorkloadMode,
+        workload_plane: Option<WorkloadPlaneDeploy>,
+    ) -> Self {
+        self.config.workload_mode = mode;
+        self.workload_plane = workload_plane;
+        self
+    }
+
+    /// The environment's attached volumes (ADR-055 Phase 9).
+    pub fn volume_mounts(
+        mut self,
+        mounts: Vec<temps_workload::VolumeMount>,
+        pin: Option<temps_workload_volumes::VolumePin>,
+    ) -> Self {
+        self.config.volume_mounts = mounts;
+        self.config.volume_pin = pin;
+        self
+    }
+
+    /// The isolation `enforce` replicas request (ADR-055 Phase 10).
+    pub fn workload_isolation(mut self, isolation: temps_workload::Isolation) -> Self {
+        self.config.workload_isolation = isolation;
         self
     }
 
@@ -4658,6 +4996,9 @@ impl DeployImageJobBuilder {
 
         if let Some(scheduler) = self.node_scheduler {
             job = job.with_node_scheduler(scheduler);
+        }
+        if let Some(workload_plane) = self.workload_plane {
+            job = job.with_workload_plane(workload_plane);
         }
         if let Some(log_id) = self.log_id {
             job = job.with_log_id(log_id);
@@ -4821,7 +5162,7 @@ mod tests {
     struct TestLogWriter;
 
     #[async_trait]
-    impl temps_core::LogWriter for TestLogWriter {
+    impl crate::workflow::LogWriter for TestLogWriter {
         async fn write_log(&self, _message: String) -> Result<(), WorkflowError> {
             Ok(())
         }
@@ -5074,6 +5415,9 @@ mod tests {
             discovered: None,
             image_platform: None,
             discoverable: None,
+            local_platforms: Vec::new(),
+            registry_platforms: Vec::new(),
+            registry_reads: Default::default(),
         });
         let mut output = build_output_with_tags(&[
             ("linux/amd64", "myapp:latest"),
@@ -5083,6 +5427,96 @@ mod tests {
         let mut platforms = job.available_image_platforms(&output).await;
         platforms.sort();
         assert_eq!(platforms, vec!["linux/amd64", "linux/arm64"]);
+    }
+
+    /// #1789: an image Temps did not build (`deploy:local-image`) that has
+    /// several architectures present locally is schedulable on each.
+    #[tokio::test]
+    async fn local_multi_platform_image_offers_every_architecture_to_the_scheduler() {
+        let job = job_with_image_builder(PlatformOnlyImageBuilder {
+            platform: "linux/amd64".into(),
+            discovered: Some("linux/amd64".into()),
+            image_platform: Some("linux/amd64".into()),
+            discoverable: None,
+            local_platforms: vec!["linux/amd64".into(), "linux/arm64".into()],
+            registry_platforms: Vec::new(),
+            registry_reads: Default::default(),
+        });
+        let output = build_output_with_tags(&[]);
+        let mut platforms = job.available_image_platforms(&output).await;
+        platforms.sort();
+        assert_eq!(platforms, vec!["linux/amd64", "linux/arm64"]);
+
+        // The same image may run on a control plane of either architecture.
+        let context = crate::test_utils::create_test_context("wf".to_string(), 1, 1, 1);
+        assert!(job
+            .verify_image_platform_for_local("myapp:latest", Some("linux/arm64"), &context)
+            .await
+            .is_ok());
+        assert!(job
+            .verify_image_platform_for_local("myapp:latest", Some("linux/riscv64"), &context)
+            .await
+            .is_err());
+    }
+
+    /// A control plane that pulled a multi-platform registry tag for its own
+    /// architecture: its store holds `linux/amd64`, the tag's index offers
+    /// `linux/amd64` and `linux/arm64`.
+    fn amd64_control_plane_with_multi_arch_index() -> PlatformOnlyImageBuilder {
+        PlatformOnlyImageBuilder {
+            platform: "linux/amd64".into(),
+            discovered: Some("linux/amd64".into()),
+            image_platform: Some("linux/amd64".into()),
+            discoverable: None,
+            local_platforms: Vec::new(),
+            registry_platforms: vec!["linux/amd64".into(), "linux/arm64".into()],
+            registry_reads: Default::default(),
+        }
+    }
+
+    /// #1892: each worker pulls a registry image itself and gets its own
+    /// architecture, so an arm64 node is eligible for a multi-platform tag
+    /// even though the control plane's pull only downloaded amd64.
+    #[tokio::test]
+    async fn registry_image_offers_every_architecture_of_its_index() {
+        let job = job_with_image_builder(amd64_control_plane_with_multi_arch_index())
+            .with_image_source(DeployImageSource::Registry);
+        let output = build_output_with_tags(&[]);
+
+        let mut platforms = job.available_image_platforms(&output).await;
+        platforms.sort();
+        assert_eq!(platforms, vec!["linux/amd64", "linux/arm64"]);
+    }
+
+    /// An uploaded image reaches a worker as an export of the control plane's
+    /// store, which holds amd64 only: the registry index of a same-named tag
+    /// says nothing about what that export carries.
+    #[tokio::test]
+    async fn control_plane_local_image_offers_only_what_the_store_holds() {
+        let job = job_with_image_builder(amd64_control_plane_with_multi_arch_index())
+            .with_image_source(DeployImageSource::ControlPlaneLocal);
+        let output = build_output_with_tags(&[]);
+
+        assert_eq!(
+            job.available_image_platforms(&output).await,
+            vec!["linux/amd64"]
+        );
+    }
+
+    /// An unreadable registry index (registry down, no daemon to ask) falls
+    /// back to the local store, as before #1892, instead of disabling the
+    /// architecture filter or failing the deployment.
+    #[tokio::test]
+    async fn registry_image_falls_back_to_the_local_store_without_an_index() {
+        let mut builder = amd64_control_plane_with_multi_arch_index();
+        builder.registry_platforms = Vec::new();
+        let job = job_with_image_builder(builder).with_image_source(DeployImageSource::Registry);
+        let output = build_output_with_tags(&[]);
+
+        assert_eq!(
+            job.available_image_platforms(&output).await,
+            vec!["linux/amd64"]
+        );
     }
 
     fn build_output_with_tags(tags: &[(&str, &str)]) -> BuildImageOutput {
@@ -5279,6 +5713,14 @@ mod tests {
         /// What a discovery attempt would return. `None` models a daemon that
         /// still doesn't answer.
         discoverable: Option<String>,
+        /// Every platform a multi-platform image has locally; empty answers
+        /// with the inspected platform alone, as a single-platform image does.
+        local_platforms: Vec<String>,
+        /// What the image's registry index offers; empty models an index
+        /// that cannot be read.
+        registry_platforms: Vec<String>,
+        /// How many times the registry index was asked for.
+        registry_reads: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl PlatformOnlyImageBuilder {
@@ -5288,6 +5730,9 @@ mod tests {
                 discovered: Some(platform.to_string()),
                 image_platform: Some(image_platform.to_string()),
                 discoverable: None,
+                local_platforms: Vec::new(),
+                registry_platforms: Vec::new(),
+                registry_reads: Default::default(),
             }
         }
 
@@ -5300,6 +5745,9 @@ mod tests {
                 discovered: None,
                 image_platform: Some(image_platform.to_string()),
                 discoverable: Some(daemon.to_string()),
+                local_platforms: Vec::new(),
+                registry_platforms: Vec::new(),
+                registry_reads: Default::default(),
             }
         }
     }
@@ -5374,7 +5822,27 @@ mod tests {
                 tags: vec![image_name.to_string()],
                 created: None,
                 working_dir: None,
+                config: None,
             })
+        }
+
+        async fn image_platforms(
+            &self,
+            image_name: &str,
+        ) -> Result<Vec<String>, temps_deployer::BuilderError> {
+            if !self.local_platforms.is_empty() {
+                return Ok(self.local_platforms.clone());
+            }
+            Ok(vec![self.inspect_image(image_name).await?.platform])
+        }
+
+        async fn registry_image_platforms(
+            &self,
+            _image_name: &str,
+            _credentials: Option<temps_deployer::remote::RemotePullCredentials>,
+        ) -> Result<Vec<String>, temps_deployer::BuilderError> {
+            self.registry_reads.fetch_add(1, Ordering::SeqCst);
+            Ok(self.registry_platforms.clone())
         }
 
         fn get_native_platform(&self) -> String {
@@ -5418,6 +5886,9 @@ mod tests {
             discovered: Some(platform.to_string()),
             image_platform: None,
             discoverable: None,
+            local_platforms: Vec::new(),
+            registry_platforms: Vec::new(),
+            registry_reads: Default::default(),
         })
     }
 
@@ -5434,7 +5905,7 @@ mod tests {
             resources: ResourceUsage::default(),
             container_ids: vec!["c1".to_string(), "c2".to_string()],
             host_ports: vec![30001, 30002],
-            container_port: 3000,
+            container_port: Some(3000),
             node_ids: vec![None, Some(7)],
             image_names: vec!["app:latest".to_string(), "app:latest-arm64".to_string()],
         };
@@ -5514,6 +5985,9 @@ mod tests {
             discovered: None,
             image_platform: Some("linux/arm64".to_string()),
             discoverable: None,
+            local_platforms: Vec::new(),
+            registry_platforms: Vec::new(),
+            registry_reads: Default::default(),
         });
         let context = crate::test_utils::create_test_context("wf".to_string(), 1, 1, 1);
 
@@ -5671,6 +6145,9 @@ mod tests {
     struct TrackingMockContainerDeployer {
         deployed_containers: Arc<StdMutex<Vec<String>>>,
         stopped_containers: Arc<StdMutex<Vec<String>>>,
+        removed_containers: Arc<StdMutex<Vec<String>>>,
+        /// Containers whose removal the test wants to fail.
+        unremovable_containers: Arc<StdMutex<Vec<String>>>,
         requests: Arc<StdMutex<Vec<DeployRequest>>>,
     }
 
@@ -5679,13 +6156,185 @@ mod tests {
             Self {
                 deployed_containers: Arc::new(StdMutex::new(Vec::new())),
                 stopped_containers: Arc::new(StdMutex::new(Vec::new())),
+                removed_containers: Arc::new(StdMutex::new(Vec::new())),
+                unremovable_containers: Arc::new(StdMutex::new(Vec::new())),
                 requests: Arc::new(StdMutex::new(Vec::new())),
             }
         }
     }
 
+    /// A log store that is broken for the whole test, as a full disk would be:
+    /// every write fails, including the ones made during cleanup.
+    struct BrokenLogWriter;
+
+    #[async_trait]
+    impl crate::workflow::LogWriter for BrokenLogWriter {
+        async fn write_log(&self, _message: String) -> Result<(), WorkflowError> {
+            Err(WorkflowError::Other("log storage is full".to_string()))
+        }
+
+        fn stage_id(&self) -> i32 {
+            1
+        }
+    }
+
+    fn job_for_cleanup_test(deployer: Arc<TrackingMockContainerDeployer>) -> DeployImageJob {
+        DeployImageJobBuilder::new(
+            "test-project",
+            temps_core::docker_socket_grant::DeployCaller::Platform,
+        )
+        .job_id("deploy".to_string())
+        .build_job_id("build".to_string())
+        .target(DeploymentTarget::Docker {
+            registry_url: "local".to_string(),
+            network: None,
+        })
+        .service_name("checkout".to_string())
+        .build(deployer)
+        .expect("valid deploy job")
+    }
+
+    /// Give the job a live log stream, so stopping it has a line to write.
+    fn start_idle_log_stream(job: &DeployImageJob) {
+        *job.log_stream_task.lock().expect("log stream lock") =
+            Some(tokio::spawn(std::future::pending()));
+    }
+
+    /// With log storage down, every cleanup log write fails. Each of them used
+    /// to return early with `?`, before the container it was announcing had
+    /// been removed, so every failed deployment left its container behind.
+    #[tokio::test]
+    async fn cleanup_removes_every_container_while_the_log_writer_stays_broken() {
+        let deployer = Arc::new(TrackingMockContainerDeployer::new());
+        let job = job_for_cleanup_test(deployer.clone());
+        job.track_container("first".to_string(), deployer.clone());
+        job.track_container("second".to_string(), deployer.clone());
+        start_idle_log_stream(&job);
+        let context = WorkflowContext::new("run-1".to_string(), 1, 1, 1, Arc::new(BrokenLogWriter));
+
+        job.cleanup(&context)
+            .await
+            .expect("a broken log writer must not fail cleanup");
+
+        assert_eq!(
+            deployer.removed_containers.lock().unwrap().as_slice(),
+            ["first", "second"]
+        );
+        assert!(job.log_stream_task.lock().unwrap().is_none());
+        assert!(
+            job.container_ids.lock().unwrap().is_empty(),
+            "removed containers must no longer be tracked"
+        );
+    }
+
+    /// Logging is what may fail quietly. A real removal failure is still
+    /// returned, it does not stop the remaining removals, and the container
+    /// stays tracked so a later cleanup can retry it.
+    #[tokio::test]
+    async fn cleanup_with_a_broken_log_writer_still_reports_a_failed_removal() {
+        let deployer = Arc::new(TrackingMockContainerDeployer::new());
+        deployer
+            .unremovable_containers
+            .lock()
+            .unwrap()
+            .push("first".to_string());
+        let job = job_for_cleanup_test(deployer.clone());
+        job.track_container("first".to_string(), deployer.clone());
+        job.track_container("second".to_string(), deployer.clone());
+        let context = WorkflowContext::new("run-1".to_string(), 1, 1, 1, Arc::new(BrokenLogWriter));
+
+        let error = job
+            .cleanup_container(&context)
+            .await
+            .expect_err("a failed removal must be reported");
+
+        let message = error.to_string();
+        assert!(message.contains("container first"), "{message}");
+        assert!(!message.contains("log storage"), "{message}");
+        assert_eq!(
+            deployer.removed_containers.lock().unwrap().as_slice(),
+            ["second"]
+        );
+        assert_eq!(job.container_ids.lock().unwrap().as_slice(), ["first"]);
+    }
+
+    /// Retaining a failed candidate stops the log stream first. That line going
+    /// unwritten must not discard the candidate kept for log inspection.
+    #[tokio::test]
+    async fn retaining_a_failed_container_survives_a_broken_log_writer() {
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 1,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let deployer = Arc::new(TrackingMockContainerDeployer::new());
+        let job = DeployImageJobBuilder::new(
+            "test-project",
+            temps_core::docker_socket_grant::DeployCaller::Platform,
+        )
+        .job_id("deploy".to_string())
+        .build_job_id("build".to_string())
+        .target(DeploymentTarget::Docker {
+            registry_url: "local".to_string(),
+            network: None,
+        })
+        .service_name("checkout".to_string())
+        .failed_container_retention(db, 42)
+        .build(deployer.clone())
+        .expect("valid deploy job");
+        job.failed_candidates
+            .lock()
+            .expect("candidate lock")
+            .push(FailedContainerCandidate {
+                container_id: "failed-app-id".to_string(),
+                container_name: "checkout-production".to_string(),
+                container_port: Some(3000),
+                host_port: 18080,
+                image_name: "checkout:broken".to_string(),
+                node_id: None,
+            });
+        start_idle_log_stream(&job);
+        let context =
+            WorkflowContext::new("run-42".to_string(), 42, 2, 3, Arc::new(BrokenLogWriter));
+
+        job.retain_failed_containers(&context)
+            .await
+            .expect("a broken log writer must not abort retention");
+
+        assert!(job.retained_failure.load(Ordering::Acquire));
+        assert_eq!(
+            deployer.stopped_containers.lock().unwrap().as_slice(),
+            ["failed-app-id"]
+        );
+        assert!(deployer.removed_containers.lock().unwrap().is_empty());
+
+        // With the failure retained, the executor's later cleanup only stops
+        // the stream, and a failed log write there must not surface either.
+        start_idle_log_stream(&job);
+        job.cleanup(&context)
+            .await
+            .expect("a broken log writer must not fail cleanup of a retained candidate");
+        assert!(job.log_stream_task.lock().unwrap().is_none());
+        assert!(deployer.removed_containers.lock().unwrap().is_empty());
+    }
+
     #[async_trait]
     impl ContainerDeployer for TrackingMockContainerDeployer {
+        async fn exec_in_container(
+            &self,
+            container_id: &str,
+            _command: Vec<String>,
+            _timeout: std::time::Duration,
+        ) -> Result<temps_deployer::ExecResult, temps_deployer::DeployerError> {
+            Err(temps_deployer::DeployerError::ExecFailed {
+                container_id: container_id.to_string(),
+                reason: "exec is not scripted by this test deployer".to_string(),
+            })
+        }
+
         async fn deploy_container(
             &self,
             request: DeployRequest,
@@ -5743,7 +6392,22 @@ mod tests {
             Ok(())
         }
 
-        async fn remove_container(&self, _container_id: &str) -> Result<(), DeployerError> {
+        async fn remove_container(&self, container_id: &str) -> Result<(), DeployerError> {
+            if self
+                .unremovable_containers
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|id| id == container_id)
+            {
+                return Err(DeployerError::Other(format!(
+                    "removal of {container_id} refused by test"
+                )));
+            }
+            self.removed_containers
+                .lock()
+                .unwrap()
+                .push(container_id.to_string());
             Ok(())
         }
 
@@ -5778,6 +6442,8 @@ mod tests {
                 memory_percent: Some(12.5),
                 network_rx_bytes: 2048000,
                 network_tx_bytes: 1024000,
+                block_read_bytes: None,
+                block_write_bytes: None,
                 timestamp: chrono::Utc::now(),
                 ..Default::default()
             })
@@ -5797,6 +6463,36 @@ mod tests {
         ) -> Result<Box<dyn futures::Stream<Item = String> + Unpin + Send>, DeployerError> {
             Err(DeployerError::Other("Not implemented".to_string()))
         }
+    }
+
+    #[tokio::test]
+    async fn deploying_a_replica_count_saved_above_the_maximum_fails_before_allocating() {
+        let container_deployer: Arc<dyn ContainerDeployer> =
+            Arc::new(TrackingMockContainerDeployer::new());
+        let job = DeployImageJobBuilder::new(
+            "test-project",
+            temps_core::docker_socket_grant::DeployCaller::Platform,
+        )
+        .job_id("test_deploy".to_string())
+        .build_job_id("build_image".to_string())
+        .target(DeploymentTarget::Docker {
+            registry_url: "registry.test.com".to_string(),
+            network: Some("test-network".to_string()),
+        })
+        .service_name("myapp".to_string())
+        .namespace("production".to_string())
+        .replicas(temps_entities::deployment_config::MAX_REPLICAS.unsigned_abs() + 1)
+        .build(container_deployer)
+        .unwrap();
+        let context = crate::test_utils::create_test_context("wf".to_string(), 1, 1, 1);
+
+        let error = job.validate_deployment_config(&context).await.unwrap_err();
+
+        assert!(
+            matches!(&error, WorkflowError::JobValidationFailed(m)
+                if m.contains("myapp") && m.contains("maximum")),
+            "{error}"
+        );
     }
 
     #[test]
@@ -5870,7 +6566,7 @@ mod tests {
             .push(FailedContainerCandidate {
                 container_id: "failed-app-id".to_string(),
                 container_name: "checkout-production".to_string(),
-                container_port: 3000,
+                container_port: Some(3000),
                 host_port: 18080,
                 image_name: "checkout:broken".to_string(),
                 node_id: Some(7),
@@ -6202,7 +6898,7 @@ mod tests {
             .resolve_container_port("temps-test-nonexistent-image:latest", &context)
             .await;
 
-        assert_eq!(port, 9090);
+        assert_eq!(port, Some(9090));
     }
 
     /// When neither environment nor project configures a port, image
@@ -6234,7 +6930,120 @@ mod tests {
             .resolve_container_port("temps-test-nonexistent-image:latest", &context)
             .await;
 
-        assert_eq!(port, 4000);
+        assert_eq!(port, Some(4000));
+    }
+
+    fn port_job(configured_port: Option<u16>) -> DeployImageJob {
+        DeployImageJobBuilder::new(
+            "test-project",
+            temps_core::docker_socket_grant::DeployCaller::Platform,
+        )
+        .job_id("deploy".to_string())
+        .build_job_id("build_image".to_string())
+        .target(DeploymentTarget::Docker {
+            registry_url: "local".to_string(),
+            network: None,
+        })
+        .service_name("app".to_string())
+        .port(4000)
+        .configured_port(configured_port)
+        .build(Arc::new(TrackingMockContainerDeployer::new()))
+        .unwrap()
+    }
+
+    fn context_with_built_config(exposed_ports: Vec<u16>) -> crate::workflow::WorkflowContext {
+        let mut context = crate::test_utils::create_test_context("run-1".to_string(), 1, 1, 1);
+        context
+            .set_output(
+                "build_image",
+                "image_config",
+                super::super::build_image::BuiltImageConfig {
+                    exposed_ports,
+                    working_dir: Some("/app".to_string()),
+                    user: None,
+                    entrypoint: Vec::new(),
+                },
+            )
+            .unwrap();
+        context
+    }
+
+    /// A worker build records the image's `EXPOSE` ports from the node that
+    /// owns the image, so the port resolves without any local copy of it.
+    #[tokio::test]
+    async fn test_resolve_container_port_uses_the_config_recorded_by_the_build_node() {
+        let job = port_job(None);
+        let context = context_with_built_config(vec![8080, 9000]);
+
+        let port = job
+            .resolve_container_port("temps-test-nonexistent-image:latest", &context)
+            .await;
+
+        assert_eq!(port, Some(8080));
+    }
+
+    /// A node that reports no EXPOSE declares a portless worker, without
+    /// needing a local copy of the image to inspect.
+    #[tokio::test]
+    async fn test_resolve_container_port_is_portless_when_node_reports_no_expose() {
+        let job = port_job(None);
+        let context = context_with_built_config(Vec::new());
+
+        let port = job
+            .resolve_container_port("temps-test-nonexistent-image:latest", &context)
+            .await;
+
+        assert_eq!(port, None);
+    }
+
+    /// The environment/project override still outranks what the image says.
+    #[tokio::test]
+    async fn test_resolve_container_port_override_wins_over_recorded_config() {
+        let job = port_job(Some(9090));
+        let context = context_with_built_config(vec![8080]);
+
+        let port = job
+            .resolve_container_port("temps-test-nonexistent-image:latest", &context)
+            .await;
+
+        assert_eq!(port, Some(9090));
+    }
+
+    /// A rollback or promotion has no workflow context from the original
+    /// build; the ports its node reported travel with the reused worker
+    /// build, so the container port is still the image's own.
+    #[tokio::test]
+    async fn test_resolve_container_port_uses_the_config_of_a_reused_worker_build() {
+        let reused = ReusedWorkerBuild {
+            image_config: Some(super::super::build_image::BuiltImageConfig {
+                exposed_ports: vec![8080],
+                working_dir: None,
+                user: None,
+                entrypoint: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        let job = DeployImageJobBuilder::new(
+            "test-project",
+            temps_core::docker_socket_grant::DeployCaller::Platform,
+        )
+        .job_id("deploy".to_string())
+        .build_job_id("external-image".to_string())
+        .external_image_tag("app:1".to_string())
+        .target(DeploymentTarget::Docker {
+            registry_url: "local".to_string(),
+            network: None,
+        })
+        .service_name("app".to_string())
+        .port(3000)
+        .build(Arc::new(TrackingMockContainerDeployer::new()))
+        .unwrap()
+        .with_reused_worker_build(reused);
+        let context = crate::test_utils::create_test_context("run-1".to_string(), 1, 1, 1);
+
+        let port = job.resolve_container_port("app:1", &context).await;
+
+        assert_eq!(port, Some(8080));
     }
 
     #[test]
@@ -6385,6 +7194,61 @@ mod tests {
             Some("8080"),
             "PORT must match the container port traffic is routed to"
         );
+    }
+
+    #[tokio::test]
+    async fn dockerfile_runtime_overrides_reach_each_container_request() {
+        let deployer = Arc::new(TrackingMockContainerDeployer::new());
+        let command = Some(vec![
+            "python".to_string(),
+            "-m".to_string(),
+            "worker".to_string(),
+            "argument with spaces".to_string(),
+        ]);
+        for entrypoint in [None, Some(vec![]), Some(vec!["/app/start".to_string()])] {
+            let job = DeployImageJobBuilder::new(
+                "test-project",
+                temps_core::docker_socket_grant::DeployCaller::Platform,
+            )
+            .job_id("deploy".into())
+            .build_job_id("build".into())
+            .target(DeploymentTarget::Docker {
+                registry_url: "local".into(),
+                network: None,
+            })
+            .service_name("worker".into())
+            .configured_port(Some(3000))
+            .health_check_path(None)
+            .command(command.clone())
+            .entrypoint(entrypoint.clone())
+            .build(deployer.clone())
+            .unwrap();
+            let context =
+                crate::test_utils::create_test_context("runtime-overrides".into(), 1, 1, 1);
+            let target: Arc<dyn ContainerDeployer> = deployer.clone();
+            job.deploy_single_replica(
+                "example/worker:test",
+                &context,
+                0,
+                None,
+                &target,
+                ReplicaTarget {
+                    assignment: &crate::services::NodeAssignment::Local,
+                    docker_socket_required: false,
+                },
+            )
+            .await
+            .unwrap();
+            let requests = deployer.requests.lock().unwrap();
+            let request = requests.last().unwrap();
+            assert_eq!(request.command, command);
+            assert_eq!(request.entrypoint, entrypoint);
+            // The same request is serialized directly to the worker agent.
+            let roundtrip: DeployRequest =
+                serde_json::from_value(serde_json::to_value(request).unwrap()).unwrap();
+            assert_eq!(roundtrip.entrypoint, entrypoint);
+            assert_eq!(roundtrip.command, command);
+        }
     }
 
     #[tokio::test]
@@ -6670,12 +7534,15 @@ mod tests {
                 mesh_wg_endpoint: None,
                 mesh_wg_address: None,
                 failover_at: None,
+                drain_requested_at: None,
                 dns_resolver_running: None,
                 dns_resolver_tasks_alive: None,
                 dns_resolver_last_sync_at: None,
                 dns_resolver_consecutive_failures: 0,
                 dns_resolver_last_error: None,
                 dns_resolver_record_count: None,
+                deployments_without_resolver: None,
+                build_limits: None,
                 public_ingress_enabled: false,
                 public_ingress_running: None,
                 public_ingress_last_error: None,
@@ -6683,6 +7550,13 @@ mod tests {
                 public_ingress_route_count: None,
                 public_ingress_unsupported_route_count: None,
                 public_ingress_unsupported_reasons: serde_json::json!([]),
+                occupied_ranges: None,
+                overlay_status: None,
+                overlay_last_error: None,
+                overlay_ready_cidr: None,
+                overlay_remediation: None,
+                overlay_network_name: None,
+                overlay_vxlan_vni: None,
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
             }
@@ -6751,12 +7625,15 @@ mod tests {
                 mesh_wg_endpoint: None,
                 mesh_wg_address: None,
                 failover_at: None,
+                drain_requested_at: None,
                 dns_resolver_running: None,
                 dns_resolver_tasks_alive: None,
                 dns_resolver_last_sync_at: None,
                 dns_resolver_consecutive_failures: 0,
                 dns_resolver_last_error: None,
                 dns_resolver_record_count: None,
+                deployments_without_resolver: None,
+                build_limits: None,
                 public_ingress_enabled: false,
                 public_ingress_running: None,
                 public_ingress_last_error: None,
@@ -6764,6 +7641,13 @@ mod tests {
                 public_ingress_route_count: None,
                 public_ingress_unsupported_route_count: None,
                 public_ingress_unsupported_reasons: serde_json::json!([]),
+                occupied_ranges: None,
+                overlay_status: None,
+                overlay_last_error: None,
+                overlay_ready_cidr: None,
+                overlay_remediation: None,
+                overlay_network_name: None,
+                overlay_vxlan_vni: None,
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
             }
@@ -6833,12 +7717,15 @@ mod tests {
             mesh_wg_endpoint: None,
             mesh_wg_address: None,
             failover_at: None,
+            drain_requested_at: None,
             dns_resolver_running: None,
             dns_resolver_tasks_alive: None,
             dns_resolver_last_sync_at: None,
             dns_resolver_consecutive_failures: 0,
             dns_resolver_last_error: None,
             dns_resolver_record_count: None,
+            deployments_without_resolver: None,
+            build_limits: None,
             public_ingress_enabled: false,
             public_ingress_running: None,
             public_ingress_last_error: None,
@@ -6846,6 +7733,13 @@ mod tests {
             public_ingress_route_count: None,
             public_ingress_unsupported_route_count: None,
             public_ingress_unsupported_reasons: serde_json::json!([]),
+            occupied_ranges: None,
+            overlay_status: None,
+            overlay_last_error: None,
+            overlay_ready_cidr: None,
+            overlay_remediation: None,
+            overlay_network_name: None,
+            overlay_vxlan_vni: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -7025,12 +7919,15 @@ mod tests {
             mesh_wg_endpoint: None,
             mesh_wg_address: None,
             failover_at: None,
+            drain_requested_at: None,
             dns_resolver_running: None,
             dns_resolver_tasks_alive: None,
             dns_resolver_last_sync_at: None,
             dns_resolver_consecutive_failures: 0,
             dns_resolver_last_error: None,
             dns_resolver_record_count: None,
+            deployments_without_resolver: None,
+            build_limits: None,
             public_ingress_enabled: false,
             public_ingress_running: None,
             public_ingress_last_error: None,
@@ -7038,6 +7935,13 @@ mod tests {
             public_ingress_route_count: None,
             public_ingress_unsupported_route_count: None,
             public_ingress_unsupported_reasons: serde_json::json!([]),
+            occupied_ranges: None,
+            overlay_status: None,
+            overlay_last_error: None,
+            overlay_ready_cidr: None,
+            overlay_remediation: None,
+            overlay_network_name: None,
+            overlay_vxlan_vni: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -7105,12 +8009,15 @@ mod tests {
             mesh_wg_endpoint: None,
             mesh_wg_address: None,
             failover_at: None,
+            drain_requested_at: None,
             dns_resolver_running: None,
             dns_resolver_tasks_alive: None,
             dns_resolver_last_sync_at: None,
             dns_resolver_consecutive_failures: 0,
             dns_resolver_last_error: None,
             dns_resolver_record_count: None,
+            deployments_without_resolver: None,
+            build_limits: None,
             public_ingress_enabled: false,
             public_ingress_running: None,
             public_ingress_last_error: None,
@@ -7118,6 +8025,13 @@ mod tests {
             public_ingress_route_count: None,
             public_ingress_unsupported_route_count: None,
             public_ingress_unsupported_reasons: serde_json::json!([]),
+            occupied_ranges: None,
+            overlay_status: None,
+            overlay_last_error: None,
+            overlay_ready_cidr: None,
+            overlay_remediation: None,
+            overlay_network_name: None,
+            overlay_vxlan_vni: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -7249,6 +8163,7 @@ mod tests {
                     tags: vec![image_name.to_string()],
                     created: None,
                     working_dir: None,
+                    config: None,
                 });
             }
             // Reported as not found so `verify_image_platform_for_node` takes
@@ -7481,6 +8396,9 @@ mod tests {
             discovered: None,
             image_platform: None,
             discoverable: None,
+            local_platforms: Vec::new(),
+            registry_platforms: Vec::new(),
+            registry_reads: Default::default(),
         });
         let mut output = build_output_with_tags(&[("linux/arm64", "myapp:latest")]);
         output.builder_node_id = Some(7);
@@ -7565,9 +8483,15 @@ mod tests {
         if path.starts_with("/agent/images/") && path.ends_with("/exists") {
             "exists".to_string()
         } else if path.starts_with("/agent/images/pull") {
-            "pull".to_string()
+            if request_text.contains(r#""replace_cached":true"#) {
+                "pull-replacing".to_string()
+            } else {
+                "pull".to_string()
+            }
         } else if path.starts_with("/agent/images/import") {
             "import".to_string()
+        } else if path.starts_with("/agent/images/inspect") {
+            "inspect".to_string()
         } else {
             request_text.lines().next().unwrap_or_default().to_string()
         }
@@ -7583,8 +8507,54 @@ mod tests {
         Arc<temps_deployer::remote::RemoteNodeDeployer>,
         AgentRequestLog,
     ) {
+        spawn_recording_agent_resolving(pull_response, "linux/amd64").await
+    }
+
+    /// [`spawn_recording_agent`] whose node, after an import, resolves the
+    /// image as `imported_platform`.
+    async fn spawn_recording_agent_resolving(
+        pull_response: (&'static str, &'static str),
+        imported_platform: &'static str,
+    ) -> (
+        Arc<temps_deployer::remote::RemoteNodeDeployer>,
+        AgentRequestLog,
+    ) {
+        spawn_recording_agent_holding(pull_response, false, vec![imported_platform]).await
+    }
+
+    /// [`spawn_recording_agent`] whose node answers `/exists` with
+    /// `image_exists` and resolves the image, on its n-th inspect, as
+    /// `inspected_platforms[n]` (the last entry repeats).
+    async fn spawn_recording_agent_holding(
+        pull_response: (&'static str, &'static str),
+        image_exists: bool,
+        inspected_platforms: Vec<&'static str>,
+    ) -> (
+        Arc<temps_deployer::remote::RemoteNodeDeployer>,
+        AgentRequestLog,
+    ) {
+        spawn_recording_agent_on(
+            pull_response,
+            image_exists,
+            inspected_platforms,
+            "linux/amd64",
+        )
+        .await
+    }
+
+    /// [`spawn_recording_agent_holding`] for a node that runs `node_platform`.
+    async fn spawn_recording_agent_on(
+        pull_response: (&'static str, &'static str),
+        image_exists: bool,
+        inspected_platforms: Vec<&'static str>,
+        node_platform: &'static str,
+    ) -> (
+        Arc<temps_deployer::remote::RemoteNodeDeployer>,
+        AgentRequestLog,
+    ) {
         let requests: AgentRequestLog = Arc::new(Mutex::new(Vec::new()));
         let recorded = requests.clone();
+        let inspections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         // More slots than any expected sequence needs, so an unexpected extra
         // request is still recorded rather than refused.
         let agent_url = spawn_sequenced_agent(6, move |request_text| {
@@ -7594,12 +8564,40 @@ mod tests {
                 .expect("agent request log")
                 .push(kind.clone());
             match kind.as_str() {
-                "exists" => ("200 OK", r#"{"success":true,"data":false}"#.to_string()),
-                "pull" => (pull_response.0, pull_response.1.to_string()),
+                "exists" => (
+                    "200 OK",
+                    format!(r#"{{"success":true,"data":{image_exists}}}"#),
+                ),
+                "pull" | "pull-replacing" => (pull_response.0, pull_response.1.to_string()),
                 "import" => (
                     "200 OK",
                     r#"{"success":true,"data":"sha256:imported"}"#.to_string(),
                 ),
+                "inspect" => {
+                    let nth = inspections.fetch_add(1, Ordering::SeqCst);
+                    let imported_platform = inspected_platforms
+                        .get(nth)
+                        .or(inspected_platforms.last())
+                        .copied()
+                        .unwrap_or("linux/amd64");
+                    let (os, architecture) = imported_platform
+                        .split_once('/')
+                        .unwrap_or(("linux", "amd64"));
+                    (
+                        "200 OK",
+                        serde_json::json!({
+                            "id": "sha256:imported",
+                            "architecture": architecture,
+                            "os": os,
+                            "platform": imported_platform,
+                            "size_bytes": 1,
+                            "tags": [],
+                            "created": null,
+                            "working_dir": null,
+                        })
+                        .to_string(),
+                    )
+                }
                 _ => (
                     "404 Not Found",
                     r#"{"success":false,"data":null,"error":"unexpected request"}"#.to_string(),
@@ -7617,7 +8615,7 @@ mod tests {
             .unwrap()
             // Known platform, so the pre-transfer architecture check never
             // needs to ask the mock agent's health endpoint.
-            .with_platform(Some("linux/amd64".to_string())),
+            .with_platform(Some(node_platform.to_string())),
         );
         (remote, requests)
     }
@@ -7677,7 +8675,7 @@ mod tests {
 
         assert_agent_requests(
             &requests,
-            &["exists", "import"],
+            &["exists", "import", "inspect"],
             "an uploaded image must be imported, never pulled from a registry",
         );
         result.expect("an uploaded image must be transferred to the worker via import");
@@ -7685,6 +8683,39 @@ mod tests {
             save_image_called.load(Ordering::SeqCst),
             "expected the uploaded image to be exported from the control plane"
         );
+    }
+
+    /// #1789: a multi-platform image passes the pre-transfer check when it has
+    /// the node's architecture; if the archive the worker imported did not
+    /// carry it, the deploy fails here with the reason instead of at start
+    /// with `exec format error`.
+    #[tokio::test]
+    async fn ensure_image_on_remote_refuses_an_import_the_node_cannot_run() {
+        let (remote, requests) = spawn_recording_agent_resolving(PULL_FAILS, "linux/arm64").await;
+        let save_image_called = Arc::new(AtomicBool::new(false));
+        let job = uploaded_image_job(
+            Some(DeployImageSource::ControlPlaneLocal),
+            Some(RecordingImageBuilder {
+                save_image_called: save_image_called.clone(),
+                has_image: true,
+            }),
+        );
+        let context = crate::test_utils::create_test_context("wf-arch".to_string(), 1, 1, 1);
+
+        let error = job
+            .ensure_image_on_remote(UPLOADED_IMAGE, &remote, "worker-1", &context, None, Some(1))
+            .await
+            .expect_err("an image the node resolves for another architecture is refused");
+
+        assert_agent_requests(
+            &requests,
+            &["exists", "import", "inspect"],
+            "the imported image is inspected on the node",
+        );
+        let message = error.to_string();
+        assert!(message.contains("worker-1"), "{message}");
+        assert!(message.contains("linux/amd64"), "{message}");
+        assert!(message.contains("linux/arm64"), "{message}");
     }
 
     /// Job configs planned before `image_source` existed carry only
@@ -7712,7 +8743,7 @@ mod tests {
 
         assert_agent_requests(
             &requests,
-            &["exists", "import"],
+            &["exists", "import", "inspect"],
             "a reserved temps.internal ref from a legacy config must be imported, never pulled",
         );
         result.expect("a reserved temps.internal ref must be transferred via import");
@@ -7747,6 +8778,87 @@ mod tests {
         );
         result.expect("registry pull should succeed");
         assert!(!save_image_called.load(Ordering::SeqCst));
+    }
+
+    /// #1892: an arm64 worker pulls the arm64 variant of a multi-platform
+    /// registry tag itself. The control plane's own pull downloaded only
+    /// amd64, which must not make the node look unable to run the image.
+    #[tokio::test]
+    async fn ensure_image_on_remote_pulls_multi_arch_registry_image_on_arm64_node() {
+        let (remote, requests) =
+            spawn_recording_agent_on(PULL_OK, false, vec!["linux/arm64"], "linux/arm64").await;
+        assert_eq!(remote.platform().as_deref(), Some("linux/arm64"));
+        let job = job_with_image_builder(amd64_control_plane_with_multi_arch_index())
+            .with_external_image_tag(REGISTRY_IMAGE.to_string())
+            .with_image_source(DeployImageSource::Registry);
+        let context = crate::test_utils::create_test_context("wf-arm64".to_string(), 1, 1, 1);
+
+        let result = job
+            .ensure_image_on_remote(REGISTRY_IMAGE, &remote, "worker-1", &context, None, Some(1))
+            .await;
+
+        result.expect("the registry index offers linux/arm64, so the node can pull and run it");
+        assert_agent_requests(
+            &requests,
+            &["exists", "pull"],
+            "the arm64 node pulls its own variant from the registry",
+        );
+    }
+
+    /// Scheduling and every replica's node check ask for the same tag's
+    /// platforms: the registry index is read once per job, whether the read
+    /// succeeds or not. An unreachable registry would otherwise be waited on
+    /// again for every replica, each time to fall back to the local store.
+    #[tokio::test]
+    async fn registry_index_is_read_once_per_job_even_when_unreadable() {
+        for (registry_platforms, node_platform) in [
+            (
+                vec!["linux/amd64".into(), "linux/arm64".into()],
+                "linux/arm64",
+            ),
+            // Unreadable: the local store's amd64 answers, so amd64 nodes.
+            (Vec::new(), "linux/amd64"),
+        ] {
+            let mut builder = amd64_control_plane_with_multi_arch_index();
+            builder.registry_platforms = registry_platforms;
+            let registry_reads = builder.registry_reads.clone();
+            let job = job_with_image_builder(builder)
+                .with_external_image_tag(REGISTRY_IMAGE.to_string())
+                .with_image_source(DeployImageSource::Registry);
+            let context = crate::test_utils::create_test_context("wf-once".to_string(), 1, 1, 1);
+            let mut output = build_output_with_tags(&[]);
+            output.image_tag = REGISTRY_IMAGE.to_string();
+
+            assert!(job
+                .available_image_platforms(&output)
+                .await
+                .iter()
+                .any(|platform| temps_deployer::platform::platforms_match(
+                    platform,
+                    node_platform
+                )));
+            for _ in 0..3 {
+                let (remote, _requests) =
+                    spawn_recording_agent_on(PULL_OK, false, vec![node_platform], node_platform)
+                        .await;
+                job.ensure_image_on_remote(
+                    REGISTRY_IMAGE,
+                    &remote,
+                    "worker-1",
+                    &context,
+                    None,
+                    Some(1),
+                )
+                .await
+                .expect("the node runs a platform the job has an image for");
+            }
+
+            assert_eq!(
+                registry_reads.load(Ordering::SeqCst),
+                1,
+                "scheduling plus three node checks for {node_platform}"
+            );
+        }
     }
 
     /// A registry-image job whose control plane holds a copy of the tag
@@ -7793,14 +8905,171 @@ mod tests {
 
         assert_agent_requests(
             &requests,
-            &["exists", "pull", "import"],
-            "a failed registry pull must fall back to importing the verified control-plane copy",
+            &["exists", "pull", "import", "inspect"],
+            "a failed registry pull must fall back to importing the verified control-plane copy, \
+             then check the node can run it",
         );
         result.expect("a failed registry pull must fall back to the verified control-plane copy");
         assert!(
             save_image_called.load(Ordering::SeqCst),
             "expected the fallback to export the control plane's copy"
         );
+    }
+
+    /// The registry fallback imports the control plane's copy; a copy without
+    /// the node's architecture is refused like any other import, instead of
+    /// failing at start with `exec format error`.
+    #[tokio::test]
+    async fn ensure_image_on_remote_refuses_a_fallback_import_the_node_cannot_run() {
+        let (remote, requests) = spawn_recording_agent_resolving(PULL_FAILS, "linux/arm64").await;
+        let save_image_called = Arc::new(AtomicBool::new(false));
+        let (job, context) = registry_fallback_job(&save_image_called, Some("sha256:local"));
+
+        let message = job
+            .ensure_image_on_remote(REGISTRY_IMAGE, &remote, "worker-1", &context, None, Some(1))
+            .await
+            .expect_err("a fallback import the node resolves for another architecture is refused")
+            .to_string();
+
+        assert_agent_requests(
+            &requests,
+            &["exists", "pull", "import", "inspect"],
+            "the fallback import is inspected on the node",
+        );
+        assert!(message.contains("worker-1"), "{message}");
+        assert!(message.contains("linux/amd64"), "{message}");
+        assert!(message.contains("linux/arm64"), "{message}");
+    }
+
+    /// A node that already holds the tag for its own architecture keeps it:
+    /// nothing is pulled or imported.
+    #[tokio::test]
+    async fn ensure_image_on_remote_reuses_a_cached_image_the_node_can_run() {
+        let (remote, requests) =
+            spawn_recording_agent_holding(PULL_OK, true, vec!["linux/amd64"]).await;
+        let save_image_called = Arc::new(AtomicBool::new(false));
+        let job = uploaded_image_job(
+            Some(DeployImageSource::ControlPlaneLocal),
+            Some(RecordingImageBuilder {
+                save_image_called: save_image_called.clone(),
+                has_image: true,
+            }),
+        );
+        let context = crate::test_utils::create_test_context("wf-cached".to_string(), 1, 1, 1);
+
+        job.ensure_image_on_remote(UPLOADED_IMAGE, &remote, "worker-1", &context, None, Some(1))
+            .await
+            .expect("a cached image for the node's architecture is reused");
+
+        assert_agent_requests(
+            &requests,
+            &["exists", "inspect"],
+            "a cached image the node can run is only inspected",
+        );
+        assert!(!save_image_called.load(Ordering::SeqCst));
+    }
+
+    /// A node that cached the tag for another architecture (an earlier
+    /// single-arch push) gets the image again rather than starting a
+    /// container that dies with `exec format error`.
+    #[tokio::test]
+    async fn ensure_image_on_remote_replaces_a_cached_image_for_another_architecture() {
+        let (remote, requests) =
+            spawn_recording_agent_holding(PULL_FAILS, true, vec!["linux/arm64", "linux/amd64"])
+                .await;
+        let save_image_called = Arc::new(AtomicBool::new(false));
+        let job = uploaded_image_job(
+            Some(DeployImageSource::ControlPlaneLocal),
+            Some(RecordingImageBuilder {
+                save_image_called: save_image_called.clone(),
+                has_image: true,
+            }),
+        );
+        let context = crate::test_utils::create_test_context("wf-stale".to_string(), 1, 1, 1);
+
+        job.ensure_image_on_remote(UPLOADED_IMAGE, &remote, "worker-1", &context, None, Some(1))
+            .await
+            .expect("a cached image for another architecture is replaced");
+
+        assert_agent_requests(
+            &requests,
+            &["exists", "inspect", "import", "inspect"],
+            "a cached image for another architecture is re-imported and checked again",
+        );
+        assert!(save_image_called.load(Ordering::SeqCst));
+    }
+
+    /// A cached registry image for another architecture is pulled again, past
+    /// the agent's cached-image shortcut, and the node is checked to resolve
+    /// the tag for its own platform afterwards.
+    #[tokio::test]
+    async fn ensure_image_on_remote_pulls_again_over_a_cached_image_for_another_architecture() {
+        let (remote, requests) =
+            spawn_recording_agent_holding(PULL_OK, true, vec!["linux/arm64", "linux/amd64"]).await;
+        let save_image_called = Arc::new(AtomicBool::new(false));
+        let (job, context) = registry_fallback_job(&save_image_called, None);
+
+        job.ensure_image_on_remote(REGISTRY_IMAGE, &remote, "worker-1", &context, None, Some(1))
+            .await
+            .expect("the registry pull replaces the cached image");
+
+        assert_agent_requests(
+            &requests,
+            &["exists", "inspect", "pull-replacing", "inspect"],
+            "a cached registry image for another architecture is pulled again and rechecked",
+        );
+        assert!(!save_image_called.load(Ordering::SeqCst));
+    }
+
+    /// A replacing pull the registry refuses (the agent reports it failed
+    /// rather than handing back the cached copy) falls back to the verified
+    /// control-plane copy, which is checked like any import.
+    #[tokio::test]
+    async fn ensure_image_on_remote_falls_back_when_replacing_a_cached_image_fails() {
+        let (remote, requests) =
+            spawn_recording_agent_holding(PULL_FAILS, true, vec!["linux/arm64", "linux/amd64"])
+                .await;
+        let save_image_called = Arc::new(AtomicBool::new(false));
+        let (job, context) = registry_fallback_job(&save_image_called, Some("sha256:local"));
+
+        job.ensure_image_on_remote(REGISTRY_IMAGE, &remote, "worker-1", &context, None, Some(1))
+            .await
+            .expect("the verified control-plane copy replaces the cached image");
+
+        assert_agent_requests(
+            &requests,
+            &["exists", "inspect", "pull-replacing", "import", "inspect"],
+            "a failed replacing pull falls back to importing the verified copy, then rechecks",
+        );
+        assert!(save_image_called.load(Ordering::SeqCst));
+    }
+
+    /// An agent that predates replacing a cached image hands the old copy back
+    /// from the pull: the deploy is refused with the reason instead of starting
+    /// a container that dies with `exec format error`.
+    #[tokio::test]
+    async fn ensure_image_on_remote_refuses_a_cached_image_the_pull_did_not_replace() {
+        let (remote, requests) =
+            spawn_recording_agent_holding(PULL_OK, true, vec!["linux/arm64"]).await;
+        let save_image_called = Arc::new(AtomicBool::new(false));
+        let (job, context) = registry_fallback_job(&save_image_called, None);
+
+        let message = job
+            .ensure_image_on_remote(REGISTRY_IMAGE, &remote, "worker-1", &context, None, Some(1))
+            .await
+            .expect_err("a cached image still for another architecture is refused")
+            .to_string();
+
+        assert_agent_requests(
+            &requests,
+            &["exists", "inspect", "pull-replacing", "inspect"],
+            "the image is rechecked after the replacing pull",
+        );
+        assert!(message.contains("worker-1"), "{message}");
+        assert!(message.contains("linux/amd64"), "{message}");
+        assert!(message.contains("linux/arm64"), "{message}");
+        assert!(message.contains("upgrade the node agent"), "{message}");
+        assert!(!save_image_called.load(Ordering::SeqCst));
     }
 
     /// The tag was re-pointed on the control plane after this deployment
@@ -8400,5 +9669,510 @@ mod tests {
             unbound.expected_image_identity(&context),
             Some(ExpectedImageIdentity::ImageId("sha256:aaa".to_string()))
         );
+    }
+}
+
+#[cfg(test)]
+mod health_probe_tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use temps_core::repo_config::HealthCheckConfig;
+    use temps_deployer::{ContainerInfo, DeployerError, ExecResult};
+
+    struct ProbeDeployer {
+        states: Mutex<VecDeque<ContainerInfo>>,
+        exits: Mutex<VecDeque<i64>>,
+        exec_timeout: bool,
+        exec_error: bool,
+    }
+
+    impl ProbeDeployer {
+        fn running() -> Self {
+            Self {
+                states: Mutex::new(VecDeque::from([ContainerInfo {
+                    status: DeployerContainerStatus::Running,
+                    restart_count: Some(0),
+                    ..Default::default()
+                }])),
+                exits: Mutex::new(VecDeque::from([0])),
+                exec_timeout: false,
+                exec_error: false,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ContainerDeployer for ProbeDeployer {
+        async fn get_container_info(&self, _id: &str) -> Result<ContainerInfo, DeployerError> {
+            let mut states = self.states.lock().unwrap();
+            let state = states.front().unwrap().clone();
+            if states.len() > 1 {
+                states.pop_front();
+            }
+            Ok(state)
+        }
+        async fn exec_in_container(
+            &self,
+            id: &str,
+            _command: Vec<String>,
+            timeout: Duration,
+        ) -> Result<ExecResult, DeployerError> {
+            if self.exec_timeout {
+                return Err(DeployerError::ExecTimeout {
+                    container_id: id.into(),
+                    timeout_secs: timeout.as_secs(),
+                });
+            }
+            if self.exec_error {
+                return Err(DeployerError::ExecFailed {
+                    container_id: id.into(),
+                    reason: "probe output".into(),
+                });
+            }
+            let mut exits = self.exits.lock().unwrap();
+            let code = *exits.front().unwrap();
+            if exits.len() > 1 {
+                exits.pop_front();
+            }
+            Ok(ExecResult {
+                exit_code: code,
+                output: "probe output".into(),
+                truncated: false,
+            })
+        }
+        async fn deploy_container(
+            &self,
+            _: DeployRequest,
+        ) -> Result<temps_deployer::DeployResult, DeployerError> {
+            unreachable!()
+        }
+        async fn start_container(&self, _: &str) -> Result<(), DeployerError> {
+            unreachable!()
+        }
+        async fn stop_container(&self, _: &str) -> Result<(), DeployerError> {
+            unreachable!()
+        }
+        async fn pause_container(&self, _: &str) -> Result<(), DeployerError> {
+            unreachable!()
+        }
+        async fn resume_container(&self, _: &str) -> Result<(), DeployerError> {
+            unreachable!()
+        }
+        async fn remove_container(&self, _: &str) -> Result<(), DeployerError> {
+            unreachable!()
+        }
+        async fn get_container_stats(
+            &self,
+            _: &str,
+        ) -> Result<temps_deployer::ContainerStats, DeployerError> {
+            unreachable!()
+        }
+        async fn list_containers(&self) -> Result<Vec<ContainerInfo>, DeployerError> {
+            unreachable!()
+        }
+        async fn get_container_logs(&self, _: &str) -> Result<String, DeployerError> {
+            unreachable!()
+        }
+        async fn stream_container_logs(
+            &self,
+            _: &str,
+        ) -> Result<Box<dyn futures::Stream<Item = String> + Send + Unpin>, DeployerError> {
+            unreachable!()
+        }
+    }
+
+    fn probe(kind: &str) -> HealthCheckConfig {
+        HealthCheckConfig {
+            probe_type: Some(kind.into()),
+            stable_for: 1,
+            interval: 1,
+            command: vec!["check-worker".into()],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn health_probe_http_keeps_existing_accepted_and_failed_statuses() {
+        for code in [200, 204, 301, 302, 404, 405] {
+            assert!(http_probe_status_is_healthy(
+                reqwest::StatusCode::from_u16(code).unwrap()
+            ));
+        }
+        for code in [400, 401, 403, 429, 500, 502, 503] {
+            assert!(!http_probe_status_is_healthy(
+                reqwest::StatusCode::from_u16(code).unwrap()
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn health_probe_process_requires_stability_and_is_bounded_by_startup_timeout() {
+        let deployer = ProbeDeployer::running();
+        let start = tokio::time::Instant::now();
+        assert!(wait_for_non_http_probe(
+            &deployer,
+            "worker",
+            &probe("process"),
+            None,
+            Duration::from_secs(2),
+            None,
+        )
+        .await
+        .is_ok());
+        assert!(start.elapsed() >= Duration::from_secs(1));
+        assert!(wait_for_non_http_probe(
+            &deployer,
+            "worker",
+            &probe("process"),
+            None,
+            Duration::from_millis(20),
+            None,
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn health_probe_crash_after_start_and_restart_loop_fail_for_every_kind() {
+        for kind in ["process", "exec", "tcp"] {
+            let deployer = ProbeDeployer::running();
+            deployer.states.lock().unwrap().front_mut().unwrap().status =
+                DeployerContainerStatus::Exited;
+            let result = wait_for_non_http_probe(
+                &deployer,
+                "worker",
+                &probe(kind),
+                Some("127.0.0.1:1"),
+                Duration::from_secs(2),
+                None,
+            )
+            .await;
+            assert!(result.is_err(), "{kind}");
+            let deployer = ProbeDeployer::running();
+            deployer
+                .states
+                .lock()
+                .unwrap()
+                .front_mut()
+                .unwrap()
+                .restart_count = Some(CRASH_LOOP_RESTART_THRESHOLD);
+            assert!(wait_for_non_http_probe(
+                &deployer,
+                "worker",
+                &probe(kind),
+                Some("127.0.0.1:1"),
+                Duration::from_secs(2),
+                None,
+            )
+            .await
+            .is_err());
+        }
+        let deployer = ProbeDeployer::running();
+        let mut exited = deployer.states.lock().unwrap().front().unwrap().clone();
+        exited.status = DeployerContainerStatus::Exited;
+        deployer.states.lock().unwrap().push_back(exited);
+        assert!(wait_for_non_http_probe(
+            &deployer,
+            "worker",
+            &probe("process"),
+            None,
+            Duration::from_secs(3),
+            None,
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn health_probe_process_restart_resets_the_stability_window() {
+        let deployer = ProbeDeployer::running();
+        let mut restarted = deployer.states.lock().unwrap().front().unwrap().clone();
+        restarted.restart_count = Some(1);
+        deployer.states.lock().unwrap().push_back(restarted);
+        let start = tokio::time::Instant::now();
+        assert!(wait_for_non_http_probe(
+            &deployer,
+            "worker",
+            &probe("process"),
+            None,
+            Duration::from_secs(4),
+            None,
+        )
+        .await
+        .is_ok());
+        assert!(start.elapsed() >= Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn health_probe_exec_retries_nonzero_then_passes_and_rejects_unknown_commands() {
+        let deployer = ProbeDeployer::running();
+        *deployer.exits.lock().unwrap() = VecDeque::from([1, 0]);
+        assert!(wait_for_non_http_probe(
+            &deployer,
+            "worker",
+            &probe("exec"),
+            None,
+            Duration::from_secs(3),
+            None,
+        )
+        .await
+        .is_ok());
+        *deployer.exits.lock().unwrap() = VecDeque::from([127]);
+        let error = wait_for_non_http_probe(
+            &deployer,
+            "worker",
+            &probe("exec"),
+            None,
+            Duration::from_secs(3),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("health.command"));
+        *deployer.exits.lock().unwrap() = VecDeque::from([1]);
+        assert!(wait_for_non_http_probe(
+            &deployer,
+            "worker",
+            &probe("exec"),
+            None,
+            Duration::from_millis(20),
+            None,
+        )
+        .await
+        .is_err());
+    }
+
+    struct ProbeLog(Mutex<Vec<String>>);
+
+    #[async_trait]
+    impl crate::workflow::LogWriter for ProbeLog {
+        async fn write_log(&self, message: String) -> Result<(), WorkflowError> {
+            self.0.lock().unwrap().push(message);
+            Ok(())
+        }
+        fn stage_id(&self) -> i32 {
+            1
+        }
+    }
+
+    #[tokio::test]
+    async fn health_probe_exec_output_is_only_written_to_authorized_job_log() {
+        let deployer = Arc::new(ProbeDeployer::running());
+        *deployer.exits.lock().unwrap() = VecDeque::from([127]);
+        let job = DeployImageJobBuilder::new(
+            "worker",
+            temps_core::docker_socket_grant::DeployCaller::Platform,
+        )
+        .job_id("deploy".into())
+        .build_job_id("build".into())
+        .target(DeploymentTarget::Docker {
+            registry_url: "local".into(),
+            network: None,
+        })
+        .service_name("worker".into())
+        .build(deployer.clone())
+        .unwrap();
+        let log = Arc::new(ProbeLog(Mutex::new(Vec::new())));
+        let context = WorkflowContext::new("worker".into(), 1, 1, 1, log.clone());
+        let error = wait_for_non_http_probe(
+            deployer.as_ref(),
+            "worker",
+            &probe("exec"),
+            None,
+            Duration::from_secs(2),
+            Some((&job, &context)),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(!error.contains("probe output"));
+        assert!(log
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|line| line.contains("probe output")));
+    }
+
+    #[tokio::test]
+    async fn health_probe_exec_output_never_enters_failure_details() {
+        for exit in [1, 126, 127] {
+            let deployer = ProbeDeployer::running();
+            *deployer.exits.lock().unwrap() = VecDeque::from([exit]);
+            let error = wait_for_non_http_probe(
+                &deployer,
+                "worker",
+                &probe("exec"),
+                None,
+                Duration::from_millis(20),
+                None,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(&exit.to_string()), "{error}");
+            assert!(
+                !error.contains("probe output"),
+                "exec output must only appear in authorized job logs"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn health_probe_runtime_diagnostics_are_not_persisted() {
+        let mut deployer = ProbeDeployer::running();
+        deployer.exec_error = true;
+        let error = wait_for_non_http_probe(
+            &deployer,
+            "worker",
+            &probe("exec"),
+            None,
+            Duration::from_secs(2),
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("exec probe failed"));
+        assert!(!error.contains("probe output"));
+    }
+
+    #[tokio::test]
+    async fn health_probe_exec_timeout_crash_during_command_and_unknown_kind_fail_closed() {
+        let mut deployer = ProbeDeployer::running();
+        deployer.exec_timeout = true;
+        assert!(wait_for_non_http_probe(
+            &deployer,
+            "worker",
+            &probe("exec"),
+            None,
+            Duration::from_secs(2),
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("timeout"));
+        let deployer = ProbeDeployer::running();
+        let mut exited = deployer.states.lock().unwrap().front().unwrap().clone();
+        exited.status = DeployerContainerStatus::Exited;
+        deployer.states.lock().unwrap().push_back(exited);
+        assert!(wait_for_non_http_probe(
+            &deployer,
+            "worker",
+            &probe("exec"),
+            None,
+            Duration::from_secs(2),
+            None,
+        )
+        .await
+        .is_err());
+        assert!(wait_for_non_http_probe(
+            &deployer,
+            "worker",
+            &probe("typo"),
+            None,
+            Duration::from_secs(2),
+            None,
+        )
+        .await
+        .is_err());
+        let mut malformed = probe("exec");
+        malformed.command.clear();
+        assert!(wait_for_non_http_probe(
+            &deployer,
+            "worker",
+            &malformed,
+            None,
+            Duration::from_secs(2),
+            None,
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn health_probe_tcp_success_refused_connection_and_missing_port() {
+        let deployer = ProbeDeployer::running();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        assert!(wait_for_non_http_probe(
+            &deployer,
+            "tcp-service",
+            &probe("tcp"),
+            Some(&address),
+            Duration::from_secs(1),
+            None,
+        )
+        .await
+        .is_ok());
+        drop(listener);
+        assert!(wait_for_non_http_probe(
+            &deployer,
+            "tcp-service",
+            &probe("tcp"),
+            Some(&address),
+            Duration::from_millis(20),
+            None,
+        )
+        .await
+        .is_err());
+        assert!(wait_for_non_http_probe(
+            &deployer,
+            "tcp-service",
+            &probe("tcp"),
+            None,
+            Duration::from_secs(1),
+            None,
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn health_probe_tcp_rejects_a_forwarder_that_accepts_then_closes() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let forwarder = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        let error = wait_for_non_http_probe(
+            &ProbeDeployer::running(),
+            "tcp-service",
+            &probe("tcp"),
+            Some(&address),
+            Duration::from_millis(250),
+            None,
+        )
+        .await
+        .unwrap_err();
+        forwarder.abort();
+        assert!(error.to_string().contains("TCP connection closed"));
+    }
+
+    #[tokio::test]
+    async fn health_probe_tcp_confirmation_accepts_a_banner_and_honors_deadlines() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stream = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+        assert!(confirm_tcp_probe_connection(
+            &stream,
+            tokio::time::Instant::now() + Duration::from_millis(10)
+        )
+        .await
+        .is_err());
+        server.write_all(b"ready\n").await.unwrap();
+        assert!(confirm_tcp_probe_connection(
+            &stream,
+            tokio::time::Instant::now() + Duration::from_secs(1)
+        )
+        .await
+        .is_ok());
     }
 }

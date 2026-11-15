@@ -64,11 +64,11 @@ afterEach(() => {
   client.setConfig({ baseUrl: originalBaseUrl })
 })
 
-function mount() {
+function mount(settings: object = STORED) {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   })
-  queryClient.setQueryData(['platform-settings'], STORED)
+  queryClient.setQueryData(['platform-settings'], settings)
   return render(
     <QueryClientProvider client={queryClient}>
       <MemoryRouter>
@@ -103,6 +103,29 @@ function field(view: ReturnType<typeof mount>, name: string) {
   ) as HTMLInputElement
 }
 
+test('missing analytics settings default to 365 days and can be adjusted', async () => {
+  const legacy = { ...STORED, analytics_retention: undefined }
+  globalThis.fetch = (async (input: Request | string | URL) => {
+    const request =
+      input instanceof Request ? input : new Request(String(input))
+    if (request.method === 'PUT') {
+      recorded.puts.push(JSON.parse(await request.text()))
+    }
+    return new Response(JSON.stringify(legacy), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })
+  }) as unknown as typeof fetch
+  const view = mount(legacy)
+  await waitFor(() => expect(field(view, 'events_days').value).toBe('365'))
+  expect(view.getByText(/Defaults to 365 days/)).toBeTruthy()
+
+  fireEvent.change(field(view, 'events_days'), { target: { value: '90' } })
+  fireEvent.click(await view.findByRole('button', { name: 'Save' }))
+  await waitFor(() => expect(recorded.puts).toHaveLength(1))
+  expect(recorded.puts[0].analytics_retention.events_days).toBe(90)
+})
+
 test('stored retention windows fill the form, and an empty optional one is saved as keep', async () => {
   const view = mount()
   await waitFor(() => expect(field(view, 'visitor_days').value).toBe('120'))
@@ -111,7 +134,7 @@ test('stored retention windows fill the form, and an empty optional one is saved
 
   fireEvent.change(field(view, 'error_events_days'), { target: { value: '' } })
   fireEvent.change(field(view, 'events_days'), { target: { value: '60' } })
-  fireEvent.click(await view.findByText('Save Changes'))
+  fireEvent.click(await view.findByRole('button', { name: 'Save' }))
 
   await waitFor(() => expect(recorded.puts).toHaveLength(1))
   expect(recorded.puts[0].analytics_retention).toEqual({
@@ -140,4 +163,18 @@ test('an invalid window is reported and nothing is sent', async () => {
   fireEvent.submit(form)
   await view.findByText('A retention window is required')
   expect(recorded.puts).toHaveLength(0)
+})
+
+test('retention explains both event stores, asynchronous expiry and visitor cleanup scope', () => {
+  const view = mount()
+  expect(
+    view.getByText(/Applies to both PostgreSQL and ClickHouse/).textContent
+  ).toContain('asynchronous background merges')
+  expect(
+    view.getByText(/With ClickHouse enabled, their events are removed/)
+      .textContent
+  ).toContain('a ClickHouse failure leaves the visitor for retry')
+  expect(
+    view.getByText(/There is no manual visitor-delete action/).textContent
+  ).toContain('this is not erasure of all visitor data')
 })

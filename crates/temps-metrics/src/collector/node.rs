@@ -40,6 +40,7 @@
 //! | `node.disk_write_bytes_total` | Gauge (cumulative) | Bytes written to physical block devices since boot (`/proc/diskstats`) |
 //! | `node.network_rx_bytes_total` | Gauge (cumulative) | Bytes received on non-virtual interfaces since boot (`/proc/net/dev`) |
 //! | `node.network_tx_bytes_total` | Gauge (cumulative) | Bytes transmitted on non-virtual interfaces since boot (`/proc/net/dev`) |
+//! | `node.raid_*`, `node.disk_wear_percent`, `node.disk_media_errors`, `node.disk_bytes_written_total`, `node.disk_health_drives*` | Gauge | RAID array and drive health — see [`super::disk_health`] |
 //!
 //! ## Cumulative I/O counters
 //!
@@ -70,6 +71,7 @@ use std::path::Path;
 use std::sync::Mutex;
 use tracing::{debug, warn};
 
+use super::disk_health::{DiskHealthReport, DriveHealthCache};
 use super::{Collector, CollectorConfig};
 use crate::error::MetricsError;
 use crate::store::{MetricKind, MetricPoint, SourceKind};
@@ -81,12 +83,69 @@ struct CpuSnapshot {
     total: u64,
 }
 
+/// Which series a [`NodeMetricsCollector`] emits.
+///
+/// The machine-wide series and the `node.process_*` series belong to different
+/// owners once the console and the proxy run as separate processes (ADR-017):
+/// the host is sampled once, by the console, and each proxy reports only its
+/// own file descriptors. Sampling the host from both would write every
+/// machine-wide series twice under the same node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NodeMetricsScope {
+    /// Everything: one process runs both the console and the proxy.
+    #[default]
+    All,
+    /// Machine-wide series only: CPU, memory, load, disk space, system-wide
+    /// file descriptors, block and network I/O.
+    Host,
+    /// This process's own file descriptors only (`node.process_*`).
+    Process,
+}
+
+impl NodeMetricsScope {
+    fn host(self) -> bool {
+        matches!(self, Self::All | Self::Host)
+    }
+
+    fn process(self) -> bool {
+        matches!(self, Self::All | Self::Process)
+    }
+}
+
+/// Every series [`NodeMetricsScope::Host`] can emit, on any platform.
+///
+/// This is the closed set a worker may report for its host (ADR 061): the
+/// control plane stores a worker-reported host point only when its name is in
+/// this list, so a worker cannot make the control plane create a series this
+/// collector would never have written. A test keeps it in step with the
+/// collector.
+pub const HOST_METRIC_NAMES: &[&str] = &[
+    "node.cpu_percent",
+    "node.memory_used_bytes",
+    "node.memory_total_bytes",
+    "node.memory_percent",
+    "node.load_avg_1m",
+    "node.load_avg_5m",
+    "node.load_avg_15m",
+    "node.disk_used_bytes",
+    "node.disk_total_bytes",
+    "node.disk_percent",
+    "node.fd_allocated",
+    "node.fd_max",
+    "node.fd_percent",
+    "node.disk_read_bytes_total",
+    "node.disk_write_bytes_total",
+    "node.network_rx_bytes_total",
+    "node.network_tx_bytes_total",
+];
+
 /// Node metric collector.
 ///
 /// Holds CPU baseline state across calls inside a `Mutex` so the collector can
 /// implement `Sync` while mutating the snapshot.  All other metrics are
 /// stateless reads from `/proc` or `statvfs(2)`.
 pub struct NodeMetricsCollector {
+    scope: NodeMetricsScope,
     /// Previous CPU tick snapshot; `None` before the first scrape.
     prev_cpu: Mutex<Option<CpuSnapshot>>,
     /// Cross-platform fallback state (non-Linux only). `sysinfo` computes CPU
@@ -94,15 +153,39 @@ pub struct NodeMetricsCollector {
     /// must outlive a single scrape — same reason `prev_cpu` exists above.
     #[cfg(not(target_os = "linux"))]
     fallback: Mutex<fallback::FallbackState>,
+    /// SMART readings, refreshed in the background (see
+    /// [`super::disk_health::DriveHealthCache`]). `None` when this collector
+    /// does not report disk health (see [`Self::without_disk_health`]).
+    drive_health: Option<std::sync::Arc<DriveHealthCache>>,
 }
 
 impl NodeMetricsCollector {
     pub fn new() -> Self {
+        Self::with_scope(NodeMetricsScope::All)
+    }
+
+    pub fn with_scope(scope: NodeMetricsScope) -> Self {
         Self {
+            scope,
+            drive_health: Some(DriveHealthCache::new("/sys/block")),
             prev_cpu: Mutex::new(None),
             #[cfg(not(target_os = "linux"))]
             fallback: Mutex::new(fallback::FallbackState::new()),
         }
+    }
+}
+
+impl NodeMetricsCollector {
+    /// Leave RAID and drive health out of this collector's points.
+    ///
+    /// A worker reports disk health in its heartbeat, from the agent's own
+    /// [`DriveHealthCache`], and its host-scope report (ADR 061) may carry
+    /// only [`HOST_METRIC_NAMES`]. Its host collector therefore skips disk
+    /// health instead of reading SMART a second time for points the control
+    /// plane would refuse.
+    pub fn without_disk_health(mut self) -> Self {
+        self.drive_health = None;
+        self
     }
 }
 
@@ -131,29 +214,44 @@ impl Collector for NodeMetricsCollector {
         let now = Utc::now();
         let mut points = Vec::new();
 
-        // CPU — synchronous (no I/O latency).
-        points.extend(self.collect_cpu(source_id, config, now));
+        if self.scope.host() {
+            // CPU — synchronous (no I/O latency).
+            points.extend(self.collect_cpu(source_id, config, now));
 
-        // Memory — async file read.
-        points.extend(collect_memory(source_id, config, now).await);
+            // Memory — async file read.
+            points.extend(collect_memory(source_id, config, now).await);
 
-        // Load average — async file read.
-        points.extend(collect_loadavg(source_id, config, now).await);
+            // Load average — async file read.
+            points.extend(collect_loadavg(source_id, config, now).await);
 
-        // Disk — synchronous statvfs call.
-        points.extend(collect_disk(source_id, config, Path::new(data_dir), now));
+            // Disk — synchronous statvfs call.
+            points.extend(collect_disk(source_id, config, Path::new(data_dir), now));
 
-        // File descriptors — synchronous /proc reads + getrlimit(2).
-        points.extend(collect_system_fds(source_id, config, now));
-        points.extend(collect_process_fds(source_id, config, now));
+            // System-wide file descriptors — synchronous /proc reads.
+            points.extend(collect_system_fds(source_id, config, now));
 
-        // Block + network I/O — cumulative kernel counters.
-        points.extend(collect_disk_io(source_id, config, now).await);
-        points.extend(collect_network_io(source_id, config, now).await);
+            // Block + network I/O — cumulative kernel counters.
+            points.extend(collect_disk_io(source_id, config, now).await);
+            points.extend(collect_network_io(source_id, config, now).await);
 
-        // Non-Linux: fill whatever `/proc` could not answer from `sysinfo`.
-        #[cfg(not(target_os = "linux"))]
-        points.extend(self.collect_fallback(source_id, config, now));
+            // RAID arrays (fresh every scrape) and drive health (cached SMART).
+            if let Some(drive_health) = &self.drive_health {
+                points.extend(
+                    DiskHealthReport::read(drive_health)
+                        .await
+                        .points(config, now),
+                );
+            }
+
+            // Non-Linux: fill whatever `/proc` could not answer from `sysinfo`.
+            #[cfg(not(target_os = "linux"))]
+            points.extend(self.collect_fallback(source_id, config, now));
+        }
+
+        // This process's file descriptors — /proc/self/fd + getrlimit(2).
+        if self.scope.process() {
+            points.extend(collect_process_fds(source_id, config, now));
+        }
 
         debug!(
             source_id,
@@ -837,9 +935,15 @@ mod fallback {
     use sysinfo::{CpuRefreshKind, Disks, MemoryRefreshKind, Networks, RefreshKind, System};
 
     pub struct FallbackState {
-        system: System,
-        networks: Networks,
-        disks: Disks,
+        /// `None` on a platform sysinfo does not support; the CPU and memory
+        /// series are then absent rather than reported as zero.
+        system: Option<System>,
+        /// `None` when the platform could not enumerate interfaces at startup;
+        /// the network series is then absent rather than reported as zero.
+        networks: Option<Networks>,
+        /// `None` when the platform could not enumerate disks at startup; the
+        /// block I/O series is then absent rather than reported as zero.
+        disks: Option<Disks>,
         /// `sysinfo` reports 0% CPU on the very first refresh (no baseline);
         /// mirror the `/proc/stat` path and skip that sample.
         cpu_primed: bool,
@@ -849,13 +953,25 @@ mod fallback {
         pub fn new() -> Self {
             let system = System::new_with_specifics(
                 RefreshKind::nothing()
-                    .with_cpu(CpuRefreshKind::nothing().with_cpu_usage())
+                    .with_cpu(CpuRefreshKind::nothing().with_usage())
                     .with_memory(MemoryRefreshKind::nothing().with_ram()),
-            );
+            )
+            .inspect_err(|error| {
+                tracing::warn!(%error, "Could not read host CPU and memory; those metrics are unavailable");
+            })
+            .ok();
             Self {
                 system,
-                networks: Networks::new_with_refreshed_list(),
-                disks: Disks::new_with_refreshed_list(),
+                networks: Networks::new_with_refreshed_list()
+                    .inspect_err(|error| {
+                        tracing::warn!(%error, "Could not list network interfaces; network metrics are unavailable");
+                    })
+                    .ok(),
+                disks: Disks::new_with_refreshed_list()
+                    .inspect_err(|error| {
+                        tracing::warn!(%error, "Could not list mounted disks; block I/O metrics are unavailable");
+                    })
+                    .ok(),
                 cpu_primed: false,
             }
         }
@@ -863,26 +979,30 @@ mod fallback {
         /// Refresh and return `(cpu_percent, memory_used, memory_total)`.
         /// `cpu_percent` is `None` on the first call.
         pub fn sample_cpu_memory(&mut self) -> (Option<f64>, u64, u64) {
-            self.system.refresh_cpu_usage();
-            self.system
-                .refresh_memory_specifics(MemoryRefreshKind::nothing().with_ram());
+            let Some(system) = self.system.as_mut() else {
+                return (None, 0, 0);
+            };
+            system.refresh_cpu_usage();
+            system.refresh_memory_specifics(MemoryRefreshKind::nothing().with_ram());
             let cpu = if self.cpu_primed {
-                Some(f64::from(self.system.global_cpu_usage()).clamp(0.0, 100.0))
+                Some(f64::from(system.global_cpu_usage()).clamp(0.0, 100.0))
             } else {
                 self.cpu_primed = true;
                 None
             };
-            (cpu, self.system.used_memory(), self.system.total_memory())
+            (cpu, system.used_memory(), system.total_memory())
         }
 
         /// Cumulative (rx, tx) bytes over non-virtual interfaces.
         pub fn sample_network(&mut self) -> Option<(u64, u64)> {
-            self.networks.refresh(true);
+            let networks = self.networks.as_mut()?;
+            networks.refresh(true);
             let mut rx = 0u64;
             let mut tx = 0u64;
             let mut seen = false;
-            for (name, data) in self.networks.iter() {
-                if super::is_virtual_interface(name)
+            for (name, data) in networks.iter() {
+                let name = name.to_string_lossy();
+                if super::is_virtual_interface(&name)
                     // macOS names: loopback is `lo0`, Docker Desktop/colima
                     // bridges show up as `bridge*`/`utun*`/`vmenet*`.
                     || name.starts_with("lo")
@@ -908,11 +1028,12 @@ mod fallback {
         /// physical counters, so volumes are de-duplicated by
         /// `(name, total_space)` — a stand-in for "same physical device".
         pub fn sample_disk_io(&mut self) -> Option<(u64, u64)> {
-            self.disks.refresh(true);
+            let disks = self.disks.as_mut()?;
+            disks.refresh(true);
             let mut read = 0u64;
             let mut write = 0u64;
             let mut seen_devices: Vec<(std::ffi::OsString, u64)> = Vec::new();
-            for disk in self.disks.list() {
+            for disk in disks.iter() {
                 let key = (disk.name().to_os_string(), disk.total_space());
                 if seen_devices.contains(&key) {
                     continue;
@@ -1439,5 +1560,69 @@ docker0: 777 7 0 0 0 0 0 0 888 8 0 0 0 0 0 0
         assert!(names.contains(&"node.memory_used_bytes"), "{names:?}");
         assert!(names.contains(&"node.memory_total_bytes"), "{names:?}");
         assert!(names.contains(&"node.cpu_percent"), "{names:?}");
+    }
+
+    /// The control plane's host collector reports RAID and drive health; a
+    /// worker's leaves it to the heartbeat.
+    #[tokio::test]
+    async fn disk_health_is_reported_unless_opted_out() {
+        let config = make_config(1, "/tmp");
+        // Every series the disk-health reader emits, RAID and drive alike.
+        const DISK_HEALTH_NAMES: [&str; 8] = [
+            "node.raid_arrays",
+            "node.raid_degraded",
+            "node.raid_devices_failed",
+            "node.disk_health_drives",
+            "node.disk_health_drives_detected",
+            "node.disk_wear_percent",
+            "node.disk_media_errors",
+            "node.disk_bytes_written_total",
+        ];
+        let is_disk_health = |name: &str| DISK_HEALTH_NAMES.contains(&name);
+
+        let worker = NodeMetricsCollector::with_scope(NodeMetricsScope::Host).without_disk_health();
+        let points = worker.collect(&config).await.unwrap();
+        assert!(!points.is_empty());
+        assert!(
+            !points.iter().any(|p| is_disk_health(&p.name)),
+            "a worker's host collector must not emit disk health"
+        );
+
+        // `/proc/mdstat` exists on every Linux host, RAID or not, so the
+        // control plane always records at least `node.raid_arrays`.
+        if std::path::Path::new("/proc/mdstat").exists() {
+            let control_plane = NodeMetricsCollector::with_scope(NodeMetricsScope::Host);
+            let points = control_plane.collect(&config).await.unwrap();
+            assert!(points.iter().any(|p| p.name == "node.raid_arrays"));
+        }
+    }
+
+    /// A worker reports its host with this collector in host scope, and the
+    /// control plane accepts only `HOST_METRIC_NAMES`. Anything the collector
+    /// emits outside that list would be silently refused for every worker.
+    #[tokio::test]
+    async fn host_scope_emits_only_names_a_worker_may_report() {
+        // Built the way the agent builds it: disk health travels in the
+        // heartbeat instead.
+        let collector =
+            NodeMetricsCollector::with_scope(NodeMetricsScope::Host).without_disk_health();
+        let config = make_config(1, "/tmp");
+        // Two passes: the first primes the CPU baseline, the second carries
+        // `node.cpu_percent`.
+        let _ = collector.collect(&config).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let points = collector.collect(&config).await.unwrap();
+        assert!(!points.is_empty());
+        for p in &points {
+            assert!(
+                HOST_METRIC_NAMES.contains(&p.name.as_str()),
+                "host scope emitted {} which a worker could not report",
+                p.name
+            );
+        }
+        // And the list holds nothing process-scoped.
+        assert!(HOST_METRIC_NAMES
+            .iter()
+            .all(|name| !name.starts_with("node.process_")));
     }
 }

@@ -7,6 +7,7 @@
 //! (JWT/session) since they are accessed by the Temps dashboard, not by
 //! OTel collectors.
 
+use crate::error::OtelError;
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -22,7 +23,7 @@ use crate::services::cross_project::is_valid_trace_id;
 use crate::services::{CrossProjectTraceError, SiblingRef, UnifiedTrace};
 use crate::types::*;
 use crate::OtelAppState;
-use temps_auth::{
+use temps_authz::{
     deny_deployment_token, permission_guard, project_access_guard, project_scope_guard, RequireAuth,
 };
 use temps_core::problemdetails::{self, Problem};
@@ -175,6 +176,10 @@ pub struct LogQueryParams {
     pub end_time: Option<String>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
+    pub attribute_key: Option<String>,
+    pub attribute_value: Option<String>,
+    pub attribute_type: Option<LogAttributeType>,
+    pub attribute_op: Option<LogAttributeOperator>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1192,6 +1197,10 @@ pub async fn get_trace(
         ("severity" = Option<String>, Query, description = "Filter by severity (TRACE, DEBUG, INFO, WARN, ERROR, FATAL)"),
         ("service_name" = Option<String>, Query, description = "Filter by service name"),
         ("search" = Option<String>, Query, description = "Full-text search in log body (ILIKE)"),
+        ("attribute_key" = Option<String>, Query, description = "Exact attribute key; pair with attribute_value"),
+        ("attribute_value" = Option<String>, Query, description = "Exact string or numeric text, preserving int64 precision"),
+        ("attribute_type" = Option<LogAttributeType>, Query, description = "Optional native declared type; older records without type metadata do not match"),
+        ("attribute_op" = Option<LogAttributeOperator>, Query, description = "Default eq; numeric types also support lt/lte/gt/gte"),
         ("trace_id" = Option<String>, Query, description = "Filter by correlated trace ID"),
         ("start_time" = Option<String>, Query, description = "Start time (RFC 3339)"),
         ("end_time" = Option<String>, Query, description = "End time (RFC 3339)"),
@@ -1200,6 +1209,7 @@ pub async fn get_trace(
     ),
     responses(
         (status = 200, description = "Log records", body = LogsResponse),
+        (status = 400, description = "Invalid log attribute filter", body = ProblemDetails),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 500, description = "Internal server error", body = ProblemDetails),
@@ -1227,8 +1237,27 @@ pub async fn query_logs(
         _ => LogSeverity::Info,
     });
 
+    let attribute_filter = if params.attribute_key.is_some()
+        || params.attribute_value.is_some()
+        || params.attribute_type.is_some()
+        || params.attribute_op.is_some()
+    {
+        let invalid = || OtelError::Validation {
+            message: "Provide both attribute_key and attribute_value for a log attribute filter"
+                .into(),
+        };
+        Some(LogAttributeFilter {
+            key: params.attribute_key.ok_or_else(invalid)?,
+            value: params.attribute_value.ok_or_else(invalid)?,
+            ty: params.attribute_type,
+            operator: params.attribute_op.unwrap_or_default(),
+        })
+    } else {
+        None
+    };
     let query = LogQuery {
         project_id: params.project_id,
+        attribute_filter,
         severity,
         service_name: params.service_name,
         search: params.search,
@@ -1883,13 +1912,13 @@ pub struct CrossProjectSiblingsParams {
 /// team model in OSS to scope against. Infrastructure errors from the checker
 /// drop the project (fail closed) rather than disclosing its spans.
 async fn readable_project_ids(
-    auth: &temps_auth::AuthContext,
+    auth: &temps_authz::AuthContext,
     state: &OtelAppState,
     project_ids: impl IntoIterator<Item = i32>,
 ) -> std::collections::HashSet<i32> {
     let project_ids: std::collections::HashSet<i32> = project_ids.into_iter().collect();
 
-    if auth.is_admin() || auth.has_role(&temps_auth::Role::PlatformAdmin) {
+    if auth.is_admin() || auth.has_role(&temps_authz::Role::PlatformAdmin) {
         return project_ids;
     }
     let Some(checker) = state.project_access_checker.as_deref() else {
@@ -2202,6 +2231,7 @@ mod tests {
             project_id,
             project_name: format!("project-{project_id}"),
             span: SpanRecord {
+                ingest_identity: None,
                 project_id,
                 deployment_id: None,
                 resource: crate::types::ResourceInfo {

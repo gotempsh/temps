@@ -12,6 +12,7 @@ import {
   Globe,
   HardDrive,
   KeyRound,
+  ListFilter,
   Server,
   Settings2,
   Shield,
@@ -62,7 +63,7 @@ const settingsGroups: SettingsGroup[] = [
       {
         title: 'Domains',
         description: 'Attach and manage service domains.',
-        url: 'settings/domains',
+        url: 'domains',
         icon: Globe,
       },
     ],
@@ -88,6 +89,13 @@ const settingsGroups: SettingsGroup[] = [
         description: 'Headers and service security controls.',
         url: 'settings/security',
         icon: Shield,
+      },
+      {
+        title: 'Edge rules',
+        description:
+          'Block, allow, challenge or redirect requests before they reach your app.',
+        url: 'settings/edge-rules',
+        icon: ListFilter,
       },
       {
         title: 'Access',
@@ -146,7 +154,7 @@ const settingsGroups: SettingsGroup[] = [
     items: [
       {
         title: 'Cron jobs',
-        description: 'Run commands on a schedule.',
+        description: 'Call endpoints of your app on a schedule.',
         url: 'settings/cron-jobs',
         icon: AlarmClock,
       },

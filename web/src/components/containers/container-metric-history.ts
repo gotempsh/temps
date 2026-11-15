@@ -2,7 +2,17 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 interface MetricHistoryPoint {
-  value: number
+  /** `null` for a bucket the container reported no sample in. */
+  value?: number | null
+}
+
+/** Whether any bucket of the history holds a sample. */
+export function hasMetricHistory(
+  history: MetricHistoryPoint[] | undefined
+): boolean {
+  return (history ?? []).some(
+    (point) => point.value != null && Number.isFinite(point.value)
+  )
 }
 
 /**
@@ -14,9 +24,10 @@ export function buildMetricHistorySeries(
   history: MetricHistoryPoint[] | undefined,
   currentValue?: number | null
 ): number[] {
+  // Trend glyph only: buckets without a sample are dropped rather than drawn.
   const values = (history ?? [])
     .map((point) => point.value)
-    .filter(Number.isFinite)
+    .filter((value): value is number => value != null && Number.isFinite(value))
 
   if (currentValue != null && Number.isFinite(currentValue)) {
     values.push(currentValue)

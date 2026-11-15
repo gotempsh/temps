@@ -15,11 +15,11 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
-import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import { ExternalLink } from 'lucide-react'
 import * as React from 'react'
 import { useNavigate, useSearchParams } from 'react-router'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 interface PagesChartProps {
   project: ProjectResponse
@@ -56,7 +56,7 @@ export function PagesChart({
     return qs ? `?${qs}` : ''
   }
 
-  const { data, isLoading, error } = useQuery({
+  const { data, isLoading, error } = useWindowQuery({
     ...getPropertyBreakdownOptions({
       path: {
         project_id: project.id,
@@ -91,7 +91,7 @@ export function PagesChart({
       <CardHeader>
         <div className="flex items-center justify-between">
           <div>
-            <CardTitle>Top Pages</CardTitle>
+            <CardTitle>Top pages</CardTitle>
             <CardDescription>
               {startDate && endDate
                 ? `${format(startDate, 'LLL dd, y')} - ${format(endDate, 'LLL dd, y')}`

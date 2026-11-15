@@ -8,7 +8,9 @@ use sea_orm::{
 use serde::Serialize;
 use slug::slugify;
 use std::sync::Arc;
+use temps_config::deployment_config::DeploymentConfigExt;
 use temps_core::problemdetails::Problem;
+use temps_core::secret_string::SecretString;
 use temps_core::{
     EnvironmentCreatedJob, EnvironmentDeletedJob, Job, JobQueue, PublicHostnameStrategy,
 };
@@ -293,6 +295,8 @@ pub struct EnvironmentService {
     db: Arc<temps_database::DbConnection>,
     config_service: Arc<temps_config::ConfigService>,
     queue_service: Option<Arc<dyn JobQueue>>,
+    /// Whether the control plane itself runs workloads.
+    local_workloads_enabled: bool,
 }
 
 impl EnvironmentService {
@@ -304,7 +308,13 @@ impl EnvironmentService {
             db,
             config_service,
             queue_service: None,
+            local_workloads_enabled: true,
         }
+    }
+
+    pub fn with_local_workloads(mut self, enabled: bool) -> Self {
+        self.local_workloads_enabled = enabled;
+        self
     }
 
     pub fn with_queue_service(mut self, queue_service: Arc<dyn JobQueue>) -> Self {
@@ -768,6 +778,14 @@ impl EnvironmentService {
         branch: String,
         replicas: Option<i32>,
     ) -> Result<environments::Model, EnvironmentError> {
+        if let Some(replicas) = replicas {
+            temps_config::deployment_config::validate_replicas(replicas).map_err(|e| {
+                EnvironmentError::InvalidInput(format!(
+                    "Invalid replicas for new environment '{name}' in project {project_id}: {e}"
+                ))
+            })?;
+        }
+
         // Verify project exists
         let txn = self.db.begin().await?;
         let project = self.lock_project(&txn, project_id).await?;
@@ -963,12 +981,79 @@ impl EnvironmentService {
     /// exceed them, so the check would be theatre for them. Everyone else is
     /// held to `AppSettings.tenant_resource_ceilings`, which is unenforced
     /// until an operator configures it.
+    /// What to tell the operator when this environment's replicas can't all get a
+    /// node of their own. Advisory, so a failed lookup means no warning, not a
+    /// failed request. Settings resolve the way a deployment resolves them, and the
+    /// count applies the scheduler's node filters, except architecture, which depends
+    /// on the image and only the deploy log can report.
+    pub async fn placement_warning(
+        &self,
+        environment: &temps_entities::environments::Model,
+    ) -> Option<String> {
+        let environment_config = environment.deployment_config.as_ref();
+        if environment_config.is_some_and(|config| !spreads_replicas(config)) {
+            return None;
+        }
+        let project = projects::Entity::find_by_id(environment.project_id)
+            .one(self.db.as_ref())
+            .await
+            .inspect_err(|error| {
+                warn!(
+                    environment_id = environment.id,
+                    project_id = environment.project_id,
+                    "Could not read the project for the placement warning: {}",
+                    error
+                );
+            })
+            .ok()?;
+        let project_config = project
+            .as_ref()
+            .and_then(|project| project.deployment_config.as_ref());
+        let config = environment_config.or(project_config)?;
+        if !spreads_replicas(config) {
+            return None;
+        }
+
+        let targets = environment_config
+            .and_then(|config| config.configured_target_nodes())
+            .or_else(|| project_config.and_then(|config| config.configured_target_nodes()));
+        let labels = environment_config
+            .and_then(|config| config.configured_target_labels())
+            .or_else(|| project_config.and_then(|config| config.configured_target_labels()));
+
+        let heartbeat_cutoff = chrono::Utc::now()
+            - chrono::Duration::seconds(temps_entities::nodes::PLACEMENT_HEARTBEAT_THRESHOLD_SECS);
+        let mut query = temps_entities::nodes::Entity::find()
+            .filter(temps_entities::nodes::Column::Status.eq("active"))
+            .filter(temps_entities::nodes::Column::LastHeartbeat.gte(heartbeat_cutoff));
+        if let Some(targets) = targets {
+            query = query.filter(temps_entities::nodes::Column::Id.is_in(targets.iter().copied()));
+        }
+        let nodes = query
+            .all(self.db.as_ref())
+            .await
+            .inspect_err(|error| {
+                warn!(
+                    environment_id = environment.id,
+                    "Could not count eligible nodes for the placement warning: {}", error
+                );
+            })
+            .ok()?;
+        let eligible = eligible_placement_nodes(
+            nodes.iter().map(|node| &node.labels),
+            targets,
+            labels,
+            self.local_workloads_enabled,
+        );
+        anti_affinity_shortfall(config.replicas, eligible)
+    }
+
     pub async fn update_environment_settings(
         &self,
         project_id_param: i32,
         env_id: i32,
         settings: crate::handlers::UpdateEnvironmentSettingsRequest,
-        ceiling_enforcement: temps_core::CeilingEnforcement,
+        ceiling_enforcement: temps_config::CeilingEnforcement,
     ) -> Result<environments::Model, EnvironmentError> {
         // Everything that does not need the environment row happens before
         // the transaction below, so it never holds the placement lock (and
@@ -977,7 +1062,7 @@ impl EnvironmentService {
         // concurrent saves queued on the lock would otherwise hold every
         // connection it could use. Hashing is CPU-bound and gains nothing
         // from the lock either.
-        let tenant_ceilings = if ceiling_enforcement == temps_core::CeilingEnforcement::Enforce {
+        let tenant_ceilings = if ceiling_enforcement == temps_config::CeilingEnforcement::Enforce {
             let app_settings = self.config_service.get_settings().await.map_err(|e| {
                 EnvironmentError::Other(format!(
                     "Failed to read instance settings to check resource ceilings for environment {env_id}: {e}"
@@ -987,7 +1072,16 @@ impl EnvironmentService {
         } else {
             None
         };
-        let password_hash = match settings.password.as_deref() {
+        // ADR 066 D7: refuse a pattern the proxy would not read the way it
+        // is written, with the parser's own explanation.
+        if let Some(paths) = &settings.shield_exempt_paths {
+            temps_shield::ExemptPaths::parse(paths).map_err(|e| {
+                EnvironmentError::InvalidInput(format!(
+                    "Invalid shield_exempt_paths for environment {env_id}: {e}"
+                ))
+            })?;
+        }
+        let password_hash = match settings.password.as_ref().map(SecretString::expose) {
             Some(password) if !password.is_empty() => {
                 use argon2::{Argon2, PasswordHasher};
                 let hash = Argon2::default()
@@ -1044,8 +1138,8 @@ impl EnvironmentService {
         if let Some(memory_limit) = settings.memory_limit {
             deployment_config.memory_limit = memory_limit;
         }
-        if settings.exposed_port.is_some() {
-            deployment_config.exposed_port = settings.exposed_port;
+        if let Some(exposed_port) = settings.exposed_port {
+            deployment_config.exposed_port = exposed_port;
         }
         if let Some(replicas) = settings.replicas {
             deployment_config.replicas = replicas;
@@ -1130,6 +1224,15 @@ impl EnvironmentService {
             deployment_config.max_concurrent_connections = max_concurrent_connections;
         }
 
+        if let Some(health) = settings.health {
+            deployment_config.health = health;
+        }
+        if let Some(timeout) = settings.health_check_timeout_seconds {
+            deployment_config.health_check_timeout_seconds = Some(timeout);
+        }
+        if let Some(stop_timeout_seconds) = settings.stop_timeout_seconds {
+            deployment_config.stop_timeout_seconds = stop_timeout_seconds;
+        }
         // Validate the deployment config
         deployment_config.validate().map_err(|e| {
             EnvironmentError::InvalidInput(format!("Invalid deployment config: {}", e))
@@ -1166,8 +1269,43 @@ impl EnvironmentService {
         // deployment_config). `Some(inner)` applies the change: inner `None`
         // clears the override (NULL → inherit project), inner `Some(b)` sets it.
         // Outer `None` leaves the column unchanged.
-        if let Some(attack_mode) = settings.attack_mode {
+        //
+        // ADR 066: `shield_mode` replaces it, and both are written together
+        // for one release (see `shield_mode::environment_shield_write`).
+        let project_mode = if settings.shield_mode.is_none()
+            && settings.attack_mode == Some(Some(false))
+            && environment.shield_mode.is_none()
+        {
+            // Only a legacy "attack off" on an inheriting environment needs
+            // to know whether the project is in attack mode.
+            let project = projects::Entity::find_by_id(project_id_param)
+                .one(&txn)
+                .await?
+                .ok_or_else(|| {
+                    EnvironmentError::NotFound(format!("Project {project_id_param} not found"))
+                })?;
+            temps_shield::ShieldMode::effective(
+                None,
+                &project.shield_mode,
+                None,
+                project.attack_mode,
+            )
+        } else {
+            temps_shield::ShieldMode::default()
+        };
+        if let Some((shield_mode, attack_mode)) = super::shield_mode::environment_shield_write(
+            settings.shield_mode,
+            settings.attack_mode,
+            crate::handlers::stored_shield_mode(environment.shield_mode.as_deref()),
+            || project_mode,
+        ) {
+            active_model.shield_mode = Set(shield_mode.map(|mode| mode.as_str().to_string()));
             active_model.attack_mode = Set(attack_mode);
+        }
+        if let Some(paths) = &settings.shield_exempt_paths {
+            let paths = paths.iter().map(|path| path.trim().to_string()).collect();
+            active_model.shield_exempt_paths =
+                Set(temps_entities::environments::ShieldExemptPaths(paths));
         }
         // force_https follows the same tri-state contract as attack_mode.
         if let Some(force_https) = settings.force_https {
@@ -1202,7 +1340,9 @@ impl EnvironmentService {
             || settings.idle_timeout_seconds.is_some()
             || settings.wake_timeout_seconds.is_some()
             || settings.force_https.is_some()
-            || settings.attack_mode.is_some();
+            || settings.attack_mode.is_some()
+            || settings.shield_mode.is_some()
+            || settings.shield_exempt_paths.is_some();
         if routing_relevant_changed {
             // "NOTIFY route_table_changes" is a fully hardcoded string — no
             // user-controlled data is interpolated. Statement::from_string is
@@ -1486,6 +1626,16 @@ impl EnvironmentService {
                     "Domain '{normalized}' is already attached to another environment"
                 )));
             }
+            // ADR 068 D3: a tunnel's environment host is Temps's, and goes
+            // when the tunnel stops publishing environment hosts. Handing it
+            // back as the user's own domain would let that delete it.
+            if let Some(connector_id) = existing.generated_by_connector_id {
+                return Err(EnvironmentError::InvalidInput(format!(
+                    "Domain '{normalized}' is environment {env_id}'s tunnel host, published by \
+                     tunnel {connector_id} and removed when it stops publishing environment \
+                     hosts; it cannot also be added as the environment's own domain"
+                )));
+            }
             return Ok(existing);
         }
 
@@ -1555,6 +1705,22 @@ impl EnvironmentService {
             "Environment {} not found",
             env_id
         )))
+    }
+
+    /// The project's live preview environments that track `branch`.
+    pub async fn branch_previews(
+        &self,
+        project_id: i32,
+        branch: &str,
+    ) -> Result<Vec<environments::Model>, EnvironmentError> {
+        Ok(environments::Entity::find()
+            .filter(environments::Column::ProjectId.eq(project_id))
+            .filter(environments::Column::IsPreview.eq(true))
+            .filter(environments::Column::Branch.eq(branch))
+            .filter(environments::Column::DeletedAt.is_null())
+            .order_by_asc(environments::Column::Id)
+            .all(self.db.as_ref())
+            .await?)
     }
 
     /// Soft-delete an environment by setting its `deleted_at` timestamp.
@@ -1691,8 +1857,209 @@ impl EnvironmentService {
     }
 }
 
+/// Whether this configuration asks for replicas on separate nodes.
+fn spreads_replicas(config: &temps_entities::deployment_config::DeploymentConfig) -> bool {
+    config.anti_affinity && config.replicas > 1
+}
+
+/// Whether placement would consider a node with these labels. Build-only nodes never
+/// run workloads, and dedicated ones only for environments that pin them by ID.
+fn takes_replicas(labels: &serde_json::Value, pinned_by_id: bool) -> bool {
+    match labels.get("temps.sh/role").and_then(|role| role.as_str()) {
+        Some("builder") => false,
+        Some("dedicated") => pinned_by_id,
+        _ => true,
+    }
+}
+
+/// How many nodes replicas can spread over, given the labels of the nodes that are
+/// active, recently heard from and allowed by `targets`. The control plane counts when
+/// it runs workloads, isn't excluded by `targets`, and no label selector is set: it
+/// has no operator labels, so a selector never matches it.
+fn eligible_placement_nodes<'a>(
+    node_labels: impl Iterator<Item = &'a serde_json::Value>,
+    targets: Option<&[i32]>,
+    selector: Option<&serde_json::Value>,
+    local_workloads_enabled: bool,
+) -> u64 {
+    let workers = node_labels
+        .filter(|labels| takes_replicas(labels, targets.is_some()))
+        .filter(|labels| {
+            selector
+                .is_none_or(|selector| temps_entities::nodes::node_matches_labels(labels, selector))
+        })
+        .count() as u64;
+    let control_plane = local_workloads_enabled
+        && selector.is_none()
+        && targets.is_none_or(|targets| targets.contains(&CONTROL_PLANE_NODE_ID));
+    workers.saturating_add(u64::from(control_plane))
+}
+
+/// Warning for `replicas` under anti-affinity with `eligible_nodes` to spread over.
+fn anti_affinity_shortfall(replicas: i32, eligible_nodes: u64) -> Option<String> {
+    let requested = u64::try_from(replicas).ok()?;
+    if requested <= 1 {
+        return None;
+    }
+    if eligible_nodes == 0 {
+        return Some(format!(
+            "No eligible node can run these {requested} replicas, so a deployment will fail. \
+             Add or bring back a node, or change the target nodes or labels."
+        ));
+    }
+    (requested > eligible_nodes).then(|| {
+        format!(
+            "Anti-affinity is on, but {requested} replicas can only spread over \
+             {eligible_nodes} eligible node(s), so some will share a node and a single node \
+             failure takes out more than one. Add a node or target, or lower the replicas."
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn more_replicas_than_eligible_nodes_warns_with_both_numbers() {
+        use super::anti_affinity_shortfall;
+        let warning = anti_affinity_shortfall(5, 3).expect("5 replicas don't fit on 3 nodes");
+        assert!(warning.contains("5 replicas"), "{warning}");
+        assert!(warning.contains("3 eligible"), "{warning}");
+        assert!(anti_affinity_shortfall(3, 3).is_none());
+        assert!(anti_affinity_shortfall(1, 0).is_none());
+    }
+
+    #[test]
+    fn no_eligible_node_says_a_deployment_will_fail_not_that_replicas_share() {
+        let warning = super::anti_affinity_shortfall(2, 0).expect("nowhere to run");
+        assert!(warning.contains("will fail"), "{warning}");
+        assert!(!warning.contains("share"), "{warning}");
+    }
+
+    #[test]
+    fn eligible_nodes_follow_the_schedulers_filters() {
+        use super::eligible_placement_nodes;
+        use serde_json::json;
+
+        let gpu = json!({"gpu": "true"});
+        let plain = json!({});
+        let builder = json!({"temps.sh/role": "builder"});
+        let dedicated = json!({"temps.sh/role": "dedicated"});
+        let selector = json!({"gpu": "true"});
+        let count = |nodes: &[&serde_json::Value], targets, selector, local| {
+            eligible_placement_nodes(nodes.iter().copied(), targets, selector, local)
+        };
+
+        // Two workers, one matching the selector: replicas would stack on it.
+        assert_eq!(count(&[&gpu, &plain], None, Some(&selector), false), 1);
+        // A selector also keeps the control plane out.
+        assert_eq!(count(&[&gpu], None, Some(&selector), true), 1);
+        // Without one it counts, unless targets leave it out.
+        assert_eq!(count(&[&plain], None, None, true), 2);
+        assert_eq!(count(&[&plain], Some(&[4]), None, true), 1);
+        assert_eq!(count(&[&plain], Some(&[0, 4]), None, true), 2);
+        assert_eq!(count(&[&plain], None, None, false), 1);
+        // Build-only never counts; dedicated only when pinned by ID.
+        assert_eq!(count(&[&builder, &dedicated], None, None, false), 0);
+        assert_eq!(count(&[&dedicated], Some(&[4]), None, false), 1);
+    }
+
+    fn environment_inheriting_placement() -> environments::Model {
+        let mut environment = make_env_model(false, false);
+        environment.deployment_config = None;
+        environment
+    }
+
+    fn project_with(
+        config: temps_entities::deployment_config::DeploymentConfig,
+    ) -> projects::Model {
+        let mut project = hosting_project(temps_entities::source_type::SourceType::Git);
+        project.deployment_config = Some(config);
+        project
+    }
+
+    async fn inherited_placement_warning(
+        config: temps_entities::deployment_config::DeploymentConfig,
+        local_workloads: bool,
+    ) -> (Option<String>, String) {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![project_with(config)]])
+                .append_query_results([Vec::<temps_entities::nodes::Model>::new()])
+                .into_connection(),
+        );
+        let server_config = temps_config::ServerConfig::new(
+            "127.0.0.1:3000".to_string(),
+            "postgres://localhost/test".to_string(),
+            None,
+            None,
+        )
+        .unwrap();
+        let config_service = Arc::new(temps_config::ConfigService::new(
+            Arc::new(server_config),
+            Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection()),
+        ));
+        let service = EnvironmentService::new(db.clone(), config_service)
+            .with_local_workloads(local_workloads);
+        let warning = service
+            .placement_warning(&environment_inheriting_placement())
+            .await;
+        drop(service);
+        let log = Arc::try_unwrap(db)
+            .expect("service dropped its connection clone")
+            .into_transaction_log();
+        (warning, format!("{log:?}"))
+    }
+
+    /// With no settings of its own an environment deploys with the project's, so its
+    /// warning has to come from them too.
+    #[tokio::test]
+    async fn placement_warning_uses_the_projects_settings_when_the_environment_has_none() {
+        let (warning, sql) = inherited_placement_warning(
+            temps_entities::deployment_config::DeploymentConfig {
+                replicas: 3,
+                target_nodes: Some(vec![42]),
+                ..Default::default()
+            },
+            false,
+        )
+        .await;
+        let warning = warning.expect("the project asks for 3 replicas");
+        assert!(warning.contains('3'), "{warning}");
+        assert!(sql.contains("42"), "the project's targets apply: {sql}");
+        assert!(
+            sql.contains("last_heartbeat"),
+            "stale nodes don't count: {sql}"
+        );
+    }
+
+    /// The control plane has no labels, so a project's selector rules it out.
+    #[tokio::test]
+    async fn placement_warning_applies_the_projects_label_selector() {
+        let (warning, _) = inherited_placement_warning(
+            temps_entities::deployment_config::DeploymentConfig {
+                replicas: 2,
+                target_labels: Some(serde_json::json!({"gpu": "true"})),
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        assert!(warning.expect("nothing matches").contains("will fail"));
+    }
+
+    #[tokio::test]
+    async fn placement_warning_stays_quiet_when_the_project_asks_for_one_replica() {
+        let (warning, _) = inherited_placement_warning(
+            temps_entities::deployment_config::DeploymentConfig {
+                replicas: 1,
+                ..Default::default()
+            },
+            false,
+        )
+        .await;
+        assert_eq!(warning, None);
+    }
 
     /// The 409 must name both what a user recognises (hostname) and what an
     /// administrator removes (binding id), and say who can remove it.
@@ -1891,8 +2258,12 @@ mod tests {
             protected: false,
             sleeping: false,
             attack_mode: None,
+            shield_mode: None,
+            shield_exempt_paths: Default::default(),
             force_https: None,
             last_activity_at: None,
+            ingress_mode: Default::default(),
+            workload_mode: Default::default(),
         };
         let mut fenced = environment.clone();
         fenced.deleted_at = Some(chrono::Utc::now());
@@ -1910,6 +2281,76 @@ mod tests {
 
         service.delete_environment(3, 7).await.unwrap();
         service.delete_environment(3, 7).await.unwrap();
+    }
+
+    /// Only live previews of the branch are ever torn down: a staging or
+    /// production environment tracking the same branch must not match.
+    #[tokio::test]
+    async fn branch_previews_selects_only_live_previews_of_the_branch() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![Vec::<environments::Model>::new()])
+                .into_connection(),
+        );
+        let server_config = temps_config::ServerConfig::new(
+            "127.0.0.1:3000".to_string(),
+            "postgres://localhost/test".to_string(),
+            None,
+            None,
+        )
+        .unwrap();
+        let config_service = Arc::new(temps_config::ConfigService::new(
+            Arc::new(server_config),
+            Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection()),
+        ));
+        let service = EnvironmentService::new(db.clone(), config_service);
+
+        assert!(service
+            .branch_previews(3, "feature/login")
+            .await
+            .unwrap()
+            .is_empty());
+
+        drop(service);
+        let db = Arc::try_unwrap(db).expect("the service held the only other handle");
+        let columns = [
+            "id",
+            "name",
+            "slug",
+            "subdomain",
+            "last_deployment",
+            "host",
+            "upstreams",
+            "created_at",
+            "updated_at",
+            "project_id",
+            "current_deployment_id",
+            "branch",
+            "deleted_at",
+            "deployment_config",
+            "is_preview",
+            "protected",
+            "sleeping",
+            "attack_mode",
+            "shield_mode",
+            "shield_exempt_paths",
+            "force_https",
+            "last_activity_at",
+            "ingress_mode",
+            "workload_mode",
+        ]
+        .map(|column| format!(r#""environments"."{column}""#))
+        .join(", ");
+        assert_eq!(
+            db.into_transaction_log(),
+            vec![sea_orm::Transaction::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                format!(
+                    r#"SELECT {columns} FROM "environments" WHERE "environments"."project_id" = $1 AND "environments"."is_preview" = $2 AND "environments"."branch" = $3 AND "environments"."deleted_at" IS NULL ORDER BY "environments"."id" ASC"#
+                ),
+                [3.into(), true.into(), "feature/login".into()],
+            )]
+        );
     }
 
     #[test]
@@ -2011,8 +2452,12 @@ mod tests {
             protected: false,
             sleeping: false,
             attack_mode: None,
+            shield_mode: None,
+            shield_exempt_paths: Default::default(),
             force_https: None,
             last_activity_at: None,
+            ingress_mode: Default::default(),
+            workload_mode: Default::default(),
         };
 
         // Query sequence:
@@ -2044,6 +2489,9 @@ mod tests {
                     load_balancing: None,
 
                     branch: Some(Some("main".to_string())),
+                    health: None,
+                    health_check_timeout_seconds: None,
+                    stop_timeout_seconds: None,
                     cpu_request: None,
                     cpu_limit: None,
                     memory_request: None,
@@ -2061,6 +2509,8 @@ mod tests {
                     build_location: None,
                     protected: None,
                     attack_mode: None,
+                    shield_mode: None,
+                    shield_exempt_paths: None,
                     force_https: None,
                     on_demand: None,
                     idle_timeout_seconds: None,
@@ -2073,7 +2523,7 @@ mod tests {
                 },
                 // These fixtures assert merge/persistence behaviour, not policy;
                 // bypassing the ceiling check keeps their mock query sequence intact.
-                temps_core::CeilingEnforcement::Bypass,
+                temps_config::CeilingEnforcement::Bypass,
             )
             .await;
 
@@ -2084,10 +2534,6 @@ mod tests {
         );
     }
 
-    /// Double-Option clearing (`Some(None)`) must actually remove the override
-    /// from the persisted `deployment_config`, not just leave it unchanged —
-    /// this project has shipped a bug before where a double-Option "clear"
-    /// silently no-opped instead of nulling the column.
     #[tokio::test]
     async fn routing_only_update_preserves_branch_and_explicit_null_clears_it() {
         for (json, writes_branch) in [
@@ -2113,7 +2559,7 @@ mod tests {
                 10,
                 1,
                 settings,
-                temps_core::CeilingEnforcement::Bypass,
+                temps_config::CeilingEnforcement::Bypass,
             )
             .await
             .unwrap();
@@ -2145,6 +2591,10 @@ mod tests {
         }
     }
 
+    /// Double-Option clearing (`Some(None)`) must actually remove the override
+    /// from the persisted `deployment_config`, not just leave it unchanged —
+    /// this project has shipped a bug before where a double-Option "clear"
+    /// silently no-opped instead of nulling the column.
     #[tokio::test]
     async fn test_update_settings_clears_request_timeout_override() {
         let current_env = environments::Model {
@@ -2169,8 +2619,12 @@ mod tests {
             protected: false,
             sleeping: false,
             attack_mode: None,
+            shield_mode: None,
+            shield_exempt_paths: Default::default(),
             force_https: None,
             last_activity_at: None,
+            ingress_mode: Default::default(),
+            workload_mode: Default::default(),
         };
         let updated_env = environments::Model {
             deployment_config: Some(temps_entities::deployment_config::DeploymentConfig {
@@ -2209,6 +2663,9 @@ mod tests {
                 crate::handlers::UpdateEnvironmentSettingsRequest {
                     load_balancing: None,
 
+                    health: None,
+                    health_check_timeout_seconds: None,
+                    stop_timeout_seconds: None,
                     branch: None,
                     cpu_request: None,
                     cpu_limit: None,
@@ -2227,6 +2684,8 @@ mod tests {
                     build_location: None,
                     protected: None,
                     attack_mode: None,
+                    shield_mode: None,
+                    shield_exempt_paths: None,
                     force_https: None,
                     on_demand: None,
                     idle_timeout_seconds: None,
@@ -2242,7 +2701,7 @@ mod tests {
                 },
                 // These fixtures assert merge/persistence behaviour, not policy;
                 // bypassing the ceiling check keeps their mock query sequence intact.
-                temps_core::CeilingEnforcement::Bypass,
+                temps_config::CeilingEnforcement::Bypass,
             )
             .await;
         assert!(
@@ -2267,6 +2726,9 @@ mod tests {
     fn empty_settings_request() -> crate::handlers::UpdateEnvironmentSettingsRequest {
         crate::handlers::UpdateEnvironmentSettingsRequest {
             load_balancing: None,
+            health: None,
+            health_check_timeout_seconds: None,
+            stop_timeout_seconds: None,
             branch: None,
             cpu_request: None,
             cpu_limit: None,
@@ -2285,6 +2747,8 @@ mod tests {
             build_location: None,
             protected: None,
             attack_mode: None,
+            shield_mode: None,
+            shield_exempt_paths: None,
             force_https: None,
             on_demand: None,
             idle_timeout_seconds: None,
@@ -2297,11 +2761,300 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn health_probe_environment_override_can_be_preserved_replaced_and_cleared() {
+        use temps_core::repo_config::HealthCheckConfig;
+        use temps_entities::deployment_config::DeploymentConfig;
+        let original = HealthCheckConfig {
+            probe_type: Some("exec".into()),
+            command: vec!["check-worker".into()],
+            ..Default::default()
+        };
+        let replacement = HealthCheckConfig {
+            probe_type: Some("process".into()),
+            ..Default::default()
+        };
+        for (change, expected) in [
+            (None, Some(original.clone())),
+            (Some(Some(replacement.clone())), Some(replacement)),
+            (Some(None), None),
+        ] {
+            let current = environments::Model {
+                deployment_config: Some(DeploymentConfig {
+                    health: Some(original.clone()),
+                    ..Default::default()
+                }),
+                ..env_for_ceiling_test()
+            };
+            let updated = environments::Model {
+                deployment_config: Some(DeploymentConfig {
+                    health: expected.clone(),
+                    ..Default::default()
+                }),
+                ..current.clone()
+            };
+            let db = Arc::new(
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results([vec![current]])
+                    .append_query_results([vec![updated]])
+                    .append_exec_results([MockExecResult {
+                        last_insert_id: 0,
+                        rows_affected: 1,
+                    }])
+                    .into_connection(),
+            );
+            let service = service_with_ceilings(db.clone(), Default::default());
+            let result = service
+                .update_environment_settings(
+                    10,
+                    1,
+                    crate::handlers::UpdateEnvironmentSettingsRequest {
+                        health: change,
+                        ..empty_settings_request()
+                    },
+                    temps_config::CeilingEnforcement::Bypass,
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.deployment_config.unwrap().health, expected);
+            drop(service);
+            let log = format!("{:?}", Arc::try_unwrap(db).unwrap().into_transaction_log());
+            // Check the UPDATE payload rather than only the canned mock reply.
+            match expected {
+                Some(health) => {
+                    assert!(log.contains(health.probe_type.as_deref().unwrap()), "{log}")
+                }
+                None => assert!(
+                    !log.contains("check-worker") && !log.contains("stable_for"),
+                    "{log}"
+                ),
+            }
+        }
+    }
+
+    /// #1806: an environment sets, keeps or clears (back to the project's
+    /// value) its stop timeout, and an out-of-range one is refused.
+    #[tokio::test]
+    async fn stop_timeout_override_is_set_kept_cleared_and_validated() {
+        use temps_entities::deployment_config::DeploymentConfig;
+        for (change, expected) in [
+            (None, Some(60)),
+            (Some(Some(45)), Some(45)),
+            (Some(None), None),
+        ] {
+            let current = environments::Model {
+                deployment_config: Some(DeploymentConfig {
+                    stop_timeout_seconds: Some(60),
+                    ..Default::default()
+                }),
+                ..env_for_ceiling_test()
+            };
+            let updated = environments::Model {
+                deployment_config: Some(DeploymentConfig {
+                    stop_timeout_seconds: expected,
+                    ..Default::default()
+                }),
+                ..current.clone()
+            };
+            let db = Arc::new(
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results([vec![current]])
+                    .append_query_results([vec![updated]])
+                    .append_exec_results([MockExecResult {
+                        last_insert_id: 0,
+                        rows_affected: 1,
+                    }])
+                    .into_connection(),
+            );
+            let service = service_with_ceilings(db.clone(), Default::default());
+            service
+                .update_environment_settings(
+                    10,
+                    1,
+                    crate::handlers::UpdateEnvironmentSettingsRequest {
+                        stop_timeout_seconds: change,
+                        ..empty_settings_request()
+                    },
+                    temps_config::CeilingEnforcement::Bypass,
+                )
+                .await
+                .unwrap();
+            drop(service);
+            let log = format!("{:?}", Arc::try_unwrap(db).unwrap().into_transaction_log());
+            // Check the UPDATE payload rather than only the canned mock reply.
+            match expected {
+                Some(seconds) => assert!(
+                    log.contains("stopTimeoutSeconds") && log.contains(&seconds.to_string()),
+                    "{log}"
+                ),
+                None => assert!(!log.contains("stopTimeoutSeconds"), "{log}"),
+            }
+        }
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![env_for_ceiling_test()]])
+                .append_exec_results([MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let service = service_with_ceilings(db, Default::default());
+        let error = service
+            .update_environment_settings(
+                10,
+                1,
+                crate::handlers::UpdateEnvironmentSettingsRequest {
+                    stop_timeout_seconds: Some(Some(0)),
+                    ..empty_settings_request()
+                },
+                temps_config::CeilingEnforcement::Bypass,
+            )
+            .await
+            .expect_err("a zero stop timeout is refused");
+        assert!(error.to_string().contains("Stop timeout 0"), "{error}");
+    }
+
+    /// ADR 066 I10: a Shield mode is stored with the attack-mode column the
+    /// older consoles read, and the exempt paths as sent.
+    #[tokio::test]
+    async fn a_shield_mode_is_written_with_attack_mode_and_exempt_paths() {
+        let current = env_for_ceiling_test();
+        let updated = environments::Model {
+            shield_mode: Some("attack".into()),
+            attack_mode: Some(true),
+            shield_exempt_paths: temps_entities::environments::ShieldExemptPaths(vec![
+                "/api/*".into()
+            ]),
+            ..current.clone()
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_exec_results([MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .append_query_results([vec![current]])
+                .append_query_results([vec![updated]])
+                .append_exec_results([MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let service = service_with_ceilings(db.clone(), Default::default());
+        let result = service
+            .update_environment_settings(
+                10,
+                1,
+                crate::handlers::UpdateEnvironmentSettingsRequest {
+                    shield_mode: Some(Some(temps_shield::ShieldMode::Attack)),
+                    shield_exempt_paths: Some(vec![" /api/* ".into()]),
+                    ..empty_settings_request()
+                },
+                temps_config::CeilingEnforcement::Bypass,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.shield_mode.as_deref(), Some("attack"));
+        drop(service);
+        let log = format!("{:?}", Arc::try_unwrap(db).unwrap().into_transaction_log());
+        // The UPDATE carries the mode, attack mode and the trimmed paths,
+        // and the proxy is told to reload.
+        assert!(log.contains(r#"String(Some("attack"))"#), "{log}");
+        assert!(log.contains("Bool(Some(true))"), "{log}");
+        assert!(log.contains(r#"String("/api/*")"#), "{log}");
+        assert!(log.contains("NOTIFY route_table_changes"), "{log}");
+    }
+
+    /// An older console that turns attack mode off on an environment that
+    /// inherits a project in attack mode must take it out of attack, so the
+    /// environment stops inheriting and runs in `log`.
+    #[tokio::test]
+    async fn a_legacy_attack_mode_off_takes_an_inheriting_environment_out_of_attack() {
+        let current = env_for_ceiling_test();
+        let mut project = hosting_project(temps_entities::source_type::SourceType::Git);
+        project.shield_mode = "attack".into();
+        project.attack_mode = true;
+        let updated = environments::Model {
+            shield_mode: Some("log".into()),
+            attack_mode: Some(false),
+            ..current.clone()
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_exec_results([MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .append_query_results([vec![current]])
+                .append_query_results([vec![project]])
+                .append_query_results([vec![updated]])
+                .append_exec_results([MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let service = service_with_ceilings(db.clone(), Default::default());
+        service
+            .update_environment_settings(
+                10,
+                1,
+                crate::handlers::UpdateEnvironmentSettingsRequest {
+                    attack_mode: Some(Some(false)),
+                    ..empty_settings_request()
+                },
+                temps_config::CeilingEnforcement::Bypass,
+            )
+            .await
+            .unwrap();
+        drop(service);
+        let log = format!("{:?}", Arc::try_unwrap(db).unwrap().into_transaction_log());
+        assert!(log.contains(r#"FROM \"projects\""#), "{log}");
+        assert!(log.contains(r#"String(Some("log"))"#), "{log}");
+        assert!(log.contains("Bool(Some(false))"), "{log}");
+    }
+
+    /// A pattern the proxy would read differently from how it is written is
+    /// refused with the parser's explanation, before anything is read or
+    /// written.
+    #[tokio::test]
+    async fn invalid_exempt_paths_are_refused_before_any_write() {
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let service = service_with_ceilings(db.clone(), Default::default());
+        let error = service
+            .update_environment_settings(
+                10,
+                1,
+                crate::handlers::UpdateEnvironmentSettingsRequest {
+                    shield_exempt_paths: Some(vec!["/ok/*".into(), "api/*".into()]),
+                    ..empty_settings_request()
+                },
+                temps_config::CeilingEnforcement::Bypass,
+            )
+            .await
+            .unwrap_err();
+        match error {
+            EnvironmentError::InvalidInput(message) => {
+                assert!(message.contains("environment 1"), "{message}");
+                assert!(message.contains("`api/*` is not a path"), "{message}");
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+        drop(service);
+        assert!(Arc::try_unwrap(db)
+            .unwrap()
+            .into_transaction_log()
+            .is_empty());
+    }
+
     fn service_with_ceilings(
         db: Arc<sea_orm::DatabaseConnection>,
-        ceilings: temps_core::TenantResourceCeilings,
+        ceilings: temps_config::TenantResourceCeilings,
     ) -> EnvironmentService {
-        let app_settings = temps_core::AppSettings {
+        let app_settings = temps_config::AppSettings {
             tenant_resource_ceilings: ceilings,
             ..Default::default()
         };
@@ -2328,6 +3081,64 @@ mod tests {
         EnvironmentService::new(db, config_service)
     }
 
+    /// ADR 068 D3: a tunnel environment host is not handed back as the
+    /// user's own domain, which turning the tunnel's hosts off would delete.
+    #[tokio::test]
+    async fn a_tunnel_environment_host_cannot_be_added_as_a_domain() {
+        let env = env_for_ceiling_test();
+        let generated = environment_domains::Model {
+            id: 9,
+            environment_id: env.id,
+            domain: "shop-staging.tunnel.example.com".to_string(),
+            created_at: chrono::Utc::now(),
+            audience: "public".to_string(),
+            private_range: None,
+            private_node_id: None,
+            private_listener: None,
+            generated_by_connector_id: Some(4),
+            private_via: None,
+            private_service: None,
+            gate: None,
+            gate_allow: None,
+            gate_not_before: None,
+            gate_access_provider_id: None,
+            gate_access_app_id: None,
+            gate_access_aud: None,
+        };
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![env.clone()]])
+            .append_query_results([vec![generated]])
+            .into_connection();
+        // No settings row: the defaults, whose zones do not cover the host.
+        let settings_db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([Vec::<temps_entities::settings::Model>::new()])
+            .into_connection();
+        let server_config = temps_config::ServerConfig::new(
+            "127.0.0.1:3000".to_string(),
+            "postgres://localhost/test".to_string(),
+            None,
+            None,
+        )
+        .unwrap();
+        let config_service = Arc::new(temps_config::ConfigService::new(
+            Arc::new(server_config),
+            Arc::new(settings_db),
+        ));
+        let result = EnvironmentService::new(Arc::new(db), config_service)
+            .add_environment_domain(
+                env.project_id,
+                env.id,
+                "shop-staging.tunnel.example.com".to_string(),
+            )
+            .await;
+        match result {
+            Err(EnvironmentError::InvalidInput(message)) => {
+                assert!(message.contains("tunnel host"), "{message}")
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
     fn env_for_ceiling_test() -> environments::Model {
         environments::Model {
             id: 1,
@@ -2348,8 +3159,12 @@ mod tests {
             protected: false,
             sleeping: false,
             attack_mode: None,
+            shield_mode: None,
+            shield_exempt_paths: Default::default(),
             force_https: None,
             last_activity_at: None,
+            ingress_mode: Default::default(),
+            workload_mode: Default::default(),
         }
     }
 
@@ -2371,7 +3186,7 @@ mod tests {
         );
         let svc = service_with_ceilings(
             db,
-            temps_core::TenantResourceCeilings {
+            temps_config::TenantResourceCeilings {
                 max_memory_limit_mb: 2048,
                 ..Default::default()
             },
@@ -2382,10 +3197,13 @@ mod tests {
                 10,
                 1,
                 crate::handlers::UpdateEnvironmentSettingsRequest {
+                    health: None,
+                    health_check_timeout_seconds: None,
+                    stop_timeout_seconds: None,
                     memory_limit: Some(Some(0)),
                     ..empty_settings_request()
                 },
-                temps_core::CeilingEnforcement::Enforce,
+                temps_config::CeilingEnforcement::Enforce,
             )
             .await
             .expect_err("unlimited memory must be refused under a ceiling");
@@ -2420,7 +3238,7 @@ mod tests {
         );
         let svc = service_with_ceilings(
             db,
-            temps_core::TenantResourceCeilings {
+            temps_config::TenantResourceCeilings {
                 max_memory_limit_mb: 2048,
                 ..Default::default()
             },
@@ -2431,10 +3249,13 @@ mod tests {
                 10,
                 1,
                 crate::handlers::UpdateEnvironmentSettingsRequest {
+                    health: None,
+                    health_check_timeout_seconds: None,
+                    stop_timeout_seconds: None,
                     memory_limit: Some(Some(0)),
                     ..empty_settings_request()
                 },
-                temps_core::CeilingEnforcement::Bypass,
+                temps_config::CeilingEnforcement::Bypass,
             )
             .await;
 
@@ -2466,8 +3287,12 @@ mod tests {
             protected: false,
             sleeping,
             attack_mode: None,
+            shield_mode: None,
+            shield_exempt_paths: Default::default(),
             force_https: None,
             last_activity_at: None,
+            ingress_mode: Default::default(),
+            workload_mode: Default::default(),
         }
     }
 
@@ -2611,7 +3436,7 @@ mod tests {
             "repo_name": "", "repo_owner": "", "directory": "/",
             "main_branch": "main", "preset": "nixpacks", "pull_only_root_directory": false,
             "created_at": chrono::Utc::now(), "updated_at": chrono::Utc::now(),
-            "is_deleted": false, "is_public_repo": false, "attack_mode": false, "ai_write_actions_enabled": false,
+            "is_deleted": false, "is_public_repo": false, "attack_mode": false, "shield_mode": "log", "ai_write_actions_enabled": false,
             "error_source_context_enabled": false, "vulnerability_scanning_enabled": false,
             "enable_preview_environments": false, "preview_envs_on_demand": false,
             "preview_envs_idle_timeout_seconds": 300, "preview_envs_wake_timeout_seconds": 30,
@@ -2711,6 +3536,19 @@ mod tests {
             environment_id: env.id,
             domain: env.subdomain.clone(),
             created_at: chrono::Utc::now(),
+            audience: "public".to_string(),
+            private_range: None,
+            private_node_id: None,
+            private_listener: None,
+            gate: None,
+            gate_allow: None,
+            gate_not_before: None,
+            gate_access_provider_id: None,
+            gate_access_app_id: None,
+            gate_access_aud: None,
+            private_via: None,
+            private_service: None,
+            generated_by_connector_id: None,
         };
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
@@ -2950,6 +3788,9 @@ mod tests {
     ) -> crate::handlers::UpdateEnvironmentSettingsRequest {
         crate::handlers::UpdateEnvironmentSettingsRequest {
             load_balancing: None,
+            health: None,
+            health_check_timeout_seconds: None,
+            stop_timeout_seconds: None,
             branch: None,
             cpu_request: None,
             cpu_limit: None,
@@ -2968,6 +3809,8 @@ mod tests {
             build_location: None,
             protected: None,
             attack_mode: None,
+            shield_mode: None,
+            shield_exempt_paths: None,
             force_https: None,
             on_demand: None,
             idle_timeout_seconds: None,
@@ -2987,8 +3830,8 @@ mod tests {
     #[tokio::test]
     async fn a_save_racing_a_node_removal_waits_and_then_rejects_the_removed_node() {
         use sea_orm::TransactionTrait;
-        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
         use temps_entities::{preset::Preset, upstream_config::UpstreamList};
+        use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 
         let test_db = match TestDatabase::with_migrations().await {
             Ok(database) => database,
@@ -3069,7 +3912,7 @@ mod tests {
                     project_id,
                     environment_id,
                     settings_with_target_nodes(vec![0, node_id]),
-                    temps_core::CeilingEnforcement::Bypass,
+                    temps_config::CeilingEnforcement::Bypass,
                 )
                 .await
         });
@@ -3117,8 +3960,8 @@ mod tests {
     /// read before the transaction starts.
     #[tokio::test]
     async fn a_ceiling_checked_save_needs_only_one_pooled_connection() {
-        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
         use temps_entities::{preset::Preset, upstream_config::UpstreamList};
+        use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 
         let test_db = match TestDatabase::with_migrations().await {
             Ok(database) => database,
@@ -3192,7 +4035,7 @@ mod tests {
                 project.id,
                 environment.id,
                 request,
-                temps_core::CeilingEnforcement::Enforce,
+                temps_config::CeilingEnforcement::Enforce,
             ),
         )
         .await

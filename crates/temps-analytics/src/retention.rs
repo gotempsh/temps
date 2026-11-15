@@ -10,10 +10,12 @@
 //! the windows in [`AnalyticsRetentionSettings`]:
 //!
 //! - **`events` / `error_events`**: the TimescaleDB retention policy is kept
-//!   in step with the setting (the same mechanism the observability tables
-//!   use, so whole chunks are dropped rather than rows deleted).
+//!   in step with the setting. The ClickHouse events TTL follows the same
+//!   window and is reconciled against the stored definition each pass.
 //! - **`visitor`**: rows not seen for N days are deleted in bounded batches.
-//!   Every foreign key to `visitor` is `SET NULL` or `CASCADE`.
+//!   Every foreign key to `visitor` is `SET NULL` or `CASCADE`. With
+//!   ClickHouse enabled, their event source and replica are deleted too;
+//!   delivery batches are fenced and failures leave the visitor for retry.
 //! - **`ip_geolocations`**: a row is deleted only when *nothing* references
 //!   it, so the stored address lives exactly as long as the data that needs
 //!   its location. An address referenced by an audit log is kept with it.
@@ -32,9 +34,11 @@ use sea_orm::{
     TransactionTrait,
 };
 use serde::Serialize;
+use temps_config::AnalyticsRetentionSettings;
+use temps_config::IP_REFERENCE_SLACK_DAYS;
 use temps_core::{
-    AnalyticsRetentionSettings, AuditLogger, AuditOperation, RetentionResolver, RetentionTable,
-    IP_REFERENCE_SLACK_DAYS,
+    AuditLogger, AuditOperation, RetentionResolver, RetentionTable, MAX_ANALYTICS_RETENTION_DAYS,
+    MIN_ANALYTICS_RETENTION_DAYS,
 };
 use thiserror::Error;
 use tracing::{debug, info, warn};
@@ -88,6 +92,9 @@ pub enum AnalyticsRetentionError {
     #[error("Failed to read analytics retention settings: {reason}")]
     Settings { reason: String },
 
+    #[error(transparent)]
+    ClickHouse(#[from] temps_analytics_backend::retention::ClickHouseRetentionError),
+
     #[error("Failed to {operation} while enforcing analytics retention: {source}")]
     Database {
         operation: String,
@@ -131,6 +138,7 @@ pub fn policy_action(installed_days: Option<u32>, desired_days: Option<u32>) -> 
 pub struct RetentionReport {
     pub events_policy: Option<PolicyAction>,
     pub error_events_policy: Option<PolicyAction>,
+    pub clickhouse_events_policy: Option<PolicyAction>,
     pub visitors_deleted: u64,
     pub ip_addresses_deleted: u64,
 }
@@ -208,6 +216,7 @@ struct PresenceRow {
 
 pub struct AnalyticsRetentionService {
     db: Arc<DatabaseConnection>,
+    clickhouse: Option<clickhouse::Client>,
     ip_cursor: tokio::sync::Mutex<IpCursor>,
     visitor_sweep: tokio::sync::Mutex<VisitorSweepState>,
 }
@@ -216,17 +225,70 @@ impl AnalyticsRetentionService {
     pub fn new(db: Arc<DatabaseConnection>) -> Self {
         Self {
             db,
+            clickhouse: None,
             ip_cursor: tokio::sync::Mutex::new(IpCursor::START),
             visitor_sweep: tokio::sync::Mutex::new(VisitorSweepState::default()),
         }
+    }
+
+    /// Enable retention/deletion of the configured ClickHouse replica.
+    pub fn with_clickhouse(mut self, client: clickhouse::Client) -> Self {
+        self.clickhouse = Some(client);
+        self
     }
 
     /// Apply every window in `settings`. A step that fails does not stop the
     /// others: its error is logged and the pass continues, so one broken
     /// table cannot hold up the rest of the cleanup.
     pub async fn enforce(&self, settings: &AnalyticsRetentionSettings) -> RetentionReport {
+        if !stored_windows_valid(settings) {
+            return RetentionReport::default();
+        }
+        self.enforce_windows(settings).await
+    }
+
+    /// Validate the persisted policy before applying the IP reference floor.
+    /// Return the derived windows with the report so audits use the same inputs.
+    async fn enforce_for_logs(
+        &self,
+        policy: &temps_config::RetentionPolicy,
+        plugin_bound: ResolverBound,
+    ) -> Option<(RetentionReport, AnalyticsRetentionSettings)> {
+        if !stored_windows_valid(&policy.analytics) {
+            return None;
+        }
+        if !(MIN_ANALYTICS_RETENTION_DAYS..=MAX_ANALYTICS_RETENTION_DAYS)
+            .contains(&policy.proxy_logs_days)
+        {
+            warn!(
+                days = policy.proxy_logs_days,
+                "skipping analytics retention: invalid stored proxy-log window"
+            );
+            return None;
+        }
+        let windows = effective_windows(
+            &policy.analytics,
+            policy.proxy_logs_days,
+            plugin_bound,
+            Utc::now(),
+        );
+        let report = self.enforce_windows(&windows).await;
+        Some((report, windows))
+    }
+
+    /// The caller validates stored settings before deriving these windows.
+    /// The IP reference floor may legitimately exceed the settings maximum.
+    async fn enforce_windows(&self, settings: &AnalyticsRetentionSettings) -> RetentionReport {
         let mut report = RetentionReport::default();
         let now = Utc::now();
+        if let Some(client) = &self.clickhouse {
+            match self.sync_clickhouse_ttl(client, settings.events_days).await {
+                Ok(action) => report.clickhouse_events_policy = Some(action),
+                Err(error) => {
+                    warn!(%error, "ClickHouse events TTL sync failed; will retry next pass")
+                }
+            }
+        }
 
         match self
             .sync_policy(EVENTS_TABLE, Some(settings.events_days))
@@ -287,6 +349,40 @@ impl AnalyticsRetentionService {
             );
         }
         report
+    }
+
+    async fn sync_clickhouse_ttl(
+        &self,
+        client: &clickhouse::Client,
+        days: u32,
+    ) -> Result<PolicyAction, AnalyticsRetentionError> {
+        let changed = tokio::time::timeout(
+            Duration::from_secs(120),
+            temps_analytics_backend::retention::reconcile_events_ttl(
+                self.db.as_ref(),
+                client,
+                days,
+            ),
+        )
+        .await
+        .map_err(|_| {
+            temps_analytics_backend::retention::ClickHouseRetentionError::Query {
+                database: client.database().unwrap_or("default").to_string(),
+                operation: format!("set events TTL to {days} days"),
+                reason: "timed out after 120s; will re-read stored TTL next pass".into(),
+            }
+        })??;
+        if changed {
+            info!(
+                days,
+                "ClickHouse events TTL updated; expiry follows asynchronous merges"
+            );
+        }
+        Ok(if changed {
+            PolicyAction::Set(days)
+        } else {
+            PolicyAction::Keep
+        })
     }
 
     /// Bring the retention policy of `table` in step with `desired_days`.
@@ -505,18 +601,49 @@ impl AnalyticsRetentionService {
         .await
         .map_err(|source| AnalyticsRetentionError::database(operation(), source))?;
 
-        let ids: Vec<i32> = IdRow::find_by_statement(Statement::from_sql_and_values(
-            DatabaseBackend::Postgres,
-            "SELECT id FROM visitor WHERE last_seen < $1 AND id <> ALL($3::int4[]) \
+        // Fence already-buffered fan-out/backfill batches before selecting
+        // candidates. Row locks make a returning visitor win the cutoff race
+        // and stop new events referencing a visitor while it is removed.
+        let scoped_visitors = if self.clickhouse.is_some() {
+            temps_analytics_backend::retention::lock_event_delivery(&txn, true)
+                .await
+                .map_err(|source| AnalyticsRetentionError::database(operation(), source))?;
+            #[derive(FromQueryResult)]
+            struct ScopedVisitor {
+                id: i32,
+                project_id: i32,
+            }
+            let rows = ScopedVisitor::find_by_statement(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT id, project_id FROM visitor WHERE last_seen < $1 AND id <> ALL($3::int4[]) \
+                 ORDER BY last_seen ASC LIMIT $2 FOR UPDATE",
+                [cutoff.into(), batch_size.into(), skip.to_vec().into()],
+            ))
+            .all(&txn).await
+            .map_err(|source| AnalyticsRetentionError::database(operation(), source))?;
+            rows.into_iter()
+                .map(|row| (row.project_id, row.id))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+
+        let ids: Vec<i32> = if self.clickhouse.is_some() {
+            scoped_visitors.iter().map(|(_, id)| *id).collect()
+        } else {
+            IdRow::find_by_statement(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT id FROM visitor WHERE last_seen < $1 AND id <> ALL($3::int4[]) \
              ORDER BY last_seen ASC LIMIT $2",
-            [cutoff.into(), batch_size.into(), skip.to_vec().into()],
-        ))
-        .all(&txn)
-        .await
-        .map_err(|source| AnalyticsRetentionError::database(operation(), source))?
-        .into_iter()
-        .map(|row| row.id)
-        .collect();
+                [cutoff.into(), batch_size.into(), skip.to_vec().into()],
+            ))
+            .all(&txn)
+            .await
+            .map_err(|source| AnalyticsRetentionError::database(operation(), source))?
+            .into_iter()
+            .map(|row| row.id)
+            .collect()
+        };
         if ids.is_empty() {
             txn.commit()
                 .await
@@ -527,15 +654,51 @@ impl AnalyticsRetentionService {
             });
         }
 
-        let result = txn
-            .execute(Statement::from_sql_and_values(
+        let result = async {
+            if self.clickhouse.is_some() {
+                // Remove the replication source too, so queued outbox rows
+                // (including a late enqueue) become orphans, and a later
+                // backfill cannot restore the deleted ClickHouse events.
+                txn.execute(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "DELETE FROM events e USING visitor v WHERE e.visitor_id = v.id \
+                     AND e.project_id = v.project_id AND v.id = ANY($1::int4[])",
+                    [ids.clone().into()],
+                ))
+                .await?;
+            }
+            txn.execute(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
                 "DELETE FROM visitor WHERE last_seen < $1 AND id = ANY($2::int4[])",
                 [cutoff.into(), ids.clone().into()],
             ))
-            .await;
+            .await
+        }
+        .await;
         match result {
             Ok(result) => {
+                if let Some(client) = &self.clickhouse {
+                    tokio::time::timeout(
+                        Duration::from_secs(120),
+                        temps_analytics_backend::retention::delete_visitor_events(
+                            client,
+                            &scoped_visitors,
+                        ),
+                    )
+                    .await
+                    .map_err(|_| {
+                        temps_analytics_backend::retention::ClickHouseRetentionError::Query {
+                            database: client.database().unwrap_or("default").to_string(),
+                            operation: format!(
+                                "delete events for {} expired visitors",
+                                scoped_visitors.len()
+                            ),
+                            reason:
+                                "timed out after 120s; PostgreSQL deletion rolled back for retry"
+                                    .into(),
+                        }
+                    })??;
+                }
                 txn.commit()
                     .await
                     .map_err(|source| AnalyticsRetentionError::database(operation(), source))?;
@@ -750,6 +913,17 @@ pub fn effective_windows(
     }
 }
 
+fn stored_windows_valid(settings: &AnalyticsRetentionSettings) -> bool {
+    if let Some((field, days)) = settings.out_of_range() {
+        warn!(
+            field,
+            days, "skipping analytics retention: invalid stored window"
+        );
+        return false;
+    }
+    true
+}
+
 /// What is known about the longest window a plugin-provided
 /// [`RetentionResolver`] stamps on proxy logs, beyond the instance setting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -782,6 +956,7 @@ impl ResolverBound {
 pub struct RetentionSweepAudit {
     pub events_policy: Option<String>,
     pub error_events_policy: Option<String>,
+    pub clickhouse_events_policy: Option<String>,
     pub visitor_days: Option<u32>,
     pub visitors_deleted: u64,
     pub unreferenced_ip_days: Option<u32>,
@@ -798,8 +973,10 @@ impl RetentionSweepAudit {
             |action: Option<PolicyAction>| action.filter(|action| *action != PolicyAction::Keep);
         let events_policy = changed(report.events_policy);
         let error_events_policy = changed(report.error_events_policy);
+        let clickhouse_events_policy = changed(report.clickhouse_events_policy);
         if events_policy.is_none()
             && error_events_policy.is_none()
+            && clickhouse_events_policy.is_none()
             && report.visitors_deleted == 0
             && report.ip_addresses_deleted == 0
         {
@@ -808,6 +985,7 @@ impl RetentionSweepAudit {
         Some(Self {
             events_policy: events_policy.map(|action| format!("{action:?}")),
             error_events_policy: error_events_policy.map(|action| format!("{action:?}")),
+            clickhouse_events_policy: clickhouse_events_policy.map(|action| format!("{action:?}")),
             visitor_days: windows.visitor_days,
             visitors_deleted: report.visitors_deleted,
             unreferenced_ip_days: windows.unreferenced_ip_days,
@@ -834,13 +1012,8 @@ impl AuditOperation for RetentionSweepAudit {
         "temps-analytics-retention"
     }
 
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to serialize ANALYTICS_RETENTION_APPLIED audit: {}",
-                e
-            )
-        })
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -863,13 +1036,12 @@ pub fn spawn_retention_job(
             // so a policy that could not be read skips the pass.
             match config.get_retention_policy().await {
                 Ok(policy) => {
-                    let windows = effective_windows(
-                        &policy.analytics,
-                        policy.proxy_logs_days,
-                        ResolverBound::of(plugin_resolver.as_ref()),
-                        Utc::now(),
-                    );
-                    let report = service.enforce(&windows).await;
+                    let Some((report, windows)) = service
+                        .enforce_for_logs(&policy, ResolverBound::of(plugin_resolver.as_ref()))
+                        .await
+                    else {
+                        continue;
+                    };
                     if let Some(entry) = RetentionSweepAudit::from_report(&report, &windows) {
                         // The data is already gone; a failed audit write is
                         // logged, not retried, and does not stop the job.
@@ -1361,6 +1533,256 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn clickhouse_visitor_failure_rolls_back_and_retries_before_counting_success() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let fail = Arc::new(AtomicBool::new(true));
+        let calls = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = axum::Router::new().route(
+            "/",
+            axum::routing::post({
+                let fail = fail.clone();
+                let calls = calls.clone();
+                move |uri: axum::http::Uri, body: String| {
+                    let fail = fail.clone();
+                    let calls = calls.clone();
+                    async move {
+                        calls.lock().await.push(format!("{uri} {body}"));
+                        if fail.load(Ordering::SeqCst) {
+                            (axum::http::StatusCode::FORBIDDEN, "mutation denied")
+                        } else {
+                            (axum::http::StatusCode::OK, "")
+                        }
+                    }
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let rows = || {
+            vec![std::collections::BTreeMap::from([
+                ("id", sea_orm::Value::Int(Some(7))),
+                ("project_id", sea_orm::Value::Int(Some(42))),
+            ])]
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([rows(), rows()])
+                // set_config, fence, source events, visitor; repeated after rollback.
+                .append_exec_results([
+                    exec_ok(0),
+                    exec_ok(0),
+                    exec_ok(3),
+                    exec_ok(1),
+                    exec_ok(0),
+                    exec_ok(0),
+                    exec_ok(3),
+                    exec_ok(1),
+                ])
+                .into_connection(),
+        );
+        let client = clickhouse::Client::default()
+            .with_url(format!("http://{address}"))
+            .with_database("configured_database")
+            .with_compression(clickhouse::Compression::None);
+        let service = AnalyticsRetentionService::new(db.clone()).with_clickhouse(client);
+        let mut total = 0;
+        let cutoff = Utc::now() - chrono::Duration::days(425);
+        let error = service
+            .purge_visitors_counting(cutoff, &mut total)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("mutation denied"));
+        assert_eq!(
+            total, 0,
+            "failed ClickHouse mutation is never counted as deleted"
+        );
+        fail.store(false, Ordering::SeqCst);
+        service
+            .purge_visitors_counting(cutoff, &mut total)
+            .await
+            .unwrap();
+        assert_eq!(total, 1);
+        let calls = calls.lock().await;
+        assert_eq!(calls.len(), 2);
+        for call in calls.iter() {
+            assert!(call.contains("database=configured_database"), "{call}");
+            assert!(call.contains("mutations_sync=2"), "{call}");
+            assert!(
+                call.contains("(project_id, visitor_id) IN ((42, 7))"),
+                "{call}"
+            );
+        }
+        drop(service);
+        let log = Arc::try_unwrap(db).unwrap().into_transaction_log();
+        let first = format!("{:?}", log[0]);
+        let second = format!("{:?}", log[1]);
+        assert!(first.contains("ROLLBACK"), "{first}");
+        assert!(second.contains("COMMIT"), "{second}");
+        for transaction in [first, second] {
+            assert!(transaction.contains("FOR UPDATE"), "{transaction}");
+            assert!(
+                transaction.contains("pg_advisory_xact_lock"),
+                "{transaction}"
+            );
+            assert!(
+                transaction.contains("DELETE FROM events e USING visitor"),
+                "{transaction}"
+            );
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn invalid_stored_window_does_not_touch_either_backend() {
+        let service = mock_service(MockDatabase::new(DatabaseBackend::Postgres).into_connection())
+            .with_clickhouse(clickhouse::Client::default());
+        let settings = AnalyticsRetentionSettings {
+            events_days: 0,
+            ..Default::default()
+        };
+        assert_eq!(service.enforce(&settings).await, RetentionReport::default());
+        assert!(service
+            .enforce_for_logs(
+                &temps_config::RetentionPolicy {
+                    analytics: settings,
+                    proxy_logs_days: 3650,
+                },
+                ResolverBound::Instance,
+            )
+            .await
+            .is_none());
+        // Invalid saved IP windows must still be rejected, even though a
+        // *derived* window may exceed the settings maximum.
+        assert!(service
+            .enforce_for_logs(
+                &temps_config::RetentionPolicy {
+                    analytics: AnalyticsRetentionSettings {
+                        unreferenced_ip_days: Some(3651),
+                        ..Default::default()
+                    },
+                    proxy_logs_days: 3650,
+                },
+                ResolverBound::Instance,
+            )
+            .await
+            .is_none());
+        // Validate the saved log window too, before it is used to derive a
+        // cutoff. A corrupt value must not become an overflowing date.
+        for proxy_logs_days in [0, 3651, u32::MAX] {
+            assert!(service
+                .enforce_for_logs(
+                    &temps_config::RetentionPolicy {
+                        analytics: AnalyticsRetentionSettings::default(),
+                        proxy_logs_days,
+                    },
+                    ResolverBound::Instance,
+                )
+                .await
+                .is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn large_derived_ip_floor_does_not_skip_clickhouse_or_visitor_retention() {
+        use sea_orm::Value;
+        use std::collections::BTreeMap;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let calls = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let router = axum::Router::new().route("/", axum::routing::any({
+            let calls = calls.clone();
+            move |uri: axum::http::Uri, body: String| {
+                let calls = calls.clone();
+                async move {
+                    let query = format!("{uri} {body}");
+                    let mut response = Vec::new();
+                    if query.contains("formatQuery") {
+                        // One String column in RowBinary, with validation off.
+                        let ddl = "CREATE TABLE events\nTTL toDateTime(timestamp) + toIntervalDay(365)";
+                        response.push(ddl.len() as u8);
+                        response.extend_from_slice(ddl.as_bytes());
+                    }
+                    calls.lock().await.push(query);
+                    response
+                }
+            }
+        }));
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        for (proxy_logs_days, bound, expected_ip_days) in [
+            (3650, ResolverBound::Instance, 3651),
+            (
+                30,
+                ResolverBound::AtMost(u16::MAX.into()),
+                u32::from(u16::MAX) + 1,
+            ),
+        ] {
+            let db = MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([
+                    vec![BTreeMap::from([("present", Value::Bool(Some(false)))])],
+                    vec![BTreeMap::from([("present", Value::Bool(Some(false)))])],
+                    vec![BTreeMap::from([
+                        ("id", Value::Int(Some(7))),
+                        ("project_id", Value::Int(Some(42))),
+                    ])],
+                    vec![], // no IP reference columns in this fixture
+                    vec![], // no IPs older than the derived floor
+                ])
+                // TTL coordinator, then visitor config/fence/source/visitor.
+                .append_exec_results([exec_ok(0), exec_ok(0), exec_ok(0), exec_ok(3), exec_ok(1)])
+                .into_connection();
+            let client = clickhouse::Client::default()
+                .with_url(format!("http://{address}"))
+                .with_compression(clickhouse::Compression::None)
+                .with_validation(false);
+            let service = mock_service(db).with_clickhouse(client);
+            let (report, windows) = service
+                .enforce_for_logs(
+                    &temps_config::RetentionPolicy {
+                        analytics: AnalyticsRetentionSettings {
+                            error_events_days: Some(30),
+                            visitor_days: Some(425),
+                            ..Default::default()
+                        },
+                        proxy_logs_days,
+                    },
+                    bound,
+                )
+                .await
+                .expect("valid stored policy is enforced");
+
+            assert_eq!(windows.unreferenced_ip_days, Some(expected_ip_days));
+            assert_eq!(report.clickhouse_events_policy, Some(PolicyAction::Keep));
+            assert_eq!(report.events_policy, Some(PolicyAction::Keep));
+            assert_eq!(report.error_events_policy, Some(PolicyAction::Keep));
+            assert_eq!(report.visitors_deleted, 1);
+        }
+        let calls = calls.lock().await;
+        assert_eq!(calls.len(), 4, "one TTL read and visitor deletion per pass");
+        assert_eq!(calls.iter().filter(|q| q.contains("ALTER")).count(), 2);
+        server.abort();
+    }
+
+    #[test]
+    fn clickhouse_policy_changes_are_audited_separately_from_timescale_success() {
+        let windows = AnalyticsRetentionSettings::default();
+        let failed = RetentionReport {
+            events_policy: Some(PolicyAction::Keep),
+            ..Default::default()
+        };
+        assert!(RetentionSweepAudit::from_report(&failed, &windows).is_none());
+        let changed = RetentionReport {
+            clickhouse_events_policy: Some(PolicyAction::Set(90)),
+            ..failed
+        };
+        let audit = RetentionSweepAudit::from_report(&changed, &windows).unwrap();
+        assert_eq!(audit.events_policy, None);
+        assert_eq!(audit.clickhouse_events_policy.as_deref(), Some("Set(90)"));
+    }
+
+    #[tokio::test]
     async fn sync_policy_leaves_a_non_hypertable_alone() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results([[std::collections::BTreeMap::from([(
@@ -1494,6 +1916,151 @@ mod integration_tests {
         .insert(db)
         .await
         .expect("insert visitor");
+    }
+
+    #[tokio::test]
+    async fn clickhouse_cleanup_fences_delivery_rolls_back_failures_and_removes_replay_source() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use temps_analytics_backend::retention::lock_event_delivery;
+        use temps_entities::events;
+        let Some(test_db) = database("retention_clickhouse_delivery").await else {
+            return;
+        };
+        let db = test_db.db.clone();
+        let ids = seed_environment(db.as_ref()).await;
+        let cutoff = Utc::now() - chrono::Duration::days(425);
+        let fail = Arc::new(AtomicBool::new(true));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = axum::Router::new().route(
+            "/",
+            axum::routing::post({
+                let fail = fail.clone();
+                move || {
+                    let fail = fail.clone();
+                    async move {
+                        if fail.load(Ordering::SeqCst) {
+                            axum::http::StatusCode::FORBIDDEN
+                        } else {
+                            axum::http::StatusCode::OK
+                        }
+                    }
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = clickhouse::Client::default()
+            .with_url(format!("http://{address}"))
+            .with_compression(clickhouse::Compression::None);
+
+        async fn event(db: &DatabaseConnection, ids: (i32, i32), visitor_id: i32) -> i64 {
+            events::ActiveModel {
+                project_id: Set(ids.0),
+                environment_id: Set(Some(ids.1)),
+                visitor_id: Set(Some(visitor_id)),
+                session_id: Set(Some("test-session".into())),
+                timestamp: Set(Utc::now()),
+                hostname: Set("example.test".into()),
+                pathname: Set("/".into()),
+                page_path: Set("/".into()),
+                href: Set("https://example.test/".into()),
+                event_type: Set("pageview".into()),
+                ..Default::default()
+            }
+            .insert(db)
+            .await
+            .unwrap()
+            .id
+        }
+        insert_visitor(db.as_ref(), ids, "pg-only", 500, None).await;
+        let v = visitor::Entity::find()
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        let pg_event = event(db.as_ref(), ids, v.id).await;
+        // PostgreSQL-only cleanup retains its historical detachment behavior.
+        assert_eq!(
+            AnalyticsRetentionService::new(db.clone())
+                .purge_visitors(cutoff)
+                .await
+                .unwrap(),
+            1
+        );
+        let kept = events::Entity::find_by_id(pg_event)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(kept.visitor_id, None);
+
+        insert_visitor(db.as_ref(), ids, "ch-expired", 500, None).await;
+        let v = visitor::Entity::find()
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        let source_id = event(db.as_ref(), ids, v.id).await;
+        db.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "INSERT INTO events_ch_outbox(event_id) VALUES ($1)",
+            [source_id.into()],
+        ))
+        .await
+        .unwrap();
+        let service = Arc::new(AnalyticsRetentionService::new(db.clone()).with_clickhouse(client));
+        // A fan-out/backfill may already have loaded rows: it holds a shared
+        // transaction fence until its remote insert has completed.
+        let delivery = db.begin().await.unwrap();
+        lock_event_delivery(&delivery, false).await.unwrap();
+        let cleanup = tokio::spawn({
+            let service = service.clone();
+            async move { service.purge_visitors(cutoff).await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !cleanup.is_finished(),
+            "cleanup must wait for a buffered delivery batch"
+        );
+        delivery.commit().await.unwrap();
+        assert!(
+            cleanup.await.unwrap().is_err(),
+            "a denied CH mutation fails cleanup"
+        );
+        assert!(visitor::Entity::find_by_id(v.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .is_some());
+        assert!(events::Entity::find_by_id(source_id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .is_some());
+        fail.store(false, Ordering::SeqCst);
+        assert_eq!(service.purge_visitors(cutoff).await.unwrap(), 1);
+        assert!(visitor::Entity::find_by_id(v.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .is_none());
+        assert!(events::Entity::find_by_id(source_id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .is_none());
+        // A late enqueue/previously claimed outbox row cannot find a source
+        // event to replicate, and a later backfill cannot find it either.
+        let row = db.query_one(Statement::from_string(DatabaseBackend::Postgres,
+            "SELECT count(*)::bigint AS n FROM events_ch_outbox o JOIN events e ON e.id = o.event_id"))
+            .await.unwrap().unwrap();
+        assert_eq!(row.try_get::<i64>("", "n").unwrap(), 0);
+        assert!(events::Entity::find_by_id(pg_event)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .is_some());
+        server.abort();
     }
 
     #[tokio::test]

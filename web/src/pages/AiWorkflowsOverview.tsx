@@ -13,6 +13,7 @@ import {
   CardTitle,
 } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
+import { PageHeader } from '@/components/layout/PageContainer'
 import { Skeleton } from '@/components/ui/skeleton'
 import { EmptyState } from '@/components/ui/empty-state'
 import { getProjectsOptions } from '@/api/client/@tanstack/react-query.gen'
@@ -34,20 +35,18 @@ export function AiWorkflowsOverview() {
 
   return (
     <div className="w-full space-y-4 px-4 py-4 sm:space-y-6 sm:px-6 sm:py-6 lg:px-8">
-      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-        <div>
-          <h1 className="text-2xl font-semibold tracking-tight">Workflows</h1>
-          <p className="text-sm text-muted-foreground">
-            Autofixer and agent runs, configured per service.
-          </p>
-        </div>
-        <Button variant="outline" asChild>
-          <Link to="/agent-sandbox">
-            <Gauge className="mr-1.5 size-4" />
-            AI runtime settings
-          </Link>
-        </Button>
-      </div>
+      <PageHeader
+        title="Workflows"
+        description="Autofixer and agent runs, configured per service."
+        actions={
+          <Button variant="outline" asChild>
+            <Link to="/agent-sandbox">
+              <Gauge className="mr-1.5 size-4" />
+              AI runtime settings
+            </Link>
+          </Button>
+        }
+      />
 
       {isPending ? (
         <div className="space-y-2">

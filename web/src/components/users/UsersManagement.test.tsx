@@ -9,7 +9,27 @@ import type { UserResponse } from '@/api/client/types.gen'
 import { AuthContext } from '@/contexts/AuthContext-shared'
 import { UsersManagement } from './UsersManagement'
 
-function render(role: string, error?: unknown) {
+const listedUser = {
+  user: {
+    id: 9,
+    name: 'Listed Person',
+    username: 'listed',
+    email: 'listed@example.test',
+    image: '',
+    email_verified: true,
+    mfa_enabled: false,
+    must_change_password: false,
+    created_at: 0,
+    updated_at: 0,
+  },
+  roles: [],
+}
+
+function render(
+  role: string,
+  error?: unknown,
+  users: unknown[] | undefined = error ? undefined : []
+) {
   const user: UserResponse = {
     id: 3,
     name: 'Example User',
@@ -31,7 +51,7 @@ function render(role: string, error?: unknown) {
           }}
         >
           <UsersManagement
-            users={error ? undefined : []}
+            users={users as never}
             isLoading={false}
             error={error}
             reloadUsers={() => {}}
@@ -59,7 +79,7 @@ const refused = {
 
 test('a non-admin is offered no Add User action and is told why', () => {
   const html = render('user', refused)
-  expect(buttonTags(html, 'Add User')).toHaveLength(0)
+  expect(buttonTags(html, 'Add user')).toHaveLength(0)
   expect(html).toContain('Only administrators can add, edit or remove users')
   expect(html).toContain('Users: access denied')
   expect(html).not.toContain('Retry')
@@ -67,13 +87,21 @@ test('a non-admin is offered no Add User action and is told why', () => {
 
 test('a non-admin with a verified-empty list is still offered no Add User action', () => {
   const html = render('user')
-  expect(buttonTags(html, 'Add User')).toHaveLength(0)
+  expect(buttonTags(html, 'Add user')).toHaveLength(0)
   expect(html).toContain('data-admin-only-note')
 })
 
 test('an administrator keeps every Add User control', () => {
   const html = render('admin')
-  const tags = buttonTags(html, 'Add User')
+  const tags = buttonTags(html, 'Add user')
   expect(tags.length).toBeGreaterThan(0)
   expect(html).not.toContain('data-admin-only-note')
+})
+
+test('a downgraded role loses the row actions on already-fetched users', () => {
+  const restricted = render('user', undefined, [listedUser])
+  expect(restricted).toContain('Listed Person')
+  expect(restricted).not.toContain('Open menu')
+  const admin = render('admin', undefined, [listedUser])
+  expect(admin).toContain('Open menu')
 })

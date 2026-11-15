@@ -6,6 +6,7 @@ import {
   ALL_HOST_KEYS_COMMAND,
   hostKeyCompareCommand,
   hostKeyFileForAlgorithm,
+  parseSshPort,
 } from './ssh-host-key'
 
 describe('host key file from the algorithm', () => {
@@ -48,6 +49,24 @@ describe('host key file from the algorithm', () => {
     expect(hostKeyCompareCommand('ssh-dss')).toBe(ALL_HOST_KEYS_COMMAND)
     expect(ALL_HOST_KEYS_COMMAND).toBe(
       'for f in /etc/ssh/ssh_host_*_key.pub; do ssh-keygen -lf "$f"; done'
+    )
+  })
+})
+
+describe('parseSshPort', () => {
+  test('accepts a port between 1 and 65535', () => {
+    expect(parseSshPort('22')).toEqual({ port: 22, error: null })
+    expect(parseSshPort(' 2222 ')).toEqual({ port: 2222, error: null })
+    expect(parseSshPort('65535')).toEqual({ port: 65535, error: null })
+  })
+
+  test('refuses what used to be read as port 22 or passed through', () => {
+    expect(parseSshPort('').error).toBe('Enter a port (usually 22)')
+    expect(parseSshPort('22abc').error).toBe('The port must be a whole number')
+    expect(parseSshPort('-1').error).toBe('The port must be a whole number')
+    expect(parseSshPort('0').error).toBe('The port must be between 1 and 65535')
+    expect(parseSshPort('70000').error).toBe(
+      'The port must be between 1 and 65535'
     )
   })
 })

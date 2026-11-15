@@ -114,7 +114,7 @@ export function CreateWebhookPage({ project }: CreateWebhookPageProps) {
           <ArrowLeft className="h-4 w-4" />
         </Button>
         <div>
-          <h2 className="text-2xl font-bold tracking-tight">Create Webhook</h2>
+          <h2 className="text-2xl font-bold tracking-tight">Create webhook</h2>
           <p className="text-muted-foreground">
             Configure a webhook endpoint to receive real-time notifications
           </p>
@@ -125,7 +125,7 @@ export function CreateWebhookPage({ project }: CreateWebhookPageProps) {
         <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-6">
           <Card>
             <CardHeader>
-              <CardTitle>Endpoint Configuration</CardTitle>
+              <CardTitle>Endpoint configuration</CardTitle>
               <CardDescription>
                 Specify the URL where webhook events will be delivered
               </CardDescription>
@@ -202,7 +202,7 @@ export function CreateWebhookPage({ project }: CreateWebhookPageProps) {
 
           <Card>
             <CardHeader>
-              <CardTitle>Event Subscriptions</CardTitle>
+              <CardTitle>Event subscriptions</CardTitle>
               <CardDescription>
                 Choose which events should trigger this webhook
               </CardDescription>
@@ -343,7 +343,7 @@ export function CreateWebhookPage({ project }: CreateWebhookPageProps) {
               {createWebhook.isPending && (
                 <Loader2 className="mr-2 h-4 w-4 animate-spin" />
               )}
-              Create Webhook
+              Create webhook
             </Button>
           </div>
         </form>

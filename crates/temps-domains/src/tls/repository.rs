@@ -38,6 +38,20 @@ pub trait CertificateRepository: Send + Sync {
         days: i32,
     ) -> Result<Vec<Certificate>, RepositoryError>;
 
+    /// Bounded keyset page for the renewal scheduler. Production implementations
+    /// must page in the database; the default supports in-memory repositories.
+    async fn expiring_certificate_page(
+        &self,
+        days: i32,
+        after_id: i32,
+    ) -> Result<Vec<Certificate>, RepositoryError> {
+        let mut certs = self.find_expiring_certificates(days).await?;
+        certs.retain(|cert| cert.id > after_id);
+        certs.sort_by_key(|cert| cert.id);
+        certs.truncate(100);
+        Ok(certs)
+    }
+
     // DNS challenge operations
     async fn save_dns_challenge(&self, data: DnsChallengeData) -> Result<(), RepositoryError>;
     async fn find_dns_challenge(
@@ -400,6 +414,27 @@ impl CertificateRepository for DefaultCertificateRepository {
         certs
             .into_iter()
             .map(|cert| self.decrypt_certificate(cert))
+            .collect()
+    }
+
+    async fn expiring_certificate_page(
+        &self,
+        days: i32,
+        after_id: i32,
+    ) -> Result<Vec<Certificate>, RepositoryError> {
+        use temps_entities::domains;
+        let results = domains::Entity::find()
+            .filter(domains::Column::Id.gt(after_id))
+            .filter(
+                domains::Column::ExpirationTime.lte(Utc::now() + Duration::days(i64::from(days))),
+            )
+            .order_by_asc(domains::Column::Id)
+            .limit(100)
+            .all(self.db.as_ref())
+            .await?;
+        results
+            .into_iter()
+            .map(|row| self.decrypt_certificate(row.into()))
             .collect()
     }
 
@@ -772,7 +807,7 @@ impl CertificateRepository for DefaultCertificateRepository {
         let results = acme_orders::Entity::find()
             .order_by_desc(acme_orders::Column::CreatedAt)
             .paginate(self.db.as_ref(), page_size)
-            .fetch_page(page - 1)
+            .fetch_page(temps_core::config::page_index(page))
             .await?;
 
         Ok(results
@@ -1222,8 +1257,8 @@ pub mod test_utils {
         async fn test_list_all_orders_with_database() {
             use chrono::Utc;
             use sea_orm::{ActiveModelTrait, Set};
-            use temps_database::test_utils::TestDatabase;
             use temps_entities::{acme_orders, domains};
+            use temps_test_utils::TestDatabase;
 
             // Setup test database
             let test_db = TestDatabase::with_migrations().await.unwrap();

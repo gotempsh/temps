@@ -9,8 +9,9 @@ authorization.
 The skill guides an agent to:
 
 1. confirm the exact host and non-secret installation choices;
-2. authenticate and review `https://temps.sh/deploy.sh` and its executable
-   dependency chain before running anything as root;
+2. check `https://temps.sh/deploy.sh` against the checksum temps.sh publishes
+   for it, review it, and authenticate its executable dependency chain before
+   running anything as root;
 3. run a bounded QuickStart, advanced, or local installation;
 4. expose only allowlisted non-secret install results;
 5. verify the console URL and service health;

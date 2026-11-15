@@ -13,6 +13,7 @@ import {
   globalLogCapabilities,
   globalLogFacetsAttrs,
   globalLogHistogram,
+  logIngestBudget,
   searchGlobalLogs,
 } from '@/api/client/sdk.gen'
 import type {
@@ -328,6 +329,21 @@ export function useGlobalLogCapabilities() {
       (await globalLogCapabilities({ signal, throwOnError: true })).data,
     staleTime: 30_000,
     refetchInterval: 60_000,
+    retry: false,
+  })
+}
+
+/**
+ * The log ingestion budget and the containers dropping lines over it. Cheap
+ * on the server (in-memory only), so every log view can poll it.
+ */
+export function useLogIngestBudget() {
+  return useQuery({
+    queryKey: ['log-ingest-budget'],
+    queryFn: async ({ signal }) =>
+      (await logIngestBudget({ signal, throwOnError: true })).data,
+    staleTime: 15_000,
+    refetchInterval: 30_000,
     retry: false,
   })
 }

@@ -6,6 +6,9 @@ import {
   getRepositoryComposePreview,
 } from '@/api/client'
 import type {
+  ComposeCheckErrorClass,
+  ComposeCheckReport,
+  ComposeOverrideRedundancy,
   ComposePreviewProblemResponse,
   ComposeSecurityCheck,
   ComposeSecurityPolicy,
@@ -17,6 +20,12 @@ export interface ComposePreviewRequest {
   composeOverride?: string
   excludedServices: string[]
   previewPolicy?: ComposeSecurityPolicy
+  /**
+   * Run the deploy-time check with this project's saved policy and
+   * environment variables. Connected repositories only.
+   */
+  projectId?: number
+  environmentId?: number
 }
 
 export interface ComposePreviewResponse {
@@ -25,6 +34,10 @@ export interface ComposePreviewResponse {
   enabledServices: string[]
   disabledServices: string[]
   redactedValues: number
+  /** The deploy-time check the preview ran; absent for public repositories. */
+  check?: ComposeCheckReport | null
+  overrideRedundancy?: ComposeOverrideRedundancy | null
+  overrideWarning?: string | null
 }
 
 export type ComposePreviewRepository =
@@ -61,6 +74,12 @@ export async function fetchComposePreview(
   request: ComposePreviewRequest,
   signal?: AbortSignal
 ): Promise<ComposePreviewResponse> {
+  // Public previews never load a project's variables.
+  const {
+    projectId: _projectId,
+    environmentId: _environmentId,
+    ...publicRequest
+  } = request
   const result =
     repository.kind === 'connected'
       ? await getRepositoryComposePreview({
@@ -76,7 +95,7 @@ export async function fetchComposePreview(
             repo: repository.repo,
           },
           query: { base_url: repository.baseUrl },
-          body: request,
+          body: publicRequest,
           signal,
           throwOnError: false,
         })
@@ -124,4 +143,25 @@ export function composePreviewPolicyCheck(
 
 export function isPublicRepositoryRateLimitError(error: unknown): boolean {
   return (error as { status?: unknown } | null)?.status === 429
+}
+
+function previewProblem(error: unknown): ComposePreviewProblemResponse | null {
+  return (
+    (error as { problem?: ComposePreviewProblemResponse } | null)?.problem ??
+    null
+  )
+}
+
+/** The class a deployment of the previewed configuration would fail with. */
+export function composePreviewErrorClass(
+  error: unknown
+): ComposeCheckErrorClass | null {
+  return previewProblem(error)?.error_class ?? null
+}
+
+/** The failed deploy-time check behind a preview error, when it ran. */
+export function composePreviewFailedCheck(
+  error: unknown
+): ComposeCheckReport | null {
+  return previewProblem(error)?.compose_check ?? null
 }

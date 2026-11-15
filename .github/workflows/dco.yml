@@ -18,6 +18,11 @@ on:
     types: [opened, synchronize, reopened]
     branches:
       - main
+  # A required check has to report in the merge queue too. The commits it
+  # checks are the pull request's, already checked above, so there the job
+  # is skipped -- which GitHub counts as passing.
+  merge_group:
+    types: [checks_requested]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -29,6 +34,7 @@ permissions:
 jobs:
   dco:
     name: Check sign-off
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

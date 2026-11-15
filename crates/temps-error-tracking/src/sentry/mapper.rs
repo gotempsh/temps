@@ -30,19 +30,36 @@ pub fn convert_sentry_event_to_error_data(
 ) -> Result<CreateErrorEventData, SentryMappingError> {
     let event = event.value().ok_or(SentryMappingError::NoValue)?;
 
-    // Extract message - for now, just use a default
-    let message: String = event
-        .logentry
-        .value()
-        .and_then(|logentry| logentry.message.value().map(|msg| msg.as_ref().to_string()))
-        .unwrap_or_else(|| "Error".to_string());
+    // SDKs use either a plain message or a structured log entry. Keep the
+    // formatted text for display; the original template remains in source data.
+    let message = raw_event
+        .pointer("/logentry/formatted")
+        .and_then(|v| v.as_str())
+        .or_else(|| raw_event.get("message").and_then(|v| v.as_str()))
+        .or_else(|| {
+            raw_event
+                .pointer("/logentry/message")
+                .and_then(|v| v.as_str())
+        })
+        .or_else(|| {
+            raw_event
+                .pointer("/message/formatted")
+                .and_then(|v| v.as_str())
+        })
+        .or_else(|| {
+            raw_event
+                .pointer("/message/message")
+                .and_then(|v| v.as_str())
+        })
+        .unwrap_or("Error")
+        .to_string();
 
     // Extract all exceptions with their stack traces
     let mut exceptions_list: Vec<ExceptionData> = Vec::new();
 
     if let Some(exceptions) = event.exceptions.value() {
         if let Some(values_vec) = exceptions.values.value() {
-            for annotated_exception in values_vec.iter() {
+            for (index, annotated_exception) in values_vec.iter().enumerate() {
                 if let Some(exc) = annotated_exception.value() {
                     let exception_type = exc
                         .ty
@@ -52,29 +69,26 @@ pub fn convert_sentry_event_to_error_data(
 
                     let exception_value = exc.value.as_str().map(|s| s.to_string());
 
+                    let wire_exception = raw_event
+                        .get("exception")
+                        .and_then(|value| {
+                            value
+                                .as_array()
+                                .or_else(|| value.get("values").and_then(|v| v.as_array()))
+                        })
+                        .and_then(|values| values.get(index));
                     // Extract stack trace for this exception
-                    let stack_trace = exc.stacktrace.value().and_then(convert_stacktrace_to_json);
+                    let stack_trace = wire_exception
+                        .and_then(|value| value.get("stacktrace"))
+                        .filter(|v| v.is_object())
+                        .cloned()
+                        .or_else(|| exc.stacktrace.value().and_then(convert_stacktrace_to_json));
 
                     // Extract mechanism if available
-                    let mechanism = exc.mechanism.value().map(|mech| {
-                        let mut obj = serde_json::Map::new();
-                        if let Some(ty) = mech.ty.as_str() {
-                            obj.insert(
-                                "type".to_string(),
-                                serde_json::Value::String(ty.to_string()),
-                            );
-                        }
-                        if let Some(handled) = mech.handled.value() {
-                            obj.insert("handled".to_string(), serde_json::Value::Bool(*handled));
-                        }
-                        if let Some(synthetic) = mech.synthetic.value() {
-                            obj.insert(
-                                "synthetic".to_string(),
-                                serde_json::Value::Bool(*synthetic),
-                            );
-                        }
-                        serde_json::Value::Object(obj)
-                    });
+                    let mechanism = wire_exception
+                        .and_then(|value| value.get("mechanism"))
+                        .filter(|v| v.is_object())
+                        .cloned();
 
                     let module = exc.module.as_str().map(|s| s.to_string());
                     let thread_id = exc.thread_id.value().map(|id| id.to_string());
@@ -94,14 +108,25 @@ pub fn convert_sentry_event_to_error_data(
 
     // If no exceptions found but event has a stacktrace at the top level, create a generic exception
     if exceptions_list.is_empty() {
-        let stack_trace = event
-            .stacktrace
-            .value()
-            .and_then(convert_stacktrace_to_json);
+        let stack_trace = raw_event
+            .get("stacktrace")
+            .filter(|v| v.is_object())
+            .cloned()
+            .or_else(|| {
+                event
+                    .stacktrace
+                    .value()
+                    .and_then(convert_stacktrace_to_json)
+            });
 
         exceptions_list.push(ExceptionData {
-            exception_type: message.clone(),
-            exception_value: None,
+            exception_type: if raw_event.get("type").and_then(|v| v.as_str()) == Some("csp") {
+                "CSPViolation"
+            } else {
+                "Message"
+            }
+            .into(),
+            exception_value: Some(message.clone()),
             stack_trace,
             mechanism: None,
             module: None,
@@ -109,80 +134,40 @@ pub fn convert_sentry_event_to_error_data(
         });
     }
 
-    // For backward compatibility, extract first exception data
-    let (exception_type, exception_value, stack_trace) =
-        if let Some(first) = exceptions_list.first() {
-            (
-                Some(first.exception_type.clone()),
-                first.exception_value.clone(),
-                first.stack_trace.clone(),
-            )
-        } else {
-            (Some(message.clone()), None, None)
-        };
-
-    // Extract breadcrumbs
-    let mut json_breadcrumbs: Option<serde_json::Value> = None;
-    if let Some(breadcrumbs) = event.breadcrumbs.value() {
-        if let Some(values) = breadcrumbs.values.value() {
-            let items: Vec<serde_json::Value> = values
-                .iter()
-                .filter_map(|annotated_breadcrumb| {
-                    annotated_breadcrumb.value().map(|breadcrumb| {
-                        let mut obj = serde_json::Map::new();
-
-                        if let Some(ty) = breadcrumb.ty.as_str() {
-                            obj.insert(
-                                "type".to_string(),
-                                serde_json::Value::String(ty.to_string()),
-                            );
-                        }
-                        if let Some(category) = breadcrumb.category.as_str() {
-                            obj.insert(
-                                "category".to_string(),
-                                serde_json::Value::String(category.to_string()),
-                            );
-                        }
-                        if let Some(message) = breadcrumb.message.as_str() {
-                            obj.insert(
-                                "message".to_string(),
-                                serde_json::Value::String(message.to_string()),
-                            );
-                        }
-                        if let Some(level) = breadcrumb.level.value() {
-                            obj.insert(
-                                "level".to_string(),
-                                serde_json::Value::String(level.to_string()),
-                            );
-                        }
-                        if let Some(timestamp) = breadcrumb.timestamp.value() {
-                            let dt = timestamp.into_inner();
-                            obj.insert(
-                                "timestamp".to_string(),
-                                serde_json::Value::String(dt.to_rfc3339()),
-                            );
-                        }
-                        if let Some(data) = breadcrumb.data.value() {
-                            let map: serde_json::Map<String, serde_json::Value> = data
-                                .iter()
-                                .filter_map(|(k, v)| {
-                                    v.value().and_then(|value| {
-                                        relay_value_to_json(value)
-                                            .map(|json_val| (k.clone(), json_val))
-                                    })
-                                })
-                                .collect();
-                            obj.insert("data".to_string(), serde_json::Value::Object(map));
-                        }
-
-                        serde_json::Value::Object(obj)
-                    })
-                })
-                .collect();
-
-            json_breadcrumbs = Some(serde_json::Value::Array(items));
+    // Some native SDKs attach the capture stack to a thread. Match an
+    // explicit exception thread ID, or the unique current/crashed thread for
+    // the primary exception. Never pick an arbitrary thread from a crash.
+    let primary = exceptions_list.len().saturating_sub(1);
+    for (index, exception) in exceptions_list.iter_mut().enumerate() {
+        if exception.stack_trace.is_none() {
+            exception.stack_trace =
+                thread_stack(&raw_event, exception.thread_id.as_deref(), index == primary);
         }
     }
+
+    // Sentry exception chains are ordered oldest to most recent.
+    let (exception_type, exception_value, stack_trace) = if let Some(first) = exceptions_list.last()
+    {
+        (
+            Some(first.exception_type.clone()),
+            first.exception_value.clone(),
+            first.stack_trace.clone(),
+        )
+    } else {
+        (Some(message.clone()), None, None)
+    };
+
+    // Preserve typed breadcrumb data, nulls, timestamps and unknown fields.
+    // SDKs use both a direct array and the legacy { values: [...] } wrapper.
+    let json_breadcrumbs = raw_event
+        .get("breadcrumbs")
+        .and_then(|value| {
+            value
+                .as_array()
+                .map(|_| value)
+                .or_else(|| value.get("values").filter(|v| v.is_array()))
+        })
+        .cloned();
 
     // Extract user information
     let (user_id, user_email, user_username, user_ip) = if let Some(user) = event.user.value() {
@@ -196,49 +181,75 @@ pub fn convert_sentry_event_to_error_data(
         (None, None, None, None)
     };
 
-    // Extract request context
-    let (url, method, headers) = if let Some(request) = event.request.value() {
-        (
-            request.url.as_str().map(|s| s.to_string()),
-            request.method.as_str().map(|s| s.to_string()),
-            None, // Skip headers serialization - complex type
-        )
+    let text = |path: &str| {
+        raw_event
+            .pointer(path)
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+    };
+    let field = |path: &str| raw_event.pointer(path).filter(|v| !v.is_null()).cloned();
+    let integer = |path: &str| raw_event.pointer(path).and_then(|v| v.as_i64());
+    let header = |name: &str| request_header(raw_event.pointer("/request/headers"), name);
+    let timestamp = |path: &str| {
+        text(path)
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+            .map(|t| t.with_timezone(&chrono::Utc))
+    };
+    let native_extra = if raw_event.get("tags").is_some() || raw_event.get("extra").is_some() {
+        Some(serde_json::json!({"tags": raw_event.get("tags"), "extra": raw_event.get("extra")}))
     } else {
-        (None, None, None)
+        None
     };
 
     Ok(CreateErrorEventData {
         source: Some("sentry".to_string()),
-        raw_sentry_event: Some(raw_event),
+        raw_sentry_event: Some(raw_event.clone()),
         exceptions: exceptions_list,
         exception_type,
         exception_value,
         stack_trace,
-        url,
-        user_agent: None, // Could extract from request headers
-        referrer: None,
-        method,
-        headers,
-        user_id,
+        url: text("/request/url"),
+        user_agent: header("user-agent"),
+        referrer: header("referer"),
+        method: text("/request/method"),
+        headers: field("/request/headers"),
+        user_id: user_id.or_else(|| {
+            raw_event
+                .pointer("/user/id")
+                .filter(|v| v.is_number())
+                .map(ToString::to_string)
+        }),
         user_email,
         user_username,
         user_ip_address: user_ip,
-        user_segment: None,
-        session_id: None,
-        user_context: None, // Skip user serialization - complex type
-        browser: None,
-        browser_version: None,
-        operating_system: None,
-        operating_system_version: None,
-        device_type: None,
-        screen_width: None,
-        screen_height: None,
+        user_segment: text("/user/segment"),
+        session_id: text("/contexts/replay/replay_id")
+            .or_else(|| text("/replay_id"))
+            .filter(|id| super::logs::valid_id(id, 32))
+            .map(|id| {
+                format!(
+                    "sentry-{project_id}-{}-{}-{}",
+                    environment_id.unwrap_or(0),
+                    deployment_id.unwrap_or(0),
+                    id.to_ascii_lowercase()
+                )
+            }),
+        user_context: field("/user"),
+        browser: text("/contexts/browser/name"),
+        browser_version: text("/contexts/browser/version"),
+        operating_system: text("/contexts/os/name"),
+        operating_system_version: text("/contexts/os/version"),
+        device_type: text("/contexts/device/family").or_else(|| text("/contexts/device/model")),
+        screen_width: integer("/contexts/device/screen_width_pixels")
+            .and_then(|v| v.try_into().ok()),
+        screen_height: integer("/contexts/device/screen_height_pixels")
+            .and_then(|v| v.try_into().ok()),
         viewport_width: None,
         viewport_height: None,
-        request_context: None, // Skip request serialization - complex type
-        extra_context: None,   // Skip extra/tags serialization for now - complex types
+        request_context: field("/request"),
+        extra_context: native_extra,
         release_version: event.release.as_str().map(|r| r.to_string()),
-        build_number: None,
+        build_number: text("/dist"),
         server_name: event.server_name.as_str().map(|s| s.to_string()),
         environment: event.environment.as_str().map(|e| e.to_string()),
         sdk_name: event
@@ -249,36 +260,112 @@ pub fn convert_sentry_event_to_error_data(
             .client_sdk
             .value()
             .and_then(|s| s.version.as_str().map(|v| v.to_string())),
-        sdk_integrations: None, // Skip SDK integrations - complex type
+        sdk_integrations: field("/sdk/integrations"),
         platform: event.platform.as_str().map(|p| p.to_string()),
         transaction_name: event.transaction.as_str().map(|t| t.to_string()),
         breadcrumbs: json_breadcrumbs,
-        request_cookies: None,
-        request_query_string: None,
-        request_data: None,
-        contexts: None, // Skip contexts serialization - complex type
-        os_name: None,
-        os_version: None,
-        os_build: None,
-        os_kernel_version: None,
-        device_arch: None,
-        device_processor_count: None,
-        device_processor_frequency: None,
-        device_memory_size: None,
-        device_free_memory: None,
-        device_boot_time: None,
-        runtime_name: None,
-        runtime_version: None,
-        app_start_time: None,
-        app_memory: None,
-        locale: None,
-        timezone: None,
+        request_cookies: field("/request/cookies"),
+        request_query_string: field("/request/query_string"),
+        request_data: field("/request/data"),
+        contexts: field("/contexts"),
+        os_name: text("/contexts/os/name"),
+        os_version: text("/contexts/os/version"),
+        os_build: text("/contexts/os/build"),
+        os_kernel_version: text("/contexts/os/kernel_version"),
+        device_arch: text("/contexts/device/arch"),
+        device_processor_count: integer("/contexts/device/processor_count")
+            .and_then(|v| v.try_into().ok()),
+        device_processor_frequency: integer("/contexts/device/processor_frequency")
+            .and_then(|v| v.try_into().ok()),
+        device_memory_size: integer("/contexts/device/memory_size"),
+        device_free_memory: integer("/contexts/device/free_memory"),
+        device_boot_time: timestamp("/contexts/device/boot_time"),
+        runtime_name: text("/contexts/runtime/name"),
+        runtime_version: text("/contexts/runtime/version"),
+        app_start_time: timestamp("/contexts/app/app_start_time"),
+        app_memory: integer("/contexts/app/app_memory"),
+        locale: text("/contexts/device/locale").or_else(|| text("/contexts/culture/locale")),
+        timezone: text("/contexts/culture/timezone"),
         project_id,
         environment_id,
         deployment_id,
         visitor_id: None,
         ip_geolocation_id: None,
     })
+}
+
+/// Validate grouping input before any native writes. The body framing limit
+/// remains the primary bound for all other preserved event metadata.
+pub fn validate_event_metadata(raw: &serde_json::Value) -> Result<(), SentryMappingError> {
+    if let Some(value) = raw.get("fingerprint").filter(|v| !v.is_null()) {
+        let values = value.as_array().ok_or_else(|| {
+            SentryMappingError::Validation("fingerprint must be a string array".into())
+        })?;
+        if values.len() > 128
+            || values.iter().any(|v| {
+                v.as_str()
+                    .is_none_or(|s| s.len() > 1024 || s.contains('\0'))
+            })
+        {
+            return Err(SentryMappingError::Validation(
+                "fingerprint exceeds component/type limits".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn thread_stack(
+    raw: &serde_json::Value,
+    id: Option<&str>,
+    primary: bool,
+) -> Option<serde_json::Value> {
+    let threads = raw.get("threads").and_then(|v| {
+        v.as_array()
+            .or_else(|| v.get("values").and_then(|v| v.as_array()))
+    })?;
+    let mut matches = threads.iter().filter(|thread| {
+        if let Some(id) = id {
+            thread.get("id").is_some_and(|value| {
+                value.as_str() == Some(id)
+                    || value.as_number().is_some_and(|number| {
+                        id.parse::<serde_json::Number>()
+                            .is_ok_and(|id| number == &id)
+                    })
+            })
+        } else {
+            primary
+                && (thread.get("current").and_then(|v| v.as_bool()) == Some(true)
+                    || thread.get("crashed").and_then(|v| v.as_bool()) == Some(true))
+        }
+    });
+    let thread = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    thread.get("stacktrace").filter(|v| v.is_object()).cloned()
+}
+
+fn request_header(headers: Option<&serde_json::Value>, name: &str) -> Option<String> {
+    match headers? {
+        serde_json::Value::Object(values) => values
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .and_then(|(_, value)| value.as_str())
+            .map(str::to_owned),
+        serde_json::Value::Array(values) => values
+            .iter()
+            .filter_map(|v| v.as_array())
+            .find(|pair| {
+                pair.first()
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|key| key.eq_ignore_ascii_case(name))
+            })
+            .and_then(|pair| pair.get(1))
+            .and_then(|v| v.as_str())
+            .map(str::to_owned),
+        _ => None,
+    }
 }
 
 /// Convert a Relay stack trace to JSON
@@ -374,34 +461,117 @@ pub fn convert_stacktrace_to_json(
     })
 }
 
-/// Convert Relay's Value type to serde_json::Value
-pub fn relay_value_to_json(value: &relay_protocol::Value) -> Option<serde_json::Value> {
-    match value {
-        relay_protocol::Value::Bool(b) => Some(serde_json::Value::Bool(*b)),
-        relay_protocol::Value::I64(i) => Some(serde_json::Value::Number((*i).into())),
-        relay_protocol::Value::U64(u) => Some(serde_json::Value::Number((*u).into())),
-        relay_protocol::Value::F64(f) => {
-            serde_json::Number::from_f64(*f).map(serde_json::Value::Number)
+#[cfg(test)]
+mod conformance_tests {
+    use super::*;
+    use relay_protocol::FromValue;
+    use serde_json::json;
+
+    #[test]
+    fn sdk_metadata_populates_native_fields_and_preserves_source() {
+        let raw = json!({"event_id":"11111111111111111111111111111111","logentry":{"formatted":"Synthetic item 42","message":"Synthetic item %s","params":[42]},"exception":{"values":[{"type":"InnerError","value":"inner"},{"type":"OuterError","value":"outer","stacktrace":{"frames":[{"filename":"synthetic.py","function":"run","lineno":7,"in_app":true,"vars":{"synthetic":null}}]},"mechanism":{"type":"generic","handled":false,"data":{"synthetic":true}}}]},"user":{"id":"synthetic-user","email":"synthetic@example.com","segment":"sample","custom":{"nullable":null}},"request":{"url":"https://synthetic.example/path","method":"POST","headers":[["User-Agent","synthetic-agent"],["Referer","https://synthetic.example/"]],"query_string":[["sample","yes"]],"cookies":"sample=synthetic","data":{"synthetic":true}},"tags":{"sample":"yes"},"extra":{"nullable":null,"integer":9007199254740993_u64},"contexts":{"browser":{"name":"SyntheticBrowser","version":"1"},"os":{"name":"SyntheticOS","version":"2","build":"sample","kernel_version":"3"},"device":{"family":"sample","arch":"arm64","processor_count":4,"screen_width_pixels":390,"screen_height_pixels":844,"memory_size":4096},"runtime":{"name":"synthetic-runtime","version":"4"},"culture":{"locale":"en","timezone":"UTC"},"custom":{"null":null,"flag":true}},"sdk":{"name":"synthetic-sdk","version":"1","integrations":["sample"]},"release":"synthetic-release","dist":"sample"});
+        let event = Event::from_value(raw.clone().into());
+        let data =
+            convert_sentry_event_to_error_data(&event, raw.clone(), 1, Some(2), Some(3)).unwrap();
+        assert_eq!(data.exception_type.as_deref(), Some("OuterError"));
+        assert_eq!(data.exceptions.len(), 2);
+        assert_eq!(
+            data.exceptions[1].mechanism.as_ref().unwrap()["data"]["synthetic"],
+            true
+        );
+        assert_eq!(data.user_id.as_deref(), Some("synthetic-user"));
+        assert_eq!(data.user_segment.as_deref(), Some("sample"));
+        assert_eq!(data.user_agent.as_deref(), Some("synthetic-agent"));
+        assert_eq!(data.browser.as_deref(), Some("SyntheticBrowser"));
+        assert_eq!(data.os_kernel_version.as_deref(), Some("3"));
+        assert_eq!(data.device_processor_count, Some(4));
+        assert_eq!(data.screen_width, Some(390));
+        assert_eq!(data.runtime_name.as_deref(), Some("synthetic-runtime"));
+        assert_eq!(data.sdk_integrations, Some(json!(["sample"])));
+        assert_eq!(data.contexts.as_ref().unwrap()["custom"]["flag"], true);
+        assert_eq!(
+            data.extra_context.as_ref().unwrap()["tags"]["sample"],
+            "yes"
+        );
+        assert_eq!(data.request_data, Some(json!({"synthetic":true})));
+        assert_eq!(data.raw_sentry_event, Some(raw));
+        assert_eq!(
+            (data.project_id, data.environment_id, data.deployment_id),
+            (1, Some(2), Some(3))
+        );
+    }
+
+    #[test]
+    fn messages_use_formatted_text_and_request_header_objects_are_supported() {
+        let raw = json!({"event_id":"11111111111111111111111111111111","logentry":{"formatted":"Synthetic display","message":"Synthetic template"},"request":{"headers":{"user-AGENT":"synthetic-agent"}}});
+        let event = Event::from_value(raw.clone().into());
+        let data = convert_sentry_event_to_error_data(&event, raw, 1, None, None).unwrap();
+        assert_eq!(data.exception_type.as_deref(), Some("Message"));
+        assert_eq!(data.exception_value.as_deref(), Some("Synthetic display"));
+        assert_eq!(data.user_agent.as_deref(), Some("synthetic-agent"));
+        let raw = json!({"event_id":"11111111111111111111111111111111", "user":{"id":42}, "breadcrumbs":{"values":[{"timestamp":1790000000.25,"data":{"nullable":null,"values":[1,null,2],"large":9007199254740993_u64}}]}});
+        let event = Event::from_value(raw.clone().into());
+        let data = convert_sentry_event_to_error_data(&event, raw.clone(), 1, None, None).unwrap();
+        assert_eq!(
+            data.breadcrumbs,
+            raw.pointer("/breadcrumbs/values").cloned()
+        );
+        assert_eq!(data.user_id.as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn native_thread_stacks_match_ids_or_unique_primary_thread() {
+        let raw = json!({"event_id":"11111111111111111111111111111111","exception":{"values":[{"type":"SyntheticError","value":"Synthetic failure"}]},"threads":{"values":[{"id":42,"current":true,"stacktrace":{"frames":[{"filename":"synthetic.rs","function":"run","lineno":7}]}}]}});
+        let event = Event::from_value(raw.clone().into());
+        let data = convert_sentry_event_to_error_data(&event, raw.clone(), 1, None, None).unwrap();
+        assert_eq!(
+            data.stack_trace.as_ref().unwrap()["frames"][0]["function"],
+            "run"
+        );
+        assert_eq!(data.exceptions[0].stack_trace, data.stack_trace);
+        assert_eq!(data.raw_sentry_event, Some(raw.clone()));
+        let legacy = json!({"event_id":"11111111111111111111111111111111","exception":[{"type":"SyntheticError","value":"Synthetic failure","stacktrace":{"frames":[{"filename":"synthetic.go","in_app":true,"vars":{"nullable":null}}]},"mechanism":{"type":"generic","handled":true,"data":{"nullable":null}}}]});
+        let event = Event::from_value(legacy.clone().into());
+        let legacy_data =
+            convert_sentry_event_to_error_data(&event, legacy, 1, None, None).unwrap();
+        assert_eq!(
+            legacy_data.stack_trace.as_ref().unwrap()["frames"][0]["in_app"],
+            true
+        );
+        assert!(
+            legacy_data.exceptions[0].mechanism.as_ref().unwrap()["data"]
+                .get("nullable")
+                .is_some()
+        );
+        let mut ambiguous = raw.clone();
+        ambiguous["threads"]["values"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"id":43,"crashed":true,"stacktrace":{"frames":[]}}));
+        assert!(thread_stack(&ambiguous, None, true).is_none());
+        assert!(thread_stack(&raw, None, false).is_none());
+        assert!(thread_stack(&ambiguous, Some("42"), false).is_some());
+        assert!(thread_stack(&ambiguous, Some("99"), true).is_none());
+    }
+
+    #[test]
+    fn fingerprints_are_bounded_and_invalid_types_are_rejected_without_echoing_values() {
+        for raw in [
+            json!({}),
+            json!({"fingerprint":null}),
+            json!({"fingerprint":[]}),
+            json!({"fingerprint":["{{ default }}","sample"]}),
+        ] {
+            assert!(validate_event_metadata(&raw).is_ok());
         }
-        relay_protocol::Value::String(s) => Some(serde_json::Value::String(s.clone())),
-        relay_protocol::Value::Array(arr) => {
-            let items: Vec<serde_json::Value> = arr
-                .iter()
-                .filter_map(|annotated| annotated.value().and_then(relay_value_to_json))
-                .collect();
-            Some(serde_json::Value::Array(items))
+        for raw in [
+            json!({"fingerprint":"private-value"}),
+            json!({"fingerprint":[42]}),
+            json!({"fingerprint":vec!["sample";129]}),
+        ] {
+            let error = validate_event_metadata(&raw).unwrap_err().to_string();
+            assert!(!error.contains("private-value"));
         }
-        relay_protocol::Value::Object(obj) => {
-            let map: serde_json::Map<String, serde_json::Value> = obj
-                .iter()
-                .filter_map(|(k, annotated)| {
-                    annotated
-                        .value()
-                        .and_then(relay_value_to_json)
-                        .map(|v| (k.clone(), v))
-                })
-                .collect();
-            Some(serde_json::Value::Object(map))
-        }
+        assert!(validate_event_metadata(&json!({"fingerprint":["x".repeat(1025)]})).is_err());
     }
 }

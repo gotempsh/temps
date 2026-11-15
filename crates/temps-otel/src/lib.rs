@@ -38,6 +38,7 @@ pub mod handlers;
 pub mod ingest;
 pub mod memory;
 pub mod plugin;
+pub mod project_metrics_sink;
 pub mod proto;
 pub mod relay;
 pub mod services;
@@ -169,3 +170,5 @@ pub struct OtelAppState {
     /// forced to re-estimate by an unrelated restart.
     pub plan_signing_key: std::sync::Arc<[u8; 32]>,
 }
+
+pub mod log_attributes;

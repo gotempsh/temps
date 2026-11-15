@@ -314,7 +314,7 @@ mod tests {
         async fn create_audit_log(
             &self,
             _operation: &dyn temps_core::AuditOperation,
-        ) -> anyhow::Result<()> {
+        ) -> temps_core::AuditResult<()> {
             Ok(())
         }
     }
@@ -348,6 +348,8 @@ mod tests {
         projects::Model {
             id: 7,
             image_retention_hours: None,
+            log_ingest_lines_per_sec: None,
+            log_ingest_kib_per_sec: None,
             cloud_telemetry_fidelity:
                 temps_entities::cloud_telemetry_fidelity::CloudTelemetryFidelity::Metered,
             cloud_telemetry_write_mode:
@@ -376,6 +378,7 @@ mod tests {
             git_url: None,
             git_provider_connection_id: None,
             attack_mode: false,
+            shield_mode: "log".to_string(),
             ai_alert_summaries_enabled: None,
             ai_api_traffic_summary_enabled: None,
             allow_alternate_sources: None,
@@ -395,10 +398,13 @@ mod tests {
             gitlab_webhook_id: None,
             gitlab_webhook_signing_token: None,
             gitea_webhook_signing_token: None,
+            github_webhook_id: None,
+            github_webhook_signing_token: None,
             bitbucket_webhook_token: None,
             bitbucket_webhook_hook_id: None,
             generic_webhook_token: None,
             cross_project_trace_sharing: true,
+            serves_own_temps_api: false,
         }
     }
 

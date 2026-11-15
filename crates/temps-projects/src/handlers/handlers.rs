@@ -27,12 +27,12 @@ use tracing::{debug, error, info, warn};
 
 use super::types::{
     ChangeProjectSourceRequest, CreateProjectRequest, PaginatedProjectList, PaginationParams,
-    ProjectResponse, ProjectStatisticsResponse, ReinstallWebhookResponse,
-    ServiceTemplateChangeKind, ServiceTemplateInstanceResponse, ServiceTemplateUpgradeChange,
-    SetAlternateSourcesRequest, SetProjectHostingRequest, TriggerPipelinePayload,
-    TriggerPipelineResponse, UpdateAutomaticDeployRequest, UpdateDeploymentConfigRequest,
-    UpdateGitSettingsRequest, UpdateProjectSettingsRequest, UpdateServiceTemplateRuntimeRequest,
-    UpgradeServiceTemplateRequest,
+    ProjectResponse, ProjectStatisticsResponse, ReinstallGithubWebhookResponse,
+    ReinstallWebhookResponse, ServiceTemplateChangeKind, ServiceTemplateInstanceResponse,
+    ServiceTemplateUpgradeChange, SetAlternateSourcesRequest, SetProjectHostingRequest,
+    TriggerPipelinePayload, TriggerPipelineResponse, UpdateAutomaticDeployRequest,
+    UpdateDeploymentConfigRequest, UpdateGitSettingsRequest, UpdateProjectSettingsRequest,
+    UpdateServiceTemplateRuntimeRequest, UpgradeServiceTemplateRequest,
 };
 use crate::services::project::GroupFilter;
 use crate::template_creation::{
@@ -155,6 +155,10 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
             "/projects/{project_id}/gitlab/reinstall-webhook",
             post(reinstall_gitlab_webhook),
         )
+        .route(
+            "/projects/{project_id}/github/reinstall-webhook",
+            post(reinstall_github_webhook),
+        )
         // Merge custom domain routes
         .merge(custom_domain_routes)
 }
@@ -221,7 +225,7 @@ fn push_template_change(
     });
 }
 
-fn template_input_summary(input: &temps_core::templates::EnvVarTemplate) -> String {
+fn template_input_summary(input: &temps_presets::templates::EnvVarTemplate) -> String {
     let mut parts = vec![if input.required {
         "required"
     } else {
@@ -238,8 +242,8 @@ fn template_input_summary(input: &temps_core::templates::EnvVarTemplate) -> Stri
 
 /// The definition of the service a release snapshot belongs to.
 fn release_spec(
-    instance: &temps_core::templates::ServiceTemplateInstance,
-) -> &temps_core::templates::TemplateServiceSpec {
+    instance: &temps_presets::templates::ServiceTemplateInstance,
+) -> &temps_presets::templates::TemplateServiceSpec {
     instance
         .spec()
         .unwrap_or_else(|| instance.template.primary())
@@ -247,9 +251,9 @@ fn release_spec(
 
 /// A catalog release, pointed at the same service of the app as `applied`.
 fn same_service_release(
-    release: temps_core::templates::ServiceTemplateInstance,
-    applied: &temps_core::templates::ServiceTemplateInstance,
-) -> temps_core::templates::ServiceTemplateInstance {
+    release: temps_presets::templates::ServiceTemplateInstance,
+    applied: &temps_presets::templates::ServiceTemplateInstance,
+) -> temps_presets::templates::ServiceTemplateInstance {
     match applied.service.clone() {
         Some(service) => release.for_service(service),
         None => release,
@@ -260,7 +264,7 @@ fn same_service_release(
 /// services through the single-service upgrade.
 fn single_to_multi_service_upgrade_detail(
     project_id: i32,
-    target: &temps_core::templates::ServiceTemplateInstance,
+    target: &temps_presets::templates::ServiceTemplateInstance,
 ) -> String {
     format!(
         "Project {project_id} runs a single service of '{}', but release {}@{} has {} services that must be created together. It cannot be upgraded one service at a time: deploy {} as a whole app from the template catalog instead.",
@@ -274,11 +278,11 @@ fn single_to_multi_service_upgrade_detail(
 
 /// What changes between two releases of the same service, comparing the
 /// variables each release actually configures the service with
-/// ([`temps_core::templates::ServiceTemplateInstance::service_variables`]):
+/// ([`temps_presets::templates::ServiceTemplateInstance::service_variables`]):
 /// a single-service template's shared variables are part of its service.
 fn service_release_changes(
-    applied: &temps_core::templates::ServiceTemplateInstance,
-    target: &temps_core::templates::ServiceTemplateInstance,
+    applied: &temps_presets::templates::ServiceTemplateInstance,
+    target: &temps_presets::templates::ServiceTemplateInstance,
 ) -> Vec<ServiceTemplateUpgradeChange> {
     template_spec_changes(
         release_spec(applied),
@@ -288,19 +292,62 @@ fn service_release_changes(
     )
 }
 
+/// A worker being unreachable is a state the operator can act on, not a failure
+/// of Temps: the delete changed nothing that a retry won't finish.
+fn container_cleanup_status(error: &temps_core::ContainerCleanupError) -> StatusCode {
+    use temps_core::ContainerCleanupError as E;
+    match error {
+        E::NodeUnreachable { .. } => StatusCode::CONFLICT,
+        E::Discovery { .. } | E::Prepare { .. } | E::Removal { .. } | E::Finalize { .. } => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
+#[cfg(test)]
+mod container_cleanup_status_tests {
+    use super::*;
+    use temps_core::ContainerCleanupError as E;
+
+    #[test]
+    fn an_unreachable_node_is_a_conflict_naming_the_node_and_anything_else_a_500() {
+        let unreachable = E::NodeUnreachable {
+            project_id: 9,
+            environment_id: 3,
+            container_id: "abc".to_string(),
+            node_id: Some(2),
+            reason: "Network error".to_string(),
+        };
+        assert_eq!(container_cleanup_status(&unreachable), StatusCode::CONFLICT);
+        assert!(unreachable.to_string().contains("Some(2)"), "{unreachable}");
+
+        let failed = E::Removal {
+            project_id: 9,
+            environment_id: 3,
+            container_id: "abc".to_string(),
+            node_id: Some(2),
+            reason: "denied".to_string(),
+        };
+        assert_eq!(
+            container_cleanup_status(&failed),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+}
+
 #[cfg(test)]
 fn service_template_changes(
-    applied: &temps_core::templates::TemplateServiceSpec,
-    target: &temps_core::templates::TemplateServiceSpec,
+    applied: &temps_presets::templates::TemplateServiceSpec,
+    target: &temps_presets::templates::TemplateServiceSpec,
 ) -> Vec<ServiceTemplateUpgradeChange> {
     template_spec_changes(applied, &applied.env_vars, target, &target.env_vars)
 }
 
 fn template_spec_changes(
-    applied: &temps_core::templates::TemplateServiceSpec,
-    applied_variables: &[temps_core::templates::EnvVarTemplate],
-    target: &temps_core::templates::TemplateServiceSpec,
-    target_variables: &[temps_core::templates::EnvVarTemplate],
+    applied: &temps_presets::templates::TemplateServiceSpec,
+    applied_variables: &[temps_presets::templates::EnvVarTemplate],
+    target: &temps_presets::templates::TemplateServiceSpec,
+    target_variables: &[temps_presets::templates::EnvVarTemplate],
 ) -> Vec<ServiceTemplateUpgradeChange> {
     let mut changes = Vec::new();
     push_template_change(
@@ -484,6 +531,7 @@ async fn canonical_template_app_url(
         get_project_service_template,
         upgrade_project_service_template,
         reinstall_gitlab_webhook,
+        reinstall_github_webhook,
         trigger_project_pipeline,
         get_project_statistics,
         list_presets,
@@ -496,6 +544,7 @@ async fn canonical_template_app_url(
     ),
     components(
         schemas(
+            temps_core::repo_config::HealthCheckConfig,
             CreateProjectRequest,
             super::types::ProjectEnvVarInput,
             DropInspectionResponse,
@@ -516,6 +565,7 @@ async fn canonical_template_app_url(
             UpdateAutomaticDeployRequest,
             UpdateDeploymentConfigRequest,
             ReinstallWebhookResponse,
+            ReinstallGithubWebhookResponse,
             TriggerPipelinePayload,
             TriggerPipelineResponse,
             ProjectStatisticsResponse,
@@ -1350,8 +1400,12 @@ pub async fn get_project(
         .await
         .map_err(Problem::from)?;
 
+    let reachability_warning = state.project_service.reachability_warning(id).await;
+
     Ok(Json(
-        ProjectResponse::map_from_project(project).with_docker_socket(docker_socket),
+        ProjectResponse::map_from_project(project)
+            .with_docker_socket(docker_socket)
+            .with_reachability_warning(reachability_warning),
     ))
 }
 
@@ -1394,10 +1448,14 @@ pub async fn get_project_by_slug(
         .await
         .map_err(Problem::from)?;
 
-    Ok(
-        Json(ProjectResponse::map_from_project(project).with_docker_socket(docker_socket))
-            .into_response(),
+    let reachability_warning = state.project_service.reachability_warning(project.id).await;
+
+    Ok(Json(
+        ProjectResponse::map_from_project(project)
+            .with_docker_socket(docker_socket)
+            .with_reachability_warning(reachability_warning),
     )
+    .into_response())
 }
 
 #[utoipa::path(
@@ -1719,44 +1777,57 @@ pub async fn set_alternate_sources(
     Ok(Json(ProjectResponse::map_from_project(updated)).into_response())
 }
 
-#[utoipa::path(
-    delete,
-    path = "/projects/{id}",
-    tag = "Projects",
-    params(
-        ("id" = i32, Path, description = "Project ID")
-    ),
-    responses(
-        (status = 204, description = "Project deleted successfully"),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden"),
-        (status = 404, description = "Project not found"),
-        (status = 409, description = "Project still has CDN delivery bindings; remove them first"),
-        (status = 500, description = "Internal server error")
-    ),
-    security(
-        ("bearer_auth" = [])
-    )
-)]
-pub async fn delete_project(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<i32>,
-    RequireAuth(auth): RequireAuth,
-    Extension(metadata): Extension<RequestMetadata>,
-) -> Result<impl IntoResponse, Problem> {
-    project_permission_guard!(auth, ProjectsDelete, id, state.project_access_checker);
-    project_scope_guard!(auth, id);
+/// Tear a project down: fence it, stop everything serving for it, release its
+/// resources and finally remove its rows.
+///
+/// Runs on a spawned task (see [`delete_project`]) so a client disconnect
+/// cannot abort it between steps. Every step is safe to retry, so a failure
+/// leaves the project fenced and a repeated `DELETE` finishes the job.
+async fn run_project_teardown(
+    state: Arc<AppState>,
+    id: i32,
+    project: crate::services::types::Project,
+    audit_context: AuditContext,
+) -> Result<(), Problem> {
+    // Failures are logged here, inside the task: after a client disconnect
+    // nobody awaits this result, so an unlogged error would leave the project
+    // fenced with no trace of why the cleanup stopped.
+    state
+        .project_service
+        .begin_project_deletion(id)
+        .await
+        .map_err(|error| {
+            warn!(
+                project_id = id,
+                %error,
+                "Project deletion did not start; project was not fenced"
+            );
+            Problem::from(error)
+        })?;
 
-    // Get project details before deletion
-    let project = state.project_service.get_project(id).await?;
-
-    state.project_service.begin_project_deletion(id).await?;
-
-    // Stop serving anything public for this project now: if cleanup below
-    // fails, the project stays fenced but `ProjectDeleted` is never emitted.
-    if let Some(hook) = &state.project_deletion_hook {
-        hook.project_deletion_started(id).await;
-    }
+    // Stop serving anything public for this project now, and retire what
+    // features run for it outside the deployment pipeline (functions): if
+    // cleanup below fails, the project stays fenced but `ProjectDeleted` is
+    // never emitted. A failing hook fails the deletion rather than letting
+    // the row delete cascade away the records it still needs to finish
+    // (a function's row is what names its workload and hostname); every
+    // hook is idempotent, so a retried delete runs them all again.
+    state
+        .project_deletion_hooks
+        .run(id)
+        .await
+        .map_err(|error| {
+            error!(
+                project_id = id,
+                %error,
+                "Project deletion hooks failed; project stays fenced, retry the delete to finish it"
+            );
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Project Deletion Cleanup Failed")
+                .with_detail(format!(
+                    "{error}. Project {id} stays marked deleted; retry the delete to finish it."
+                ))
+        })?;
 
     state
         .deployment_canceller
@@ -1777,7 +1848,7 @@ pub async fn delete_project(
         .await
         .map_err(|error| {
             error!(project_id = id, %error, "Failed to clean up project containers");
-            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+            problemdetails::new(container_cleanup_status(&error))
                 .with_title("Project Container Cleanup Failed")
                 .with_detail(error.to_string())
         })?;
@@ -1795,28 +1866,149 @@ pub async fn delete_project(
                 ))
         })?;
 
+    // Read which images the project's builds produced, and where they live,
+    // while those records still exist: they cascade away with the project
+    // row. Best-effort: without the plan the images are left labelled for
+    // the nightly sweep of images whose project no longer exists.
+    let image_plan = match state
+        .project_image_cleaner
+        .plan_project_image_cleanup(id)
+        .await
+    {
+        Ok(plan) => Ok(plan),
+        Err(error) => {
+            warn!(
+                project_id = id,
+                %error,
+                "Could not read the project's built images; they are left for the nightly sweep"
+            );
+            Err(error.to_string())
+        }
+    };
+
     state
         .project_service
         .delete_project(id, &project.name)
-        .await?;
+        .await
+        .map_err(|error| {
+            error!(
+                project_id = id,
+                project_name = %project.name,
+                %error,
+                "Failed to delete project rows; project stays fenced, retry the delete to finish it"
+            );
+            Problem::from(error)
+        })?;
 
-    // Create audit event
-    let audit_context = AuditContext {
-        user_id: auth.user_id(),
-        ip_address: Some(metadata.ip_address.to_string()),
-        user_agent: metadata.user_agent,
+    // Only once the rows are gone, so nothing can deploy these images again.
+    // Cannot fail the deletion: every image kept or not removed is logged
+    // with its reason, and stays labelled for the nightly sweep.
+    // `None` with the reason when the images could not even be read, so the
+    // audit tells "nothing to remove" from "cleanup never ran".
+    let (images, image_plan_error) = match &image_plan {
+        Ok(plan) => (
+            Some(
+                state
+                    .project_image_cleaner
+                    .remove_project_images(plan)
+                    .await,
+            ),
+            None,
+        ),
+        Err(reason) => (None, Some(reason.clone())),
     };
+    let counts = images.unwrap_or_default();
+
+    info!(
+        project_id = id,
+        project_name = %project.name,
+        image_cleanup_planned = image_plan_error.is_none(),
+        images_removed = counts.removed,
+        images_skipped = counts.skipped,
+        images_failed = counts.failed,
+        image_runtimes_unreachable = counts.unreachable_runtimes,
+        "Project deleted"
+    );
 
     let audit_event = ProjectDeletedAudit {
         context: audit_context,
         project_id: project.id,
         project_name: project.name,
         project_slug: project.slug,
+        images,
+        image_plan_error,
     };
 
     if let Err(e) = state.audit_service.create_audit_log(&audit_event).await {
         error!("Failed to create audit log: {:?}", e);
         // Continue with the operation even if audit logging fails
+    }
+
+    Ok(())
+}
+
+#[utoipa::path(
+    delete,
+    path = "/projects/{id}",
+    tag = "Projects",
+    params(
+        ("id" = i32, Path, description = "Project ID")
+    ),
+    responses(
+        (status = 204, description = "Project deleted successfully"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden"),
+        (status = 404, description = "Project not found"),
+        (status = 409, description = "Project still has CDN delivery bindings, or containers on a node that can't be reached right now; remove the bindings, or bring the node back or remove it, and retry"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(
+        ("bearer_auth" = [])
+    )
+)]
+pub async fn delete_project(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i32>,
+    RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
+) -> Result<impl IntoResponse, Problem> {
+    project_permission_guard!(auth, ProjectsDelete, id, state.project_access_checker);
+    project_scope_guard!(auth, id);
+
+    // Get project details before deletion
+    let project = state.project_service.get_project(id).await?;
+
+    let audit_context = AuditContext {
+        user_id: auth.user_id(),
+        ip_address: Some(metadata.ip_address.to_string()),
+        user_agent: metadata.user_agent,
+    };
+
+    // The teardown is a multi-step sequence (fence, cancel deployments, remove
+    // containers, remove archives, delete rows) that must not stop half-way.
+    // Axum drops the handler future when the client disconnects, which would
+    // leave the project fenced (`is_deleted = true`) but still listed and
+    // serving. Run it on its own task so it always completes; the handler only
+    // awaits the result. Dropping the `JoinHandle` detaches the task rather
+    // than cancelling it.
+    let teardown = tokio::spawn(run_project_teardown(
+        state.clone(),
+        id,
+        project,
+        audit_context,
+    ));
+
+    match teardown.await {
+        Ok(result) => result?,
+        Err(join_error) => {
+            error!(project_id = id, %join_error, "Project deletion task failed");
+            return Err(problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Project Deletion Failed")
+                .with_detail(format!(
+                    "Project {id} deletion task did not complete: {join_error}. \
+                     The project may be partially deleted; retry the delete to finish it."
+                )));
+        }
     }
 
     Ok(StatusCode::NO_CONTENT.into_response())
@@ -1924,6 +2116,12 @@ pub async fn update_project_settings(
         compose_configuration_updated: settings.preset_config.as_ref().map(|_| true),
         image_retention_hours: settings.image_retention_hours,
         previous_image_retention_hours,
+        log_ingest_lines_per_sec: settings.log_ingest_lines_per_sec,
+        log_ingest_kib_per_sec: settings.log_ingest_kib_per_sec,
+        serves_own_temps_api: settings.serves_own_temps_api,
+        shield_mode: (settings.shield_mode.is_some() || settings.attack_mode.is_some())
+            .then(|| temps_shield::ShieldMode::parse(&update.project.shield_mode))
+            .flatten(),
     };
 
     let audit_event = ProjectSettingsUpdatedAudit {
@@ -2194,6 +2392,91 @@ pub async fn reinstall_gitlab_webhook(
     }))
 }
 
+/// Install or reinstall the GitHub repository webhook for a project
+///
+/// For projects on a GitHub connection that is not a GitHub App (personal
+/// access token or OAuth). Removes the existing repository webhook (if any)
+/// and registers a fresh one with a new signing secret. Use this when the
+/// webhook could not be registered automatically (the token lacks webhook
+/// permission) or was deleted on GitHub, and pushes have stopped deploying.
+#[utoipa::path(
+    post,
+    path = "/projects/{project_id}/github/reinstall-webhook",
+    tag = "Projects",
+    responses(
+        (status = 200, description = "Webhook installed", body = ReinstallGithubWebhookResponse),
+        (status = 400, description = "Project is not on a GitHub PAT/OAuth connection, or GitHub refused to create the webhook"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden"),
+        (status = 404, description = "Project not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("project_id" = i32, Path, description = "Project ID")
+    ),
+    security(
+        ("bearer_auth" = [])
+    )
+)]
+pub async fn reinstall_github_webhook(
+    State(state): State<Arc<AppState>>,
+    Path(project_id): Path<i32>,
+    RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, ProjectsWrite);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
+
+    info!("Reinstalling GitHub webhook for project: {}", project_id);
+
+    let hook_id = state
+        .project_service
+        .reinstall_github_webhook(project_id)
+        .await
+        .map_err(|e| {
+            error!(
+                "Error reinstalling GitHub webhook for project {}: {:?}",
+                project_id, e
+            );
+            Problem::from(e)
+        })?;
+
+    let audit_event = ProjectUpdatedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.to_string()),
+            user_agent: metadata.user_agent,
+        },
+        project_id,
+        project_name: format!("project-{}", project_id),
+        project_slug: String::new(),
+        updated_fields: ProjectUpdatedFields {
+            name: None,
+            repo_name: None,
+            repo_owner: None,
+            directory: None,
+            main_branch: None,
+            preset: None,
+            automatic_deploy: None,
+            compose_configuration_updated: None,
+            hosting: None,
+        },
+    };
+
+    if let Err(e) = state.audit_service.create_audit_log(&audit_event).await {
+        error!(
+            "Failed to create audit log for GitHub webhook reinstall on project {}: {:?}",
+            project_id, e
+        );
+    }
+
+    Ok(Json(ReinstallGithubWebhookResponse {
+        hook_id,
+        message: "GitHub webhook installed successfully".to_string(),
+    }))
+}
+
 /// Update deployment configuration for a project
 #[utoipa::path(
     patch,
@@ -2226,6 +2509,18 @@ pub async fn update_project_deployment_config(
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
+    if config.health.is_some() && auth.is_instance_admin() {
+        let project = state.project_service.get_project(project_id).await?;
+        if temps_core::docker_socket_grant::process_grant().declares(&project.slug) {
+            temps_auth::require_sensitive_action(
+                state.sensitive_action_authorizer.as_ref(),
+                &auth,
+                temps_core::SensitiveAction::ChangeDockerSocketHealth { project_id },
+            )
+            .await?;
+        }
+    }
+
     info!("Updating deployment config for project: {}", project_id);
 
     let updated_project = state
@@ -2235,7 +2530,7 @@ pub async fn update_project_deployment_config(
             config.clone(),
             // An operator who can edit the instance-wide ceilings is not
             // meaningfully constrained by them.
-            temps_core::CeilingEnforcement::from_has_settings_write(
+            temps_config::CeilingEnforcement::from_has_settings_write(
                 auth.has_permission(&temps_auth::Permission::SettingsWrite),
             ),
             temps_core::docker_socket_grant::DeployCaller::from_instance_admin(
@@ -2325,11 +2620,18 @@ pub async fn update_project_deployment_config(
     if config.load_balancing.is_some() {
         updated_fields.insert("load_balancing".to_string(), "updated".to_string());
     }
+
+    if config.health.is_some() {
+        updated_fields.insert("health".to_string(), "updated".to_string());
+    }
     if config.health_check_timeout_seconds.is_some() {
         updated_fields.insert(
             "health_check_timeout_seconds".to_string(),
             "updated".to_string(),
         );
+    }
+    if config.stop_timeout_seconds.is_some() {
+        updated_fields.insert("stop_timeout_seconds".to_string(), "updated".to_string());
     }
 
     let audit_event = super::audit::DeploymentConfigUpdatedAudit {
@@ -2396,7 +2698,7 @@ pub async fn get_project_service_template(
         .await
     {
         Ok(latest) => (Some(latest), None),
-        Err(temps_core::templates::TemplateConfigError::NotFound(_)) => (
+        Err(temps_presets::templates::TemplateConfigError::NotFound(_)) => (
             None,
             Some(
                 "This service family is no longer present in the active template catalog."
@@ -2464,7 +2766,7 @@ pub async fn get_project_service_template(
                 .iter()
                 .filter(|service| {
                     !linked_service_types.iter().any(|linked| {
-                        temps_core::templates::managed_service_types_compatible(service, linked)
+                        temps_presets::templates::managed_service_types_compatible(service, linked)
                     })
                 })
                 .cloned()
@@ -2527,15 +2829,15 @@ pub async fn upgrade_project_service_template(
         .get_service_template_instance(&applied.slug)
         .await
         .map_err(|error| match error {
-            temps_core::templates::TemplateConfigError::NotFound(_) => {
+            temps_presets::templates::TemplateConfigError::NotFound(_) => {
                 temps_core::error_builder::not_found()
                     .title("Service Template Not Found")
                     .detail(error.to_string())
                     .build()
             }
-            temps_core::templates::TemplateConfigError::IoError(_)
-            | temps_core::templates::TemplateConfigError::ParseError(_)
-            | temps_core::templates::TemplateConfigError::ValidationErrors(_) => {
+            temps_presets::templates::TemplateConfigError::IoError(_)
+            | temps_presets::templates::TemplateConfigError::ParseError(_)
+            | temps_presets::templates::TemplateConfigError::ValidationErrors(_) => {
                 temps_core::error_builder::internal_server_error()
                     .title("Service Template Catalog Invalid")
                     .detail(error.to_string())
@@ -2601,7 +2903,7 @@ pub async fn upgrade_project_service_template(
         .iter()
         .filter(|service| {
             !linked_service_types.iter().any(|linked| {
-                temps_core::templates::managed_service_types_compatible(service, linked)
+                temps_presets::templates::managed_service_types_compatible(service, linked)
             })
         })
         .cloned()
@@ -2664,7 +2966,7 @@ pub async fn upgrade_project_service_template(
             project_id,
             target,
             new_environment_variables,
-            temps_core::CeilingEnforcement::from_has_settings_write(
+            temps_config::CeilingEnforcement::from_has_settings_write(
                 auth.has_permission(&temps_auth::Permission::SettingsWrite),
             ),
             // ADR 045: see `update_service_template_runtime` — this is the
@@ -2768,7 +3070,7 @@ pub async fn update_service_template_runtime(
         .update_service_template_runtime(
             project_id,
             runtime,
-            temps_core::CeilingEnforcement::from_has_settings_write(
+            temps_config::CeilingEnforcement::from_has_settings_write(
                 auth.has_permission(&temps_auth::Permission::SettingsWrite),
             ),
             // ADR 045: the persisted command this writes becomes the default
@@ -3161,7 +3463,7 @@ pub async fn generate_preset_dockerfile(
     params(
         ("tag" = Option<String>, Query, description = "Filter templates by tag"),
         ("featured" = Option<bool>, Query, description = "Only return featured templates"),
-        ("kind" = Option<temps_core::templates::TemplateKind>, Query, description = "Filter by gallery: starter or service")
+        ("kind" = Option<temps_presets::templates::TemplateKind>, Query, description = "Filter by gallery: starter or service")
     ),
     responses(
         (status = 200, description = "List of templates", body = super::templates::ListTemplatesResponse),
@@ -3323,7 +3625,7 @@ pub async fn create_project_from_template(
     let service = template.primary().clone();
     let source = service.source(&template.git);
     super::compose_security::reject_legacy_sandbox_grants(service.preset_config.as_ref())?;
-    let release = if template.kind == temps_core::templates::TemplateKind::App {
+    let release = if template.kind == temps_presets::templates::TemplateKind::App {
         Some(
             state
                 .template_service
@@ -3345,7 +3647,7 @@ pub async fn create_project_from_template(
     let template_provenance = release
         .as_ref()
         .map(|instance| instance.slug.clone())
-        .unwrap_or_else(|| temps_core::templates::template_provenance(&template).to_string());
+        .unwrap_or_else(|| temps_presets::templates::template_provenance(&template).to_string());
     let runtime_overrides = TemplateRuntimeOverrides::from(&request);
     resolve_image_template_runtime(&service, &runtime_overrides).map_err(|error| {
         temps_core::error_builder::bad_request()
@@ -3679,7 +3981,7 @@ mod tests {
 
     #[test]
     fn service_template_change_preview_includes_bindings_and_input_defaults() {
-        let applied = temps_core::templates::bundled_template_by_slug("keycloak")
+        let applied = temps_presets::templates::bundled_template_by_slug("keycloak")
             .expect("Keycloak should be bundled")
             .primary()
             .clone();
@@ -3713,8 +4015,8 @@ mod tests {
         name: &str,
         required: bool,
         generator: Option<&str>,
-    ) -> temps_core::templates::EnvVarTemplate {
-        temps_core::templates::EnvVarTemplate {
+    ) -> temps_presets::templates::EnvVarTemplate {
+        temps_presets::templates::EnvVarTemplate {
             name: name.to_string(),
             example: None,
             default: None,
@@ -3725,10 +4027,10 @@ mod tests {
         }
     }
 
-    fn keycloak_release() -> temps_core::templates::ServiceTemplateInstance {
-        temps_core::templates::ServiceTemplateInstance::new(
-            temps_core::templates::SERVICE_TEMPLATE_SCHEMA_VERSION,
-            temps_core::templates::bundled_template_by_slug("keycloak")
+    fn keycloak_release() -> temps_presets::templates::ServiceTemplateInstance {
+        temps_presets::templates::ServiceTemplateInstance::new(
+            temps_presets::templates::SERVICE_TEMPLATE_SCHEMA_VERSION,
+            temps_presets::templates::bundled_template_by_slug("keycloak")
                 .expect("Keycloak should be bundled"),
         )
     }
@@ -3865,7 +4167,7 @@ mod tests {
 
     #[test]
     fn browserless_environment_is_complete_and_protects_its_token_server_side() {
-        let template = temps_core::templates::bundled_template_by_slug("browserless")
+        let template = temps_presets::templates::bundled_template_by_slug("browserless")
             .expect("Browserless should be bundled")
             .primary()
             .clone();
@@ -3900,7 +4202,7 @@ mod tests {
 
     #[test]
     fn client_cannot_downgrade_a_template_password_to_regular_storage() {
-        let template = temps_core::templates::bundled_template_by_slug("keycloak")
+        let template = temps_presets::templates::bundled_template_by_slug("keycloak")
             .expect("Keycloak should be bundled")
             .primary()
             .clone();
@@ -3923,7 +4225,7 @@ mod tests {
 
     #[test]
     fn template_environment_rejects_duplicates_and_missing_required_values() {
-        let template = temps_core::templates::bundled_template_by_slug("browserless")
+        let template = temps_presets::templates::bundled_template_by_slug("browserless")
             .expect("Browserless should be bundled")
             .primary()
             .clone();
@@ -3972,7 +4274,7 @@ mod tests {
 
     #[test]
     fn image_template_runtime_uses_curated_defaults() {
-        let template = temps_core::templates::bundled_template_by_slug("keycloak")
+        let template = temps_presets::templates::bundled_template_by_slug("keycloak")
             .expect("Keycloak should be bundled")
             .primary()
             .clone();
@@ -4006,7 +4308,7 @@ mod tests {
 
     #[test]
     fn image_template_runtime_applies_user_overrides_and_can_clear_command() {
-        let template = temps_core::templates::bundled_template_by_slug("keycloak")
+        let template = temps_presets::templates::bundled_template_by_slug("keycloak")
             .expect("Keycloak should be bundled")
             .primary()
             .clone();
@@ -4038,7 +4340,7 @@ mod tests {
 
     #[test]
     fn image_template_runtime_rejects_unsafe_health_paths() {
-        let template = temps_core::templates::bundled_template_by_slug("keycloak")
+        let template = temps_presets::templates::bundled_template_by_slug("keycloak")
             .expect("Keycloak should be bundled")
             .primary()
             .clone();
@@ -4053,7 +4355,7 @@ mod tests {
 
     #[test]
     fn image_template_runtime_rejects_mutable_image_tags() {
-        let template = temps_core::templates::bundled_template_by_slug("keycloak")
+        let template = temps_presets::templates::bundled_template_by_slug("keycloak")
             .expect("Keycloak should be bundled")
             .primary()
             .clone();
@@ -4793,13 +5095,13 @@ mod tests {
 
     #[test]
     fn template_upgrade_only_accepts_new_declared_configuration() {
-        let mut template = temps_core::templates::bundled_template_by_slug("browserless")
+        let mut template = temps_presets::templates::bundled_template_by_slug("browserless")
             .expect("browserless template must be bundled")
             .primary()
             .clone();
         template
             .env_vars
-            .push(temps_core::templates::EnvVarTemplate {
+            .push(temps_presets::templates::EnvVarTemplate {
                 name: "NEW_API_KEY".to_string(),
                 example: None,
                 default: None,
@@ -4877,7 +5179,7 @@ mod tests {
 
     #[test]
     fn template_upgrade_cannot_overwrite_existing_or_inject_unknown_configuration() {
-        let template = temps_core::templates::bundled_template_by_slug("browserless")
+        let template = temps_presets::templates::bundled_template_by_slug("browserless")
             .expect("browserless template must be bundled")
             .primary()
             .clone();
@@ -5061,5 +5363,151 @@ mod tests {
             StatusCode::BAD_REQUEST,
             "mutual exclusion must produce 400 Bad Request"
         );
+    }
+
+    /// A client disconnect drops the handler future between teardown steps and
+    /// leaves the project fenced but still listed and serving. The handler must
+    /// therefore hand the whole sequence to a spawned task and only await it.
+    #[test]
+    fn delete_project_runs_teardown_on_a_detached_task() {
+        let source = include_str!("handlers.rs");
+        let start = source
+            .find("pub async fn delete_project(")
+            .expect("delete_project handler exists");
+        let tail = &source[start..];
+        let end = tail
+            .find("/// Update project settings")
+            .expect("end of delete_project handler");
+        let handler = &tail[..end];
+
+        assert!(
+            handler.contains("tokio::spawn(run_project_teardown("),
+            "teardown must run on a spawned task so a client disconnect cannot abort it"
+        );
+        for step in [
+            "begin_project_deletion",
+            "cancel_all_project_deployments",
+            "cleanup_project_containers",
+            "cleanup_project_archives",
+            ".delete_project(",
+        ] {
+            assert!(
+                !handler.contains(step),
+                "`{step}` must run inside run_project_teardown, not in the request future"
+            );
+        }
+    }
+
+    /// Project hooks (functions retiring their workloads, status pages going
+    /// down) must run before the rows are deleted, because the row delete
+    /// cascades away the records that say what to retire; and a failing hook
+    /// must stop the teardown instead of being skipped.
+    #[test]
+    fn teardown_runs_deletion_hooks_before_deleting_rows_and_stops_on_failure() {
+        let source = include_str!("handlers.rs");
+        let start = source
+            .find("async fn run_project_teardown(")
+            .expect("run_project_teardown exists");
+        let tail = &source[start..];
+        let end = tail
+            .find("pub async fn delete_project(")
+            .expect("end of run_project_teardown");
+        let teardown = &tail[..end];
+
+        let fence = teardown
+            .find("begin_project_deletion")
+            .expect("the teardown fences the project");
+        let hooks = teardown
+            .find(".project_deletion_hooks")
+            .expect("the teardown runs the project deletion hooks");
+        let rows = teardown
+            .find(".delete_project(")
+            .expect("the teardown deletes the project rows");
+        assert!(fence < hooks, "hooks run after the fence commits");
+        assert!(hooks < rows, "hooks run before the rows are deleted");
+        let hook_call = &teardown[hooks..rows];
+        let propagated = hook_call
+            .find("})?;")
+            .expect("a failing hook is propagated with `?`");
+        assert!(
+            hook_call[..propagated].contains(".run(id)"),
+            "the hook result is what is propagated"
+        );
+    }
+
+    /// The project's built images are read while their build records exist
+    /// (before the row delete cascades them away) and removed only after
+    /// the rows are deleted, and their removal cannot fail the deletion.
+    #[test]
+    fn teardown_plans_images_before_deleting_rows_and_removes_them_after() {
+        let source = include_str!("handlers.rs");
+        let start = source
+            .find("async fn run_project_teardown(")
+            .expect("run_project_teardown exists");
+        let tail = &source[start..];
+        let end = tail
+            .find("pub async fn delete_project(")
+            .expect("end of run_project_teardown");
+        let teardown = &tail[..end];
+
+        let containers = teardown
+            .find("cleanup_project_containers")
+            .expect("the teardown removes containers");
+        let plan = teardown
+            .find(".plan_project_image_cleanup(id)")
+            .expect("the teardown reads the project's images");
+        let rows = teardown
+            .find(".delete_project(")
+            .expect("the teardown deletes the project rows");
+        let removal = teardown
+            .find(".remove_project_images(plan)")
+            .expect("the teardown removes the project's images");
+        let audit = teardown
+            .find("ProjectDeletedAudit {")
+            .expect("the teardown audits the deletion");
+        assert!(
+            containers < plan,
+            "images are planned after containers are removed"
+        );
+        assert!(plan < rows, "images are read before the rows cascade away");
+        assert!(
+            rows < removal,
+            "images are removed only after the rows are deleted"
+        );
+        assert!(removal < audit, "the audit records what the removal did");
+
+        let plan_call = &teardown[plan..rows];
+        assert!(
+            !plan_call[..plan_call.find(";").expect("end of the plan statement")].contains('?'),
+            "a failure to read the images must not fail the deletion"
+        );
+        assert!(
+            teardown[removal..audit].contains("images_removed = counts.removed"),
+            "the deletion log carries the image counts"
+        );
+        assert!(
+            teardown[audit..].contains("image_plan_error,"),
+            "the audit records when the images could not be read"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawned_task_survives_the_awaiting_future_being_dropped() {
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let _ = done_tx.send(());
+        });
+
+        // Dropping the awaiting future is what a disconnect does to a handler.
+        let waiter = tokio::spawn(async move {
+            let _ = task.await;
+        });
+        waiter.abort();
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), done_rx)
+            .await
+            .expect("spawned work must finish")
+            .expect("spawned work must signal completion");
     }
 }

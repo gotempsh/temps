@@ -1,0 +1,159 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# Migrations that do not run in file-name order.
+#
+# `build.rs` generates `Migrator::migrations()` from the files in this
+# directory, sorted by name. Each block below then moves the listed migrations,
+# in the order given, to directly after the `after` migration. Blocks apply top
+# to bottom. See `src/migration_order.rs`.
+#
+# This is shipped upgrade history: existing databases applied migrations in
+# this order, mostly where two branches shipped migrations with overlapping
+# stamps and the one that landed second had to run second. Never edit, reorder
+# or remove a block. A new migration needs no entry here: give it a stamp later
+# than every existing migration file, and it sorts last.
+#
+# `tests/fixtures/migration_order.txt` holds the full resulting order, and the
+# registry tests in `mod.rs` check the generated list against it.
+
+after m20260226_000001_add_deployment_id_to_deployment_tokens:
+    m20260225_000001_create_log_aggregator_tables
+
+after m20260720_000001_add_backend_to_sandboxes:
+    m20260720_000002_create_sandbox_events
+
+# Two migrations share the m20260804_000001 stamp; the one that shipped first
+# runs first.
+after m20260803_000002_add_step_up_expires_at_to_sessions:
+    m20260804_000001_add_must_change_password_to_users
+
+after m20260805_000001_index_normalized_managed_domains:
+    m20260806_000001_sandbox_workspace_lifecycle
+
+# Three migrations share the m20260810_000001 stamp; the sandbox one shipped
+# first.
+after m20260809_000001_ai_gateway_config_provider_type:
+    m20260810_000001_create_sandbox_snapshots
+
+# Two migrations share the m20260811_000001 stamp; renewal attempts shipped
+# first.
+after m20260810_000004_add_ai_conversation_runtime_options:
+    m20260811_000001_create_renewal_attempts
+
+# ADR-041 §7a step (b) runs right after the certificates it backfills, ahead
+# of the managed status monitors that share its stamp.
+after m20260831_000001_create_traefik_route_certificates:
+    m20260831_000002_backfill_acme_verification_method
+
+# Three migrations share the m20260903_000001 stamp; the cloud telemetry
+# outbox shipped first.
+after m20260902_000001_backup_safety_and_provenance:
+    m20260903_000001_generalize_cloud_telemetry_outbox
+
+# The AI workspace chain landed after main's migrations up to this point, so
+# it runs after them: main's upgrade history stays a stable prefix.
+after m20260907_000001_add_mfa_pending_origin_to_sessions:
+    m20260831_000001_ai_first_applications
+    m20260901_000001_persist_ai_turn_state
+    m20260901_000002_user_owned_ai_conversations
+    m20260903_000001_application_workspace_topology
+    m20260903_000002_harden_application_workspaces
+    m20260903_000003_application_workspace_quarantine
+    m20260903_000004_repair_application_primary_projects
+
+after m20260909_000001_index_global_log_chunks:
+    m20260901_000001_add_database_provisioning_to_project_services
+
+# Registered after the v0.3.2 workspace images, despite their older stamps.
+after m20260912_000003_managed_daemon_workspace_images_v032:
+    m20260713_000002_add_dns_ownership
+    m20260714_000001_create_domain_delivery
+
+after m20260917_000001_add_next_check_at_to_status_monitors:
+    m20260929_000001_add_bunny_delivery
+
+after m20260917_000003_add_cron_next_run_at_to_project_agents:
+    m20260916_000001_visitor_activity_reports
+
+# Two branches each shipped m20260921_00000{1,2,3} migrations for unrelated
+# features. The line-index stores landed first and run first.
+after m20260920_000002_log_collector_positions:
+    m20260921_000001_log_lines_index
+    m20260921_000002_log_line_index_state
+    m20260921_000003_log_line_forget_backlog
+
+after m20260921_000004_credential_catalog:
+    m20260921_000001_add_worker_public_ingress
+
+after m20260922_000001_stateless_control_plane_jobs:
+    m20260918_000001_add_pull_only_root_directory_to_projects
+
+# Two migrations share the m20260928_000001 stamp; host git imports shipped
+# first.
+after m20260927_000001_add_port_bindings_to_deployment_containers:
+    m20260928_000001_host_git_imports
+
+# Two migrations share the m20261002_000001 stamp; Bunny hostname ownership
+# shipped first.
+after m20260928_000001_add_node_id_to_sandboxes:
+    m20261002_000001_add_bunny_hostname_owned
+    m20261002_000001_secret_checks_and_history
+
+after m20261005_000001_ai_gateway_objects:
+    m20261005_000002_ai_batch_reconciliation
+
+# Project groups, template instantiations and project hosting landed after
+# everything main had shipped, so they run after it.
+after m20261013_000002_add_kind_to_ai_conversations:
+    m20260928_000001_create_project_groups
+    m20260928_000002_create_project_group_env_vars
+    m20260928_000003_add_project_group_repository
+    m20260928_000004_create_project_group_routes
+    m20260929_000001_create_template_instantiations
+    m20260929_000002_add_project_hosting
+    m20260930_000001_add_project_instantiation_token
+
+# Main's CI, health, cron monitor and ingest migrations landed ahead of the AI
+# chat chain that starts with create_ai_goals.
+after m20261016_000002_ci_build_dispatch:
+    m20261017_000001_retain_ci_cancellation
+    m20261017_000001_deployment_health_probes
+    m20261017_000002_runtime_health
+    m20261019_000001_mfa_verification_guards
+    m20261019_000001_cron_monitors
+    m20261019_000002_reconcile_error_group_counts
+    m20261019_000003_cron_monitor_management
+    m20261019_000004_error_event_source_keys
+    m20261020_000001_project_feedback
+    m20261020_000002_log_attribute_types
+    m20261020_000003_debug_id_artifacts
+    m20261020_000004_client_outcomes
+    m20261020_000005_client_outcome_receipts
+    m20261020_000006_otel_ingest_receipts
+    m20261010_000001_create_ai_goals
+
+after m20261020_000001_create_ai_blueprints:
+    m20261020_000002_create_autofix_incidents
+
+after m20261022_000002_fence_revenue_subscription_events:
+    m20261023_000001_add_overlay_network_name
+    m20261023_000002_add_serves_own_temps_api_to_projects
+    m20261024_000001_reachability
+    m20261025_000001_private_audience
+    m20261022_000001_dns_name_claims
+
+# Landed after the tunnel environment hosts; drop_functions removes what the
+# retired functions migration created.
+after m20261028_000001_tunnel_environment_hosts:
+    m20261027_000001_nodes_deployments_without_resolver
+    m20261028_000002_drop_functions
+
+# Landed after ADR 066's Shield migrations.
+after m20261101_000001_shield_query_indexes:
+    m20261028_000001_domain_certificate_settings
+    m20261029_000001_completed_dns_cleanup_orders
+
+# Landed after the 2026-11-07 migrations with an earlier stamp.
+after m20261107_000004_add_nodes_drain_requested_at:
+    m20261103_000002_git_oauth_reauthorization

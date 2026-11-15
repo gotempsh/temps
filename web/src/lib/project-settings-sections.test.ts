@@ -14,8 +14,8 @@ import {
 
 describe('settings section links', () => {
   test('builds absolute links that open one section', () => {
-    expect(settingsSectionHref('app', 'automation', 'cron-jobs')).toBe(
-      '/projects/app/settings/automation?section=cron-jobs'
+    expect(settingsSectionHref('app', 'automation', 'chats')).toBe(
+      '/projects/app/settings/automation?section=chats'
     )
   })
 
@@ -56,12 +56,8 @@ describe('legacyProjectRouteTarget', () => {
     expect(legacyProjectRouteTarget('flags', '')).toBe(
       'settings/delivery?section=feature-flags'
     )
-    expect(legacyProjectRouteTarget('settings/cron-jobs', '')).toBe(
-      'settings/automation?section=cron-jobs'
-    )
-    expect(legacyProjectRouteTarget('setup', '')).toBe(
-      'settings/general?section=setup'
-    )
+    expect(legacyProjectRouteTarget('settings/cron-jobs', '')).toBe('cron-jobs')
+    expect(legacyProjectRouteTarget('setup', '')).toBe('project')
     expect(legacyProjectRouteTarget('settings/environment-variables', '')).toBe(
       'environment-variables'
     )

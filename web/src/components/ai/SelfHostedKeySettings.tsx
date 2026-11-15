@@ -14,6 +14,7 @@ import { isSelfHostedProvider } from '@/lib/ai-providers'
 import {
   SELF_HOSTED_CAPABILITY_LABELS,
   hasIpLiteralHost,
+  isPrivateAddressUrl,
   normalizeSelfHostedCapabilities,
   type SelfHostedCapabilitiesInput,
 } from './self-hosted-provider'
@@ -60,58 +61,60 @@ export function SelfHostedKeySettings({
         </div>
       )}
 
-      <div className="flex flex-wrap items-center gap-2">
-        <span className="text-muted-foreground">Private address trust</span>
-        {trusted ? (
-          <>
-            <Badge
-              variant="secondary"
-              className="gap-1"
-              title="This key may reach this exact address even though it is not in Trusted private networks"
-            >
-              <ShieldCheck className="h-3 w-3" />
-              Trusts {trusted}
-            </Badge>
-            {providerKey.trusted_private_address_set_at && (
-              <span className="text-xs text-muted-foreground">
-                since{' '}
-                {new Date(
-                  providerKey.trusted_private_address_set_at
-                ).toLocaleString()}
-              </span>
-            )}
-            <Button
-              variant="ghost"
-              size="sm"
-              className="h-7"
-              disabled={pending}
-              onClick={() => onUpdate({ trust_private_address: false })}
-            >
-              Remove trust
-            </Button>
-          </>
-        ) : (
-          <>
-            <span className="text-xs text-muted-foreground">
-              None — the address must be in Trusted private networks.
-            </span>
-            {canTrustThisUrl && (
+      {(trusted || isPrivateAddressUrl(providerKey.base_url ?? '')) && (
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-muted-foreground">Private address trust</span>
+          {trusted ? (
+            <>
+              <Badge
+                variant="secondary"
+                className="gap-1"
+                title="This key may reach this exact address even though it is not in trusted private networks"
+              >
+                <ShieldCheck className="h-3 w-3" />
+                Trusts {trusted}
+              </Badge>
+              {providerKey.trusted_private_address_set_at && (
+                <span className="text-xs text-muted-foreground">
+                  since{' '}
+                  {new Date(
+                    providerKey.trusted_private_address_set_at
+                  ).toLocaleString()}
+                </span>
+              )}
               <Button
-                variant="outline"
+                variant="ghost"
                 size="sm"
                 className="h-7"
                 disabled={pending}
-                onClick={() => onUpdate({ trust_private_address: true })}
+                onClick={() => onUpdate({ trust_private_address: false })}
               >
-                Trust this address for this key
+                Remove trust
               </Button>
-            )}
-          </>
-        )}
-        {pending && (
-          <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" />
-        )}
-      </div>
+            </>
+          ) : (
+            <>
+              <span className="text-xs text-muted-foreground">
+                None — the address must be in Trusted private networks.
+              </span>
+              {canTrustThisUrl && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-7"
+                  disabled={pending}
+                  onClick={() => onUpdate({ trust_private_address: true })}
+                >
+                  Trust this address for this key
+                </Button>
+              )}
+            </>
+          )}
+          {pending && (
+            <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" />
+          )}
+        </div>
+      )}
 
       {selfHosted && (
         <div className="grid gap-2">

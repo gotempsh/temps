@@ -5,7 +5,7 @@
 //!
 //! Temps writes two kinds of logs to durable storage: aggregated container
 //! logs (`temps-log-aggregator`, compressed NDJSON chunks) and build/deploy
-//! job logs (`temps-logs`, JSONL files written incrementally while a job
+//! job logs (`temps-deployment-logs`, JSONL files written incrementally while a job
 //! runs). Both are operationally the same question for a self-hosted
 //! operator -- "where does Temps put log data, local disk or an
 //! S3-compatible bucket" -- so they share one configuration type and one set
@@ -13,12 +13,12 @@
 //! resolved once in `temps-cli`'s serve command and handed to both plugins.
 //!
 //! This type lives in `temps-core` rather than in `temps-log-aggregator`
-//! (where it originated) because `temps-logs` needed it too: `temps-logs` is
+//! (where it originated) because `temps-deployment-logs` needed it too: `temps-deployment-logs` is
 //! a lightweight leaf crate (only `temps-core` as a dependency) used broadly
 //! across the deployment pipeline, while `temps-log-aggregator` pulls in
 //! `temps-auth`, `temps-database`, `temps-entities` and `sea-orm` for its
 //! chunk-indexing responsibilities. Depending on `temps-log-aggregator` from
-//! `temps-logs` would have dragged that entire dependency graph into a crate
+//! `temps-deployment-logs` would have dragged that entire dependency graph into a crate
 //! that otherwise needs none of it. `temps-core` is the one crate both
 //! already depend on, so the shared *data* (this enum) lives here while each
 //! crate keeps its own storage-backend *implementation* (chunked

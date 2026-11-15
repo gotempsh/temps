@@ -180,7 +180,7 @@ export function AgentSandboxDashboard() {
 
   const cards = [
     {
-      title: 'AI Providers',
+      title: 'AI providers',
       to: '/agent-sandbox/providers',
       icon: Sparkles,
       tone: providerTone,
@@ -196,7 +196,7 @@ export function AgentSandboxDashboard() {
       hint: 'Isolated Docker containers for AI sessions and workflows.',
     },
     {
-      title: 'Preview Gateway',
+      title: 'Preview gateway',
       to: '/agent-sandbox/preview',
       icon: Globe,
       tone: gatewayTone,

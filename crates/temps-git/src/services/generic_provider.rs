@@ -29,7 +29,7 @@ use async_trait::async_trait;
 /// cannot bypass the create-time validation.
 pub struct GenericProvider {
     /// Optional display-only base URL. Not used for API calls.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // injected but not used yet
     base_url: Option<String>,
     auth_method: AuthMethod,
 }

@@ -13,8 +13,8 @@ use sea_orm::{
 };
 use std::collections::HashSet;
 use temps_core::{
-    ManagedBackupArchiveConflict, ManagedBackupSchedule, ManagedBackupScheduleError,
-    ManagedBackupScheduleProvisioner, ReleasedManagedBackupSchedules,
+    BackupScheduleAuthority, ManagedBackupArchiveConflict, ManagedBackupSchedule,
+    ManagedBackupScheduleError, ManagedBackupScheduleProvisioner, ReleasedManagedBackupSchedules,
     MANAGED_BACKUP_SCHEDULE_EXPRESSION, MANAGED_BACKUP_SCHEDULE_NAME,
 };
 
@@ -165,16 +165,23 @@ impl ManagedBackupScheduleProvisioner for ManagedScheduleProvisioner {
         &self,
         s3_source_id: i32,
         retention_days: u16,
+        authority: BackupScheduleAuthority,
     ) -> Result<ManagedBackupSchedule, ManagedBackupScheduleError> {
+        // The default schedule covers every database and the control plane
+        // (NV1): refuse a scoped caller before even revealing whether one
+        // already exists.
+        if !authority.is_instance_admin() {
+            return Err(ManagedBackupScheduleError::NotAuthorized { s3_source_id });
+        }
         let _serialised = self.ensure.lock().await;
         if let Some(existing) = self.schedule_for_source(s3_source_id).await? {
             return Ok(existing);
         }
         self.backups
-            .create_backup_schedule(default_managed_schedule_request(
-                s3_source_id,
-                retention_days,
-            ))
+            .create_backup_schedule(
+                default_managed_schedule_request(s3_source_id, retention_days),
+                authority,
+            )
             .await
             .map(summary)
             .map_err(|error| ManagedBackupScheduleError::Create {
@@ -269,8 +276,11 @@ impl ManagedBackupScheduleProvisioner for ManagedScheduleProvisioner {
             .iter()
             .filter(|schedule| is_managed_schedule(&schedule.tags))
         {
+            // Releasing runs because the destination's credential is about
+            // to be revoked: stopping writes to it is a safety step the
+            // instance takes on its own behalf, not a caller's choice.
             self.backups
-                .delete_backup_schedule(schedule.id)
+                .delete_backup_schedule(schedule.id, BackupScheduleAuthority::InstanceAdmin)
                 .await
                 .map_err(|error| ManagedBackupScheduleError::Release {
                     s3_source_id,
@@ -332,11 +342,18 @@ mod tests {
             health_metadata: None,
             metrics_enabled: false,
             default_backup_provisioned: false,
-            ai_data_access: false,
             created_by_user_id: None,
             container_name: None,
             continuous_archive_s3_source_id: pinned,
             continuous_archive_pinned_at: None,
+            workload_mode: Default::default(),
+            log_ingest_lines_per_sec: None,
+            log_ingest_kib_per_sec: None,
+            healthcheck_interval_secs: None,
+            healthcheck_start_interval_secs: None,
+            healthcheck_start_period_secs: None,
+            healthcheck_timeout_secs: None,
+            healthcheck_retries: None,
         }
     }
 
@@ -357,6 +374,7 @@ mod tests {
             managed_by_cloud: false,
             lifecycle_reconcile_failed_at: None,
             lifecycle_reconcile_generation: 0,
+            worker_credentials: "scoped".to_string(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             backing_service_id: None,

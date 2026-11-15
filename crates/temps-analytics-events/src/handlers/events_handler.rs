@@ -35,12 +35,12 @@ use temps_analytics::ingest_keys::{
     stamp_retry_after_on_rate_limited, wildcard_ingest_cors, AnalyticsIngestKeyService,
     AnalyticsIngestRateLimiter, IngestBranch, IngestJson, KeyedIngestCors,
 };
-use temps_auth::{
+use temps_authz::{
     deny_deployment_token, permission_guard, project_access_guard, project_scope_guard, RequireAuth,
 };
 use temps_core::error_builder::ErrorBuilder;
 use temps_core::problemdetails::Problem;
-use temps_proxy::CachedPeerTable;
+use temps_routes::CachedPeerTable;
 use tracing::error;
 
 pub struct AppState {
@@ -62,7 +62,38 @@ pub struct AppState {
     pub ingest_key_service: Arc<AnalyticsIngestKeyService>,
     /// Per-key sliding-window limiter for the keyed ingest path.
     pub ingest_rate_limiter: Arc<AnalyticsIngestRateLimiter>,
+    /// Lock-free per-project limiter for the Host-resolved ingest path, which
+    /// is the per-event hot path for every deployed site.
+    pub host_ingest_rate_limiter: Arc<super::HostIngestRateLimiter>,
 }
+
+/// Per-project ceiling applied to the Host-resolved (keyless) ingest branch
+/// of `POST /_temps/event`.
+///
+/// The keyed branch is limited per ingest key (default
+/// [`temps_analytics::ingest_keys::DEFAULT_RATE_LIMIT_PER_MINUTE`] = 600/min,
+/// operator-configurable on the key row). The Host-resolved branch has no key
+/// row to carry a limit, and is just as unauthenticated: anyone can set `Host`
+/// to a tracked project's hostname. It is limited per project by the
+/// lock-free [`super::HostIngestRateLimiter`] (this branch is the per-event
+/// hot path, so it must not take the keyed limiter's mutex), with a
+/// deliberately higher ceiling (100 events/s sustained) so a
+/// busy deployed site — pageviews plus periodic heartbeats from every open tab
+/// — is not throttled, while a flood is still bounded to a fixed DB write rate
+/// per project. Cardinality is bounded by the number of projects.
+pub const HOST_RESOLVED_INGEST_RATE_LIMIT_PER_MINUTE: u32 = 6_000;
+
+/// Request-body cap for `POST /_temps/event`.
+///
+/// One analytics event is a page path/query, title, referrer, a few numeric
+/// dimensions and a small `event_data` object — typically well under 2 KiB.
+/// 64 KiB matches the browser ceiling for the transports the SDK uses for
+/// page-unload events (`navigator.sendBeacon` and `fetch(.., {keepalive})`
+/// both cap in-flight bodies at 64 KiB), so no SDK-originated event can exceed
+/// it, while an unauthenticated caller can no longer push axum's 2 MiB default
+/// per request. Session replay (4 MiB) and Sentry envelopes (2 MiB) carry
+/// genuinely larger payloads and keep their own caps.
+pub const EVENT_INGEST_BODY_LIMIT: usize = 64 * 1024;
 
 /// Get event counts with filtering
 #[utoipa::path(
@@ -823,6 +854,32 @@ pub async fn record_event_metrics(
                     host, project_id, environment_id, deployment_id
                 );
 
+                // Without a limit here, anyone who sets `Host` to a tracked
+                // hostname could inject events at an unbounded rate. Checked
+                // before the geolocation lookup and the insert, so a rejected
+                // request costs no DB work; lock-free, so it never serializes
+                // ingest across projects.
+                if !state
+                    .host_ingest_rate_limiter
+                    .check(project_id, HOST_RESOLVED_INGEST_RATE_LIMIT_PER_MINUTE)
+                {
+                    tracing::warn!(
+                        project_id,
+                        host = %host,
+                        limit_per_minute = HOST_RESOLVED_INGEST_RATE_LIMIT_PER_MINUTE,
+                        "Host-resolved analytics ingest rate limit exceeded; dropping event"
+                    );
+                    return ErrorBuilder::new(StatusCode::TOO_MANY_REQUESTS)
+                        .title("Analytics ingest rate limit exceeded")
+                        .detail(format!(
+                            "Analytics ingest for project {} via host '{}' exceeded {} events \
+                             per minute.",
+                            project_id, host, HOST_RESOLVED_INGEST_RATE_LIMIT_PER_MINUTE
+                        ))
+                        .build()
+                        .into_response();
+                }
+
                 // Unchanged: on this branch the Host header *is* the tracked
                 // site, so it stays the site hostname exactly as before.
                 (
@@ -898,8 +955,10 @@ pub async fn record_event_metrics(
         })
         .and_then(|raw| primary_accept_language(&raw));
 
-    // Lookup IP geolocation
-    let ip_geolocation_id = if !metadata.ip_address.is_empty() {
+    // Lookup IP geolocation. The network attributes (ASN, country, hosting
+    // verdict) ride along from the same (memory-cached) lookup, so datacenter
+    // detection and the project's traffic filters cost no extra I/O.
+    let (ip_geolocation_id, client_network) = if !metadata.ip_address.is_empty() {
         match state
             .ip_address_service
             .get_or_create_ip(&metadata.ip_address)
@@ -907,21 +966,36 @@ pub async fn record_event_metrics(
         {
             Ok(ip_info) => {
                 info!(
-                    "Resolved IP {} to geolocation: country={:?}, city={:?}",
-                    metadata.ip_address, ip_info.country, ip_info.city
+                    "Resolved IP {} to geolocation: country={:?}, city={:?}, asn={:?}, hosting={:?}",
+                    metadata.ip_address,
+                    ip_info.country,
+                    ip_info.city,
+                    ip_info.asn_number,
+                    ip_info.is_hosting_provider
                 );
-                Some(ip_info.id)
+                let client_network = crate::services::ClientNetwork {
+                    ip: metadata.ip_address.parse().ok(),
+                    asn_number: ip_info.asn_number.and_then(|asn| u32::try_from(asn).ok()),
+                    country_code: ip_info.country_code.clone(),
+                    is_hosting_provider: ip_info.is_hosting_provider,
+                };
+                (Some(ip_info.id), Some(client_network))
             }
             Err(e) => {
                 error!(
                     "Failed to lookup IP geolocation for {}: {}",
                     metadata.ip_address, e
                 );
-                None
+                // IP rules still apply when geolocation is unavailable.
+                let client_network = crate::services::ClientNetwork {
+                    ip: metadata.ip_address.parse().ok(),
+                    ..Default::default()
+                };
+                (None, Some(client_network))
             }
         }
     } else {
-        None
+        (None, None)
     };
 
     let session_id = resolve_client_identity(
@@ -971,6 +1045,7 @@ pub async fn record_event_metrics(
             language,
             payload.page_title,
             ip_geolocation_id,
+            client_network,
             user_agent,
             referrer,
             // Performance metrics (web vitals)
@@ -1104,6 +1179,7 @@ pub async fn record_console_event(
             None, // language
             None, // page_title
             None, // ip_geolocation_id
+            None, // client_network
             None, // user_agent
             None, // referrer
             None, // ttfb
@@ -1156,7 +1232,7 @@ pub async fn record_console_event(
     ),
     responses(
         (status = 200, description = "Successfully retrieved aggregated buckets", body = AggregatedBucketsResponse),
-        (status = 400, description = "Bad request"),
+        (status = 400, description = "Invalid range, or a bucket size that would return too many points"),
         (status = 401, description = "Unauthorized"),
         (status = 500, description = "Internal server error")
     ),
@@ -1186,6 +1262,19 @@ pub async fn get_aggregated_buckets(
         aggregation_level: query.aggregation_level,
         bucket_size: query.bucket_size,
     };
+    // Both storage backends build one row per bucket in memory, so this is
+    // checked here rather than in each of them.
+    temps_core::time_window::check_series_points(
+        spec.range.start,
+        spec.range.end,
+        &spec.bucket_size,
+    )
+    .map_err(|e| {
+        ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Invalid Time Series Request")
+            .detail(format!("Project {project_id}: {e}"))
+            .build()
+    })?;
     let result = state
         .events_service
         .query_aggregated_buckets(spec)
@@ -1341,7 +1430,12 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
 /// [`temps_analytics::ingest_keys::cors`].
 pub fn configure_public_routes(cors: KeyedIngestCors) -> Router<Arc<AppState>> {
     Router::new()
-        .route("/_temps/event", post(record_event_metrics))
+        .route(
+            "/_temps/event",
+            post(record_event_metrics).layer(axum::extract::DefaultBodyLimit::max(
+                EVENT_INGEST_BODY_LIMIT,
+            )),
+        )
         .layer(axum::middleware::map_response(
             stamp_retry_after_on_rate_limited,
         ))
@@ -1417,8 +1511,8 @@ mod tests {
     use axum::http::Request;
     use axum::middleware;
     use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter};
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::projects;
+    use temps_test_utils::TestDatabase;
     use tower::ServiceExt;
 
     #[test]
@@ -1473,7 +1567,7 @@ mod tests {
         );
     }
 
-    fn create_test_auth_context() -> temps_auth::AuthContext {
+    fn create_test_auth_context() -> temps_authz::AuthContext {
         let user = temps_entities::users::Model {
             id: 1,
             name: "Test User".to_string(),
@@ -1494,7 +1588,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
-        temps_auth::AuthContext::new_session(user, temps_auth::Role::Admin)
+        temps_authz::AuthContext::new_session(user, temps_authz::Role::Admin)
     }
 
     async fn setup_test_app(
@@ -1502,7 +1596,7 @@ mod tests {
     ) -> (axum::Router, Arc<AppState>, Arc<temps_core::CookieCrypto>) {
         let events_writer = Arc::new(crate::services::AnalyticsEventsService::new(db.clone()));
         let events_service: Arc<dyn crate::services::AnalyticsEvents> = events_writer.clone();
-        let route_table = Arc::new(temps_proxy::CachedPeerTable::new(db.clone()));
+        let route_table = Arc::new(temps_routes::CachedPeerTable::new(db.clone()));
         let geoip_service = Arc::new(temps_geo::GeoIpService::Mock(
             temps_geo::MockGeoIpService::new(),
         ));
@@ -1521,6 +1615,7 @@ mod tests {
             project_access_checker: None,
             ingest_key_service: Arc::new(AnalyticsIngestKeyService::new(db.clone())),
             ingest_rate_limiter: Arc::new(AnalyticsIngestRateLimiter::new()),
+            host_ingest_rate_limiter: Arc::new(crate::handlers::HostIngestRateLimiter::new()),
         });
 
         let auth_middleware = middleware::from_fn(
@@ -1640,7 +1735,7 @@ mod tests {
     fn setup_deployment_token_app(state: Arc<AppState>, token_project_id: i32) -> axum::Router {
         let auth_middleware = middleware::from_fn(
             move |mut req: Request<Body>, next: axum::middleware::Next| async move {
-                let auth_context = temps_auth::AuthContext::new_deployment_token(
+                let auth_context = temps_authz::AuthContext::new_deployment_token(
                     token_project_id,
                     None,
                     None,
@@ -2004,7 +2099,7 @@ mod tests {
 
         let events_writer = Arc::new(crate::services::AnalyticsEventsService::new(db.clone()));
         let events_service: Arc<dyn crate::services::AnalyticsEvents> = events_writer.clone();
-        let route_table = Arc::new(temps_proxy::CachedPeerTable::new(db.clone()));
+        let route_table = Arc::new(temps_routes::CachedPeerTable::new(db.clone()));
         let geoip_service = Arc::new(temps_geo::GeoIpService::Mock(
             temps_geo::MockGeoIpService::new(),
         ));
@@ -2022,6 +2117,7 @@ mod tests {
             project_access_checker: None,
             ingest_key_service: Arc::new(AnalyticsIngestKeyService::new(db.clone())),
             ingest_rate_limiter: Arc::new(AnalyticsIngestRateLimiter::new()),
+            host_ingest_rate_limiter: Arc::new(crate::handlers::HostIngestRateLimiter::new()),
         });
 
         // No auth middleware — should return 401
@@ -2277,7 +2373,7 @@ mod tests {
     /// Register a host in the route table so the no-key branch can resolve it,
     /// without needing a real deployment to exist.
     fn insert_test_route(
-        route_table: &temps_proxy::CachedPeerTable,
+        route_table: &temps_routes::CachedPeerTable,
         host: &str,
         project: Option<projects::Model>,
     ) {
@@ -2736,6 +2832,93 @@ mod tests {
         test_db.cleanup().await;
     }
 
+    /// F-011: the Host-resolved branch is rate limited per project, and a
+    /// rejected event is never stored.
+    #[tokio::test]
+    async fn host_resolved_ingest_over_its_rate_limit_returns_429() {
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = insert_test_project(db.as_ref()).await;
+        let (_app, state, _crypto) = setup_test_app(db.clone()).await;
+        insert_test_route(
+            &state.route_table,
+            "app.example.test",
+            Some(project.clone()),
+        );
+
+        // Exhaust the project's budget directly (in memory) rather than
+        // inserting thousands of rows.
+        for _ in 0..HOST_RESOLVED_INGEST_RATE_LIMIT_PER_MINUTE {
+            assert!(state
+                .host_ingest_rate_limiter
+                .check(project.id, HOST_RESOLVED_INGEST_RATE_LIMIT_PER_MINUTE));
+        }
+
+        let response = setup_public_app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_temps/event")
+                    .header("host", "app.example.test")
+                    .header("content-type", "application/json")
+                    .body(Body::from(event_payload().to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            response.headers().contains_key(header::RETRY_AFTER),
+            "the public route's Retry-After stamping must cover this branch too"
+        );
+        assert!(stored_events(db.as_ref()).await.is_empty());
+
+        test_db.cleanup().await;
+    }
+
+    /// F-020: the unkeyed branch is subject to the explicit body cap.
+    #[tokio::test]
+    async fn host_resolved_ingest_over_the_body_limit_is_a_413() {
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = insert_test_project(db.as_ref()).await;
+        let (_app, state, _crypto) = setup_test_app(db.clone()).await;
+        insert_test_route(&state.route_table, "app.example.test", Some(project));
+
+        let mut payload = event_payload();
+        payload["page_title"] = serde_json::json!("a".repeat(EVENT_INGEST_BODY_LIMIT + 1));
+        let response = setup_public_app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_temps/event")
+                    .header("host", "app.example.test")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(stored_events(db.as_ref()).await.is_empty());
+
+        test_db.cleanup().await;
+    }
+
     /// Regression: the three no-key rejection shapes are unchanged — empty Host
     /// is 400, an unknown host is 404, and a sandbox/orphan route silently
     /// drops with 204.
@@ -3172,10 +3355,11 @@ mod tests {
         let (_app, state, _crypto) = setup_test_app(db.clone()).await;
         let key = mint_key(&state, project.id, None).await;
 
-        // axum's default body limit (2 MiB) applies to this route, exactly as
-        // it does to an `application/json` body.
+        // The route's explicit cap (`EVENT_INGEST_BODY_LIMIT`) applies to
+        // this route, exactly as it does to an `application/json` body — and
+        // it is well below axum's 2 MiB default.
         let mut payload = event_payload();
-        payload["page_title"] = serde_json::json!("a".repeat(3 * 1024 * 1024));
+        payload["page_title"] = serde_json::json!("a".repeat(EVENT_INGEST_BODY_LIMIT + 1));
         for content_type in ["text/plain", "application/json"] {
             let response = setup_public_app(state.clone())
                 .oneshot(beacon(&key, content_type, SITE_ORIGIN, payload.to_string()))

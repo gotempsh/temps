@@ -5,6 +5,7 @@ pub(crate) mod admin_gate;
 mod admin_gate_handler;
 pub(crate) mod admin_gate_service;
 pub mod console;
+mod internal_routing;
 mod node_api;
 pub(crate) mod on_demand_cert;
 pub(crate) mod proxy;
@@ -12,6 +13,7 @@ pub(crate) mod self_update;
 mod shutdown;
 pub(crate) mod startup_failure;
 pub(crate) mod stateless;
+mod static_files;
 pub(crate) mod upgrade_telemetry;
 
 use clap::{Args, ValueEnum};
@@ -103,6 +105,16 @@ enum LocalStartupMigrationError {
         #[source]
         source: temps_core::ServiceError,
     },
+}
+
+/// Open the pool every subsystem of `temps serve` shares, sized by `TEMPS_DB_*`.
+/// Migrations run later, once startup has decided they may.
+async fn connect_server_database(
+    database_url: &str,
+) -> temps_core::ServiceResult<Arc<temps_database::DbConnection>> {
+    temps_database::connect_pooled(database_url)
+        .await
+        .map(Arc::new)
 }
 
 async fn run_local_mode_migrations(
@@ -216,6 +228,22 @@ impl ServeProfile {
     }
 }
 
+/// `PR_SET_DUMPABLE(0)`. Failure is logged, never fatal: the process is still
+/// what it was before this existed.
+fn make_process_non_dumpable() {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: prctl with integer arguments has no memory preconditions.
+        if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+            warn!(
+                "Could not mark the Temps process non-dumpable; other processes of this user \
+                 can still read its environment: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+}
+
 #[derive(Args)]
 pub struct ServeCommand {
     /// Address to bind the server to
@@ -238,9 +266,9 @@ pub struct ServeCommand {
     #[arg(long, env = "TEMPS_PROXY_TLS_ADDRESS")]
     pub proxy_tls_address: Option<String>,
 
-    /// Database connection URL (set via TEMPS_DATABASE_URL env var; not accepted as a flag to prevent credentials leaking into process listings)
+    /// Database connection URL. Prefer TEMPS_DATABASE_URL (or TEMPS_DATABASE_URL_FILE / the systemd credential temps_database_url): the flag form puts the password in the process command line
     #[arg(long, env = "TEMPS_DATABASE_URL", hide_env_values = true)]
-    pub database_url: String,
+    pub database_url: Option<String>,
 
     /// Seconds to wait for the database at startup before giving up. While
     /// it is unreachable (refused, no route, still starting up) the server
@@ -258,6 +286,14 @@ pub struct ServeCommand {
     /// Data directory for storing configuration and runtime files
     #[arg(long, env = "TEMPS_DATA_DIR")]
     pub data_dir: Option<PathBuf>,
+
+    /// Program that runs each external plugin as a separate, unprivileged
+    /// user (verbs `exec`, `signal` and `probe`; see the
+    /// `temps_external_plugins::launcher` docs). When set, Temps refuses to
+    /// start plugins unless that user provably cannot read this process's
+    /// environment, memory or secret files. Fixed by how the host is built.
+    #[arg(long, env = "TEMPS_PLUGIN_LAUNCHER")]
+    pub plugin_launcher: Option<PathBuf>,
 
     /// Console/Admin address (defaults to random port on localhost).
     ///
@@ -352,6 +388,14 @@ pub struct ServeCommand {
     #[arg(long, env = "TEMPS_PRIVATE_ADDRESS")]
     pub private_address: Option<String>,
 
+    /// `ip:port` workers dial for this control plane's end of the WireGuard
+    /// mesh. Only used when the cluster runs the managed mesh. Defaults to
+    /// `--private-address` on the mesh port; set it when workers reach this
+    /// server through a different IP or a forwarded port (NAT). The mesh
+    /// still listens on its own port. Must be an IP literal, not a hostname.
+    #[arg(long, env = "TEMPS_WG_ENDPOINT", value_parser = parse_wg_endpoint)]
+    pub wg_endpoint: Option<std::net::SocketAddr>,
+
     /// Which halves of the control plane to run in this process.
     ///
     /// `all` (default) runs the proxy (:80/:443) and the console together —
@@ -379,6 +423,11 @@ pub struct ServeCommand {
     /// exactly what the running process provides.
     #[arg(long, value_enum, default_value_t = ServeProfile::Full, env = "TEMPS_SERVE_PROFILE")]
     pub profile: ServeProfile,
+
+    /// Export this server's own traces over OpenTelemetry (OTLP). Disabled
+    /// unless `--otel-export` is given; see docs/howto/export-server-traces.
+    #[command(flatten)]
+    pub otel: crate::otel_export::OtelArgs,
 }
 
 /// Name the flag whose address the public-only listener would collide with,
@@ -399,6 +448,13 @@ fn ingress_listener_clash(
     } else {
         None
     }
+}
+
+/// `--wg-endpoint` / `TEMPS_WG_ENDPOINT`: a literal `ip:port` other machines
+/// can dial, held to the rules a node's endpoint is (no hostnames, no
+/// loopback, link-local, multicast or metadata addresses, no port 0).
+fn parse_wg_endpoint(value: &str) -> Result<std::net::SocketAddr, String> {
+    temps_network::mesh::parse_endpoint(value).map_err(|error| error.to_string())
 }
 
 impl ServeCommand {
@@ -435,6 +491,13 @@ impl ServeCommand {
         ip_gate_builder: Option<crate::commands::proxy::FallibleProjectIpGateBuilder>,
         request_policy_gate_builder: Option<crate::commands::proxy::RequestPolicyGateBuilder>,
     ) -> anyhow::Result<()> {
+        // Only this process's own sources: the server never adopts another
+        // service definition's URL. Missing, this lists what was checked.
+        let database_url = crate::database_url_source::resolve_database_url(
+            self.database_url.as_deref(),
+            crate::database_url_source::UrlDiscovery::ThisProcess,
+        )?
+        .into_url();
         let has_extra_plugins = !extra_plugins.is_empty();
         let has_ip_gate_builder = ip_gate_builder.is_some();
         let has_request_policy_gate_builder = request_policy_gate_builder.is_some();
@@ -456,6 +519,16 @@ impl ServeCommand {
         // Install the rustls crypto provider once at startup, before any
         // dependency (e.g. temps-domains) constructs a rustls client.
         crate::install_crypto_provider();
+
+        // No other process of this user may read this one's environment or
+        // memory (`/proc/<pid>/environ`, `/proc/<pid>/mem`, ptrace): it holds
+        // the database URL, the encryption key and the Cloud credential.
+        // Children reset this on exec, so plugins and builds are unaffected.
+        make_process_non_dumpable();
+
+        if let Some(ref launcher) = self.plugin_launcher {
+            std::env::set_var("TEMPS_PLUGIN_LAUNCHER", launcher);
+        }
 
         // Set screenshot provider from CLI flag (takes precedence over env var)
         // This allows: temps serve --screenshot-provider=noop
@@ -531,7 +604,7 @@ impl ServeCommand {
 
         let serve_config = temps_config::ServerConfig::new(
             effective_proxy_address,
-            self.database_url.clone(),
+            database_url.clone(),
             effective_proxy_tls_address,
             self.console_address.clone(),
         )?;
@@ -542,7 +615,7 @@ impl ServeCommand {
         let serve_config = Arc::new(if self.role == ServeRole::Console {
             serve_config
         } else {
-            serve_config.with_default_ingress_listener()
+            serve_config.with_default_ingress_listener()?
         });
         let encryption_service = Arc::new(temps_core::EncryptionService::new(
             &serve_config.encryption_key,
@@ -576,20 +649,18 @@ impl ServeCommand {
         // is waited for here, instead of exiting and letting a supervisor's
         // restart policy turn it into a restart loop.
         rt.block_on(temps_database::wait_for_database(
-            &self.database_url,
+            &database_url,
             std::time::Duration::from_secs(self.database_startup_wait),
         ))?;
         let bootstrap_stateless = temps_config::bootstrap_stateless_requested()?;
         _control_plane_owner = if bootstrap_stateless {
             stateless::validate_profile(self.profile, self.role)?;
             stateless::validate_scratch_directory(&serve_config.data_dir)?;
-            Some(rt.block_on(stateless::ControlPlaneOwner::acquire(&self.database_url))?)
+            Some(rt.block_on(stateless::ControlPlaneOwner::acquire(&database_url))?)
         } else {
             None
         };
-        let db = rt.block_on(temps_database::connect_without_migrations(
-            &self.database_url,
-        ))?;
+        let db = rt.block_on(connect_server_database(&database_url))?;
         let persisted_mode = rt.block_on(temps_config::installation_mode(db.as_ref()))?;
         if persisted_mode.is_stateless() && !bootstrap_stateless {
             rt.block_on(stateless::reject_local_mode_for_managed_database(
@@ -616,7 +687,7 @@ impl ServeCommand {
             // dir may be temporary, so copy a dump to durable storage.
             rt.block_on(crate::commands::schema_upgrade::prepare_schema_upgrade(
                 db.as_ref(),
-                &self.database_url,
+                &database_url,
                 &serve_config.data_dir,
                 crate::commands::schema_upgrade::BackupPolicy::from_flag(self.pre_migration_backup),
             ))?;
@@ -631,7 +702,7 @@ impl ServeCommand {
             // start.
             rt.block_on(run_local_mode_migrations(
                 db.as_ref(),
-                &self.database_url,
+                &database_url,
                 &serve_config.data_dir,
                 crate::commands::schema_upgrade::BackupPolicy::from_flag(self.pre_migration_backup),
             ))?
@@ -673,6 +744,45 @@ impl ServeCommand {
                     .await
                 {
                     tracing::error!("Failed to update private address setting: {}", e);
+                }
+            });
+        }
+
+        // `--wg-endpoint` belongs to the flag: record it, or clear a value an
+        // earlier start recorded, so the mesh setup (deployer plugin and
+        // `temps network setup-multi-node`) publishes exactly what this
+        // process was started with. Written only when it changes.
+        {
+            let wg_endpoint = self.wg_endpoint.map(|endpoint| endpoint.to_string());
+            if let Some(ref endpoint) = wg_endpoint {
+                info!(
+                    wg_endpoint = %endpoint,
+                    "Advertising this WireGuard endpoint to workers"
+                );
+            }
+            let config_service = temps_config::ConfigService::new(serve_config.clone(), db.clone());
+            rt.block_on(async move {
+                match config_service.get_settings().await {
+                    Ok(settings) if settings.multi_node.wg_endpoint == wg_endpoint => {}
+                    Ok(_) => {
+                        if let Err(e) = config_service
+                            .update_setting_field(|settings| {
+                                settings.multi_node.wg_endpoint = wg_endpoint;
+                            })
+                            .await
+                        {
+                            tracing::error!(
+                                "Failed to record the --wg-endpoint setting: {}; workers keep \
+                                 the previously published WireGuard endpoint",
+                                e
+                            );
+                        }
+                    }
+                    Err(e) => tracing::error!(
+                        "Failed to read settings to record --wg-endpoint: {}; workers keep the \
+                         previously published WireGuard endpoint",
+                        e
+                    ),
                 }
             });
         }
@@ -747,15 +857,26 @@ impl ServeCommand {
                 .then(|| traefik_discovery_config.network.clone()),
         );
 
+        // The control-plane resolver's gateway, published by the DNS
+        // bootstrap loop and read by the deployer (ADR-024).
+        let overlay_dns_slot: temps_dns::OverlayDnsSlot = Arc::new(std::sync::RwLock::new(None));
+        // The same gateway, set only while the control plane's internal
+        // proxy serves its port 80 and no worker can: where the deployment
+        // DNS publisher points the internal names (ADR-104 D3).
+        let internal_names_slot: temps_dns::OverlayDnsSlot = Arc::new(std::sync::RwLock::new(None));
+
         // ADR-012-lite: every successful route_table reload also
         // reconciles internal `<env>.<project>.temps.local` A records,
         // so the L7 routes and the internal DNS zone share one trigger
         // and one source of truth.
         {
-            let publisher = Arc::new(temps_dns::DeploymentDnsPublisher::new(
-                db.clone(),
-                Arc::new(temps_dns::DnsRegistry::new(db.clone())),
-            ));
+            let publisher = Arc::new(
+                temps_dns::DeploymentDnsPublisher::new(
+                    db.clone(),
+                    Arc::new(temps_dns::DnsRegistry::new(db.clone())),
+                )
+                .with_control_plane_gateway(internal_names_slot.clone()),
+            );
             route_table.set_on_reload_callback(Arc::new(move || {
                 let publisher = publisher.clone();
                 Box::pin(async move {
@@ -778,13 +899,13 @@ impl ServeCommand {
         // resolved below — so the actual starts happen after that block.
         let route_table_listener = Arc::new(temps_routes::RouteTableListener::new(
             route_table.clone(),
-            self.database_url.clone(),
+            database_url.clone(),
             queue.clone(),
         ));
         // Keep the project listener alive on the stack so its Drop doesn't abort
         // the background task.
         let project_listener = temps_routes::ProjectChangeListener::new(
-            self.database_url.clone(),
+            database_url.clone(),
             route_table.clone(),
             queue.clone(),
         );
@@ -808,8 +929,21 @@ impl ServeCommand {
             rt.spawn(async move {
                 let mut retry_delay = POST_MIGRATION_INDEX_INITIAL_RETRY;
                 loop {
-                    match temps_database::run_post_migration_indexes(index_db.as_ref()).await {
+                    match temps_schema::run_post_migration_indexes(index_db.as_ref()).await {
                         Ok(()) => break,
+                        // Retrying cannot fix this one on its own: the operator
+                        // has to raise a PostgreSQL setting and restart it. It is
+                        // still retried, so it completes once they have.
+                        Err(e @ temps_schema::SchemaError::LockSlotsExhausted(_)) => {
+                            tracing::error!(
+                                "Post-migration maintenance ran out of PostgreSQL lock slots; \
+                                 retrying in {:?}: {}",
+                                retry_delay,
+                                e
+                            );
+                            tokio::time::sleep(retry_delay).await;
+                            retry_delay = next_post_migration_index_retry(retry_delay);
+                        }
                         Err(e) => {
                             tracing::warn!(
                                 "Post-migration index build failed; retrying in {:?}: {}",
@@ -823,10 +957,42 @@ impl ServeCommand {
                 }
             });
 
+            // Pre-migration audit events are attributed to their vaults in
+            // committed batches. Vault audit pages keep the slower read-time
+            // enumeration until it completes, so it is retried until then.
+            let attribution_db = db.clone();
+            rt.spawn(async move {
+                let mut retry_delay = POST_MIGRATION_INDEX_INITIAL_RETRY;
+                loop {
+                    match temps_schema::run_vault_audit_backfill(attribution_db.as_ref()).await {
+                        Ok(summary) => {
+                            if summary.batches > 0 {
+                                tracing::info!(
+                                    batches = summary.batches,
+                                    attributed = summary.attributed,
+                                    "Attributed pre-migration audit events to their access vaults"
+                                );
+                            }
+                            break;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                retry_in = ?retry_delay,
+                                error = %e,
+                                "Vault audit attribution backfill failed; vault audit pages \
+                                 use the read-time enumeration until it completes"
+                            );
+                            tokio::time::sleep(retry_delay).await;
+                            retry_delay = next_post_migration_index_retry(retry_delay);
+                        }
+                    }
+                }
+            });
+
             let backfill_db = db.clone();
             rt.spawn(async move {
                 if let Err(e) =
-                    temps_database::run_post_migration_backfill(backfill_db.as_ref()).await
+                    temps_schema::run_post_migration_backfill(backfill_db.as_ref()).await
                 {
                     tracing::warn!(
                         "Post-migration backfill failed (refresh policy will catch up): {}",
@@ -878,7 +1044,7 @@ impl ServeCommand {
             self.disable_self_update,
             self_update_caveat,
             update_status.clone(),
-            self.database_url.clone(),
+            database_url.clone(),
             self.pre_migration_backup,
         ));
 
@@ -990,8 +1156,30 @@ impl ServeCommand {
             }));
 
             // Start background idle sweep (checks every 60 seconds)
-            on_demand_manager.start_sweep_task(std::time::Duration::from_secs(60));
+            on_demand_manager
+                .start_sweep_task(std::time::Duration::from_secs(60))
+                .map_err(|e| anyhow::anyhow!("Failed to spawn on-demand idle sweep thread: {e}"))?;
         }
+
+        // ADR-055 phase 10: one activator per process wakes scale-to-zero
+        // targets on their first request and its one sweep (O(targets), every
+        // 30 s) puts idle ones back to sleep: on-demand environments whose
+        // `workload_mode` is `enforce`. Every other
+        // environment keeps the on-demand manager's own path above.
+        let activator = Arc::new(temps_workload_activator::Activator::new(
+            temps_workload_activator::ActivatorConfig::default(),
+        ));
+        if let Some(ref on_demand_manager) = on_demand_manager {
+            on_demand_manager.attach_activator(activator.clone());
+        }
+        {
+            let _runtime = rt.enter();
+            // Detached: it sweeps for the life of the process.
+            drop(activator.spawn_sweeper(std::time::Duration::from_secs(30)));
+        }
+        let local_drivers = Arc::new(temps_workload_plane::LocalDrivers::new(
+            local_runtime_drivers(),
+        ));
 
         // NOW start the route-reload machinery. `start_listening` subscribes to
         // PG NOTIFY synchronously and spawns the initial load in the background,
@@ -1025,7 +1213,7 @@ impl ServeCommand {
                         .unwrap_or_else(|| PathBuf::from("."))
                         .join(".temps")
                 });
-            temps_agents::preview_gateway::spawn_reconcile(&rt, docker, db.clone(), data_dir);
+            temps_ai_agents::preview_gateway::spawn_reconcile(&rt, docker, db.clone(), data_dir);
         }
 
         // Traefik-label discovery: adopt containers the operator already runs
@@ -1133,7 +1321,7 @@ impl ServeCommand {
         // `Arc<ArcSwap<_>>`, so this clone writes to the same live handle.
         {
             let listener_service = Arc::new(admin_gate_service.clone());
-            let database_url = self.database_url.clone();
+            let database_url = database_url.clone();
             rt.block_on(async { listener_service.start_settings_listener(database_url) });
         }
 
@@ -1174,7 +1362,10 @@ impl ServeCommand {
         // review as an explicit exception rather than a second precedent.
         let project_ip_gate_slot = Arc::new(temps_core::ProjectIpGateSlot::new_default());
         let request_policy_gate_slot = Arc::new(temps_core::RequestPolicyGateSlot::new_default());
-        let overlay_dns_slot: temps_dns::OverlayDnsSlot = Arc::new(std::sync::RwLock::new(None));
+        // Node 0's network policy view: the enforcer (NetworkPolicyPlugin)
+        // writes it, the proxy-owned resolver answers restricted workloads
+        // from it. Both run in this process.
+        let dns_policy_slot = temps_dns::open_dns_policy_slot();
 
         // Resolve proxy enforcement before console startup. These builders are
         // the same extension boundary used by standalone `temps proxy`; they
@@ -1220,12 +1411,15 @@ impl ServeCommand {
             cookie_crypto: cookie_crypto.clone(),
             encryption_service: encryption_service.clone(),
             route_table: route_table.clone(),
+            runtime_context: runtime_context.clone(),
             queue: queue.clone(),
             ready_signal: Some(ready_tx),
             additional_templates: self.additional_templates.clone(),
             on_demand_waker: on_demand_manager
                 .clone()
                 .map(|m| m as Arc<dyn temps_core::OnDemandWaker>),
+            activator: activator.clone(),
+            local_drivers,
             extra_plugins,
             admin_gate_service: Some(admin_gate_service),
             admin_gate_handle: Some(admin_gate_handle.clone()),
@@ -1233,6 +1427,7 @@ impl ServeCommand {
             project_ip_gate_slot: project_ip_gate_slot.clone(),
             request_policy_gate_slot: request_policy_gate_slot.clone(),
             overlay_dns_slot: overlay_dns_slot.clone(),
+            dns_policy_slot: dns_policy_slot.clone(),
             update_status,
             self_updater,
             traefik_discovery: traefik_discovery_handle,
@@ -1259,6 +1454,34 @@ impl ServeCommand {
                  `temps proxy` process). Health: GET {}/readyz",
                 serve_config.console_address
             );
+            // The host's cpu/memory/disk/network series for the Server page.
+            // The proxy samples them only when it shares this process, and a
+            // console-only deployment (a hosted control plane) runs no proxy
+            // at all, so this process owns them in split topology.
+            {
+                let config_service = Arc::new(temps_config::ConfigService::new(
+                    serve_config.clone(),
+                    db.clone(),
+                ));
+                let serve_config = serve_config.clone();
+                let db = db.clone();
+                rt.spawn(async move {
+                    let store = temps_proxy::service::metrics_sampler::build_metrics_store(
+                        &config_service,
+                        &serve_config,
+                        db,
+                    )
+                    .await;
+                    temps_metrics::NodeMetricsSampler::with_scope(
+                        store,
+                        config_service,
+                        serve_config.data_dir.clone(),
+                        temps_metrics::NodeMetricsScope::Host,
+                    )
+                    .run()
+                    .await;
+                });
+            }
             return rt.block_on(async move {
                 start_console_api(params).await.map_err(|e| {
                     tracing::error!("❌ Console API failed: {}", e);
@@ -1347,7 +1570,7 @@ impl ServeCommand {
             self.tls_address.clone(),
             cookie_crypto.clone(),
             encryption_service.clone(),
-            self.database_url.clone(),
+            database_url.clone(),
             route_table,
             serve_config.clone(),
             self.disable_https_redirect,
@@ -1357,11 +1580,19 @@ impl ServeCommand {
             project_ip_gate_slot as Arc<dyn temps_core::ProjectIpGate>,
             request_policy_gate_slot as Arc<dyn temps_core::RequestPolicyGate>,
             overlay_dns_slot,
+            internal_names_slot,
+            Some(dns_policy_slot),
             docker_handle,
             self.profile.local_workloads_enabled(),
             console_startup_state,
         )
     }
+}
+
+/// Runtime drivers this binary adds on the control plane next to the node
+/// driver (ADR-055 phase 10). None today.
+fn local_runtime_drivers() -> Vec<Arc<dyn temps_workload::RuntimeDriver>> {
+    Vec::new()
 }
 
 #[cfg(test)]
@@ -1494,6 +1725,64 @@ mod serve_profile_tests {
         );
         // The retired no-op flag stays CLI-only.
         assert_eq!(env_of("skip_pre_migration_backup"), None);
+    }
+
+    #[test]
+    fn wg_endpoint_reads_the_flag_or_its_env_var() {
+        assert_eq!(
+            parse_with_env("wge_unset", &[], &[])
+                .expect("parses")
+                .wg_endpoint,
+            None
+        );
+        assert_eq!(
+            parse_with_env("wge_flag", &[], &["--wg-endpoint", "157.180.96.48:20517"])
+                .expect("parses")
+                .wg_endpoint,
+            Some("157.180.96.48:20517".parse().unwrap())
+        );
+        assert_eq!(
+            parse_with_env("wge_env", &[("wg_endpoint", "203.0.113.7:4000")], &[])
+                .expect("parses")
+                .wg_endpoint,
+            Some("203.0.113.7:4000".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn wg_endpoint_rejects_hostnames_and_undialable_addresses() {
+        let error = match parse_with_env(
+            "wge_host",
+            &[],
+            &["--wg-endpoint", "plane.example.com:20517"],
+        ) {
+            Ok(_) => panic!("a hostname must be refused"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("a hostname is not accepted"), "{error}");
+        for bad in [
+            "157.180.96.48",
+            "127.0.0.1:20517",
+            "0.0.0.0:51820",
+            "157.180.96.48:0",
+        ] {
+            assert!(
+                parse_with_env("wge_bad", &[], &["--wg-endpoint", bad]).is_err(),
+                "{bad} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn wg_endpoint_env_var_mirrors_the_agent() {
+        use clap::CommandFactory;
+        let command = TestCli::command();
+        let env = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "wg_endpoint")
+            .and_then(|arg| arg.get_env())
+            .map(|name| name.to_string_lossy().into_owned());
+        assert_eq!(env.as_deref(), Some("TEMPS_WG_ENDPOINT"));
     }
 
     #[test]
@@ -1881,6 +2170,46 @@ mod serve_profile_tests {
 }
 
 #[cfg(test)]
+mod server_database_tests {
+    use super::*;
+
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "test: an operator's pool settings change what this test expects"
+    )]
+    fn pool_settings_are_defaults() -> bool {
+        std::env::var_os("TEMPS_DB_MAX_CONNECTIONS").is_none()
+            && std::env::var_os("TEMPS_DB_MIN_CONNECTIONS").is_none()
+    }
+
+    #[tokio::test]
+    async fn the_server_pool_is_sized_by_the_documented_defaults() {
+        if !pool_settings_are_defaults() {
+            eprintln!("Skipping: TEMPS_DB_* pool settings are set in this environment");
+            return;
+        }
+        let database = match temps_test_utils::TestDatabase::new().await {
+            Ok(database) => database,
+            Err(error)
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+            {
+                eprintln!("Skipping server pool test: Docker unavailable: {error}");
+                return;
+            }
+            Err(error) => panic!("server pool test database failed: {error}"),
+        };
+
+        let db = connect_server_database(&database.database_url)
+            .await
+            .unwrap();
+
+        let pool = db.get_postgres_connection_pool();
+        assert_eq!(pool.options().get_max_connections(), 100);
+        assert_eq!(pool.options().get_min_connections(), 5);
+    }
+}
+
+#[cfg(test)]
 mod post_migration_tests {
     use super::*;
     use sea_orm::ConnectionTrait;
@@ -1896,12 +2225,10 @@ mod post_migration_tests {
 
     #[tokio::test]
     async fn local_startup_rejects_bound_database_before_pending_migration() {
-        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let database = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!(
                     "Skipping startup identity integration test: Docker unavailable: {error}"
@@ -1942,7 +2269,7 @@ mod post_migration_tests {
             ) if detail.contains("TEMPS_STATELESS=true")
         ));
         assert!(
-            temps_database::get_pending_migration_names(db)
+            temps_schema::get_pending_migration_names(db)
                 .await
                 .expect("read pending migrations after rejection")
                 .iter()
@@ -1972,7 +2299,7 @@ mod post_migration_tests {
         .await
         .expect("fresh local startup should apply migrations");
         assert!(
-            !temps_database::get_pending_migration_names(db)
+            !temps_schema::get_pending_migration_names(db)
                 .await
                 .expect("read pending migrations after startup")
                 .iter()

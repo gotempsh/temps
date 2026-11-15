@@ -489,6 +489,14 @@ impl VisitorCreationIpLimiter {
     }
 }
 
+// rrweb permits fractional milliseconds; the native index stores integer
+// milliseconds while event JSON retains the producer's fractional precision.
+fn recording_timestamp(event: &Value) -> Option<i64> {
+    let timestamp = event.get("timestamp")?.as_f64()?;
+    (timestamp.is_finite() && (0.0..=253402300799000.0).contains(&timestamp))
+        .then_some(timestamp as i64)
+}
+
 pub struct SessionReplayService {
     db: Arc<DatabaseConnection>,
     visitor_creation_limiter: temps_analytics::AnalyticsIngestRateLimiter,
@@ -539,6 +547,15 @@ impl SessionReplayService {
         // request would then see that row as "existing" and skip re-creating
         // the session it was actually trying to open.
         let txn = self.db.begin().await?;
+
+        // Serialize initialization for one session, including concurrent source
+        // segment arrivals. This is a bounded database lock, not a process lock.
+        txn.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 7391))",
+            [session_id.into()],
+        ))
+        .await?;
 
         // Look up visitor by visitor_id GUID, scoped to this project.
         // `visitor` is uniquely keyed on (visitor_id, project_id) — the same
@@ -643,7 +660,35 @@ impl SessionReplayService {
             .one(&txn)
             .await?;
 
-        if existing.is_some() {
+        if let Some(existing) = existing {
+            if existing.project_id != project_id {
+                return Err(SessionReplayError::CrossProjectAccess {
+                    session_replay_id: session_id.into(),
+                    project_id,
+                });
+            }
+            // Out-of-order source segments can initialize a replay before its
+            // snapshot arrives. Reconcile earlier metadata rather than keeping
+            // unknown viewport/URL fields for the lifetime of the recording.
+            let earlier =
+                created_at.is_some_and(|time| existing.created_at.is_none_or(|old| time < old));
+            let missing_viewport = (metadata.viewport.width > 0
+                && existing.viewport_width.unwrap_or(0) == 0)
+                || (metadata.viewport.height > 0 && existing.viewport_height.unwrap_or(0) == 0);
+            if earlier || missing_viewport {
+                let mut model: session_replay_sessions::ActiveModel = existing.into();
+                model.created_at = Set(created_at);
+                if metadata.viewport.width > 0 {
+                    model.viewport_width = Set(Some(metadata.viewport.width as i32));
+                }
+                if metadata.viewport.height > 0 {
+                    model.viewport_height = Set(Some(metadata.viewport.height as i32));
+                }
+                if !metadata.url.is_empty() {
+                    model.url = Set(Some(metadata.url.clone()));
+                }
+                model.update(&txn).await?;
+            }
             // Still commit: a lookup-miss above may have upserted the
             // visitor row (or bumped its `last_seen`), and that write is
             // real and wanted even though this call turns out to be a no-op
@@ -892,11 +937,101 @@ impl SessionReplayService {
             return Ok(0);
         }
 
+        self.append_decoded_events(session, events_to_store, batch_id, None)
+            .await
+    }
+
+    /// Wire-independent ingestion for recording adapters. Uses the same native
+    /// batch markers, writes and retention as the Temps browser SDK. Source
+    /// sequence breaks timestamp ties when segments arrive out of order; this
+    /// internal ordering field is removed from the playback response.
+    pub async fn add_decoded_session_events(
+        &self,
+        project_id: i32,
+        session_id: &str,
+        events: Vec<Value>,
+        batch_id: &str,
+        source_sequence: u32,
+    ) -> Result<usize, SessionReplayError> {
+        if let Some(reason) = batch_id_rejection_reason(batch_id) {
+            return Err(SessionReplayError::InvalidBatchId {
+                session_replay_id: session_id.into(),
+                reason,
+            });
+        }
+        if events.len() > MAX_EVENTS_PER_BATCH
+            || serde_json::to_vec(&events)?.len() > MAX_DECOMPRESSED_BYTES
+        {
+            return Err(SessionReplayError::BatchTooLarge {
+                session_replay_id: session_id.into(),
+                unit: "events",
+                actual: events.len(),
+                limit: MAX_EVENTS_PER_BATCH,
+            });
+        }
+        for event in &events {
+            if !event.is_object()
+                || recording_timestamp(event).is_none()
+                || event
+                    .get("type")
+                    .and_then(Value::as_i64)
+                    .is_none_or(|t| !(0..=6).contains(&t))
+                || event.get("_temps_source_order").is_some()
+            {
+                return Err(SessionReplayError::InvalidPackedData(
+                    "invalid decoded replay event".into(),
+                ));
+            }
+        }
+        let session = session_replay_sessions::Entity::find()
+            .filter(session_replay_sessions::Column::SessionReplayId.eq(session_id))
+            .filter(session_replay_sessions::Column::IsActive.eq(true))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| SessionReplayError::SessionNotFound(session_id.into()))?;
+        if session.project_id != project_id {
+            return Err(SessionReplayError::CrossProjectAccess {
+                session_replay_id: session_id.into(),
+                project_id,
+            });
+        }
+        self.append_decoded_events(session, events, Some(batch_id), Some(source_sequence))
+            .await
+    }
+
+    async fn append_decoded_events(
+        &self,
+        session: session_replay_sessions::Model,
+        mut events_to_store: Vec<Value>,
+        batch_id: Option<&str>,
+        source_sequence: Option<u32>,
+    ) -> Result<usize, SessionReplayError> {
+        let session_id = session.session_replay_id.as_str();
+        let event_count = events_to_store.len();
+        if event_count == 0 {
+            return Ok(0);
+        }
+        if let Some(sequence) = source_sequence {
+            for (index, event) in events_to_store.iter_mut().enumerate() {
+                event["_temps_source_order"] = serde_json::json!([sequence, index]);
+            }
+        }
         // The marker and the events go in together. Claiming the batch outside
         // a transaction would let a failed event insert leave the marker
         // behind, and the client's retry would then be discarded as a
         // duplicate — turning a retryable error into permanent data loss.
         let txn = self.db.begin().await?;
+
+        if source_sequence.is_some() {
+            // Bound each replay to the native reader's 50k event window. Lock
+            // the session so concurrent segments cannot race this admission.
+            txn.query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT id FROM session_replay_sessions WHERE id = $1 FOR UPDATE",
+                [session.id.into()],
+            ))
+            .await?;
+        }
 
         if let Some(batch_id) = batch_id {
             let marker = session_replay_ingest_batches::ActiveModel {
@@ -937,6 +1072,21 @@ impl SessionReplayService {
             }
         }
 
+        if source_sequence.is_some() {
+            let total = session_replay_events::Entity::find()
+                .filter(session_replay_events::Column::SessionId.eq(session.id))
+                .count(&txn)
+                .await?;
+            if total + event_count as u64 > 50_000 {
+                return Err(SessionReplayError::BatchTooLarge {
+                    session_replay_id: session_id.into(),
+                    unit: "session events",
+                    actual: total as usize + event_count,
+                    limit: 50_000,
+                });
+            }
+        }
+
         // Insert in batches rather than one round-trip per event. rrweb emits
         // hundreds to thousands of events per flush (mousemove/scroll sampling
         // dominates), so a row-at-a-time loop costs one network round-trip per
@@ -946,7 +1096,7 @@ impl SessionReplayService {
         // its own queue. Batching turns that into a handful of statements.
         for chunk in events_to_store.chunks(EVENT_INSERT_CHUNK_SIZE) {
             let models = chunk.iter().map(|event| {
-                let timestamp = event.get("timestamp").and_then(|t| t.as_i64()).unwrap_or(0);
+                let timestamp = recording_timestamp(event).unwrap_or(0);
                 let event_type = event.get("type").and_then(|t| t.as_i64()).map(|t| t as i32);
 
                 session_replay_events::ActiveModel {
@@ -967,10 +1117,18 @@ impl SessionReplayService {
                 .await?;
         }
 
+        if source_sequence.is_some() {
+            // The native list hides recordings without duration. Commit it
+            // with the source marker/events, so a failed summary update cannot
+            // leave a deduplicated but invisible recording after retry.
+            txn.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,
+                "UPDATE session_replay_sessions SET duration = LEAST(2147483647, GREATEST(0, (SELECT MAX(timestamp)-MIN(timestamp) FROM session_replay_events WHERE session_id=$1 AND is_active=true))) WHERE id=$1",[session.id.into()])).await?;
+        }
+
         txn.commit().await?;
 
         // Recompute duration from ALL stored events (not just this batch)
-        if event_count > 0 {
+        if event_count > 0 && source_sequence.is_none() {
             self.compute_and_update_session_duration(session_id, session.id)
                 .await?;
         }
@@ -1715,7 +1873,26 @@ impl SessionReplayService {
             })
             .collect();
 
-        let session_events = session_events?;
+        let mut session_events = session_events?;
+        session_events.sort_by_key(|e| {
+            let sequence = e.data.get("_temps_source_order").and_then(Value::as_array);
+            (
+                e.timestamp,
+                sequence
+                    .and_then(|s| s.first())
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                sequence
+                    .and_then(|s| s.get(1))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(e.id as u64),
+            )
+        });
+        for event in &mut session_events {
+            if let Some(data) = event.data.as_object_mut() {
+                data.remove("_temps_source_order");
+            }
+        }
 
         let visitor = VisitorInfo {
             id: row.visitor_internal_id,
@@ -1926,7 +2103,7 @@ impl SessionReplayService {
             max_ts: Some(max),
         }) = result
         {
-            let duration_ms = (max - min) as i32;
+            let duration_ms = max.saturating_sub(min).clamp(0, i32::MAX as i64) as i32;
             self.update_session_duration(session_replay_id, duration_ms)
                 .await?;
         }
@@ -2254,6 +2431,10 @@ mod tests {
     async fn initialize_session_writes_null_scope_not_zero_sentinel() {
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
+                .append_exec_results(vec![sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
                 // 1. visitor lookup
                 .append_query_results(vec![vec![make_visitor_model(3)]])
                 // 1b. the visitor's `last_seen` is refreshed
@@ -2326,6 +2507,12 @@ mod tests {
     async fn initialize_session_refreshes_an_existing_visitors_last_seen() {
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
+                // Session initialization claims its advisory lock before
+                // looking up or refreshing the visitor.
+                .append_exec_results(vec![sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
                 .append_query_results(vec![vec![make_visitor_model(3)]])
                 .append_exec_results(vec![sea_orm::MockExecResult {
                     last_insert_id: 0,
@@ -2371,6 +2558,12 @@ mod tests {
         upserted.insert("id".to_string(), sea_orm::Value::Int(Some(9)));
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
+                // Session initialization claims its advisory lock before
+                // looking up or refreshing the visitor.
+                .append_exec_results(vec![sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
                 .append_query_results(vec![vec![make_visitor_model(3)]])
                 // The refresh matches no row: retention removed it.
                 .append_exec_results(vec![sea_orm::MockExecResult {
@@ -2424,6 +2617,10 @@ mod tests {
     async fn initialize_session_preserves_concrete_scope() {
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
+                .append_exec_results(vec![sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
                 .append_query_results(vec![vec![make_visitor_model(3)]])
                 .append_exec_results(vec![sea_orm::MockExecResult {
                     last_insert_id: 0,

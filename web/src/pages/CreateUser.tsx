@@ -9,7 +9,9 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import type { TeamRole } from '@/api/client'
 import { RolePermissionDetails } from '@/components/users/RolePermissionDetails'
+import { TeamFieldHint } from '@/components/users/TeamFieldHint'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
+import { PageHeader } from '@/components/layout/PageContainer'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Checkbox } from '@/components/ui/checkbox'
@@ -143,6 +145,14 @@ export function CreateUser() {
     listTeamsOptions({ query: { page: 1, page_size: 100 } })
   )
 
+  const teamsStatus = teamsQuery.isPending
+    ? 'pending'
+    : teamsQuery.isError
+      ? 'error'
+      : teamsQuery.data?.teams.length
+        ? 'available'
+        : 'empty'
+
   const form = useForm<CreateUserFormData>({
     resolver: zodResolver(createUserSchema),
     defaultValues: {
@@ -162,8 +172,15 @@ export function CreateUser() {
   const selectedTeamRole = useWatch({ control: form.control, name: 'teamRole' })
   const requirementResults = passwordRequirementResults(password)
 
+  // Used right after the account is created and again on retry; either way the
+  // account already exists, which is what the operator needs to know. The
+  // banner below the form keeps the retry guidance on screen.
   const addTeamMember = useMutation({
     ...addTeamMemberMutation(),
+    meta: {
+      errorTitle:
+        'Team assignment failed. The account exists, so retrying is safe',
+    },
   })
 
   const createUser = useMutation({
@@ -187,9 +204,6 @@ export function CreateUser() {
             teamId: teamAssignment.teamId,
             role: teamAssignment.role,
           })
-          toast.error(
-            'User created, but team assignment failed. Retry it before leaving this page.'
-          )
           await queryClient.invalidateQueries({ queryKey: ['listUsers'] })
           return
         }
@@ -239,9 +253,7 @@ export function CreateUser() {
       toast.success('User added to the team')
       navigate('/settings/users')
     } catch {
-      toast.error(
-        'Team assignment still failed. The account was not created again; you can retry safely.'
-      )
+      // The app-wide mutation handler already toasts this failure.
     }
   }
 
@@ -251,24 +263,17 @@ export function CreateUser() {
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-wrap items-start justify-between gap-4">
-        <div className="space-y-1">
-          <Button type="button" variant="ghost" size="sm" asChild>
-            <Link to="/settings/users">
-              <ArrowLeft className="size-4 shrink-0" />
-              Back to users
-            </Link>
-          </Button>
-          <div>
-            <h1 className="text-balance text-2xl font-semibold tracking-tight">
-              Create user
-            </h1>
-            <p className="max-w-[65ch] text-pretty text-base text-muted-foreground sm:text-sm">
-              Create login credentials, choose the platform role, and review
-              every permission before granting access.
-            </p>
-          </div>
-        </div>
+      <div className="space-y-1">
+        <Button type="button" variant="ghost" size="sm" asChild>
+          <Link to="/settings/users">
+            <ArrowLeft className="size-4 shrink-0" />
+            Back to users
+          </Link>
+        </Button>
+        <PageHeader
+          title="Create user"
+          description="Create login credentials, choose the platform role, and review every permission before granting access."
+        />
       </div>
 
       <Form {...form}>
@@ -515,16 +520,13 @@ export function CreateUser() {
                             ))}
                           </SelectContent>
                         </Select>
-                        <FormDescription>
-                          Optional. Adds the user to the selected team after
-                          creating their account.
+                        <FormDescription
+                          className={
+                            teamsQuery.isError ? 'text-destructive' : undefined
+                          }
+                        >
+                          <TeamFieldHint status={teamsStatus} />
                         </FormDescription>
-                        {teamsQuery.isError && (
-                          <p className="text-sm text-destructive">
-                            Teams could not be loaded. You can still create the
-                            user and add them from the Teams page later.
-                          </p>
-                        )}
                         <FormMessage />
                       </FormItem>
                     )}

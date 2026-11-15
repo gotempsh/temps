@@ -30,6 +30,7 @@ import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import { CopyButton } from '@/components/ui/copy-button'
 import { HighlightedCode } from '@/components/ui/code-block'
+import { ScrollRegion } from '@/components/ui/scroll-region'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
@@ -549,9 +550,14 @@ function OneTimeKeySecret({ value }: { value: string }) {
         </div>
       </div>
       <div className="flex min-w-0 items-center gap-2 rounded-lg border bg-background px-3 py-2.5">
-        <code className="min-w-0 flex-1 select-all overflow-x-auto whitespace-nowrap font-mono text-xs">
-          {value}
-        </code>
+        <ScrollRegion
+          className="min-w-0 flex-1"
+          regionLabel="AI harness API key, scrollable"
+        >
+          <code className="block w-max select-all whitespace-nowrap font-mono text-xs">
+            {value}
+          </code>
+        </ScrollRegion>
         <CopyButton
           value={value}
           minimal

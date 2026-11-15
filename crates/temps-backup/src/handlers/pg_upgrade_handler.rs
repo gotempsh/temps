@@ -576,6 +576,7 @@ pub struct PgUpgradeApiDoc;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::execution::BackupExecutorBuilder;
     use async_trait::async_trait;
     use axum::http::HeaderMap;
     use bollard::Docker;
@@ -584,7 +585,6 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
     use temps_auth::Role;
-    use temps_backup_core::BackupExecutorBuilder;
     use temps_core::notifications::{
         EmailMessage, NotificationData, NotificationError, NotificationService,
     };
@@ -592,8 +592,8 @@ mod tests {
         AuditLogger, AuditOperation, ProjectAccessChecker, SensitiveActionAuthorizationError,
         SensitiveActionAuthorizer, SensitiveActionDecision, SensitiveActionPrincipal,
     };
+    use temps_deployment_logs::LogService;
     use temps_entities::{postgres_major_upgrades, project_services, users};
-    use temps_logs::LogService;
     use temps_providers::externalsvc::postgres_upgrade::{
         PostgresConnection, PostgresContainerLifecycle, PreUpgradeBackupProvider,
     };
@@ -641,7 +641,10 @@ mod tests {
 
     #[async_trait]
     impl AuditLogger for RecordingAuditLogger {
-        async fn create_audit_log(&self, operation: &dyn AuditOperation) -> anyhow::Result<()> {
+        async fn create_audit_log(
+            &self,
+            operation: &dyn AuditOperation,
+        ) -> temps_core::AuditResult<()> {
             self.operations
                 .lock()
                 .expect("recording audit mutex should not be poisoned")
@@ -656,9 +659,15 @@ mod tests {
 
     #[async_trait]
     impl AuditLogger for FailingAuditLogger {
-        async fn create_audit_log(&self, _operation: &dyn AuditOperation) -> anyhow::Result<()> {
+        async fn create_audit_log(
+            &self,
+            operation: &dyn AuditOperation,
+        ) -> temps_core::AuditResult<()> {
             self.called.store(true, Ordering::SeqCst);
-            Err(anyhow::anyhow!("audit store unavailable"))
+            Err(temps_core::AuditError::write(
+                operation.operation_type(),
+                "audit store unavailable",
+            ))
         }
     }
 
@@ -886,7 +895,7 @@ mod tests {
             docker.clone(),
             Arc::new(temps_providers::DnsRegistry::new(db.clone())),
         ));
-        let alarm_service = Arc::new(temps_monitoring::alarm_service::AlarmService::new(
+        let alarm_service = Arc::new(temps_alarms::alarm_service::AlarmService::new(
             db.clone(),
             Arc::new(NoopNotifications),
             Arc::new(NoopJobQueue),
@@ -900,6 +909,7 @@ mod tests {
                 db.clone(),
             )),
             encryption.clone(),
+            Arc::new(NoopJobQueue),
         ));
         let restore_service = Arc::new(RestoreService::new(
             db.clone(),

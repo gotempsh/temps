@@ -2,14 +2,15 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use crate::digest::DigestService;
+use crate::error::NotificationError;
 use crate::routing::{
     CreateNotificationRoute, NotificationRoute, NotificationRouteCoverage, NotificationRouteError,
     NotificationRoutePage, NotificationRouteTestResult, NotificationRoutingService,
     RouteTestDelivery, RouteTestDeliveryStatus, UpdateNotificationRoute,
 };
 use crate::services::{
-    NotificationPreferences, NotificationPreferencesService, NotificationProviderConfigMergeError,
-    NotificationProviderCreateError, NotificationProviderRevealError, NotificationService, TlsMode,
+    NotificationPreferences, NotificationPreferencesService, NotificationProviderCreateError,
+    NotificationProviderRevealError, NotificationService, TlsMode,
 };
 use axum::{
     extract::{Extension, Path, Query, State},
@@ -20,10 +21,11 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use temps_auth::permission_guard;
-use temps_auth::RequireAuth;
+use temps_authz::permission_guard;
+use temps_authz::RequireAuth;
 use temps_core::error_builder::ErrorBuilder;
 use temps_core::problemdetails::Problem;
+use temps_core::secret_string::SecretString;
 use temps_core::{AuditContext, AuditLogger, AuditOperation, RequestMetadata};
 use tracing::{error, info};
 use utoipa::OpenApi;
@@ -97,9 +99,8 @@ impl AuditOperation for NotificationProviderAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -116,9 +117,8 @@ impl AuditOperation for NotificationPreferencesAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -135,9 +135,8 @@ impl AuditOperation for NotificationRouteAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self)
-            .map_err(|error| anyhow::anyhow!("Failed to serialize audit operation {error}"))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -154,13 +153,12 @@ impl AuditOperation for NotificationProviderConfigRevealedAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
-fn make_audit_context(auth: &temps_auth::AuthContext, metadata: &RequestMetadata) -> AuditContext {
+fn make_audit_context(auth: &temps_authz::AuthContext, metadata: &RequestMetadata) -> AuditContext {
     AuditContext {
         user_id: auth.user_id(),
         ip_address: Some(metadata.ip_address.clone()),
@@ -282,18 +280,33 @@ pub struct TestProviderResponse {
     pub message: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+/// Request-side Slack config. Deliberately not `Serialize`: the webhook URL is
+/// a `SecretString`, which would serialize as `"***"`. Use
+/// [`SlackConfig::into_stored_value`] to build the value that gets encrypted.
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct SlackConfig {
-    pub webhook_url: String,
+    pub webhook_url: SecretString,
     pub channel: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+impl SlackConfig {
+    /// The JSON persisted (encrypted) for this provider, with the secret exposed.
+    pub fn into_stored_value(self) -> serde_json::Value {
+        serde_json::json!({
+            "webhook_url": self.webhook_url.into_exposed(),
+            "channel": self.channel,
+        })
+    }
+}
+
+/// Request-side SMTP config. Not `Serialize` for the same reason as
+/// [`SlackConfig`]; use [`EmailConfig::into_stored_value`].
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct EmailConfig {
     pub smtp_host: String,
     pub smtp_port: u16,
     pub username: String,
-    pub password: String,
+    pub password: SecretString,
     pub from_name: Option<String>,
     pub from_address: String,
     pub to_addresses: Vec<String>,
@@ -303,6 +316,24 @@ pub struct EmailConfig {
     pub starttls_required: bool, // Only used when tls_mode is Starttls
     #[serde(default = "default_accept_invalid_certs")]
     pub accept_invalid_certs: bool, // Accept self-signed certificates (use with caution)
+}
+
+impl EmailConfig {
+    /// The JSON persisted (encrypted) for this provider, with the secret exposed.
+    pub fn into_stored_value(self) -> serde_json::Value {
+        serde_json::json!({
+            "smtp_host": self.smtp_host,
+            "smtp_port": self.smtp_port,
+            "username": self.username,
+            "password": self.password.into_exposed(),
+            "from_name": self.from_name,
+            "from_address": self.from_address,
+            "to_addresses": self.to_addresses,
+            "tls_mode": self.tls_mode,
+            "starttls_required": self.starttls_required,
+            "accept_invalid_certs": self.accept_invalid_certs,
+        })
+    }
 }
 
 fn default_tls_mode() -> TlsMode {
@@ -317,28 +348,28 @@ fn default_accept_invalid_certs() -> bool {
     false // Default to secure behavior
 }
 
-#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct CreateSlackProviderRequest {
     pub name: String,
     pub config: SlackConfig,
     pub enabled: Option<bool>,
 }
 
-#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct CreateNotificationEmailProviderRequest {
     pub name: String,
     pub config: EmailConfig,
     pub enabled: Option<bool>,
 }
 
-#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct UpdateSlackProviderRequest {
     pub name: Option<String>,
     pub config: SlackConfig,
     pub enabled: Option<bool>,
 }
 
-#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct UpdateNotificationEmailProviderRequest {
     pub name: Option<String>,
     pub config: EmailConfig,
@@ -392,14 +423,16 @@ pub struct UpdateWebhookProviderRequest {
 /// Notifications are delivered through Cloudflare's transactional Email Sending
 /// API. Only the account, token, sender and recipients are configured here —
 /// subject and body are derived from each notification.
-#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+/// Request-side config. Not `Serialize`: `api_token` is a `SecretString`; use
+/// [`CloudflareConfig::into_stored_value`].
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct CloudflareConfig {
     /// Cloudflare account id that owns the Email Sending configuration.
     #[schema(example = "023e105f4ecef8ad9ca31a8372d0c353")]
     pub account_id: String,
     /// Cloudflare API token with the Email Sending permission. Encrypted at
     /// rest and masked in normal API responses.
-    pub api_token: String,
+    pub api_token: SecretString,
     /// Verified sender address (must belong to a domain enabled for Cloudflare
     /// Email Sending).
     #[schema(example = "welcome@infracf.example.com")]
@@ -411,14 +444,27 @@ pub struct CloudflareConfig {
     pub to_addresses: Vec<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+impl CloudflareConfig {
+    /// The JSON persisted (encrypted) for this provider, with the secret exposed.
+    pub fn into_stored_value(self) -> serde_json::Value {
+        serde_json::json!({
+            "account_id": self.account_id,
+            "api_token": self.api_token.into_exposed(),
+            "from_address": self.from_address,
+            "from_name": self.from_name,
+            "to_addresses": self.to_addresses,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct CreateCloudflareProviderRequest {
     pub name: String,
     pub config: CloudflareConfig,
     pub enabled: Option<bool>,
 }
 
-#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct UpdateCloudflareProviderRequest {
     pub name: Option<String>,
     pub config: CloudflareConfig,
@@ -627,9 +673,7 @@ async fn reveal_notification_provider_config(
     ))
 }
 
-fn require_notification_reveal_audit(
-    result: std::result::Result<(), anyhow::Error>,
-) -> Result<(), Problem> {
+fn require_notification_reveal_audit(result: temps_core::AuditResult<()>) -> Result<(), Problem> {
     result.map_err(|_| {
         ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
             .title("Configuration value could not be revealed")
@@ -719,8 +763,8 @@ impl From<UpdateProviderRequest> for crate::services::UpdateProviderRequest {
     }
 }
 
-fn notification_provider_write_problem(error: &anyhow::Error, title: &'static str) -> Problem {
-    if let Some(validation_error) = error.downcast_ref::<NotificationProviderConfigMergeError>() {
+fn notification_provider_write_problem(error: &NotificationError, title: &'static str) -> Problem {
+    if let NotificationError::ConfigMerge(validation_error) = error {
         return ErrorBuilder::new(StatusCode::BAD_REQUEST)
             .title("Invalid masked provider configuration")
             .detail(validation_error.to_string())
@@ -964,7 +1008,7 @@ async fn create_slack_provider(
     permission_guard!(auth, NotificationProvidersCreate);
     info!("Creating Slack notification provider {}", request.name);
     let enabled = request.enabled.unwrap_or(true);
-    let config = serde_json::to_value(request.config).unwrap_or_default();
+    let config = request.config.into_stored_value();
     match app_state
         .notification_service
         .add_provider(request.name, "slack".to_string(), config, enabled)
@@ -1033,7 +1077,7 @@ async fn create_notification_email_provider(
     permission_guard!(auth, NotificationProvidersCreate);
     info!("Creating Email notification provider {}", request.name);
     let enabled = request.enabled.unwrap_or(true);
-    let config = serde_json::to_value(&request.config).unwrap_or_default();
+    let config = request.config.into_stored_value();
     match app_state
         .notification_service
         .add_provider(request.name, "email".to_string(), config, enabled)
@@ -1106,7 +1150,7 @@ async fn update_slack_provider(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, NotificationProvidersWrite);
     info!("Updating Slack notification provider {}", id);
-    let config = serde_json::to_value(request.config).unwrap_or_default();
+    let config = request.config.into_stored_value();
     let update_request = UpdateProviderRequest {
         name: request.name,
         config: Some(config),
@@ -1191,7 +1235,7 @@ async fn update_notification_email_provider(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, NotificationProvidersWrite);
     info!("Updating Email notification provider {}", id);
-    let config = serde_json::to_value(request.config).unwrap_or_default();
+    let config = request.config.into_stored_value();
     let update_request = UpdateProviderRequest {
         name: request.name,
         config: Some(config),
@@ -1473,7 +1517,7 @@ async fn create_cloudflare_provider(
     permission_guard!(auth, NotificationProvidersCreate);
     info!("Creating Cloudflare notification provider {}", request.name);
     let enabled = request.enabled.unwrap_or(true);
-    let config = serde_json::to_value(request.config).unwrap_or_default();
+    let config = request.config.into_stored_value();
     match app_state
         .notification_service
         .add_provider(request.name, "cloudflare".to_string(), config, enabled)
@@ -1546,7 +1590,7 @@ async fn update_cloudflare_provider(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, NotificationProvidersWrite);
     info!("Updating Cloudflare notification provider {}", id);
-    let config = serde_json::to_value(request.config).unwrap_or_default();
+    let config = request.config.into_stored_value();
     let update_request = UpdateProviderRequest {
         name: request.name,
         config: Some(config),
@@ -1889,7 +1933,7 @@ async fn trigger_weekly_digest(
     // the trigger to instance administrators; deployment tokens carry no user
     // identity and are never operators.
     if auth.is_deployment_token()
-        || !(auth.is_admin() || auth.has_role(&temps_auth::Role::PlatformAdmin))
+        || !(auth.is_admin() || auth.has_role(&temps_authz::Role::PlatformAdmin))
     {
         return Err(ErrorBuilder::new(StatusCode::FORBIDDEN)
             .type_("https://temps.sh/probs/insufficient-permissions")
@@ -2409,8 +2453,8 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use sea_orm::MockDatabase;
     use std::sync::{Arc, Mutex};
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::notification_providers;
+    use temps_test_utils::TestDatabase;
     use testcontainers::{core::ContainerPort, runners::AsyncRunner, ContainerAsync, GenericImage};
 
     use tower::ServiceExt;
@@ -2418,9 +2462,105 @@ mod tests {
     #[test]
     fn credential_reveal_fails_closed_when_audit_write_fails() {
         assert!(require_notification_reveal_audit(Ok(())).is_ok());
+        let problem = require_notification_reveal_audit(Err(temps_core::AuditError::write(
+            "NOTIFICATION_PROVIDER_SECRET_REVEALED",
+            "database unavailable",
+        )))
+        .expect_err("reveal must fail when its audit cannot be written");
+        assert_eq!(
+            problem.body["title"],
+            "Configuration value could not be revealed"
+        );
+        assert_eq!(
+            problem.body["detail"],
+            "The audit record for this reveal could not be written"
+        );
+        assert_eq!(
+            problem.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    fn state_over(db: MockDatabase) -> Arc<NotificationState> {
+        let db = Arc::new(db.into_connection());
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
+            "notification-handler-test",
+        ));
+        let notification_service =
+            Arc::new(NotificationService::new(db.clone(), encryption_service));
+        Arc::new(NotificationState::new(
+            notification_service.clone(),
+            Arc::new(NotificationRoutingService::new(db.clone())),
+            Arc::new(NotificationPreferencesService::new(db.clone())),
+            Arc::new(DigestService::new(db, notification_service)),
+            Arc::new(RecordingAuditLogger::default()),
+        ))
+    }
+
+    async fn test_endpoint_response(db: MockDatabase) -> (StatusCode, serde_json::Value) {
+        let response = test_notification_provider(
+            State(state_over(db)),
+            Path(9),
+            RequireAuth(test_auth_context()),
+            Extension(test_request_metadata()),
+        )
+        .await
+        .expect("the endpoint reports failures in its body")
+        .into_response();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("the body is buffered");
+        let body = serde_json::from_slice(&body).expect("the body is JSON");
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn testing_a_missing_provider_answers_404_with_its_id() {
+        let (status, body) = test_endpoint_response(
+            MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results(
+                    [Vec::<temps_entities::notification_providers::Model>::new()],
+                ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["success"], false);
+        assert_eq!(
+            body["message"],
+            "Test failed: Notification provider with ID 9 not found"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_database_failure_testing_a_provider_answers_500() {
+        let (status, body) = test_endpoint_response(
+            MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_errors([sea_orm::DbErr::Custom("connection lost".to_string())]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            body["message"],
+            "Test failed: Failed to load the configuration for notification provider 9: \
+             Custom Error: connection lost"
+        );
+    }
+
+    #[test]
+    fn other_provider_write_failures_stay_opaque_500s() {
+        let error = NotificationError::ConfigEncryption {
+            provider_id: 7,
+            reason: "synthetic internal detail".to_string(),
+        };
+
         let problem =
-            require_notification_reveal_audit(Err(anyhow::anyhow!("database unavailable")))
-                .expect_err("reveal must fail when its audit cannot be written");
+            notification_provider_write_problem(&error, "Failed to update notification provider");
+
+        assert_eq!(
+            problem.body["detail"],
+            "The notification provider could not be updated"
+        );
         assert_eq!(
             problem.into_response().status(),
             StatusCode::INTERNAL_SERVER_ERROR
@@ -2429,10 +2569,11 @@ mod tests {
 
     #[test]
     fn masked_provider_update_validation_maps_to_bad_request() {
-        let error =
-            anyhow::Error::new(NotificationProviderConfigMergeError::UnmatchedMaskedValue {
+        let error = NotificationError::ConfigMerge(
+            crate::services::NotificationProviderConfigMergeError::UnmatchedMaskedValue {
                 path: "headers.X-Authorization".to_string(),
-            });
+            },
+        );
 
         let problem =
             notification_provider_write_problem(&error, "Failed to update notification provider");
@@ -2450,7 +2591,7 @@ mod tests {
         async fn create_audit_log(
             &self,
             operation: &dyn temps_core::AuditOperation,
-        ) -> Result<(), anyhow::Error> {
+        ) -> temps_core::AuditResult<()> {
             self.operations
                 .lock()
                 .expect("recording audit mutex should not be poisoned")
@@ -2459,7 +2600,7 @@ mod tests {
         }
     }
 
-    fn test_auth_context() -> temps_auth::AuthContext {
+    fn test_auth_context() -> temps_authz::AuthContext {
         let now = chrono::Utc::now();
         let user = temps_entities::users::Model {
             id: 42,
@@ -2481,7 +2622,7 @@ mod tests {
             created_at: now,
             updated_at: now,
         };
-        temps_auth::AuthContext::new_session(user, temps_auth::Role::Admin)
+        temps_authz::AuthContext::new_session(user, temps_authz::Role::Admin)
     }
 
     fn test_request_metadata() -> RequestMetadata {
@@ -2569,12 +2710,270 @@ mod tests {
         );
     }
 
+    /// A notification state backed by a real database, with an admin caller.
+    async fn console_flow_state() -> Option<(TestDatabase, Arc<NotificationState>)> {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(test_db) => test_db,
+            Err(error) => {
+                let message = format!("{error:#}");
+                if temps_test_utils::is_container_runtime_unavailable(&message) {
+                    eprintln!("Skipping Docker-dependent test: {message}");
+                    return None;
+                }
+                panic!("Failed to set up notification handler test: {message}");
+            }
+        };
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
+            "notification-handler-console-flow-test",
+        ));
+        let db = test_db.connection_arc();
+        let notification_service =
+            Arc::new(NotificationService::new(db.clone(), encryption_service));
+        let state = Arc::new(NotificationState::new(
+            notification_service.clone(),
+            Arc::new(NotificationRoutingService::new(db.clone())),
+            Arc::new(NotificationPreferencesService::new(db.clone())),
+            Arc::new(DigestService::new(db, notification_service)),
+            Arc::new(RecordingAuditLogger::default()),
+        ));
+        Some((test_db, state))
+    }
+
+    /// The provider as the console reads it back: credentials masked.
+    async fn read_back_provider(state: &Arc<NotificationState>, id: i32) -> serde_json::Value {
+        let response = get_notification_provider(
+            State(state.clone()),
+            Path(id),
+            RequireAuth(test_auth_context()),
+        )
+        .await
+        .expect("provider should be readable")
+        .into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("provider body should be readable");
+        serde_json::from_slice::<serde_json::Value>(&body).expect("provider body should be JSON")
+    }
+
+    /// A stored credential, as an administrator would reveal it.
+    async fn revealed(state: &Arc<NotificationState>, id: i32, field: &str) -> String {
+        state
+            .notification_service
+            .reveal_provider_config_value(id, field)
+            .await
+            .expect("field should be revealable")
+            .1
+    }
+
+    /// Replays what the console's edit page does: read the provider back
+    /// masked, put the same values in the form, and submit them. An edit that
+    /// leaves the destination alone must keep working, and one that moves it
+    /// must be refused while a credential is still masked.
+    #[tokio::test]
+    async fn console_edit_of_an_email_provider_keeps_credentials_until_the_host_moves() {
+        let Some((test_db, state)) = console_flow_state().await else {
+            return;
+        };
+        let created: CreateNotificationEmailProviderRequest =
+            serde_json::from_value(serde_json::json!({
+                "name": "Ops email",
+                "config": {
+                    "smtp_host": "smtp.example.com",
+                    "smtp_port": 587,
+                    "username": "mailer",
+                    "password": "mail-secret",
+                    "from_name": "Temps",
+                    "from_address": "alerts@example.com",
+                    "to_addresses": ["ops@example.com"],
+                    "tls_mode": "Starttls",
+                    "starttls_required": true,
+                    "accept_invalid_certs": false
+                },
+                "enabled": true
+            }))
+            .expect("create request should parse");
+        create_notification_email_provider(
+            State(state.clone()),
+            RequireAuth(test_auth_context()),
+            Extension(test_request_metadata()),
+            Json(created),
+        )
+        .await
+        .map_err(|_| "create should succeed")
+        .expect("create should succeed");
+        let id = state
+            .notification_service
+            .list_providers_paginated(1, 10)
+            .await
+            .expect("providers should list")[0]
+            .id;
+
+        let masked = read_back_provider(&state, id).await["config"].clone();
+        assert_eq!(masked["password"], "***");
+        assert_eq!(masked["smtp_host"], "smtp.example.com");
+
+        let submit = |config: serde_json::Value| {
+            let request: UpdateNotificationEmailProviderRequest =
+                serde_json::from_value(serde_json::json!({
+                    "name": "Ops email",
+                    "config": config,
+                    "enabled": true
+                }))
+                .expect("edit request should parse");
+            let state = state.clone();
+            async move {
+                update_notification_email_provider(
+                    State(state),
+                    Path(id),
+                    RequireAuth(test_auth_context()),
+                    Extension(test_request_metadata()),
+                    Json(request),
+                )
+                .await
+                .map(|response| response.into_response().status())
+                .map_err(|problem| problem.into_response().status())
+            }
+        };
+
+        // The edit page with a recipient added and nothing else touched.
+        let mut recipients_added = masked.clone();
+        recipients_added["to_addresses"] =
+            serde_json::json!(["ops@example.com", "oncall@example.com"]);
+        assert_eq!(submit(recipients_added).await, Ok(StatusCode::OK));
+        assert_eq!(revealed(&state, id, "password").await, "mail-secret");
+        let config = read_back_provider(&state, id).await["config"].clone();
+        assert_eq!(config["to_addresses"][1], "oncall@example.com");
+
+        // The same form with a different mail server and the password untouched.
+        let mut host_moved = masked.clone();
+        host_moved["smtp_host"] = serde_json::json!("smtp.other.example");
+        assert_eq!(
+            submit(host_moved.clone()).await,
+            Err(StatusCode::BAD_REQUEST)
+        );
+        let config = read_back_provider(&state, id).await["config"].clone();
+        assert_eq!(config["smtp_host"], "smtp.example.com");
+        assert_eq!(revealed(&state, id, "password").await, "mail-secret");
+
+        // The password typed again alongside the new server is accepted.
+        host_moved["password"] = serde_json::json!("new-mail-secret");
+        assert_eq!(submit(host_moved).await, Ok(StatusCode::OK));
+        let config = read_back_provider(&state, id).await["config"].clone();
+        assert_eq!(config["smtp_host"], "smtp.other.example");
+        assert_eq!(revealed(&state, id, "password").await, "new-mail-secret");
+
+        test_db.cleanup_all_tables().await.ok();
+    }
+
+    #[tokio::test]
+    async fn console_edit_of_a_webhook_keeps_credentials_until_the_url_moves() {
+        let Some((test_db, state)) = console_flow_state().await else {
+            return;
+        };
+        let created: CreateWebhookProviderRequest = serde_json::from_value(serde_json::json!({
+            "name": "Incident hook",
+            "config": {
+                "url": "https://hooks.example.com/incident",
+                "method": "POST",
+                "headers": {"Authorization": "Bearer hook-secret"},
+                "timeout_secs": 30
+            },
+            "enabled": true
+        }))
+        .expect("create request should parse");
+        create_webhook_provider(
+            State(state.clone()),
+            RequireAuth(test_auth_context()),
+            Extension(test_request_metadata()),
+            Json(created),
+        )
+        .await
+        .map_err(|_| "create should succeed")
+        .expect("create should succeed");
+        let id = state
+            .notification_service
+            .list_providers_paginated(1, 10)
+            .await
+            .expect("providers should list")[0]
+            .id;
+
+        let masked = read_back_provider(&state, id).await["config"].clone();
+        assert_eq!(masked["url"], "***");
+        assert_eq!(masked["headers"]["Authorization"], "***");
+
+        let submit = |name: &'static str, config: serde_json::Value| {
+            let request: UpdateWebhookProviderRequest = serde_json::from_value(serde_json::json!({
+                "name": name,
+                "config": config,
+                "enabled": true
+            }))
+            .expect("edit request should parse");
+            let state = state.clone();
+            async move {
+                update_webhook_provider(
+                    State(state),
+                    Path(id),
+                    RequireAuth(test_auth_context()),
+                    Extension(test_request_metadata()),
+                    Json(request),
+                )
+                .await
+                .map(|response| response.into_response().status())
+                .map_err(|problem| problem.into_response().status())
+            }
+        };
+
+        // The edit page with only the name changed: url and header stay masked.
+        assert_eq!(
+            submit("Renamed hook", masked.clone()).await,
+            Ok(StatusCode::OK)
+        );
+        assert_eq!(
+            revealed(&state, id, "url").await,
+            "https://hooks.example.com/incident"
+        );
+        assert_eq!(
+            revealed(&state, id, "headers.Authorization").await,
+            "Bearer hook-secret"
+        );
+
+        // A new URL with the header still masked.
+        let mut url_moved = masked.clone();
+        url_moved["url"] = serde_json::json!("https://other.example.net/collect");
+        assert_eq!(
+            submit("Renamed hook", url_moved.clone()).await,
+            Err(StatusCode::BAD_REQUEST)
+        );
+        assert_eq!(
+            revealed(&state, id, "url").await,
+            "https://hooks.example.com/incident"
+        );
+        assert_eq!(
+            revealed(&state, id, "headers.Authorization").await,
+            "Bearer hook-secret"
+        );
+
+        // The header typed again alongside the new URL is accepted.
+        url_moved["headers"]["Authorization"] = serde_json::json!("Bearer new-hook-secret");
+        assert_eq!(submit("Renamed hook", url_moved).await, Ok(StatusCode::OK));
+        assert_eq!(
+            revealed(&state, id, "url").await,
+            "https://other.example.net/collect"
+        );
+        assert_eq!(
+            revealed(&state, id, "headers.Authorization").await,
+            "Bearer new-hook-secret"
+        );
+
+        test_db.cleanup_all_tables().await.ok();
+    }
+
     struct TestSetup {
         pub test_db: TestDatabase,
-        #[allow(dead_code)]
+        #[allow(dead_code)] // held so the container is stopped on drop
         pub mailpit_container: ContainerAsync<GenericImage>,
         pub mailpit_smtp_port: u16,
-        #[allow(dead_code)]
+        #[allow(dead_code)] // kept with the container it describes
         pub mailpit_web_port: u16,
         pub notification_state: Arc<NotificationState>,
     }
@@ -2630,7 +3029,7 @@ mod tests {
                 async fn create_audit_log(
                     &self,
                     _operation: &dyn temps_core::AuditOperation,
-                ) -> Result<(), anyhow::Error> {
+                ) -> temps_core::AuditResult<()> {
                     Ok(())
                 }
             }
@@ -2657,7 +3056,7 @@ mod tests {
                 smtp_host: "localhost".to_string(),
                 smtp_port: self.mailpit_smtp_port,
                 username: "".to_string(), // Mailpit doesn't require auth
-                password: "".to_string(),
+                password: "".to_string().into(),
                 from_name: Some("Test Sender".to_string()),
                 from_address: "test@example.com".to_string(),
                 to_addresses: vec!["recipient@example.com".to_string()],
@@ -2669,7 +3068,9 @@ mod tests {
 
         fn create_test_slack_config(&self) -> SlackConfig {
             SlackConfig {
-                webhook_url: "https://hooks.slack.com/services/TEST/TEST/TEST".to_string(),
+                webhook_url: "https://hooks.slack.com/services/TEST/TEST/TEST"
+                    .to_string()
+                    .into(),
                 channel: Some("#test".to_string()),
             }
         }
@@ -2686,7 +3087,7 @@ mod tests {
                 Ok(setup) => setup,
                 Err(error) => {
                     let message = format!("{error:#}");
-                    if temps_database::test_utils::is_container_runtime_unavailable(&message) {
+                    if temps_test_utils::is_container_runtime_unavailable(&message) {
                         eprintln!("Skipping Docker-dependent test: {message}");
                         return Ok(());
                     }
@@ -2737,7 +3138,14 @@ mod tests {
             .uri("/notification-providers/email")
             .header("authorization", "Bearer test-token")
             .header("content-type", "application/json")
-            .body(Body::from(serde_json::to_string(&request_body)?))?;
+            .body(Body::from(
+                serde_json::json!({
+                    "name": request_body.name,
+                    "config": request_body.config.into_stored_value(),
+                    "enabled": request_body.enabled,
+                })
+                .to_string(),
+            ))?;
 
         let response = app.oneshot(request).await?;
 
@@ -2817,7 +3225,14 @@ mod tests {
             .uri("/notification-providers/slack")
             .header("authorization", "Bearer test-token")
             .header("content-type", "application/json")
-            .body(Body::from(serde_json::to_string(&request_body)?))?;
+            .body(Body::from(
+                serde_json::json!({
+                    "name": request_body.name,
+                    "config": request_body.config.into_stored_value(),
+                    "enabled": request_body.enabled,
+                })
+                .to_string(),
+            ))?;
 
         let response = app.oneshot(request).await?;
 
@@ -2864,7 +3279,9 @@ mod tests {
         let request_body = UpdateSlackProviderRequest {
             name: Some("Updated Slack Provider".to_string()),
             config: SlackConfig {
-                webhook_url: "https://hooks.slack.com/services/UPDATED/WEBHOOK/URL".to_string(),
+                webhook_url: "https://hooks.slack.com/services/UPDATED/WEBHOOK/URL"
+                    .to_string()
+                    .into(),
                 channel: Some("#updated-channel".to_string()),
             },
             enabled: Some(false),
@@ -2877,7 +3294,14 @@ mod tests {
             .uri("/notification-providers/slack/1")
             .header("authorization", "Bearer test-token")
             .header("content-type", "application/json")
-            .body(Body::from(serde_json::to_string(&request_body)?))?;
+            .body(Body::from(
+                serde_json::json!({
+                    "name": request_body.name,
+                    "config": request_body.config.into_stored_value(),
+                    "enabled": request_body.enabled,
+                })
+                .to_string(),
+            ))?;
 
         let response = app.oneshot(request).await?;
 
@@ -2897,7 +3321,7 @@ mod tests {
                 smtp_host: "updated-smtp.example.com".to_string(),
                 smtp_port: 587,
                 username: "updated@example.com".to_string(),
-                password: "updated-password".to_string(),
+                password: "updated-password".to_string().into(),
                 from_name: Some("Updated Sender".to_string()),
                 from_address: "updated@example.com".to_string(),
                 to_addresses: vec!["updated-recipient@example.com".to_string()],
@@ -2915,7 +3339,14 @@ mod tests {
             .uri("/notification-providers/email/1")
             .header("authorization", "Bearer test-token")
             .header("content-type", "application/json")
-            .body(Body::from(serde_json::to_string(&request_body)?))?;
+            .body(Body::from(
+                serde_json::json!({
+                    "name": request_body.name,
+                    "config": request_body.config.into_stored_value(),
+                    "enabled": request_body.enabled,
+                })
+                .to_string(),
+            ))?;
 
         let response = app.oneshot(request).await?;
 
@@ -3087,7 +3518,7 @@ mod tests {
         let setup = test_setup_or_skip!();
         let service = &setup.notification_state.notification_service;
         let routing = &setup.notification_state.notification_routing_service;
-        let email_config = serde_json::to_value(setup.create_test_email_config())?;
+        let email_config = setup.create_test_email_config().into_stored_value();
         let enabled = service
             .add_provider(
                 "Mailpit route test".to_string(),
@@ -3147,7 +3578,7 @@ mod tests {
         let setup = test_setup_or_skip!();
 
         // Create an email provider directly using the service
-        let email_config = serde_json::to_value(setup.create_test_email_config())?;
+        let email_config = setup.create_test_email_config().into_stored_value();
 
         let provider = setup
             .notification_state
@@ -3178,5 +3609,50 @@ mod tests {
 
         setup.cleanup().await?;
         Ok(())
+    }
+
+    #[test]
+    fn stored_provider_configs_keep_the_real_secret() {
+        let slack: SlackConfig = serde_json::from_value(serde_json::json!({
+            "webhook_url": "https://hooks.slack.com/services/T/B/real-secret",
+            "channel": "#ops",
+        }))
+        .unwrap();
+        assert!(!format!("{slack:?}").contains("real-secret"));
+        let stored = slack.into_stored_value();
+        assert_eq!(
+            stored["webhook_url"],
+            "https://hooks.slack.com/services/T/B/real-secret"
+        );
+        assert_eq!(stored["channel"], "#ops");
+
+        let email: EmailConfig = serde_json::from_value(serde_json::json!({
+            "smtp_host": "smtp.example.com",
+            "smtp_port": 587,
+            "username": "mailer",
+            "password": "real-smtp-password",
+            "from_address": "from@example.com",
+            "to_addresses": ["to@example.com"],
+        }))
+        .unwrap();
+        assert!(!format!("{email:?}").contains("real-smtp-password"));
+        let stored = email.into_stored_value();
+        assert_eq!(stored["password"], "real-smtp-password");
+        assert_eq!(stored["tls_mode"], "Starttls");
+        assert_eq!(stored["starttls_required"], true);
+        assert_eq!(stored["accept_invalid_certs"], false);
+        assert_eq!(stored["to_addresses"][0], "to@example.com");
+
+        let cloudflare: CloudflareConfig = serde_json::from_value(serde_json::json!({
+            "account_id": "acct",
+            "api_token": "real-cf-token",
+            "from_address": "from@example.com",
+            "to_addresses": ["to@example.com"],
+        }))
+        .unwrap();
+        assert!(!format!("{cloudflare:?}").contains("real-cf-token"));
+        let stored = cloudflare.into_stored_value();
+        assert_eq!(stored["api_token"], "real-cf-token");
+        assert_eq!(stored["account_id"], "acct");
     }
 }

@@ -56,6 +56,7 @@ pub mod migrations;
 pub mod read_limits;
 
 use migrations::WriteTable;
+use temps_core::escape::escape_like;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -526,6 +527,7 @@ impl From<ChSpanRow> for SpanRecord {
         };
 
         SpanRecord {
+            ingest_identity: None,
             project_id: row.project_id,
             deployment_id: row.deployment_id,
             resource,
@@ -684,7 +686,7 @@ pub struct ChMetricRow {
 /// sentinel. The [`ChMetricRow`] struct must have exactly this many domain
 /// fields, in the same order. Bump together with the DDL when the schema
 /// changes. Used by the field-order guard test.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) const CH_METRIC_ROW_FIELD_COUNT: usize = 32;
 
 impl From<&MetricPoint> for ChMetricRow {
@@ -1029,10 +1031,7 @@ fn build_ch_span_stats_filters(query: &SpanStatsQuery) -> (String, Vec<ChBind>) 
     }
     if let Some(ref pattern) = query.name_pattern {
         where_parts.push("spans.name ILIKE ?".to_owned());
-        binds.push(ChBind::Str(format!(
-            "%{}%",
-            escape_like_pattern(pattern.as_str())
-        )));
+        binds.push(ChBind::Str(format!("%{}%", escape_like(pattern.as_str()))));
     }
     if let Some(kind) = query.kind {
         where_parts.push("spans.kind = ?".to_owned());
@@ -1120,34 +1119,6 @@ struct ChGenAiSummaryRow {
 struct ChSpanEventsRow {
     span_id: String,
     events: String, // JSON string
-}
-
-// ── LIKE pattern helpers ────────────────────────────────────────────────────
-
-/// Escape LIKE/ILIKE metacharacters in a user-supplied substring pattern.
-///
-/// ClickHouse LIKE uses backslash as the default escape character (no explicit
-/// `ESCAPE` clause required). We must escape:
-///
-/// - `\` → `\\`   (backslash itself, before the other replacements)
-/// - `%` → `\%`   (wildcard: any sequence of chars)
-/// - `_` → `\_`   (wildcard: exactly one char)
-///
-/// The caller then wraps the result with `%{escaped}%` to perform a
-/// case-insensitive substring search via ILIKE.
-///
-/// ## Verification
-///
-/// Confirmed against live ClickHouse 26.2: `'hello%world' LIKE '%\%%'`
-/// returns 1, `'helloXworld' LIKE '%\%%'` returns 0. The backslash is the
-/// default escape character; no `ESCAPE` clause is needed.
-pub(crate) fn escape_like_pattern(pattern: &str) -> String {
-    // Order matters: escape backslash first so the subsequent replacements
-    // don't double-escape the backslashes we just introduced.
-    pattern
-        .replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
 }
 
 // ── Metric bucket-interval translation ──────────────────────────────────────
@@ -1525,6 +1496,69 @@ impl ClickHouseOtelStorage {
     }
 }
 
+impl ClickHouseOtelStorage {
+    /// Insert `(trace_id, project_id)` rows for every `(project_id,
+    /// trace_ids)` pair in one ClickHouse insert. Shared by
+    /// `record_trace_refs` and `record_trace_refs_batch`.
+    async fn insert_trace_refs(
+        &self,
+        refs: &[(i32, &[String])],
+        operation: &str,
+    ) -> StorageResult<u64> {
+        let total: usize = refs.iter().map(|(_, ids)| ids.len()).sum();
+        if total == 0 {
+            return Ok(0);
+        }
+        self.ensure_migrated(WriteTable::TraceRefs, operation)?;
+
+        let first_seen_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+
+        let mut inserter = self
+            .ch
+            .insert::<ChTraceRefRow>("cross_project_trace_refs")
+            .await
+            .map_err(|e| OtelError::Storage {
+                kind: ch_err_kind(&e),
+                message: format!(
+                    "ClickHouse cross_project_trace_refs inserter setup failed ({operation}, {total} refs): {e}"
+                ),
+            })?;
+        for (project_id, trace_ids) in refs {
+            let retention_days = self
+                .resolver
+                .resolve(*project_id, temps_core::RetentionTable::Spans);
+            for trace_id in trace_ids.iter() {
+                inserter
+                    .write(&ChTraceRefRow {
+                        trace_id: trace_id.clone(),
+                        project_id: *project_id,
+                        first_seen: first_seen_ms,
+                        retention_days,
+                        _version: trace_ref_version(first_seen_ms),
+                    })
+                    .await
+                    .map_err(|e| OtelError::Storage {
+                        kind: ch_err_kind(&e),
+                        message: format!(
+                            "ClickHouse cross_project_trace_refs write failed ({operation}, project {project_id}): {e}"
+                        ),
+                    })?;
+            }
+        }
+        inserter.end().await.map_err(|e| OtelError::Storage {
+            kind: ch_err_kind(&e),
+            message: format!(
+                "ClickHouse cross_project_trace_refs insert failed ({operation}, {total} refs): {e}"
+            ),
+        })?;
+
+        Ok(total as u64)
+    }
+}
+
 #[async_trait]
 impl OtelStorage for ClickHouseOtelStorage {
     async fn global_trace_stream(
@@ -1704,7 +1738,7 @@ impl OtelStorage for ClickHouseOtelStorage {
         }
         if let Some(ref pattern) = query.name_pattern {
             where_sql.push_str(" AND name ILIKE ?");
-            binds.push(Bv::Str(format!("%{}%", escape_like_pattern(pattern))));
+            binds.push(Bv::Str(format!("%{}%", escape_like(pattern))));
         }
         if query.root_only {
             // Root spans use the '' sentinel for parent_span_id in the CH
@@ -1882,6 +1916,7 @@ impl OtelStorage for ClickHouseOtelStorage {
                     attributes: std::collections::BTreeMap::new(),
                 };
                 SpanRecord {
+                    ingest_identity: None,
                     project_id: r.project_id,
                     deployment_id: r.deployment_id,
                     resource,
@@ -2041,7 +2076,7 @@ impl OtelStorage for ClickHouseOtelStorage {
         }
         if let Some(ref pattern) = query.name_pattern {
             where_parts.push("name ILIKE ?".to_owned());
-            binds.push(Bv::Str(format!("%{}%", escape_like_pattern(pattern))));
+            binds.push(Bv::Str(format!("%{}%", escape_like(pattern))));
         }
 
         let where_sql = where_parts.join(" AND ");
@@ -2282,7 +2317,7 @@ impl OtelStorage for ClickHouseOtelStorage {
         }
         if let Some(ref pattern) = query.name_pattern {
             where_parts.push("name ILIKE ?".to_owned());
-            binds.push(Bv::Str(format!("%{}%", escape_like_pattern(pattern))));
+            binds.push(Bv::Str(format!("%{}%", escape_like(pattern))));
         }
 
         let where_sql = where_parts.join(" AND ");
@@ -2349,7 +2384,7 @@ impl OtelStorage for ClickHouseOtelStorage {
     async fn has_traces(&self, project_id: i32) -> StorageResult<bool> {
         #[derive(::clickhouse::Row, Deserialize, Debug)]
         struct ChExistsRow {
-            #[allow(dead_code)]
+            #[allow(dead_code)] // maps the selected column; only the row's presence is used
             one: u8,
         }
 
@@ -2437,6 +2472,7 @@ impl OtelStorage for ClickHouseOtelStorage {
                     attributes: std::collections::BTreeMap::new(),
                 };
                 SpanRecord {
+                    ingest_identity: None,
                     project_id: r.project_id,
                     deployment_id: r.deployment_id,
                     resource,
@@ -3522,48 +3558,20 @@ impl OtelStorage for ClickHouseOtelStorage {
     /// `first_seen` — the CH equivalent of the Postgres table's
     /// `ON CONFLICT DO NOTHING`.
     async fn record_trace_refs(&self, trace_ids: &[String], project_id: i32) -> StorageResult<u64> {
-        if trace_ids.is_empty() {
-            return Ok(0);
-        }
-        self.ensure_migrated(WriteTable::TraceRefs, "record_trace_refs")?;
-
-        let first_seen_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64;
-        let retention_days = self
-            .resolver
-            .resolve(project_id, temps_core::RetentionTable::Spans);
-
-        let mut inserter = self
-            .ch
-            .insert::<ChTraceRefRow>("cross_project_trace_refs")
+        self.insert_trace_refs(&[(project_id, trace_ids)], "record_trace_refs")
             .await
-            .map_err(|e| OtelError::Storage {
-                kind: ch_err_kind(&e),
-                message: format!("ClickHouse cross_project_trace_refs inserter setup failed: {e}"),
-            })?;
-        for trace_id in trace_ids {
-            inserter
-                .write(&ChTraceRefRow {
-                    trace_id: trace_id.clone(),
-                    project_id,
-                    first_seen: first_seen_ms,
-                    retention_days,
-                    _version: trace_ref_version(first_seen_ms),
-                })
-                .await
-                .map_err(|e| OtelError::Storage {
-                    kind: ch_err_kind(&e),
-                    message: format!("ClickHouse cross_project_trace_refs write failed: {e}"),
-                })?;
-        }
-        inserter.end().await.map_err(|e| OtelError::Storage {
-            kind: ch_err_kind(&e),
-            message: format!("ClickHouse cross_project_trace_refs insert failed: {e}"),
-        })?;
+    }
 
-        Ok(trace_ids.len() as u64)
+    /// One insert for every project's refs: the hint writer coalesces a few
+    /// seconds of OTLP batches (typically 1-3 trace ids each) into a single
+    /// call, so this table no longer takes an insert per ingested batch.
+    async fn record_trace_refs_batch(&self, refs: &[(i32, Vec<String>)]) -> StorageResult<u64> {
+        let refs: Vec<(i32, &[String])> = refs
+            .iter()
+            .map(|(project_id, ids)| (*project_id, ids.as_slice()))
+            .collect();
+        self.insert_trace_refs(&refs, "record_trace_refs_batch")
+            .await
     }
 
     /// Union of the native ClickHouse rows and any legacy rows still in the
@@ -4060,6 +4068,7 @@ mod tests {
 
     fn make_span() -> SpanRecord {
         SpanRecord {
+            ingest_identity: None,
             project_id: 42,
             deployment_id: Some(7),
             resource: ResourceInfo {
@@ -4217,26 +4226,26 @@ mod tests {
         assert_eq!(str_to_span_status("BOGUS"), SpanStatusCode::Unset);
     }
 
-    // ── escape_like_pattern tests ─────────────────────────────────────────
+    // ── escape_like tests ─────────────────────────────────────────
 
     #[test]
     fn escape_plain_pattern_unchanged() {
-        assert_eq!(escape_like_pattern("hello"), "hello");
-        assert_eq!(escape_like_pattern("GET /api/v1"), "GET /api/v1");
+        assert_eq!(escape_like("hello"), "hello");
+        assert_eq!(escape_like("GET /api/v1"), "GET /api/v1");
     }
 
     #[test]
     fn escape_percent_metachar() {
         // A literal '%' in the user pattern must become '\%' so it does not
         // act as a wildcard in the LIKE expression.
-        assert_eq!(escape_like_pattern("%"), "\\%");
-        assert_eq!(escape_like_pattern("50%"), "50\\%");
+        assert_eq!(escape_like("%"), "\\%");
+        assert_eq!(escape_like("50%"), "50\\%");
     }
 
     #[test]
     fn escape_underscore_metachar() {
-        assert_eq!(escape_like_pattern("_id"), "\\_id");
-        assert_eq!(escape_like_pattern("user_name"), "user\\_name");
+        assert_eq!(escape_like("_id"), "\\_id");
+        assert_eq!(escape_like("user_name"), "user\\_name");
     }
 
     #[test]
@@ -4244,18 +4253,18 @@ mod tests {
         // A literal backslash must become '\\' and must be processed before
         // the other replacements so that introduced backslashes are not
         // double-escaped.
-        assert_eq!(escape_like_pattern("\\"), "\\\\");
+        assert_eq!(escape_like("\\"), "\\\\");
         // A pattern with both a backslash and a %:
         //   input:  `\%`  (backslash then percent)
         //   want:   `\\\%` (escaped backslash, then escaped percent)
-        assert_eq!(escape_like_pattern("\\%"), "\\\\\\%");
+        assert_eq!(escape_like("\\%"), "\\\\\\%");
     }
 
     #[test]
     fn wrapped_escaped_pattern_is_correct() {
         // Full round-trip: user types "50%" → ILIKE pattern "%50\%%"
         let pattern = "50%";
-        let wrapped = format!("%{}%", escape_like_pattern(pattern));
+        let wrapped = format!("%{}%", escape_like(pattern));
         assert_eq!(wrapped, "%50\\%%");
     }
 

@@ -194,6 +194,16 @@ for (const width of [1440, 390]) {
             created_at: 1,
             updated_at: 1,
           },
+          {
+            id: 3,
+            key: 'EXAMPLE_SERVICE_BACKUP_STORAGE_ACCOUNT_IDENTIFIER',
+            value: '***',
+            is_secret: false,
+            environments: [environment],
+            include_in_preview: true,
+            created_at: 1,
+            updated_at: 1,
+          },
         ]
       else if (path === '/projects/1/env-vars/resolved')
         body = [
@@ -255,6 +265,33 @@ for (const width of [1440, 390]) {
     await expect(
       table.getByRole('columnheader', { name: 'Checks', exact: true })
     ).toBeVisible()
+    // The table fits the space it has rather than scrolling sideways: columns
+    // that do not fit stack under the key, with nothing lost.
+    const tableFits = await table.evaluate((element) => {
+      const scroller = element.parentElement
+      return scroller ? scroller.scrollWidth <= scroller.clientWidth : false
+    })
+    expect(tableFits).toBe(true)
+    const longKey = table.getByRole('link', {
+      name: 'View EXAMPLE_SERVICE_BACKUP_STORAGE_ACCOUNT_IDENTIFIER details',
+    })
+    await expect(longKey.locator('> span')).toHaveCSS('word-break', 'normal')
+    const longRow = table.getByRole('row').filter({
+      hasText: 'EXAMPLE_SERVICE_BACKUP_STORAGE_ACCOUNT_IDENTIFIER',
+    })
+    await expect(longRow).toContainText('production')
+    await expect(longRow).toContainText('Preview')
+    await expect(
+      longRow.getByRole('button', {
+        name: /Reveal EXAMPLE_SERVICE_BACKUP_STORAGE_ACCOUNT_IDENTIFIER/,
+      })
+    ).toBeVisible()
+    await expect(
+      table.getByRole('columnheader', { name: 'Environments', exact: true })
+    ).toHaveCount(width < 640 ? 0 : 1)
+    await expect(
+      table.getByRole('columnheader', { name: /^Value/ })
+    ).toHaveCount(width < 640 ? 0 : 1)
     const secret = table
       .getByRole('row')
       .filter({ hasText: 'PROVIDER_API_KEY' })
@@ -288,7 +325,7 @@ for (const width of [1440, 390]) {
       exact: true,
     })
     // Integration and discovered rows remain read-only.
-    await expect(table.getByRole('checkbox')).toHaveCount(3)
+    await expect(table.getByRole('checkbox')).toHaveCount(4)
     await secretSelection.click()
     await expect(secretSelection).toBeChecked()
     await expect(urlSelection).not.toBeChecked()
@@ -378,7 +415,7 @@ for (const width of [1440, 390]) {
     })
     await expect(
       breadcrumbs.getByRole('link', {
-        name: 'Environment Variables',
+        name: 'Environment variables',
         exact: true,
       })
     ).toHaveAttribute('href', '/projects/example-app/environment-variables')
@@ -499,7 +536,11 @@ for (const width of [1440, 390]) {
       fullPage: true,
     })
     await dialog.getByRole('button', { name: 'Delete', exact: true }).click()
-    await dialog.getByRole('button', { name: 'Confirm delete' }).click()
+    // The confirmation is an alert dialog portalled outside the region.
+    await page
+      .getByRole('alertdialog')
+      .getByRole('button', { name: 'Delete', exact: true })
+      .click()
     await expect(dialog.getByRole('button', { name: 'Check now' })).toHaveCount(
       0
     )
@@ -536,11 +577,11 @@ for (const width of [1440, 390]) {
       page.getByRole('heading', { name: 'Variable not found' })
     ).toBeVisible()
     await page
-      .getByRole('link', { name: 'Back to Environment Variables', exact: true })
+      .getByRole('link', { name: 'Back to environment variables', exact: true })
       .click()
     await expect(table).toBeVisible()
     await expect(breadcrumbs.locator('[aria-current="page"]')).toHaveText(
-      'Environment Variables'
+      'Environment variables'
     )
     await page.goto('/projects/example-app/environment-variables/not-a-number')
     await expect(

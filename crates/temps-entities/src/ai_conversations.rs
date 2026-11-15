@@ -71,6 +71,9 @@ pub struct Model {
     pub last_turn_id: Option<String>,
     /// When the active turn was claimed by the server.
     pub turn_started_at: Option<DBDateTime>,
+    /// `off`, `ask` or `always` for next-step suggestions after each answer;
+    /// `None` follows the user's default.
+    pub next_step_suggestions: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

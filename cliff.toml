@@ -13,6 +13,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).\n
 """
 # template for the changelog body
+# A breaking commit's `BREAKING CHANGE:` footer is printed after the marker so
+# the entry says how to migrate; a `!`-only commit has no footer, and git-cliff
+# then reports the subject as the description, so only the marker is shown.
+# The footer is joined onto one line so a wrapped footer stays in its list item.
+# An entry that would print exactly the line already printed in its section is
+# skipped: a rebased branch merged together with its pre-rebase copy carries
+# each commit twice. The key covers everything the line shows -- scope, text,
+# the breaking marker and its note -- so a copy that only became breaking during
+# the rebase is still listed with its marker. scripts/test_changelog_template.py
+# renders these cases.
 body = """
 {% if version %}\
     ## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
@@ -21,9 +31,20 @@ body = """
 {% endif %}\
 {% for group, commits in commits | group_by(attribute="group") %}
     ### {{ group | upper_first }}
-    {% for commit in commits %}
+    {% set_global seen = [] %}\
+    {% for commit in commits %}\
+        {% set scope = commit.scope | default(value="") %}\
+        {% set breaking = "" %}\
+        {% if commit.breaking %}\
+        {% set note = commit.breaking_description | default(value="") %}\
+        {% set breaking = "!" ~ note %}\
+        {% endif %}\
+        {% set entry = scope ~ "|" ~ commit.message ~ "|" ~ breaking %}\
+        {% if entry not in seen %}\
+        {% set_global seen = seen | concat(with=entry) %}
         - {% if commit.scope %}**{{commit.scope}}:** {% endif %}{{ commit.message | upper_first }}\
-          {% if commit.breaking %} [**BREAKING**]{% endif %}\
+          {% if commit.breaking %} [**BREAKING**]{% if commit.breaking_description != commit.message %}: {{ commit.breaking_description | split(pat="\n") | join(sep=" ") }}{% endif %}{% endif %}\
+        {% endif %}\
     {% endfor %}
 {% endfor %}\n
 """

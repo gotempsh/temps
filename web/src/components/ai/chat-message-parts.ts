@@ -41,6 +41,8 @@ export interface ChatMessage {
   attachments?: ChatAttachment[]
   /** Ephemeral id used to reconcile an optimistic turn with its WS echo. */
   client_turn_id?: string
+  /** Next steps already suggested after this answer, saved by the server. */
+  next_steps?: string[]
 }
 
 export interface PendingActionLike {

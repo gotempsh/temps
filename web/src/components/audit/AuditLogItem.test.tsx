@@ -93,3 +93,27 @@ test.each([
   )
   expect(markup).toContain(`${label} plugin generate ai`)
 })
+
+test('a retired preview names its branch and why it closed', () => {
+  const markup = renderToStaticMarkup(
+    <table>
+      <tbody>
+        <AuditLogItemRow
+          id={4}
+          audit_date={0}
+          operation_type="PREVIEW_ENVIRONMENT_RETIRED"
+          data={{
+            project_id: 3,
+            environment_id: 7,
+            environment_name: 'feature-login',
+            branch: 'feature/login',
+            reason: { kind: 'pull_request_merged', number: 12 },
+          }}
+        />
+      </tbody>
+    </table>
+  )
+  expect(markup).toContain(
+    'Retired the preview of branch &quot;feature/login&quot; because its pull request was merged'
+  )
+})

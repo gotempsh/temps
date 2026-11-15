@@ -75,7 +75,6 @@ pub async fn auth_middleware(
     } else {
         "http"
     };
-    let is_secure = scheme == "https";
     // `base_url` keeps the port so generated links point back at the same
     // listener the client reached us on. `host` is port-stripped so it can be
     // used directly as a route-table key (the proxy normalizes the same way).
@@ -89,6 +88,13 @@ pub async fn auth_middleware(
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|c| c.0);
+    // Cookie `Secure` must come from trusted server-side state, never from the
+    // client-controllable `X-Forwarded-Proto` alone (F-013).
+    let is_secure = temps_core::secure_cookie_for_request(
+        temps_core::declared_console_scheme(),
+        req.headers(),
+        peer,
+    );
 
     // Create RequestMetadata
     let metadata = RequestMetadata {
@@ -321,18 +327,16 @@ pub fn extract_session_id_cookie(req: &Request, crypto: &CookieCrypto) -> Option
     None
 }
 
+/// Fresh per request (see [`crate::user_service::current_session_role`]);
+/// a lookup failure degrades to the least-privileged session role.
 async fn determine_user_role(
     user: &temps_entities::users::Model,
     user_service: &UserService,
 ) -> Result<Role, AuthError> {
-    // Check if user is admin
-    if user_service.is_admin(user.id).await.unwrap_or(false) {
-        return Ok(Role::Admin);
-    }
-
-    // For now, return User as default
-    // In the future, you might want to check the user_roles table
-    Ok(Role::User)
+    Ok(user_service
+        .current_session_role(user.id)
+        .await
+        .unwrap_or(Role::User))
 }
 
 #[derive(Debug)]

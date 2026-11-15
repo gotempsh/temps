@@ -37,9 +37,22 @@ pub struct MeshLockdown {
     /// On the control plane only: the node API port (ADR 048 D3), which
     /// mesh members reach on the control plane's mesh address.
     pub node_api_port: Option<u16>,
+    /// On a worker whose agent serves mutual TLS: the agent API port, which
+    /// only the control plane's mesh address may reach, so a control plane
+    /// that can reach the worker only through the mesh still can.
+    pub agent_api: Option<MeshAgentApi>,
     /// This host is the mesh hub (ADR 048 D4): it forwards traffic between
     /// mesh members, from the tunnel back into the tunnel, and nothing else.
     pub relay: bool,
+}
+
+/// The one TCP port a worker accepts over the mesh for its agent API, and the
+/// only source allowed to use it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MeshAgentApi {
+    /// The control plane's mesh address.
+    pub from: Ipv4Addr,
+    pub port: u16,
 }
 
 /// Install the nftables lockdown for [`MESH_INTERFACE`] unless it is already
@@ -51,7 +64,14 @@ pub async fn ensure_lockdown(lockdown: &MeshLockdown) -> Result<bool, NetworkErr
     crate::linux::firewall::ensure_mesh_lockdown(lockdown).await
 }
 
-#[cfg(not(target_os = "linux"))]
+/// macOS: the same ruleset, installed in the Docker app's VM, where the mesh
+/// interface and every published port live (ADR 090).
+#[cfg(target_os = "macos")]
+pub async fn ensure_lockdown(lockdown: &MeshLockdown) -> Result<bool, NetworkError> {
+    crate::vm::ensure_lockdown(lockdown).await
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub async fn ensure_lockdown(_lockdown: &MeshLockdown) -> Result<bool, NetworkError> {
     Err(NetworkError::UnsupportedPlatform {
         target: std::env::consts::OS,
@@ -102,7 +122,12 @@ pub async fn lockdown_state(lockdown: &MeshLockdown) -> Result<LockdownState, Ne
     crate::linux::firewall::mesh_lockdown_state(lockdown).await
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+pub async fn lockdown_state(lockdown: &MeshLockdown) -> Result<LockdownState, NetworkError> {
+    crate::vm::lockdown_state(lockdown).await
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub async fn lockdown_state(_lockdown: &MeshLockdown) -> Result<LockdownState, NetworkError> {
     Err(NetworkError::UnsupportedPlatform {
         target: std::env::consts::OS,
@@ -116,7 +141,12 @@ pub async fn preflight_routes(pool: Ipv4Net) -> Result<(), NetworkError> {
     crate::linux::preflight_mesh_routes(pool).await
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+pub async fn preflight_routes(pool: Ipv4Net) -> Result<(), NetworkError> {
+    crate::vm::preflight_mesh_routes(pool).await
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub async fn preflight_routes(_pool: Ipv4Net) -> Result<(), NetworkError> {
     Err(NetworkError::UnsupportedPlatform {
         target: std::env::consts::OS,
@@ -127,11 +157,91 @@ pub async fn preflight_routes(_pool: Ipv4Net) -> Result<(), NetworkError> {
 /// to the operator's `configured` underlay MTU if smaller, minus WireGuard's
 /// overhead (see [`mesh_mtu_for`]).
 pub async fn detect_mtu(configured: Option<u32>) -> Result<u32, NetworkError> {
-    let device = crate::detect_underlay_device().await?;
-    let detected = crate::detect_underlay_mtu(&device).await?;
+    #[cfg(target_os = "macos")]
+    let detected = crate::vm::default_route_mtu().await?;
+    #[cfg(not(target_os = "macos"))]
+    let detected = {
+        let device = crate::detect_underlay_device().await?;
+        crate::detect_underlay_mtu(&device).await?
+    };
     Ok(mesh_mtu_for(
         configured.map_or(detected, |configured| configured.min(detected)),
     ))
+}
+
+/// The nftables table owning the mesh lockdown (see [`render_lockdown`]).
+pub const MESH_TABLE: &str = "temps_mesh";
+
+/// The mesh carries VXLAN between nodes, plus (on workers) the control
+/// plane's connections to published container ports. Without this table it
+/// would also be a path from every peer to anything the host binds on
+/// 0.0.0.0 (the control plane's database, agent APIs) and, since Docker
+/// enables forwarding, a route through the node into its own LAN — reachable
+/// even where a cloud firewall guards the public addresses. The icmp rule is
+/// IPv4-only on purpose: the mesh carries no IPv6.
+pub(crate) fn render_lockdown(lockdown: &MeshLockdown) -> String {
+    let wg = MESH_INTERFACE;
+    let vxlan_port = lockdown.vxlan_port;
+    let mesh = lockdown.mesh;
+    let marker = lockdown_marker(lockdown);
+    let node_api = lockdown
+        .node_api_port
+        .map(|port| {
+            format!(
+                "add rule inet {MESH_TABLE} input iifname \"{wg}\" ip saddr {mesh} tcp dport {port} accept\n"
+            )
+        })
+        .unwrap_or_default();
+    // A worker's agent API, for the control plane only (mutual TLS on top).
+    let agent_api = lockdown
+        .agent_api
+        .map(|api| {
+            format!(
+                "add rule inet {MESH_TABLE} input iifname \"{wg}\" ip saddr {} tcp dport {} accept\n",
+                api.from, api.port
+            )
+        })
+        .unwrap_or_default();
+    // A hub forwards between members (ADR 048 D4): in from the tunnel and
+    // straight back into it, mesh address to mesh address. Each member's own
+    // input rules still decide what it accepts.
+    let relay = if lockdown.relay {
+        format!(
+            "add rule inet {MESH_TABLE} forward iifname \"{wg}\" oifname \"{wg}\" ip saddr {mesh} ip daddr {mesh} accept\n"
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "
+add table inet {MESH_TABLE}
+delete table inet {MESH_TABLE}
+add table inet {MESH_TABLE}
+
+# Ahead of temps_network (-100) and Docker's chains.
+add chain inet {MESH_TABLE} input {{ type filter hook input priority -110; policy accept; }}
+add rule inet {MESH_TABLE} input counter comment \"{marker}\"
+add rule inet {MESH_TABLE} input iifname \"{wg}\" ct state established,related accept
+add rule inet {MESH_TABLE} input iifname \"{wg}\" udp dport {vxlan_port} accept
+add rule inet {MESH_TABLE} input iifname \"{wg}\" icmp type echo-request accept
+{node_api}{agent_api}add rule inet {MESH_TABLE} input iifname \"{wg}\" counter drop
+
+add chain inet {MESH_TABLE} forward {{ type filter hook forward priority -110; policy accept; }}
+add rule inet {MESH_TABLE} forward oifname \"{wg}\" ct state established,related accept
+{relay}add rule inet {MESH_TABLE} forward iifname \"{wg}\" ip saddr {mesh} ct status dnat accept
+add rule inet {MESH_TABLE} forward iifname \"{wg}\" counter drop
+add rule inet {MESH_TABLE} forward oifname \"{wg}\" counter drop
+"
+    )
+}
+
+pub(crate) fn lockdown_marker(lockdown: &MeshLockdown) -> String {
+    const MESH_LOCKDOWN_VERSION: &str = "v1";
+    let signature = format!("{MESH_LOCKDOWN_VERSION}|{lockdown:?}");
+    format!(
+        "temps-mesh-{MESH_LOCKDOWN_VERSION}-{}",
+        uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, signature.as_bytes())
+    )
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -140,6 +250,10 @@ pub enum MeshError {
     Disabled,
     #[error("wireguard_cidr {value:?} is invalid: {reason}")]
     InvalidCidr { value: String, reason: String },
+    /// The cluster CA was created before Temps recorded the addresses its
+    /// worker certificates name, so no pool can be proven free of them.
+    #[error("the mesh cannot use {pool} yet: this cluster's CA was created before Temps recorded which addresses its worker certificates name, and those certificates are never revoked (deleted nodes keep theirs), so Temps cannot prove none of them covers the pool. The pool is fine. Rotate the cluster CA (Settings > Worker Nodes > Cluster trust), re-enroll any workers, then turn the mesh on")]
+    CaPredatesCertificateHistory { pool: Ipv4Net },
     #[error("wireguard_cidr {mesh} overlaps the compute pool {pool}")]
     OverlapsComputePool { mesh: Ipv4Net, pool: Ipv4Net },
     #[error("wireguard_cidr {cidr} has no free address left for another node")]
@@ -347,6 +461,41 @@ pub struct MeshIdentityClaim {
     pub holder: MeshIdentityHolder,
 }
 
+/// The one mesh-pool address a registration may claim: its own, reached
+/// over the node API from that very address, which WireGuard routes only to
+/// the key that holds it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OwnMeshAddress {
+    pub owner: MeshAddressOwner,
+    pub address: Ipv4Addr,
+}
+
+/// Whose mesh address an [`OwnMeshAddress`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeshAddressOwner {
+    /// The pairing that reserved it, for a worker that joined outbound only
+    /// and registers through that pairing (ADR 055).
+    Pairing(i32),
+    /// The node that already holds it, re-registering under its own name
+    /// when it joins the same control plane again (ADR 060).
+    Node(i32),
+}
+
+/// `addresses` without the registration's own mesh address (ADR 055). The
+/// control plane's mesh address is never exempt, whatever a pairing says.
+pub fn without_own_address(
+    addresses: &[(String, Ipv4Addr)],
+    own: Option<OwnMeshAddress>,
+    pool: Ipv4Net,
+) -> Vec<(String, Ipv4Addr)> {
+    let control_plane = control_plane_mesh_address(pool);
+    addresses
+        .iter()
+        .filter(|(_, ip)| own.is_none_or(|own| *ip != own.address || *ip == control_plane))
+        .cloned()
+        .collect()
+}
+
 /// The first of `addresses` (claimed value, its IPv4 address) that is the
 /// control plane's mesh address in `pool`, or any other address of `pool`.
 pub fn pool_claim(addresses: &[(String, Ipv4Addr)], pool: Ipv4Net) -> Option<MeshIdentityClaim> {
@@ -401,10 +550,16 @@ pub fn parse_endpoint(value: &str) -> Result<SocketAddr, MeshError> {
         value: value.to_string(),
         reason: reason.to_string(),
     };
-    let endpoint: SocketAddr = value
-        .trim()
-        .parse()
-        .map_err(|_| invalid("expected ip:port, e.g. 203.0.113.10:51820"))?;
+    let endpoint: SocketAddr = value.trim().parse().map_err(|_| {
+        if names_a_host(value) {
+            invalid(
+                "a hostname is not accepted, the endpoint must be an IP literal: resolve it and \
+                 pass ip:port, e.g. 203.0.113.10:51820",
+            )
+        } else {
+            invalid("expected ip:port, e.g. 203.0.113.10:51820")
+        }
+    })?;
     if endpoint.port() == 0 {
         return Err(invalid("port must not be 0"));
     }
@@ -446,6 +601,55 @@ pub fn check_endpoint_outside_pools(
         });
     }
     Ok(())
+}
+
+/// Whether `value` is `host:port` with a DNS name rather than an IP literal,
+/// so the error can say so instead of only "expected ip:port".
+fn names_a_host(value: &str) -> bool {
+    let Some((host, port)) = value.trim().rsplit_once(':') else {
+        return false;
+    };
+    !host.is_empty()
+        && port.parse::<u16>().is_ok()
+        && host.parse::<IpAddr>().is_err()
+        && !host.starts_with('[')
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
+        && host.chars().any(|c| c.is_ascii_alphabetic())
+}
+
+/// The endpoint the control plane publishes for workers to dial its end of
+/// the mesh.
+///
+/// In order of precedence:
+/// 1. `advertised` -- the operator's `temps serve --wg-endpoint`, published
+///    exactly as given. For a control plane behind NAT or port forwarding,
+///    whose reachable `ip:port` differs from its address and listen port; the
+///    listen port stays the mesh port either way.
+/// 2. `configured_address` -- `--private-address`, on the mesh port, unless it
+///    is the mesh address itself.
+/// 3. `persisted` -- the endpoint published before, on a restart with neither.
+pub fn resolve_control_plane_endpoint(
+    advertised: Option<&str>,
+    configured_address: Option<&str>,
+    persisted: Option<&str>,
+    mesh: Ipv4Net,
+    port: u16,
+) -> Result<Option<SocketAddr>, MeshError> {
+    if let Some(advertised) = advertised.map(str::trim).filter(|value| !value.is_empty()) {
+        let endpoint = parse_endpoint(advertised)?;
+        check_endpoint_outside_pools(endpoint, mesh, None)?;
+        return Ok(Some(endpoint));
+    }
+    let mesh_address = control_plane_mesh_address(mesh).to_string();
+    match configured_address
+        .map(str::trim)
+        .filter(|address| !address.is_empty() && *address != mesh_address)
+    {
+        Some(address) => default_endpoint(address, port).map(Some),
+        None => Ok(persisted.and_then(|endpoint| endpoint.parse().ok())),
+    }
 }
 
 /// A node's default endpoint: the address it registered with, on the mesh
@@ -574,10 +778,15 @@ mod db {
 
     /// Reserve all certificate IP SANs before releasing a leaf, under the same lock as
     /// pool changes. Entries survive node removal and failed registrations.
+    ///
+    /// `own` exempts the registration's own mesh address (ADR 055); it is
+    /// recorded like every other address, so it is never handed to another
+    /// member while the CA lasts.
     pub async fn reserve_certificate_addresses(
         db: &DatabaseConnection,
         ca_cert_pem: &str,
         identities: &[String],
+        own: Option<OwnMeshAddress>,
     ) -> Result<(), MeshError> {
         use sea_orm::{ConnectionTrait, Statement};
         let txn = db.begin().await?;
@@ -586,7 +795,8 @@ mod db {
             .iter()
             .filter_map(|value| identity_ipv4(value).map(|ip| (value.clone(), ip)))
             .collect();
-        if let Some(claim) = pool_claim(&addresses, reserved_mesh_pool(&cfg.wireguard_cidr)) {
+        let pool = reserved_mesh_pool(&cfg.wireguard_cidr);
+        if let Some(claim) = pool_claim(&without_own_address(&addresses, own, pool), pool) {
             return Err(MeshError::InvalidCidr {
                 value: cfg.wireguard_cidr,
                 reason: format!(
@@ -609,6 +819,76 @@ mod db {
         Ok(())
     }
 
+    /// Every address a leaf of the current cluster CA names. A worker that
+    /// joined outbound only (ADR 055) holds a leaf for its mesh address, and
+    /// leaves are not revoked, so new pairings and nodes skip these.
+    pub(crate) async fn certificate_addresses<C: sea_orm::ConnectionTrait>(
+        db: &C,
+    ) -> Result<std::collections::HashSet<Ipv4Addr>, MeshError> {
+        use sea_orm::{FromQueryResult, Statement};
+        let Some(ca_key) = current_ca_key(db).await? else {
+            return Ok(Default::default());
+        };
+        #[derive(FromQueryResult)]
+        struct Address {
+            address: String,
+        }
+        Ok(Address::find_by_statement(Statement::from_sql_and_values(
+            db.get_database_backend(),
+            "SELECT address FROM cluster_certificate_addresses WHERE ca_key = $1",
+            [ca_key.into()],
+        ))
+        .all(db)
+        .await?
+        .into_iter()
+        .filter_map(|row| row.address.parse().ok())
+        .collect())
+    }
+
+    /// Key of the current cluster CA in the certificate history tables, or
+    /// `None` while no CA exists (nothing has been issued).
+    async fn current_ca_key<C: sea_orm::ConnectionTrait>(
+        db: &C,
+    ) -> Result<Option<String>, MeshError> {
+        let settings = temps_entities::settings::Entity::find_by_id(1)
+            .one(db)
+            .await?;
+        Ok(settings
+            .as_ref()
+            .and_then(|row| row.data.get("multi_node"))
+            .and_then(|value| value.get("cluster_ca_cert_pem"))
+            .and_then(|value| value.as_str())
+            .map(|ca| hex::encode(<sha2::Sha256 as sha2::Digest>::digest(ca.as_bytes()))))
+    }
+
+    async fn ca_has_history<C: sea_orm::ConnectionTrait>(
+        db: &C,
+        ca_key: &str,
+    ) -> Result<bool, MeshError> {
+        use sea_orm::Statement;
+        Ok(db
+            .query_one(Statement::from_sql_and_values(
+                db.get_database_backend(),
+                "SELECT ca_key FROM cluster_certificate_history WHERE ca_key = $1",
+                [ca_key.into()],
+            ))
+            .await?
+            .is_some())
+    }
+
+    /// Whether the cluster CA was created before Temps recorded the addresses
+    /// its leaves name. Such a CA blocks turning the mesh on or moving it
+    /// until it is rotated, whatever the pool: see
+    /// [`MeshError::CaPredatesCertificateHistory`].
+    pub async fn ca_predates_certificate_history<C: sea_orm::ConnectionTrait>(
+        db: &C,
+    ) -> Result<bool, MeshError> {
+        match current_ca_key(db).await? {
+            Some(ca_key) => Ok(!ca_has_history(db, &ca_key).await?),
+            None => Ok(false),
+        }
+    }
+
     /// A pre-history CA may have issued certificates for deleted or renamed
     /// nodes. Current rows cannot prove safety; rotate that CA explicitly.
     async fn check_certificate_history<C: sea_orm::ConnectionTrait>(
@@ -616,33 +896,13 @@ mod db {
         pool: Ipv4Net,
     ) -> Result<(), MeshError> {
         use sea_orm::{FromQueryResult, Statement};
-        let settings = temps_entities::settings::Entity::find_by_id(1)
-            .one(txn)
-            .await?;
-        let Some(ca) = settings
-            .as_ref()
-            .and_then(|row| row.data.get("multi_node"))
-            .and_then(|value| value.get("cluster_ca_cert_pem"))
-            .and_then(|value| value.as_str())
-        else {
+        let Some(ca_key) = current_ca_key(txn).await? else {
             return Ok(());
         };
-        let ca_key = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(ca.as_bytes()));
-        let backend = txn.get_database_backend();
-        if txn
-            .query_one(Statement::from_sql_and_values(
-                backend,
-                "SELECT ca_key FROM cluster_certificate_history WHERE ca_key = $1",
-                [ca_key.clone().into()],
-            ))
-            .await?
-            .is_none()
-        {
-            return Err(MeshError::InvalidCidr {
-                value: pool.to_string(),
-                reason: "the cluster CA predates certificate address history; deleted nodes may still hold certificates for this pool. Rotate the cluster CA in Settings > Worker Nodes and re-enroll workers before enabling or changing the mesh".into(),
-            });
+        if !ca_has_history(txn, &ca_key).await? {
+            return Err(MeshError::CaPredatesCertificateHistory { pool });
         }
+        let backend = txn.get_database_backend();
         #[derive(FromQueryResult)]
         struct Address {
             address: String,
@@ -686,7 +946,12 @@ mod db {
         if i32::from(requested_port) == cfg.vxlan_port {
             return Err(MeshError::PortClashesWithVxlan(requested_port));
         }
-        let current = parse_mesh_cidr(&cfg.wireguard_cidr, pool)?;
+        // The stored pool is only compared against, never validated here:
+        // until the mesh is first turned on it is the migration's default,
+        // which can overlap an upgraded cluster's compute pool. Validating it
+        // refused every request, including one that names a clear range.
+        // The requested pool was checked above, and is what gets stored.
+        let current = reserved_mesh_pool(&cfg.wireguard_cidr);
         // Addresses are in use as underlays and every endpoint (the control
         // plane's, --wg-endpoint values) carries the port: both are frozen
         // once any node is on the mesh.
@@ -762,6 +1027,12 @@ mod db {
             .all(txn)
             .await?
         {
+            // A node that joined outbound only registered under its own mesh
+            // address (ADR 055); that is its identity, not a claim on another.
+            let own = node
+                .mesh_wg_address
+                .as_deref()
+                .and_then(|address| address.parse::<Ipv4Addr>().ok());
             for (field, value) in [
                 ("name", node.name.as_str()),
                 ("address", node.address.as_str()),
@@ -770,7 +1041,7 @@ mod db {
                 let Some(ip) = identity_ipv4(value) else {
                     continue;
                 };
-                if !pool.contains(&ip) {
+                if !pool.contains(&ip) || (field != "name" && Some(ip) == own) {
                     continue;
                 }
                 let role = if ip == control_plane {
@@ -812,9 +1083,16 @@ mod db {
     /// is assigned or reserved), so the pool check alone covers them; the
     /// node and pairing lookups keep that true for rows written before the
     /// pool was frozen for pending pairings, and name the holder.
+    ///
+    /// `own` is the registration's own mesh address: exempt from the pool
+    /// check and from its own pairing's reservation (ADR 055), or from the
+    /// node that holds it when that node re-registers (ADR 060), but never
+    /// from another node holding it or from being the control plane's
+    /// address.
     pub async fn mesh_identity_claimed(
         db: &DatabaseConnection,
         claimed: &[String],
+        own: Option<OwnMeshAddress>,
     ) -> Result<Option<MeshIdentityClaim>, MeshError> {
         let addresses: Vec<(String, Ipv4Addr)> = claimed
             .iter()
@@ -824,7 +1102,8 @@ mod db {
             return Ok(None);
         }
         let cfg = load_config(db).await?;
-        if let Some(claim) = pool_claim(&addresses, reserved_mesh_pool(&cfg.wireguard_cidr)) {
+        let pool = reserved_mesh_pool(&cfg.wireguard_cidr);
+        if let Some(claim) = pool_claim(&without_own_address(&addresses, own, pool), pool) {
             return Ok(Some(claim));
         }
         let texts: Vec<String> = addresses.iter().map(|(_, ip)| ip.to_string()).collect();
@@ -835,12 +1114,22 @@ mod db {
                 .map(|(value, _)| value.clone())
                 .unwrap_or_else(|| address.to_string())
         };
-        if let Some(node) = nodes::Entity::find()
-            .filter(nodes::Column::MeshWgAddress.is_in(texts.clone()))
-            .order_by_asc(nodes::Column::Id)
-            .one(db)
-            .await?
+        let mut holders =
+            nodes::Entity::find().filter(nodes::Column::MeshWgAddress.is_in(texts.clone()));
+        // A node re-registering is not refused for the address it holds
+        // itself (ADR 060); any other node holding a claimed address is.
+        if let Some(OwnMeshAddress {
+            owner: MeshAddressOwner::Node(node_id),
+            address,
+        }) = own
         {
+            holders = holders.filter(
+                sea_orm::Condition::any()
+                    .add(nodes::Column::Id.ne(node_id))
+                    .add(nodes::Column::MeshWgAddress.ne(address.to_string())),
+            );
+        }
+        if let Some(node) = holders.order_by_asc(nodes::Column::Id).one(db).await? {
             return Ok(Some(MeshIdentityClaim {
                 claimed: claimed_text(node.mesh_wg_address.as_deref().unwrap_or_default()),
                 holder: MeshIdentityHolder::Node {
@@ -849,9 +1138,17 @@ mod db {
                 },
             }));
         }
-        if let Some(pairing) = temps_entities::node_pairings::Entity::find()
+        let mut pairings = temps_entities::node_pairings::Entity::find()
             .filter(temps_entities::node_pairings::Column::MeshAddress.is_in(texts))
-            .filter(temps_entities::node_pairings::Column::Status.is_in(crate::pairing::PENDING))
+            .filter(temps_entities::node_pairings::Column::Status.is_in(crate::pairing::PENDING));
+        if let Some(OwnMeshAddress {
+            owner: MeshAddressOwner::Pairing(pairing_id),
+            ..
+        }) = own
+        {
+            pairings = pairings.filter(temps_entities::node_pairings::Column::Id.ne(pairing_id));
+        }
+        if let Some(pairing) = pairings
             .order_by_asc(temps_entities::node_pairings::Column::Id)
             .one(db)
             .await?
@@ -917,6 +1214,12 @@ mod db {
         parse_mesh_port(cfg.wireguard_port)
     }
 
+    /// The pool turning the mesh on would use when no other is asked for.
+    pub async fn configured_pool(db: &DatabaseConnection) -> Result<Ipv4Net, MeshError> {
+        let cfg = load_config(db).await?;
+        Ok(reserved_mesh_pool(&cfg.wireguard_cidr))
+    }
+
     /// What a node needs to bring its end of the mesh up.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct NodeMeshRegistration {
@@ -928,6 +1231,9 @@ mod db {
     /// Store a node's mesh public key and endpoint, assign its mesh address
     /// on first registration, and make that address its underlay.
     ///
+    /// `endpoint` is `None` for a node nobody can dial (ADR 055): it dials
+    /// the control plane, which learns its address from the handshake.
+    ///
     /// Serialized on the `network_config` row lock so two nodes registering
     /// at once never receive the same address (the unique index is the
     /// backstop).
@@ -935,7 +1241,7 @@ mod db {
         db: &Arc<DatabaseConnection>,
         node_id: i32,
         public_key: &str,
-        endpoint: SocketAddr,
+        endpoint: Option<SocketAddr>,
     ) -> Result<NodeMeshRegistration, MeshError> {
         let txn = db.begin().await?;
         let registration = register_node_in(&txn, node_id, public_key, endpoint).await?;
@@ -949,18 +1255,20 @@ mod db {
         txn: &C,
         node_id: i32,
         public_key: &str,
-        endpoint: SocketAddr,
+        endpoint: Option<SocketAddr>,
     ) -> Result<NodeMeshRegistration, MeshError> {
         if !temps_wireguard::mesh::is_valid_public_key(public_key) {
             return Err(MeshError::InvalidPublicKey);
         }
         let cfg = lock_config(txn).await?;
         let settings = settings_from(&cfg)?.ok_or(MeshError::Disabled)?;
-        check_endpoint_outside_pools(
-            endpoint,
-            settings.cidr,
-            cfg.compute_pool_cidr.parse::<Ipv4Net>().ok(),
-        )?;
+        if let Some(endpoint) = endpoint {
+            check_endpoint_outside_pools(
+                endpoint,
+                settings.cidr,
+                cfg.compute_pool_cidr.parse::<Ipv4Net>().ok(),
+            )?;
+        }
         let node = nodes::Entity::find_by_id(node_id)
             .one(txn)
             .await?
@@ -997,7 +1305,13 @@ mod db {
         // A node that registered with a pairing's token takes the address
         // the pairing reserved for this key (ADR 048 D2b).
         let paired = crate::pairing::adopt_for_node(txn, node_id, public_key).await?;
+        // A node that joined outbound only registered under the paired
+        // address (ADR 055) and its interface already carries it, so that
+        // address wins over one the node held before re-joining.
+        let registered_under_paired =
+            paired.is_some_and(|paired| identity_ipv4(&node.private_address) == Some(paired));
         let address = match (current, paired) {
+            (Some(_), Some(address)) if registered_under_paired => address,
             (Some(address), _) => address,
             (None, Some(address)) => address,
             (None, None) => {
@@ -1006,15 +1320,15 @@ mod db {
         };
 
         let address_text = address.to_string();
-        let endpoint_text = endpoint.to_string();
+        let endpoint_text = endpoint.map(|endpoint| endpoint.to_string());
         let unchanged = node.mesh_wg_public_key.as_deref() == Some(public_key)
-            && node.mesh_wg_endpoint.as_deref() == Some(endpoint_text.as_str())
+            && node.mesh_wg_endpoint == endpoint_text
             && node.mesh_wg_address.as_deref() == Some(address_text.as_str())
             && node.underlay_address.as_deref() == Some(address_text.as_str());
         if !unchanged {
             let mut active: nodes::ActiveModel = node.into();
             active.mesh_wg_public_key = Set(Some(public_key.to_string()));
-            active.mesh_wg_endpoint = Set(Some(endpoint_text));
+            active.mesh_wg_endpoint = Set(endpoint_text);
             active.mesh_wg_address = Set(Some(address_text.clone()));
             active.underlay_address = Set(Some(address_text));
             active.update(txn).await?;
@@ -1071,6 +1385,8 @@ mod db {
         if excluding_node.is_none() {
             // Nodes being paired: the control plane dials them so they can
             // register over the mesh (ADR 048 D2b). Workers never see them.
+            // One that joined outbound only (ADR 055) has no endpoint: it
+            // dials the control plane, which roams to its address.
             for pairing in crate::pairing::peering(db).await? {
                 let (Some(public_key), Ok(address)) =
                     (pairing.public_key, pairing.mesh_address.parse())
@@ -1081,7 +1397,10 @@ mod db {
                     name: format!("pairing:{}", pairing.name),
                     peer: MeshPeer {
                         public_key,
-                        endpoint: pairing.node_endpoint.parse().ok(),
+                        endpoint: pairing
+                            .node_endpoint
+                            .as_deref()
+                            .and_then(|endpoint| endpoint.parse().ok()),
                         address,
                         relayed: Vec::new(),
                     },
@@ -1322,6 +1641,99 @@ mod tests {
             "[::ffff:169.254.169.254]:51820",
         ] {
             assert!(parse_endpoint(bad).is_err(), "{bad} should be rejected");
+        }
+    }
+
+    #[test]
+    fn a_hostname_endpoint_is_refused_with_a_specific_reason() {
+        for host in ["node-a.example.com:51820", "localhost:51820"] {
+            let error = parse_endpoint(host).unwrap_err().to_string();
+            assert!(
+                error.contains("a hostname is not accepted"),
+                "{host}: {error}"
+            );
+        }
+        for not_a_host in ["203.0.113.10", "203.0.113.10:99999", "garbage", "[::1"] {
+            let error = parse_endpoint(not_a_host).unwrap_err().to_string();
+            assert!(!error.contains("hostname"), "{not_a_host}: {error}");
+        }
+    }
+
+    const MESH: Ipv4Net = Ipv4Net::new_assert(Ipv4Addr::new(10, 201, 0, 0), 16);
+
+    #[test]
+    fn the_advertised_endpoint_is_published_exactly_and_wins() {
+        let published = resolve_control_plane_endpoint(
+            Some("157.180.96.48:20517"),
+            Some("157.180.96.48"),
+            Some("198.51.100.1:51820"),
+            MESH,
+            51820,
+        )
+        .unwrap();
+        assert_eq!(published, Some("157.180.96.48:20517".parse().unwrap()));
+        // Even without a private address.
+        assert_eq!(
+            resolve_control_plane_endpoint(Some(" 203.0.113.7:4000 "), None, None, MESH, 51820)
+                .unwrap(),
+            Some("203.0.113.7:4000".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn without_an_advertised_endpoint_the_existing_rules_apply() {
+        // The private address, forced onto the listen port.
+        assert_eq!(
+            resolve_control_plane_endpoint(
+                None,
+                Some("157.180.96.48"),
+                Some("198.51.100.1:51820"),
+                MESH,
+                51820
+            )
+            .unwrap(),
+            Some("157.180.96.48:51820".parse().unwrap())
+        );
+        // A blank flag counts as unset.
+        assert_eq!(
+            resolve_control_plane_endpoint(Some("  "), Some("203.0.113.9"), None, MESH, 51820)
+                .unwrap(),
+            Some("203.0.113.9:51820".parse().unwrap())
+        );
+        // The mesh address itself, or nothing: the published endpoint is kept.
+        for configured in [Some("10.201.0.1"), None] {
+            assert_eq!(
+                resolve_control_plane_endpoint(
+                    None,
+                    configured,
+                    Some("198.51.100.1:51820"),
+                    MESH,
+                    51820
+                )
+                .unwrap(),
+                Some("198.51.100.1:51820".parse().unwrap())
+            );
+        }
+        assert_eq!(
+            resolve_control_plane_endpoint(None, None, None, MESH, 51820).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn an_unusable_advertised_endpoint_is_an_error_not_a_fallback() {
+        for bad in [
+            "plane.example.com:20517",
+            "157.180.96.48",
+            "127.0.0.1:20517",
+            "10.201.0.1:51820",
+            "157.180.96.48:0",
+        ] {
+            assert!(
+                resolve_control_plane_endpoint(Some(bad), Some("157.180.96.48"), None, MESH, 51820)
+                    .is_err(),
+                "{bad} must be refused"
+            );
         }
     }
 

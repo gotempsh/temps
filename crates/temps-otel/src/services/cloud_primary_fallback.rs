@@ -437,6 +437,7 @@ fn rehydrate(project_id: i32, span: &temps_cloud_protocol::SpanRecord) -> SpanRe
         .single()
         .unwrap_or_else(chrono::Utc::now);
     SpanRecord {
+        ingest_identity: None,
         project_id,
         deployment_id: None,
         resource: ResourceInfo {

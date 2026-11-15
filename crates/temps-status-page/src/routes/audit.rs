@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use anyhow::Result;
 use serde::Serialize;
 use temps_core::AuditOperation;
 
@@ -14,6 +13,7 @@ pub enum StatusPageMutationAction {
     IncidentCreated,
     IncidentStatusUpdated,
     IncidentUpdateVisibilityChanged,
+    IncidentPublicTitleChanged,
 }
 
 impl StatusPageMutationAction {
@@ -27,6 +27,7 @@ impl StatusPageMutationAction {
             Self::IncidentUpdateVisibilityChanged => {
                 "STATUS_PAGE_INCIDENT_UPDATE_VISIBILITY_CHANGED"
             }
+            Self::IncidentPublicTitleChanged => "STATUS_PAGE_INCIDENT_PUBLIC_TITLE_CHANGED",
         }
     }
 }
@@ -71,9 +72,8 @@ impl AuditOperation for StatusPageMutationAudit {
         &self.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|error| anyhow::anyhow!("failed to serialize status-page audit: {error}"))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -122,7 +122,9 @@ pub struct PublicStatusPageAudit {
     pub ip_address: Option<String>,
     pub user_agent: String,
     pub action: PublicStatusPageAction,
-    pub project_id: i32,
+    /// Every project the page drew components from when the action ran:
+    /// whose monitors it exposed or stopped exposing.
+    pub project_ids: Vec<i32>,
     pub status_page_id: i32,
     pub title: Option<String>,
     pub is_published: Option<bool>,
@@ -154,11 +156,11 @@ impl AuditOperation for PublicStatusPageAudit {
         &self.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self).map_err(|error| {
-            anyhow::anyhow!(
-                "failed to serialize status page {} audit: {error}",
-                self.status_page_id
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        serde_json::to_string(self).map_err(|source| {
+            temps_core::AuditError::serialize(
+                format!("status page {}", self.status_page_id),
+                source,
             )
         })
     }
@@ -212,7 +214,7 @@ mod tests {
             ip_address: None,
             user_agent: "status-page-test".to_string(),
             action: PublicStatusPageAction::Published,
-            project_id: 9,
+            project_ids: vec![4, 9],
             status_page_id: 12,
             title: Some("Public status".to_string()),
             is_published: Some(true),
@@ -225,6 +227,7 @@ mod tests {
         let payload: serde_json::Value =
             serde_json::from_str(&serialized).expect("serialized audit should be valid JSON");
         assert_eq!(payload["status_page_id"], 12);
+        assert_eq!(payload["project_ids"], serde_json::json!([4, 9]));
         assert_eq!(payload["monitor_ids"], serde_json::json!([3, 1]));
         assert_eq!(payload["action"], "published");
         assert!(payload.get("slug").is_none());

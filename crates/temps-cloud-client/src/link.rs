@@ -1416,6 +1416,18 @@ impl CloudLink {
             .await
     }
 
+    /// A worker job's scoped credential for the managed bucket (ADR-102).
+    pub async fn managed_backup_scoped_credentials(
+        &self,
+        request: &temps_cloud_protocol::ManagedBackupScopedCredentialsRequest,
+    ) -> Result<temps_cloud_protocol::ManagedBackupScopedCredentials, CloudError> {
+        let (base_url, token) = self.linked_credential()?;
+        let backend = self.parse_backend(&base_url)?;
+        CloudClient::new(backend)?
+            .managed_backup_scoped_credentials(&token, request)
+            .await
+    }
+
     pub async fn managed_ai_analysis(
         &self,
         request: &ManagedAiAnalysisRequest,
@@ -2359,12 +2371,10 @@ mod postgres_persistence_tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn postgres_state_survives_scratch_directory_replacement() {
-        let database = match temps_database::test_utils::TestDatabase::new().await {
+        let database = match temps_test_utils::TestDatabase::new().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping Cloud state integration test: Docker unavailable: {error}");
                 return;

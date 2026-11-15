@@ -10,11 +10,14 @@
 //! known-good policy instead of flushing a live chain.
 
 use std::process::Stdio;
+use std::sync::Arc;
+use std::time::Duration;
 
 use bollard::Docker;
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
-use tracing::info;
+use tokio::sync::Notify;
+use tracing::{info, warn};
 
 const TABLE: &str = "temps_metadata";
 const FORWARD_PRIORITY: i32 = -200;
@@ -54,10 +57,7 @@ pub async fn apply_metadata_egress_block(
         return Ok(());
     }
 
-    static APPLY_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-    let _guard = APPLY_LOCK.lock().await;
-    let ruleset = render_ruleset();
-    apply_nft(&ruleset).await?;
+    install().await?;
 
     info!(
         network = network_name,
@@ -66,6 +66,53 @@ pub async fn apply_metadata_egress_block(
         "Cloud-metadata egress protection reconciled"
     );
     Ok(())
+}
+
+/// Install the guard now and keep it installed until `shutdown` fires.
+///
+/// Deploys re-apply the guard, but nothing restores it after a reboot or a
+/// host firewall flush, so a node that restarts and is not deployed to again
+/// would run its containers without it. Each pass replaces the table in one
+/// transaction, which also undoes any edit to it. Only the first success,
+/// failures and the recovery after a failure are logged, not every pass.
+pub async fn maintain_metadata_egress_block(interval: Duration, shutdown: Arc<Notify>) {
+    if !cfg!(target_os = "linux") {
+        return;
+    }
+
+    let mut installed = false;
+    loop {
+        match install().await {
+            Ok(()) if !installed => {
+                info!(
+                    table = TABLE,
+                    priority = FORWARD_PRIORITY,
+                    "Cloud-metadata egress protection installed"
+                );
+                installed = true;
+            }
+            Ok(()) => {}
+            Err(error) => {
+                warn!(
+                    %error,
+                    retry_in_secs = interval.as_secs(),
+                    "Cloud-metadata egress protection is not installed; containers on this node can reach the cloud metadata service until it is"
+                );
+                installed = false;
+            }
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
+            _ = shutdown.notified() => return,
+        }
+    }
+}
+
+/// One nft transaction at a time, whichever caller asks.
+async fn install() -> Result<(), MetadataEgressError> {
+    static APPLY_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _guard = APPLY_LOCK.lock().await;
+    apply_nft(&render_ruleset()).await
 }
 
 fn render_ruleset() -> String {

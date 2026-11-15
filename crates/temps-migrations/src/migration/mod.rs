@@ -1,755 +1,32 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-mod m20260916_000001_visitor_activity_reports;
-mod m20260918_000001_visitor_activity_run_history;
-mod m20260919_000001_add_managed_by_cloud_to_oidc_providers;
-mod m20260921_000001_add_worker_public_ingress;
-
-pub mod m20260921_000001_http_checks;
-pub mod m20260921_000002_env_check_history;
-pub mod m20260921_000003_detection_retry;
-pub mod m20260921_000004_credential_catalog;
-pub mod m20261002_000001_secret_checks_and_history;
+//! Every migration in this directory, registered by `build.rs`.
+//!
+//! Adding a migration means adding a `mYYYYMMDD_NNNNNN_description.rs` file
+//! here with a stamp later than every existing one. `build.rs` declares one
+//! module per file and generates the list `Migrator::migrations()` returns:
+//! the file names sorted, with the shipped exceptions in
+//! `order_exceptions.txt` (rules in `src/migration_order.rs`). The order is
+//! upgrade history, checked against `tests/fixtures/migration_order.txt` by
+//! `registry_tests` below.
+//!
+//! `m20260421_000001_squash_apr_post_v006` squashes the 34 migrations from
+//! m20260403 through m20260420 into one. Databases created before it still
+//! have the original names in `seaql_migrations`; on a local database already
+//! past those, insert the squash migration's name into `seaql_migrations` by
+//! hand to mark it done.
 
 pub use sea_orm_migration::prelude::*;
 
-mod m20250101_000001_initial_schema;
-mod m20250127_000001_add_unique_email_constraint;
-mod m20250129_000001_add_session_id_to_proxy_logs;
-mod m20250205_000001_create_ip_access_control;
-mod m20250205_000002_add_attack_mode;
-mod m20250205_000003_add_projects_route_trigger;
-mod m20251115_000001_add_preview_environments_support;
-mod m20251121_000001_create_webhooks;
-mod m20251203_000001_create_email_tables;
-mod m20251204_000001_create_deployment_tokens;
-mod m20251205_000001_create_dns_providers;
-mod m20251206_000001_make_email_domain_id_optional;
-mod m20251206_000002_add_encrypted_token_to_deployment_tokens;
-mod m20251206_000003_alter_visitor_custom_data_to_jsonb;
-mod m20251206_000004_add_route_type_to_custom_routes;
-mod m20251208_000001_create_vulnerability_scans;
-mod m20251208_000002_add_deployment_id_to_scans;
-mod m20251209_000001_add_environments_route_trigger;
-mod m20251210_000001_add_vulnerability_class_fields;
-mod m20260103_000001_add_visitor_has_activity;
-mod m20260103_000002_add_utm_fields_to_sessions;
-mod m20260121_000001_add_remote_builds_support;
-mod m20260122_000001_increase_checksum_length;
-mod m20260213_000001_create_source_maps;
-mod m20260214_000001_create_events_hourly_aggregate;
-mod m20260214_000002_add_analytics_performance_indexes;
-mod m20260217_000001_add_first_referrer_to_visitor;
-mod m20260225_000001_add_proxy_logs_retention;
-mod m20260225_000001_create_log_aggregator_tables;
-mod m20260225_000001_create_otel_tables;
-mod m20260226_000001_add_deployment_id_to_deployment_tokens;
-mod m20260305_000001_create_nodes_table;
-mod m20260305_000002_add_node_id_columns;
-mod m20260305_000003_add_encrypted_flag_to_env_vars;
-mod m20260308_000001_create_alarms_table;
-mod m20260310_000001_create_ai_provider_keys;
-mod m20260310_000002_create_ai_gateway_config;
-mod m20260310_000003_create_ai_usage_logs;
-mod m20260310_000004_add_is_byok_to_ai_usage_logs;
-mod m20260310_000005_add_agent_tracking_to_ai_usage_logs;
-mod m20260310_000006_add_environment_protection;
-mod m20260311_000001_add_on_demand_environments;
-mod m20260313_000001_add_service_members;
-mod m20260313_000002_add_service_error_message;
-mod m20260314_000001_update_environment_route_trigger;
-mod m20260315_000001_add_last_activity_at_to_environments;
-mod m20260315_000002_create_error_alert_rules;
-mod m20260320_000001_add_email_tracking;
-mod m20260323_000004_add_deployment_container_service_name;
-mod m20260326_000001_create_asset_manifests;
-mod m20260326_000002_create_static_asset_cache;
-mod m20260326_000003_add_edge_public_key_to_nodes;
-mod m20260327_000001_add_service_name_to_custom_domains;
-mod m20260328_000001_create_email_events;
-mod m20260328_000002_add_check_path_to_status_monitors;
-mod m20260331_000001_create_autopilot_tables;
-mod m20260401_000001_add_tracked_html_body_to_emails;
-mod m20260401_000001_autopilot_to_agents;
-mod m20260401_000002_add_autofixer_columns;
-mod m20260401_000002_add_missing_email_events_columns;
-// Squashes 34 migrations from m20260403 through m20260420 into one.
-// Production (b8d6519) still has the original migrations in seaql_migrations;
-// this replaces them on fresh setups. On local DBs already past b8d6519,
-// insert this migration name into seaql_migrations manually to mark it done.
-mod m20260421_000001_squash_apr_post_v006;
-mod m20260422_000001_external_service_health;
-mod m20260422_000002_add_git_connection_health;
-mod m20260423_000001_create_oauth_states;
-mod m20260423_000002_add_sync_progress_count;
-mod m20260423_000003_fix_gitlab_nested_group_owner;
-mod m20260424_000001_create_secrets;
-mod m20260427_000001_add_compute_network;
-mod m20260427_000002_add_dns_service_endpoints;
-mod m20260427_000003_add_compute_ip_to_service_members;
-mod m20260427_000004_add_provisioning_to_service_members;
-mod m20260428_000001_unique_member_ordinal;
-mod m20260428_000002_dns_owner_kind_deployment;
-mod m20260428_000003_create_node_route_state;
-mod m20260430_000001_add_deployment_container_exit_info;
-mod m20260430_000002_add_deployment_container_runtime_info;
-mod m20260501_000001_add_gitlab_webhook_to_projects;
-mod m20260502_000001_add_observe_correlation;
-mod m20260504_000001_widen_backup_size_and_heartbeat;
-mod m20260505_000001_create_events_ch_outbox;
-mod m20260507_000001_add_workspace_preview_password_encrypted;
-mod m20260511_000001_create_cli_login_sessions;
-mod m20260511_000002_add_is_secret_to_env_vars;
-mod m20260514_000001_create_backup_jobs;
-mod m20260515_000001_create_backup_alerts;
-mod m20260515_000002_add_backup_jobs_max_runtime;
-mod m20260515_000003_add_backup_schedules_max_runtime;
-mod m20260516_000001_create_schedule_runs;
-mod m20260517_000001_add_health_metadata_to_external_services;
-mod m20260517_000002_drop_backup_jobs;
-mod m20260518_000001_drop_backups_last_heartbeat_at;
-mod m20260519_000001_create_backup_schedule_services;
-mod m20260519_000002_add_target_all_services;
-mod m20260519_000003_add_include_control_plane;
-mod m20260522_000001_oidc_sso;
-mod m20260522_000002_oidc_role_mappings;
-mod m20260526_000001_add_preview_envs_on_demand;
-mod m20260526_000002_add_trust_idp_email_to_oidc_providers;
-mod m20260528_000001_add_proxy_logs_listing_indexes;
-mod m20260529_000001_add_proxy_logs_filter_indexes;
-mod m20260601_000001_create_service_metrics;
-mod m20260601_000002_add_monitoring_settings;
-mod m20260601_000003_add_monitoring_alert_rules;
-mod m20260601_000004_add_monitoring_alert_rules_unique_idx;
-mod m20260601_000005_add_service_id_to_api_keys;
-mod m20260601_000006_update_metrics_retention_30d;
-mod m20260601_000007_create_service_metrics_status;
-mod m20260601_000008_alarms_nullable_env_deployment;
-mod m20260601_000009_metrics_caggs_keep_labels;
-mod m20260601_000010_add_service_id_to_alarms;
-mod m20260603_000001_create_otel_trace_summaries;
-mod m20260609_000001_create_deployment_container_logs;
-mod m20260611_000001_change_log_deploy_id_to_integer;
-mod m20260615_000001_add_environment_attack_mode;
-mod m20260618_000001_create_on_demand_cert_attempts;
-mod m20260618_000002_add_domains_on_demand_backoff;
-mod m20260619_000001_add_settings_change_trigger;
-mod m20260621_000001_create_telemetry_milestones;
-mod m20260622_000001_managed_domain_hostnames;
-mod m20260623_000001_add_external_services_default_backup_provisioned;
-mod m20260626_000001_create_metric_dashboards;
-mod m20260626_000002_create_metric_alert_rules;
-mod m20260627_000001_add_ai_alert_summaries;
-mod m20260627_000001_node_enrollment_tokens;
-mod m20260627_000002_create_ai_conversations;
-mod m20260628_000001_add_node_to_log_chunks;
-mod m20260628_000001_otel_spans_root_index;
-mod m20260629_000001_otel_metrics_full_fidelity;
-mod m20260629_000002_add_provider_default_model;
-mod m20260630_000001_add_ai_pending_actions_and_write_toggle;
-mod m20260701_000001_add_ai_action_plans;
-mod m20260701_000001_add_provider_webhook_tokens;
-mod m20260701_000002_add_bitbucket_webhook_hook_id;
-mod m20260702_000001_add_label_filters_to_metric_alert_rules;
-mod m20260702_000002_add_dynamic_alerting_to_metric_alert_rules;
-mod m20260702_000003_add_grouped_threshold_and_series_state_to_metric_alert_rules;
-mod m20260703_000001_cross_project_trace_refs;
-mod m20260705_000001_add_visitor_unique_index;
-mod m20260707_000001_add_external_service_to_logs;
-mod m20260707_000002_add_external_services_container_name;
-mod m20260708_000001_add_node_id_to_monitoring_alert_rules;
-mod m20260711_000001_add_proxy_logs_stats_cagg;
-mod m20260711_000001_normalize_email_event_types;
-mod m20260711_000002_add_ip_geolocations_hosting_provider;
-mod m20260711_000002_create_suppressed_recipients;
-mod m20260711_000003_add_visitor_non_crawler_partial_index;
-mod m20260713_000001_add_mfa_pending_to_sessions;
-mod m20260713_000002_add_dns_ownership;
-mod m20260714_000001_create_domain_delivery;
-mod m20260714_000001_fix_otel_spans_compression_segmentby;
-mod m20260714_000001_secure_sns_email_events;
-mod m20260716_000001_observability_compression_24h;
-mod m20260717_000001_drop_magic_link_tokens;
-mod m20260720_000001_add_backend_to_sandboxes;
-mod m20260720_000001_audit_logs_keep_history_on_user_delete;
-mod m20260720_000002_create_sandbox_events;
-mod m20260722_000001_create_source_files;
-mod m20260722_000002_add_source_context_enabled_to_projects;
-mod m20260723_000001_add_error_source_root_to_projects;
-mod m20260724_000001_add_run_config_to_agent_runs;
-mod m20260725_000001_sandboxes_agent_run_link;
-mod m20260728_000001_add_environment_id_to_metric_alert_rules;
-mod m20260730_000001_add_architecture_to_nodes;
-mod m20260730_000001_create_teams_rbac;
-mod m20260731_000001_create_source_bundles;
-mod m20260802_000001_add_environment_force_https;
-mod m20260802_000002_create_feature_flags;
-mod m20260803_000001_add_flag_last_evaluated_at;
-mod m20260803_000001_add_template_slug_to_projects;
-mod m20260803_000002_add_step_up_expires_at_to_sessions;
-mod m20260804_000001_add_ai_data_access_to_external_services;
-mod m20260804_000001_add_must_change_password_to_users;
-pub mod m20260805_000001_index_normalized_managed_domains;
-mod m20260806_000001_index_permission_denied_retention;
-pub mod m20260806_000001_sandbox_workspace_lifecycle;
-mod m20260809_000001_ai_gateway_config_provider_type;
-mod m20260810_000001_add_cli_session_id_to_ai_conversations;
-mod m20260810_000001_create_cloud_backup_mirror_states;
-pub mod m20260810_000001_create_sandbox_snapshots;
-mod m20260810_000002_add_interactive_bridge_enabled_to_ai_gateway_config;
-mod m20260810_000003_pin_ai_provider_to_conversations;
-mod m20260810_000004_add_ai_conversation_runtime_options;
-mod m20260811_000001_add_cli_session_fingerprint;
-mod m20260811_000001_create_renewal_attempts;
-mod m20260813_000001_add_ai_api_traffic_summary_enabled;
-mod m20260814_000001_create_ai_provider_models;
-mod m20260814_000001_create_otel_span_facets;
-mod m20260814_000002_add_ai_summary_preference;
-mod m20260815_000001_add_facet_attr_columns_to_otel_spans;
-mod m20260815_000001_default_preview_inclusion_off;
-mod m20260816_000001_add_image_retention_hours;
-mod m20260816_000001_project_scoped_email_delivery;
-mod m20260817_000001_add_system_dimension_to_proxy_stats;
-mod m20260817_000001_index_deployments_retention_scan;
-mod m20260817_000002_create_secret_compose_services;
-mod m20260818_000001_add_allow_alternate_sources;
-mod m20260819_000001_create_session_replay_ingest_batches;
-mod m20260821_000001_add_email_retry_tracking;
-mod m20260824_000001_create_otel_ingest_errors;
-mod m20260825_000001_add_dns_resolver_health_to_nodes;
-mod m20260827_000001_add_control_plane_overlay_allocation;
-mod m20260827_000001_create_notification_routes;
-mod m20260827_000002_add_control_plane_setup_generation;
-mod m20260828_000001_alarms_nullable_project;
-mod m20260828_000002_add_alarms_silenced_until;
-mod m20260829_000001_allow_duplicate_ready_snapshot_digests;
-mod m20260830_000001_add_external_service_creator;
-mod m20260830_000001_add_managed_by_cloud_to_s3_sources;
-mod m20260830_000001_create_traefik_discovered_routes;
-mod m20260929_000001_add_bunny_delivery;
-// Module declarations are kept lexically sorted by rustfmt. Migration execution
-// order is defined by Migrator::migrations below, where all mainline migrations
-// remain ahead of this branch's AI workspace chain.
-mod m20260831_000001_ai_first_applications;
-mod m20260831_000001_create_analytics_ingest_keys;
-mod m20260831_000001_create_traefik_route_certificates;
-mod m20260831_000002_add_managed_status_monitors;
-mod m20260831_000002_backfill_acme_verification_method;
-mod m20260901_000001_add_cloud_telemetry_fidelity;
-mod m20260901_000001_persist_ai_turn_state;
-mod m20260901_000002_create_cloud_telemetry_backfills;
-mod m20260901_000002_user_owned_ai_conversations;
-mod m20260901_000003_constrain_cloud_telemetry_fidelity;
-mod m20260901_000004_create_cloud_span_outbox;
-mod m20260901_000005_add_cloud_telemetry_write_mode;
-mod m20260901_000006_create_telemetry_write_ledger;
-mod m20260901_000007_create_cloud_telemetry_bulk_jobs;
-// This branch and main each shipped a migration with the same date and
-// sequence stamp. Preserve that upgrade history rather than renumbering.
-mod m20260902_000001_add_session_token_to_s3_sources;
-mod m20260902_000001_backup_safety_and_provenance;
-// Three migrations share this date and sequence stamp across this branch
-// and main. Preserve that upgrade history rather than renumbering.
-mod m20260903_000001_add_service_project_identity;
-mod m20260903_000001_add_vulnerability_scanning_enabled_to_projects;
-mod m20260903_000001_application_workspace_topology;
-mod m20260903_000001_generalize_cloud_telemetry_outbox;
-mod m20260903_000002_add_signal_group_to_write_intervals;
-mod m20260903_000002_harden_application_workspaces;
-mod m20260903_000003_add_cloud_analytics_write_mode;
-mod m20260903_000003_application_workspace_quarantine;
-mod m20260903_000004_add_target_table_and_payload_row_to_outbox;
-mod m20260903_000004_repair_application_primary_projects;
-// This branch and main each shipped a migration with the same date and
-// sequence stamp. Preserve that upgrade history rather than renumbering.
-mod m20260901_000001_add_database_provisioning_to_project_services;
-mod m20260904_000001_add_lifecycle_reconcile_failed_at_to_s3_sources;
-mod m20260904_000001_reset_ambiguous_managed_status_monitors;
-mod m20260904_000002_add_lifecycle_reconcile_generation_to_s3_sources;
-mod m20260904_000003_add_continuous_archive_source_to_external_services;
-mod m20260907_000001_add_mfa_pending_origin_to_sessions;
-mod m20260908_000001_reconcile_legacy_status_monitors;
-mod m20260909_000001_index_global_log_chunks;
-mod m20260910_000001_managed_daemon_workspace_images;
-mod m20260911_000001_create_ai_application_git_bindings;
-mod m20260912_000001_expand_managed_daemon_workspace_images;
-mod m20260912_000002_managed_daemon_workspace_images_v031;
-mod m20260912_000003_managed_daemon_workspace_images_v032;
-mod m20260913_000001_managed_daemon_workspace_images_v033;
-mod m20260913_000002_managed_daemon_workspace_images_v034;
-mod m20260914_000001_managed_daemon_digest_images;
-mod m20260915_000001_backfill_backup_expires_at;
-mod m20260915_000002_add_upload_request_id_to_deployments;
-mod m20260916_000001_external_plugin_actors;
-pub mod m20260916_000001_reconcile_otel_trace_summaries;
-pub mod m20260917_000001_add_next_check_at_to_status_monitors;
-pub mod m20260917_000002_add_breach_started_at_to_alert_rules;
-pub mod m20260917_000003_add_cron_next_run_at_to_project_agents;
-mod m20260918_000001_add_pull_only_root_directory_to_projects;
-pub mod m20260919_000001_add_failover_at_to_nodes;
-pub mod m20260919_000001_log_chunks_v2;
-pub mod m20260920_000001_log_chunks_indexed_at;
-pub mod m20260920_000002_log_collector_positions;
-pub mod m20260921_000001_log_lines_index;
-pub mod m20260921_000002_log_line_index_state;
-pub mod m20260921_000003_log_line_forget_backlog;
-pub mod m20260922_000001_stateless_control_plane_jobs;
-pub mod m20260926_000001_stateless_telemetry_anonymous_id;
-pub mod m20260928_000001_host_git_imports;
-
-mod m20260920_000001_compose_security_policies;
-mod m20260921_000005_add_docker_socket_mounted_to_deployments;
-mod m20260924_000001_add_sync_error_to_git_provider_connections;
-mod m20260927_000001_add_port_bindings_to_deployment_containers;
-mod m20260928_000001_add_node_id_to_sandboxes;
-mod m20260928_000001_create_project_groups;
-mod m20260928_000001_wireguard_mesh;
-mod m20260928_000002_create_project_group_env_vars;
-mod m20260928_000003_add_project_group_repository;
-mod m20260928_000004_create_project_group_routes;
-mod m20260929_000001_create_template_instantiations;
-mod m20260929_000001_node_pairings;
-mod m20260929_000002_add_project_hosting;
-mod m20260929_000002_node_pairing_rejection;
-mod m20260929_000003_node_ssh_enrollments;
-mod m20260929_000004_mesh_hub;
-mod m20260930_000001_add_project_instantiation_token;
-mod m20261002_000001_add_bunny_hostname_owned;
-mod m20261005_000001_ai_gateway_objects;
-mod m20261005_000001_certificate_address_history;
-mod m20261005_000002_ai_batch_reconciliation;
-mod m20261006_000001_restore_runs_interrupted_status;
-mod m20261007_000001_cron_executions_cron_index;
-mod m20261007_000002_restore_runs_cancellation;
-mod m20261008_000001_create_service_data_imports;
-mod m20261009_000001_unconfirm_legacy_worker_container_removals;
-mod m20261011_000001_create_public_status_pages;
-mod m20261012_000001_ai_provider_keys_self_hosted;
-mod m20261012_000002_create_status_page_domains;
-mod m20261012_000003_managed_daemon_beta_images;
-mod m20261013_000001_webhook_delivery_identity;
-mod m20261013_000002_add_kind_to_ai_conversations;
-mod m20261013_000003_allow_source_built_service_release;
-mod m20261014_000001_add_instantiation_claim_token;
-mod m20261014_000002_create_project_ip_access_rules;
-mod m20261014_000002_index_ip_geolocation_references;
-mod m20261014_000003_ip_geolocation_last_used_at;
+include!(concat!(env!("OUT_DIR"), "/migrations.rs"));
 
 pub struct Migrator;
 
 #[async_trait::async_trait]
 impl MigratorTrait for Migrator {
     fn migrations() -> Vec<Box<dyn MigrationTrait>> {
-        vec![
-            Box::new(m20250101_000001_initial_schema::Migration),
-            Box::new(m20250127_000001_add_unique_email_constraint::Migration),
-            Box::new(m20250129_000001_add_session_id_to_proxy_logs::Migration),
-            Box::new(m20250205_000001_create_ip_access_control::Migration),
-            Box::new(m20250205_000002_add_attack_mode::Migration),
-            Box::new(m20250205_000003_add_projects_route_trigger::Migration),
-            Box::new(m20251115_000001_add_preview_environments_support::Migration),
-            Box::new(m20251121_000001_create_webhooks::Migration),
-            Box::new(m20251203_000001_create_email_tables::Migration),
-            Box::new(m20251204_000001_create_deployment_tokens::Migration),
-            Box::new(m20251205_000001_create_dns_providers::Migration),
-            Box::new(m20251206_000001_make_email_domain_id_optional::Migration),
-            Box::new(m20251206_000002_add_encrypted_token_to_deployment_tokens::Migration),
-            Box::new(m20251206_000003_alter_visitor_custom_data_to_jsonb::Migration),
-            Box::new(m20251206_000004_add_route_type_to_custom_routes::Migration),
-            Box::new(m20251208_000001_create_vulnerability_scans::Migration),
-            Box::new(m20251208_000002_add_deployment_id_to_scans::Migration),
-            Box::new(m20251209_000001_add_environments_route_trigger::Migration),
-            Box::new(m20251210_000001_add_vulnerability_class_fields::Migration),
-            Box::new(m20260103_000001_add_visitor_has_activity::Migration),
-            Box::new(m20260103_000002_add_utm_fields_to_sessions::Migration),
-            Box::new(m20260121_000001_add_remote_builds_support::Migration),
-            Box::new(m20260122_000001_increase_checksum_length::Migration),
-            Box::new(m20260213_000001_create_source_maps::Migration),
-            Box::new(m20260214_000001_create_events_hourly_aggregate::Migration),
-            Box::new(m20260214_000002_add_analytics_performance_indexes::Migration),
-            Box::new(m20260217_000001_add_first_referrer_to_visitor::Migration),
-            Box::new(m20260225_000001_add_proxy_logs_retention::Migration),
-            Box::new(m20260225_000001_create_otel_tables::Migration),
-            Box::new(m20260226_000001_add_deployment_id_to_deployment_tokens::Migration),
-            Box::new(m20260225_000001_create_log_aggregator_tables::Migration),
-            Box::new(m20260305_000001_create_nodes_table::Migration),
-            Box::new(m20260305_000002_add_node_id_columns::Migration),
-            Box::new(m20260305_000003_add_encrypted_flag_to_env_vars::Migration),
-            Box::new(m20260308_000001_create_alarms_table::Migration),
-            Box::new(m20260310_000001_create_ai_provider_keys::Migration),
-            Box::new(m20260310_000002_create_ai_gateway_config::Migration),
-            Box::new(m20260310_000003_create_ai_usage_logs::Migration),
-            Box::new(m20260310_000004_add_is_byok_to_ai_usage_logs::Migration),
-            Box::new(m20260310_000005_add_agent_tracking_to_ai_usage_logs::Migration),
-            Box::new(m20260310_000006_add_environment_protection::Migration),
-            Box::new(m20260311_000001_add_on_demand_environments::Migration),
-            Box::new(m20260313_000001_add_service_members::Migration),
-            Box::new(m20260313_000002_add_service_error_message::Migration),
-            Box::new(m20260314_000001_update_environment_route_trigger::Migration),
-            Box::new(m20260315_000001_add_last_activity_at_to_environments::Migration),
-            Box::new(m20260315_000002_create_error_alert_rules::Migration),
-            Box::new(m20260320_000001_add_email_tracking::Migration),
-            Box::new(m20260323_000004_add_deployment_container_service_name::Migration),
-            Box::new(m20260326_000001_create_asset_manifests::Migration),
-            Box::new(m20260326_000002_create_static_asset_cache::Migration),
-            Box::new(m20260326_000003_add_edge_public_key_to_nodes::Migration),
-            Box::new(m20260327_000001_add_service_name_to_custom_domains::Migration),
-            Box::new(m20260328_000001_create_email_events::Migration),
-            Box::new(m20260328_000002_add_check_path_to_status_monitors::Migration),
-            Box::new(m20260331_000001_create_autopilot_tables::Migration),
-            Box::new(m20260401_000001_add_tracked_html_body_to_emails::Migration),
-            Box::new(m20260401_000001_autopilot_to_agents::Migration),
-            Box::new(m20260401_000002_add_autofixer_columns::Migration),
-            Box::new(m20260401_000002_add_missing_email_events_columns::Migration),
-            Box::new(m20260421_000001_squash_apr_post_v006::Migration),
-            Box::new(m20260422_000001_external_service_health::Migration),
-            Box::new(m20260422_000002_add_git_connection_health::Migration),
-            Box::new(m20260423_000001_create_oauth_states::Migration),
-            Box::new(m20260423_000002_add_sync_progress_count::Migration),
-            Box::new(m20260423_000003_fix_gitlab_nested_group_owner::Migration),
-            Box::new(m20260424_000001_create_secrets::Migration),
-            Box::new(m20260427_000001_add_compute_network::Migration),
-            Box::new(m20260427_000002_add_dns_service_endpoints::Migration),
-            Box::new(m20260427_000003_add_compute_ip_to_service_members::Migration),
-            Box::new(m20260427_000004_add_provisioning_to_service_members::Migration),
-            Box::new(m20260428_000001_unique_member_ordinal::Migration),
-            Box::new(m20260428_000002_dns_owner_kind_deployment::Migration),
-            Box::new(m20260428_000003_create_node_route_state::Migration),
-            Box::new(m20260430_000001_add_deployment_container_exit_info::Migration),
-            Box::new(m20260430_000002_add_deployment_container_runtime_info::Migration),
-            Box::new(m20260501_000001_add_gitlab_webhook_to_projects::Migration),
-            Box::new(m20260502_000001_add_observe_correlation::Migration),
-            Box::new(m20260504_000001_widen_backup_size_and_heartbeat::Migration),
-            Box::new(m20260505_000001_create_events_ch_outbox::Migration),
-            Box::new(m20260507_000001_add_workspace_preview_password_encrypted::Migration),
-            Box::new(m20260511_000001_create_cli_login_sessions::Migration),
-            Box::new(m20260511_000002_add_is_secret_to_env_vars::Migration),
-            Box::new(m20260514_000001_create_backup_jobs::Migration),
-            Box::new(m20260515_000001_create_backup_alerts::Migration),
-            Box::new(m20260515_000002_add_backup_jobs_max_runtime::Migration),
-            Box::new(m20260515_000003_add_backup_schedules_max_runtime::Migration),
-            Box::new(m20260516_000001_create_schedule_runs::Migration),
-            Box::new(m20260517_000001_add_health_metadata_to_external_services::Migration),
-            Box::new(m20260517_000002_drop_backup_jobs::Migration),
-            Box::new(m20260518_000001_drop_backups_last_heartbeat_at::Migration),
-            Box::new(m20260519_000001_create_backup_schedule_services::Migration),
-            Box::new(m20260519_000002_add_target_all_services::Migration),
-            Box::new(m20260519_000003_add_include_control_plane::Migration),
-            Box::new(m20260522_000001_oidc_sso::Migration),
-            Box::new(m20260522_000002_oidc_role_mappings::Migration),
-            Box::new(m20260526_000001_add_preview_envs_on_demand::Migration),
-            Box::new(m20260526_000002_add_trust_idp_email_to_oidc_providers::Migration),
-            Box::new(m20260528_000001_add_proxy_logs_listing_indexes::Migration),
-            Box::new(m20260529_000001_add_proxy_logs_filter_indexes::Migration),
-            Box::new(m20260601_000001_create_service_metrics::Migration),
-            Box::new(m20260601_000002_add_monitoring_settings::Migration),
-            Box::new(m20260601_000003_add_monitoring_alert_rules::Migration),
-            Box::new(m20260601_000004_add_monitoring_alert_rules_unique_idx::Migration),
-            Box::new(m20260601_000005_add_service_id_to_api_keys::Migration),
-            Box::new(m20260601_000006_update_metrics_retention_30d::Migration),
-            Box::new(m20260601_000007_create_service_metrics_status::Migration),
-            Box::new(m20260601_000008_alarms_nullable_env_deployment::Migration),
-            Box::new(m20260601_000009_metrics_caggs_keep_labels::Migration),
-            Box::new(m20260601_000010_add_service_id_to_alarms::Migration),
-            Box::new(m20260603_000001_create_otel_trace_summaries::Migration),
-            Box::new(m20260609_000001_create_deployment_container_logs::Migration),
-            Box::new(m20260611_000001_change_log_deploy_id_to_integer::Migration),
-            Box::new(m20260615_000001_add_environment_attack_mode::Migration),
-            Box::new(m20260618_000001_create_on_demand_cert_attempts::Migration),
-            Box::new(m20260618_000002_add_domains_on_demand_backoff::Migration),
-            Box::new(m20260619_000001_add_settings_change_trigger::Migration),
-            Box::new(m20260621_000001_create_telemetry_milestones::Migration),
-            Box::new(m20260622_000001_managed_domain_hostnames::Migration),
-            Box::new(m20260623_000001_add_external_services_default_backup_provisioned::Migration),
-            Box::new(m20260626_000001_create_metric_dashboards::Migration),
-            Box::new(m20260626_000002_create_metric_alert_rules::Migration),
-            Box::new(m20260627_000001_add_ai_alert_summaries::Migration),
-            Box::new(m20260627_000001_node_enrollment_tokens::Migration),
-            Box::new(m20260627_000002_create_ai_conversations::Migration),
-            Box::new(m20260628_000001_add_node_to_log_chunks::Migration),
-            Box::new(m20260628_000001_otel_spans_root_index::Migration),
-            Box::new(m20260629_000001_otel_metrics_full_fidelity::Migration),
-            Box::new(m20260629_000002_add_provider_default_model::Migration),
-            Box::new(m20260630_000001_add_ai_pending_actions_and_write_toggle::Migration),
-            Box::new(m20260701_000001_add_ai_action_plans::Migration),
-            Box::new(m20260701_000001_add_provider_webhook_tokens::Migration),
-            Box::new(m20260701_000002_add_bitbucket_webhook_hook_id::Migration),
-            Box::new(m20260702_000001_add_label_filters_to_metric_alert_rules::Migration),
-            Box::new(m20260702_000002_add_dynamic_alerting_to_metric_alert_rules::Migration),
-            Box::new(
-                m20260702_000003_add_grouped_threshold_and_series_state_to_metric_alert_rules::Migration,
-            ),
-            Box::new(m20260703_000001_cross_project_trace_refs::Migration),
-            Box::new(m20260705_000001_add_visitor_unique_index::Migration),
-            Box::new(m20260707_000001_add_external_service_to_logs::Migration),
-            Box::new(m20260707_000002_add_external_services_container_name::Migration),
-            Box::new(m20260708_000001_add_node_id_to_monitoring_alert_rules::Migration),
-            Box::new(m20260711_000001_add_proxy_logs_stats_cagg::Migration),
-            Box::new(m20260711_000001_normalize_email_event_types::Migration),
-            Box::new(m20260711_000002_add_ip_geolocations_hosting_provider::Migration),
-            Box::new(m20260711_000002_create_suppressed_recipients::Migration),
-            Box::new(m20260711_000003_add_visitor_non_crawler_partial_index::Migration),
-            Box::new(m20260713_000001_add_mfa_pending_to_sessions::Migration),
-            Box::new(m20260714_000001_fix_otel_spans_compression_segmentby::Migration),
-            Box::new(m20260714_000001_secure_sns_email_events::Migration),
-            Box::new(m20260716_000001_observability_compression_24h::Migration),
-            Box::new(m20260717_000001_drop_magic_link_tokens::Migration),
-            Box::new(m20260720_000001_add_backend_to_sandboxes::Migration),
-            Box::new(m20260720_000002_create_sandbox_events::Migration),
-            Box::new(m20260720_000001_audit_logs_keep_history_on_user_delete::Migration),
-            Box::new(m20260722_000001_create_source_files::Migration),
-            Box::new(m20260722_000002_add_source_context_enabled_to_projects::Migration),
-            Box::new(m20260723_000001_add_error_source_root_to_projects::Migration),
-            Box::new(m20260724_000001_add_run_config_to_agent_runs::Migration),
-            Box::new(m20260725_000001_sandboxes_agent_run_link::Migration),
-            Box::new(
-                m20260728_000001_add_environment_id_to_metric_alert_rules::Migration,
-            ),
-            Box::new(m20260730_000001_add_architecture_to_nodes::Migration),
-            Box::new(m20260730_000001_create_teams_rbac::Migration),
-            Box::new(m20260731_000001_create_source_bundles::Migration),
-            Box::new(m20260802_000001_add_environment_force_https::Migration),
-            Box::new(m20260802_000002_create_feature_flags::Migration),
-            Box::new(m20260803_000001_add_flag_last_evaluated_at::Migration),
-            Box::new(m20260803_000001_add_template_slug_to_projects::Migration),
-            Box::new(m20260803_000002_add_step_up_expires_at_to_sessions::Migration),
-            // Both carry the 20260804_000001 stamp (independently authored on
-            // two branches). They touch different tables, so the order between
-            // them is arbitrary — but main's shipped first, so it runs first
-            // and this branch's is appended rather than inserted ahead of it.
-            // `DeriveMigrationName` keys on the full module name, so the shared
-            // timestamp is not a collision in `seaql_migrations`.
-            Box::new(m20260804_000001_add_must_change_password_to_users::Migration),
-            Box::new(
-                m20260804_000001_add_ai_data_access_to_external_services::Migration,
-            ),
-            Box::new(m20260805_000001_index_normalized_managed_domains::Migration),
-            Box::new(m20260806_000001_sandbox_workspace_lifecycle::Migration),
-            Box::new(m20260806_000001_index_permission_denied_retention::Migration),
-            Box::new(m20260809_000001_ai_gateway_config_provider_type::Migration),
-            // Main shipped the sandbox migration first. Keep it ahead of this
-            // branch's independently authored migration with the same date and
-            // sequence stamp; DeriveMigrationName uses the full module name, so
-            // the two records remain distinct in seaql_migrations.
-            Box::new(m20260810_000001_create_sandbox_snapshots::Migration),
-            Box::new(
-                m20260810_000001_add_cli_session_id_to_ai_conversations::Migration,
-            ),
-            Box::new(m20260810_000001_create_cloud_backup_mirror_states::Migration),
-            Box::new(
-                m20260810_000002_add_interactive_bridge_enabled_to_ai_gateway_config::Migration,
-            ),
-            Box::new(m20260810_000003_pin_ai_provider_to_conversations::Migration),
-            Box::new(m20260810_000004_add_ai_conversation_runtime_options::Migration),
-            // Main shipped the renewal-attempts migration first. Preserve
-            // that upgrade history before this branch's independently named
-            // migration with the same date and sequence stamp.
-            Box::new(m20260811_000001_create_renewal_attempts::Migration),
-            Box::new(m20260811_000001_add_cli_session_fingerprint::Migration),
-            Box::new(m20260813_000001_add_ai_api_traffic_summary_enabled::Migration),
-            // Main shipped m20260814_000001_create_ai_provider_models first.
-            // Keep it ahead of this branch's independently authored migration
-            // with the same date and sequence stamp; DeriveMigrationName uses
-            // the full module name, so the two records remain distinct in
-            // seaql_migrations.
-            Box::new(m20260814_000001_create_ai_provider_models::Migration),
-            Box::new(m20260814_000001_create_otel_span_facets::Migration),
-            Box::new(m20260814_000002_add_ai_summary_preference::Migration),
-            // Main shipped the facet-attribute migration first. Preserve that
-            // order before this branch's independently named migration with
-            // the same date and sequence stamp.
-            Box::new(m20260815_000001_add_facet_attr_columns_to_otel_spans::Migration),
-            Box::new(m20260815_000001_default_preview_inclusion_off::Migration),
-            Box::new(m20260816_000001_add_image_retention_hours::Migration),
-            Box::new(m20260816_000001_project_scoped_email_delivery::Migration),
-            // Main shipped the proxy-stats migration first. Preserve that
-            // upgrade history before this branch's independently authored
-            // migration with the same date and sequence stamp.
-            Box::new(m20260817_000001_add_system_dimension_to_proxy_stats::Migration),
-            Box::new(m20260817_000001_index_deployments_retention_scan::Migration),
-            Box::new(m20260817_000002_create_secret_compose_services::Migration),
-            Box::new(m20260818_000001_add_allow_alternate_sources::Migration),
-            Box::new(m20260819_000001_create_session_replay_ingest_batches::Migration),
-            Box::new(m20260821_000001_add_email_retry_tracking::Migration),
-            Box::new(m20260824_000001_create_otel_ingest_errors::Migration),
-            Box::new(m20260825_000001_add_dns_resolver_health_to_nodes::Migration),
-            Box::new(m20260827_000001_add_control_plane_overlay_allocation::Migration),
-            Box::new(m20260827_000001_create_notification_routes::Migration),
-            Box::new(m20260827_000002_add_control_plane_setup_generation::Migration),
-            Box::new(m20260828_000001_alarms_nullable_project::Migration),
-            Box::new(m20260828_000002_add_alarms_silenced_until::Migration),
-            Box::new(m20260829_000001_allow_duplicate_ready_snapshot_digests::Migration),
-            // Main shipped this migration first with the same date and sequence
-            // stamp as the discovered-routes migration below. Preserve that
-            // upgrade history.
-            Box::new(m20260830_000001_add_external_service_creator::Migration),
-            Box::new(m20260830_000001_add_managed_by_cloud_to_s3_sources::Migration),
-            Box::new(m20260830_000001_create_traefik_discovered_routes::Migration),
-            // Main shipped this migration first with the same date and sequence
-            // stamp as the certificates migration below. Preserve that upgrade
-            // history.
-            Box::new(m20260831_000001_create_analytics_ingest_keys::Migration),
-            // ADR-041: durable per-host TLS authorization records for discovered routes.
-            Box::new(m20260831_000001_create_traefik_route_certificates::Migration),
-            // ADR-041 §7a step (b): backfill "acme"/"http" → "http-01" so the renewal
-            // scheduler can dispatch them; "manual" is intentionally left untouched.
-            Box::new(m20260831_000002_backfill_acme_verification_method::Migration),
-            Box::new(m20260831_000002_add_managed_status_monitors::Migration),
-            Box::new(m20260901_000001_add_cloud_telemetry_fidelity::Migration),
-            Box::new(m20260901_000002_create_cloud_telemetry_backfills::Migration),
-            Box::new(m20260901_000003_constrain_cloud_telemetry_fidelity::Migration),
-            Box::new(m20260901_000004_create_cloud_span_outbox::Migration),
-            Box::new(m20260901_000005_add_cloud_telemetry_write_mode::Migration),
-            Box::new(m20260901_000006_create_telemetry_write_ledger::Migration),
-            Box::new(m20260901_000007_create_cloud_telemetry_bulk_jobs::Migration),
-            // This branch and main each shipped a migration with the same date
-            // and sequence stamp. Preserve that upgrade history.
-            Box::new(m20260902_000001_add_session_token_to_s3_sources::Migration),
-            Box::new(m20260902_000001_backup_safety_and_provenance::Migration),
-            // Three migrations share this date and sequence stamp across this
-            // branch and main. Preserve that upgrade history.
-            Box::new(
-                m20260903_000001_generalize_cloud_telemetry_outbox::Migration,
-            ),
-            Box::new(m20260903_000001_add_service_project_identity::Migration),
-            Box::new(
-                m20260903_000001_add_vulnerability_scanning_enabled_to_projects::Migration,
-            ),
-            Box::new(
-                m20260903_000002_add_signal_group_to_write_intervals::Migration,
-            ),
-            Box::new(m20260903_000003_add_cloud_analytics_write_mode::Migration),
-            Box::new(
-                m20260903_000004_add_target_table_and_payload_row_to_outbox::Migration,
-            ),
-            // This branch and main each shipped a migration with the same date
-            // and sequence stamp. Preserve that upgrade history.
-            Box::new(
-                m20260904_000001_add_lifecycle_reconcile_failed_at_to_s3_sources::Migration,
-            ),
-            Box::new(m20260904_000001_reset_ambiguous_managed_status_monitors::Migration),
-            Box::new(
-                m20260904_000002_add_lifecycle_reconcile_generation_to_s3_sources::Migration,
-            ),
-            Box::new(
-                m20260904_000003_add_continuous_archive_source_to_external_services::Migration,
-            ),
-            Box::new(m20260907_000001_add_mfa_pending_origin_to_sessions::Migration),
-            // Keep the canonical main-branch migrations before feature-branch
-            // migrations so existing main upgrade history remains a stable prefix.
-            Box::new(m20260831_000001_ai_first_applications::Migration),
-            Box::new(m20260901_000001_persist_ai_turn_state::Migration),
-            Box::new(m20260901_000002_user_owned_ai_conversations::Migration),
-            Box::new(m20260903_000001_application_workspace_topology::Migration),
-            Box::new(m20260903_000002_harden_application_workspaces::Migration),
-            Box::new(m20260903_000003_application_workspace_quarantine::Migration),
-            Box::new(m20260903_000004_repair_application_primary_projects::Migration),
-            Box::new(m20260908_000001_reconcile_legacy_status_monitors::Migration),
-            Box::new(m20260909_000001_index_global_log_chunks::Migration),
-            Box::new(
-                m20260901_000001_add_database_provisioning_to_project_services::Migration,
-            ),
-            Box::new(m20260910_000001_managed_daemon_workspace_images::Migration),
-            Box::new(m20260911_000001_create_ai_application_git_bindings::Migration),
-            Box::new(m20260912_000001_expand_managed_daemon_workspace_images::Migration),
-            Box::new(m20260912_000002_managed_daemon_workspace_images_v031::Migration),
-            Box::new(m20260912_000003_managed_daemon_workspace_images_v032::Migration),
-            Box::new(m20260713_000002_add_dns_ownership::Migration),
-            Box::new(m20260714_000001_create_domain_delivery::Migration),
-
-            Box::new(m20260913_000001_managed_daemon_workspace_images_v033::Migration),
-            Box::new(m20260913_000002_managed_daemon_workspace_images_v034::Migration),
-            Box::new(m20260914_000001_managed_daemon_digest_images::Migration),
-            Box::new(m20260915_000001_backfill_backup_expires_at::Migration),
-            Box::new(m20260915_000002_add_upload_request_id_to_deployments::Migration),
-            Box::new(m20260916_000001_external_plugin_actors::Migration),
-            Box::new(m20260916_000001_reconcile_otel_trace_summaries::Migration),
-            Box::new(m20260917_000001_add_next_check_at_to_status_monitors::Migration),
-            Box::new(m20260929_000001_add_bunny_delivery::Migration),
-            Box::new(m20260917_000002_add_breach_started_at_to_alert_rules::Migration),
-            Box::new(m20260917_000003_add_cron_next_run_at_to_project_agents::Migration),
-            Box::new(m20260916_000001_visitor_activity_reports::Migration),
-            Box::new(m20260918_000001_visitor_activity_run_history::Migration),
-            Box::new(m20260919_000001_add_failover_at_to_nodes::Migration),
-            Box::new(m20260919_000001_add_managed_by_cloud_to_oidc_providers::Migration),
-            Box::new(m20260919_000001_log_chunks_v2::Migration),
-            Box::new(m20260920_000001_compose_security_policies::Migration),
-            Box::new(m20260920_000001_log_chunks_indexed_at::Migration),
-            Box::new(m20260920_000002_log_collector_positions::Migration),
-            // This branch and main each shipped migrations stamped
-            // m20260921_0000{1,2,3}, independently and for unrelated
-            // features (line-index stores here vs. monitoring credential
-            // checks on main). This branch's landed first (07:22 UTC vs
-            // main's 17:31 UTC); DeriveMigrationName keys on the full
-            // module name, so the shared stamps are not a collision in
-            // seaql_migrations.
-            Box::new(m20260921_000001_log_lines_index::Migration),
-            Box::new(m20260921_000002_log_line_index_state::Migration),
-            Box::new(m20260921_000003_log_line_forget_backlog::Migration),
-            Box::new(m20260921_000001_http_checks::Migration),
-            Box::new(m20260921_000002_env_check_history::Migration),
-            Box::new(m20260921_000003_detection_retry::Migration),
-            Box::new(m20260921_000004_credential_catalog::Migration),
-            Box::new(m20260921_000001_add_worker_public_ingress::Migration),
-            Box::new(m20260921_000005_add_docker_socket_mounted_to_deployments::Migration),
-            Box::new(m20260922_000001_stateless_control_plane_jobs::Migration),
-            Box::new(m20260918_000001_add_pull_only_root_directory_to_projects::Migration),
-            Box::new(m20260924_000001_add_sync_error_to_git_provider_connections::Migration),
-            Box::new(m20260926_000001_stateless_telemetry_anonymous_id::Migration),
-            Box::new(m20260927_000001_add_port_bindings_to_deployment_containers::Migration),
-            // main and the worker-sandboxes branch each shipped a migration
-            // stamped m20260928_000001, for unrelated tables (host git
-            // credential imports vs. sandbox node placement). main's landed
-            // first, so it runs first; DeriveMigrationName keys on the full
-            // module name, so the shared stamp is not a collision.
-            Box::new(m20260928_000001_host_git_imports::Migration),
-            Box::new(m20260928_000001_add_node_id_to_sandboxes::Migration),
-            Box::new(m20261002_000001_add_bunny_hostname_owned::Migration),
-            // Shares main's m20261002_000001 stamp for unrelated tables (secret
-            // checks and history vs. Bunny hostname ownership); main's landed
-            // first, so it runs first.
-            Box::new(m20261002_000001_secret_checks_and_history::Migration),
-            Box::new(m20260928_000001_wireguard_mesh::Migration),
-            Box::new(m20260929_000001_node_pairings::Migration),
-            Box::new(m20260929_000002_node_pairing_rejection::Migration),
-            Box::new(m20260929_000003_node_ssh_enrollments::Migration),
-            Box::new(m20260929_000004_mesh_hub::Migration),
-            Box::new(m20261005_000001_ai_gateway_objects::Migration),
-            Box::new(m20261005_000002_ai_batch_reconciliation::Migration),
-            Box::new(m20261005_000001_certificate_address_history::Migration),
-            Box::new(m20261006_000001_restore_runs_interrupted_status::Migration),
-            Box::new(m20261007_000001_cron_executions_cron_index::Migration),
-            Box::new(m20261007_000002_restore_runs_cancellation::Migration),
-            Box::new(m20261008_000001_create_service_data_imports::Migration),
-            Box::new(m20261009_000001_unconfirm_legacy_worker_container_removals::Migration),
-            Box::new(m20261011_000001_create_public_status_pages::Migration),
-            Box::new(m20261012_000001_ai_provider_keys_self_hosted::Migration),
-            Box::new(m20261012_000002_create_status_page_domains::Migration),
-            Box::new(m20261012_000003_managed_daemon_beta_images::Migration),
-            Box::new(m20261013_000001_webhook_delivery_identity::Migration),
-            Box::new(m20261013_000002_add_kind_to_ai_conversations::Migration),
-            // Project groups, template instantiations and project hosting.
-            // Registered after everything main shipped so they run last on a
-            // database that already applied main's migrations; none of the
-            // tables above are touched by them.
-            Box::new(m20260928_000001_create_project_groups::Migration),
-            Box::new(m20260928_000002_create_project_group_env_vars::Migration),
-            Box::new(m20260928_000003_add_project_group_repository::Migration),
-            Box::new(m20260928_000004_create_project_group_routes::Migration),
-            Box::new(m20260929_000001_create_template_instantiations::Migration),
-            Box::new(m20260929_000002_add_project_hosting::Migration),
-            Box::new(m20260930_000001_add_project_instantiation_token::Migration),
-            // Source-built services of an app template keep their release.
-            Box::new(m20261013_000003_allow_source_built_service_release::Migration),
-            // Each claim of a template instantiation gets an ownership token.
-            Box::new(m20261014_000001_add_instantiation_claim_token::Migration),
-            // Per-project / per-environment IP allow and deny lists.
-            Box::new(m20261014_000002_create_project_ip_access_rules::Migration),
-            // Partial indexes on the columns that reference stored IP addresses.
-            Box::new(m20261014_000002_index_ip_geolocation_references::Migration),
-            Box::new(m20261014_000003_ip_geolocation_last_used_at::Migration),
-        ]
+        generated_migrations()
     }
 }
 
@@ -846,6 +123,110 @@ mod registry_tests {
                 "shipped migration '{shipped}' must precede '{added}'"
             );
         }
+    }
+
+    fn registered_names() -> Vec<String> {
+        Migrator::migrations()
+            .into_iter()
+            .map(|migration| migration.name().to_string())
+            .collect()
+    }
+
+    /// The shipped history fixture, one migration name per line.
+    fn shipped_history() -> Vec<&'static str> {
+        include_str!("../../tests/fixtures/migration_order.txt")
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .collect()
+    }
+
+    /// `Migrator::migrations()` order is upgrade history: an existing database
+    /// recorded these names in this order, and a fresh one must apply them in
+    /// the same order. The registered list must start with the fixture exactly;
+    /// only migrations newer than all of it may follow.
+    #[test]
+    fn registered_order_starts_with_shipped_history_fixture() {
+        let names = registered_names();
+        let shipped = shipped_history();
+        assert!(
+            names.len() >= shipped.len(),
+            "{} migrations are registered but the shipped history fixture lists {}: \
+             a shipped migration was removed",
+            names.len(),
+            shipped.len()
+        );
+        for (position, (registered, expected)) in names.iter().zip(&shipped).enumerate() {
+            assert_eq!(
+                registered,
+                expected,
+                "migration order diverges from shipped history at position {position}: \
+                 the fixture has '{expected}' but '{registered}' is registered there. A new \
+                 migration must sort after '{}'; give it a later timestamp",
+                latest_shipped(&shipped)
+            );
+        }
+    }
+
+    /// The name a new migration has to sort after. Not the fixture's last line:
+    /// the fixture is in run order, and `order_exceptions.txt` can run an
+    /// earlier-stamped migration last, so a name after the last line could still
+    /// sort into the middle of the file-name order.
+    fn latest_shipped<'a>(shipped: &[&'a str]) -> &'a str {
+        shipped.iter().copied().max().unwrap_or_default()
+    }
+
+    #[test]
+    fn a_new_migration_is_told_to_sort_after_the_latest_shipped_name() {
+        // The middle migration ran last in the history, as an exception.
+        assert_eq!(
+            latest_shipped(&[
+                "m20260101_000001_a",
+                "m20260301_000001_c",
+                "m20260201_000001_b"
+            ]),
+            "m20260301_000001_c"
+        );
+        assert_eq!(latest_shipped(&[]), "");
+
+        // A name that follows the advice sorts after everything shipped, which
+        // is what keeps the shipped order a prefix of the registered one.
+        let shipped = shipped_history();
+        let bound = latest_shipped(&shipped);
+        let new_migration = format!("{bound}_later");
+        assert!(shipped.iter().all(|name| **name < *new_migration));
+    }
+
+    /// Every `mYYYYMMDD_NNNNNN_*.rs` file in the migration directory is a
+    /// registered migration, and every registered migration has a file.
+    #[test]
+    fn every_migration_file_is_registered() {
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/migration");
+        let mut files = std::fs::read_dir(&directory)
+            .unwrap_or_else(|error| panic!("reading {}: {error}", directory.display()))
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| {
+                !name.starts_with('.') && name != "mod.rs" && name != "order_exceptions.txt"
+            })
+            .map(|name| {
+                name.strip_suffix(".rs")
+                    .unwrap_or_else(|| {
+                        panic!("{name} in {} is not a .rs file", directory.display())
+                    })
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        files.sort();
+        let mut names = registered_names();
+        names.sort();
+        assert_eq!(
+            files.len(),
+            names.len(),
+            "{} migration files but {} registered migrations",
+            files.len(),
+            names.len()
+        );
+        assert_eq!(files, names, "migration files and registered names differ");
     }
 
     /// The analytics ingest-key migration also drops `NOT NULL` on

@@ -1,0 +1,51 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "temps-providers-s3"
+version.workspace = true
+edition.workspace = true
+description = "The S3-compatible object storage engines: RustFS, Garage and legacy MinIO, with their backup, restore and bucket mirroring"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+temps-core = { path = "../temps-core" }
+temps-database = { path = "../temps-database" }
+temps-docker-util = { path = "../temps-docker-util" }
+temps-entities = { path = "../temps-entities" }
+temps-providers-core = { path = "../temps-providers-core" }
+async-trait = { workspace = true }
+aws-config = { workspace = true }
+aws-credential-types = { workspace = true }
+aws-sdk-s3 = { workspace = true }
+bollard = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
+rand = { workspace = true }
+reqwest = { workspace = true }
+schemars = { workspace = true }
+sea-orm = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { version = "0.7", features = ["io"] }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[features]
+docker-tests = ["temps-providers-core/docker-tests"]
+
+[dev-dependencies]
+temps-providers-core = { path = "../temps-providers-core", features = ["test-support"] }
+hex = { workspace = true }
+sha2 = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

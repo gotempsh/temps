@@ -20,6 +20,7 @@ import {
 import { toast } from 'sonner'
 import {
   adminListNodesOptions,
+  mintEnrollmentTokenMutation,
   nodePairingCancelMutation,
   nodePairingCreateMutation,
   nodePairingListOptions,
@@ -46,6 +47,7 @@ import {
 import { Badge } from '@/components/ui/badge'
 import { ScrollRegion } from '@/components/ui/scroll-region'
 import { Button } from '@/components/ui/button'
+import { MeshCaRotationRequired } from '@/components/nodes/RotateClusterCaDialog'
 import { CopyButton } from '@/components/ui/copy-button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -67,13 +69,18 @@ import {
 import { problemDetail } from '@/lib/api-problem'
 import { httpStatusOf } from '@/lib/http-error-status'
 import {
+  controlPlaneMeshPort,
   defaultInternetMethod,
   defaultJoinPath,
   joinCommand,
   joinUrl,
+  joinUrlIsHttps,
   joinUrlReachableFromOutside,
   meshConnectionLabel,
   meshProblems,
+  offersOutboundJoin,
+  outboundJoinCommand,
+  outboundPeerReach,
   pairingAsOf,
   pairingEnded,
   pairingProgress,
@@ -81,15 +88,37 @@ import {
   type InternetJoinMethod,
   type JoinPath,
 } from '@/lib/wireguard-mesh'
-
-const INSTALL_COMMAND = 'curl -fsSL https://temps.sh/install.sh | bash'
-const AGENT_SERVICE_COMMAND = 'temps agent service install'
+import { AGENT_SERVICE_COMMAND, installCommand } from '@/lib/worker-join-script'
+import { usePlaneRelease } from '@/hooks/usePlaneRelease'
+import {
+  WorkerInstallNote,
+  WorkerJoinScript,
+} from '@/components/nodes/WorkerJoinScript'
 const WITHOUT_SYSTEMD = (
   <>
     Without systemd, run <code>temps agent</code> under your own supervisor
     instead.
   </>
 )
+
+/**
+ * Install Temps as root, pinned to the release this server runs so the worker
+ * matches it (the newest nightly build for a build between releases). It
+ * waits (a bounded time) for that before offering a command, and says what
+ * it installs whenever that is not this server's release.
+ */
+function InstallCommandLine() {
+  const release = usePlaneRelease()
+  if (release.pending) return <Skeleton className="mt-1 h-8 w-full" />
+  return (
+    <>
+      <CommandLine command={installCommand(release.install)} />
+      {release.install.kind !== 'release' && (
+        <WorkerInstallNote install={release.install} />
+      )}
+    </>
+  )
+}
 
 /** Mesh state for the Worker Nodes page; polls faster while it comes up. */
 export function useWireguardMesh() {
@@ -177,7 +206,7 @@ function GenerateTokenFirst({ missing }: { missing: MissingJoinToken }) {
         ) : (
           <Key className="mr-1 h-4 w-4" />
         )}
-        Generate Join Token
+        Generate join token
       </Button>
     </div>
   )
@@ -237,13 +266,11 @@ export function WorkerJoinGuide({
         value={activePath}
         onValueChange={(value) => setPath(value as JoinPath)}
       >
-        <TabsList className="grid w-full grid-cols-2">
-          <TabsTrigger value="private" className="gap-1.5">
-            <Network className="h-4 w-4" />
+        <TabsList className="w-full">
+          <TabsTrigger value="private" icon={Network}>
             Same private network
           </TabsTrigger>
-          <TabsTrigger value="internet" className="gap-1.5">
-            <Globe className="h-4 w-4" />
+          <TabsTrigger value="internet" icon={Globe}>
             Over the internet
           </TabsTrigger>
         </TabsList>
@@ -257,7 +284,7 @@ export function WorkerJoinGuide({
             server — for example a Hetzner vSwitch or an AWS VPC.
           </p>
           <Step number={1} title="Install Temps on the worker">
-            <CommandLine command={INSTALL_COMMAND} />
+            <InstallCommandLine />
           </Step>
           <Step number={2} title="Join the cluster">
             {missingToken ? (
@@ -273,7 +300,7 @@ export function WorkerJoinGuide({
               </>
             )}
           </Step>
-          <Step number={3} title="Start the agent, as root">
+          <Step number={3} title="Start the agent">
             <CommandLine command={AGENT_SERVICE_COMMAND} />
             <p className="mt-1 text-xs">
               Runs the worker as a systemd service that restarts on failure and
@@ -434,8 +461,33 @@ function UrlJoin({
   missingToken?: MissingJoinToken
   urlReachable: boolean
 }) {
+  if (offersOutboundJoin(mesh, url)) {
+    return <OutboundJoin mesh={mesh} url={url} />
+  }
+  const httpsOnlyMissing =
+    urlReachable &&
+    !joinUrlIsHttps(url) &&
+    !!mesh.control_plane?.endpoint?.trim() &&
+    !mesh.control_plane.endpoint_is_private
   return (
     <>
+      {httpsOnlyMissing && (
+        <Alert className="border-amber-500/30 bg-amber-500/5">
+          <AlertTriangle className="h-4 w-4 text-amber-500" />
+          <AlertTitle className="text-amber-700 dark:text-amber-400">
+            Joining without a worker address needs HTTPS
+          </AlertTitle>
+          <AlertDescription className="text-amber-700 dark:text-amber-300">
+            {url} is plain HTTP. A worker that joins with no address trusts what
+            this server answers, so <code>temps join</code> only does it over
+            HTTPS.{' '}
+            <Link to="/settings" className="font-medium underline">
+              Set an https:// external URL
+            </Link>{' '}
+            to join workers with no public IP; until then, use the steps below.
+          </AlertDescription>
+        </Alert>
+      )}
       {!urlReachable && (
         <Alert className="border-amber-500/30 bg-amber-500/5">
           <AlertTriangle className="h-4 w-4 text-amber-500" />
@@ -462,19 +514,33 @@ function UrlJoin({
             The mesh endpoint is {mesh.control_plane.endpoint}, which a machine
             on the internet cannot reach. Pair workers from here instead (This
             server reaches the worker), or start <code>temps serve</code> with{' '}
-            <code>--private-address &lt;this server&apos;s public IP&gt;</code>.
+            <code>--private-address &lt;this server&apos;s public IP&gt;</code>{' '}
+            (or <code>--wg-endpoint &lt;public-ip&gt;:&lt;port&gt;</code> when
+            it is behind NAT).
           </AlertDescription>
         </Alert>
       )}
       <Step number={1} title="Open the mesh port">
         <p className="mt-1">
-          Allow UDP <code>{mesh.listen_port}</code> in from the other nodes on
-          this server and on the new worker (your provider&apos;s firewall and
-          any host firewall).
+          {controlPlaneMeshPort(mesh) === mesh.listen_port ? (
+            <>
+              Allow UDP <code>{mesh.listen_port}</code> in from the other nodes
+              on this server and on the new worker (your provider&apos;s
+              firewall and any host firewall).
+            </>
+          ) : (
+            <>
+              Allow UDP <code>{controlPlaneMeshPort(mesh)}</code> in from the
+              other nodes on this server (forwarded to its port{' '}
+              <code>{mesh.listen_port}</code>), and UDP{' '}
+              <code>{mesh.listen_port}</code> on the new worker (your
+              provider&apos;s firewall and any host firewall).
+            </>
+          )}
         </p>
       </Step>
       <Step number={2} title="Install Temps on the worker">
-        <CommandLine command={INSTALL_COMMAND} />
+        <InstallCommandLine />
       </Step>
       <Step number={3} title="Join the cluster">
         {missingToken ? (
@@ -490,7 +556,7 @@ function UrlJoin({
           </>
         )}
       </Step>
-      <Step number={4} title="Start the agent, as root">
+      <Step number={4} title="Start the agent">
         <CommandLine command={AGENT_SERVICE_COMMAND} />
         <p className="mt-1 text-xs">
           The worker registers on the mesh and shows as Connected below within a
@@ -500,6 +566,141 @@ function UrlJoin({
             temps agent --wg-endpoint &lt;public-ip&gt;:{mesh.listen_port}
           </code>
           .
+        </p>
+      </Step>
+    </>
+  )
+}
+
+/**
+ * The outbound join takes a per-node enrollment token, never the shared join
+ * token (the server refuses it there: it has no use count). Each command
+ * carries a fresh single-use token that expires in an hour.
+ */
+function OutboundJoinCommand({ url }: { url: string }) {
+  const { handleSensitiveActionError, verificationDialog } =
+    useSensitiveActionVerification()
+  const mint = useMutation({
+    ...mintEnrollmentTokenMutation(),
+    onError: (error, variables) => {
+      if (handleSensitiveActionError(error, () => mint.mutate(variables)))
+        return
+      toast.error('Could not create the join command', {
+        description: problemDetail(error, 'Try again.'),
+      })
+    },
+  })
+  const create = () =>
+    mint.mutate({ body: { max_uses: 1, ttl_secs: ENROLLMENT_TOKEN_TTL_SECS } })
+  if (!mint.data) {
+    return (
+      <div className="mt-1 space-y-2 rounded-md border bg-background p-3">
+        <p>
+          The command carries a single-use enrollment token for one worker. It
+          expires in an hour and is shown once.
+        </p>
+        <Button
+          type="button"
+          size="sm"
+          onClick={create}
+          disabled={mint.isPending}
+        >
+          {mint.isPending ? (
+            <Loader2 className="mr-1 h-4 w-4 animate-spin" />
+          ) : (
+            <Key className="mr-1 h-4 w-4" />
+          )}
+          Create join command
+        </Button>
+        {verificationDialog}
+      </div>
+    )
+  }
+  return (
+    <>
+      <CommandLine command={outboundJoinCommand(url, mint.data.token)} />
+      <p className="mt-1 text-xs">
+        Shown once. The token registers one worker and expires{' '}
+        <TimeAgo date={mint.data.expires_at} />.{' '}
+        <Button
+          type="button"
+          variant="link"
+          size="sm"
+          className="h-auto p-0 text-xs"
+          onClick={create}
+          disabled={mint.isPending}
+        >
+          Create another
+        </Button>
+      </p>
+      {verificationDialog}
+    </>
+  )
+}
+
+const ENROLLMENT_TOKEN_TTL_SECS = 3600
+
+/**
+ * The worker joins with no public address (ADR 055): it sends its WireGuard
+ * key over HTTPS and dials this server, so only this server's mesh port has
+ * to be open.
+ */
+function OutboundJoin({
+  mesh,
+  url,
+}: {
+  mesh: WireguardMeshStatusResponse
+  url: string
+}) {
+  const port = controlPlaneMeshPort(mesh)
+  const peers = outboundPeerReach(mesh.hub)
+  return (
+    <>
+      <Step number={1} title="Open the mesh port on this server">
+        <p className="mt-1">
+          Allow UDP <code>{port}</code> in on this server
+          {port !== mesh.listen_port && (
+            <>
+              {' '}
+              (forwarded to its port <code>{mesh.listen_port}</code>)
+            </>
+          )}{' '}
+          in your provider&apos;s firewall and any host firewall. Nothing has to
+          be opened on the worker: it dials out.
+        </p>
+      </Step>
+      <Step number={2} title="Install Temps on the worker">
+        <InstallCommandLine />
+      </Step>
+      <Step number={3} title="Join the cluster">
+        <OutboundJoinCommand url={url} />
+        <p className="mt-1 text-xs">
+          The worker sends its WireGuard key to this server over HTTPS, brings
+          the mesh up by dialing <code>{mesh.control_plane?.endpoint}</code> and
+          registers under its mesh address. It needs no public IP.
+        </p>
+      </Step>
+      <Step number={4} title="Start the agent">
+        <CommandLine command={AGENT_SERVICE_COMMAND} />
+        <p className="mt-1 text-xs">
+          The worker shows as Connected below within a minute. {WITHOUT_SYSTEMD}
+        </p>
+        <p className="mt-1 text-xs">
+          {'via' in peers ? (
+            <>Other workers reach it through {peers.via}, the mesh hub.</>
+          ) : (
+            <>
+              With more than one worker joined this way, choose a hub in{' '}
+              <strong>Mesh hub</strong> on this page (this server is the usual
+              choice, since every such worker reaches it); without one, these
+              workers cannot reach each other.
+            </>
+          )}{' '}
+          To let other workers connect to it directly instead, start it with{' '}
+          <code>
+            temps agent --wg-endpoint &lt;public-ip&gt;:{mesh.listen_port}
+          </code>{' '}
+          and open that UDP port on the worker.
         </p>
       </Step>
     </>
@@ -564,6 +765,12 @@ function PairNode({ mesh }: { mesh: WireguardMeshStatusResponse }) {
         server — for example this server runs on a laptop or behind NAT. This
         server dials the worker; no private key leaves either machine.
       </p>
+      <p className="text-xs">
+        For a Linux worker. A Mac cannot be paired: its end of the mesh runs
+        inside its Docker app, which nothing can dial. Add a Mac with{' '}
+        <strong>Add worker</strong> and choose <strong>Mac</strong>; it dials
+        this server instead.
+      </p>
       <Step number={1} title="Open the mesh port on the worker">
         <p className="mt-1">
           Allow UDP <code>{mesh.listen_port}</code> in on the worker (your
@@ -571,10 +778,7 @@ function PairNode({ mesh }: { mesh: WireguardMeshStatusResponse }) {
           needs to reach out.
         </p>
       </Step>
-      <Step number={2} title="Install Temps on the worker">
-        <CommandLine command={INSTALL_COMMAND} />
-      </Step>
-      <Step number={3} title="Create the pairing">
+      <Step number={2} title="Create the pairing">
         <form
           className="mt-2 grid gap-2 sm:grid-cols-[1fr_1fr_auto] sm:items-end"
           onSubmit={(event) => {
@@ -616,7 +820,7 @@ function PairNode({ mesh }: { mesh: WireguardMeshStatusResponse }) {
           onCreateAgain={() =>
             create.mutate({
               body: {
-                address: address.trim() || created.pairing.node_endpoint,
+                address: address.trim() || created.pairing.node_endpoint || '',
                 name: name.trim() || null,
               },
             })
@@ -647,6 +851,9 @@ function CreatedPairing({
 }) {
   const { data } = usePairings()
   const now = useNow(15_000)
+  // The server pins the command to the release it runs; this reads the
+  // same version to say which one, as the Add worker panel does.
+  const release = usePlaneRelease()
   const listed = data?.pairings.find((pairing) => pairing.id === created.id)
   const pairing = pairingAsOf(listed ?? created, now)
   const { label, tone, hint } = pairingProgress(pairing)
@@ -658,7 +865,7 @@ function CreatedPairing({
 
   if (pairingEnded(pairing)) {
     return (
-      <Step number={4} title={`Run the pairing command on ${pairing.name}`}>
+      <Step number={3} title={`Run the pairing command on ${pairing.name}`}>
         <Alert className="mt-1 border-amber-500/30 bg-amber-500/5">
           <AlertTriangle className="h-4 w-4 text-amber-500" />
           <AlertTitle className="text-amber-700 dark:text-amber-400">
@@ -671,8 +878,14 @@ function CreatedPairing({
               Its command no longer works.{' '}
               {pairing.status === 'expired' &&
                 'The node did not answer before it expired. '}
-              A new pairing for <code>{pairing.node_endpoint}</code> gives a new
-              command.
+              {pairing.node_endpoint ? (
+                <>
+                  A new pairing for <code>{pairing.node_endpoint}</code> gives a
+                  new command.
+                </>
+              ) : (
+                'A new pairing gives a new command.'
+              )}
             </p>
             <Button
               type="button"
@@ -696,20 +909,30 @@ function CreatedPairing({
 
   if (pairing.status === 'completed') {
     return (
-      <Step number={4} title={`Start the agent on ${pairing.name}, as root`}>
+      <Step number={3} title={`${pairing.name} joined`}>
         <div className="mt-1 flex items-center gap-2">
           <CheckCircle2 className="h-4 w-4 text-green-600" />
           <span>{pairing.name} is on the mesh.</span>
           {badge}
         </div>
+        <p className="mt-1 text-xs">
+          The command starts the agent service once the worker has joined. If it
+          stopped before that, start it on the worker with:
+        </p>
         <CommandLine command={AGENT_SERVICE_COMMAND} />
       </Step>
     )
   }
 
   return (
-    <Step number={4} title={`Run this on ${pairing.name}, as root`}>
-      <CommandLine command={command} />
+    <Step number={3} title={`Run this on ${pairing.name}`}>
+      <div className="mt-1">
+        <WorkerJoinScript
+          command={command}
+          install={release.install}
+          pending={release.pending}
+        />
+      </div>
       <div className="mt-1 flex flex-wrap items-center gap-2 text-xs">
         {badge}
         <span>
@@ -722,16 +945,15 @@ function CreatedPairing({
         </p>
       )}
       <p className="mt-1 text-xs">
-        It holds a one-time secret and is shown only now. It waits until this
-        server reaches it at <code>{pairing.node_endpoint}</code>, brings the
-        mesh up and registers. Then start the worker with{' '}
-        <code>{AGENT_SERVICE_COMMAND}</code>.
+        It holds a one-time secret and is shown only now. It installs Temps,
+        then waits until this server reaches it at{' '}
+        <code>{pairing.node_endpoint}</code>, brings the mesh up and registers,
+        then starts the agent service.
       </p>
       <p className="mt-1 text-xs">
-        The code is piped to <code>temps join --pair -</code> so it never shows
-        in the process list, and the leading space keeps the line out of the
-        shell history. Not in a root shell? Put <code>sudo</code> right before{' '}
-        <code>temps join</code>, after the <code>|</code>.
+        The code is piped to <code>temps join --pair -</code>, so it never shows
+        in the process list or in sudo&apos;s log, and the leading space keeps
+        the command out of the shell history.
       </p>
     </Step>
   )
@@ -778,7 +1000,7 @@ function PendingPairings() {
               <p className="font-medium text-foreground">
                 {pairing.name}{' '}
                 <span className="font-mono text-muted-foreground">
-                  {pairing.node_endpoint}
+                  {pairing.node_endpoint ?? 'joined outbound'}
                 </span>
               </p>
               {hint && (
@@ -864,17 +1086,26 @@ function MeshOnboarding({ mesh }: { mesh: WireguardMeshStatusResponse }) {
       </div>
       <ul className="list-disc space-y-1 pl-5 text-xs">
         <li>
+          Nodes get mesh addresses from <code>{mesh.pool_cidr}</code>, separate
+          from the range containers use.
+        </li>
+        <li>
           Every node must accept UDP <code>{mesh.listen_port}</code> from the
           other nodes.
         </li>
-        <li>Nodes run Linux with kernel WireGuard (5.6 or newer).</li>
+        <li>
+          Nodes run Linux with kernel WireGuard (5.6 or newer), or macOS with a
+          Docker app whose VM holds the node&apos;s end of the mesh.
+        </li>
         <li>
           Workers already on your private network keep using it. Once on, the
           mesh stays on.
         </li>
       </ul>
 
-      {mesh.enable_blocker ? (
+      {mesh.ca_rotation_required ? (
+        <MeshCaRotationRequired mesh={mesh} />
+      ) : mesh.enable_blocker ? (
         <Alert className="border-amber-500/30 bg-amber-500/5">
           <AlertTriangle className="h-4 w-4 text-amber-500" />
           <AlertTitle className="text-amber-700 dark:text-amber-400">

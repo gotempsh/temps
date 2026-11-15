@@ -71,6 +71,8 @@ pub struct MockOtelStorage {
     pub fail_store_logs: Arc<Mutex<Option<String>>>,
     /// [`StorageErrorKind`] stamped onto the injected `fail_store_logs` error.
     pub fail_store_logs_kind: Arc<Mutex<Option<StorageErrorKind>>>,
+    /// Fail only the first N attempts when set, allowing retry recovery tests.
+    pub fail_store_logs_times: Arc<Mutex<Option<u32>>>,
     /// Total number of `store_logs` invocations, including failed ones.
     /// Mirrors `store_spans_calls`.
     pub store_logs_calls: Arc<Mutex<u32>>,
@@ -435,9 +437,24 @@ impl OtelStorage for MockOtelStorage {
     }
 
     async fn store_logs(&self, records: Vec<LogRecord>) -> StorageResult<u64> {
-        *self.store_logs_calls.lock().unwrap() += 1;
+        let call = {
+            let mut calls = self.store_logs_calls.lock().unwrap();
+            *calls += 1;
+            *calls
+        };
 
-        if let Some(msg) = self.fail_store_logs.lock().unwrap().as_ref() {
+        let should_fail = self
+            .fail_store_logs_times
+            .lock()
+            .unwrap()
+            .is_none_or(|times| call <= times);
+        if let Some(msg) = self
+            .fail_store_logs
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|_| should_fail)
+        {
             return Err(OtelError::Storage {
                 message: msg.clone(),
                 kind: self
@@ -1172,6 +1189,7 @@ pub fn metric_point(
     attributes: &[(&str, &str)],
 ) -> MetricPoint {
     MetricPoint {
+        ingest_identity: None,
         project_id,
         deployment_id: None,
         resource: ResourceInfo {

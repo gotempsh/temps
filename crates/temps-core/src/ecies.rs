@@ -91,7 +91,7 @@ pub fn encrypt_for_edge(
     let shared_secret = ephemeral_secret.diffie_hellman(&recipient_pk);
 
     // HKDF-SHA256: derive AES-256-GCM key
-    let aes_key = derive_aes_key(shared_secret.as_bytes())?;
+    let aes_key = derive_aes_key(shared_secret.as_bytes(), HKDF_INFO)?;
 
     // Generate random nonce
     let mut nonce_bytes = [0u8; NONCE_SIZE];
@@ -128,6 +128,14 @@ pub struct EncryptionSession {
 impl EncryptionSession {
     /// Create a new session for a specific edge node's public key.
     pub fn new(recipient_public_key_b64: &str) -> Result<Self, EciesError> {
+        Self::with_info(recipient_public_key_b64, HKDF_INFO)
+    }
+
+    /// [`Self::new`] under another HKDF info string, so a payload sealed
+    /// for one purpose (e.g. `temps-shield-keys-v1`) can never be opened as
+    /// another. Open it with [`decrypt_bundle_with_info`] and the same
+    /// string.
+    pub fn with_info(recipient_public_key_b64: &str, info: &[u8]) -> Result<Self, EciesError> {
         let recipient_pk_bytes = BASE64
             .decode(recipient_public_key_b64)
             .map_err(|e| EciesError::InvalidPublicKey(format!("base64 decode: {}", e)))?;
@@ -144,7 +152,7 @@ impl EncryptionSession {
         let ephemeral_secret = generate_x25519_static_secret()?;
         let ephemeral_public = x25519_dalek::PublicKey::from(&ephemeral_secret);
         let shared_secret = ephemeral_secret.diffie_hellman(&recipient_pk);
-        let aes_key = derive_aes_key(shared_secret.as_bytes())?;
+        let aes_key = derive_aes_key(shared_secret.as_bytes(), info)?;
 
         let cipher = Aes256Gcm::new_from_slice(&aes_key)
             .map_err(|e| EciesError::EncryptionFailed(format!("cipher init: {}", e)))?;
@@ -184,10 +192,24 @@ pub fn decrypt_bundle(
     ephemeral_public_key_b64: &str,
     bundle: &EncryptedBundle,
 ) -> Result<Vec<u8>, EciesError> {
+    decrypt_bundle_with_info(private_key_b64, ephemeral_public_key_b64, bundle, HKDF_INFO)
+}
+
+/// [`decrypt_bundle`] for a bundle sealed by [`EncryptionSession::with_info`]
+/// under `info`.
+pub fn decrypt_bundle_with_info(
+    private_key_b64: &str,
+    ephemeral_public_key_b64: &str,
+    bundle: &EncryptedBundle,
+    info: &[u8],
+) -> Result<Vec<u8>, EciesError> {
     // Decode private key
-    let sk_bytes = BASE64
-        .decode(private_key_b64)
-        .map_err(|e| EciesError::InvalidPrivateKey(format!("base64 decode: {}", e)))?;
+    let sk_bytes = BASE64.decode(private_key_b64).map_err(|e| {
+        EciesError::InvalidPrivateKey(format!(
+            "base64 decode: {}",
+            crate::encryption::describe_base64_error(&e)
+        ))
+    })?;
     if sk_bytes.len() != 32 {
         return Err(EciesError::InvalidPrivateKey(format!(
             "expected 32 bytes, got {}",
@@ -216,7 +238,7 @@ pub fn decrypt_bundle(
     let shared_secret = secret.diffie_hellman(&ephemeral_pk);
 
     // HKDF-SHA256: derive AES-256-GCM key
-    let aes_key = derive_aes_key(shared_secret.as_bytes())?;
+    let aes_key = derive_aes_key(shared_secret.as_bytes(), info)?;
 
     // Decode nonce and ciphertext
     let nonce_bytes = BASE64
@@ -246,10 +268,10 @@ pub fn decrypt_bundle(
 }
 
 /// Derive a 32-byte AES key from the ECDH shared secret using HKDF-SHA256.
-fn derive_aes_key(shared_secret: &[u8]) -> Result<[u8; 32], EciesError> {
+fn derive_aes_key(shared_secret: &[u8], info: &[u8]) -> Result<[u8; 32], EciesError> {
     let hk = Hkdf::<Sha256>::new(None, shared_secret);
     let mut key = [0u8; 32];
-    hk.expand(HKDF_INFO, &mut key)
+    hk.expand(info, &mut key)
         .map_err(|e| EciesError::EncryptionFailed(format!("HKDF expand: {}", e)))?;
     Ok(key)
 }
@@ -293,6 +315,21 @@ pub fn cert_fingerprint(cert_pem: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_private_key_error_does_not_name_the_rejected_symbol() {
+        let bundle = EncryptedBundle {
+            ciphertext: String::new(),
+            nonce: String::new(),
+        };
+        // `!` is byte 33.
+        let error = decrypt_bundle_with_info("secret!key", "", &bundle, b"info").unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Invalid private key: base64 decode: Invalid symbol at offset 6."
+        );
+    }
 
     struct FailingCryptoRng;
 
@@ -345,6 +382,22 @@ mod tests {
             decrypt_bundle(&private_key, session.ephemeral_public_key(), &bundle).unwrap();
 
         assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn a_session_under_another_info_string_opens_only_with_it() {
+        let (private_key, public_key) = generate_test_keypair();
+        let session = EncryptionSession::with_info(&public_key, b"temps-shield-keys-v1").unwrap();
+        let bundle = session.encrypt(b"shield keys").unwrap();
+        let epk = session.ephemeral_public_key();
+        assert_eq!(
+            decrypt_bundle_with_info(&private_key, epk, &bundle, b"temps-shield-keys-v1").unwrap(),
+            b"shield keys"
+        );
+        assert!(matches!(
+            decrypt_bundle(&private_key, epk, &bundle),
+            Err(EciesError::DecryptionFailed(_))
+        ));
     }
 
     #[test]

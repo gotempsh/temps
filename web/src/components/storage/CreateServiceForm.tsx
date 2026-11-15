@@ -40,7 +40,7 @@ import { useForm, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
 import * as z from 'zod'
 
-import { problemDetail } from '@/lib/api-problem'
+import { handleServiceCreateError } from '@/lib/service-create-error'
 
 import { advancedParamsHint } from '@/lib/service-link-copy'
 import {
@@ -359,23 +359,14 @@ export function CreateServiceForm({
     meta: {
       errorTitle: 'Failed to create service',
     },
-    onError: (error) => {
-      if (
-        error &&
-        typeof error === 'object' &&
-        'error_code' in error &&
-        error.error_code === 'SERVICE_NAME_CONFLICT'
-      ) {
+    onError: (error, _variables, _onMutateResult, context) =>
+      handleServiceCreateError(error, context, (message) => {
         form.setError(
           'name',
-          {
-            type: 'server',
-            message: problemDetail(error, 'Choose a unique service name.'),
-          },
+          { type: 'server', message },
           { shouldFocus: true }
         )
-      }
-    },
+      }),
     onSuccess: (data) => {
       completeServiceCreation({
         createdService: data,

@@ -92,7 +92,7 @@ catalog.
 | Observability | — | — |
 | Data & Storage | `navigation` (databases page only) | — |
 | AI | `ai-chat-layout` | — |
-| Security & Auth | `auth`, `user-creation`, `api-key-create` | `cli-scenario` (apikeys read paths) |
+| Security & Auth | `auth`, `user-creation`, `api-key-create`, `edge-rules` | `cli-scenario` (apikeys read paths), `edge-rules-scenario` |
 | Platform & Commerce | `command-palette`, `preview-share-link`, `email-provider-mailpit` | `email-scenario` |
 
 Rows with only a dash are not covered end-to-end yet — tracked gaps, not
@@ -156,6 +156,47 @@ bun run e2e:report                # open the HTML report after a run
 
 First run only: `bunx playwright install chromium`.
 
+### Deployment health probes
+
+`authenticated/health-probes.spec.ts` drives real HTTP/TCP/process/exec gates
+through the generated SDK using the browser's authenticated session. It builds
+three uniquely tagged BusyBox fixtures (HTTP, portless worker, delayed crash),
+pushes them to a disposable registry, and deploys them through the live API.
+No API responses or database rows are mocked. CI enables this scenario in
+`e2e-tests.yml` and provisions its own registry.
+
+For a local run, start a disposable Temps slot from this checkout and supply a
+registry that both its Docker daemon and the test runner can reach. The runner
+and Temps must use the same Docker daemon: this single-node scenario inspects
+its retained candidate directly to verify it stopped. Use your slot's console
+and public proxy ports, and provide login credentials through the usual
+`E2E_EMAIL` / `E2E_PASSWORD` variables:
+
+```bash
+cd web
+E2E_BASE_URL=http://localhost:8141 \
+HEALTH_PROBE_E2E_PROXY_URL=http://localhost:8140 \
+HEALTH_PROBE_E2E_REGISTRY=localhost:5113 \
+  bun run e2e -- health-probes.spec.ts --workers=1
+```
+
+The scenario checks default HTTP and explicit TCP success, closed-port failure
+for both, process crash after startup, exec nonzero/missing command/timeout,
+unknown-kind rejection, current-deployment preservation after failed probes,
+default process selection for portless images, persisted health metadata,
+probe-selector persistence after switching away from invalid hidden fields,
+worker presentation, disappearance of the prior HTTP response, sanitized
+retained failure details, and exec gating during rollback and promotion.
+The oversized exec output exercises the live capture path; exact byte
+truncation and cancellation races remain covered by the Rust protocol tests.
+
+It cleans up only its own deployment IDs, project, scratch directory and image
+tags. It never prunes Docker or modifies unrelated resources. Without
+`HEALTH_PROBE_E2E_REGISTRY`, the scenario is explicitly skipped; a skipped
+scenario is not evidence of a passing live deployment test. Allow up to
+15 minutes on a cold runner. Multi-node route/DNS acknowledgements and remote
+agent cleanup still need a separate cluster E2E run.
+
 `domain-tls-pebble` and `email-provider-mailpit` need a **dedicated** instance,
 not a normal `start-temps` slot: `--address` must be `0.0.0.0:5002` specifically
 (Pebble's fixed HTTP-01 validation port), plus `ACME_DIRECTORY_URL`/
@@ -196,3 +237,46 @@ will serve them -- the assets are compiled in, so restarting alone is not enough
   Playwright resolves a glob relative to it, so `waitForURL('**/projects')`
   never matches `http://host/projects` and fails with an opaque 30s timeout.
   Use the exported `URL_PROJECTS` / `URL_LOGIN` / `urlForProject()`.
+
+### Continuous runtime health
+
+`authenticated/runtime-health.spec.ts` uses the same disposable-instance and
+`HEALTH_PROBE_E2E_REGISTRY` setup as the deployment probe suite. It deploys a
+real HTTP workload, removes/restores its health file, verifies sustained-failure
+alarm delivery and recovery, then deploys a portless worker. It checks immutable
+effective configuration, honest coverage, pause/resume and the explicit runtime
+exec limitation. Every image, container and project is owned by that run.
+
+```sh
+bun run e2e -- runtime-health.spec.ts --workers=1
+```
+
+The distributed scenario is separate from browser tests. Build a Linux Temps
+binary from this checkout in the existing dev-cluster image with a dedicated
+Docker target volume, then run from the repository root:
+
+```sh
+python3 tools/dev-cluster/runtime-health-e2e.py \
+  --image temps-runtime-e2e:local \
+  --target-volume temps-runtime-e2e-target \
+  --binary /workspace/target/fast/temps
+```
+
+It starts an initially empty control plane with no Docker daemon, socket or
+privileged container, plus two distinct mTLS DinD workers. It checks late remote
+placement, process/HTTP/TCP probes, application-failure and recovery alarms,
+replica aggregation, node loss, monitoring-loss alarms, worker restart
+and control-plane restart. The current checkout and prebuilt target are mounted
+read-only. The generated bootstrap state stays in private temporary volumes.
+The random Compose project owns every mutable resource and removes only those
+resources on success or failure; the external target volume is preserved.
+`GeoLite2-City.mmdb` must already exist under `crates/temps-cli/`.
+
+The distributed scenario then moves the same control-plane identity onto one
+worker while that worker’s agent remains running. A three-replica deployment
+uses local embedded, co-located agent and separate remote placements together.
+
+The Rust Docker adapter tests additionally run a second OS process to verify
+cross-process container exclusion and exercise the shared four-slot budget for
+co-located embedded and agent roles. These are component checks; they do not
+replace testing separately hosted control-plane and agent processes together.

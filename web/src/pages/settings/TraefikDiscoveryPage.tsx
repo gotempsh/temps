@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import { PageHeader } from '@temps-sdk/ds'
 import { HighlightedCode } from '@/components/ui/code-block'
 
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
@@ -15,6 +16,7 @@ import { CopyButton } from '@/components/ui/copy-button'
 import { ResponsivePagination } from '@/components/ui/responsive-pagination'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Switch } from '@/components/ui/switch'
+import { ScrollRegion } from '@/components/ui/scroll-region'
 import {
   Table,
   TableBody,
@@ -40,12 +42,7 @@ import type {
 } from '@/api/client/types.gen'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { formatDistanceToNow } from 'date-fns'
-import {
-  AlertCircle,
-  AlertTriangle,
-  CheckCircle2,
-  Waypoints,
-} from 'lucide-react'
+import { AlertCircle, AlertTriangle, CheckCircle2 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { toast } from 'sonner'
 
@@ -118,9 +115,14 @@ function TlsStatusCell({
           HTTPS will fail — no cert authorized
         </span>
         <span className="flex items-start justify-between gap-1 rounded-md bg-muted px-1.5 py-1">
-          <code className="overflow-x-auto whitespace-nowrap font-mono text-[11px] leading-relaxed">
-            {requestCommand}
-          </code>
+          <ScrollRegion
+            className="min-w-0"
+            regionLabel="Request-certificate command, scrollable"
+          >
+            <code className="block w-max whitespace-nowrap font-mono text-[11px] leading-relaxed">
+              {requestCommand}
+            </code>
+          </ScrollRegion>
           <CopyButton
             value={requestCommand}
             minimal
@@ -575,11 +577,11 @@ export function TraefikDiscoveryPage() {
   useEffect(() => {
     setBreadcrumbs([
       { label: 'Settings', href: '/settings' },
-      { label: 'Traefik Discovery' },
+      { label: 'Traefik discovery' },
     ])
   }, [setBreadcrumbs])
 
-  usePageTitle('Traefik Discovery')
+  usePageTitle('Traefik discovery')
 
   const {
     data: status,
@@ -656,18 +658,17 @@ export function TraefikDiscoveryPage() {
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-col gap-1">
-        <div className="flex items-center gap-2">
-          <Waypoints className="h-5 w-5 text-muted-foreground" />
-          <h1 className="text-xl font-semibold">Traefik Discovery</h1>
-        </div>
-        <p className="text-sm text-muted-foreground">
-          Route containers Temps did not deploy by reading the Traefik labels
-          they already carry, so an existing docker-compose, Coolify or Dokploy
-          stack becomes reachable through this instance without changing those
-          containers.
-        </p>
-      </div>
+      <PageHeader
+        title="Traefik discovery"
+        description={
+          <>
+            Route containers Temps did not deploy by reading the Traefik labels
+            they already carry, so an existing docker-compose, Coolify or
+            Dokploy stack becomes reachable through this instance without
+            changing those containers.
+          </>
+        }
+      />
 
       {/* Status — always rendered. When discovery is off this is the onboarding
           surface, not an empty page: the feature has to explain itself. */}

@@ -21,6 +21,7 @@ use sea_orm::{
 use temps_ai_api_tools::{ApiCallScope, ProjectSelectorScope, WriteApiToolsHandle};
 use temps_auth::context::AuthContext;
 use temps_auth::permissions::Permission;
+use temps_core::ai_tool_call::AiToolOrigin;
 use temps_entities::ai_pending_actions;
 
 use crate::sensitive::{decrypt_value, encrypt_value, redact_text, redact_value};
@@ -55,8 +56,12 @@ pub enum PendingActionError {
     )]
     StepBlocked { step_index: i32, pending: usize },
 
-    #[error("permission '{permission}' is required to confirm this action")]
-    PermissionDenied { permission: String },
+    #[error("permission '{permission}' is required to {decision} pending action '{public_id}'")]
+    PermissionDenied {
+        public_id: String,
+        permission: String,
+        decision: &'static str,
+    },
 
     #[error("write action feature is not available (write caller not yet wired)")]
     Unavailable,
@@ -106,6 +111,43 @@ fn ensure_expected_status(
     })
 }
 
+/// Whether a reject must re-check the caller's authority over the action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RejectAuthority {
+    Check,
+    AlreadyChecked,
+}
+
+/// Rejecting a proposal decides its fate just as confirming does, so it takes
+/// the same authority: the permission the operation itself requires. Without
+/// this, a credential that could never approve an action, such as a read-only
+/// API key, could still discard one its owner meant to approve.
+///
+/// Unlike confirm, a reject executes nothing, so there is no router guard
+/// behind it to fall back on. An unknown permission therefore fails closed, as
+/// the inline approval prompt does, and an action that declares no permission
+/// requires `projects:write`, the gate the project-scoped reject route applies.
+fn ensure_reject_authority(
+    action: &ai_pending_actions::Model,
+    auth: &AuthContext,
+) -> Result<(), PendingActionError> {
+    let (required, name) = match action.required_permission.as_deref() {
+        Some(name) => (Permission::from_str(name), name.to_string()),
+        None => (
+            Some(Permission::ProjectsWrite),
+            Permission::ProjectsWrite.to_string(),
+        ),
+    };
+    if required.is_some_and(|permission| auth.has_permission(&permission)) {
+        return Ok(());
+    }
+    Err(PendingActionError::PermissionDenied {
+        public_id: action.public_id.clone(),
+        permission: name,
+        decision: "reject",
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Service
 // ---------------------------------------------------------------------------
@@ -116,6 +158,10 @@ pub struct PendingActionService {
     db: Arc<DatabaseConnection>,
     write_handle: Arc<WriteApiToolsHandle>,
     encryption: Arc<temps_core::EncryptionService>,
+    /// Where `secret_ref:` handles in an approved action's params are resolved
+    /// from. `None` means the action runs without secrets, and a handle in its
+    /// params is refused rather than sent as text.
+    secret_slots: Option<crate::secret_slots::SecretSlotService>,
 }
 
 impl PendingActionService {
@@ -128,7 +174,14 @@ impl PendingActionService {
             db,
             write_handle,
             encryption,
+            secret_slots: None,
         }
+    }
+
+    /// Let approved actions use the secrets the user provided in this chat.
+    pub fn with_secret_slots(mut self, slots: crate::secret_slots::SecretSlotService) -> Self {
+        self.secret_slots = Some(slots);
+        self
     }
 
     /// Insert a new `proposed` pending action row.
@@ -194,6 +247,7 @@ impl PendingActionService {
             message_id: Set(None),
             project_id: Set(project_id),
             operation_id: Set(prepared.operation_id.clone()),
+            plugin_revision: Set(prepared.plugin_revision.clone()),
             method: Set(prepared.method.clone()),
             summary: Set(prepared.summary.clone()),
             params: Set(
@@ -294,6 +348,7 @@ impl PendingActionService {
                 plan_public_id: Set(Some(plan_public_id.clone())),
                 step_index: Set(idx as i32),
                 operation_id: Set(prepared.operation_id.clone()),
+                plugin_revision: Set(prepared.plugin_revision.clone()),
                 method: Set(prepared.method.clone()),
                 summary: Set(prepared.summary.clone()),
                 params: Set(encrypted_params),
@@ -427,9 +482,17 @@ impl PendingActionService {
         public_id: &str,
         auth: &AuthContext,
         confirmed_by: Option<i32>,
+        origin: Option<AiToolOrigin>,
     ) -> Result<ai_pending_actions::Model, PendingActionError> {
-        self.confirm_with_status(project_id, public_id, auth, confirmed_by, "proposed")
-            .await
+        self.confirm_with_status(
+            project_id,
+            public_id,
+            auth,
+            confirmed_by,
+            origin,
+            "proposed",
+        )
+        .await
     }
 
     /// Resolve an action that belongs to the currently active inline waiter.
@@ -439,12 +502,14 @@ impl PendingActionService {
         public_id: &str,
         auth: &AuthContext,
         confirmed_by: Option<i32>,
+        origin: Option<AiToolOrigin>,
     ) -> Result<ai_pending_actions::Model, PendingActionError> {
         self.confirm_with_status(
             project_id,
             public_id,
             auth,
             confirmed_by,
+            origin,
             "awaiting_inline_approval",
         )
         .await
@@ -456,11 +521,22 @@ impl PendingActionService {
         public_id: &str,
         auth: &AuthContext,
         confirmed_by: Option<i32>,
+        origin: Option<AiToolOrigin>,
         expected_status: &str,
     ) -> Result<ai_pending_actions::Model, PendingActionError> {
         // 1. Load + project-scope check.
         let user_id = auth.user_id();
         let action = self.get(project_id, user_id, public_id).await?;
+
+        if temps_core::ai_tool_call::requires_human_consent(&action.operation_id)
+            && confirmed_by != Some(user_id)
+        {
+            return Err(PendingActionError::PermissionDenied {
+                public_id: public_id.to_owned(),
+                permission: "explicit human confirmation".into(),
+                decision: "confirm",
+            });
+        }
 
         // 2. Status pre-check. Project-level feature toggles do not participate
         // in authorization: the native harness approval and the confirming
@@ -479,7 +555,9 @@ impl PendingActionService {
             if let Some(perm) = Permission::from_str(perm_str) {
                 if !auth.has_permission(&perm) {
                     return Err(PendingActionError::PermissionDenied {
+                        public_id: public_id.to_string(),
                         permission: perm_str.clone(),
+                        decision: "confirm",
                     });
                 }
             }
@@ -539,15 +617,29 @@ impl PendingActionService {
             project_scope: project_id.map_or(ProjectSelectorScope::Unrestricted, |project_id| {
                 ProjectSelectorScope::Allowed(vec![project_id])
             }),
+            origin,
+            // Bound to the action's owner and conversation, so an action can
+            // only spend secrets its own user gave in its own chat.
+            secrets: self.secret_slots.as_ref().map(|slots| {
+                Arc::new(slots.resolver(user_id, action.conversation_id))
+                    as Arc<dyn temps_ai_api_tools::SecretResolver>
+            }),
         };
         let exec_result = caller
-            .execute_write(&action.operation_id, executable_params, &scope)
+            .execute_approved_write(
+                &action.operation_id,
+                executable_params,
+                &scope,
+                action.plugin_revision.as_deref(),
+                // The owner confirmed it here; the endpoint refuses assistants.
+                temps_ai_api_tools::WriteApproval::OwnerInApp,
+            )
             .await;
 
         // 8. Persist outcome regardless of success/failure.
         let updated = match exec_result {
             Ok(resp) => {
-                ai_pending_actions::ActiveModel {
+                let executed = ai_pending_actions::ActiveModel {
                     id: Set(action.id),
                     status: Set("executed".to_string()),
                     result: Set(Some(redact_value(&resp.body))),
@@ -557,7 +649,11 @@ impl PendingActionService {
                     ..Default::default()
                 }
                 .update(self.db.as_ref())
-                .await?
+                .await?;
+                // A deployment, backup or restore it started joins the chat's
+                // operations list.
+                crate::chat_operations::record_executed_action(self.db.as_ref(), &executed).await;
+                executed
             }
             Err(e) => {
                 let failed = ai_pending_actions::ActiveModel {
@@ -592,8 +688,15 @@ impl PendingActionService {
         auth: &AuthContext,
         rejected_by: Option<i32>,
     ) -> Result<ai_pending_actions::Model, PendingActionError> {
-        self.reject_with_status(project_id, public_id, auth, rejected_by, "proposed")
-            .await
+        self.reject_with_status(
+            project_id,
+            public_id,
+            auth,
+            rejected_by,
+            "proposed",
+            RejectAuthority::Check,
+        )
+        .await
     }
 
     pub async fn reject_inline(
@@ -609,6 +712,9 @@ impl PendingActionService {
             auth,
             rejected_by,
             "awaiting_inline_approval",
+            // The inline approval prompt already re-checked the operation's
+            // permission against this auth before handing over the decision.
+            RejectAuthority::AlreadyChecked,
         )
         .await
     }
@@ -620,6 +726,7 @@ impl PendingActionService {
         auth: &AuthContext,
         rejected_by: Option<i32>,
         expected_status: &str,
+        authority: RejectAuthority,
     ) -> Result<ai_pending_actions::Model, PendingActionError> {
         // Load first so we have the id and can return the updated row.
         let user_id = auth.user_id();
@@ -628,6 +735,10 @@ impl PendingActionService {
         // Name the real reason before attempting the claim: an inline approval
         // or an already-resolved action is not a "concurrent confirm/reject".
         ensure_expected_status(&action, public_id, expected_status)?;
+
+        if authority == RejectAuthority::Check {
+            ensure_reject_authority(&action, auth)?;
+        }
 
         let now = Utc::now();
 
@@ -791,6 +902,7 @@ mod tests {
 
     fn make_prepared() -> PreparedWrite {
         PreparedWrite {
+            plugin_revision: None,
             operation_id: "redeploy_deployment".to_string(),
             method: "POST".to_string(),
             path: "/projects/{project_id}/deployments/redeploy".to_string(),
@@ -804,6 +916,7 @@ mod tests {
     fn make_proposed(id: i64, public_id: &str, project_id: i32) -> ai_pending_actions::Model {
         let now = Utc::now();
         ai_pending_actions::Model {
+            plugin_revision: None,
             id,
             public_id: public_id.to_string(),
             conversation_id: 1,
@@ -832,6 +945,8 @@ mod tests {
         temps_entities::projects::Model {
             id,
             image_retention_hours: None,
+            log_ingest_lines_per_sec: None,
+            log_ingest_kib_per_sec: None,
             cloud_telemetry_fidelity:
                 temps_entities::cloud_telemetry_fidelity::CloudTelemetryFidelity::Metered,
             cloud_telemetry_write_mode:
@@ -860,6 +975,7 @@ mod tests {
             git_url: None,
             git_provider_connection_id: None,
             attack_mode: false,
+            shield_mode: "log".to_string(),
             ai_alert_summaries_enabled: None,
             ai_api_traffic_summary_enabled: None,
             allow_alternate_sources: None,
@@ -879,15 +995,26 @@ mod tests {
             gitlab_webhook_id: None,
             gitlab_webhook_signing_token: None,
             gitea_webhook_signing_token: None,
+            github_webhook_id: None,
+            github_webhook_signing_token: None,
             bitbucket_webhook_token: None,
             bitbucket_webhook_hook_id: None,
             generic_webhook_token: None,
             cross_project_trace_sharing: true,
+            serves_own_temps_api: false,
         }
     }
 
     fn make_auth() -> AuthContext {
-        let user = temps_entities::users::Model {
+        AuthContext::new_session(test_user(), temps_auth::permissions::Role::Admin)
+    }
+
+    fn api_key_with_role(role: temps_auth::permissions::Role) -> AuthContext {
+        AuthContext::new_api_key(test_user(), Some(role), None, "test-key".to_string(), 1)
+    }
+
+    fn test_user() -> temps_entities::users::Model {
+        temps_entities::users::Model {
             id: 1,
             name: "t".to_string(),
             email: "t@t.com".to_string(),
@@ -906,8 +1033,7 @@ mod tests {
             oidc_provider_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
-        };
-        AuthContext::new_session(user, temps_auth::permissions::Role::Admin)
+        }
     }
 
     fn noop_write_handle() -> Arc<WriteApiToolsHandle> {
@@ -966,7 +1092,7 @@ mod tests {
         let auth = make_auth();
 
         let error = svc
-            .confirm(Some(7), "inline", &auth, Some(auth.user_id()))
+            .confirm(Some(7), "inline", &auth, Some(auth.user_id()), None)
             .await
             .expect_err("legacy confirmation must reject inline lifecycle rows");
         assert!(matches!(
@@ -1070,6 +1196,41 @@ mod tests {
         assert!(log.contains("***"));
     }
 
+    #[tokio::test]
+    async fn standalone_and_plan_inserts_bind_plugin_revision() {
+        for plan in [false, true] {
+            let row = make_proposed(1, "approval", 7);
+            let db = Arc::new(
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results([vec![row]])
+                    .into_connection(),
+            );
+            let svc = PendingActionService::new(db.clone(), noop_write_handle(), test_encryption());
+            let mut prepared = make_prepared();
+            let revision = "00000000-0000-4000-8000-000000000123";
+            prepared.plugin_revision = Some(revision.into());
+            if plan {
+                svc.create_plan(1, Some(7), &[(prepared, None)], 1)
+                    .await
+                    .unwrap();
+            } else {
+                svc.create(1, Some(7), &prepared, None, 1).await.unwrap();
+            }
+            drop(svc);
+            let transactions = Arc::try_unwrap(db).unwrap().into_transaction_log();
+            let insert = transactions
+                .iter()
+                .flat_map(|t| t.statements())
+                .find(|s| s.sql.starts_with("INSERT"))
+                .unwrap();
+            assert!(insert.sql.contains("plugin_revision"));
+            assert!(
+                format!("{:?}", insert.values).contains(revision),
+                "{insert:?}"
+            );
+        }
+    }
+
     // get: not-found returns NotFound.
     #[tokio::test]
     async fn test_get_not_found_returns_error() {
@@ -1140,8 +1301,14 @@ mod tests {
             Err(PendingActionError::NotFound { .. })
         ));
         assert!(matches!(
-            svc.confirm(Some(7), "other-user-or-legacy", &auth, Some(auth.user_id()))
-                .await,
+            svc.confirm(
+                Some(7),
+                "other-user-or-legacy",
+                &auth,
+                Some(auth.user_id()),
+                None
+            )
+            .await,
             Err(PendingActionError::NotFound { .. })
         ));
         assert!(matches!(
@@ -1179,7 +1346,7 @@ mod tests {
         let svc = make_svc(db);
         let auth = make_auth();
         let err = svc
-            .confirm(Some(7), "abc", &auth, Some(1))
+            .confirm(Some(7), "abc", &auth, Some(1), None)
             .await
             .expect_err("empty write handle remains unavailable");
         assert!(matches!(err, PendingActionError::Unavailable));
@@ -1220,7 +1387,7 @@ mod tests {
         let svc = make_svc(db);
         let auth = make_auth();
         let err = svc
-            .confirm(Some(7), "abc", &auth, Some(1))
+            .confirm(Some(7), "abc", &auth, Some(1), None)
             .await
             .expect_err("should fail");
         assert!(
@@ -1250,7 +1417,7 @@ mod tests {
         let svc = make_svc(db);
         let auth = make_auth();
         let err = svc
-            .confirm(Some(7), "step2", &auth, Some(1))
+            .confirm(Some(7), "step2", &auth, Some(1), None)
             .await
             .expect_err("step 2 must be blocked until step 1 executes");
         assert!(
@@ -1301,6 +1468,108 @@ mod tests {
         assert!(result.is_ok(), "reject should succeed: {:?}", result.err());
         let m = result.unwrap();
         assert_eq!(m.status, "rejected");
+    }
+
+    /// A proposal recording `permission` the way the write tools prepare it.
+    fn proposed_requiring(public_id: &str, permission: Option<&str>) -> ai_pending_actions::Model {
+        let mut action = make_proposed(1, public_id, 7);
+        action.required_permission = permission.map(str::to_string);
+        action
+    }
+
+    // A read-only key can't confirm a proposal, so it must not be able to
+    // discard one either. The check runs before the claim: nothing is written.
+    #[tokio::test]
+    async fn read_only_api_keys_cannot_reject_a_proposal() {
+        for role in [
+            temps_auth::permissions::Role::Reader,
+            temps_auth::permissions::Role::ApiReader,
+        ] {
+            for permission in [Some("deployments:create"), None] {
+                let db = MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results(vec![vec![proposed_requiring("abc", permission)]])
+                    .into_connection();
+                let svc = make_svc(db);
+                let auth = api_key_with_role(role.clone());
+
+                let error = svc
+                    .reject(Some(7), "abc", &auth, Some(auth.user_id()))
+                    .await
+                    .expect_err("a read-only key must not reject a proposal");
+
+                let expected = permission.unwrap_or("projects:write");
+                assert!(
+                    matches!(
+                        &error,
+                        PendingActionError::PermissionDenied { public_id, permission, decision }
+                            if public_id == "abc" && permission == expected && *decision == "reject"
+                    ),
+                    "{role:?} / {permission:?}: {error:?}"
+                );
+            }
+        }
+    }
+
+    // Rejecting takes the operation's own permission, not a blanket project
+    // write: a role holding it may reject, a role without it may not.
+    #[tokio::test]
+    async fn reject_requires_the_permission_the_action_declares() {
+        let mut rejected = proposed_requiring("abc", Some("deployments:create"));
+        rejected.status = "rejected".to_string();
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![proposed_requiring(
+                "abc",
+                Some("deployments:create"),
+            )]])
+            .append_exec_results(vec![MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }])
+            .append_query_results(vec![vec![rejected]])
+            .into_connection();
+        let svc = make_svc(db);
+        let user = api_key_with_role(temps_auth::permissions::Role::User);
+        let result = svc
+            .reject(Some(7), "abc", &user, Some(user.user_id()))
+            .await
+            .expect("a user who could confirm the action may reject it");
+        assert_eq!(result.status, "rejected");
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![proposed_requiring("abc", Some("users:create"))]])
+            .into_connection();
+        let svc = make_svc(db);
+        let error = svc
+            .reject(Some(7), "abc", &user, Some(user.user_id()))
+            .await
+            .expect_err("a user who could not confirm the action may not reject it");
+        assert!(
+            matches!(&error, PendingActionError::PermissionDenied { permission, .. } if permission == "users:create"),
+            "{error:?}"
+        );
+    }
+
+    // There is no router guard behind a reject, so an unrecognised permission
+    // fails closed instead of passing like it does on confirm.
+    #[tokio::test]
+    async fn reject_fails_closed_on_an_unknown_permission() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![proposed_requiring(
+                "abc",
+                Some("not_a:permission"),
+            )]])
+            .into_connection();
+        let svc = make_svc(db);
+        let auth = make_auth();
+        let error = svc
+            .reject(Some(7), "abc", &auth, Some(auth.user_id()))
+            .await
+            .expect_err("an unknown permission cannot be satisfied");
+        assert!(
+            matches!(&error, PendingActionError::PermissionDenied { permission, .. } if permission == "not_a:permission"),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("reject pending action 'abc'"));
     }
 
     // reject on non-proposed → atomic update returns 0 rows → InvalidState.
@@ -1399,12 +1668,68 @@ mod tests {
         let svc = make_svc(db);
         let auth = make_auth();
         let err = svc
-            .confirm(Some(7), "abc", &auth, Some(1))
+            .confirm(Some(7), "abc", &auth, Some(1), None)
             .await
             .expect_err("should fail with Unavailable");
         assert!(
             matches!(err, PendingActionError::Unavailable),
             "unexpected: {err:?}"
         );
+    }
+
+    // A grant of internal access stays staged until its owner confirms that
+    // exact action: a confirmation not attributed to them (an automatic
+    // approval, an MCP client, anything the model produced) is refused before
+    // the row is claimed, so nothing executes.
+    #[tokio::test]
+    async fn an_internal_access_grant_runs_only_on_its_owners_confirmation() {
+        for operation in [
+            "create_internal_access_sandbox_grant",
+            "create_internal_access_grant",
+        ] {
+            for confirmed_by in [None, Some(2)] {
+                let mut action = make_proposed(1, "grant", 7);
+                action.operation_id = operation.to_string();
+                let db = MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results(vec![vec![action]])
+                    .into_connection();
+                let svc = make_svc(db);
+                let err = svc
+                    .confirm(Some(7), "grant", &make_auth(), confirmed_by, None)
+                    .await
+                    .expect_err("a grant without its owner's confirmation must not run");
+                assert!(
+                    matches!(
+                        err,
+                        PendingActionError::PermissionDenied { ref permission, .. }
+                            if permission == "explicit human confirmation"
+                    ),
+                    "{operation} {confirmed_by:?}: {err:?}"
+                );
+            }
+
+            // The owner's own confirmation goes on to claim and execute it
+            // (here the write handle is not wired, so it ends Unavailable).
+            let mut action = make_proposed(1, "grant", 7);
+            action.operation_id = operation.to_string();
+            let mut failed = action.clone();
+            failed.status = "failed".to_string();
+            let db = MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![action]])
+                .append_exec_results(vec![MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .append_query_results(vec![vec![failed]])
+                .into_connection();
+            let err = make_svc(db)
+                .confirm(Some(7), "grant", &make_auth(), Some(1), None)
+                .await
+                .expect_err("no write handle in this fixture");
+            assert!(
+                matches!(err, PendingActionError::Unavailable),
+                "{operation}: {err:?}"
+            );
+        }
     }
 }

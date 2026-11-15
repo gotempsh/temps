@@ -23,6 +23,13 @@ pub enum GitProviderError {
     #[error("Authentication failed: {0}")]
     AuthenticationFailed(String),
 
+    /// The provider's token endpoint answered 400 `invalid_grant`: it will never
+    /// accept this refresh token again, so retrying cannot help. Any other
+    /// refresh failure (5xx, 429, a network error, `invalid_client`) says nothing
+    /// about the token and must not use this variant.
+    #[error("{provider} rejected the stored refresh token (invalid_grant); the connection must be reauthorized")]
+    RefreshTokenRejected { provider: String },
+
     #[error(
         "Permission denied while trying to {operation}. Required permission: {required_permission}. Git provider response: {provider_message}"
     )]
@@ -44,6 +51,16 @@ pub enum GitProviderError {
     #[error("A repository named '{name}' already exists on this account")]
     RepositoryAlreadyExists { name: String },
 
+    /// The provider answered that the file does not exist at the revision.
+    /// Distinct from [`Self::ApiError`] so callers can tell a missing file
+    /// from an unavailable provider.
+    #[error("File '{path}' was not found in repository '{repository}' at '{git_ref}'")]
+    FileNotFound {
+        repository: String,
+        path: String,
+        git_ref: String,
+    },
+
     #[error("Not implemented for this provider")]
     NotImplemented,
 
@@ -53,8 +70,88 @@ pub enum GitProviderError {
     #[error("Rate limit exceeded")]
     RateLimitExceeded,
 
+    #[error("Failed to build the {provider} {purpose} HTTP client: {reason}")]
+    HttpClientBuild {
+        provider: String,
+        purpose: String,
+        reason: String,
+    },
+
     #[error("Other error: {0}")]
     Other(String),
+}
+
+/// Tokens issued by one successful call to a provider's OAuth token endpoint.
+pub struct RefreshedOAuthToken {
+    pub access_token: String,
+    /// `None` when the provider did not rotate the refresh token.
+    pub refresh_token: Option<String>,
+    /// From the provider's `expires_in`; `None` when it reported no usable
+    /// lifetime. Never a guessed value, so a recorded expiry is always real.
+    pub expires_at: Option<temps_core::UtcDateTime>,
+}
+
+// Hand-written so a token cannot reach a log through `{:?}`.
+impl std::fmt::Debug for RefreshedOAuthToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RefreshedOAuthToken")
+            .field("access_token", &"***")
+            .field("refresh_token", &self.refresh_token.as_ref().map(|_| "***"))
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+/// When a token issued in a response to a request sent at `requested_at`
+/// expires. Counted from before the request, so the recorded expiry errs early.
+/// An absent, non-numeric or non-positive `expires_in` gives `None`: a malformed
+/// lifetime must not cost the tokens, which the provider has already issued.
+pub(crate) fn oauth_token_expiry(
+    requested_at: temps_core::UtcDateTime,
+    expires_in: Option<&serde_json::Value>,
+) -> Option<temps_core::UtcDateTime> {
+    let seconds = expires_in.and_then(|value| {
+        value
+            .as_i64()
+            .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+    })?;
+    if seconds <= 0 {
+        return None;
+    }
+    requested_at.checked_add_signed(chrono::Duration::try_seconds(seconds)?)
+}
+
+/// Header value carrying a provider credential. A token that contains bytes
+/// not allowed in an HTTP header (a pasted newline, say) is a configuration
+/// error; the message names the provider and header but never the token.
+pub(crate) fn credential_header_value(
+    provider: &str,
+    header: &str,
+    value: &str,
+) -> Result<reqwest::header::HeaderValue, GitProviderError> {
+    reqwest::header::HeaderValue::from_str(value).map_err(|_| {
+        GitProviderError::InvalidConfiguration(format!(
+            "{provider} access token cannot be sent in the {header} header: it contains \
+             characters that are not valid in an HTTP header value (check for whitespace or newlines)"
+        ))
+    })
+}
+
+/// [`GitProviderError::FileNotFound`] when a provider answered a file read
+/// with HTTP 404, so callers can tell a missing file from a provider that
+/// failed to answer. `None` for every other status.
+pub(crate) fn file_not_found(
+    status: reqwest::StatusCode,
+    owner: &str,
+    repo: &str,
+    path: &str,
+    git_ref: Option<&str>,
+) -> Option<GitProviderError> {
+    (status == reqwest::StatusCode::NOT_FOUND).then(|| GitProviderError::FileNotFound {
+        repository: format!("{owner}/{repo}"),
+        path: path.to_string(),
+        git_ref: git_ref.unwrap_or("HEAD").to_string(),
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -465,8 +562,15 @@ pub struct ArchiveProgress {
 
 /// Thread-safe sink for [`ArchiveProgress`] updates. The provider sends throttled
 /// updates here while streaming; the caller drains the receiver and logs them.
-/// `try_send`-style (unbounded) so a slow logger never backpressures the download.
-pub type ArchiveProgressSender = tokio::sync::mpsc::UnboundedSender<ArchiveProgress>;
+/// Providers `try_send` into it: when a slow logger leaves the buffer full the
+/// update is dropped, so progress never backpressures the download and never
+/// queues without bound. Callers size the channel with
+/// [`ARCHIVE_PROGRESS_CHANNEL_CAPACITY`].
+pub type ArchiveProgressSender = tokio::sync::mpsc::Sender<ArchiveProgress>;
+
+/// Progress updates buffered for the logger. Updates are throttled, so this
+/// covers minutes of a stalled logger; anything beyond is lossy by design.
+pub const ARCHIVE_PROGRESS_CHANNEL_CAPACITY: usize = 32;
 
 /// Trait that all git providers must implement
 #[allow(clippy::too_many_arguments)]
@@ -496,6 +600,19 @@ pub trait GitProviderService: Send + Sync {
         access_token: &str,
         refresh_token: Option<&str>,
     ) -> Result<(String, Option<String>), GitProviderError>;
+
+    /// Exchange a refresh token for new tokens with exactly one request.
+    ///
+    /// Refresh tokens can be single-use: a repeated POST could use up the token
+    /// an earlier attempt already exchanged, so implementations must not retry.
+    /// A 400 `invalid_grant` must be reported as
+    /// [`GitProviderError::RefreshTokenRejected`], and nothing else may be.
+    async fn refresh_oauth_token(
+        &self,
+        _refresh_token: &str,
+    ) -> Result<RefreshedOAuthToken, GitProviderError> {
+        Err(GitProviderError::NotImplemented)
+    }
 
     /// Mint a per-operation, narrowly-scoped credential for a single
     /// repository. The returned token MUST live only as long as one
@@ -684,6 +801,23 @@ pub trait GitProviderService: Send + Sync {
         repo: &str,
         webhook_id: &str,
     ) -> Result<(), GitProviderError>;
+
+    /// Replace the configuration (URL, secret, events) of an existing webhook,
+    /// keeping its ID. Returns `Ok(false)` when the webhook no longer exists,
+    /// so the caller can register a new one instead.
+    ///
+    /// # Default
+    /// Returns [`GitProviderError::NotImplemented`].
+    async fn update_webhook(
+        &self,
+        _access_token: &str,
+        _owner: &str,
+        _repo: &str,
+        _webhook_id: &str,
+        _config: WebhookConfig,
+    ) -> Result<bool, GitProviderError> {
+        Err(GitProviderError::NotImplemented)
+    }
 
     /// Verify webhook signature
     async fn verify_webhook_signature(
@@ -993,4 +1127,168 @@ pub trait GitProviderRepositoryService: Send + Sync {
         owner: &str,
         repo: &str,
     ) -> Result<Vec<GitProviderTag>, GitProviderError>;
+}
+
+/// Connect-time SSRF guard for every Git provider API client.
+///
+/// Self-hosted providers (Gitea/Forgejo, self-managed GitLab, GitHub
+/// Enterprise) take a user-supplied `base_url`/`api_url`, and creating or
+/// re-validating a connection synchronously calls it with the supplied token.
+/// The handlers reject internal IP literals up front, but a public hostname
+/// can resolve -- or later rebind -- to `127.0.0.1`, an RFC 1918 address or
+/// `169.254.169.254`. Installed as the client's DNS resolver, this validates
+/// every address of each lookup with the shared outbound policy
+/// (`resolve_and_validate_domain`: public, or inside the operator's trusted
+/// private networks, never cloud metadata) and hands exactly those addresses
+/// to the connector, so what was checked is what gets dialled -- the same
+/// guarantee as `resolve_to_addrs` pinning on the webhook and monitor
+/// clients, but for every host a provider talks to (API and archive hops).
+///
+/// IP-literal URLs never reach a resolver; those are rejected by
+/// `validate_external_url` when the provider is created.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OutboundGuardResolver;
+
+impl reqwest::dns::Resolve for OutboundGuardResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            // Port is irrelevant to the address check; reqwest overwrites it.
+            let addresses = temps_core::url_validation::resolve_and_validate_domain(&host, 0)
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                    tracing::warn!(
+                        host = %host,
+                        error = %e,
+                        "Refusing Git provider connection to a blocked address"
+                    );
+                    format!("Git provider host '{host}' is not an allowed destination: {e}").into()
+                })?;
+            let addrs: reqwest::dns::Addrs = Box::new(addresses.into_iter());
+            Ok(addrs)
+        })
+    }
+}
+
+/// `reqwest::ClientBuilder` preconfigured for talking to a Git provider:
+/// [`OutboundGuardResolver`] for DNS and no automatic redirects (a public
+/// host could otherwise 302 to an internal address). Callers add timeouts and
+/// the user agent.
+pub fn guarded_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .dns_resolver(Arc::new(OutboundGuardResolver))
+}
+
+#[cfg(test)]
+mod oauth_token_expiry_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn uses_the_reported_lifetime_and_refuses_to_invent_one() {
+        let now = chrono::Utc::now();
+        assert_eq!(
+            oauth_token_expiry(now, Some(&json!(7200))),
+            Some(now + chrono::Duration::seconds(7200))
+        );
+        assert_eq!(
+            oauth_token_expiry(now, Some(&json!("7200"))),
+            Some(now + chrono::Duration::seconds(7200))
+        );
+        for unusable in [
+            json!(0),
+            json!(-1),
+            json!("soon"),
+            json!(null),
+            json!(i64::MAX),
+        ] {
+            assert_eq!(oauth_token_expiry(now, Some(&unusable)), None, "{unusable}");
+        }
+        assert_eq!(oauth_token_expiry(now, None), None);
+    }
+}
+
+#[cfg(test)]
+mod outbound_guard_tests {
+    use super::*;
+    use reqwest::dns::Resolve;
+    use std::str::FromStr;
+
+    #[tokio::test]
+    async fn resolver_rejects_internal_literals_and_loopback_names() {
+        for host in ["127.0.0.1", "10.0.0.1", "169.254.169.254", "localhost"] {
+            let name = reqwest::dns::Name::from_str(host).expect("valid DNS name");
+            let result = OutboundGuardResolver.resolve(name).await;
+            assert!(result.is_err(), "{host} must be refused");
+        }
+    }
+
+    #[tokio::test]
+    async fn resolver_passes_public_literal() {
+        let name = reqwest::dns::Name::from_str("8.8.8.8").expect("valid DNS name");
+        let result = OutboundGuardResolver.resolve(name).await;
+        let addresses: Vec<_> = match result {
+            Ok(addrs) => addrs.collect(),
+            Err(e) => panic!("public literal must pass: {e}"),
+        };
+        assert!(addresses
+            .iter()
+            .all(|a| a.ip() == std::net::IpAddr::from([8, 8, 8, 8])));
+    }
+}
+
+#[cfg(test)]
+mod file_not_found_tests {
+    use super::*;
+    use crate::services::git_provider_manager::GitProviderManagerError;
+
+    #[test]
+    fn only_a_404_is_a_missing_file() {
+        let error = file_not_found(
+            reqwest::StatusCode::NOT_FOUND,
+            "owner",
+            "repo",
+            "stack/shared.yaml",
+            Some("main"),
+        );
+        assert!(matches!(
+            &error,
+            Some(GitProviderError::FileNotFound { repository, path, git_ref })
+                if repository == "owner/repo" && path == "stack/shared.yaml" && git_ref == "main"
+        ));
+        for status in [
+            reqwest::StatusCode::OK,
+            reqwest::StatusCode::UNAUTHORIZED,
+            reqwest::StatusCode::FORBIDDEN,
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            reqwest::StatusCode::BAD_GATEWAY,
+        ] {
+            assert!(
+                file_not_found(status, "owner", "repo", "a.yaml", None).is_none(),
+                "{status}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_manager_reports_missing_files_apart_from_provider_failures() {
+        let missing = GitProviderManagerError::ProviderError(GitProviderError::FileNotFound {
+            repository: "owner/repo".to_string(),
+            path: "a.yaml".to_string(),
+            git_ref: "HEAD".to_string(),
+        });
+        assert!(missing.is_file_not_found());
+        for failure in [
+            GitProviderManagerError::ProviderError(GitProviderError::ApiError(
+                "HTTP 500".to_string(),
+            )),
+            GitProviderManagerError::ProviderError(GitProviderError::RateLimitExceeded),
+            GitProviderManagerError::ConnectionNotFound("7".to_string()),
+            GitProviderManagerError::RepositoryNotFound("owner/repo".to_string()),
+        ] {
+            assert!(!failure.is_file_not_found(), "{failure}");
+        }
+    }
 }

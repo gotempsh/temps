@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { containerWorkload } from './container-workload'
+import { ContainerRuntimeBadge } from './ContainerRuntime'
+import { Status } from '@temps-sdk/ds'
 import { ContainerInfoResponse } from '@/api/client'
 import { Button } from '@/components/ui/button'
 import {
@@ -29,6 +32,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { useContainerMetricsStream } from './useContainerMetricsStream'
 import { ContainerMetricHistory } from './ContainerMetricHistory'
 import { containerPublicUrls } from './container-public-urls'
+import { uptimeStart } from './container-uptime'
 import { displayUrl } from '@/lib/deployment-url'
 
 type ContainerStatus = string
@@ -83,6 +87,10 @@ export function ContainerHeaderBar({
     selectedContainer?.container_id ?? '',
     isRunning
   )
+  const uptimeFrom = uptimeStart(
+    selectedContainer?.status,
+    metrics?.started_at || selectedContainer?.created_at
+  )
 
   const navItems: {
     id: ContainerTab
@@ -119,19 +127,40 @@ export function ContainerHeaderBar({
                   </code>
                 </div>
               )}
+              {selectedContainer && (
+                <ContainerRuntimeBadge container={selectedContainer} />
+              )}
               {selectedContainer?.node_name && (
                 <div className="inline-flex items-center gap-1.5">
                   <ServerIcon className="size-3.5" aria-hidden="true" />
                   <span>{selectedContainer.node_name}</span>
                 </div>
               )}
-              {(metrics?.started_at || selectedContainer?.created_at) && (
-                <UptimeInline
-                  startedAt={
-                    metrics?.started_at || selectedContainer?.created_at || null
-                  }
-                />
-              )}
+              {selectedContainer &&
+                containerWorkload(selectedContainer) === 'worker' && (
+                  <div
+                    className="inline-flex items-center gap-2"
+                    title={
+                      selectedContainer.health_detail ??
+                      'Deploy-time health; runtime probing is not enabled'
+                    }
+                  >
+                    <span>Background worker</span>
+                    <Status
+                      tone={
+                        selectedContainer.health_state === 'healthy'
+                          ? 'ok'
+                          : selectedContainer.health_state === 'unhealthy'
+                            ? 'error'
+                            : 'idle'
+                      }
+                      label={selectedContainer.health_state || 'unknown'}
+                    />
+                    <span>at deploy</span>
+                  </div>
+                )}
+              {selectedContainer?.container_port != null &&
+                uptimeFrom != null && <UptimeInline startedAt={uptimeFrom} />}
               {(metrics?.restart_count ?? 0) > 0 && (
                 <RestartCountChip count={metrics?.restart_count ?? 0} />
               )}

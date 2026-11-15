@@ -70,6 +70,26 @@ struct UpdaterState {
     migrations_applied: Option<u32>,
     migrations_total: Option<u32>,
     current_migration_name: Option<String>,
+    /// The pre-update lock capacity warning (see
+    /// [`refresh_lock_capacity_warning`]), shown as a caveat.
+    lock_capacity_warning: Option<String>,
+}
+
+/// Re-read the PostgreSQL lock table against the TimescaleDB chunk count and
+/// record the warning, if any, for the update caveat. A check that cannot run
+/// is logged and leaves the previous result in place.
+async fn refresh_lock_capacity_warning(state: &RwLock<UpdaterState>, database_url: &str) {
+    match crate::commands::upgrade::lock_capacity_warning(database_url).await {
+        Ok(warning) => {
+            if let Some(warning) = &warning {
+                warn!("{warning}");
+            }
+            if let Ok(mut state) = state.write() {
+                state.lock_capacity_warning = warning;
+            }
+        }
+        Err(reason) => warn!("Could not check PostgreSQL lock capacity before updating: {reason}"),
+    }
 }
 
 /// Replaces the on-disk binary and exits so the supervisor restarts it.
@@ -145,6 +165,15 @@ impl BinarySelfUpdater {
         let last_attempt = updater.reconcile_journal();
         if let Ok(mut state) = updater.state.write() {
             state.last_attempt = last_attempt;
+        }
+        // So the version page can show the lock capacity caveat before the
+        // operator clicks, without waiting for a manual check.
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let state = updater.state.clone();
+            let database_url = updater.database_url.clone();
+            runtime.spawn(async move {
+                refresh_lock_capacity_warning(&state, &database_url).await;
+            });
         }
         updater
     }
@@ -269,6 +298,14 @@ impl BinarySelfUpdater {
         }
         if let Some(topology) = &self.topology_caveat {
             parts.push(topology.clone());
+        }
+        if let Some(warning) = self
+            .state
+            .read()
+            .ok()
+            .and_then(|state| state.lock_capacity_warning.clone())
+        {
+            parts.push(warning);
         }
         (!parts.is_empty()).then(|| parts.join(" "))
     }
@@ -449,6 +486,8 @@ impl SelfUpdater for BinarySelfUpdater {
             reason: blocker.as_ref().map(|(_, r)| r.clone()),
             manual_command: self.manual_command(blocker.as_ref().map(|(b, _)| *b)),
             current_version: current_version.clone(),
+            worker_install: temps_core::worker_install::PlaneBuild::new(env!("TEMPS_VERSION"))
+                .worker_install(),
             channel: channel.as_str().to_string(),
             channel_is_pinned: pinned,
             supervisor: self.supervisor,
@@ -539,6 +578,7 @@ impl SelfUpdater for BinarySelfUpdater {
     }
 
     async fn check_now(&self, channel: Option<String>) -> Result<ReleaseCheckResult, String> {
+        refresh_lock_capacity_warning(&self.state, &self.database_url).await;
         let current_version = current_version_tag();
         let (channel, _) = resolve_channel(channel.as_deref(), &current_version);
 
@@ -985,6 +1025,12 @@ impl UpdateJob {
             }
         };
 
+        // Last look before the swap: an install whose lock table is too small
+        // for its chunk count gets the warning in the log and on the version
+        // page. It does not stop the update; the migration's own error names
+        // the fix if it does run out.
+        refresh_lock_capacity_warning(&self.state, &self.database_url).await;
+
         self.set_phase(SelfUpdatePhase::Installing, None);
         // Keep the outgoing binary next to the new one so a release that boots
         // but misbehaves can be reverted with a single `mv`, without network.
@@ -1006,6 +1052,10 @@ impl UpdateJob {
                     "Host binary updated but the Firecracker guest agent could not be replaced; it is still the previous version"
                 ),
             }
+        }
+
+        if let Some(reminder) = crate::commands::firecracker::launcher_refresh_reminder() {
+            warn!(to = %to_version, "{reminder}");
         }
 
         Ok((to_version, backup_path))

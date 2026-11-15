@@ -258,7 +258,7 @@ impl HttpChecksService {
             .await
             .map_err(|e| db_error(project_id, "count", e))?;
         let items = query
-            .fetch_page(page - 1)
+            .fetch_page(temps_core::config::page_index(page))
             .await
             .map_err(|e| db_error(project_id, "list", e))?
             .into_iter()
@@ -951,6 +951,7 @@ mod tests {
             include_in_preview: false,
             is_encrypted: false,
             is_secret: true,
+            secret_suggestion_dismissed_at: None,
         };
         let s = service(
             MockDatabase::new(DatabaseBackend::Postgres)

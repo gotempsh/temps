@@ -84,7 +84,7 @@ export function WebhooksSettings({ project }: WebhooksSettingsProps) {
 
   return (
     <div>
-      <div className="flex items-center justify-between mb-4">
+      <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div>
           <p className="text-sm text-muted-foreground">
             Configure webhooks to receive real-time notifications about events
@@ -94,7 +94,7 @@ export function WebhooksSettings({ project }: WebhooksSettingsProps) {
         <CreateActionButton
           to={`/projects/${project.slug}/settings/webhooks/new`}
           disabled={isLoading}
-          label="Add Webhook"
+          label="Add webhook"
         />
       </div>
 
@@ -227,7 +227,7 @@ export function WebhooksSettings({ project }: WebhooksSettingsProps) {
                           )
                         }
                       >
-                        View Details
+                        View details
                       </DropdownMenuItem>
                       <DropdownMenuItem
                         onClick={() =>
@@ -278,7 +278,7 @@ export function WebhooksSettings({ project }: WebhooksSettingsProps) {
               }
             >
               <Plus className="h-4 w-4 mr-2" />
-              Create Your First Webhook
+              Create your first webhook
             </Button>
           </CardContent>
         </Card>

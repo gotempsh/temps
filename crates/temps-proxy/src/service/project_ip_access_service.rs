@@ -23,7 +23,8 @@ use sea_orm::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use temps_core::ways_in::{private_allow_list_message, AddressWayIn, EnvironmentWaysIn};
 use temps_entities::project_ip_access_rules::{self, IpAccessCidrEntry, IpAccessCidrs};
 use temps_entities::{environments, projects};
 use thiserror::Error;
@@ -105,6 +106,18 @@ pub enum ProjectIpAccessError {
     )]
     ConcurrentUpdate { scope: String },
 
+    /// ADR 064 D9: an allow list of only private ranges on an environment
+    /// with an address visitors reach through a tunnel or a `behind_proxy`
+    /// ingress. Those hand the proxy the visitor's internet address, so such
+    /// a list admits nobody on that address.
+    #[error("{}", private_allow_list_message(through, cidr, address))]
+    PrivateOnlyAllowListBehindProxy {
+        /// `tunnel `homelab``, or the load balancer in front of a worker.
+        through: String,
+        cidr: String,
+        address: String,
+    },
+
     #[error("Database error: {0}")]
     Database(sea_orm::DbErr),
 }
@@ -175,6 +188,10 @@ pub struct ProjectIpAccessResponse {
     pub max_cidrs: usize,
     #[schema(value_type = Option<String>, format = "date-time", example = "2026-10-13T09:30:00Z")]
     pub updated_at: Option<DateTime<Utc>>,
+    /// Things the operator should know about the saved policy, such as Temps
+    /// not being able to tell how visitors arrive (ADR 064 D9).
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 impl ProjectIpAccessResponse {
@@ -187,6 +204,7 @@ impl ProjectIpAccessResponse {
             cidrs: Vec::new(),
             max_cidrs: MAX_CIDRS_PER_POLICY,
             updated_at: None,
+            warnings: Vec::new(),
         }
     }
 }
@@ -203,6 +221,7 @@ impl From<project_ip_access_rules::Model> for ProjectIpAccessResponse {
             cidrs: model.cidrs.0,
             max_cidrs: MAX_CIDRS_PER_POLICY,
             updated_at: Some(model.updated_at),
+            warnings: Vec::new(),
         }
     }
 }
@@ -371,13 +390,100 @@ fn evaluate_with_set(mode: IpAccessMode, networks: &[IpNetwork], ip: IpAddr) -> 
     }
 }
 
+/// Whether every address in every network is one nobody on the internet
+/// has: RFC 1918, carrier-grade NAT (tailnets), IPv6 unique-local, loopback,
+/// link-local.
+fn only_private_ranges(networks: &[IpNetwork]) -> bool {
+    !networks.is_empty()
+        && networks
+            .iter()
+            .all(|network| temps_core::ways_in::cidr_is_private(&network.to_string()) == Some(true))
+}
+
+/// ADR 064 D9 for an allow list of only private ranges: refused when any
+/// address is served through a tunnel or a `behind_proxy` ingress. An
+/// environment's IP rules apply to all of its addresses, so such a rule is
+/// never right for a proxied one; limiting one address to a network is what
+/// a private address is for.
+fn tunnel_check(addresses: &[AddressWayIn], first_cidr: &str) -> Result<(), ProjectIpAccessError> {
+    match addresses
+        .iter()
+        .find_map(|address| Some((address, address.way_in.proxied_through()?)))
+    {
+        Some((address, through)) => Err(ProjectIpAccessError::PrivateOnlyAllowListBehindProxy {
+            through,
+            cidr: first_cidr.to_string(),
+            address: address.address.clone(),
+        }),
+        None => Ok(()),
+    }
+}
+
 pub struct ProjectIpAccessService {
     db: Arc<DatabaseConnection>,
+    /// How visitors reach each address, for the D9 check. Attached once the
+    /// ingress plugin has registered it; without it the check is skipped.
+    ways_in: OnceLock<Arc<dyn EnvironmentWaysIn>>,
 }
 
 impl ProjectIpAccessService {
     pub fn new(db: Arc<DatabaseConnection>) -> Self {
-        Self { db }
+        Self {
+            db,
+            ways_in: OnceLock::new(),
+        }
+    }
+
+    /// Lets `set` check an allow list against how visitors arrive (ADR 064
+    /// D9). Later calls are ignored.
+    pub fn attach_ways_in(&self, ways_in: Arc<dyn EnvironmentWaysIn>) {
+        let _ = self.ways_in.set(ways_in);
+    }
+
+    /// The D9 check for a policy about to be saved: refuses it when any
+    /// address's visitors come through a tunnel or a load balancer. Returns
+    /// what the operator should know when Temps cannot tell.
+    async fn tunnel_warnings(
+        &self,
+        project_id: i32,
+        environment_id: Option<i32>,
+        policy: &ValidatedPolicy,
+    ) -> Result<Vec<String>, ProjectIpAccessError> {
+        if policy.mode != IpAccessMode::Allow || !only_private_ranges(&policy.networks) {
+            return Ok(Vec::new());
+        }
+        let Some(ways_in) = self.ways_in.get() else {
+            return Ok(Vec::new());
+        };
+        let mut addresses = match ways_in.ways_in(project_id, environment_id).await {
+            Ok(addresses) => addresses,
+            Err(error) => {
+                return Ok(vec![format!(
+                    "{error}. If visitors arrive through a tunnel, this allow list of private \
+                     ranges will block them."
+                )])
+            }
+        };
+        // The project-wide policy does not apply to an environment with its
+        // own policy, so its addresses do not count.
+        if environment_id.is_none() {
+            let overridden: HashSet<i32> = project_ip_access_rules::Entity::find()
+                .filter(project_ip_access_rules::Column::ProjectId.eq(project_id))
+                .filter(project_ip_access_rules::Column::EnvironmentId.is_not_null())
+                .all(self.db.as_ref())
+                .await?
+                .into_iter()
+                .filter_map(|rule| rule.environment_id)
+                .collect();
+            addresses.retain(|address| !overridden.contains(&address.environment_id));
+        }
+        let first_cidr = policy
+            .entries
+            .first()
+            .map(|entry| entry.cidr.clone())
+            .unwrap_or_default();
+        tunnel_check(&addresses, &first_cidr)?;
+        Ok(Vec::new())
     }
 
     async fn ensure_scope_exists(
@@ -487,6 +593,9 @@ impl ProjectIpAccessService {
         }
 
         self.ensure_scope_exists(project_id, environment_id).await?;
+        let warnings = self
+            .tunnel_warnings(project_id, environment_id, &policy)
+            .await?;
 
         let cidrs = IpAccessCidrs(policy.entries);
         // Two writers creating the same scope at once both see no row and both
@@ -511,7 +620,9 @@ impl ProjectIpAccessService {
             other => other,
         })?;
 
-        Ok(ProjectIpAccessResponse::from(saved))
+        let mut response = ProjectIpAccessResponse::from(saved);
+        response.warnings = warnings;
+        Ok(response)
     }
 
     /// Insert or update the single row for a scope inside one transaction.
@@ -725,6 +836,7 @@ impl ProjectIpAccessService {
 mod tests {
     use super::*;
     use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
+    use temps_core::ways_in::WayInKind;
 
     fn entry(cidr: &str) -> IpAccessCidrEntry {
         IpAccessCidrEntry {
@@ -1092,6 +1204,157 @@ mod tests {
             .expect("set succeeds");
         assert!(response.configured);
         assert_eq!(response.mode, IpAccessMode::Allow);
+    }
+
+    struct FixedWaysIn(Vec<AddressWayIn>);
+
+    #[async_trait::async_trait]
+    impl EnvironmentWaysIn for FixedWaysIn {
+        async fn ways_in(
+            &self,
+            _project_id: i32,
+            _environment_id: Option<i32>,
+        ) -> Result<Vec<AddressWayIn>, temps_core::ways_in::WaysInError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn tunneled(address: &str) -> AddressWayIn {
+        AddressWayIn {
+            environment_id: 7,
+            address: address.to_string(),
+            way_in: WayInKind::Tunnel {
+                name: "homelab".to_string(),
+            },
+        }
+    }
+
+    fn direct(address: &str) -> AddressWayIn {
+        AddressWayIn {
+            environment_id: 7,
+            address: address.to_string(),
+            way_in: WayInKind::Direct,
+        }
+    }
+
+    fn networks(cidrs: &[&str]) -> Vec<IpNetwork> {
+        cidrs
+            .iter()
+            .map(|cidr| cidr.parse().expect("test CIDR is valid"))
+            .collect()
+    }
+
+    #[test]
+    fn private_ranges_are_told_apart_from_internet_ones() {
+        assert!(only_private_ranges(&networks(&["100.64.0.0/10"])));
+        assert!(only_private_ranges(&networks(&[
+            "10.0.0.0/8",
+            "192.168.1.0/24",
+            "fd7a:115c:a1e0::/48",
+            "127.0.0.1/32",
+        ])));
+        // One internet range is enough for a tunnel visitor to match.
+        assert!(!only_private_ranges(&networks(&[
+            "10.0.0.0/8",
+            "203.0.113.0/24"
+        ])));
+        // A range that only starts private is not private.
+        assert!(!only_private_ranges(&networks(&["0.0.0.0/0"])));
+        assert!(!only_private_ranges(&networks(&["::/0"])));
+        assert!(!only_private_ranges(&[]));
+    }
+
+    #[test]
+    fn a_private_allow_list_is_refused_when_any_address_is_proxied() {
+        let error = tunnel_check(
+            &[direct("app.internal.example"), tunneled("app.example.com")],
+            "100.64.0.0/10",
+        )
+        .expect_err("visitors on the tunneled address would be blocked");
+        assert_eq!(
+            error.to_string(),
+            "Visitors through tunnel `homelab` arrive with their internet address, so \
+             `100.64.0.0/10` would block everyone on `app.example.com`. To limit this app to \
+             your tailnet, make that address private instead."
+        );
+
+        let behind = AddressWayIn {
+            environment_id: 7,
+            address: "shop.example.com".into(),
+            way_in: WayInKind::BehindProxy {
+                node: "edge-1".into(),
+            },
+        };
+        let error = tunnel_check(&[behind], "10.0.0.0/8").expect_err("load balancer");
+        assert!(error
+            .to_string()
+            .starts_with("Visitors through the load balancer in front of `edge-1`"));
+
+        tunnel_check(&[direct("app.example.com")], "10.0.0.0/8").expect("nothing proxied");
+        tunnel_check(&[], "10.0.0.0/8").expect("no addresses");
+    }
+
+    #[tokio::test]
+    async fn set_refuses_a_tailnet_allow_list_on_a_tunneled_environment() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // ensure_scope_exists: project, then environment
+            .append_query_results(vec![vec![id_row(5)]])
+            .append_query_results(vec![vec![id_row(7)]])
+            .into_connection();
+        let service = ProjectIpAccessService::new(Arc::new(db));
+        service.attach_ways_in(Arc::new(FixedWaysIn(vec![tunneled("app.example.com")])));
+
+        let error = service
+            .set(
+                5,
+                Some(7),
+                SetProjectIpAccessRequest {
+                    mode: IpAccessMode::Allow,
+                    cidrs: vec![entry("100.64.0.0/10")],
+                    acknowledge_lockout: true,
+                },
+                None,
+                Some(1),
+            )
+            .await
+            .expect_err("the policy is refused before it is saved");
+        assert!(matches!(
+            error,
+            ProjectIpAccessError::PrivateOnlyAllowListBehindProxy { ref through, ref cidr, ref address }
+                if through == "tunnel `homelab`" && cidr == "100.64.0.0/10" && address == "app.example.com"
+        ));
+    }
+
+    #[tokio::test]
+    async fn set_ignores_tunnels_for_a_list_with_an_internet_range() {
+        let inserted = rule_row(5, None, "allow", &["203.0.113.0/24"]);
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![id_row(5)]])
+            .append_query_results(vec![Vec::<project_ip_access_rules::Model>::new()])
+            .append_query_results(vec![vec![inserted]])
+            .append_exec_results(vec![MockExecResult {
+                last_insert_id: 1,
+                rows_affected: 1,
+            }])
+            .into_connection();
+        let service = ProjectIpAccessService::new(Arc::new(db));
+        service.attach_ways_in(Arc::new(FixedWaysIn(vec![tunneled("app.example.com")])));
+
+        let response = service
+            .set(
+                5,
+                None,
+                SetProjectIpAccessRequest {
+                    mode: IpAccessMode::Allow,
+                    cidrs: vec![entry("203.0.113.0/24")],
+                    acknowledge_lockout: true,
+                },
+                None,
+                Some(1),
+            )
+            .await
+            .expect("an internet range can match tunnel visitors");
+        assert!(response.warnings.is_empty());
     }
 
     #[test]

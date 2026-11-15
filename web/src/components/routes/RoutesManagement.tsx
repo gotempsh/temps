@@ -9,6 +9,7 @@ import {
   RouteResponse,
   updateRoute,
 } from '@/api/client'
+import { AdminOnlyNote } from '@/components/ui/admin-only-note'
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -54,6 +55,8 @@ import { useForm } from 'react-hook-form'
 import { Link } from 'react-router'
 import { toast } from 'sonner'
 import { z } from 'zod'
+import { useCurrentUserRole } from '@/hooks/useCurrentUserRole'
+import { useIsInstanceAdmin } from '@/hooks/useIsInstanceAdmin'
 
 interface RoutesManagementProps {
   routes?: ListRoutesResponse
@@ -86,6 +89,10 @@ export function RoutesManagement({
   // Checked before the empty branch: a refused or failed read must not claim
   // no routes are configured and invite the operator to add one.
   const readFailed = error != null
+  // Adding a route needs the load balancer write permission; offering it to a
+  // role that cannot use it just leads to a refusal.
+  const canManageRoutes = useIsInstanceAdmin()
+  const currentRole = useCurrentUserRole()
   const [routeToDelete, setRouteToDelete] = useState<string | null>(null)
   const [editRoute, setEditRoute] = useState<RouteResponse | null>(null)
 
@@ -98,23 +105,21 @@ export function RoutesManagement({
           host: data.host,
           port: data.port,
         },
+        throwOnError: true,
       }),
     meta: {
       errorTitle: 'Failed to update route',
     },
-    onSuccess: ({ response }: any) => {
-      if (response.status >= 300) {
-        toast.error('Failed to update route')
-      } else {
-        setEditRoute(null)
-        toast.success('Route updated successfully')
-        reloadRoutes()
-      }
+    onSuccess: () => {
+      setEditRoute(null)
+      toast.success('Route updated successfully')
+      reloadRoutes()
     },
   })
 
   const deleteRouteMutation = useMutation({
-    mutationFn: (domain: string) => deleteRoute({ path: { domain } }),
+    mutationFn: (domain: string) =>
+      deleteRoute({ path: { domain }, throwOnError: true }),
     meta: {
       errorTitle: 'Failed to delete route',
     },
@@ -171,18 +176,24 @@ export function RoutesManagement({
   }
   return (
     <div className="space-y-6">
-      <div className="flex items-center justify-between">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div>
           <h2 className="text-lg font-semibold">Routes</h2>
           <p className="text-sm text-muted-foreground">
             Configure custom domain routing and load balancing
           </p>
         </div>
-        <CreateActionButton
-          to="/settings/load-balancer/add"
-          label="Add Route"
-        />
+        {canManageRoutes && (
+          <CreateActionButton
+            to="/settings/load-balancer/add"
+            label="Add route"
+          />
+        )}
       </div>
+
+      {!canManageRoutes && (
+        <AdminOnlyNote action="add, edit or remove routes" role={currentRole} />
+      )}
 
       {readFailed && !!routes?.length && (
         <ReadFailure
@@ -220,16 +231,19 @@ export function RoutesManagement({
         />
       ) : !routes?.length ? (
         <EmptyState
+          size="compact"
           icon={Router}
           title="No routes configured"
           description="Get started by adding a new route to direct traffic to your backend services"
           action={
-            <Button asChild>
-              <Link to="/settings/load-balancer/add">
-                <Plus className="mr-2 h-4 w-4" />
-                Add Route
-              </Link>
-            </Button>
+            canManageRoutes ? (
+              <Button asChild>
+                <Link to="/settings/load-balancer/add">
+                  <Plus className="mr-2 h-4 w-4" />
+                  Add route
+                </Link>
+              </Button>
+            ) : undefined
           }
         />
       ) : (
@@ -291,7 +305,7 @@ export function RoutesManagement({
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Edit Route</DialogTitle>
+            <DialogTitle>Edit route</DialogTitle>
           </DialogHeader>
           <Form {...editForm}>
             <form
@@ -354,7 +368,7 @@ export function RoutesManagement({
 
               <div className="flex justify-end">
                 <Button type="submit" disabled={updateRouteMutation.isPending}>
-                  {updateRouteMutation.isPending ? 'Saving...' : 'Save Changes'}
+                  {updateRouteMutation.isPending ? 'Saving…' : 'Save'}
                 </Button>
               </div>
             </form>

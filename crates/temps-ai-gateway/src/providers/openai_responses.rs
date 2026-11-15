@@ -19,7 +19,8 @@ use serde_json::{Map, Value};
 use crate::error::AiGatewayError;
 use crate::types::{
     ChatCompletionChoice, ChatCompletionChunk, ChatCompletionChunkChoice, ChatCompletionDelta,
-    ChatCompletionRequest, ChatCompletionResponse, ChatMessage, MessageContent, UsageInfo,
+    ChatCompletionRequest, ChatCompletionResponse, ChatMessage, MessageContent,
+    PromptTokensDetails, UsageInfo,
 };
 
 const MAX_REASONING_ITEMS: usize = 32;
@@ -447,6 +448,11 @@ fn response_usage(value: &Value) -> UsageInfo {
         .get("output_tokens")
         .and_then(Value::as_i64)
         .unwrap_or_default();
+    let cached_tokens = value
+        .get("input_tokens_details")
+        .and_then(|details| details.get("cached_tokens"))
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
     UsageInfo {
         prompt_tokens,
         completion_tokens,
@@ -454,6 +460,10 @@ fn response_usage(value: &Value) -> UsageInfo {
             .get("total_tokens")
             .and_then(Value::as_i64)
             .unwrap_or(prompt_tokens + completion_tokens),
+        prompt_tokens_details: (cached_tokens > 0).then_some(PromptTokensDetails {
+            cached_tokens,
+            cache_write_tokens: 0,
+        }),
     }
 }
 

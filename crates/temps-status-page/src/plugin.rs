@@ -246,13 +246,19 @@ impl TempsPlugin for StatusPagePlugin {
 
             // Create health check service with mandatory ConfigService and JobQueue
             // The service will emit StatusCheckCompleted jobs for outage detection
-            let health_check_service = Arc::new(
+            let mut health_check_service =
                 HealthCheckService::new(db.clone(), config_service, queue_service.clone())
                     .map_err(|error| PluginError::PluginRegistrationFailed {
                         plugin_name: "status-page".to_string(),
                         error: error.to_string(),
-                    })?,
-            );
+                    })?;
+            // ADR 068 D4: probe each environment's primary address.
+            if let Some(slot) =
+                context.get_service::<temps_core::environment_address::EnvironmentAddressSlot>()
+            {
+                health_check_service = health_check_service.with_environment_addresses(slot);
+            }
+            let health_check_service = Arc::new(health_check_service);
             context.register_service(health_check_service.clone());
 
             // Publishable status pages (#1412): one snapshot cache shared by the
@@ -266,9 +272,8 @@ impl TempsPlugin for StatusPagePlugin {
                 snapshot_cache.clone(),
             ));
             context.register_service(public_status_page_service.clone());
-            let deletion_hook: Arc<dyn temps_core::ProjectDeletionHook> =
-                public_status_page_service.clone();
-            context.register_service(deletion_hook);
+            temps_core::ProjectDeletionHooks::get_or_register(context)
+                .add(public_status_page_service.clone());
             tokio::spawn(snapshot_cache.run_refresh_loop());
 
             // Start the health check scheduler with job receiver for realtime monitor creation

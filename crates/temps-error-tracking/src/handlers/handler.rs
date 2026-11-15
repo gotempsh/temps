@@ -13,7 +13,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use temps_auth::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
+use temps_authz::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
 use temps_core::problemdetails::Problem;
 use temps_core::{DateTime, RequestMetadata};
 use utoipa::{IntoParams, OpenApi, ToSchema};
@@ -60,6 +60,9 @@ pub struct ErrorTrackingApiDoc;
 
 pub fn configure_routes() -> Router<Arc<AppState>> {
     Router::new()
+        .merge(super::feedback_handler::routes())
+        .merge(super::release_handler::routes())
+        .merge(super::client_outcome_handler::routes())
         .route("/error-groups", get(list_global_error_groups))
         .route(
             "/projects/{project_id}/error-groups",
@@ -115,6 +118,11 @@ pub struct ListErrorEventsQuery {
     pub page: u64,
     #[serde(default = "default_page_size")]
     pub page_size: u64,
+    /// Exact native user ID match.
+    pub user_id: Option<String>,
+    /// Exact tag match; supply tag_value together with this field.
+    pub tag_key: Option<String>,
+    pub tag_value: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -432,7 +440,7 @@ pub async fn list_error_groups(
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
     let page = query.page;
-    let page_size = std::cmp::min(query.page_size, 100);
+    let page_size = query.page_size.clamp(1, 100);
 
     let (groups, total_count) = state
         .error_tracking_service
@@ -562,6 +570,7 @@ pub async fn update_error_group(
     path = "/projects/{project_id}/error-groups/{group_id}/events",
     responses(
         (status = 200, description = "Paginated list of error events", body = PaginatedErrorEventsResponse),
+        (status = 400, description = "Invalid metadata filters"),
         (status = 404, description = "Error group not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -581,12 +590,22 @@ pub async fn list_error_events(
     permission_guard!(auth, ErrorTrackingRead);
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
-    let page = query.page;
-    let page_size = std::cmp::min(query.page_size, 100);
+    let page = query.page.max(1);
+    let page_size = query.page_size.clamp(1, 100);
 
     let (events, total_count) = state
         .error_tracking_service
-        .list_error_events(group_id, project_id, Some(page), Some(page_size))
+        .list_error_events_filtered(
+            group_id,
+            project_id,
+            Some(page),
+            Some(page_size),
+            &crate::services::ErrorEventFilter {
+                user_id: query.user_id,
+                tag_key: query.tag_key,
+                tag_value: query.tag_value,
+            },
+        )
         .await?;
 
     let total_pages = if total_count > 0 {
@@ -725,6 +744,7 @@ pub async fn get_error_dashboard_stats(
     path = "/projects/{project_id}/error-time-series",
     responses(
         (status = 200, description = "Error time series data", body = Vec<ErrorTimeSeriesDataResponse>),
+        (status = 400, description = "Range wider than 366 days, too many points, or a bucket that can't be read or is too wide"),
         (status = 500, description = "Internal server error")
     ),
     params(
@@ -938,9 +958,9 @@ mod tests {
     use axum::http::HeaderMap;
     use sea_orm::{ActiveModelTrait, EntityTrait, Set};
     use std::sync::Mutex;
-    use temps_auth::{AuthContext, Role};
-    use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+    use temps_authz::{AuthContext, Role};
     use temps_entities::{error_groups, projects, users};
+    use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 
     /// Audit logger that records every operation it receives so tests can
     /// assert exactly which audit events a handler emitted.
@@ -954,11 +974,17 @@ mod tests {
         async fn create_audit_log(
             &self,
             operation: &dyn temps_core::AuditOperation,
-        ) -> Result<(), anyhow::Error> {
-            let payload: serde_json::Value = serde_json::from_str(&operation.serialize()?)?;
+        ) -> temps_core::AuditResult<()> {
+            let payload: serde_json::Value = serde_json::from_str(&operation.serialize()?)
+                .expect("audit operation serializes to valid JSON");
             self.entries
                 .lock()
-                .map_err(|_| anyhow::anyhow!("recording audit logger lock poisoned"))?
+                .map_err(|_| {
+                    temps_core::AuditError::write(
+                        operation.operation_type(),
+                        "recording audit logger lock poisoned",
+                    )
+                })?
                 .push((operation.operation_type(), operation.user_id(), payload));
             Ok(())
         }

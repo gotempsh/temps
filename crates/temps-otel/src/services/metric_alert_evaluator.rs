@@ -9,7 +9,7 @@
 //! the threshold, and tracks an `ok <-> firing` state machine. A breach only
 //! transitions `ok -> firing` after it has persisted for `for_duration_secs`.
 //!
-//! Firing/resolving reuses `temps_monitoring::AlarmService` (the same path the
+//! Firing/resolving reuses `temps_alarms::AlarmService` (the same path the
 //! monitoring evaluator uses): it inserts the alarm row, enforces a cooldown,
 //! fans out the notification to Slack/webhook/email, and emits a `Job::AlarmFired`.
 //! We do NOT build a new notifier.
@@ -31,7 +31,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 use utoipa::ToSchema;
 
-use temps_monitoring::{AlarmService, AlarmSeverity, AlarmStatus, AlarmType, FireAlarmRequest};
+use temps_alarms::{AlarmService, AlarmSeverity, AlarmStatus, AlarmType, FireAlarmRequest};
 
 use crate::detectors::{
     AnomalyParams, BandModel, Comparator, DetectionConfig, StaticParams, DEFAULT_LOOKBACK_DAYS,

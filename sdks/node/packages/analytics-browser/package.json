@@ -1,6 +1,6 @@
 {
 	"name": "@temps-sdk/analytics-browser",
-	"version": "0.0.7",
+	"version": "0.0.8",
 	"description": "Vanilla JS analytics SDK for Temps. Use as a script tag or import programmatically.",
 	"private": false,
 	"type": "module",
@@ -34,7 +34,7 @@
 		"test": "bun run test:run",
 		"test:cdn": "node scripts/verify-cdn-bundle.mjs",
 		"test:run": "bun run build && bun run test:cdn",
-		"prepublishOnly": "bun run clean && bun run build"
+		"prepublishOnly": "node ../../scripts/require-bun-publish.mjs && bun run clean && bun run build"
 	},
 	"publishConfig": {
 		"access": "public"

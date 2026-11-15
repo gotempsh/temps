@@ -249,6 +249,27 @@ fn kv_to_string_map(attrs: &[proto::common::v1::KeyValue]) -> BTreeMap<String, S
     map
 }
 
+fn kv_to_log_types(attrs: &[proto::common::v1::KeyValue]) -> BTreeMap<String, LogAttributeType> {
+    use proto::common::v1::any_value::Value;
+    attrs
+        .iter()
+        .filter_map(|kv| {
+            kv.value.as_ref().map(|value| {
+                let ty = match &value.value {
+                    Some(Value::BoolValue(_)) => LogAttributeType::Boolean,
+                    Some(Value::IntValue(_)) => LogAttributeType::Integer,
+                    Some(Value::DoubleValue(_)) => LogAttributeType::Double,
+                    Some(Value::ArrayValue(_)) => LogAttributeType::Array,
+                    Some(Value::KvlistValue(_)) => LogAttributeType::Object,
+                    Some(Value::BytesValue(_)) => LogAttributeType::Bytes,
+                    _ => LogAttributeType::String,
+                };
+                (kv.key.clone(), ty)
+            })
+        })
+        .collect()
+}
+
 fn any_value_to_string(val: &proto::common::v1::AnyValue) -> String {
     match &val.value {
         Some(proto::common::v1::any_value::Value::StringValue(s)) => s.clone(),
@@ -555,6 +576,7 @@ fn extract_span_record(
     };
 
     Some(SpanRecord {
+        ingest_identity: None,
         project_id,
         deployment_id,
         resource: resource.clone(),
@@ -639,6 +661,8 @@ fn extract_log_record(
     };
 
     Some(LogRecord {
+        ingest_identity: None,
+        attribute_types: kv_to_log_types(&log.attributes),
         project_id,
         deployment_id,
         resource: resource.clone(),
@@ -1260,7 +1284,25 @@ mod tests {
                         }),
                         trace_id: trace_id.clone(),
                         span_id: span_id.clone(),
-                        attributes: vec![test_support::kv("component", "db-pool")],
+                        attributes: vec![
+                            test_support::kv("component", "db-pool"),
+                            proto::common::v1::KeyValue {
+                                key: "large".into(),
+                                value: Some(proto::common::v1::AnyValue {
+                                    value: Some(proto::common::v1::any_value::Value::IntValue(
+                                        9007199254740993,
+                                    )),
+                                }),
+                            },
+                            proto::common::v1::KeyValue {
+                                key: "flag".into(),
+                                value: Some(proto::common::v1::AnyValue {
+                                    value: Some(proto::common::v1::any_value::Value::BoolValue(
+                                        true,
+                                    )),
+                                }),
+                            },
+                        ],
                         ..Default::default()
                     }],
                     schema_url: String::new(),
@@ -1285,6 +1327,19 @@ mod tests {
             Some(hex::encode(&span_id).as_str())
         );
         assert_eq!(records[0].resource.service_name, "log-producer");
+        assert_eq!(records[0].attributes["large"], "9007199254740993");
+        assert_eq!(
+            records[0].attribute_types["large"],
+            LogAttributeType::Integer
+        );
+        assert_eq!(
+            records[0].attribute_types["component"],
+            LogAttributeType::String
+        );
+        assert_eq!(
+            records[0].attribute_types["flag"],
+            LogAttributeType::Boolean
+        );
         assert_eq!(records[0].project_id, 10);
     }
 

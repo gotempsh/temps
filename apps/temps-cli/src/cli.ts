@@ -38,6 +38,7 @@ import { registerWebhooksCommands } from './commands/webhooks/index.js'
 import { registerContainersCommands } from './commands/containers/index.js'
 import { registerClusterCommands } from './commands/cluster/index.js'
 import { registerNodesCommands } from './commands/nodes/index.js'
+import { registerTunnelsCommands } from './commands/tunnels/index.js'
 import { registerDocsCommand } from './commands/docs.js'
 import { registerTokensCommands } from './commands/tokens/index.js'
 import { registerErrorsCommands } from './commands/errors/index.js'
@@ -58,6 +59,8 @@ import { registerDnsProvidersCommands } from './commands/dns-providers/index.js'
 import { registerDeliveryProfilesCommands } from './commands/delivery-profiles/index.js'
 import { registerDeliveryCommands } from './commands/delivery/index.js'
 import { registerIpAccessCommands } from './commands/ip-access/index.js'
+import { registerEdgeRulesCommands } from './commands/edge-rules/index.js'
+import { registerNetworkPolicyCommands } from './commands/network-policy/index.js'
 import { registerAuditCommands } from './commands/audit/index.js'
 import { registerProxyLogsCommands } from './commands/proxy-logs/index.js'
 import { registerGlobalLogsCommands } from './commands/global-logs/index.js'
@@ -80,6 +83,7 @@ import { registerMcpServersCommands } from './commands/mcp-servers/index.js'
 import { registerMcpCommands } from './commands/mcp/index.js'
 import { registerSecretsCommands } from './commands/secrets/index.js'
 import { registerSandboxCommands } from './commands/sandbox/index.js'
+import { registerDurableWorkflowCommands } from './commands/workflows/index.js'
 import { registerWorkflowCommands } from './commands/workflow/index.js'
 import { registerRevenueCommands } from './commands/revenue/index.js'
 import { registerSessionReplayCommands } from './commands/session-replay/index.js'
@@ -201,6 +205,7 @@ export function createProgram(): Command {
   registerContainersCommands(program)
   registerClusterCommands(program)
   registerNodesCommands(program)
+  registerTunnelsCommands(program)
   registerTokensCommands(program)
   registerErrorsCommands(program)
   registerMetricsCommands(program)
@@ -220,6 +225,8 @@ export function createProgram(): Command {
   registerDeliveryProfilesCommands(program)
   registerDeliveryCommands(program)
   registerIpAccessCommands(program)
+  registerEdgeRulesCommands(program)
+  registerNetworkPolicyCommands(program)
   registerAuditCommands(program)
   registerProxyLogsCommands(program)
   registerGlobalLogsCommands(program)
@@ -243,6 +250,7 @@ export function createProgram(): Command {
   registerSecretsCommands(program)
   registerSandboxCommands(program)
   registerWorkflowCommands(program)
+  registerDurableWorkflowCommands(program)
   registerRevenueCommands(program)
   registerSessionReplayCommands(program)
   registerTraefikDiscoveryCommands(program)

@@ -26,6 +26,7 @@ import { MonitoringSettingsPage } from './MonitoringSettingsPage'
 import { RateLimitingPage } from './RateLimitingPage'
 import { RequestTimeoutsPage } from './RequestTimeoutsPage'
 import { SecurityPage } from './SecurityPage'
+import { ServiceHealthchecksPage } from './ServiceHealthchecksPage'
 
 const refused = {
   title: 'Forbidden',
@@ -81,6 +82,10 @@ const SETTINGS_PAGES: [string, ReactElement][] = [
   ['Rate limiting', <RateLimitingPage key="rate" />],
   ['Build limits', <BuildLimitsPage key="build" />],
   ['Request timeouts', <RequestTimeoutsPage key="timeouts" />],
+  [
+    'Service health checks',
+    <ServiceHealthchecksPage key="service-healthchecks" />,
+  ],
   ['Docker registry', <DockerRegistryPage key="registry" />],
   ['Disk monitoring', <DiskMonitoringPage key="disk" />],
   ['Metrics monitoring', <MonitoringSettingsPage key="metrics" />],

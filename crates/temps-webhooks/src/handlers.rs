@@ -14,11 +14,12 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use temps_auth::{
+use temps_authz::{
     permission_check, permission_guard, project_access_guard, Permission, RequireAuth,
 };
 use temps_core::error_builder::ErrorBuilder;
 use temps_core::problemdetails::Problem;
+use temps_core::secret_string::SecretString;
 use temps_core::{AuditContext, AuditLogger, AuditOperation, RequestMetadata};
 use tracing::{error, info};
 use utoipa::{OpenApi, ToSchema};
@@ -61,9 +62,8 @@ impl AuditOperation for WebhookAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -151,7 +151,7 @@ pub struct CreateWebhookRequestBody {
     #[schema(example = "https://example.com/webhook")]
     pub url: String,
     /// Secret for HMAC signature verification (optional)
-    pub secret: Option<String>,
+    pub secret: Option<SecretString>,
     /// Event types to subscribe to
     #[schema(example = json!(["deployment.created", "deployment.succeeded"]))]
     pub events: Vec<String>,
@@ -165,7 +165,7 @@ pub struct UpdateWebhookRequestBody {
     /// Target URL for webhook delivery
     pub url: Option<String>,
     /// Secret for HMAC signature verification
-    pub secret: Option<String>,
+    pub secret: Option<SecretString>,
     /// Event types to subscribe to
     pub events: Option<Vec<String>>,
     /// Whether the webhook is enabled
@@ -336,6 +336,38 @@ async fn get_webhook(
 /// permission -- would let a principal without any backup access route that
 /// data to a URL of their choosing and read it back via the webhook's
 /// delivery log.
+/// A webhook's requested events, refusing any name Temps doesn't know. Dropping
+/// one would leave a webhook that quietly never fires for it, or, with every name
+/// dropped, never fires at all.
+fn parse_event_types(names: &[String]) -> Result<Vec<WebhookEventType>, Problem> {
+    let invalid = |detail: String| {
+        ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Invalid event types")
+            .detail(detail)
+            .build()
+    };
+    let unknown: Vec<&str> = names
+        .iter()
+        .map(String::as_str)
+        .filter(|name| WebhookEventType::from_str(name).is_none())
+        .collect();
+    if !unknown.is_empty() {
+        return Err(invalid(format!(
+            "Unknown event types: {}",
+            unknown.join(", ")
+        )));
+    }
+    if names.is_empty() {
+        return Err(invalid(
+            "At least one valid event type is required".to_string(),
+        ));
+    }
+    Ok(names
+        .iter()
+        .filter_map(|name| WebhookEventType::from_str(name))
+        .collect())
+}
+
 fn subscribes_to_backup_events(events: &[WebhookEventType]) -> bool {
     events.iter().any(|event| {
         matches!(
@@ -376,18 +408,7 @@ async fn create_webhook(
     project_access_guard!(auth, project_id, state.project_access_checker);
 
     // Parse event types
-    let events: Vec<WebhookEventType> = body
-        .events
-        .iter()
-        .filter_map(|e| WebhookEventType::from_str(e))
-        .collect();
-
-    if events.is_empty() {
-        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
-            .title("Invalid event types")
-            .detail("At least one valid event type is required")
-            .build());
-    }
+    let events = parse_event_types(&body.events)?;
     if subscribes_to_backup_events(&events) {
         permission_check!(auth, Permission::BackupsRead);
     }
@@ -395,7 +416,7 @@ async fn create_webhook(
     let request = CreateWebhookRequest {
         project_id,
         url: body.url,
-        secret: body.secret,
+        secret: body.secret.map(SecretString::into_exposed),
         events,
         enabled: body.enabled.unwrap_or(true),
     };
@@ -478,11 +499,7 @@ async fn update_webhook(
     }
 
     // Parse event types if provided
-    let events: Option<Vec<WebhookEventType>> = body.events.map(|e| {
-        e.iter()
-            .filter_map(|s| WebhookEventType::from_str(s))
-            .collect()
-    });
+    let events = body.events.as_deref().map(parse_event_types).transpose()?;
     // Gated on the webhook's events before *and* after this update, not just
     // whether this call happens to touch `events`: a caller who omits
     // `events` (e.g. only changing `url`) would otherwise be able to
@@ -496,7 +513,7 @@ async fn update_webhook(
 
     let request = UpdateWebhookRequest {
         url: body.url,
-        secret: body.secret,
+        secret: body.secret.map(SecretString::into_exposed),
         events,
         enabled: body.enabled,
     };
@@ -954,7 +971,7 @@ mod backup_permission_tests {
     use crate::events::WebhookEventType;
     use axum::http::StatusCode;
     use chrono::Utc;
-    use temps_auth::{permission_check, AuthContext, Permission};
+    use temps_authz::{permission_check, AuthContext, Permission};
     use temps_core::problemdetails::Problem;
     use temps_entities::users;
 
@@ -1015,6 +1032,22 @@ mod backup_permission_tests {
     // -------------------------------------------------------------------------
     // subscribes_to_backup_events unit tests
     // -------------------------------------------------------------------------
+
+    #[test]
+    fn parse_event_types_refuses_unknown_names_and_an_empty_list() {
+        let names = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        let known = WebhookEventType::BackupStarted.as_str();
+
+        let problem = super::parse_event_types(&names(&["bogus"])).unwrap_err();
+        assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+        let body = serde_json::to_string(&problem.body).unwrap();
+        assert!(body.contains("bogus"), "{body}");
+
+        // A known name alongside doesn't rescue the unknown one.
+        assert!(super::parse_event_types(&names(&[known, "bogus"])).is_err());
+        assert!(super::parse_event_types(&[]).is_err());
+        assert_eq!(super::parse_event_types(&names(&[known])).unwrap().len(), 1);
+    }
 
     #[test]
     fn test_subscribes_to_backup_events_true_when_backup_started_present() {
@@ -1221,7 +1254,6 @@ mod response_shape_tests {
     use super::{WebhookDeliveryResponse, WebhookResponse};
     use chrono::Utc;
 
-    #[allow(deprecated)]
     fn attempt(
         id: i32,
         delivery_id: Option<i32>,
@@ -1235,7 +1267,6 @@ mod response_shape_tests {
             payload: "{}".to_string(),
             success: false,
             status_code: Some(500),
-            response_body: None,
             error_message: None,
             attempt_number,
             delivery_id,

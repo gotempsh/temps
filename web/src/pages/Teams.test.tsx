@@ -134,3 +134,29 @@ test('a refused teams read has no Retry for a role that can never pass it', () =
   expect(html).not.toContain('Retry')
   client.clear()
 })
+
+test('a downgraded role loses the Delete action on already-fetched teams', () => {
+  const client = createClient()
+  client.setQueryData(teamsKey, {
+    teams: [
+      {
+        id: 7,
+        name: 'Ops',
+        slug: 'ops',
+        description: null,
+        created_by: 1,
+        created_at: '2026-01-01T00:00:00Z',
+        updated_at: '2026-01-01T00:00:00Z',
+      },
+    ],
+    total: 1,
+    page: 1,
+    page_size: 100,
+  })
+  const restricted = render(client, 'user')
+  expect(restricted).toContain('Ops')
+  expect(restricted).not.toContain('Delete team Ops')
+  const admin = render(client, 'admin')
+  expect(admin).toContain('Delete team Ops')
+  client.clear()
+})

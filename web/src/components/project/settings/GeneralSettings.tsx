@@ -1,5 +1,5 @@
-import { SettingsSection } from '@/components/ui/settings-section'
-import { FolderPen, GitFork, FileCode, Trash2 } from 'lucide-react'
+import { SaveRow, SettingsGroup } from '@temps-sdk/ds'
+import { SettingToggleRow } from '@/components/settings/SettingToggleRow'
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
@@ -8,10 +8,11 @@ import {
   deleteProjectMutation,
   updateProjectSettingsMutation,
 } from '@/api/client/@tanstack/react-query.gen'
+import { AdminOnlyNote } from '@/components/ui/admin-only-note'
 import { Button } from '@/components/ui/button'
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { CloudTelemetryBackfillCard } from './CloudTelemetryBackfillCard'
-import { MonitoringCard } from './MonitoringCard'
+import { MonitoringToggles } from './MonitoringCard'
 import {
   Form,
   FormControl,
@@ -22,9 +23,9 @@ import {
   FormMessage,
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
+import { useCurrentUserRole } from '@/hooks/useCurrentUserRole'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
-import { Label } from '@/components/ui/label'
-import { Switch } from '@/components/ui/switch'
+import { canDeleteProjects } from '@/lib/instance-admin'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation } from '@tanstack/react-query'
 import { useEffect, useRef, useState } from 'react'
@@ -129,13 +130,15 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
       ) {
         return
       }
-      const problem = error as { detail?: string; message?: string }
-      toast.error(
-        problem.detail || problem.message || 'Failed to update service'
-      )
+      // Any other failure is toasted by the app-wide mutation handler.
       return
     }
     toast.success('Service updated successfully', { id: toastId })
+    // The saved identity is the new baseline, so Save disables again.
+    projectForm.reset({
+      name: updated?.name ?? values.name,
+      slug: updated?.slug ?? values.slug,
+    })
     refetch()
     // Navigate to the slug the server persisted, not the one submitted: the
     // server normalizes it, so routing on the raw input can land on a URL that
@@ -156,7 +159,6 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
       {
         loading: 'Updating cross-service trace sharing...',
         success: 'Cross-service trace sharing updated',
-        error: 'Failed to update cross-service trace sharing',
       }
     )
     refetch()
@@ -175,12 +177,37 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
       {
         loading: 'Updating source context setting...',
         success: 'Error tracking source context updated',
-        error: 'Failed to update source context setting',
       }
     )
     refetch()
   }
 
+  const handleToggleServesOwnTempsApi = async (enabled: boolean) => {
+    if (!project?.id) return
+
+    await toast.promise(
+      updateProjectSettings.mutateAsync({
+        path: { project_id: project.id! },
+        body: {
+          serves_own_temps_api: enabled,
+        },
+      }),
+      {
+        loading: 'Updating Temps API routing...',
+        success: enabled
+          ? 'Temps API paths now reach this service'
+          : 'Temps API paths now reach this Temps instance',
+      }
+    )
+    refetch()
+  }
+
+  // `projects:delete` is held by the `admin` role alone: `platform_admin` is
+  // read-only on deployable resources, so `useIsInstanceAdmin` would offer it
+  // a button the server refuses. Gate on the exact role instead of letting the
+  // user type the service name first and be refused on confirm.
+  const role = useCurrentUserRole()
+  const canDeleteProject = canDeleteProjects(role)
   const [isDeleteDialogOpen, setIsDeleteDialogOpen] = useState(false)
   const deleteProjectMutationM = useMutation({
     ...deleteProjectMutation(),
@@ -202,7 +229,6 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
             navigate('/projects')
             return 'Service deleted'
           },
-          error: 'Failed to delete service',
         }
       )
     } catch (error) {
@@ -211,142 +237,124 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
   }
 
   return (
-    <div className="space-y-3">
+    <div className="divide-y [&>section]:py-8 [&>section:first-of-type]:pt-0">
       {verificationDialog}
-      {/* Project Settings Card */}
-      <Form {...projectForm}>
-        <form onSubmit={projectForm.handleSubmit(handleSaveProject)}>
-          <SettingsSection
-            title="Service identity"
-            icon={FolderPen}
-            defaultOpen
+      <SettingsGroup
+        id="setting-identity"
+        title="Identity"
+        description="How this service is named in the console, its URL, alerts and traces."
+      >
+        <Form {...projectForm}>
+          <form
+            onSubmit={projectForm.handleSubmit(handleSaveProject)}
+            className="space-y-5"
           >
-            <div className="space-y-6">
-              <FormField
-                control={projectForm.control}
-                name="name"
-                render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>Service name</FormLabel>
-                    <FormControl>
-                      <Input {...field} className="max-w-[400px]" />
-                    </FormControl>
-                    <FormDescription className="text-muted-foreground">
-                      The display name shown on the dashboard, in alerts, and in
-                      notifications. Also used as the OpenTelemetry service name
-                      for future deployments, so renaming starts a new series in
-                      traces and metrics.
-                    </FormDescription>
-                    <FormMessage />
-                  </FormItem>
-                )}
-              />
-
-              <FormField
-                control={projectForm.control}
-                name="slug"
-                render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>Service slug</FormLabel>
-                    <FormControl>
-                      <Input {...field} className="max-w-[400px]" />
-                    </FormControl>
-                    <FormDescription className="text-muted-foreground">
-                      This will be used in your service&apos;s URL
-                    </FormDescription>
-                    <FormMessage />
-                  </FormItem>
-                )}
-              />
-            </div>
-            <div className="pt-4">
-              <Button
-                size="sm"
-                type="submit"
-                disabled={updateProjectSettings.isPending}
-              >
-                Save
-              </Button>
-            </div>
-          </SettingsSection>
-        </form>
-      </Form>
-
-      {/* Monitoring — what deployments report about themselves */}
-      {project.source_type !== 'external' && (
-        <MonitoringCard project={project} refetch={refetch} />
-      )}
-
-      {/* ADR-040 — where this project's telemetry history stands with Temps
-          Cloud. Always rendered: the backfill is a deliberate CLI action, so
-          this card is the only place it is discoverable from the Console. */}
-      <CloudTelemetryBackfillCard project={project} />
-
-      {/* Cross-Project Trace Sharing Card */}
-      <SettingsSection title="Trace sharing" icon={GitFork}>
-        <div>
-          <div className="flex flex-row items-center justify-between rounded-lg border p-4">
-            <div className="space-y-0.5 pr-4">
-              <Label
-                htmlFor="cross-project-trace-sharing"
-                className="text-base"
-              >
-                Cross-service trace sharing
-              </Label>
-              <p className="text-sm text-muted-foreground">
-                When on, this service&apos;s spans appear in other
-                services&apos; unified cross-service traces. Turn off to keep
-                this service&apos;s spans private to itself.
-              </p>
-            </div>
-            <Switch
-              id="cross-project-trace-sharing"
-              checked={project?.cross_project_trace_sharing ?? true}
-              onCheckedChange={handleToggleCrossProjectTraceSharing}
-              disabled={updateProjectSettings.isPending}
+            <FormField
+              control={projectForm.control}
+              name="name"
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>Service name</FormLabel>
+                  <FormControl>
+                    <Input {...field} className="max-w-md" />
+                  </FormControl>
+                  <FormDescription>
+                    Also the OpenTelemetry service name for future deployments,
+                    so renaming starts a new series in traces and metrics.
+                  </FormDescription>
+                  <FormMessage />
+                </FormItem>
+              )}
             />
+            <FormField
+              control={projectForm.control}
+              name="slug"
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>Service slug</FormLabel>
+                  <FormControl>
+                    <Input {...field} className="max-w-md" />
+                  </FormControl>
+                  <FormDescription>
+                    Used in this service&apos;s URL.
+                  </FormDescription>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+            <SaveRow
+              dirty={projectForm.formState.isDirty}
+              saving={updateProjectSettings.isPending}
+            />
+          </form>
+        </Form>
+      </SettingsGroup>
+
+      <SettingsGroup
+        title="Telemetry"
+        description="What this service reports, and who else can see it."
+      >
+        <div className="divide-y">
+          {project.source_type !== 'external' && (
+            <MonitoringToggles project={project} refetch={refetch} />
+          )}
+          <SettingToggleRow
+            id="cross-project-trace-sharing"
+            label="Cross-service trace sharing"
+            description="Show this service's spans in other services' unified traces. Off keeps them private to this service."
+            checked={project?.cross_project_trace_sharing ?? true}
+            onCheckedChange={handleToggleCrossProjectTraceSharing}
+            disabled={updateProjectSettings.isPending}
+          />
+          <SettingToggleRow
+            id="error-source-context"
+            label="Source code in stack traces"
+            description="Upload source per release (CLI or API) and errors show the code around each frame. Source is only accepted while this is on."
+            checked={project?.error_source_context_enabled ?? false}
+            onCheckedChange={handleToggleErrorSourceContext}
+            disabled={updateProjectSettings.isPending}
+          />
+          <SettingToggleRow
+            id="serves-own-temps-api"
+            label="App serves its own Temps API"
+            description={
+              <>
+                Send <code>/api/_temps</code> and <code>/api/otel</code> on this
+                service&apos;s domains to the app instead of Temps. Only for an
+                app that is itself a Temps console; Temps&apos; analytics and
+                ingest then stop receiving its traffic.
+              </>
+            }
+            checked={project?.serves_own_temps_api ?? false}
+            onCheckedChange={handleToggleServesOwnTempsApi}
+            disabled={updateProjectSettings.isPending}
+          />
+          {/* ADR-040: the backfill is a deliberate CLI action, so its status
+              here is the only place it is discoverable from the Console. */}
+          <div className="space-y-3 py-4 last:pb-0">
+            <p className="text-sm font-medium">Cloud telemetry backfill</p>
+            <CloudTelemetryBackfillCard project={project} bare />
           </div>
         </div>
-      </SettingsSection>
+      </SettingsGroup>
 
-      {/* Error Tracking Source Context Card */}
-      <SettingsSection title="Source context" icon={FileCode}>
-        <div>
-          <div className="flex flex-row items-center justify-between rounded-lg border p-4">
-            <div className="space-y-0.5 pr-4">
-              <Label htmlFor="error-source-context" className="text-base">
-                Source code in stack traces
-              </Label>
-              <p className="text-sm text-muted-foreground">
-                Off by default. When enabled, upload your application source per
-                release (via the CLI or API, keyed by the deployed commit/tag)
-                and Temps shows the code around each frame. Source files are
-                only accepted and stored while this is on.
-              </p>
-            </div>
-            <Switch
-              id="error-source-context"
-              checked={project?.error_source_context_enabled ?? false}
-              onCheckedChange={handleToggleErrorSourceContext}
-              disabled={updateProjectSettings.isPending}
-            />
-          </div>
+      <SettingsGroup
+        id="setting-danger-zone"
+        title="Danger zone"
+        description="Permanently delete this service and everything in it. This cannot be undone."
+      >
+        <div className="space-y-3">
+          <Button
+            variant="destructive"
+            disabled={!canDeleteProject}
+            onClick={() => setIsDeleteDialogOpen(true)}
+          >
+            Delete service
+          </Button>
+          {!canDeleteProject && (
+            <AdminOnlyNote action="delete a service" role={role} />
+          )}
         </div>
-      </SettingsSection>
-
-      {/* Danger Zone */}
-      <SettingsSection title="Delete service" icon={Trash2}>
-        <p className="text-sm text-muted-foreground mt-1 mb-4">
-          Permanently delete this service and all of its contents from the
-          platform. This action is not reversible, so please continue with
-          caution.
-        </p>
-        <Button
-          variant="destructive"
-          onClick={() => setIsDeleteDialogOpen(true)}
-        >
-          Delete service
-        </Button>
         <ConfirmDeleteDialog
           open={isDeleteDialogOpen}
           onOpenChange={setIsDeleteDialogOpen}
@@ -356,7 +364,7 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
           requireTypedName
           onConfirm={() => void handleDeleteProject()}
         />
-      </SettingsSection>
+      </SettingsGroup>
     </div>
   )
 }

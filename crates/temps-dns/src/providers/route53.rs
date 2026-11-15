@@ -199,6 +199,11 @@ mod aws_signing {
     }
 
     fn hmac_sha256(key: &[u8], data: &str) -> Vec<u8> {
+        #[allow(
+            clippy::expect_used,
+            reason = "HMAC accepts keys of any length (long keys are hashed, short ones padded), \
+                      so new_from_slice never returns InvalidLength"
+        )]
         let mut mac = HmacSha256::new_from_slice(key).expect("HMAC can take key of any size");
         mac.update(data.as_bytes());
         mac.finalize().into_bytes().to_vec()
@@ -237,9 +242,6 @@ struct HostedZone {
     id: String,
     #[serde(rename = "Name")]
     name: String,
-    #[serde(rename = "CallerReference")]
-    #[allow(dead_code)]
-    caller_reference: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

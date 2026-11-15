@@ -67,16 +67,16 @@ impl PgStatConnectionPolicy {
         username: &str,
         password: &str,
         database: &str,
-    ) -> temps_query::Result<tokio_postgres::Client> {
+    ) -> temps_providers_core::query::Result<tokio_postgres::Client> {
         match self {
             Self::Standard => {
-                temps_query_postgres::connect_with_tls_ladder(
+                temps_providers_postgres::query::connect_with_tls_ladder(
                     host, port, username, password, database,
                 )
                 .await
             }
             Self::ManagedPrivate => {
-                temps_query_postgres::connect_with_private_tls_ladder(
+                temps_providers_postgres::query::connect_with_private_tls_ladder(
                     host, port, username, password, database,
                 )
                 .await
@@ -485,7 +485,32 @@ impl PgStatStatementsService {
                         reason: format!("invalid port '{}': {}", port_str, e),
                     }
                 })?;
-                pg_stat_connection_target(None, config.host.clone(), port)
+                // A worker publishes the service on its data address; the
+                // stored `localhost` would point at the control plane itself.
+                let resolve_failed = |e| PgStatStatementsError::ConnectionFailed {
+                    service_id,
+                    host: config.host.clone(),
+                    port,
+                    reason: format!("failed to resolve the node hosting the service: {}", e),
+                };
+                let service = self
+                    .external_service_manager
+                    .get_service(service_id)
+                    .await
+                    .map_err(resolve_failed)?;
+                let worker_host = self
+                    .external_service_manager
+                    .worker_data_address(&service)
+                    .await
+                    .map_err(resolve_failed)?;
+                match worker_host {
+                    Some(worker)
+                        if temps_core::node_address::is_local_service_host(&config.host) =>
+                    {
+                        pg_stat_connection_target(Some((worker, port)), config.host.clone(), port)
+                    }
+                    _ => pg_stat_connection_target(None, config.host.clone(), port),
+                }
             }
             Err(e) => {
                 return Err(PgStatStatementsError::ConnectionFailed {
@@ -761,7 +786,10 @@ impl PgStatStatementsService {
         pagination: SlowQueryPage,
     ) -> Result<(Vec<SlowQueryRow>, u64), PgStatStatementsError> {
         let limit = pagination.page_size;
-        let offset = (pagination.page - 1) * pagination.page_size;
+        let offset = temps_core::config::page_offset(
+            u64::from(pagination.page),
+            u64::from(pagination.page_size),
+        );
 
         // Ensure the extension is installed. This is idempotent and fast when
         // it's already present. It will fail if shared_preload_libraries does

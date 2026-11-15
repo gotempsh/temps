@@ -20,6 +20,7 @@ pub mod dns_registry;
 pub mod domain_delivery;
 pub mod hostname_sync;
 pub mod managed_records;
+pub mod observability;
 pub mod provider_service;
 pub mod record_service;
 
@@ -29,7 +30,9 @@ pub use dns_registry::{
     StaleResolver, ZoneSnapshot,
 };
 pub use hostname_sync::{HostChange, HostnameModeResult, RecordChange};
-pub use managed_records::{ManagedDnsRecordService, OwnershipScope, RecordOwnership};
+pub use managed_records::{
+    ManagedDnsRecordService, OwnershipScope, RecordOwnership, RecordSnapshot,
+};
 pub use provider_service::{
     AddManagedDomainRequest, CreateProviderRequest, DnsProviderService, UpdateManagedDomainRequest,
     UpdateProviderRequest,

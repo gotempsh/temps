@@ -8,11 +8,12 @@ use std::sync::Arc;
 use temps_core::plugin::{
     PluginContext, PluginError, PluginRoutes, ServiceRegistrationContext, TempsPlugin,
 };
-use temps_core::templates::TemplateService;
+use temps_presets::templates::TemplateService;
 use utoipa::openapi::OpenApi;
 use utoipa::OpenApi as OpenApiTrait;
 
 use crate::services::custom_domains::CustomDomainService;
+use crate::services::data_purge::{ProjectDataPurgeConfig, ProjectDataPurger};
 use crate::services::operations::OperationsService;
 use crate::services::project::ProjectService;
 
@@ -52,6 +53,15 @@ impl TempsPlugin for ProjectsPlugin {
                 context.require_service::<temps_environments::EnvironmentService>();
             let encryption_service = context.require_service::<temps_core::EncryptionService>();
 
+            // Removes deleted projects' telemetry in the background; the
+            // project delete only records what to purge. Several control
+            // planes may run it: each purge is leased to one worker at a time.
+            Arc::new(ProjectDataPurger::new(
+                db.clone(),
+                ProjectDataPurgeConfig::default(),
+            ))
+            .spawn(queue_service.clone());
+
             // Create ProjectService
             let project_service = Arc::new(ProjectService::new(
                 db.clone(),
@@ -62,7 +72,16 @@ impl TempsPlugin for ProjectsPlugin {
                 environment_service,
                 encryption_service,
             ));
+            if let Some(slot) =
+                context.get_service::<temps_core::environment_address::EnvironmentAddressSlot>()
+            {
+                project_service.set_environment_addresses(slot);
+            }
             context.register_service(project_service);
+
+            // The list other plugins add their project deletion hooks to;
+            // whichever plugin registers first creates it.
+            temps_core::ProjectDeletionHooks::get_or_register(context);
 
             // Create CustomDomainService
             let custom_domain_service = Arc::new(CustomDomainService::new(db.clone()));
@@ -96,6 +115,8 @@ impl TempsPlugin for ProjectsPlugin {
             });
         let project_archive_cleaner =
             context.require_service::<dyn temps_core::ProjectArchiveCleaner>();
+        let project_image_cleaner =
+            context.require_service::<dyn temps_core::ProjectImageCleaner>();
         let telemetry = context
             .get_service::<dyn temps_core::telemetry::TelemetryReporter>()
             .unwrap_or_else(|| Arc::new(temps_core::telemetry::NoopTelemetryReporter));
@@ -126,10 +147,13 @@ impl TempsPlugin for ProjectsPlugin {
             config_service,
             public_hostname_resolver,
             project_archive_cleaner,
+            project_image_cleaner,
             telemetry,
             project_access_checker,
             sensitive_action_authorizer,
-            project_deletion_hook: context.get_service::<dyn temps_core::ProjectDeletionHook>(),
+            // Registered (possibly empty) by `register_services`, so always
+            // present; plugins add their hooks to the same list.
+            project_deletion_hooks: context.require_service::<temps_core::ProjectDeletionHooks>(),
         });
         let routes = crate::handlers::configure_routes()
             .with_state(app_state)

@@ -76,7 +76,7 @@ export default function IpGeolocationDetail() {
   })
 
   useEffect(() => {
-    setBreadcrumbs([{ label: 'IP Geolocation' }])
+    setBreadcrumbs([{ label: 'IP geolocation' }])
   }, [setBreadcrumbs])
 
   const backAction = (
@@ -159,7 +159,7 @@ export default function IpGeolocationDetail() {
                     className="flex items-center gap-1 text-sm text-primary hover:underline"
                   >
                     <MapPin className="h-3 w-3" />
-                    View on Google Maps
+                    View on Google maps
                   </a>
                 </div>
               )}

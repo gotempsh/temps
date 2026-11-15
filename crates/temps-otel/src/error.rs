@@ -129,6 +129,8 @@ pub enum OtelError {
 /// or any other unbounded value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StorageErrorKind {
+    /// Bounded adapter retry receipts are full; transaction was aborted.
+    AdapterCapacity,
     /// ClickHouse transport failure — socket error, connection refused/reset.
     ClickHouseNetwork,
     /// ClickHouse request exceeded its deadline.
@@ -144,9 +146,12 @@ pub enum StorageErrorKind {
     /// The connection pool never handed out a connection — it timed out or was
     /// closed. Nothing was transmitted, so the write provably did not happen.
     ///
-    /// This is the *only* Postgres failure a non-idempotent write may retry;
+    /// Together with an explicit transaction abort, this is safe to retry;
     /// see [`StorageErrorKind::is_transient`].
     PostgresConnAcquire,
+    /// SQLSTATE 40001/40P01 explicitly aborted the transaction. No records
+    /// committed, so retrying the native atomic batch cannot duplicate rows.
+    PostgresTransactionAborted,
     /// An established Postgres connection failed. The statement may have been
     /// transmitted, executed and committed before the failure was observed, so
     /// the outcome is **unknown**. Not retryable — see
@@ -193,7 +198,7 @@ impl StorageErrorKind {
     /// note on `TimescaleDbStorage::batch_insert_spans`.
     ///
     /// That leaves the second condition: retry only when the failure proves
-    /// nothing was transmitted. Exactly one variant does:
+    /// nothing committed: explicit transaction aborts (40001/40P01), or
     /// [`StorageErrorKind::PostgresConnAcquire`], which sea-orm raises only
     /// for `PoolTimedOut`/`PoolClosed` — both occur before a connection
     /// exists. [`StorageErrorKind::PostgresConn`] wraps an arbitrary
@@ -213,11 +218,13 @@ impl StorageErrorKind {
     pub fn is_transient(&self) -> bool {
         match self {
             // Idempotent destination (ReplacingMergeTree): safe to re-send.
-            StorageErrorKind::ClickHouseNetwork
+            StorageErrorKind::AdapterCapacity
+            | StorageErrorKind::ClickHouseNetwork
             | StorageErrorKind::ClickHouseTimeout
             | StorageErrorKind::ClickHouseOther => true,
             // Non-idempotent destination, but the batch provably never left us.
-            StorageErrorKind::PostgresConnAcquire => true,
+            StorageErrorKind::PostgresConnAcquire
+            | StorageErrorKind::PostgresTransactionAborted => true,
             // Outcome unknown against a non-idempotent destination.
             StorageErrorKind::PostgresConn => false,
             // Deterministic: the identical batch reproduces these exactly.
@@ -234,6 +241,7 @@ impl StorageErrorKind {
     /// format: renaming one splits an existing group in two.
     pub fn as_class(&self) -> &'static str {
         match self {
+            StorageErrorKind::AdapterCapacity => "adapter_capacity",
             StorageErrorKind::ClickHouseNetwork => "clickhouse_network",
             StorageErrorKind::ClickHouseTimeout => "clickhouse_timeout",
             StorageErrorKind::ClickHouseSchema => "clickhouse_schema",
@@ -241,6 +249,7 @@ impl StorageErrorKind {
             StorageErrorKind::ClickHouseOther => "clickhouse_other",
             StorageErrorKind::PostgresConnAcquire => "postgres_conn_acquire",
             StorageErrorKind::PostgresConn => "postgres_conn",
+            StorageErrorKind::PostgresTransactionAborted => "postgres_transaction_aborted",
             StorageErrorKind::PostgresQuery => "postgres_query",
             StorageErrorKind::Precondition => "precondition",
         }
@@ -332,9 +341,9 @@ impl OtelError {
 /// the statement reached the server — which is what decides whether a
 /// non-idempotent write may be retried. See [`StorageErrorKind::is_transient`].
 ///
-/// Everything else — `Query`, `Type`, `RecordNotInserted`, `RecordNotFound`,
-/// `Exec`, `Migration`, … — describes the *statement or the data* and will
-/// fail identically on the next attempt.
+/// Except explicit transaction aborts (40001/40P01), query, execution,
+/// conversion and migration failures describe the statement or data and
+/// will fail identically on the next attempt.
 ///
 /// This is narrower than `temps-status-page`'s retry helper, which treats
 /// `ConnectionAcquire | Conn` alike. That helper guards idempotent
@@ -346,11 +355,22 @@ pub(crate) fn db_err_kind(err: &sea_orm::DbErr) -> StorageErrorKind {
         // sqlx errors — `PoolTimedOut` and `PoolClosed` — both of which happen
         // before a connection is obtained, hence before any bytes reach
         // Postgres. That "provably never sent" guarantee is what makes it the
-        // only Postgres failure a non-idempotent write may retry.
+        // safe to retry, as are explicit transaction aborts below.
         sea_orm::DbErr::ConnectionAcquire(_) => StorageErrorKind::PostgresConnAcquire,
         // Wraps an arbitrary `sqlx::Error` on an already-established
         // connection, so the statement may already have committed.
         sea_orm::DbErr::Conn(_) => StorageErrorKind::PostgresConn,
+        sea_orm::DbErr::Query(sea_orm::RuntimeErr::SqlxError(sea_orm::sqlx::Error::Database(
+            error,
+        )))
+        | sea_orm::DbErr::Exec(sea_orm::RuntimeErr::SqlxError(sea_orm::sqlx::Error::Database(
+            error,
+        ))) if error
+            .code()
+            .is_some_and(|code| matches!(code.as_ref(), "40001" | "40P01")) =>
+        {
+            StorageErrorKind::PostgresTransactionAborted
+        }
         _ => StorageErrorKind::PostgresQuery,
     }
 }
@@ -663,6 +683,10 @@ mod tests {
             ),
             (StorageErrorKind::PostgresConn, "postgres_conn"),
             (StorageErrorKind::PostgresQuery, "postgres_query"),
+            (
+                StorageErrorKind::PostgresTransactionAborted,
+                "postgres_transaction_aborted",
+            ),
             (StorageErrorKind::Precondition, "precondition"),
         ];
         for (kind, expected) in cases {
@@ -700,6 +724,7 @@ mod tests {
             "postgres_conn_acquire",
             "postgres_conn",
             "postgres_query",
+            "postgres_transaction_aborted",
             "precondition",
             "s3",
             "io",
@@ -785,6 +810,7 @@ mod tests {
             StorageErrorKind::ClickHouseTimeout,
             StorageErrorKind::ClickHouseOther,
             StorageErrorKind::PostgresConnAcquire,
+            StorageErrorKind::PostgresTransactionAborted,
         ];
         for kind in transient {
             assert!(kind.is_transient(), "{} must be transient", kind.as_class());
@@ -820,6 +846,7 @@ mod tests {
             StorageErrorKind::PostgresConnAcquire,
             StorageErrorKind::PostgresConn,
             StorageErrorKind::PostgresQuery,
+            StorageErrorKind::PostgresTransactionAborted,
             StorageErrorKind::Precondition,
         ];
         let unique: std::collections::HashSet<&str> = kinds.iter().map(|k| k.as_class()).collect();

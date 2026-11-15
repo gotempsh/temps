@@ -114,3 +114,6 @@ export type {
   // CLI
   PluginArgs,
 } from "./types.js";
+
+export { createToolPlugin } from "./tools.js";
+export type { PluginToolOptions } from "./tools.js";

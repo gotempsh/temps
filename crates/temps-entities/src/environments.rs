@@ -10,7 +10,7 @@ use sea_orm::{
 use serde::{Deserialize, Serialize};
 use temps_core::DBDateTime;
 
-use super::deployment_config::{DeploymentConfig, SecurityConfig};
+use super::deployment_config::DeploymentConfig;
 use super::upstream_config::UpstreamList;
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq, Serialize, Deserialize)]
@@ -49,6 +49,13 @@ pub struct Model {
     /// this environment, taking precedence over the project default.
     /// (A nullable boolean column maps to `Option<bool>` automatically.)
     pub attack_mode: Option<bool>,
+    /// ADR 066 D1: this environment's Shield mode; `None` inherits the
+    /// project's.
+    pub shield_mode: Option<String>,
+    /// ADR 066 D7: paths Shield never challenges here (`/api/*`, `/healthz`).
+    #[sea_orm(column_type = "JsonBinary")]
+    #[serde(default)]
+    pub shield_exempt_paths: ShieldExemptPaths,
     /// Per-environment override for the proxy's HTTP→HTTPS redirect.
     /// `None` (NULL) means inherit the proxy default, which redirects only when
     /// the requested host has an active TLS certificate. `Some(true)` always
@@ -61,6 +68,18 @@ pub struct Model {
     /// Last proxied request timestamp for on-demand environments.
     /// Persisted periodically by the idle sweep, not on every request.
     pub last_activity_at: Option<DBDateTime>,
+    /// Which access evaluator decides this environment's requests
+    /// (ADR-055 §11): the legacy chain, the legacy chain compared against the
+    /// compiled endpoint, or the compiled endpoint. A serialized row from
+    /// before the column reads as `legacy`.
+    #[serde(default)]
+    pub ingress_mode: super::ingress_mode::IngressMode,
+    /// Which scheduler places this environment's deployments (ADR-055
+    /// Phase 5): `NodeScheduler`, both compared, or the unified scheduler and
+    /// the workload plane. A serialized row from before the column reads as
+    /// `legacy`.
+    #[serde(default)]
+    pub workload_mode: super::environment_workload_mode::EnvironmentWorkloadMode,
 }
 
 /// Serialize a claim on the global preview-hostname namespace and return any
@@ -93,49 +112,11 @@ pub async fn claim_subdomain(
     conflict.one(txn).await
 }
 
-impl Model {
-    /// Get the effective deployment configuration by merging project and environment configs
-    ///
-    /// The project configuration serves as defaults, and the environment configuration
-    /// overrides specific values. This allows setting project-wide defaults with
-    /// environment-specific overrides.
-    pub fn get_effective_deployment_config(
-        &self,
-        project_config: &DeploymentConfig,
-    ) -> DeploymentConfig {
-        let env_config = self.deployment_config.clone().unwrap_or_default();
-        project_config.merge(&env_config)
-    }
-
-    /// Get the effective security configuration by merging global, project, and environment configs
-    ///
-    /// The inheritance chain is: Environment > Project > Global
-    /// This allows:
-    /// - Global defaults for all projects
-    /// - Project-specific overrides (from project.deployment_config.security)
-    /// - Environment-specific overrides (from environment.deployment_config.security)
-    pub fn get_effective_security_config(
-        &self,
-        global_config: &SecurityConfig,
-        project_deployment_config: &DeploymentConfig,
-    ) -> SecurityConfig {
-        // Extract security configs from deployment configs
-        let project_security = project_deployment_config
-            .security
-            .as_ref()
-            .cloned()
-            .unwrap_or_default();
-
-        let env_security = self
-            .deployment_config
-            .as_ref()
-            .and_then(|dc| dc.security.clone())
-            .unwrap_or_default();
-
-        // Chain: global -> project -> environment
-        global_config.merge(&project_security).merge(&env_security)
-    }
-}
+/// The exempt path patterns an environment stores (ADR 066, D7).
+#[derive(
+    Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, sea_orm::FromJsonQueryResult,
+)]
+pub struct ShieldExemptPaths(pub Vec<String>);
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {

@@ -660,7 +660,6 @@ where
 /// the `StartExecResults` re-export is needed elsewhere. Tests in the
 /// engines crate consume `attach_container` directly which forces the
 /// linker to keep these.
-#[allow(dead_code)]
 fn _force_link_referenced_types() {
     let _ = std::mem::size_of::<StartExecResults>();
 }

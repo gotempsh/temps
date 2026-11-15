@@ -140,35 +140,48 @@ export function harnessSetupStatus(
   return provider.workspace_ready ? 'Credential saved' : 'Needs attention'
 }
 
-export function workspaceReturnTo(value: string | null): string {
+/**
+ * The workspace page a harness setup was opened from, if it is one: the
+ * workspaces list or a single workspace. Anything else (missing, external,
+ * malformed, another page) is null, and the setup pages show no way back.
+ */
+export function workspaceReturnTo(value: string | null): string | null {
   if (
     !value ||
     !value.startsWith('/') ||
     value.startsWith('//') ||
     /[\\\s]/.test(value)
   )
-    return '/ai-first'
+    return null
   const url = new URL(value, 'https://temps.invalid')
-  if (url.origin !== 'https://temps.invalid') return '/ai-first'
+  if (url.origin !== 'https://temps.invalid') return null
   if (
-    url.pathname !== '/ai-first' &&
     url.pathname !== '/workspaces' &&
     !/^\/workspaces\/[a-zA-Z0-9_-]+$/.test(url.pathname)
   )
-    return '/ai-first'
+    return null
   return `${url.pathname}${url.search}`
 }
 
-export function harnessSetupHref(providerId: string | null, returnTo: string) {
+/** "Back to workspaces" for the list, "Back to workspace" for one. */
+export function backToWorkspaceLabel(returnTo: string): string {
+  return new URL(returnTo, 'https://temps.invalid').pathname === '/workspaces'
+    ? 'Back to workspaces'
+    : 'Back to workspace'
+}
+
+export function harnessSetupHref(
+  providerId: string | null,
+  returnTo: string | null
+) {
   const path =
     '/agent-sandbox/providers' +
     (providerId ? `/${encodeURIComponent(providerId)}` : '')
-  return `${path}?returnTo=${encodeURIComponent(workspaceReturnTo(returnTo))}`
+  const back = workspaceReturnTo(returnTo)
+  return back ? `${path}?returnTo=${encodeURIComponent(back)}` : path
 }
 
 export function harnessSectionHref(path: string, search: string): string {
-  const returnTo = new URLSearchParams(search).get('returnTo')
-  return returnTo
-    ? `${path}?${new URLSearchParams({ returnTo: workspaceReturnTo(returnTo) })}`
-    : path
+  const back = workspaceReturnTo(new URLSearchParams(search).get('returnTo'))
+  return back ? `${path}?${new URLSearchParams({ returnTo: back })}` : path
 }

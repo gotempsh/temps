@@ -15,7 +15,11 @@ pub struct Model {
     pub project_id: i32,
     pub environment_id: Option<i32>,
     pub monitor_id: Option<i32>,
+    /// Internal title; never published.
     pub title: String,
+    /// Heading written for the public. Published status pages show it when
+    /// set, and a severity-derived heading otherwise.
+    pub public_title: Option<String>,
     pub description: Option<String>,
     pub severity: String, // minor, major, critical
     pub status: String,   // investigating, identified, monitoring, resolved

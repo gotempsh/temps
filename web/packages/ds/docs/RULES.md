@@ -21,6 +21,15 @@ Imperative digest. If a rule and a screenshot disagree, fix the screenshot.
   concrete example, a link to the settings page. Never nothing. `PageState`
   variant `not-set-up` enforces this at the type level — `requirement`,
   `example`, `settingsHref` are required props.
+- Pages don't explain themselves. No paragraph under a page or section title
+  saying what the page is or how the feature works: users skip it and it
+  pushes the content down. A description appears only when it is one short
+  line the user needs to act; constraints sit beside the control, consequences
+  in the confirm dialog, background in `HelpPopover`/`Disclosure` or the docs
+  (see Progressive disclosure and `DESIGN.md`).
+- Nothing scrolls sideways, at any width: not the page, a table, or a tab
+  strip. Tables show columns by priority with container queries and fold
+  what is needed to act under the record's name (see Responsive).
 - Color never decorates. It appears only through `Status` (badges, dots,
   chart series). If you reach for a raw color to convey meaning outside
   `Status`, stop and add a tone to `Status` instead. Existing provider logos
@@ -84,7 +93,10 @@ See sandbox `/iconography` for examples.
 ## Page structure
 
 `PageContainer` owns horizontal padding — nothing else in a page tree sets
-`px-*` on its outer wrapper. `PageHeader` owns the `h1` + actions row.
+`px-*` on its outer wrapper. Only the outermost one pads: a template's own
+`PageContainer` inside a route shell's renders as a plain column. `PageHeader`
+owns the `h1` + actions row; under `PageNamedByChromeContext` (a tab strip
+that already names the page) the `h1` is screen-reader only.
 
 ## Record page checklist
 
@@ -94,12 +106,22 @@ optional; `main` is not.
 
 ## Forms
 
+A form beyond a few fields is a routed page with its URL, not a modal; a modal
+form is one column. Catch predictable failures beside the field before Save (a
+name already used in its scope: say so and suggest a free one), never as a raw
+server or database error after it.
+
 `Field` for every control (label + control + description + error, wired
 `aria-describedby`). `FormErrors` above the sticky save bar, not only inline. Error summaries identify
 the field as well as the problem. Pass Field props through `Picker inputProps`
 so searchable controls retain label/help/error associations.
 `Settings`'s save bar is always mounted — it doesn't appear/disappear with
 `dirty`, so its position never jumps.
+On settings pages built from `SettingsSection`/`SettingsGroup`, save with
+`SaveRow`: the same rule, hint and Save, always mounted, disabled until
+something changed. One sticky `SaveRow` for a page saved as one form, or one
+at the end of each group that saves on its own; never a Save button floating
+under a field.
 
 ## Notifications
 
@@ -132,8 +154,8 @@ Keep the section heading and filter controls mounted while data changes.
 
 Keep errors, empty content, and loading in the collection's usual location.
 Do not nest a second bordered empty-state panel inside a table surface.
-`DataTable` owns its border and horizontal scroll; `PageState` can replace
-it or sit inside an existing surface without adding another border.
+`DataTable` owns its border; `PageState` can replace it or sit inside an
+existing surface without adding another border.
 
 Example: sandbox `/table-states` has shareable scenarios, working retries,
 and filtering. Production reference: `CronJobDetail.tsx`.
@@ -191,10 +213,28 @@ opt-in, never needed to communicate success; use a text-labeled `Status`.
 
 ## Responsive
 
-`PageHeader` actions wrap to a second row before they overflow. `Detail`'s
-aside stacks below `main` under `lg`. Tables scroll horizontally before they
-break layout — never let a fact grid or button row force horizontal page
-scroll.
+No horizontal scrolling, anywhere. `PageHeader` actions keep their width and
+wrap to a second row; the description wraps, never under them. `Detail`'s aside
+stacks below `main` under `lg`. Tables are query containers: `DataTable`
+declares one around its table, so give each `DataTableColumn` a priority class
+(`hidden @xl:table-cell`; it applies to the head and every cell) and a narrow
+table keeps the name, the state and the actions. A hand-built shared `Table`
+is not a container by itself: wrap it in `<div className="@container">`
+directly around the table, or the `@` classes measure some ancestor instead
+(and with none, the columns never show). Move
+what a hidden column says that is needed to act under the name. Long
+identifiers break (`overflow-wrap: anywhere`). Tabs wrap. Check from 320px up.
+`DataTable`'s overflow wrapper and `ScrollableTabsList` are a safety net and a
+legacy gap, not a layout; convert a table when touching it.
+
+A card grid (a catalogue, a picker) becomes a list of rows where fewer than
+three cards fit side by side; never one or two cramped cards per row.
+
+Tables show only what is needed to scan and act: the name, its state, one
+compact time (relative within a day, then the date; the exact time in a
+tooltip). IDs, keys, certificates and full timestamps belong to the detail
+view. A row has at most one inline action; the rest go in one "…" menu,
+destructive last, disabled items saying why.
 
 ## Requirements: the URL is the state
 
@@ -209,12 +249,17 @@ Filters, tab, page number, selected record: `useUrlState`, not local
    this, but re-scan by eye for anything the regex can't (inline `<style>`,
    a `boxShadow` object).
 4. The record recipe order (title → verdict → facts → main → aside) holds.
+5. No page or section opens with a paragraph explaining itself.
 
 ## Progressive disclosure
 
-Show only what the user needs for the next action. Page descriptions are optional;
-omit copy that repeats a title, label, or obvious control. Keep field-format
-requirements next to the field. Prefer one short sentence over a paragraph.
+Show only what the user needs for the next action. Page and section
+descriptions are off by default: never define the title's noun, tour the
+feature, or explain how it works or why it is safe. Keep field-format
+requirements and constraints next to the field. When a line is needed to act,
+it is one short sentence, never a paragraph. A record's own description is
+data and may show under its name; an empty one renders nothing, not
+"No description".
 
 Use `HelpPopover` for optional, short context and `Disclosure` for longer technical
 details or advanced settings. Name the topic in the trigger ("Retention details",
@@ -227,32 +272,56 @@ sample label in demos, and move walkthrough instructions into "About this exampl
 outside the main workflow. Use existing semantic spacing and colors; help is not
 a new bordered card around every field.
 
-Use `SettingsSection` for collapsible form groups, not the informational
-`Disclosure`: it retains field values and reveals validation errors. Use open sections for everyday settings, with section headings on the left and
-controls on the right on desktop; stack headings above controls on mobile. Separate groups with
-spacing instead of a card or divider around each one. Reserve collapsible form
-groups for advanced or infrequent controls. Keep short forms at a readable width
-(the settings reference uses a `max-w-5xl` grid with one-third headings and
-two-thirds controls) rather than stretching inputs across the viewport. `Field.help` places optional context beside the label;
-required instructions and errors remain visible below the control.
+Settings are never collapsible. No expand/collapse on settings, and never a
+collapsible inside a collapsible: a setting is read and edited in place.
+`SettingsSection` is always open. At the top level it is an open group laid
+out like `SettingsGroup` (title and description left, settings right, a rule
+between groups); inside another section (or a `SettingsSurface`) it renders
+flat, as a sub-heading with a divider. A console `Card` placed directly on a
+settings surface drops its frame, and dialogs, sheets and popovers reset the
+surface so their cards keep it. A settings page is never a box inside a box,
+and links reach a section through `?section=` deep links, not disclosures.
 
-Use `SettingsGroup` for the aligned open layout. Use `SettingsSection` only when
-the form group should collapse; each caller retains its own save scope.
+List pages in settings (secrets, tokens, variables, access) use one
+`PageHeader` with the primary action on the right, then the list itself on the
+page; they never repeat the page title as a section heading.
 
-SettingsGroup descriptions are optional: one short sentence beneath the heading
-that clarifies scope or outcome. Omit repeated labels and detailed instructions.
+On full settings forms only, use open sections with section headings on the left and controls on the right
+on desktop; stack headings above controls on mobile. Separate groups with
+spacing instead of a card or divider around each one. Keep short forms at a
+readable width (the settings reference uses a `max-w-5xl` grid with one-third
+headings and two-thirds controls) rather than stretching inputs across the
+viewport. `Field.help` places optional context beside the label; required
+instructions and errors remain visible below the control.
+
+Use `SettingsGroup` for the aligned open layout and `SettingsSection` for a
+titled group of settings; each caller retains its own save scope. `Disclosure`
+stays for informational detail only, never for settings.
+
+SettingsGroup descriptions are optional: one short line beneath the heading
+saying what the setting controls when the title doesn't. Omit the reasoning
+behind it, repeated labels and detailed instructions.
 
 ## Resource detail navigation
 
-- Use `RecordLink` for the resource name in a table's identity column. Its
-  underline and right arrow are always visible, including on touch screens.
-- No row-click navigation, overlay links, or duplicate View/Details buttons in
-  the actions column. `DataTable` and `Ledger` intentionally have no `onRowClick`.
-- Keep selection, expansion, copy, menus, Edit, and Delete independently operable.
-  Use a labeled button for expansion; row whitespace does not navigate.
+- Use `RecordLink` for the resource name in a table's identity column, inside
+  a `RecordRow`. The name has no underline and no arrow, including on hover;
+  the whole row opens the record. `DataTable` and `Ledger` rows already are
+  `RecordRow`s; use it yourself only in a `renderRow` or a hand-built table.
+- No `onRowClick`, overlay links, `role="button"` rows, or duplicate
+  View/Details buttons in the actions column. `RecordRow` is the only row
+  navigation, and it follows the row's `RecordLink`. One `RecordLink` per row;
+  counts and related resources are plain router links in `text-primary`.
+  Record lists (`<ul role="list">`) use `RecordListItem`.
+- Keep selection, expansion, copy, menus, Edit, and Delete independently
+  operable: clicks on them, or in a menu or dialog they open, never navigate.
+  Custom widgets count when they carry their ARIA role (`tab`, `combobox`,
+  `radio`, …), and so do disabled controls, even though they take no pointer
+  events. Mark a value meant to be selected or copied, such as a revealed
+  value, with `data-row-ignore`. Use a labeled button for expansion.
 - Use real routed URLs for details/configuration; preserve Enter, modifier-click,
   new-tab, refresh, and browser history. Do not replace links with buttons.
-- Records without a detail route use plain text, with no navigation arrow.
+- Records without a detail route use plain text and do not respond to clicks.
 - Detail facts, checks, forms, and history fill the parent width. No page-level
   `max-w-*`; reserve aside space only when an aside exists.
 - Migrate touched legacy tables to this pattern. Reference: sandbox `/ledger`,
@@ -293,13 +362,20 @@ Use the shared `Tabs`, `TabsList`, `TabsTrigger`, and `TabsContent` exported by
 `@temps-sdk/ds` (and `@temps-sdk/ui`) for peer page views. The default is a
 transparent, full-width strip with a bottom divider and an underline on the
 active tab. No pill container, selected-card background, shadow, or page-local
-styling overrides. Keep labels text-first, with constant font weight.
+styling overrides. Labels keep a constant font weight. Lead each label with a
+Lucide icon through `TabsTrigger icon={Icon}` (`size-4`, hidden from assistive
+technology), so a strip can be scanned by shape as well as by word. The icon
+never replaces the label, on any screen size. Give every tab in a strip an
+icon or none, keep icons distinct within a strip, and let a section's landing
+tab share the icon its section has in the menu. Add icons to a strip when
+touching it.
 
 Use `TabsTrigger count={number}` for optional counts, including zero. Omit a
 count until it is known; never invent totals or show the current page's item
 count as the total. Counts stay visible on inactive tabs. Keep Radix keyboard
-navigation, focus indicators, disabled states, and panel semantics; let long
-strips scroll horizontally. Meaningful detail views keep their selection in
+navigation, focus indicators, disabled states, and panel semantics; long
+strips wrap to a second line rather than scroll (the shared scrolling strip is
+a legacy gap). Meaningful detail views keep their selection in
 the URL. Use a segmented toggle only for a local value choice (such as chart
 interval or list/grid display), not for navigating content sections.
 
@@ -344,3 +420,25 @@ Official sources: [GitHub brand toolkit](https://brand.github.com/foundations/lo
 [Anthropic's company site](https://www.anthropic.com/) (compact company symbol;
 vector pinned to [Simple Icons 13.0.0](https://github.com/simple-icons/simple-icons/blob/13.0.0/icons/anthropic.svg)).
 The company marks remain the property of their respective owners.
+
+For a small form embedded in a record page, use `Field` and `FormErrors`
+in the record layout with a local save footer. Do not introduce left/right
+settings columns. Route extensive forms to a dedicated settings page.
+
+
+
+The left/right heading-and-controls layout is reserved for full settings forms.
+Never use `SettingsSection` or `SettingsGroup` as a wrapper for a read-only
+record, resource list, grant table, or operational panel. Detail and collection
+pages keep one consistent full-width content layout; link to a dedicated
+settings route for extensive editing. Small inline forms use `Field` and
+`FormErrors` in the surrounding layout without introducing settings columns.
+Vault owns Services, Access bundles, and Sessions. Services hold provider
+configuration and credentials; bundles define reusable service selections and
+access limits; sessions authorize identified consumers for a bounded lifetime.
+Session details expose the allowed consumers, effective restrictions, expiry,
+and revocation state. Sandbox detail pages show only that sandbox's access and
+link to the owning Vault sessions; a sandbox picker is not a Vault navigation tab.
+Keep session records distinct from individual grants and internal proxy tokens.
+Creation and editing use dedicated form pages; operational details use the
+full-width record layout.

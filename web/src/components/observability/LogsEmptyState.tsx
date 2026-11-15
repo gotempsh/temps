@@ -12,13 +12,20 @@ export function LogsEmptyState({ projectSlug }: { projectSlug: string }) {
       size="compact"
       icon={ScrollText}
       title="No telemetry logs yet"
-      description="Connect OpenTelemetry to search structured application logs here."
+      description="Send structured application logs using OpenTelemetry or a Sentry SDK."
       action={
-        <Button asChild size="sm">
-          <Link to={`/projects/${projectSlug}/traces#traces-setup`}>
-            Connect telemetry
-          </Link>
-        </Button>
+        <div className="flex flex-wrap justify-center gap-2">
+          <Button asChild size="sm" variant="outline">
+            <Link to={`/projects/${projectSlug}/traces#traces-setup`}>
+              Set up OpenTelemetry
+            </Link>
+          </Button>
+          <Button asChild size="sm" variant="outline">
+            <Link to={`/projects/${projectSlug}/errors/setup`}>
+              Set up Sentry
+            </Link>
+          </Button>
+        </div>
       }
     />
   )

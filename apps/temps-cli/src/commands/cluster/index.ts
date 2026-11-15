@@ -18,7 +18,7 @@ import { newline, header, icons, json, colors, keyValue, formatRelativeTime } fr
 // Generating requires `bun run spec:update` against a live server, which
 // wasn't available when this command was added — see root CLAUDE.md's
 // "Regenerating the OpenAPI clients". These interfaces are hand-maintained
-// to mirror `crates/temps-deployments/src/handlers/nodes.rs`'s
+// to mirror `crates/temps-nodes/src/handlers/nodes.rs`'s
 // `ClusterDnsStatusResponse` / `NodeDnsStatusEntry` exactly. Once the spec is
 // regenerated against a running server, switch this command to the
 // generated types/functions and delete these.

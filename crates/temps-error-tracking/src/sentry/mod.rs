@@ -3,7 +3,10 @@
 
 //! # Sentry Integration Module
 //!
-//! Complete Sentry SDK compatibility including:
+//! Sentry SDK ingestion adapters for native Temps errors and structured logs.
+//! Other item types are reported unsupported rather than counted as stored.
+//!
+//! Shared infrastructure includes:
 //! - Envelope parsing via relay-event-schema
 //! - Event mapping to internal format
 //! - HTTP ingestion endpoints
@@ -18,13 +21,11 @@
 //!     ↓
 //! Envelope Parser (envelope.rs)
 //!     ↓
-//! Event Mapper (mapper.rs)
+//! Provider dispatch (providers/sentry.rs)
 //!     ↓
-//! Ingestion Service (service.rs)
+//! ErrorTrackingService / OtelService
 //!     ↓
-//! Error Ingestion Service
-//!     ↓
-//! Database (raw event in JSONB)
+//! Native error / log storage and queries
 //! ```
 //!
 //! ## DSN Flow
@@ -34,13 +35,14 @@
 //!     ↓
 //! Store in DB (dsn_service.rs)
 //!     ↓
-//! Validate on ingestion (service.rs)
+//! Validate on ingestion (providers/sentry.rs)
 //! ```
 
 pub mod dsn_handlers;
 pub mod dsn_service;
 pub mod envelope;
 pub mod handlers;
+pub mod logs;
 pub mod mapper;
 pub mod rate_limiter;
 pub mod service;
@@ -55,3 +57,21 @@ pub use types::{
     CreateDSNRequest, DSNResponse, ParsedDSN, ProjectDSN, SentryEventRequest, SentryEventResponse,
     SentryIngesterError,
 };
+
+pub mod check_ins;
+
+pub mod metrics;
+pub mod replay;
+pub mod traces;
+
+pub(crate) mod inference;
+
+pub mod feedback;
+
+pub mod statsd;
+
+pub mod client_reports;
+
+pub mod security;
+
+pub(crate) mod identities;

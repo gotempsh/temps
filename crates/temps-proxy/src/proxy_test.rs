@@ -14,8 +14,8 @@ pub mod proxy_tests {
     use std::sync::atomic::{AtomicU16, Ordering};
     use std::sync::Arc;
 
-    use temps_database::test_utils::TestDatabase;
     use temps_routes::CachedPeerTable;
+    use temps_test_utils::TestDatabase;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
 
@@ -281,10 +281,7 @@ pub mod proxy_tests {
             ),
         );
 
-        // Create challenge service
-        let challenge_service = Arc::new(crate::service::challenge_service::ChallengeService::new(
-            test_db.db.clone(),
-        ));
+        let challenge_gate = Arc::new(crate::shield::test_gate());
 
         // Create cert-host cache (WS3; starts empty, populated on first refresh)
         let cert_host_cache = Arc::new(crate::service::cert_host_cache::CertHostCache::new(
@@ -301,7 +298,7 @@ pub mod proxy_tests {
             config_service,
             ip_access_control_service,
             Arc::new(temps_core::OpenIpGate),
-            challenge_service,
+            challenge_gate,
             cert_host_cache,
             false,
         );
@@ -323,7 +320,7 @@ pub mod proxy_tests {
     }
 
     #[tokio::test]
-    #[ignore] // TODO: Fix route table lookup - CachedPeerTable.load_routes() not finding custom domain entries
+    #[ignore = "known broken: CachedPeerTable::load_routes() does not find custom domain entries"]
     async fn test_proxy_context_resolution() -> Result<()> {
         let test_db_mock = TestDatabase::with_migrations().await.unwrap();
         let test_db = TestDBMockOperations::new(test_db_mock.connection_arc().clone())
@@ -933,10 +930,7 @@ pub mod proxy_tests {
             crate::service::ip_access_control_service::IpAccessControlService::new(db.clone()),
         );
 
-        // Create challenge service
-        let challenge_service = Arc::new(
-            crate::service::challenge_service::ChallengeService::new(db.clone()),
-        );
+        let challenge_gate = Arc::new(crate::shield::test_gate());
 
         // Create cert-host cache (WS3; starts empty, populated on first refresh)
         let cert_host_cache = Arc::new(
@@ -953,7 +947,7 @@ pub mod proxy_tests {
             config_service,
             ip_access_control_service,
             Arc::new(temps_core::OpenIpGate),
-            challenge_service,
+            challenge_gate,
             cert_host_cache,
             false,
         );
@@ -1342,7 +1336,7 @@ pub mod proxy_tests {
             deployment_id: Set(deployment.id),
             container_id: Set("test-container-123".to_string()),
             container_name: Set("test-container".to_string()),
-            container_port: Set(3000),
+            container_port: Set(Some(3000)),
             host_port: Set(Some(8080)),
             image_name: Set(Some("test-image:latest".to_string())),
             status: Set(Some("running".to_string())),

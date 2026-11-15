@@ -411,7 +411,7 @@ export function EditServiceForm({
             type="submit"
             disabled={updateServiceMut.isPending || !form.formState.isValid}
           >
-            {updateServiceMut.isPending ? 'Saving...' : 'Save Changes'}
+            {updateServiceMut.isPending ? 'Saving…' : 'Save'}
           </Button>
         </div>
       </form>

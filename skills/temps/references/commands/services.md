@@ -101,6 +101,8 @@ Create a new external service
 | `-t, --type <type>` | Service type (postgres, mongodb, redis, s3) | - | No |
 | `-n, --name <name>` | Service name | - | No |
 | `-s, --set <key=value>` | Set a parameter (repeatable) | `` | No |
+| `--backend <backend>` | S3 storage engine: rustfs (default) or garage (s3/blob only) | - | No |
+| `--bucket <name>` | Bucket to create (repeatable, s3/blob only; the first is S3_BUCKET) | `` | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `services show`

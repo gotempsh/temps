@@ -28,6 +28,7 @@ import {
   operationsTriggerLabel,
   operationTimestamp,
   RUNNING_OPERATIONS_QUERY,
+  WAITING_OPERATIONS_QUERY,
   uniqueOperations,
 } from './operations'
 
@@ -80,10 +81,10 @@ describe('operationsPollInterval', () => {
 })
 
 describe('status helpers', () => {
-  test('active statuses are queued, running and waiting', () => {
+  test('only queued and running statuses are active', () => {
     expect(isActiveOperationStatus('queued')).toBe(true)
     expect(isActiveOperationStatus('running')).toBe(true)
-    expect(isActiveOperationStatus('waiting')).toBe(true)
+    expect(isActiveOperationStatus('waiting')).toBe(false)
     expect(isActiveOperationStatus('succeeded')).toBe(false)
     expect(isActiveOperationStatus('failed')).toBe(false)
     expect(isActiveOperationStatus('cancelled')).toBe(false)
@@ -128,6 +129,11 @@ describe('row helpers', () => {
         entry({ status: 'failed', finished_at: '2026-10-07T10:03:00Z' })
       )
     ).toBe('2026-10-07T10:03:00Z')
+    expect(
+      operationTimestamp(
+        entry({ status: 'waiting', finished_at: '2026-10-07T10:03:00Z' })
+      )
+    ).toBe('2026-10-07T10:00:05Z')
     expect(operationTimestamp(entry({ started_at: null }))).toBe(
       '2026-10-07T10:00:00Z'
     )
@@ -142,14 +148,15 @@ describe('row helpers', () => {
     expect(formatRelativeShort('not a date', now)).toBe('')
   })
 
-  test('grouping splits active from finished and keeps order', () => {
+  test('grouping separates active, review and finished work and keeps order', () => {
     const groups = groupOperations([
       entry({ id: 'a', status: 'running' }),
       entry({ id: 'b', status: 'failed' }),
       entry({ id: 'c', status: 'waiting' }),
       entry({ id: 'd', status: 'succeeded' }),
     ])
-    expect(groups.active.map((op) => op.id)).toEqual(['a', 'c'])
+    expect(groups.active.map((op) => op.id)).toEqual(['a'])
+    expect(groups.waiting.map((op) => op.id)).toEqual(['c'])
     expect(groups.finished.map((op) => op.id)).toEqual(['b', 'd'])
   })
 })
@@ -168,18 +175,20 @@ describe('trigger labels', () => {
 })
 
 describe('invalidateOperations', () => {
-  test('invalidates every operations query regardless of params', async () => {
+  test('invalidates activity, reviews and history after a lifecycle change', async () => {
     const queryClient = new QueryClient()
-    const operationsKey = [
-      { _id: 'listOperations', baseUrl: '/api', query: { page: 1 } },
-    ]
+    const operationsKeys = ['running', 'waiting', 'finished'].map((status) => [
+      { _id: 'listOperations', baseUrl: '/api', query: { status, page: 2 } },
+    ])
     const otherKey = [{ _id: 'listBackupAlerts', baseUrl: '/api' }]
-    queryClient.setQueryData(operationsKey, { operations: [] })
+    for (const key of operationsKeys)
+      queryClient.setQueryData(key, { operations: [] })
     queryClient.setQueryData(otherKey, { alerts: [] })
 
     await invalidateOperations(queryClient)
 
-    expect(queryClient.getQueryState(operationsKey)?.isInvalidated).toBe(true)
+    for (const key of operationsKeys)
+      expect(queryClient.getQueryState(key)?.isInvalidated).toBe(true)
     expect(queryClient.getQueryState(otherKey)?.isInvalidated).toBe(false)
   })
 })
@@ -203,6 +212,10 @@ describe('tray queries', () => {
     expect(RUNNING_OPERATIONS_QUERY).toEqual({
       status: 'running',
       page_size: 100,
+    })
+    expect(WAITING_OPERATIONS_QUERY).toEqual({
+      status: 'waiting',
+      page_size: 20,
     })
     expect(FINISHED_OPERATIONS_QUERY).toEqual({
       status: 'finished',
@@ -254,9 +267,9 @@ describe('operationsLastPage / operationsClampPage', () => {
   test('steps back when the feed shrank under the user', () => {
     // Running work finished while the user sat on page 3 of 3.
     expect(operationsClampPage(3, page([], { page: 3, total: 30 }))).toBe(2)
-    expect(operationsClampPage(3, page([entry()], { page: 3, total: 41 }))).toBe(
-      3
-    )
+    expect(
+      operationsClampPage(3, page([entry()], { page: 3, total: 41 }))
+    ).toBe(3)
     expect(operationsClampPage(1, undefined)).toBe(1)
   })
 })
@@ -331,6 +344,8 @@ describe('operationsTrayFeed', () => {
       runningCount: 0,
       runningNav: EMPTY_OPERATIONS_PAGE_NAV,
       recentNav: EMPTY_OPERATIONS_PAGE_NAV,
+      waiting: [],
+      waitingNav: EMPTY_OPERATIONS_PAGE_NAV,
     })
   })
 })
@@ -346,4 +361,35 @@ describe('operationsLeftRunning', () => {
     expect(operationsLeftRunning(['a', 'b'], ['b', 'a'])).toBe(false)
     expect(operationsLeftRunning([], ['a'])).toBe(false)
   })
+})
+
+// A review-only feed must stay actionable without animating the running badge
+// or maintaining a closed-tray polling loop.
+test('review-only feeds do not count as activity or keep polling', () => {
+  const review = entry({ id: 'autofix:8', kind: 'autofix', status: 'waiting' })
+  const feed = operationsTrayFeed({
+    runningPage: page([]),
+    waitingPage: page([review]),
+    finishedPage: page([]),
+  })
+  expect(feed.running).toEqual([])
+  expect(feed.waiting).toEqual([review])
+  expect(feed.recent).toEqual([])
+  expect(operationsBadgeText(feed.runningCount)).toBeNull()
+  expect(
+    operationsPollInterval({ open: false, runningCount: feed.runningCount })
+  ).toBe(false)
+  expect(
+    operationsPollInterval({ open: true, runningCount: feed.runningCount })
+  ).toBe(OPERATIONS_OPEN_POLL_MS)
+})
+
+test('transitions deduplicate review rows across independently refreshed feeds', () => {
+  const review = entry({ id: 'autofix:8', kind: 'autofix', status: 'waiting' })
+  const feed = operationsTrayFeed({
+    runningPage: page([review]),
+    waitingPage: page([review]),
+    finishedPage: page([review]),
+  })
+  expect([...feed.running, ...feed.waiting, ...feed.recent]).toEqual([review])
 })

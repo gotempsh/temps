@@ -226,7 +226,7 @@ impl EnrollmentTokenService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use temps_database::test_utils::TestDatabase;
+    use temps_test_utils::TestDatabase;
 
     #[test]
     fn test_hash_is_stable_64_hex() {

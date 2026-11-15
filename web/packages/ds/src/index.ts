@@ -6,7 +6,9 @@ export { cn } from './lib/cn'
 export {
   PageContainer,
   PageHeader,
+  PageTitle,
   type PageContainerProps,
+  type PageWidth,
   type PageHeaderProps,
 } from './page-header'
 export { ProjectAvatar, type ProjectAvatarProps } from './project-avatar'
@@ -87,11 +89,21 @@ export { LogLevelBadge } from './log-level-badge'
 
 export { HelpPopover, Disclosure } from './help'
 
-export { SettingsSection } from './settings-section'
+export { SettingsSection, SettingsSurface } from './settings-section'
+export { useOnSettingsSurface } from './settings-surface-context'
+export {
+  InsidePageContainerContext,
+  PageNamedByChromeContext,
+  PageTitleLevelContext,
+  usePageNamedByChrome,
+  usePageTitleLevel,
+} from './page-context'
 
 export { SettingsGroup } from './settings-group'
+export { SaveRow, saveRowClassName } from './save-row'
 
-export { RecordLink } from './record-link'
+export { RecordLink, RecordListItem, RecordRow } from './record-link'
+export { followsRecordLink } from './lib/follows-record-link'
 
 export {
   Tabs,

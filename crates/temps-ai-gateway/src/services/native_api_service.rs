@@ -1083,6 +1083,10 @@ impl NativeApiService {
             tags: vec!["batch".to_string()],
             request_id: Some(batch.id.clone()),
             trace_id: None,
+            // Objects are owned by a user or, for deployment tokens, a
+            // project; the creating token itself is not recorded.
+            project_id: owner.project_id,
+            token_id: None,
         };
         // Latency is not meaningful for a job that ran for hours; 0 keeps it
         // out of latency percentiles.
@@ -1099,6 +1103,7 @@ impl NativeApiService {
                 200,
                 false,
                 record.provider_key_id.is_none(),
+                crate::types::PromptTokensDetails::default(),
                 &context,
             )
             .await?;
@@ -1756,6 +1761,8 @@ mod tests {
                 .unwrap(),
         );
         let log = temps_entities::ai_usage_logs::Model {
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             id: 1,
             timestamp: chrono::Utc::now(),
             user_id: Some(4),
@@ -1772,10 +1779,14 @@ mod tests {
             tags: vec!["batch".into()],
             request_id: Some("batch_test".into()),
             trace_id: None,
+            project_id: None,
+            token_id: None,
         };
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
                 .append_query_results([vec![record]])
+                // No catalogue price for the batch model.
+                .append_query_results([Vec::<temps_entities::ai_provider_models::Model>::new()])
                 .append_query_results([vec![log]])
                 .append_exec_results([
                     MockExecResult {

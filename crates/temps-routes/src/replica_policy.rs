@@ -58,13 +58,21 @@ impl Drop for InFlightGuard {
 /// consume the last free slot of the preferred tier. On sustained contention
 /// use the current choice rather than spin indefinitely on the hot path.
 pub fn reserve(backends: &[BackendEntry], cursor: usize) -> Option<(usize, InFlightGuard)> {
+    reserve_avoiding(backends, cursor, &[])
+}
+
+pub fn reserve_avoiding(
+    backends: &[BackendEntry],
+    cursor: usize,
+    avoid: &[String],
+) -> Option<(usize, InFlightGuard)> {
     for _ in 0..3 {
-        let (index, had_capacity) = select_candidate(backends, cursor)?;
+        let (index, had_capacity) = select_candidate(backends, cursor, avoid)?;
         if let Some(guard) = reserve_candidate(&backends[index], had_capacity) {
             return Some((index, guard));
         }
     }
-    let (index, _) = select_candidate(backends, cursor)?;
+    let (index, _) = select_candidate(backends, cursor, avoid)?;
     Some((index, InFlightGuard::acquire(backends[index].state.clone())))
 }
 
@@ -91,19 +99,26 @@ fn reserve_candidate(backend: &BackendEntry, had_capacity: bool) -> Option<InFli
 
 #[cfg(test)]
 fn select(backends: &[BackendEntry], cursor: usize) -> Option<usize> {
-    select_candidate(backends, cursor).map(|(index, _)| index)
+    select_candidate(backends, cursor, &[]).map(|(index, _)| index)
 }
 
 /// O(replicas), no locks, allocations, or I/O. Rotation breaks equal-tier ties.
-fn select_candidate(backends: &[BackendEntry], cursor: usize) -> Option<(usize, bool)> {
+fn select_candidate(
+    backends: &[BackendEntry],
+    cursor: usize,
+    avoid: &[String],
+) -> Option<(usize, bool)> {
     if backends.is_empty() {
         return None;
     }
+    let has_untried = backends.iter().any(|b| !avoid.contains(&b.address));
+    let untried = |b: &BackendEntry| !has_untried || !avoid.contains(&b.address);
     let has_healthy = backends
         .iter()
-        .any(|b| b.state.health.load(Ordering::Relaxed) == 1);
+        .any(|b| untried(b) && b.state.health.load(Ordering::Relaxed) == 1);
     let eligible = |b: &BackendEntry| {
-        !b.check_health || !has_healthy || b.state.health.load(Ordering::Relaxed) == 1
+        untried(b)
+            && (!b.check_health || !has_healthy || b.state.health.load(Ordering::Relaxed) == 1)
     };
     let mut best = None;
     let mut least = None;
@@ -149,6 +164,27 @@ fn select_candidate(backends: &[BackendEntry], cursor: usize) -> Option<(usize, 
         .or(Some((chosen, best.is_some())))
 }
 
+/// Treat every recorded readiness path as untrusted, including legacy job
+/// outputs. Set URL components separately so a path cannot supply an authority.
+pub(crate) fn probe_url(address: &str, path: &str) -> Option<String> {
+    if !path.starts_with('/')
+        || path.starts_with("//")
+        || path.len() > 2048
+        || path.contains('\\')
+        || path.contains('#')
+        || path.chars().any(char::is_control)
+    {
+        return None;
+    }
+    let mut url = reqwest::Url::parse(&format!("http://{address}/")).ok()?;
+    let (path, query) = path
+        .split_once('?')
+        .map_or((path, None), |(path, query)| (path, Some(query)));
+    url.set_path(path);
+    url.set_query(query);
+    Some(url.into())
+}
+
 #[derive(Clone)]
 pub struct Probe {
     pub state: Arc<ReplicaState>,
@@ -173,8 +209,45 @@ impl Probe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn probe_paths_cannot_replace_the_backend_authority() {
+        for path in [
+            "@other-host.example:8080/health",
+            "http://other-host.example/health",
+            "//other-host.example/health",
+            "/\\other-host.example/health",
+            "/health#fragment",
+            "/health\r\nHost: other-host.example",
+            "",
+        ] {
+            assert!(
+                probe_url("127.0.0.1:9000", path).is_none(),
+                "unsafe path was accepted"
+            );
+        }
+        for path in [
+            "/health",
+            "/ready?full=true",
+            "/@other-host.example:8080/health",
+            "/https://other-host.example/health",
+        ] {
+            let value = probe_url("127.0.0.1:9000", path).expect("valid origin-relative path");
+            let url = reqwest::Url::parse(&value).unwrap();
+            assert_eq!(url.host_str(), Some("127.0.0.1"));
+            assert_eq!(url.port(), Some(9000));
+            assert_eq!(url.username(), "");
+            assert_eq!(url.password(), None);
+        }
+        assert_eq!(
+            probe_url("[::1]:9000", "/ready?full=true").as_deref(),
+            Some("http://[::1]:9000/ready?full=true")
+        );
+    }
+
     fn entry(tier: usize) -> BackendEntry {
         BackendEntry {
+            compose_service: None,
+            pinned: None,
             address: format!("127.0.0.1:{}", 8000 + tier),
             container_id: None,
             container_name: None,
@@ -185,6 +258,30 @@ mod tests {
             check_health: true,
         }
     }
+    #[test]
+    fn retries_avoid_a_failed_preferred_replica_even_when_it_is_healthy() {
+        let backends = vec![entry(0), entry(1)];
+        backends[0].state.health.store(1, Ordering::Relaxed);
+        let avoid = vec![backends[0].address.clone()];
+        let (index, guard) = reserve_avoiding(&backends, 0, &avoid).unwrap();
+        assert_eq!(index, 1);
+        assert_eq!(backends[0].state.in_flight.load(Ordering::Relaxed), 0);
+        assert_eq!(backends[1].state.in_flight.load(Ordering::Relaxed), 1);
+        drop(guard);
+        assert_eq!(backends[1].state.in_flight.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn retries_fail_open_after_every_replica_has_been_tried() {
+        let backends = vec![entry(0), entry(1)];
+        let avoid = backends
+            .iter()
+            .map(|b| b.address.clone())
+            .collect::<Vec<_>>();
+        let (index, _guard) = reserve_avoiding(&backends, 1, &avoid).unwrap();
+        assert_eq!(index, 0);
+    }
+
     #[tokio::test]
     async fn accepting_connections_without_http_response_becomes_unhealthy() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -239,7 +336,7 @@ mod tests {
     #[test]
     fn a_candidate_filled_after_selection_retries_into_the_overflow_tier() {
         let backends = vec![entry(0), entry(1)];
-        let (index, had_capacity) = select_candidate(&backends, 0).unwrap();
+        let (index, had_capacity) = select_candidate(&backends, 0, &[]).unwrap();
         assert_eq!(index, 0);
         let competing_request = InFlightGuard::acquire(backends[0].state.clone());
         assert!(reserve_candidate(&backends[index], had_capacity).is_none());

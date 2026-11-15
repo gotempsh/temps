@@ -29,6 +29,7 @@ import { printTable, type TableColumn } from '../../ui/table.js'
 import { promptText, promptConfirm, promptSelect, promptCheckbox } from '../../ui/prompts.js'
 import { newline, header, icons, json, colors, success, warning, keyValue, info, error as errorOutput } from '../../ui/output.js'
 import { formatMicrocores, parseMillicores } from '../../lib/cpu.js'
+import { registerEnvironmentWorkloadCommands } from './workload.js'
 
 export function registerEnvironmentsCommands(program: Command): void {
   const environments = program
@@ -179,6 +180,9 @@ export function registerEnvironmentsCommands(program: Command): void {
     .option('--load-balancing <json>', 'Replica routing policy as JSON; null restores project inheritance')
     .option('--json', 'Output in JSON format')
     .action(scaleCmd)
+
+  // Placement, isolation, volumes and ingress login (ADR-055)
+  registerEnvironmentWorkloadCommands(environments)
 
   // Cron jobs subcommand
   const crons = environments
@@ -659,10 +663,11 @@ async function setEnvVar(
   const projectId = await getProjectId(project)
   const includeInPreview = resolvePreviewInclusion(options.preview, options.update, existingVar?.include_in_preview)
 
+  let saved: EnvironmentVariableResponse | undefined
   if (existingVar && options.update) {
     // Update existing variable
     await withSpinner(`Updating ${key}...`, async () => {
-      const { error } = await updateEnvironmentVariable({
+      const { data, error } = await updateEnvironmentVariable({
         client,
         path: { project_id: projectId, var_id: existingVar.id },
         body: {
@@ -677,12 +682,13 @@ async function setEnvVar(
         },
       })
       if (error) throw new Error(getErrorMessage(error))
+      saved = data
     })
     success(`Updated ${key}${options.secret ? ' (secret)' : ''}`)
   } else {
     // Create new variable
     await withSpinner(`Setting ${key}...`, async () => {
-      const { error } = await createEnvironmentVariable({
+      const { data, error } = await createEnvironmentVariable({
         client,
         path: { project_id: projectId },
         body: {
@@ -694,8 +700,16 @@ async function setEnvVar(
         },
       })
       if (error) throw new Error(getErrorMessage(error))
+      saved = data
     })
     success(`Set ${key}${options.secret ? ' (secret)' : ''}`)
+  }
+
+  if (saved?.secret_suggestion) {
+    warning(
+      `${saved.secret_suggestion.message}. Consider rotating it and storing it as a secret: ` +
+        `temps environments vars set ${key} --update --secret`
+    )
   }
 
   info(`Environments: ${envs.filter(e => environmentIds.includes(e.id)).map(e => e.name).join(', ')}`)
@@ -1069,7 +1083,7 @@ async function exportEnvVars(
   if (failed.length > 0) {
     errorOutput(
       `Could not read ${failed.length} value(s): ${failed.join(', ')}. ` +
-        'Reading plaintext needs the secrets:read permission. Nothing was written — ' +
+        'Reading plaintext needs the secrets:read or environments:write permission. Nothing was written — ' +
         'a partial export would silently blank these variables.'
     )
     // Non-zero exit so `export -o .env && deploy` cannot march on with a stale
@@ -1237,7 +1251,6 @@ async function resourcesCmd(environment: string, options: ResourcesOptions): Pro
     if (options.json) {
       const config = updatedEnv?.deployment_config
       json({
-        load_balancing: updatedEnv?.deployment_config?.loadBalancing ?? null,
         environment: updatedEnv?.slug,
         cpu_limit: config?.cpuLimit,
         cpu_request: config?.cpuRequest,
@@ -1662,6 +1675,7 @@ async function scaleCmd(
       json({
         environment: updatedEnv?.slug,
         replicas: updatedEnv?.deployment_config?.replicas ?? 1,
+        load_balancing: updatedEnv?.deployment_config?.loadBalancing ?? null,
       })
       return
     }
@@ -1678,6 +1692,7 @@ async function scaleCmd(
       json({
         environment: targetEnv.slug,
         replicas: currentReplicas,
+        load_balancing: targetEnv.deployment_config?.loadBalancing ?? null,
       })
       return
     }

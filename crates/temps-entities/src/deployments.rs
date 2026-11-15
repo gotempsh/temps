@@ -129,11 +129,28 @@ pub struct DeploymentMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub health_check_path: Option<String>,
 
+    /// Container startup settings captured when planning this deployment.
+    /// Keeping an explicit empty snapshot prevents later project edits from
+    /// changing a rollback or promotion's image defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_overrides: Option<super::preset::ContainerRuntimeOverrides>,
+
     /// Command passed to a prebuilt image entrypoint. Stored in deployment
     /// metadata so redeploy, rollback, and node failover reproduce the exact
     /// workload rather than falling back to the image default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<Vec<String>>,
+}
+
+impl DeploymentMetadata {
+    pub fn container_runtime(&self) -> super::preset::ContainerRuntimeOverrides {
+        let mut runtime = self.runtime_overrides.clone().unwrap_or_default();
+        // An explicit image-deploy command keeps its existing precedence.
+        if self.command.is_some() {
+            runtime.command = self.command.clone();
+        }
+        runtime
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq, Serialize, Deserialize)]
@@ -260,5 +277,39 @@ impl ActiveModelBehavior for ActiveModel {
         }
 
         Ok(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::preset::ContainerRuntimeOverrides;
+
+    #[test]
+    fn container_runtime_snapshot_preserves_arguments_and_image_deploy_precedence() {
+        let mut metadata = DeploymentMetadata {
+            runtime_overrides: Some(ContainerRuntimeOverrides {
+                command: Some(vec![
+                    "worker".into(),
+                    "argument with spaces".into(),
+                    "".into(),
+                ]),
+                entrypoint: Some(vec![]),
+            }),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&metadata).unwrap();
+        let restored: DeploymentMetadata = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            restored.container_runtime(),
+            metadata.runtime_overrides.clone().unwrap()
+        );
+        metadata.command = Some(vec!["explicit-image-command".into()]);
+        assert_eq!(metadata.container_runtime().command, metadata.command);
+        assert_eq!(metadata.container_runtime().entrypoint, Some(vec![]));
+        assert_eq!(
+            DeploymentMetadata::default().container_runtime(),
+            ContainerRuntimeOverrides::default()
+        );
     }
 }

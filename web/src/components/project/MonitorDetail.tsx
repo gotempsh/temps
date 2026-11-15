@@ -7,10 +7,15 @@ import { MonitorPathForm } from './MonitorPathForm'
 import { ProjectResponse, StatusBucket } from '@/api/client'
 import {
   getBucketedStatusOptions,
+  getBucketedStatusQueryKey,
   getCurrentMonitorStatusOptions,
+  getCurrentMonitorStatusQueryKey,
   getMonitorOptions,
+  getMonitorQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
 import { Badge } from '@/components/ui/badge'
+import { RefreshButton } from '@/components/ui/refresh-button'
+import { queryKeyPrefix } from '@/lib/refresh'
 import { Button } from '@/components/ui/button'
 import {
   Card,
@@ -28,6 +33,7 @@ import {
   PopoverTrigger,
 } from '@/components/ui/popover'
 import { useQuery } from '@tanstack/react-query'
+import { Callout } from '@temps-sdk/ds'
 import {
   Activity,
   AlertCircle,
@@ -35,10 +41,19 @@ import {
   Clock,
   TrendingUp,
 } from 'lucide-react'
-import { useMemo, useState, useRef } from 'react'
+import { useMemo, useReducer, useState, useRef } from 'react'
 import { Link, useParams } from 'react-router'
+import { reachabilityPath } from '@/lib/reachability-page'
 import { format, subDays } from 'date-fns'
 import { DateRange } from 'react-day-picker'
+import {
+  BUCKET_TONE_CLASS,
+  BUCKET_TONE_LABEL,
+  bucketTone,
+  formatUptime,
+  unknownTimeNote,
+} from '@/lib/monitor-uptime'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 interface MonitorDetailProps {
   project: ProjectResponse
@@ -51,6 +66,7 @@ interface BucketItemProps {
 }
 
 function BucketItem({ bucket, isOpen, onOpenChange }: BucketItemProps) {
+  const tone = bucketTone(bucket.status)
   const timeoutRef = useRef<ReturnType<typeof setTimeout>>(undefined)
 
   const handleMouseEnter = () => {
@@ -74,15 +90,7 @@ function BucketItem({ bucket, isOpen, onOpenChange }: BucketItemProps) {
         asChild
       >
         <div
-          className={`flex-1 rounded-sm transition-opacity hover:opacity-80 cursor-pointer ${
-            bucket.status === 'operational'
-              ? 'bg-green-500'
-              : bucket.status === 'major_outage'
-                ? 'bg-red-500'
-                : bucket.status === 'degraded'
-                  ? 'bg-yellow-500'
-                  : 'bg-gray-300'
-          }`}
+          className={`flex-1 rounded-sm transition-opacity hover:opacity-80 cursor-pointer ${BUCKET_TONE_CLASS[tone]}`}
         />
       </PopoverTrigger>
       <PopoverContent
@@ -95,7 +103,7 @@ function BucketItem({ bucket, isOpen, onOpenChange }: BucketItemProps) {
       >
         <div className="space-y-2">
           <div className="pb-2 border-b">
-            <h4 className="font-semibold text-sm">Status Details</h4>
+            <h4 className="font-semibold text-sm">Status details</h4>
             <p className="text-xs text-muted-foreground mt-1">
               {new Date(bucket.bucket_start).toLocaleString()}
             </p>
@@ -105,22 +113,27 @@ function BucketItem({ bucket, isOpen, onOpenChange }: BucketItemProps) {
               <span className="text-xs text-muted-foreground">Status</span>
               <Badge
                 variant={
-                  bucket.status === 'operational'
+                  tone === 'operational'
                     ? 'default'
-                    : bucket.status === 'major_outage'
+                    : tone === 'down'
                       ? 'destructive'
                       : 'secondary'
                 }
                 className="text-xs"
               >
-                {bucket.status === 'major_outage'
-                  ? 'Major Outage'
-                  : bucket.status}
+                {BUCKET_TONE_LABEL[tone]}
               </Badge>
             </div>
+            {bucket.total_checks === 0 && (
+              <p className="text-xs text-muted-foreground">
+                No check ran in this interval, so Temps can&apos;t say whether
+                the site was up — e.g. the Temps server was down or the
+                deployment was paused.
+              </p>
+            )}
             <div className="flex items-center justify-between">
               <span className="text-xs text-muted-foreground">
-                Avg Response Time
+                Avg response time
               </span>
               <span className="text-xs font-medium">
                 {bucket.avg_response_time_ms?.toFixed(0) ?? 'N/A'}ms
@@ -128,7 +141,7 @@ function BucketItem({ bucket, isOpen, onOpenChange }: BucketItemProps) {
             </div>
             <div className="flex items-center justify-between">
               <span className="text-xs text-muted-foreground">
-                Total Checks
+                Total checks
               </span>
               <span className="text-xs font-medium">
                 {bucket.total_checks ?? 0}
@@ -136,7 +149,7 @@ function BucketItem({ bucket, isOpen, onOpenChange }: BucketItemProps) {
             </div>
             <div className="flex items-center justify-between">
               <span className="text-xs text-muted-foreground">
-                Successful Checks
+                Successful checks
               </span>
               <span className="text-xs font-medium">
                 {bucket.operational_count ?? 0}
@@ -144,7 +157,7 @@ function BucketItem({ bucket, isOpen, onOpenChange }: BucketItemProps) {
             </div>
             <div className="flex items-center justify-between">
               <span className="text-xs text-muted-foreground">
-                Failed Checks
+                Failed checks
               </span>
               <span className="text-xs font-medium">
                 {bucket.down_count ?? 0}
@@ -187,8 +200,11 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
   const [dateRange, setDateRange] = useState<DateRange | undefined>(undefined)
   const [hoveredBucket, setHoveredBucket] = useState<number | null>(null)
 
+  // Refresh moves a preset window ("Last 24 hours") to now.
+  const [windowMoves, moveWindow] = useReducer((n: number) => n + 1, 0)
   // Memoize start and end dates to prevent unnecessary refetches
   const { startDate, endDate } = useMemo(() => {
+    void windowMoves
     const now = new Date()
     if (activeFilter === 'custom' && dateRange) {
       return {
@@ -231,7 +247,7 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
         }
       }
     }
-  }, [activeFilter, dateRange])
+  }, [activeFilter, dateRange, windowMoves])
 
   // Resolution is derived from the selected range — no standalone selector,
   // so there are no invalid (range × granularity) combinations.
@@ -245,6 +261,7 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
     isLoading: isLoadingMonitor,
     error: monitorError,
     refetch: refetchMonitor,
+    isFetching: isFetchingMonitor,
   } = useQuery({
     ...getMonitorOptions({
       path: {
@@ -258,7 +275,7 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
     isLoading: isLoadingCurrentMonitorStatus,
     error: currentMonitorStatusError,
     refetch: refetchCurrentMonitorStatus,
-  } = useQuery({
+  } = useWindowQuery({
     ...getCurrentMonitorStatusOptions({
       path: {
         monitor_id: parseInt(monitorId || '0'),
@@ -275,7 +292,7 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
     isLoading: isLoadingStatus,
     error: statusError,
     refetch: refetchStatus,
-  } = useQuery({
+  } = useWindowQuery({
     ...getBucketedStatusOptions({
       path: {
         monitor_id: parseInt(monitorId || '0'),
@@ -290,10 +307,10 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
     refetchInterval: 30000, // Refresh every 30 seconds
   })
   // Calculate uptime stats from status data (filtered by date range)
-  const uptimePercentage = useMemo(
-    () => currentMonitorStatus?.uptime_percentage ?? 0,
-    [currentMonitorStatus]
-  )
+  const uptimePercentage = currentMonitorStatus?.uptime_percentage ?? null
+  const unknownNote = currentMonitorStatus
+    ? unknownTimeNote(currentMonitorStatus)
+    : null
   const avgResponseTime = useMemo(
     () => currentMonitorStatus?.avg_response_time_ms ?? 0,
     [currentMonitorStatus]
@@ -303,9 +320,14 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
     [currentMonitorStatus]
   )
 
-  if (monitorError || currentMonitorStatusError) {
+  // A failed refresh keeps the loaded page (and the path form); only data
+  // that never loaded is replaced by the error.
+  if (
+    (monitorError && !monitor) ||
+    (currentMonitorStatusError && !currentMonitorStatus)
+  ) {
     return (
-      <div className="p-6">
+      <div>
         <ErrorAlert
           title="Failed to load monitor"
           description={
@@ -350,7 +372,7 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
 
   if (!monitor) {
     return (
-      <div className="p-6">
+      <div>
         <ErrorAlert
           title="Monitor not found"
           description="The monitor you're looking for doesn't exist."
@@ -361,6 +383,19 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
 
   return (
     <div className="space-y-6">
+      {monitorError ? (
+        <Callout tone="error" title="Couldn't refresh monitor">
+          Showing the last loaded monitor.{' '}
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => void refetchMonitor()}
+            disabled={isFetchingMonitor}
+          >
+            Retry monitor
+          </Button>
+        </Callout>
+      ) : null}
       {/* Header */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-4">
@@ -381,9 +416,23 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
             </p>
           </div>
         </div>
-        <Badge variant={monitor.is_active ? 'default' : 'secondary'}>
-          {monitor.is_active ? 'Active' : 'Inactive'}
-        </Badge>
+        <div className="flex items-center gap-2">
+          <RefreshButton
+            queryKeys={[
+              getMonitorQueryKey({ path: { monitor_id: monitor.id } }),
+              queryKeyPrefix(getCurrentMonitorStatusQueryKey, {
+                path: { monitor_id: monitor.id },
+              }),
+              queryKeyPrefix(getBucketedStatusQueryKey, {
+                path: { monitor_id: monitor.id },
+              }),
+            ]}
+            onRefresh={moveWindow}
+          />
+          <Badge variant={monitor.is_active ? 'default' : 'secondary'}>
+            {monitor.is_active ? 'Active' : 'Inactive'}
+          </Badge>
+        </div>
       </div>
 
       {/* Date Range Filter */}
@@ -404,7 +453,7 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
         <Card>
           <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
             <CardTitle className="text-sm font-medium">
-              Current Status
+              Current status
             </CardTitle>
             <Activity className="h-4 w-4 text-muted-foreground" />
           </CardHeader>
@@ -424,9 +473,30 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
               <div className="text-2xl font-bold capitalize">
                 {currentStatus === 'major_outage'
                   ? 'Major Outage'
-                  : currentStatus}
+                  : currentStatus === 'no_address'
+                    ? 'Nothing to check'
+                    : currentStatus}
               </div>
             </div>
+            {currentStatus === 'no_address' && (
+              <p className="text-xs text-muted-foreground mt-1">
+                Nothing to check: nobody can reach this environment yet.
+                {monitor.environment_id ? (
+                  <>
+                    {' '}
+                    <Link
+                      className="text-foreground underline"
+                      to={reachabilityPath(
+                        project.slug,
+                        monitor.environment_id
+                      )}
+                    >
+                      Make it reachable
+                    </Link>
+                  </>
+                ) : null}
+              </p>
+            )}
             <p className="text-xs text-muted-foreground mt-1">
               Last checked{' '}
               {new Date(
@@ -447,13 +517,20 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
             ) : (
               <>
                 <div className="text-2xl font-bold">
-                  {uptimePercentage.toFixed(2)}%
+                  {formatUptime(uptimePercentage)}
                 </div>
                 <p className="text-xs text-muted-foreground mt-1">
                   {startDate && endDate
                     ? `${format(startDate, 'MMM dd')} - ${format(endDate, 'MMM dd')}`
                     : 'Select a date range'}
+                  {unknownNote ? ' · of monitored time' : ''}
                 </p>
+                {unknownNote && (
+                  <p className="mt-1 flex items-center gap-1 text-xs text-amber-700 dark:text-amber-400">
+                    <AlertCircle className="h-3 w-3 shrink-0" />
+                    {unknownNote}
+                  </p>
+                )}
               </>
             )}
           </CardContent>
@@ -462,7 +539,7 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
         <Card>
           <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
             <CardTitle className="text-sm font-medium">
-              Avg Response Time
+              Avg response time
             </CardTitle>
             <Clock className="h-4 w-4 text-muted-foreground" />
           </CardHeader>
@@ -487,7 +564,7 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
       <Card>
         <CardHeader className="flex flex-row items-center justify-between">
           <div>
-            <CardTitle>Status Timeline</CardTitle>
+            <CardTitle>Status timeline</CardTitle>
             <CardDescription>
               Historical uptime and performance data
             </CardDescription>
@@ -542,8 +619,10 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
                   <span>Major Outage</span>
                 </div>
                 <div className="flex items-center gap-2">
-                  <div className="h-3 w-3 rounded-sm bg-gray-300" />
-                  <span>Unknown</span>
+                  <div
+                    className={`h-3 w-3 rounded-sm ${BUCKET_TONE_CLASS.unknown}`}
+                  />
+                  <span>No checks</span>
                 </div>
               </div>
             </div>
@@ -576,13 +655,13 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
             </div>
             <div className="space-y-2">
               <p className="text-sm font-medium text-muted-foreground">
-                Monitor Type
+                Monitor type
               </p>
               <Badge variant="outline">{monitor.monitor_type}</Badge>
             </div>
             <div className="space-y-2">
               <p className="text-sm font-medium text-muted-foreground">
-                Check Interval
+                Check interval
               </p>
               <p className="text-sm">
                 {monitor.check_interval_seconds} seconds

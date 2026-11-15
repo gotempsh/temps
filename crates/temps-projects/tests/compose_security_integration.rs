@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use sea_orm::{ConnectionTrait, EntityTrait, PaginatorTrait};
-use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
 use temps_entities::{
     compose_security::{ComposeSecurityCheck, ComposeSecurityPolicy},
     compose_security_policies, compose_security_policy_changes,
@@ -11,6 +10,7 @@ use temps_migrations::{Migrator, MigratorTrait, SchemaManager};
 use temps_projects::services::compose_security::{
     legacy_migration_pending, read, update, ComposeSecurityError,
 };
+use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 
 #[tokio::test]
 async fn compose_policy_migration_persistence_rollback_and_project_deletion() {

@@ -80,7 +80,9 @@ impl ErrorCRUDService {
             request_data: data
                 .as_ref()
                 .and_then(|d| d.request.as_ref()?.post_data.clone()),
-            request_context: None,
+            request_context: data
+                .as_ref()
+                .and_then(|d| d.sentry.as_ref()?.get("request").cloned()),
 
             // User context
             user_id: data.as_ref().and_then(|d| d.user.as_ref()?.user_id.clone()),
@@ -246,8 +248,8 @@ impl ErrorCRUDService {
         start_date: Option<DateTime<Utc>>,
         end_date: Option<DateTime<Utc>>,
     ) -> Result<(Vec<ErrorGroupDomain>, u64), ErrorTrackingError> {
-        let page = page.unwrap_or(1);
-        let page_size = std::cmp::min(page_size.unwrap_or(20), 100);
+        let page = page.unwrap_or(1).max(1);
+        let page_size = page_size.unwrap_or(20).clamp(1, 100);
 
         let mut query =
             error_groups::Entity::find().filter(error_groups::Column::ProjectId.eq(project_id));
@@ -331,7 +333,9 @@ impl ErrorCRUDService {
                 rows
             }
         } else {
-            paginator.fetch_page(page.saturating_sub(1)).await?
+            paginator
+                .fetch_page(temps_core::config::page_index(page))
+                .await?
         };
 
         let mut domain_groups: Vec<ErrorGroupDomain> = groups
@@ -663,6 +667,8 @@ impl ErrorCRUDService {
         status: String,
         assigned_to: Option<String>,
     ) -> Result<(), ErrorTrackingError> {
+        validate_group_status(&status)?;
+
         let group = error_groups::Entity::find_by_id(group_id)
             .filter(error_groups::Column::ProjectId.eq(project_id))
             .one(self.db.as_ref())
@@ -697,17 +703,65 @@ impl ErrorCRUDService {
         page: Option<u64>,
         page_size: Option<u64>,
     ) -> Result<(Vec<ErrorEventDomain>, u64), ErrorTrackingError> {
-        let page = page.unwrap_or(1);
-        let page_size = std::cmp::min(page_size.unwrap_or(20), 100);
+        self.list_error_events_filtered(
+            group_id,
+            project_id,
+            page,
+            page_size,
+            &super::types::ErrorEventFilter::default(),
+        )
+        .await
+    }
 
-        let query = error_events::Entity::find()
+    pub async fn list_error_events_filtered(
+        &self,
+        group_id: i32,
+        project_id: i32,
+        page: Option<u64>,
+        page_size: Option<u64>,
+        filter: &super::types::ErrorEventFilter,
+    ) -> Result<(Vec<ErrorEventDomain>, u64), ErrorTrackingError> {
+        if filter
+            .user_id
+            .as_ref()
+            .is_some_and(|s| s.is_empty() || s.len() > 1024)
+            || filter
+                .tag_key
+                .as_ref()
+                .is_some_and(|s| s.is_empty() || s.len() > 1024)
+            || filter.tag_value.as_ref().is_some_and(|s| s.len() > 4096)
+            || filter.tag_key.is_some() != filter.tag_value.is_some()
+        {
+            return Err(ErrorTrackingError::Validation(
+                "Metadata filters exceed limits, or tag_key/tag_value are not paired".into(),
+            ));
+        }
+        let page = page.unwrap_or(1).max(1);
+        let page_size = page_size.unwrap_or(20).clamp(1, 100);
+
+        let mut query = error_events::Entity::find()
             .filter(error_events::Column::ErrorGroupId.eq(group_id))
             .filter(error_events::Column::ProjectId.eq(project_id))
             .order_by_desc(error_events::Column::Timestamp);
 
+        if let Some(user_id) = &filter.user_id {
+            query = query.filter(sea_orm::sea_query::Expr::cust_with_values(
+                "data #>> '{user,user_id}' = $1",
+                [user_id.clone()],
+            ));
+        }
+        if let (Some(key), Some(value)) = (&filter.tag_key, &filter.tag_value) {
+            let object = serde_json::json!({(key):value}).to_string();
+            query = query.filter(sea_orm::sea_query::Expr::cust_with_values(
+                "(data #> '{trace,extra,tags}' @> CAST($1 AS jsonb) OR EXISTS (SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(data #> '{trace,extra,tags}')='array' THEN data #> '{trace,extra,tags}' ELSE '[]'::jsonb END) AS tag WHERE tag->>0=$2 AND tag->>1=$3))",
+                [object, key.clone(), value.clone()],
+            ));
+        }
         let paginator = query.paginate(self.db.as_ref(), page_size);
         let total = paginator.num_items().await?;
-        let events = paginator.fetch_page(page - 1).await?;
+        let events = paginator
+            .fetch_page(temps_core::config::page_index(page))
+            .await?;
 
         let domain_events = events.into_iter().map(Self::to_domain).collect();
 
@@ -742,11 +796,56 @@ impl ErrorCRUDService {
     }
 }
 
+/// The statuses a group can hold. Anything else would drop the group out of every
+/// status filter and stats bucket.
+const ERROR_GROUP_STATUSES: [&str; 4] = ["unresolved", "resolved", "ignored", "assigned"];
+
+fn validate_group_status(status: &str) -> Result<(), ErrorTrackingError> {
+    if ERROR_GROUP_STATUSES.contains(&status) {
+        return Ok(());
+    }
+    Err(ErrorTrackingError::Validation(format!(
+        "unknown error group status '{status}'; expected one of {}",
+        ERROR_GROUP_STATUSES.join(", ")
+    )))
+}
+
+#[cfg(test)]
+mod group_status_tests {
+    use super::*;
+
+    #[test]
+    fn every_known_status_is_accepted() {
+        for status in ERROR_GROUP_STATUSES {
+            assert!(validate_group_status(status).is_ok(), "{status}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_status_is_refused_by_name() {
+        for status in ["definitely-not-a-status", "", "RESOLVED", " resolved"] {
+            let err = validate_group_status(status).unwrap_err();
+            assert!(matches!(err, ErrorTrackingError::Validation(_)));
+            assert!(err.to_string().contains(&format!("'{status}'")), "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unknown_status_is_refused_before_any_query() {
+        // An empty mock fails on any query, so a pass proves nothing was read.
+        let db = sea_orm::MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let result = ErrorCRUDService::new(Arc::new(db))
+            .update_error_group_status(1, 1, "definitely-not-a-status".to_string(), None)
+            .await;
+        assert!(matches!(result, Err(ErrorTrackingError::Validation(_))));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::{error_groups, projects};
+    use temps_test_utils::TestDatabase;
 
     /// Test: Manual error resolution workflow
     ///
@@ -757,12 +856,6 @@ mod tests {
     /// 3. Ignore errors with "ignored" status
     /// 4. Proper error handling for non-existent groups
     /// 5. Project isolation - can't update groups from other projects
-    async fn setup_test_db() -> TestDatabase {
-        TestDatabase::with_migrations()
-            .await
-            .expect("Failed to create test database")
-    }
-
     async fn create_test_project(db: &Arc<DatabaseConnection>) -> i32 {
         use temps_entities::preset::Preset;
         use uuid::Uuid;
@@ -825,9 +918,7 @@ mod tests {
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping global errors database test: {error}");
                 return;
@@ -932,7 +1023,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_update_error_group_status_to_resolved() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorCRUDService::new(db.clone());
 
@@ -959,7 +1050,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_update_error_group_with_assignment() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorCRUDService::new(db.clone());
 
@@ -992,7 +1083,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_update_error_group_to_ignored() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorCRUDService::new(db.clone());
 
@@ -1019,7 +1110,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_update_error_group_not_found() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorCRUDService::new(db);
 
@@ -1038,7 +1129,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_update_error_group_wrong_project() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorCRUDService::new(db.clone());
 
@@ -1060,7 +1151,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_list_error_groups_with_pagination() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorCRUDService::new(db.clone());
 
@@ -1094,7 +1185,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_list_error_groups_with_status_filter() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorCRUDService::new(db.clone());
 
@@ -1134,9 +1225,7 @@ mod tests {
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping range sort database test: {error}");
                 return;
@@ -1207,7 +1296,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_get_error_group_by_id() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorCRUDService::new(db.clone());
 
@@ -1226,7 +1315,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_has_error_groups() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorCRUDService::new(db.clone());
 
@@ -1303,7 +1392,7 @@ impl ErrorCRUDService {
         let total: i64 = count.try_get("", "total")?;
         values.push(page_size.into());
         let limit = values.len();
-        values.push(((page - 1) * page_size).into());
+        values.push(temps_core::config::page_offset(page, page_size).into());
         let offset = values.len();
         let sql = format!(
             r#"

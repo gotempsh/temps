@@ -16,6 +16,28 @@ fn agent_worker_threads(available_parallelism: usize) -> usize {
     available_parallelism.clamp(1, MAX_AGENT_WORKER_THREADS)
 }
 
+/// See [`AgentCommand::labels_settings`]. `agent.json` is reloaded, and
+/// written next to, only when it is this agent's own config: it parsed, and
+/// any `--node-id` names the same node. An agent configured by flags never
+/// takes another node's labels from a stale file.
+fn labels_settings_for(
+    pinned: bool,
+    flag_node_id: Option<i32>,
+    saved_node_id: Option<i32>,
+    data_dir: PathBuf,
+) -> temps_node_agent::labels::LabelsSettings {
+    use temps_node_agent::labels::{LabelsOrigin, LabelsSettings};
+    let own_file = saved_node_id.is_some_and(|saved| flag_node_id.is_none_or(|flag| flag == saved));
+    LabelsSettings {
+        origin: if pinned {
+            LabelsOrigin::Override
+        } else {
+            LabelsOrigin::AgentJson
+        },
+        data_dir: own_file.then_some(data_dir),
+    }
+}
+
 /// Resolve the agent data directory (`TEMPS_DATA_DIR` env var, or
 /// `~/.temps`, or `./` as a last resort). Used for the saved agent
 /// config and the per-node DNS resolver snapshot (`<dir>/dns/zone.json`).
@@ -30,6 +52,40 @@ pub fn agent_data_dir() -> PathBuf {
 }
 
 /// Run the worker node agent server
+/// The plugin compiler a worker's agent runs for a control plane without
+/// Docker.
+struct ContainerPluginBuilder;
+
+fn plugin_build_error(
+    error: temps_external_plugins::repository::LocalBuildError,
+) -> temps_node_agent::plugin_build_handler::PluginBuildError {
+    use temps_external_plugins::repository::LocalBuildError;
+    use temps_node_agent::plugin_build_handler::PluginBuildError;
+    match error {
+        LocalBuildError::RuntimeMissing => PluginBuildError::RuntimeMissing,
+        LocalBuildError::Failed(reason) => PluginBuildError::Failed { reason },
+    }
+}
+
+#[async_trait::async_trait]
+impl temps_node_agent::plugin_build_handler::PluginContainerBuilder for ContainerPluginBuilder {
+    async fn build_from_archive(
+        &self,
+        archive: &std::path::Path,
+        target: &str,
+        output: &std::path::Path,
+    ) -> Result<(), temps_node_agent::plugin_build_handler::PluginBuildError> {
+        temps_external_plugins::repository::build_in_container(
+            temps_external_plugins::repository::ContainerBuildSource::Archive(archive),
+            target,
+            output,
+            None,
+        )
+        .await
+        .map_err(plugin_build_error)
+    }
+}
+
 #[derive(Args)]
 pub struct AgentCommand {
     /// Listen address for the agent API
@@ -53,7 +109,8 @@ pub struct AgentCommand {
     pub node_id: Option<i32>,
 
     /// Node labels for scheduling (comma-separated key=value pairs, e.g., "region=us-east,gpu=true").
-    /// Overrides labels from saved config. Sent in every heartbeat.
+    /// Overrides labels from saved config for the life of the process: `temps
+    /// agent labels set` changes are then ignored. Sent in every heartbeat.
     #[arg(long, env = "TEMPS_NODE_LABELS", value_delimiter = ',')]
     pub labels: Vec<String>,
 
@@ -101,6 +158,12 @@ pub struct AgentCommand {
     #[arg(long, default_value_t = 443)]
     pub public_ingress_https_port: u16,
 
+    /// Do not run the node runtime or advertise the `state_stream`
+    /// capability (ADR-055 §7): the control plane drives this node through
+    /// the `/agent/*` API only, as older agents are. A rollback switch.
+    #[arg(long)]
+    pub disable_state_stream: bool,
+
     #[command(subcommand)]
     pub service: Option<AgentSubcommand>,
 }
@@ -110,13 +173,28 @@ pub enum AgentSubcommand {
     /// Run the agent as a systemd service (install, uninstall, status)
     #[command(subcommand)]
     Service(super::agent_service::AgentServiceCommand),
+    /// Choose whether this worker takes public traffic (ADR 058 D7)
+    #[command(subcommand)]
+    Ingress(super::agent_ingress::AgentIngressCommand),
+    /// Show or change this worker's scheduling labels, such as
+    /// `temps.sh/role=dedicated` (ADR-091)
+    #[command(subcommand)]
+    Labels(super::agent_labels::AgentLabelsCommand),
 }
 
 impl AgentCommand {
     pub fn execute(self) -> anyhow::Result<()> {
-        if let Some(AgentSubcommand::Service(command)) = &self.service {
-            return command.execute();
+        match &self.service {
+            Some(AgentSubcommand::Service(command)) => return command.execute(),
+            Some(AgentSubcommand::Ingress(command)) => return command.execute(),
+            Some(AgentSubcommand::Labels(command)) => return command.execute(),
+            None => {}
         }
+        // A Mac worker (ADR 090): pin the Docker app `temps join` recorded
+        // before anything connects to Docker, while this process is still
+        // single-threaded.
+        #[cfg(target_os = "macos")]
+        let mac_worker = prepare_mac_worker()?;
         let available_parallelism = std::thread::available_parallelism()
             .map(usize::from)
             .unwrap_or(1);
@@ -130,7 +208,14 @@ impl AgentCommand {
             .build()?;
 
         rt.block_on(async move {
+            let disable_state_stream = self.disable_state_stream;
             let config = self.resolve_config()?;
+            let labels = self.labels_settings();
+
+            #[cfg(target_os = "macos")]
+            if let Some(worker) = mac_worker.clone() {
+                wait_for_mac_sidecar(worker).await;
+            }
 
             let docker = bollard::Docker::connect_with_defaults()
                 .map_err(|e| anyhow::anyhow!("Failed to connect to Docker: {}", e))?;
@@ -142,19 +227,17 @@ impl AgentCommand {
             // sync loop has run for the first time). Operators who really
             // need to disable can override via TEMPS_OVERLAY_NETWORK="".
             //
-            // The default must match the network name `temps-network`
-            // actually creates (`NetworkConfig::default().docker_network_name`),
-            // which is `temps0`. The previous default `temps-overlay`
-            // never matched any real network on the worker so app
-            // containers were silently single-host attached.
-            let overlay_network = std::env::var("TEMPS_OVERLAY_NETWORK")
-                .unwrap_or_else(|_| temps_network::NetworkConfig::default().docker_network_name);
+            // Unset, the runtime follows the overlay network name the
+            // network sync loop reconciles (`temps0` unless the control
+            // plane names another, ADR 059), so containers join the
+            // network `temps-network` actually created on this host.
+            let overlay_network = std::env::var("TEMPS_OVERLAY_NETWORK").ok();
             // Shared peer-list slot. The agent's network_sync loop
             // refreshes it on every poll; both the deployer (for app
             // containers) and the agent's service handlers (for
             // user-managed services) read it to install per-peer
             // overlay routes inside each new container's netns.
-            let overlay_peers: temps_agent::network_sync::SharedPeers =
+            let overlay_peers: temps_node_agent::network_sync::SharedPeers =
                 Arc::new(std::sync::RwLock::new(Vec::new()));
             // Shared bridge-IP slot, populated by network_sync once
             // the overlay bridge is up. The deployer reads it to set
@@ -223,9 +306,9 @@ impl AgentCommand {
             // a node that joined with a public address moves onto its
             // WireGuard mesh address, containers created afterwards publish
             // there instead of on the address captured here at startup.
-            let host_bind_slot: temps_agent::network_sync::SharedBindAddress =
+            let host_bind_slot: temps_node_agent::network_sync::SharedBindAddress =
                 Arc::new(std::sync::RwLock::new(
-                    temps_agent::network_sync::initial_bind_address(Some(&host_bind_address)),
+                    temps_node_agent::network_sync::initial_bind_address(Some(&host_bind_address)),
                 ));
 
             let mut runtime_builder = temps_deployer::docker::DockerRuntime::new(
@@ -236,10 +319,18 @@ impl AgentCommand {
             .with_host_bind_slot(host_bind_slot.clone())
             .with_docker_socket_grant(docker_socket_grant.clone())
             .with_overlay_dns_slot(overlay_bridge_address.clone());
-            if !overlay_network.is_empty() {
-                runtime_builder = runtime_builder
-                    .with_overlay_network(overlay_network)
-                    .with_overlay_peers(overlay_peers.clone());
+            match overlay_network {
+                Some(name) if name.is_empty() => {}
+                Some(name) => {
+                    runtime_builder = runtime_builder
+                        .with_overlay_network(name)
+                        .with_overlay_peers(overlay_peers.clone());
+                }
+                None => {
+                    runtime_builder = runtime_builder
+                        .with_current_overlay_network()
+                        .with_overlay_peers(overlay_peers.clone());
+                }
             }
             let docker_runtime = Arc::new(runtime_builder);
 
@@ -275,7 +366,7 @@ impl AgentCommand {
             // long-polls the CP and applies snapshots into this store;
             // the internal edge proxy reads from it on every request.
             let route_snapshot_path = agent_data_dir().join("routes").join("snapshot.json");
-            let route_store = Arc::new(temps_agent::route_store::RouteStore::new(
+            let route_store = Arc::new(temps_node_agent::route_store::RouteStore::new(
                 route_snapshot_path,
             ));
             route_store.load_from_disk();
@@ -284,13 +375,24 @@ impl AgentCommand {
             // global notifier passed below; if the agent server exits,
             // the client stops on the next round.
             let route_sync_shutdown = Arc::new(tokio::sync::Notify::new());
-            match temps_agent::route_sync_client::RouteSyncClient::new_with_ca(
+
+            // Cloud-metadata egress guard: installed at start rather than on
+            // the first deploy, so a rebooted node never runs containers
+            // without it, and re-asserted periodically after firewall flushes.
+            tokio::spawn(
+                temps_deployer::metadata_egress::maintain_metadata_egress_block(
+                    std::time::Duration::from_secs(60),
+                    route_sync_shutdown.clone(),
+                ),
+            );
+
+            match temps_node_agent::route_sync_client::RouteSyncClient::new_with_ca(
                 config.control_plane_url.clone(),
                 config.node_id,
                 config.token.clone(),
                 route_store.clone(),
                 route_sync_shutdown.clone(),
-                temps_agent::control_plane_ca(&config),
+                temps_node_agent::control_plane_ca(&config),
             ) {
                 Ok(client) => {
                     tokio::spawn(async move {
@@ -306,56 +408,149 @@ impl AgentCommand {
                 }
             }
 
-            if let (Some(public_ip), Some(private_key_b64)) = (
-                config.public_ingress_address,
-                config.public_ingress_private_key.clone(),
-            ) {
-                let ingress_config = temps_agent::public_ingress::PublicIngressConfig {
-                    http_address: std::net::SocketAddr::new(
-                        public_ip,
-                        config.public_ingress_http_port,
-                    ),
-                    https_address: std::net::SocketAddr::new(
-                        public_ip,
-                        config.public_ingress_https_port,
-                    ),
-                    private_key_b64,
-                    control_plane_url: config.control_plane_url.clone(),
-                    control_plane_ca: temps_agent::control_plane_ca(&config),
-                    node_id: config.node_id,
-                    node_token: config.token.clone(),
-                };
-                match temps_agent::public_ingress::spawn(
-                    ingress_config,
-                    route_store.clone(),
-                    route_sync_shutdown.clone(),
-                )
-                .await
-                {
-                    Ok(handle) => tracing::info!(
-                        http = %handle.http_address(),
-                        https = %handle.https_address(),
-                        "public worker ingress started"
-                    ),
-                    Err(error) => tracing::error!(%error, "public worker ingress failed to start"),
+            // Network policy: the same enforcer as node 0, fed by the
+            // control plane. In `legacy` (the default) a pass is one
+            // request and nothing else. Its DNS view is shared with the
+            // node resolver (started by the network sync loop), which
+            // answers restricted workloads from it.
+            let dns_policy = temps_dns::open_dns_policy_slot();
+            match temps_node_agent::with_control_plane_trust(
+                reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)),
+                temps_node_agent::control_plane_ca(&config),
+            )
+            .build()
+            {
+                Ok(http) => {
+                    if let Err(e) = temps_node_agent::network_policy::spawn_worker_enforcer(
+                        http,
+                        &config.control_plane_url,
+                        config.node_id,
+                        config.token.clone(),
+                        docker.clone(),
+                        dns_policy.clone(),
+                        &agent_data_dir(),
+                    ) {
+                        tracing::warn!(error = %e, "network policy enforcer could not start");
+                    }
                 }
-            } else if config.public_ingress_address.is_some() {
-                let message = "public ingress is configured but this worker has no ingress encryption key; rerun the original `temps join` command with the same node name and control-plane target to re-enroll, then restart the agent";
-                temps_agent::public_ingress::record_failure(message);
-                tracing::error!("{message}");
-            } else {
-                tracing::info!("public worker ingress listener not configured on this node");
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "network policy enforcer could not start: building its HTTP client failed"
+                ),
             }
 
-            // Internal edge proxy bound to the overlay bridge gateway.
+            // netwatch on this node (ADR 066 D12), when TEMPS_NETWATCH turns
+            // it on: its bans join this node's lists.
+            route_store
+                .shield()
+                .start_netwatch(temps_node_agent::shield::NetwatchConfig::from_env());
+
+            // Shield on the public ingress (ADR 066 D10): the snapshot and
+            // keys the control plane names in the route snapshot, and the
+            // events this node's ingress records.
+            match temps_node_agent::control_plane_client_builder(&config)
+                .timeout(std::time::Duration::from_secs(60))
+                .build()
+            {
+                Ok(http) => {
+                    temps_node_agent::shield::sync::start(
+                        temps_node_agent::shield::sync::ShieldSyncConfig {
+                            control_plane_url: config.control_plane_url.clone(),
+                            node_id: config.node_id,
+                            node_token: config.token.clone(),
+                            http,
+                            private_key_b64: config.public_ingress_private_key.clone(),
+                            // Where the ingress manager saves the key it
+                            // provisions when `temps join` gave none.
+                            key_file: Some(agent_data_dir().join("public-ingress.key")),
+                            uploader: Default::default(),
+                        },
+                        route_store.shield().clone(),
+                        route_sync_shutdown.clone(),
+                    );
+                }
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "could not start Shield sync; Shield routes on this node will answer 503"
+                ),
+            }
+
+            // Signed-in addresses (ADR 065 D8): the ingress redeems sign-in
+            // codes and revokes sessions over this node's token channel.
+            match temps_node_agent::gate::GateChannel::new(
+                config.control_plane_url.clone(),
+                config.node_id,
+                config.token.clone(),
+                config.node_name.clone(),
+                temps_node_agent::control_plane_ca(&config),
+            ) {
+                Ok(channel) => temps_node_agent::gate::install(channel),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "could not build the signed-in gate channel; signed-in addresses on this \
+                     node will say sign-in is unavailable"
+                ),
+            }
+
+            // Direct worker ingress (ADR 058 D7): the worker's own mode
+            // (`temps agent ingress`) decides whether and where it listens.
+            temps_node_agent::public_ingress_manager::start(
+                temps_node_agent::public_ingress_manager::ManagerConfig {
+                    private_key_b64: config.public_ingress_private_key.clone(),
+                    data_dir: agent_data_dir(),
+                    control_plane_url: config.control_plane_url.clone(),
+                    control_plane_ca: temps_node_agent::control_plane_ca(&config),
+                    node_id: config.node_id,
+                    node_token: config.token.clone(),
+                    ingress: config.local_ingress(),
+                    pinned: self.public_ingress_address.is_some(),
+                    config_path: agent_data_dir().join("agent.json"),
+                },
+                route_store.clone(),
+                route_sync_shutdown.clone(),
+                route_store.public_ingress_snapshot().listen,
+            );
+
+            // Ingress connectors (ADR 058): tunnels such as Cloudflare Tunnel
+            // the control plane assigns to this node. Saved specs start even
+            // while the control plane is unreachable.
+            {
+                let supervisor = temps_node_agent::connectors::ConnectorSupervisor::new(
+                    agent_data_dir(),
+                    route_store.clone(),
+                    route_sync_shutdown.clone(),
+                );
+                match temps_node_agent::connectors::sync::ConnectorSync::new(
+                    config.control_plane_url.clone(),
+                    config.node_id,
+                    config.token.clone(),
+                    temps_node_agent::control_plane_ca(&config),
+                    supervisor,
+                    agent_data_dir(),
+                    route_sync_shutdown.clone(),
+                ) {
+                    Ok(sync) => {
+                        tokio::spawn(sync.run());
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "ingress connector sync could not start")
+                    }
+                }
+            }
+
+            // Internal routing on the overlay bridge gateway (ADR-098).
             // Watches two sources for the bridge IP, taking whichever
             // appears first:
             //   1. `overlay_bridge_address` — populated by network_sync
             //      after the CP returns this node's compute_cidr.
-            //   2. The kernel directly (`br-temps0` interface) — works
-            //      across CP-outage cold starts, because the bridge is
-            //      preserved by the kernel even when the agent restarts
-            //      with CP unreachable.
+            //   2. The kernel directly (the overlay bridge's interface) —
+            //      works across CP-outage cold starts, because the bridge
+            //      is preserved by the kernel even when the agent restarts
+            //      with CP unreachable. The bridge is the one named in
+            //      agent.json when `temps join` chose another overlay name
+            //      (ADR-059): the default `br-temps0` may then belong to
+            //      another Temps install on this host, and redirecting its
+            //      port 80 (ADR-098) would break that install's routing.
             // Without (2) the proxy would refuse to bind whenever the
             // agent reboots while the CP is down, which is exactly when
             // serving stale-but-correct routes from disk matters most.
@@ -364,17 +559,24 @@ impl AgentCommand {
                 let store = route_store.clone();
                 let proxy_docker = docker.clone();
                 let proxy_shutdown = route_sync_shutdown.clone();
+                let saved_bridge = saved_overlay_bridge(config.overlay_network_name.as_deref());
                 tokio::spawn(async move {
                     let bridge_ip = loop {
-                        if let Some(ip) = *bridge_slot.read().expect("bridge slot poisoned") {
+                        if let Some(ip) = *bridge_slot
+                            .read()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        {
                             break ip;
                         }
                         // Fallback path: the bridge IP is also visible
-                        // in the kernel as the `br-temps0` interface
+                        // in the kernel as the overlay bridge's interface
                         // address. Read it directly so the proxy can
                         // bind without waiting for CP to confirm the
                         // allocation.
-                        if let Some(ip) = read_bridge_ip_from_kernel("br-temps0").await {
+                        let bridge = saved_bridge
+                            .clone()
+                            .unwrap_or_else(|| temps_network::overlay_name::current().bridge);
+                        if let Some(ip) = read_bridge_ip_from_kernel(&bridge).await {
                             tracing::info!(
                                 bridge = %ip,
                                 "using kernel-derived bridge IP (CP slot not yet populated)"
@@ -383,34 +585,44 @@ impl AgentCommand {
                         }
                         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     };
-                    if let Err(e) = temps_agent::internal_proxy::spawn(
+                    // The proxy listens on its own port of the bridge address
+                    // and nftables redirects containers' port-80 calls to it
+                    // (ADR-098), so another program on port 80 of this host
+                    // keeps its port. Without the redirect the agent falls
+                    // back to binding port 80 directly. Supervised for the
+                    // agent's lifetime; each pass rides on the heartbeat.
+                    temps_node_agent::internal_routing::supervise(
                         bridge_ip,
-                        80,
                         store,
                         proxy_docker,
                         proxy_shutdown,
                     )
-                    .await
-                    {
-                        tracing::warn!(
-                            error = %e,
-                            "internal edge proxy failed to bind; internal HTTP routing disabled"
-                        );
-                    }
+                    .await;
                 });
             }
 
-            temps_agent::server::start_agent_server(
+            temps_node_agent::server::start_agent_server_with(
                 deployer,
                 builder,
                 Some(docker),
                 config,
-                temps_agent::server::SharedNetwork {
+                temps_node_agent::server::SharedNetwork {
                     overlay_bridge_address,
                     overlay_peers,
                     host_bind_address: host_bind_slot,
+                    dns_policy,
                 },
                 docker_socket_grant,
+                temps_node_agent::server::AgentServerOptions {
+                    state_stream: !disable_state_stream,
+                    labels,
+                    engines: temps_node_agent::server::AgentEngines {
+                        service_runtime: Arc::new(
+                            temps_providers::node_runtime::ProvidersNodeRuntime,
+                        ),
+                        plugin_builder: Arc::new(ContainerPluginBuilder),
+                    },
+                },
             )
             .await
             .map_err(|e| anyhow::anyhow!("Agent server error: {}", e))?;
@@ -422,7 +634,7 @@ impl AgentCommand {
     }
 
     /// Load config from `~/.temps/agent.json`, then overlay any CLI flags on top.
-    fn resolve_config(&self) -> anyhow::Result<temps_agent::AgentConfig> {
+    fn resolve_config(&self) -> anyhow::Result<temps_node_agent::AgentConfig> {
         let saved = self.load_saved_config();
 
         let listen_address = self
@@ -556,7 +768,7 @@ impl AgentCommand {
             );
         }
 
-        let mut config = temps_agent::AgentConfig {
+        let mut config = temps_node_agent::AgentConfig {
             listen_address,
             token,
             node_name,
@@ -594,6 +806,13 @@ impl AgentCommand {
             public_ingress_private_key: saved
                 .as_ref()
                 .and_then(|config| config.public_ingress_private_key.clone()),
+            // `--public-ingress-address` on the command line pins this run to
+            // `fixed` on that address, over whatever agent.json says.
+            ingress: if self.public_ingress_address.is_some() {
+                None
+            } else {
+                saved.as_ref().and_then(|config| config.ingress.clone())
+            },
             mesh_key_dir: agent_data_dir().join("wireguard"),
             wg_endpoint: self
                 .wg_endpoint
@@ -606,6 +825,10 @@ impl AgentCommand {
             control_plane_legacy_cert_path: saved
                 .as_ref()
                 .and_then(|config| config.control_plane_legacy_cert_path.clone()),
+            join_url: saved.as_ref().and_then(|config| config.join_url.clone()),
+            overlay_network_name: saved
+                .as_ref()
+                .and_then(|config| config.overlay_network_name.clone()),
             control_plane_trust: saved
                 .as_ref()
                 .map(|config| config.effective_control_plane_trust()),
@@ -624,12 +847,26 @@ impl AgentCommand {
         Ok(config)
     }
 
+    /// ADR-091: labels from `--labels`/`TEMPS_NODE_LABELS` are pinned;
+    /// labels from a saved `agent.json` are reloaded from it while the agent
+    /// runs, and the labels the control plane accepts are recorded next to
+    /// it for `temps agent labels`.
+    fn labels_settings(&self) -> temps_node_agent::labels::LabelsSettings {
+        let saved_node_id = self.load_saved_config().map(|config| config.node_id);
+        labels_settings_for(
+            !self.labels.is_empty(),
+            self.node_id,
+            saved_node_id,
+            agent_data_dir(),
+        )
+    }
+
     /// Try to load `agent.json` from the configured agent data directory.
     /// Returns None if not found or unparsable.
-    fn load_saved_config(&self) -> Option<temps_agent::AgentConfig> {
+    fn load_saved_config(&self) -> Option<temps_node_agent::AgentConfig> {
         let config_path = agent_data_dir().join("agent.json");
         let data = std::fs::read_to_string(&config_path).ok()?;
-        match serde_json::from_str::<temps_agent::AgentConfig>(&data) {
+        match serde_json::from_str::<temps_node_agent::AgentConfig>(&data) {
             Ok(config) => {
                 tracing::info!("Loaded agent config from {}", config_path.display());
                 Some(config)
@@ -648,6 +885,74 @@ impl AgentCommand {
 /// kernel still has the bridge from the previous run. Returns None if
 /// the interface doesn't exist, has no v4 address, or `ip` isn't on
 /// PATH (single-host dev mode).
+/// Load this Mac's worker record, pin its Docker app for every component
+/// of the agent, and refuse a Mac that never joined as a Mac worker.
+#[cfg(target_os = "macos")]
+fn prepare_mac_worker() -> anyhow::Result<Option<temps_node_agent::mac_worker::MacWorker>> {
+    use temps_node_agent::mac_worker::MacWorker;
+
+    let data_dir = agent_data_dir();
+    let Some(worker) = MacWorker::load(&data_dir)? else {
+        return Ok(None);
+    };
+    temps_wireguard::vm::set_docker_endpoint(worker.endpoint())?;
+    temps_node_agent::mac_worker::set_running(&worker);
+    // bollard and the deployer read DOCKER_HOST. This is the endpoint `temps
+    // join` recorded in the agent's own data directory, not configuration
+    // taken from the environment: a later `docker context use` must not move
+    // a running worker to another VM.
+    std::env::set_var("DOCKER_HOST", &worker.docker_host);
+    tracing::info!(
+        docker_app = worker.docker_app.display_name(),
+        docker_host = %worker.docker_host,
+        mesh_address = %worker.mesh_address,
+        "macOS worker: containers and the mesh run in the Docker app's VM"
+    );
+    Ok(Some(worker))
+}
+
+/// Keep trying until the mesh sidecar runs in the Docker app's VM. At login
+/// the agent can start before the Docker app does, and the app can be
+/// restarted under it: neither is an error worth exiting on.
+#[cfg(target_os = "macos")]
+async fn wait_for_mac_sidecar(worker: temps_node_agent::mac_worker::MacWorker) {
+    let mut delay = std::time::Duration::from_secs(2);
+    loop {
+        let attempt = worker.clone();
+        match tokio::task::spawn_blocking(move || {
+            temps_node_agent::mac_worker::ensure_sidecar(&attempt)
+        })
+        .await
+        {
+            Ok(Ok(action)) => {
+                tracing::info!(?action, "mesh sidecar is running in the Docker app's VM");
+                return;
+            }
+            Ok(Err(error)) => tracing::warn!(
+                %error,
+                retry_in_secs = delay.as_secs(),
+                hint = %worker.docker_app.start_hint(worker.colima_profile.as_deref()),
+                "the mesh sidecar is not running yet; is the Docker app running?"
+            ),
+            Err(error) => tracing::warn!(%error, "mesh sidecar check panicked; retrying"),
+        }
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(std::time::Duration::from_secs(60));
+    }
+}
+
+/// The overlay bridge `temps join` recorded in agent.json, used to find the
+/// bridge address before the first network sync. `None` (use the names the
+/// sync loop reconciled, else the defaults) when nothing usable was saved.
+fn saved_overlay_bridge(saved: Option<&str>) -> Option<String> {
+    let names = temps_network::OverlayNames::new(saved?)
+        .map_err(|error| {
+            tracing::warn!(%error, "agent.json names an unusable overlay network; ignoring it")
+        })
+        .ok()?;
+    Some(names.bridge)
+}
+
 async fn read_bridge_ip_from_kernel(iface: &str) -> Option<std::net::IpAddr> {
     use tokio::process::Command;
     let out = Command::new("ip")
@@ -681,6 +986,45 @@ async fn read_bridge_ip_from_kernel(iface: &str) -> Option<std::net::IpAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Another overlay name chosen at join must be what a cold start looks
+    /// for: the default bridge may be another Temps install's (ADR-098).
+    #[test]
+    fn a_cold_start_looks_for_the_overlay_bridge_join_chose() {
+        let other = temps_network::OverlayNames::new("temps1").unwrap();
+        assert_eq!(
+            saved_overlay_bridge(Some("temps1")),
+            Some(other.bridge.clone())
+        );
+        assert_ne!(other.bridge, temps_network::OverlayNames::default().bridge);
+        assert_eq!(saved_overlay_bridge(None), None);
+        assert_eq!(saved_overlay_bridge(Some("br0; rm -rf")), None);
+    }
+
+    #[test]
+    fn labels_reload_only_from_this_agents_own_agent_json() {
+        use temps_node_agent::labels::LabelsOrigin;
+        let dir = PathBuf::from("/root/.temps");
+        let own = labels_settings_for(false, None, Some(4), dir.clone());
+        assert_eq!(own.origin, LabelsOrigin::AgentJson);
+        assert_eq!(own.data_dir.as_deref(), Some(dir.as_path()));
+        assert!(labels_settings_for(false, Some(4), Some(4), dir.clone())
+            .data_dir
+            .is_some());
+        // Configured by flags for another node, or the file did not parse.
+        assert!(labels_settings_for(false, Some(9), Some(4), dir.clone())
+            .data_dir
+            .is_none());
+        assert!(labels_settings_for(false, None, None, dir.clone())
+            .data_dir
+            .is_none());
+        let pinned = labels_settings_for(true, None, Some(4), dir);
+        assert_eq!(pinned.origin, LabelsOrigin::Override);
+        assert!(
+            pinned.data_dir.is_some(),
+            "a pinned agent still records its labels"
+        );
+    }
 
     #[test]
     fn agent_runtime_uses_available_threads_on_small_hosts() {
@@ -753,6 +1097,27 @@ mod tests {
                 error.to_string().contains("not-an-ip"),
                 "error should echo the offending value, got: {error}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod plugin_builder_tests {
+    use super::*;
+    use temps_external_plugins::repository::LocalBuildError;
+    use temps_node_agent::plugin_build_handler::PluginBuildError;
+
+    /// The agent answers 501 for a missing container engine and 500 with the
+    /// reason for a failed build, so each must keep its meaning.
+    #[test]
+    fn local_build_errors_keep_their_meaning_for_the_agent() {
+        assert!(matches!(
+            plugin_build_error(LocalBuildError::RuntimeMissing),
+            PluginBuildError::RuntimeMissing
+        ));
+        match plugin_build_error(LocalBuildError::Failed("bun exited 1".to_string())) {
+            PluginBuildError::Failed { reason } => assert_eq!(reason, "bun exited 1"),
+            other => panic!("expected a failed build, got {other}"),
         }
     }
 }

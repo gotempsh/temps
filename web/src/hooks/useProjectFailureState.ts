@@ -85,6 +85,7 @@ export function useProjectFailureState(
   return {
     status,
     environmentsQuery,
+    containersQuery,
     /** Environment whose containers were checked for Degraded. */
     healthEnvironment: environment,
     containerIssues,

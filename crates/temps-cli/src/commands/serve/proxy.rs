@@ -31,7 +31,19 @@ enum ProxyDnsBootstrapError {
 }
 
 const DNS_RETRY_INTERVAL: Duration = Duration::from_secs(5);
-const DNS_MAX_CONSECUTIVE_FAILURES: u32 = 12;
+const DNS_MAX_RETRY_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Delay before the next reconciliation after `failures` consecutive
+/// failures: the healthy cadence doubled per failure, up to five minutes.
+/// It never stops: a resolver that could not bind at boot (port 53 taken, the
+/// app network not created yet) must come back once the cause is gone, not
+/// stay off until the next restart while cluster DNS reads as enabled.
+fn dns_retry_delay(failures: u32) -> Duration {
+    let doublings = failures.saturating_sub(1).min(16);
+    DNS_RETRY_INTERVAL
+        .saturating_mul(1u32 << doublings)
+        .min(DNS_MAX_RETRY_INTERVAL)
+}
 
 fn publish_dns_gateway(
     slot: &temps_dns::OverlayDnsSlot,
@@ -43,14 +55,79 @@ fn publish_dns_gateway(
     Ok(())
 }
 
+/// Whether cluster DNS is on, given this pass's settings read and the
+/// state the previous pass acted on. A failed read keeps the previous
+/// state: a database hiccup must neither start nor tear down the resolver.
+fn cluster_dns_wanted(read: Option<bool>, previous: bool) -> bool {
+    read.unwrap_or(previous)
+}
+
+/// What the control plane needs to serve `*.temps.local` HTTP calls to its
+/// own containers next to its resolver (ADR-104): the route table it serves
+/// from and where the routes snapshot is kept. `None` in a standalone
+/// `temps proxy`, whose console process deploys the containers and so never
+/// points them at this process's resolver.
+pub(crate) struct LocalRouting {
+    pub peer_table: Arc<temps_proxy::CachedPeerTable>,
+    pub data_dir: std::path::PathBuf,
+    /// Where the deployment DNS publisher points the names when no worker
+    /// can serve them: the gateway, only while the internal proxy serves its
+    /// port 80 (ADR-104 D3). Never set while it does not, so a call to a
+    /// name cannot reach whatever else holds that port.
+    pub names_slot: temps_dns::OverlayDnsSlot,
+}
+
+/// Reload the route table once, so the deployment DNS publisher runs and
+/// points the names at the gateway now served, or withdraws them (ADR-104
+/// D3). In the background: a reload reads the database and must not delay
+/// the resolver loop.
+fn republish_names(
+    peer_table: &Arc<temps_proxy::CachedPeerTable>,
+    served: Option<std::net::IpAddr>,
+) {
+    let peer_table = peer_table.clone();
+    tokio::spawn(async move {
+        if let Err(error) = peer_table.load_routes().await {
+            warn!(
+                error = %error,
+                served_gateway = ?served,
+                "Could not reload routes after the control plane's DNS gateway changed; internal names follow on the next route reload"
+            );
+        }
+    });
+}
+
+/// Runs the control-plane cluster resolver while cluster DNS is enabled.
+///
+/// The setting is read on every pass, so turning it on or off in the
+/// console takes effect within one pass, without restarting `temps serve`.
+/// While it is off the resolver is stopped and the slot is empty, and new
+/// containers keep Docker's embedded DNS.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each input is a distinct process-wide handle the loop owns; a struct would only rename them"
+)]
 pub(crate) fn spawn_control_plane_dns_bootstrap(
     runtime: &tokio::runtime::Handle,
     db: Arc<DbConnection>,
     docker: Arc<bollard::Docker>,
     snapshot_dir: std::path::PathBuf,
     overlay_dns_slot: temps_dns::OverlayDnsSlot,
+    dns_policy: Option<temps_dns::DnsPolicySlot>,
+    config_service: Arc<temps_config::ConfigService>,
+    local_routing: Option<LocalRouting>,
 ) {
     runtime.spawn(async move {
+        let routing_docker = (*docker).clone();
+        // ADR-104: the internal proxy that answers the names this resolver
+        // gives local containers, on the same gateway, while it serves.
+        let mut routing: Option<super::internal_routing::ControlPlaneRouting> = None;
+        // The gateway the names were last published for, so they are
+        // republished only when it changes.
+        let mut published: Option<std::net::IpAddr> = None;
+        // Whether no worker has a bridge; kept as it was when the nodes
+        // cannot be read.
+        let mut single_server = false;
         let docker_runtime = temps_deployer::docker::DockerRuntime::new(
             docker,
             true,
@@ -58,7 +135,71 @@ pub(crate) fn spawn_control_plane_dns_bootstrap(
         );
         let mut active: Option<temps_dns::ControlPlaneResolver> = None;
         let mut failures = 0u32;
+        let mut enabled = false;
+        // ADR-095: node 0 reports its resolver through the same store the
+        // console reads, from this process, which owns the resolver.
+        let mut reporter = {
+            let store = temps_proxy::service::metrics_sampler::build_metrics_store(
+                &config_service,
+                &config_service.get_server_config(),
+                db.clone(),
+            )
+            .await;
+            temps_dns::ControlPlaneDnsReporter::new(Arc::new(
+                temps_dns::DnsObservabilityService::new(db.clone(), store),
+            ))
+        };
+        let mut last_error: Option<String> = None;
         loop {
+            let read = match config_service.get_settings().await {
+                Ok(settings) => Some(settings.cluster_dns.enabled),
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        cluster_dns_enabled = enabled,
+                        "Could not read the cluster DNS setting; keeping the control-plane resolver as it is"
+                    );
+                    None
+                }
+            };
+            let wanted = cluster_dns_wanted(read, enabled);
+            if wanted != enabled {
+                info!(
+                    cluster_dns_enabled = wanted,
+                    "Cluster DNS setting changed; {} the control-plane resolver",
+                    if wanted { "starting" } else { "stopping" }
+                );
+                enabled = wanted;
+            }
+            if !enabled {
+                last_error = None;
+            }
+            let routing_report = routing
+                .as_ref()
+                .and_then(|_| super::internal_routing::ControlPlaneRouting::report());
+            reporter
+                .maybe_report(active.as_ref(), last_error.as_deref(), routing_report)
+                .await;
+            if !enabled {
+                if let Err(error) = publish_dns_gateway(&overlay_dns_slot, None) {
+                    warn!(error = %error, "Could not clear the cluster DNS slot");
+                }
+                if let Some(running) = routing.take() {
+                    running.stop().await;
+                }
+                if let Some(resolver) = active.take() {
+                    resolver.shutdown().await;
+                }
+                if published.take().is_some() {
+                    if let Some(local) = local_routing.as_ref() {
+                        let _ = publish_dns_gateway(&local.names_slot, None);
+                        republish_names(&local.peer_table, None);
+                    }
+                }
+                failures = 0;
+                tokio::time::sleep(DNS_RETRY_INTERVAL).await;
+                continue;
+            }
             // Only cancellable Docker operations are timed out. Once DNS has
             // bound port 53, its handle must be explicitly shut down.
             let gateway = tokio::time::timeout(Duration::from_secs(10), async {
@@ -71,6 +212,7 @@ pub(crate) fn spawn_control_plane_dns_bootstrap(
             .await
             .unwrap_or(Err(ProxyDnsBootstrapError::NetworkTimeout));
 
+            let served = gateway.as_ref().ok().copied();
             let attempt = match gateway {
                 Ok(gateway) => {
                     let healthy = if active.as_ref().is_some_and(|resolver| resolver.gateway() == gateway) {
@@ -88,7 +230,8 @@ pub(crate) fn spawn_control_plane_dns_bootstrap(
                         match cleared {
                             Err(error) => Err(error),
                             Ok(()) => match temps_dns::start_control_plane_resolver(
-                                db.clone(), gateway, snapshot_dir.clone(),
+                                db.clone(), gateway, snapshot_dir.clone(), dns_policy.clone(),
+                                Some(reporter.observer()),
                             ).await {
                                 Some(resolver) => {
                                     active = Some(resolver);
@@ -101,6 +244,53 @@ pub(crate) fn spawn_control_plane_dns_bootstrap(
                 }
                 Err(error) => Err(error),
             };
+            last_error = attempt.as_ref().err().map(ToString::to_string);
+            let now_served = attempt.as_ref().ok().and(served);
+            // The proxy follows the resolver: same gateway, and only while it
+            // answers there and no worker has a bridge, which is when the
+            // names point here (ADR-104 D1). With workers it stays off, so it
+            // never competes for the redirect table with an agent that runs
+            // on this host.
+            if local_routing.is_some() && now_served.is_some() {
+                match temps_dns::services::deployment_publisher::worker_bridge_gateways(db.as_ref()).await {
+                    Ok(bridges) => single_server = bridges.is_empty(),
+                    Err(error) => warn!(
+                        error = %error,
+                        single_server,
+                        "Could not list worker nodes; the control plane's internal routing stays as it is"
+                    ),
+                }
+            }
+            let route_on = now_served.filter(|_| single_server);
+            let names_on = route_on.filter(|gateway| {
+                routing.as_ref().is_some_and(|running| running.gateway() == *gateway)
+                    && temps_node_agent::internal_routing::current_status().is_some_and(|status| {
+                        status.listening && status.address.ip() == *gateway
+                    })
+            });
+            if routing.as_ref().map(|r| r.gateway()) != route_on {
+                if let Some(running) = routing.take() {
+                    running.stop().await;
+                }
+                if let (Some(gateway), Some(local)) = (route_on, local_routing.as_ref()) {
+                    routing = Some(super::internal_routing::ControlPlaneRouting::start(
+                        gateway,
+                        local.peer_table.clone(),
+                        db.clone(),
+                        routing_docker.clone(),
+                        &local.data_dir,
+                    ));
+                }
+            }
+            if published != names_on {
+                published = names_on;
+                if let Some(local) = local_routing.as_ref() {
+                    if let Err(error) = publish_dns_gateway(&local.names_slot, names_on) {
+                        warn!(error = %error, "Could not update the control plane's internal names slot");
+                    }
+                    republish_names(&local.peer_table, names_on);
+                }
+            }
             match attempt {
                 Ok(()) => failures = 0,
                 Err(error) => {
@@ -108,15 +298,21 @@ pub(crate) fn spawn_control_plane_dns_bootstrap(
                     if let Some(resolver) = active.take() {
                         resolver.shutdown().await;
                     }
-                    failures += 1;
-                    if failures >= DNS_MAX_CONSECUTIVE_FAILURES {
-                        warn!(error = %error, attempts = failures, "Proxy cluster DNS reconciliation stopped after repeated failures");
-                        break;
-                    }
-                    warn!(error = %error, attempts = failures, "Proxy cluster DNS reconciliation failed; retrying");
+                    failures = failures.saturating_add(1);
+                    warn!(
+                        error = %error,
+                        attempts = failures,
+                        retry_in_secs = dns_retry_delay(failures).as_secs(),
+                        "Proxy cluster DNS reconciliation failed; containers keep Docker's embedded DNS until it recovers"
+                    );
                 }
             }
-            tokio::time::sleep(DNS_RETRY_INTERVAL).await;
+            tokio::time::sleep(if failures == 0 {
+                DNS_RETRY_INTERVAL
+            } else {
+                dns_retry_delay(failures)
+            })
+            .await;
         }
     });
 }
@@ -126,10 +322,25 @@ pub(crate) fn spawn_control_plane_dns_bootstrap_with_docker_discovery(
     db: Arc<DbConnection>,
     snapshot_dir: std::path::PathBuf,
     overlay_dns_slot: temps_dns::OverlayDnsSlot,
+    dns_policy: Option<temps_dns::DnsPolicySlot>,
+    config_service: Arc<temps_config::ConfigService>,
+    local_routing: Option<LocalRouting>,
 ) {
     let runtime_handle = runtime.clone();
     runtime.spawn(async move {
-        for attempt in 1..=DNS_MAX_CONSECUTIVE_FAILURES {
+        let mut attempt = 0u32;
+        loop {
+            // A host without Docker must not warn about it while cluster
+            // DNS is off and nothing needs the resolver.
+            let enabled = config_service
+                .get_settings()
+                .await
+                .is_ok_and(|settings| settings.cluster_dns.enabled);
+            if !enabled {
+                tokio::time::sleep(DNS_RETRY_INTERVAL).await;
+                continue;
+            }
+            attempt = attempt.saturating_add(1);
             let docker = tokio::time::timeout(Duration::from_secs(5), async {
                 let docker = bollard::Docker::connect_with_defaults()?;
                 docker.ping().await?;
@@ -144,17 +355,17 @@ pub(crate) fn spawn_control_plane_dns_bootstrap_with_docker_discovery(
                         docker,
                         snapshot_dir,
                         overlay_dns_slot,
+                        dns_policy,
+                        config_service,
+                        local_routing,
                     );
                     return;
                 }
                 Ok(Err(error)) => warn!(error = %error, attempt, "Proxy cluster DNS Docker discovery failed; retrying"),
                 Err(_) => warn!(attempt, "Proxy cluster DNS Docker discovery timed out; retrying"),
             }
-            if attempt < DNS_MAX_CONSECUTIVE_FAILURES {
-                tokio::time::sleep(DNS_RETRY_INTERVAL).await;
-            }
+            tokio::time::sleep(dns_retry_delay(attempt)).await;
         }
-        warn!(attempts = DNS_MAX_CONSECUTIVE_FAILURES, "Proxy cluster DNS Docker discovery stopped after repeated failures");
     });
 }
 
@@ -272,6 +483,8 @@ pub fn start_proxy_server(
     project_ip_gate: Arc<dyn temps_core::ProjectIpGate>,
     request_policy_gate: Arc<dyn temps_core::RequestPolicyGate>,
     overlay_dns_slot: temps_dns::OverlayDnsSlot,
+    internal_names_slot: temps_dns::OverlayDnsSlot,
+    dns_policy: Option<temps_dns::DnsPolicySlot>,
     docker: Option<Arc<bollard::Docker>>,
     local_workloads_enabled: bool,
     console_startup: Arc<temps_core::console_startup::ConsoleStartupState>,
@@ -298,8 +511,8 @@ pub fn start_proxy_server(
 
     // Fetch settings once: we need `preview_domain` for routing AND the full
     // `AppSettings` to decide whether to wire ADR-018 on-demand TLS.
-    let settings = rt.block_on(async {
-        let config_service = temps_config::ConfigService::new(
+    let (settings, config_service) = rt.block_on(async {
+        let config_service = Arc::new(temps_config::ConfigService::new(
             Arc::new(temps_config::ServerConfig::new(
                 address.clone(),
                 database_url.clone(),
@@ -307,19 +520,20 @@ pub fn start_proxy_server(
                 Some(console_address.clone()),
             )?),
             db.clone(),
-        );
+        ));
 
-        match config_service.get_settings().await {
-            Ok(settings) => Ok::<Option<temps_core::AppSettings>, anyhow::Error>(Some(settings)),
+        let settings = match config_service.get_settings().await {
+            Ok(settings) => Some(settings),
             Err(e) => {
                 warn!(
                     "Failed to fetch settings: {}, using defaults (preview_domain 'localhost', \
                      on-demand TLS disabled)",
                     e
                 );
-                Ok(None)
+                None
             }
-        }
+        };
+        Ok::<_, anyhow::Error>((settings, config_service))
     })?;
 
     let preview_domain = Some(
@@ -328,38 +542,48 @@ pub fn start_proxy_server(
             .map(|s| s.preview_domain.clone())
             .unwrap_or_else(|| "localhost".to_string()),
     );
-    let internal_dns_sync_address = match settings.as_ref() {
-        Some(settings) if settings.cluster_dns.enabled => {
-            match rt.block_on(temps_dns::start_proxy_dns_sync_service(db.clone())) {
-                Ok(address) => Some(address.to_string()),
-                Err(error) => {
-                    warn!(error = %error, "Proxy DNS sync service is unavailable; HTTP proxy startup will continue");
-                    None
-                }
-            }
-        }
-        _ => None,
-    };
-    if settings
-        .as_ref()
-        .is_some_and(|settings| settings.cluster_dns.enabled)
+    // Started whatever the cluster DNS setting says, so turning it on later
+    // needs no restart: the relay only forwards the two node DNS paths, and
+    // their handlers authenticate the node before reading anything.
+    let internal_dns_sync_address = match rt
+        .block_on(temps_dns::start_proxy_dns_sync_service(db.clone()))
     {
-        if let Some(docker) = docker {
-            spawn_control_plane_dns_bootstrap(
-                rt.handle(),
-                db.clone(),
-                docker,
-                config.data_dir.join("dns"),
-                overlay_dns_slot.clone(),
-            );
-        } else if local_workloads_enabled {
-            spawn_control_plane_dns_bootstrap_with_docker_discovery(
-                rt.handle(),
-                db.clone(),
-                config.data_dir.join("dns"),
-                overlay_dns_slot.clone(),
-            );
+        Ok(address) => Some(address.to_string()),
+        Err(error) => {
+            warn!(error = %error, "Proxy DNS sync service is unavailable; HTTP proxy startup will continue");
+            None
         }
+    };
+    // The resolver loop follows the setting itself; see
+    // `spawn_control_plane_dns_bootstrap`.
+    // ADR-104: this process deploys the local containers and owns the route
+    // table, so it also answers their `*.temps.local` calls.
+    let local_routing = || LocalRouting {
+        peer_table: route_table.clone(),
+        data_dir: config.data_dir.clone(),
+        names_slot: internal_names_slot.clone(),
+    };
+    if let Some(docker) = docker {
+        spawn_control_plane_dns_bootstrap(
+            rt.handle(),
+            db.clone(),
+            docker,
+            config.data_dir.join("dns"),
+            overlay_dns_slot.clone(),
+            dns_policy.clone(),
+            config_service.clone(),
+            Some(local_routing()),
+        );
+    } else if local_workloads_enabled {
+        spawn_control_plane_dns_bootstrap_with_docker_discovery(
+            rt.handle(),
+            db.clone(),
+            config.data_dir.join("dns"),
+            overlay_dns_slot.clone(),
+            dns_policy.clone(),
+            config_service.clone(),
+            Some(local_routing()),
+        );
     }
 
     // ADR-018 on-demand TLS: build the certificate manager when enabled in
@@ -415,6 +639,8 @@ pub fn start_proxy_server(
         disable_https_redirect,
         on_demand_cert_manager,
         console_startup: Some(console_startup),
+        // Console and proxy share this process, so it samples the host too.
+        host_metrics: true,
     };
 
     info!(
@@ -491,6 +717,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_resolver_follows_the_setting_and_a_failed_read_changes_nothing() {
+        // Turning it on or off in the console reaches the loop.
+        assert!(cluster_dns_wanted(Some(true), false));
+        assert!(!cluster_dns_wanted(Some(false), true));
+        // A failed read keeps whatever the previous pass acted on.
+        assert!(cluster_dns_wanted(None, true));
+        assert!(!cluster_dns_wanted(None, false));
+    }
+
+    #[test]
+    fn dns_reconciliation_backs_off_but_never_gives_up() {
+        assert_eq!(dns_retry_delay(1), Duration::from_secs(5));
+        assert_eq!(dns_retry_delay(2), Duration::from_secs(10));
+        assert_eq!(dns_retry_delay(4), Duration::from_secs(40));
+        assert_eq!(dns_retry_delay(7), Duration::from_secs(300));
+        // Far past the old 12-failure cut-off it still retries, capped.
+        assert_eq!(dns_retry_delay(13), Duration::from_secs(300));
+        assert_eq!(dns_retry_delay(u32::MAX), Duration::from_secs(300));
+    }
+
+    #[test]
     fn unavailable_docker_disables_optional_features_without_failing_startup() {
         let result = optional_docker_feature::<()>(
             Err(anyhow::anyhow!("Docker socket is unavailable")),
@@ -548,6 +795,18 @@ mod tests {
 
     #[async_trait]
     impl ContainerDeployer for MockDeployer {
+        async fn exec_in_container(
+            &self,
+            container_id: &str,
+            _command: Vec<String>,
+            _timeout: std::time::Duration,
+        ) -> Result<temps_deployer::ExecResult, temps_deployer::DeployerError> {
+            Err(temps_deployer::DeployerError::ExecFailed {
+                container_id: container_id.to_string(),
+                reason: "exec is not scripted by this test deployer".to_string(),
+            })
+        }
+
         async fn deploy_container(
             &self,
             _request: DeployRequest,

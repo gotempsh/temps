@@ -31,7 +31,6 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
-import { getErrorMessage } from '@/utils/errorHandling'
 import { DisconnectRepositoryDialog } from './DisconnectRepositoryDialog'
 import { normalizeDirectory } from './repository-import'
 import { useInvalidateGroups } from './useProjectGroups'
@@ -55,8 +54,14 @@ export function GroupRepositoryPanel({
   const repo = group.repository
   const invalidate = useInvalidateGroups()
   const [confirmDisconnect, setConfirmDisconnect] = useState(false)
-  const reapply = useMutation({ ...setGroupRepositoryMutation() })
-  const follow = useMutation({ ...setRepositoryInheritanceMutation() })
+  const reapply = useMutation({
+    ...setGroupRepositoryMutation(),
+    meta: { errorTitle: 'Could not apply the repository again' },
+  })
+  const follow = useMutation({
+    ...setRepositoryInheritanceMutation(),
+    meta: { errorTitle: 'Could not update the service' },
+  })
 
   if (!repo) {
     return (
@@ -122,8 +127,8 @@ export function GroupRepositoryPanel({
           `Every service now follows ${repoLabel}@${repo.main_branch}`
         )
       }
-    } catch (err) {
-      toast.error(getErrorMessage(err, 'Could not apply the repository again'))
+    } catch {
+      // The app-wide mutation handler already toasts this failure.
     }
   }
 
@@ -142,8 +147,8 @@ export function GroupRepositoryPanel({
           ? `${service.name} now follows ${repoLabel}@${repo.main_branch}`
           : `${service.name} keeps its settings and no longer follows the project's repository`
       )
-    } catch (err) {
-      toast.error(getErrorMessage(err, `Could not update ${service.name}`))
+    } catch {
+      // The app-wide mutation handler already toasts this failure.
     }
   }
 

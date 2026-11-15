@@ -64,11 +64,15 @@ impl TempsPlugin for AuthPlugin {
                 context.require_service::<dyn temps_core::notifications::NotificationService>();
 
             // Create AuthService
-            let auth_service = Arc::new(AuthService::new(db.clone(), notification_service.clone()));
+            let auth_service = Arc::new(AuthService::new(
+                db.clone(),
+                notification_service.clone(),
+                encryption_service.clone(),
+            ));
             context.register_service(auth_service);
 
             // Create UserService
-            let user_service = Arc::new(UserService::new(db.clone()));
+            let user_service = Arc::new(UserService::new(db.clone(), encryption_service.clone()));
             context.register_service(user_service.clone());
 
             let sensitive_action_authorizer: Arc<dyn temps_core::SensitiveActionAuthorizer> =

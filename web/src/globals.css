@@ -14,6 +14,10 @@
 @custom-variant dark (&:is(.dark *));
 
 :root {
+  /* Native controls and scrollbars follow the console's theme, not the OS:
+     index.html declares `light dark` so the browser never recolours the page,
+     and these rules pick the one that matches the active theme class. */
+  color-scheme: light;
   /* Vercel-inspired light palette (Geist design system) */
   /* Main background is pure white, cards sit on subtle gray-50 */
   --background: oklch(1 0 0); /* #ffffff — geist background */
@@ -47,9 +51,7 @@
   /* #0f813d. White text on the previous, brighter green (#0da34d) measured
      3.16:1, below the 4.5:1 WCAG 1.4.3 floor for badges and buttons; this
      reaches 4.74:1 and, used as text on white, 4.95:1. */
-  --success: oklch(
-    0.53 0.14 150.31
-  ); /* green — solid fill paired with white text */
+  --success: oklch(0.53 0.14 150.31); /* green — solid fill paired with white text */
   --success-foreground: oklch(0.985 0 0);
   /* Green *text* on light surfaces. --success is a fill colour: as text it
      falls short of 4.5:1 (WCAG 1.4.3), and Tailwind's green-700 on a green
@@ -115,6 +117,7 @@
 }
 
 .dark {
+  color-scheme: dark;
   /* Vercel-inspired dark palette (Geist design system) */
   /* background-0 (#0a0a0a), background-100 (#0a0a0a), background-200 (#000) */
   --background: oklch(0.145 0 0); /* #0a0a0a — geist background */
@@ -146,9 +149,7 @@
      dark foreground reads well on both. */
   /* Bright green fill: white text on it is 3.16:1, so the foreground is the
      near-black used by --warning-foreground (6.0:1). */
-  --success: oklch(
-    0.627 0.1684 150.31
-  ); /* green — solid fill paired with dark text */
+  --success: oklch(0.627 0.1684 150.31); /* green — solid fill paired with dark text */
   --success-foreground: oklch(0.145 0 0);
   /* Green text on dark surfaces: ~9.9:1 on the card colour. */
   --success-strong: oklch(0.79 0.17 150);
@@ -538,10 +539,82 @@ body {
   animation: ai-activity-shimmer 1.4s linear infinite;
 }
 
+/* The assistant's work trace: a step slides in as it is taken, the summary
+   fades in as the work settles, and the sparkle breathes while it works. */
+@keyframes ai-trace-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+}
+
+@keyframes ai-trace-fade {
+  from {
+    opacity: 0;
+  }
+}
+
+@keyframes ai-trace-sparkle {
+  50% {
+    opacity: 0.45;
+    transform: scale(0.82) rotate(45deg);
+  }
+}
+
+.ai-trace-row {
+  animation: ai-trace-in 320ms cubic-bezier(0.23, 1, 0.32, 1) both;
+}
+
+.ai-trace-fade {
+  animation: ai-trace-fade 350ms ease-out both;
+}
+
+.ai-trace-sparkle {
+  animation: ai-trace-sparkle 1.6s ease-in-out infinite;
+}
+
+/* First-paint screen (InitialLoadScreen): the mark breathes and a segment
+   sweeps across the track. The reduced-motion block below swaps the sweep for
+   a slow full-bar fade, since a motionless bar looks like a hung load. */
+@keyframes initial-load-slide {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(300%);
+  }
+}
+
+@keyframes initial-load-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+
+.initial-load-mark {
+  animation: initial-load-pulse 1.6s ease-in-out infinite;
+}
+
+.initial-load-bar {
+  animation: initial-load-slide 1.2s ease-in-out infinite;
+}
+
 @media (prefers-reduced-motion: reduce) {
+  .initial-load-bar {
+    width: 100%;
+    animation: initial-load-pulse 2s ease-in-out infinite;
+  }
+
   .log-fresh-line,
   .ai-activity-pixel,
-  .ai-activity-shimmer {
+  .ai-activity-shimmer,
+  .ai-trace-row,
+  .ai-trace-fade,
+  .ai-trace-sparkle {
     animation: none;
   }
 }
@@ -581,6 +654,15 @@ body {
   text-align: right;
   color: color-mix(in oklch, var(--muted-foreground) 40%, transparent);
   user-select: none;
+}
+
+/* Settled chat transcript rows: the browser skips layout and paint for the ones
+   scrolled out of view, so a very long conversation costs about what its visible
+   screenful costs. `auto` remembers each row's real height once it has rendered,
+   so the scrollbar does not jump as rows come into view. */
+.chat-transcript-row {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 96px;
 }
 
 /* Radix renders an aria-hidden, transparent checkbox beside every Switch,

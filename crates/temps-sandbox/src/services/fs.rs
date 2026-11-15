@@ -105,21 +105,22 @@ pub struct BatchWriteEntry {
 /// Map a provider error from a filesystem operation. Errors that already
 /// carry a precise meaning keep it — a rejected request (400, e.g. a file
 /// over a worker node's read limit), a feature a worker node can't serve
-/// (422), an unreachable node (503), a missing container (404) — and
+/// (422), an unreachable node (503), a VM that is not running (409) — and
 /// everything else is a failed file operation naming the path.
 fn file_op_err(
     public_id: &str,
     op: &str,
     path: impl Into<String>,
-    err: temps_agents::error::AgentError,
+    err: temps_agent_core::error::AgentError,
 ) -> SandboxError {
-    use temps_agents::error::AgentError;
+    use temps_agent_core::error::AgentError;
     match err {
         AgentError::Validation { .. }
         | AgentError::SandboxUnsupportedOnNode { .. }
         | AgentError::SandboxNodeUnavailable { .. }
         | AgentError::SandboxProviderUnavailable { .. }
-        | AgentError::SandboxNotFound { .. } => crate::error::from_agent_error(public_id, err),
+        | AgentError::SandboxNotFound { .. }
+        | AgentError::SandboxNotRunning { .. } => crate::error::from_agent_error(public_id, err),
         other => SandboxError::FileOp {
             sandbox_id: public_id.to_string(),
             op: op.to_string(),
@@ -139,16 +140,39 @@ impl SandboxService {
     ) -> Result<Vec<u8>, SandboxError> {
         validate_absolute(path, "read")?;
         let (row, internal_id) = self.resolve_id(public_id, user_id).await?;
+        let handle = self.live_handle(&row).await?;
+        // Only a sandbox that is really running counts as activity: a dead
+        // VM must not have its idle deadline pushed out by every attempt.
         self.touch(internal_id, row.timeout_secs).await;
-        let handle = self
-            .registry()
-            .get(internal_id, public_id)
-            .await
-            .map_err(|e| Self::provider_err(public_id, e))?;
         let bytes = self
             .registry()
             .provider()
             .read_file(&handle, path)
+            .await
+            .map_err(|e| file_op_err(public_id, "read", path.to_string(), e))?;
+        Ok(bytes)
+    }
+
+    /// [`fs_read`](Self::fs_read), refusing a file larger than `max_bytes`
+    /// with [`SandboxError::Validation`] naming the sandbox, path and limit.
+    /// Providers that can stop early (Docker, microsandbox) never buffer more
+    /// than about `max_bytes`, so callers that only need a bounded amount of
+    /// a file, or must cap their memory, use this instead of `fs_read`.
+    pub async fn fs_read_bounded(
+        &self,
+        public_id: &str,
+        user_id: i32,
+        path: &str,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, SandboxError> {
+        validate_absolute(path, "read")?;
+        let (row, internal_id) = self.resolve_id(public_id, user_id).await?;
+        let handle = self.live_handle(&row).await?;
+        self.touch(internal_id, row.timeout_secs).await;
+        let bytes = self
+            .registry()
+            .provider()
+            .read_file_bounded(&handle, path, max_bytes)
             .await
             .map_err(|e| file_op_err(public_id, "read", path.to_string(), e))?;
         Ok(bytes)
@@ -167,12 +191,10 @@ impl SandboxService {
     ) -> Result<(), SandboxError> {
         validate_absolute(path, "write")?;
         let (row, internal_id) = self.resolve_id(public_id, user_id).await?;
+        let handle = self.live_handle(&row).await?;
+        // Only a sandbox that is really running counts as activity: a dead
+        // VM must not have its idle deadline pushed out by every attempt.
         self.touch(internal_id, row.timeout_secs).await;
-        let handle = self
-            .registry()
-            .get(internal_id, public_id)
-            .await
-            .map_err(|e| Self::provider_err(public_id, e))?;
         self.registry()
             .provider()
             .write_file(&handle, path, contents, mode)
@@ -191,12 +213,10 @@ impl SandboxService {
     ) -> Result<StatInfo, SandboxError> {
         validate_absolute(path, "stat")?;
         let (row, internal_id) = self.resolve_id(public_id, user_id).await?;
+        let handle = self.live_handle(&row).await?;
+        // Only a sandbox that is really running counts as activity: a dead
+        // VM must not have its idle deadline pushed out by every attempt.
         self.touch(internal_id, row.timeout_secs).await;
-        let handle = self
-            .registry()
-            .get(internal_id, public_id)
-            .await
-            .map_err(|e| Self::provider_err(public_id, e))?;
 
         // `test -e && stat -c '%F %s' <path>` → prints "regular file 42"
         // / "directory 4096" / ... on success, exits non-zero on missing.
@@ -279,12 +299,10 @@ impl SandboxService {
         validate_absolute(path, "list")?;
         let (page, page_size) = list_page_bounds(page, page_size);
         let (row, internal_id) = self.resolve_id(public_id, user_id).await?;
+        let handle = self.live_handle(&row).await?;
+        // Only a sandbox that is really running counts as activity: a dead
+        // VM must not have its idle deadline pushed out by every attempt.
         self.touch(internal_id, row.timeout_secs).await;
-        let handle = self
-            .registry()
-            .get(internal_id, public_id)
-            .await
-            .map_err(|e| Self::provider_err(public_id, e))?;
 
         let cmd = vec![
             "sh".into(),
@@ -346,12 +364,10 @@ impl SandboxService {
             return Ok(0);
         }
         let (row, internal_id) = self.resolve_id(public_id, user_id).await?;
+        let handle = self.live_handle(&row).await?;
+        // Only a sandbox that is really running counts as activity: a dead
+        // VM must not have its idle deadline pushed out by every attempt.
         self.touch(internal_id, row.timeout_secs).await;
-        let handle = self
-            .registry()
-            .get(internal_id, public_id)
-            .await
-            .map_err(|e| Self::provider_err(public_id, e))?;
 
         let mut written = 0usize;
         for entry in files {
@@ -376,12 +392,10 @@ impl SandboxService {
     ) -> Result<(), SandboxError> {
         validate_absolute(path, "mkdir")?;
         let (row, internal_id) = self.resolve_id(public_id, user_id).await?;
+        let handle = self.live_handle(&row).await?;
+        // Only a sandbox that is really running counts as activity: a dead
+        // VM must not have its idle deadline pushed out by every attempt.
         self.touch(internal_id, row.timeout_secs).await;
-        let handle = self
-            .registry()
-            .get(internal_id, public_id)
-            .await
-            .map_err(|e| Self::provider_err(public_id, e))?;
         let cmd = vec!["mkdir".into(), "-p".into(), path.to_string()];
         let result = self
             .registry()
@@ -636,7 +650,7 @@ fn shell_quote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use temps_agents::error::AgentError;
+    use temps_agent_core::error::AgentError;
 
     #[test]
     fn file_op_errors_keep_precise_provider_meanings() {
@@ -672,7 +686,24 @@ mod tests {
                 sandbox: "temps-sandbox-1".into(),
             },
         );
-        assert!(matches!(err, SandboxError::NotFound { .. }), "{err:?}");
+        assert!(matches!(err, SandboxError::VmNotRunning { .. }), "{err:?}");
+
+        let err = file_op_err(
+            "sbx_1",
+            "read",
+            "/a",
+            AgentError::SandboxNotRunning {
+                run_id: 0,
+                sandbox_id: "sbx_1".into(),
+                container: "temps-sandbox-1".into(),
+                backend: "firecracker".into(),
+                reason: "its firecracker process exited".into(),
+            },
+        );
+        assert!(
+            matches!(&err, SandboxError::VmNotRunning { backend: Some(b), .. } if b == "firecracker"),
+            "{err:?}"
+        );
     }
 
     #[test]

@@ -9,6 +9,7 @@ import {
   updateSelfMutation,
   verifyAndEnableMfaMutation,
 } from '@/api/client/@tanstack/react-query.gen'
+import { SignOutOfAppsCard } from '@/components/account/SignOutOfAppsCard'
 import { Button } from '@/components/ui/button'
 import {
   Card,
@@ -45,6 +46,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Check, Circle, Loader2, X } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
+import { SaveRow } from '@temps-sdk/ds'
 import { toast } from 'sonner'
 import { z } from 'zod'
 import { MfaSetupResponse } from '@/api/client'
@@ -98,8 +100,15 @@ const mfaVerifySchema = z.object({
 
 type MfaVerifyValues = z.infer<typeof mfaVerifySchema>
 
+// Disabling MFA accepts a recovery code too: someone who lost their
+// authenticator must be able to turn MFA off with one. Current recovery
+// codes are `XXXXX-XXXXX`; codes issued by older versions are 6 digits.
 const mfaDisableSchema = z.object({
-  code: z.string().length(6, 'Code must be 6 digits'),
+  code: z
+    .string()
+    .trim()
+    .min(6, 'Enter a 6-digit code or a recovery code')
+    .max(32, 'Enter a 6-digit code or a recovery code'),
 })
 
 type MfaDisableValues = z.infer<typeof mfaDisableSchema>
@@ -150,6 +159,8 @@ export function Account() {
     },
     onSuccess: () => {
       toast.success('Account updated successfully')
+      // What was sent is now what is saved, so Save goes quiet again.
+      form.reset(form.getValues())
       refetch()
     },
     onError: (error, variables) => {
@@ -317,7 +328,7 @@ export function Account() {
       {verificationDialog}
       <Card>
         <CardHeader>
-          <CardTitle>Account Settings</CardTitle>
+          <CardTitle>Account settings</CardTitle>
           <CardDescription>Manage your account information</CardDescription>
         </CardHeader>
         <CardContent>
@@ -368,14 +379,7 @@ export function Account() {
                   </div>
                 </div>
               )}
-              <div className="flex justify-end">
-                <Button type="submit" disabled={isPending}>
-                  {isPending && (
-                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                  )}
-                  Save Changes
-                </Button>
-              </div>
+              <SaveRow dirty={form.formState.isDirty} saving={isPending} />
             </form>
           </Form>
         </CardContent>
@@ -383,7 +387,7 @@ export function Account() {
 
       <Card>
         <CardHeader>
-          <CardTitle>Change Password</CardTitle>
+          <CardTitle>Change password</CardTitle>
           <CardDescription>
             Update your account password. You&apos;ll need your current password
             to confirm the change.
@@ -542,7 +546,7 @@ export function Account() {
 
       <Card>
         <CardHeader>
-          <CardTitle>Two-Factor Authentication</CardTitle>
+          <CardTitle>Two-factor authentication</CardTitle>
           <CardDescription>
             Add an extra layer of security to your account by enabling
             two-factor authentication
@@ -576,11 +580,13 @@ export function Account() {
               {isSettingUpMfa && (
                 <Loader2 className="mr-2 h-4 w-4 animate-spin" />
               )}
-              Setup 2FA
+              Set up 2FA
             </Button>
           )}
         </CardContent>
       </Card>
+
+      <SignOutOfAppsCard />
 
       {/* Current-password confirmation before generating a new MFA secret.
           SSO-only accounts (no local password) may leave the field empty;
@@ -594,7 +600,7 @@ export function Account() {
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Confirm Identity to Setup 2FA</DialogTitle>
+            <DialogTitle>Confirm identity to setup 2FA</DialogTitle>
             <DialogDescription>
               Enter your current password to begin two-factor authentication
               setup. If your account uses SSO and has no local password, leave
@@ -611,7 +617,7 @@ export function Account() {
                 name="current_password"
                 render={({ field }) => (
                   <FormItem>
-                    <FormLabel>Current Password</FormLabel>
+                    <FormLabel>Current password</FormLabel>
                     <FormControl>
                       <Input
                         {...field}
@@ -650,7 +656,7 @@ export function Account() {
       <Dialog open={showMfaDialog} onOpenChange={setShowMfaDialog}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Setup Two-Factor Authentication</DialogTitle>
+            <DialogTitle>Set up two-factor authentication</DialogTitle>
             <DialogDescription>
               Scan the QR code with your authenticator app and enter the
               verification code below.
@@ -720,7 +726,7 @@ export function Account() {
                     {isVerifyingMfa && (
                       <Loader2 className="mr-2 h-4 w-4 animate-spin" />
                     )}
-                    Verify and Enable
+                    Verify and enable
                   </Button>
                 </div>
               </form>
@@ -735,9 +741,10 @@ export function Account() {
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Disable Two-Factor Authentication</DialogTitle>
+            <DialogTitle>Disable two-factor authentication</DialogTitle>
             <DialogDescription>
-              Please enter your 2FA code to confirm disabling two-factor
+              Enter a code from your authenticator app, or one of your
+              recovery codes, to confirm disabling two-factor
               authentication. This will make your account less secure.
             </DialogDescription>
           </DialogHeader>
@@ -753,7 +760,14 @@ export function Account() {
                   <FormItem>
                     <FormLabel>Verification Code</FormLabel>
                     <FormControl>
-                      <Input {...field} placeholder="Enter 6-digit code" />
+                      <Input
+                        {...field}
+                        placeholder="6-digit code or recovery code"
+                        maxLength={32}
+                        autoCapitalize="characters"
+                        autoComplete="one-time-code"
+                        spellCheck={false}
+                      />
                     </FormControl>
                     <FormMessage />
                   </FormItem>

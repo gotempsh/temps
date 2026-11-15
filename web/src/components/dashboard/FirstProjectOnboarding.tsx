@@ -29,6 +29,7 @@ import {
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { CopyButton } from '@/components/ui/copy-button'
+import { ScrollRegion } from '@/components/ui/scroll-region'
 import { HighlightedCode } from '@/components/ui/code-block'
 
 /** First-run service collection: choose a task before configuring its inputs. */
@@ -149,11 +150,16 @@ export function FirstProjectOnboarding() {
                         : '2. Deploy your service'}
                     </p>
                     <div className="flex min-w-0 items-center gap-2 rounded-md border bg-muted/50 p-2 pl-3">
-                      <HighlightedCode
-                        code={command}
-                        language="bash"
-                        className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap text-sm"
-                      />
+                      <ScrollRegion
+                        className="min-w-0 flex-1"
+                        regionLabel={`Command ${index + 1}, scrollable`}
+                      >
+                        <HighlightedCode
+                          code={command}
+                          language="bash"
+                          className="block w-max whitespace-nowrap text-sm"
+                        />
+                      </ScrollRegion>
                       <CopyButton
                         value={command}
                         minimal

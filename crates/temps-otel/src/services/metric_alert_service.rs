@@ -273,7 +273,9 @@ impl MetricAlertService {
             .order_by_desc(Column::CreatedAt)
             .paginate(self.db.as_ref(), page_size);
         let total = paginator.num_items().await?;
-        let items = paginator.fetch_page(page - 1).await?;
+        let items = paginator
+            .fetch_page(temps_core::config::page_index(page))
+            .await?;
         Ok((items, total))
     }
 
@@ -664,7 +666,7 @@ mod tests {
     /// and reports a missing project as not found.
     #[tokio::test]
     async fn create_persists_and_stops_at_the_per_project_limit() {
-        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+        use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error) if is_container_runtime_unavailable(&error.to_string()) => {

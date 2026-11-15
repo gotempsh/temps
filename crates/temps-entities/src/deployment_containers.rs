@@ -17,7 +17,10 @@ pub struct Model {
     pub deployment_id: i32,
     pub container_id: String,
     pub container_name: String,
-    pub container_port: i32,
+    pub container_port: Option<i32>,
+    pub health_state: String,
+    pub health_checked_at: Option<DBDateTime>,
+    pub health_detail: Option<String>,
     pub host_port: Option<i32>,
     pub image_name: Option<String>,
     pub status: Option<String>,
@@ -84,7 +87,7 @@ impl Model {
                 .find(|binding| binding.container_port == container_port)
                 .map(|binding| binding.host_port);
         }
-        (self.container_port == container_port)
+        (self.container_port == Some(container_port))
             .then_some(self.host_port)
             .flatten()
     }
@@ -92,7 +95,7 @@ impl Model {
     /// Whether the container exposes `container_port`, either as its primary
     /// target or as one of its published bindings.
     pub fn exposes_port(&self, container_port: i32) -> bool {
-        self.container_port == container_port
+        self.container_port == Some(container_port)
             || self.port_bindings.as_ref().is_some_and(|bindings| {
                 bindings
                     .0

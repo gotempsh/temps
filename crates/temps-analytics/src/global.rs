@@ -15,6 +15,10 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use utoipa::{IntoParams, ToSchema};
 
+use crate::datacenter::{
+    hosting_traffic_counted_unless_opted_out, projects_counting_datacenter_traffic,
+};
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, ToSchema, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum AnalyticsFacet {
@@ -94,7 +98,17 @@ impl GlobalAnalyticsService {
         q: &GlobalAnalyticsQuery,
         hidden: &[i32],
     ) -> Result<GlobalAnalyticsResponse, GlobalAnalyticsError> {
-        let (cte, mut values, order) = build_query(q, hidden)?;
+        // Every check, the allowlists included, runs before the Speed facet's
+        // opt-out read: an invalid request is a 400 without touching the
+        // database, even when the database is down.
+        let built = build_query(q, hidden, &[])?;
+        let (cte, mut values, order) = if q.facet.unwrap_or_default() == AnalyticsFacet::Speed {
+            let datacenter_opt_outs =
+                projects_counting_datacenter_traffic(self.db.as_ref()).await?;
+            build_query(q, hidden, &datacenter_opt_outs)?
+        } else {
+            built
+        };
         #[derive(FromQueryResult)]
         struct Total {
             total: i64,
@@ -167,9 +181,12 @@ pub fn validate(q: &GlobalAnalyticsQuery) -> Result<(), GlobalAnalyticsError> {
     }
     Ok(())
 }
+/// `datacenter_opt_outs` are the projects that count datacenter traffic; only
+/// the Speed facet reads them (as `$10`).
 fn build_query(
     q: &GlobalAnalyticsQuery,
     hidden: &[i32],
+    datacenter_opt_outs: &[i32],
 ) -> Result<(String, Vec<Value>, String), GlobalAnalyticsError> {
     validate(q)?;
     let facet = q.facet.unwrap_or_default();
@@ -214,10 +231,10 @@ fn build_query(
         "GROUP BY 1"
     };
     let event_filter=match facet {
-        AnalyticsFacet::Events=>"COALESCE(e.event_name,e.event_type) NOT IN ('page_view','page_leave','heartbeat') AND e.event_name IS NOT NULL",
-        AnalyticsFacet::Speed=>"COALESCE(g.is_hosting_provider, false) = false AND (e.lcp IS NOT NULL OR e.inp IS NOT NULL OR e.cls IS NOT NULL OR e.ttfb IS NOT NULL OR e.fcp IS NOT NULL)",
-        AnalyticsFacet::Pages=>"e.event_type='page_view' AND e.page_path<>''",
-        _=>"e.event_type='page_view'",
+        AnalyticsFacet::Events=>"COALESCE(e.event_name,e.event_type) NOT IN ('page_view','page_leave','heartbeat') AND e.event_name IS NOT NULL".to_string(),
+        AnalyticsFacet::Speed=>format!("{} AND (e.lcp IS NOT NULL OR e.inp IS NOT NULL OR e.cls IS NOT NULL OR e.ttfb IS NOT NULL OR e.fcp IS NOT NULL)", hosting_traffic_counted_unless_opted_out("g", "e.project_id", "$10")),
+        AnalyticsFacet::Pages=>"e.event_type='page_view' AND e.page_path<>''".to_string(),
+        _=>"e.event_type='page_view'".to_string(),
     };
     let vitals = if facet == AnalyticsFacet::Speed {
         ["lcp", "inp", "cls", "ttfb", "fcp"]
@@ -314,21 +331,21 @@ fn build_query(
     ), filtered AS (SELECT key,project_id,name AS project_name,views,sessions,visitors,avg_time_seconds,bounce_rate,lcp_p75,inp_p75,cls_p75,ttfb_p75,fcp_p75 FROM grouped
        WHERE ($7::text='' OR strpos(lower(key),lower($7))>0 OR strpos(lower(name),lower($7))>0)
          AND views >= $8 AND sessions >= $9)");
-    Ok((
-        sql,
-        vec![
-            q.start_date.into(),
-            q.end_date.into(),
-            q.project_id.into(),
-            q.environment_id.into(),
-            hidden.to_vec().into(),
-            q.device.clone().into(),
-            q.search.clone().unwrap_or_default().into(),
-            (q.min_views.unwrap_or(0) as i64).into(),
-            (q.min_sessions.unwrap_or(0) as i64).into(),
-        ],
-        order,
-    ))
+    let mut values: Vec<Value> = vec![
+        q.start_date.into(),
+        q.end_date.into(),
+        q.project_id.into(),
+        q.environment_id.into(),
+        hidden.to_vec().into(),
+        q.device.clone().into(),
+        q.search.clone().unwrap_or_default().into(),
+        (q.min_views.unwrap_or(0) as i64).into(),
+        (q.min_sessions.unwrap_or(0) as i64).into(),
+    ];
+    if facet == AnalyticsFacet::Speed {
+        values.push(datacenter_opt_outs.to_vec().into());
+    }
+    Ok((sql, values, order))
 }
 
 #[cfg(test)]
@@ -342,22 +359,63 @@ mod tests {
     fn rejects_unbounded_and_injected_queries() {
         let mut q = query();
         q.per_page = Some(101);
-        assert!(build_query(&q, &[]).is_err());
+        assert!(build_query(&q, &[], &[]).is_err());
         q = query();
         q.sort_by = Some("views; DROP TABLE events".into());
-        assert!(build_query(&q, &[]).is_err());
+        assert!(build_query(&q, &[], &[]).is_err());
         q = query();
         q.dimension = Some("untrusted".into());
-        assert!(build_query(&q, &[]).is_err());
+        assert!(build_query(&q, &[], &[]).is_err());
         q = query();
         q.environment_id = Some(1);
         assert!(validate(&q).is_err());
         q = query();
         q.search = Some("%' OR true --".into());
-        let (sql, values, _) = build_query(&q, &[9]).unwrap();
+        let (sql, values, _) = build_query(&q, &[9], &[]).unwrap();
         assert!(!sql.contains("OR true"));
         assert_eq!(values.len(), 9);
     }
+    #[tokio::test]
+    async fn an_invalid_speed_query_is_rejected_before_any_database_read() {
+        // No results queued: any statement the service issued would fail with
+        // a database error instead of the validation error.
+        let db = sea_orm::MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let service = GlobalAnalyticsService::new(Arc::new(db));
+        for invalid in ["sort_by", "sort_order", "dimension"] {
+            let mut q = query();
+            q.facet = Some(AnalyticsFacet::Speed);
+            match invalid {
+                "sort_by" => q.sort_by = Some("views; DROP TABLE events".into()),
+                "sort_order" => q.sort_order = Some("sideways".into()),
+                _ => q.dimension = Some("untrusted".into()),
+            }
+            let err = service
+                .query(&q, &[])
+                .await
+                .expect_err("an invalid query must be refused");
+            assert!(
+                matches!(err, GlobalAnalyticsError::InvalidQuery { .. }),
+                "{invalid}: expected InvalidQuery, got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn speed_binds_the_datacenter_opt_outs_instead_of_a_per_row_lookup() {
+        let mut q = query();
+        q.facet = Some(AnalyticsFacet::Speed);
+        let (sql, values, _) = build_query(&q, &[], &[4, 7]).unwrap();
+        assert_eq!(values.len(), 10);
+        assert!(sql.contains("e.project_id = ANY($10::int[])"), "{sql}");
+        // A per-row settings lookup loses the parallel plan (see datacenter.rs).
+        assert!(!sql.contains("project_analytics_settings"), "{sql}");
+
+        q.facet = Some(AnalyticsFacet::Pages);
+        let (sql, values, _) = build_query(&q, &[], &[4, 7]).unwrap();
+        assert_eq!(values.len(), 9, "only the Speed facet reads $10");
+        assert!(!sql.contains("$10"));
+    }
+
     #[tokio::test]
     async fn global_speed_excludes_hosting_providers_before_counts_and_percentiles() {
         let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
@@ -370,6 +428,7 @@ mod tests {
         db.execute_unprepared(r#"
             CREATE TEMP TABLE projects(id int, name text, is_deleted bool DEFAULT false);
             CREATE TEMP TABLE ip_geolocations(id int, is_hosting_provider bool);
+            CREATE TEMP TABLE project_analytics_settings(project_id int, exclude_datacenter_traffic bool);
             CREATE TEMP TABLE performance_metrics(project_id int, environment_id int, recorded_at timestamptz,
                 is_crawler bool, ip_address_id int, session_id int, visitor_id int, device_type text,
                 lcp real, inp real, cls real, ttfb real, fcp real);
@@ -385,7 +444,8 @@ mod tests {
                 (1,10,'2026-01-01T01:00:00Z',true,2,200,200,'desktop',9999,9999,9999,9999,9999),
                 (2,20,'2026-01-01T01:00:00Z',false,2,1,1,'desktop',500,500,500,500,500);
         "#).await.unwrap();
-        let service = GlobalAnalyticsService::new(Arc::new(db));
+        let db = Arc::new(db);
+        let service = GlobalAnalyticsService::new(db.clone());
         let mut q = query();
         q.facet = Some(AnalyticsFacet::Speed);
         let result = service.query(&q, &[2]).await.unwrap();
@@ -414,6 +474,18 @@ mod tests {
         assert_eq!(service.query(&q, &[]).await.unwrap().total_views, 3);
         q.environment_id = Some(20);
         assert_eq!(service.query(&q, &[]).await.unwrap().total, 0);
+
+        // A project that opted out of datacenter exclusion counts its
+        // hosting-provider samples here too, not only in ingest-flag views.
+        db.execute_unprepared("INSERT INTO project_analytics_settings VALUES (1, false)")
+            .await
+            .unwrap();
+        q.environment_id = Some(10);
+        assert_eq!(
+            service.query(&q, &[]).await.unwrap().total_views,
+            103,
+            "hosting samples count once the project opts out"
+        );
     }
 
     // A dedicated single-connection pool owns only TEMP tables. No shared
@@ -429,6 +501,7 @@ mod tests {
         let db = Database::connect(options).await.unwrap();
         db.execute_unprepared("CREATE TEMP TABLE projects(id int,name text,is_deleted bool DEFAULT false);
           CREATE TEMP TABLE ip_geolocations(id int,country text,region text,city text,is_hosting_provider bool);
+          CREATE TEMP TABLE project_analytics_settings(project_id int,exclude_datacenter_traffic bool);
           CREATE TEMP TABLE events(id bigserial,project_id int, environment_id int, timestamp timestamptz, is_crawler bool DEFAULT false,
           event_type text DEFAULT 'page_view',event_name text,page_path text,session_id text,visitor_id int,time_on_page int,is_bounce bool DEFAULT false,
           device_type text,ip_geolocation_id int,lcp real,inp real,cls real,ttfb real,fcp real);

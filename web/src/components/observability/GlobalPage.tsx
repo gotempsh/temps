@@ -9,6 +9,8 @@ import { Input } from '@/components/ui/input'
 import { DateTimeRange } from '@/components/ui/date-time-range'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
+import { EmptyState } from '@/components/ui/empty-state'
+import { RefreshButton } from '@/components/ui/refresh-button'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
   Select,
@@ -24,8 +26,9 @@ import {
   OBSERVABILITY_PAGE_SIZE,
   observationError,
 } from '@/lib/global-observability'
-import { RefreshCw, Search, X } from 'lucide-react'
+import { Inbox, Search, X } from 'lucide-react'
 import type { GlobalView } from '@/hooks/useGlobalView'
+import type { QueryKey } from '@tanstack/react-query'
 import { useUrlBoundText } from '@temps-sdk/ds'
 
 export function FilterSelect({
@@ -84,8 +87,7 @@ export function GlobalPage({
   title,
   description,
   view,
-  fetching,
-  refresh,
+  refreshQueryKeys,
   searchLabel,
   filters,
   filterNotice,
@@ -95,8 +97,8 @@ export function GlobalPage({
   title: string
   description: string
   view: GlobalView
-  fetching: boolean
-  refresh: () => void
+  /** The queries this page shows, refetched by its Refresh. */
+  refreshQueryKeys: readonly QueryKey[]
   searchLabel: string
   filters?: ReactNode
   /** Explains a filter's effect (cost, completeness) under the filter row. */
@@ -119,19 +121,10 @@ export function GlobalPage({
         title={title}
         description={description}
         actions={
-          <Button
-            variant="outline"
-            disabled={fetching}
-            onClick={() => {
-              if (view.range !== 'custom') view.setRange(view.range)
-              else refresh()
-            }}
-          >
-            <RefreshCw
-              className={fetching ? 'size-4 animate-spin' : 'size-4'}
-            />
-            Refresh
-          </Button>
+          <RefreshButton
+            queryKeys={refreshQueryKeys}
+            onRefresh={view.advance}
+          />
         }
       />
       <div
@@ -223,15 +216,18 @@ export function QueryContent({
     )
   if (empty)
     return (
-      <div className="rounded-lg border border-dashed p-8 text-center">
-        <h2 className="font-medium">No {title.toLowerCase()} in this view</h2>
-        <p className="mt-2 text-sm text-muted-foreground">
-          Choose another service or time range, or clear your search. If you
-          have not sent data yet, open a service to configure collection.
-        </p>
-        <Button asChild variant="outline" className="mt-4">
-          <Link to="/projects">Open projects</Link>
-        </Button>
+      <div className="rounded-lg border bg-card text-card-foreground">
+        <EmptyState
+          size="compact"
+          icon={Inbox}
+          title={`No ${title.toLowerCase()} in this view`}
+          description="Choose another service or time range, or clear your search. If you have not sent data yet, open a service to configure collection."
+          action={
+            <Button asChild variant="outline">
+              <Link to="/projects">Open projects</Link>
+            </Button>
+          }
+        />
       </div>
     )
   return <>{children}</>
@@ -250,7 +246,7 @@ export function GlobalPagination({
       pageSize={OBSERVABILITY_PAGE_SIZE}
       total={total}
       totalPages={Math.max(1, Math.ceil(total / OBSERVABILITY_PAGE_SIZE))}
-      onPageChange={view.setPage}
+      onPageChange={(page) => view.setPage(page)}
     />
   )
 }

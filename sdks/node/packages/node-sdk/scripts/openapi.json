@@ -3909,7 +3909,7 @@
                     }
                 ]
             },
-            "put": {
+            "patch": {
                 "tags": [
                     "API Keys"
                 ],

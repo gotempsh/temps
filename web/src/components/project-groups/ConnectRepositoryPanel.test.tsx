@@ -346,12 +346,11 @@ test('saves the picked repository on its default branch', async () => {
   })
   let connected = 0
   render(panel({ onConnected: () => (connected += 1) }))
-  await settle()
+  const body = within(document.body)
+  await waitFor(() => expect(body.getByText('admin-console')).toBeTruthy())
 
   await act(async () => {
-    fireEvent.click(
-      within(document.body).getByText('admin-console').closest('button')!
-    )
+    fireEvent.click(body.getByText('admin-console').closest('button')!)
   })
   await settle()
   expect(saveDisabled()).toBe(false)

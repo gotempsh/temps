@@ -45,8 +45,8 @@ pub use service::{
     RuntimeProcessSnapshot,
 };
 pub use streaming::{
-    ChatMessage, ChatStreamDelta, ChatTool, ChatTurnRequest, ChatTurnResponse, ChatTurnStream,
-    ContextUsageSource, ContextWindowUsage, HarnessMcpServer, HarnessWorkspace,
+    ChatImage, ChatMessage, ChatStreamDelta, ChatTool, ChatTurnRequest, ChatTurnResponse,
+    ChatTurnStream, ContextUsageSource, ContextWindowUsage, HarnessMcpServer, HarnessWorkspace,
     InteractionExecutor, PermissionDecision, PermissionKind, PermissionRequest, SandboxAttachment,
     SensitiveEnvironment, TokenStream, ToolCall, ToolExecutor, TurnServices,
 };

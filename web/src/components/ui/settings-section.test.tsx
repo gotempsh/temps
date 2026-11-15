@@ -6,7 +6,7 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { Cpu } from 'lucide-react'
 import { SettingsSection } from './settings-section'
 
-test('collapsed sections keep form fields mounted for submission', () => {
+test('sections render their fields open, with no expand control', () => {
   const html = renderToStaticMarkup(
     <SettingsSection title="Compute resources" icon={Cpu}>
       <input name="memory" defaultValue="512" />
@@ -14,24 +14,15 @@ test('collapsed sections keep form fields mounted for submission', () => {
   )
   expect(html).toContain('name="memory"')
   expect(html).toContain('value="512"')
-  expect(html).not.toContain('open=""')
-  expect(html).toContain('<summary')
-})
-test('primary section can start open without adding a nested form', () => {
-  const html = renderToStaticMarkup(
-    <SettingsSection title="Identity" icon={Cpu} defaultOpen>
-      <input name="name" />
-    </SettingsSection>
-  )
-  expect(html).toContain('open=""')
+  expect(html).not.toContain('<summary')
   expect(html).not.toContain('<form')
 })
-test('sections with form errors render expanded', () => {
+test('fields with errors are visible without any interaction', () => {
   const html = renderToStaticMarkup(
     <SettingsSection title="Compute" icon={Cpu} hasError>
       <input aria-invalid="true" />
     </SettingsSection>
   )
-  expect(html).toContain('open=""')
   expect(html).toContain('aria-invalid="true"')
+  expect(html).not.toContain('<details')
 })
