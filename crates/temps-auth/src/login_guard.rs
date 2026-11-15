@@ -18,7 +18,10 @@
 //! A throttled account answers exactly like a wrong password and like an
 //! unknown email: the same `InvalidCredentials`, and the same single Argon2
 //! verification, because the caller still runs
-//! `verify_against_dummy_hash`. Nothing in the status, the body or the time
+//! `verify_against_dummy_hash`. The database work still differs -- a real
+//! account reserves an attempt, an unknown one can only be probed -- so
+//! `AuthService::login` holds every rejection to a common minimum time
+//! (`LOGIN_REJECTION_FLOOR`). Nothing in the status, the body or the time
 //! taken says whether the account exists or is being throttled. That is also
 //! why a failed throttle *write* must never surface as an error: a 500 for a
 //! real account next to a 401 for an unknown one would be the oracle this

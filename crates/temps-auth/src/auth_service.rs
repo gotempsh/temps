@@ -919,13 +919,26 @@ impl AuthService {
         Ok(updated_user)
     }
 
-    // Login with email/password
+    /// Log in with email and password.
+    ///
+    /// Every rejection takes at least [`LOGIN_REJECTION_FLOOR`]. The
+    /// branches do not cost the same: a real account reserves a throttle
+    /// attempt (a committed write) where an unknown address can only read,
+    /// so without a common floor the response time would say which one the
+    /// address is.
     pub async fn login(
         &self,
         request: LoginRequest,
     ) -> Result<temps_entities::users::Model, UserAuthError> {
-        // Every rejection below costs one Argon2 verification, the same as a
-        // wrong password for a real account, so response time does not
+        with_rejection_floor(LOGIN_REJECTION_FLOOR, self.authenticate_password(request)).await
+    }
+
+    async fn authenticate_password(
+        &self,
+        request: LoginRequest,
+    ) -> Result<temps_entities::users::Model, UserAuthError> {
+        // Every rejection below also costs one Argon2 verification, the same
+        // as a wrong password for a real account, so the CPU work does not
         // reveal whether the email exists or has a password.
         let found = temps_entities::users::Entity::find()
             .filter(temps_entities::users::Column::Email.eq(request.email.to_lowercase()))
@@ -934,8 +947,9 @@ impl AuthService {
             .await?;
 
         // Consult the throttle before reading the password, for an unknown
-        // address too so the work this path costs does not say whether the
-        // account exists. Reserving *is* the count, so a burst of
+        // address too. The two branches still do different database work --
+        // an unknown address has no row to reserve against -- which is why
+        // `login` holds every rejection to a common floor. Reserving *is* the count, so a burst of
         // simultaneous guesses cannot slip past a threshold that a separate
         // check-then-count would still read as clear
         // (`crate::login_guard`).
@@ -1664,6 +1678,28 @@ fn verify_against_dummy_hash(password: &str) -> bool {
         }
     }
     false
+}
+
+/// Minimum time a rejected password login takes.
+///
+/// Comfortably above the database work any rejection branch does, so the
+/// response time is the floor whichever branch refused. Only rejections
+/// wait: a caller who presented the right password learns nothing from the
+/// time a success takes. The wait holds no database connection.
+pub(crate) const LOGIN_REJECTION_FLOOR: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Run `attempt`, and if it fails, return no sooner than `floor` after it
+/// started.
+async fn with_rejection_floor<T, E>(
+    floor: std::time::Duration,
+    attempt: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T, E> {
+    let started = tokio::time::Instant::now();
+    let result = attempt.await;
+    if result.is_err() {
+        tokio::time::sleep_until(started + floor).await;
+    }
+    result
 }
 
 /// Refuse a password login because the per-account throttle could not be
@@ -4850,6 +4886,36 @@ mod tests {
         DUMMY_VERIFICATIONS.with(|count| count.get())
     }
 
+    /// A rejection that finished early is held until the floor, so the
+    /// branch that refused it does not show in the response time.
+    #[tokio::test(start_paused = true)]
+    async fn a_fast_rejection_waits_for_the_floor() {
+        let floor = std::time::Duration::from_millis(250);
+        let started = tokio::time::Instant::now();
+        let result: Result<(), &str> = with_rejection_floor(floor, async { Err("refused") }).await;
+        assert_eq!(result, Err("refused"));
+        assert_eq!(started.elapsed(), floor);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_rejection_and_a_success_are_not_delayed() {
+        let floor = std::time::Duration::from_millis(250);
+
+        let started = tokio::time::Instant::now();
+        let ok: Result<u8, &str> = with_rejection_floor(floor, async { Ok(1) }).await;
+        assert_eq!(ok, Ok(1));
+        assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+
+        let started = tokio::time::Instant::now();
+        let slow: Result<(), &str> = with_rejection_floor(floor, async {
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            Err("refused")
+        })
+        .await;
+        assert_eq!(slow, Err("refused"));
+        assert_eq!(started.elapsed(), std::time::Duration::from_millis(400));
+    }
+
     #[test]
     fn dummy_password_hash_uses_the_real_hash_parameters() {
         let parsed = argon2::PasswordHash::new(dummy_password_hash()).unwrap();
@@ -4890,8 +4956,13 @@ mod tests {
         };
 
         let before = dummy_verifications();
+        let started = std::time::Instant::now();
         let unknown = auth_service.login(attempt("nobody@example.com")).await;
         assert!(matches!(unknown, Err(UserAuthError::InvalidCredentials)));
+        assert!(
+            started.elapsed() >= LOGIN_REJECTION_FLOOR,
+            "an unknown address must be held to the rejection floor"
+        );
         assert_eq!(dummy_verifications(), before + 1, "unknown email must hash");
 
         let no_password = auth_service.login(attempt("sso-only@example.com")).await;
@@ -4905,10 +4976,15 @@ mod tests {
             "no-password user must hash"
         );
 
+        let started = std::time::Instant::now();
         let wrong = auth_service
             .login(attempt("has-password@example.com"))
             .await;
         assert!(matches!(wrong, Err(UserAuthError::InvalidCredentials)));
+        assert!(
+            started.elapsed() >= LOGIN_REJECTION_FLOOR,
+            "a wrong password for a real account must be held to the rejection floor"
+        );
         assert_eq!(
             dummy_verifications(),
             before + 2,
