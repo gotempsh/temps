@@ -2136,6 +2136,7 @@ impl CachedPeerTable {
             tls_wildcards_matcher,
             status_page_hosts,
             environments_cache,
+            generated_hosts,
             ..
         } = state;
 
@@ -2304,7 +2305,19 @@ impl CachedPeerTable {
             }
         };
 
+        // Hostnames the platform owns even with nothing serving them right
+        // now: every stored environment address, and the hostnames of
+        // sleeping environments. A TLS wildcard custom route never takes one.
+        let mut owned_hosts = generated_hosts;
+        owned_hosts.extend(
+            sleeping_environments
+                .iter()
+                .filter(|entry| !entry.domain.starts_with("*."))
+                .map(|entry| entry.domain.trim_end_matches('.').to_ascii_lowercase()),
+        );
+
         let new_snapshot = Arc::new(RouteTableSnapshot {
+            owned_hosts,
             http_routes: http_routes_map,
             tls_routes: tls_routes_map,
             http_wildcards: http_wildcards_matcher,
@@ -2786,6 +2799,8 @@ mod tests {
         .await?;
         insert_custom_route(db, "draft.example.net", "8.8.8.8", 8080, RouteType::Http).await?;
         insert_custom_route(db, "draft.example.net", "8.8.4.4", 8443, RouteType::Tls).await?;
+        // A TLS wildcard covering it must not take it either.
+        insert_custom_route(db, "*.example.net", "8.8.4.4", 8443, RouteType::Tls).await?;
 
         let table = CachedPeerTable::new(test_db.db.clone());
         table.load_routes().await?;
@@ -2795,6 +2810,10 @@ mod tests {
             "an undeployed environment's hostname must not be served by a custom route"
         );
         assert!(table.get_route_by_sni("draft.example.net").is_none());
+        assert!(
+            table.get_route_by_sni("unclaimed.example.net").is_some(),
+            "a name nothing else serves still uses the wildcard"
+        );
 
         test_db.cleanup().await?;
         Ok(())

@@ -999,6 +999,10 @@ struct LegacyRouteTable {
 
 #[derive(Clone, Debug, Default)]
 struct RouteTableSnapshot {
+    /// Platform hostnames that may have no route at all right now (an
+    /// undeployed environment's stored address, a sleeping environment's
+    /// hostname), lower-cased. Only consulted to keep a TLS wildcard off them.
+    owned_hosts: HashSet<String>,
     http_routes: HashMap<String, RouteInfo>,
     tls_routes: HashMap<String, RouteInfo>,
     http_wildcards: WildcardMatcher,
@@ -1028,11 +1032,14 @@ impl RouteTableSnapshot {
         self.http_routes.contains_key(host)
             || self.legacy.exact.contains_key(host)
             || self.unavailable.exact.contains_key(host)
+            || self.owned_hosts.contains(host)
     }
 
     fn has_live_route(&self, host: &str) -> bool {
         self.tls_routes.contains_key(host)
-            || self.tls_wildcards.match_domain(host).is_some()
+            // A TLS wildcard only serves a name no exact route claims; see
+            // `get_route_by_sni`.
+            || (self.tls_wildcards.match_domain(host).is_some() && !self.has_exact_route(host))
             || self.http_routes.contains_key(host)
             || self.legacy.exact.contains_key(host)
             || self.http_wildcards.match_domain(host).is_some()
@@ -4936,6 +4943,52 @@ mod unavailable_route_tests {
             "the sleeping environment must still be handed to the wake path: {sleeping:?}"
         );
 
+        Ok(())
+    }
+
+    /// A TLS wildcard custom route does not take an app hostname that is down
+    /// right now: SNI lookup refuses it, and the host still reports the
+    /// unavailable page rather than looking routable.
+    #[tokio::test]
+    async fn a_tls_wildcard_does_not_hide_an_unavailable_app_hostname(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(database) = database_or_skip().await else {
+            return Ok(());
+        };
+        let test_db = TestDBMockOperations::new(database.db.clone()).await?;
+        let (_project, environment, deployment) = test_db
+            .create_test_project_with_domain("down-tls.example.com")
+            .await?;
+        insert_container(&test_db, deployment.id, "exited", Some(9704)).await?;
+        insert_environment_domain(&test_db, environment.id, "store.tlswild.example.com").await?;
+        custom_routes::ActiveModel {
+            domain: Set("*.tlswild.example.com".to_string()),
+            host: Set("8.8.4.4".to_string()),
+            port: Set(8443),
+            enabled: Set(true),
+            route_type: Set(temps_entities::custom_routes::RouteType::Tls),
+            ..Default::default()
+        }
+        .insert(test_db.db.as_ref())
+        .await?;
+
+        let route_table = CachedPeerTable::new(test_db.db.clone());
+        route_table.load_routes().await?;
+
+        assert!(route_table
+            .get_route_by_sni("store.tlswild.example.com")
+            .is_none());
+        assert!(
+            route_table
+                .get_unavailable_route("store.tlswild.example.com")
+                .is_some(),
+            "the down app hostname must still answer with its unavailable page"
+        );
+        assert!(route_table
+            .get_route_by_sni("other.tlswild.example.com")
+            .is_some());
+
+        test_db.cleanup().await?;
         Ok(())
     }
 
