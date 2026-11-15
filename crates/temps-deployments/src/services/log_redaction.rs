@@ -101,9 +101,105 @@ pub fn redact_common_secret_patterns(text: &str) -> String {
     redacted
 }
 
+/// Remove identifying addresses and repository/path references from outbound reports.
+/// This deliberately favors privacy over retaining paths in diagnostic output.
+pub fn redact_report_identifiers(text: &str) -> String {
+    let text = IPV6_PATTERN.replace_all(text, |captures: &regex::Captures<'_>| {
+        match captures.get(0) {
+            Some(matched) => {
+                let candidate = matched.as_str().trim_matches(['[', ']']);
+                if candidate.parse::<std::net::Ipv6Addr>().is_ok() {
+                    "[redacted]".to_string()
+                } else {
+                    matched.as_str().to_string()
+                }
+            }
+            None => "[redacted]".to_string(),
+        }
+    });
+    IDENTIFIER_PATTERNS
+        .iter()
+        .fold(text.into_owned(), |text, pattern| {
+            pattern.replace_all(&text, "[redacted]").into_owned()
+        })
+}
+
+#[allow(
+    clippy::expect_used,
+    reason = "literal patterns exercised by adjacent tests"
+)]
+static IDENTIFIER_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+    [
+        // Whole URLs first, including scp-style Git remotes.
+        r#"(?i)(?:[a-z][a-z0-9+.-]*://|git@)[^\s<>"']+"#,
+        // Emails, bare domains (including internal hostnames), IPv4.
+        r#"[^\s@<>"']+@[^\s@<>"']+"#,
+        r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b",
+        r"(?i)\b(?:[\p{L}\p{N}_-]+\.)+[\p{L}][\p{L}\p{N}_-]*\b",
+        // Commit, trace and request identifiers can identify a repository or captured operation.
+        r"(?i)\b[0-9a-f]{16,64}\b",
+        r"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
+        // Bare owner/repository, absolute paths and nested checkout paths.
+        r"(?:[\p{L}\p{N}_.@~-]+)?(?:/[\p{L}\p{N}_.@~-]+)+",
+        r#"(?i)(?:[a-z]:\\|\\\\)[^\s<>"']+"#,
+    ]
+    .into_iter()
+    .map(|pattern| Regex::new(pattern).expect("valid identifier pattern"))
+    .collect()
+});
+
+// Validate candidates with the standard parser so timestamps are retained.
+#[allow(
+    clippy::expect_used,
+    reason = "literal IPv6 candidate pattern exercised by adjacent tests"
+)]
+static IPV6_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\[?(?:[a-f0-9]{0,4}:){2,}[a-f0-9:.]*\]?")
+        .expect("valid IPv6 candidate pattern")
+});
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redacts_commit_trace_and_request_identifiers() {
+        let safe = redact_report_identifiers("commit 1111111111111111111111111111111111111111 request 11111111-2222-4333-8444-555555555555");
+        assert_eq!(safe, "commit [redacted] request [redacted]");
+    }
+
+    #[test]
+    fn redacts_unicode_addresses_and_windows_checkout_paths() {
+        let text = r"contact opérateur@exemple.invalid hôte.exemple.invalid C:\work\sample-org\sample-repo";
+        let safe = redact_report_identifiers(text);
+        for identifying in ["opérateur", "exemple", "sample-org", "sample-repo"] {
+            assert!(!safe.contains(identifying), "{safe}");
+        }
+    }
+
+    #[test]
+    fn preserves_versions_and_failure_diagnostics() {
+        let text = "Temps version 0.1.0-beta.62: 12:34:56 build failed with exit code 127";
+        assert_eq!(redact_report_identifiers(text), text);
+    }
+
+    #[test]
+    fn outbound_reports_remove_addresses_and_repository_paths() {
+        let text = "clone https://github.com/sample-org/sample-repo.git git@forge.example:sample-org/sample-repo.git sample-org/sample-repo /workspace/sample-repo contact dev@example.invalid 192.0.2.10 [2001:db8::1] ::1 api.internal";
+        let safe = redact_report_identifiers(text);
+        for identifying in [
+            "sample-org",
+            "sample-repo",
+            "dev@",
+            "192.0.2",
+            "2001",
+            "::1",
+            "api.internal",
+        ] {
+            assert!(!safe.contains(identifying), "{safe}");
+        }
+        assert!(safe.contains("clone"));
+    }
 
     #[test]
     fn redacts_known_secret_values() {
