@@ -209,6 +209,21 @@ export function ApiKeyTable({
       render: (key) => <PermissionsDisplay apiKey={key} />,
     },
     {
+      key: 'project_id',
+      header: 'Scope',
+      render: (key) =>
+        key.project_id ? (
+          <span className="text-xs">
+            Project #{key.project_id}
+            {key.environment_id
+              ? ` · Environment #${key.environment_id}`
+              : ' · All environments'}
+          </span>
+        ) : (
+          'Account-wide'
+        ),
+    },
+    {
       key: 'status',
       header: 'Status',
       render: (key) => (

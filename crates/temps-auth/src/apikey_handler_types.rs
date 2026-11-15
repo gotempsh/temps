@@ -13,7 +13,7 @@ pub struct ApiKeyResponse {
     pub name: String,
     pub key_prefix: String,
     pub role_type: String,
-    pub permissions: Option<Vec<String>>, // Reserved for future use
+    pub permissions: Option<Vec<String>>,
     pub is_active: bool,
     #[schema(value_type = Option<String>, format = "date-time", example = "2024-12-31T23:59:59Z")]
     pub expires_at: Option<UtcDateTime>,
@@ -21,12 +21,17 @@ pub struct ApiKeyResponse {
     pub last_used_at: Option<UtcDateTime>,
     #[schema(value_type = String, format = "date-time", example = "2024-01-01T00:00:00Z")]
     pub created_at: UtcDateTime,
+    /// Immutable optional deployment resource scope.
+    pub project_id: Option<i32>,
+    pub environment_id: Option<i32>,
 }
 
 impl From<Model> for ApiKeyResponse {
     fn from(model: Model) -> Self {
         Self {
             id: model.id,
+            project_id: model.project_id,
+            environment_id: model.environment_id,
             name: model.name,
             key_prefix: model.key_prefix,
             role_type: model.role_type,
@@ -47,12 +52,15 @@ pub struct CreateApiKeyResponse {
     pub name: String,
     pub key_prefix: String,
     pub role_type: String,
-    pub permissions: Option<Vec<String>>, // Reserved for future use
-    pub api_key: String,                  // Only returned on creation
+    pub permissions: Option<Vec<String>>,
+    pub api_key: String, // Only returned on creation
     #[schema(value_type = Option<String>, format = "date-time", example = "2024-12-31T23:59:59Z")]
     pub expires_at: Option<UtcDateTime>,
     #[schema(value_type = String, format = "date-time", example = "2024-01-01T00:00:00Z")]
     pub created_at: UtcDateTime,
+    /// Immutable optional deployment resource scope.
+    pub project_id: Option<i32>,
+    pub environment_id: Option<i32>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -71,6 +79,9 @@ pub struct CreateApiKeyRequest {
     pub permissions: Option<Vec<String>>,
     #[schema(value_type = Option<String>, format = "date-time", example = "2024-12-31T23:59:59Z")]
     pub expires_at: Option<UtcDateTime>,
+    /// Immutable optional deployment resource scope.
+    pub project_id: Option<i32>,
+    pub environment_id: Option<i32>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -97,6 +108,8 @@ impl From<UpdateApiKeyRequest> for crate::apikey_service::UpdateApiKeyRequest {
 impl From<CreateApiKeyRequest> for crate::apikey_service::CreateApiKeyRequest {
     fn from(request: CreateApiKeyRequest) -> Self {
         Self {
+            project_id: request.project_id,
+            environment_id: request.environment_id,
             name: request.name,
             role_type: request.role_type,
             permissions: request.permissions,

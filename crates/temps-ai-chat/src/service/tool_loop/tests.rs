@@ -231,6 +231,8 @@ fn assistant_message_row() -> ai_messages::Model {
 fn api_key_row() -> temps_entities::api_keys::Model {
     let now = Utc::now();
     temps_entities::api_keys::Model {
+        project_id: None,
+        environment_id: None,
         id: 73,
         name: "tool-loop".to_string(),
         key_hash: "hash".to_string(),

@@ -118,6 +118,8 @@ impl ApiKeyCommand {
         let api_key_service = ApiKeyService::new(db.clone());
 
         let request = CreateApiKeyRequest {
+            project_id: None,
+            environment_id: None,
             name: self.name.clone(),
             role_type: self.role.clone(),
             permissions: self.permissions.clone(),

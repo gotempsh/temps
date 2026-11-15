@@ -1907,6 +1907,7 @@ export type ApiKeyListResponse = {
 
 export type ApiKeyResponse = {
     created_at: string;
+    environment_id?: number | null;
     expires_at?: string | null;
     id: number;
     is_active: boolean;
@@ -1914,6 +1915,10 @@ export type ApiKeyResponse = {
     last_used_at?: string | null;
     name: string;
     permissions?: Array<string> | null;
+    /**
+     * Immutable optional deployment resource scope.
+     */
+    project_id?: number | null;
     role_type: string;
 };
 
@@ -7792,20 +7797,30 @@ export type CreateAnalyticsIngestKeyRequest = {
 };
 
 export type CreateApiKeyRequest = {
+    environment_id?: number | null;
     expires_at?: string | null;
     name: string;
     permissions?: Array<string> | null;
+    /**
+     * Immutable optional deployment resource scope.
+     */
+    project_id?: number | null;
     role_type: string;
 };
 
 export type CreateApiKeyResponse = {
     api_key: string;
     created_at: string;
+    environment_id?: number | null;
     expires_at?: string | null;
     id: number;
     key_prefix: string;
     name: string;
     permissions?: Array<string> | null;
+    /**
+     * Immutable optional deployment resource scope.
+     */
+    project_id?: number | null;
     role_type: string;
 };
 
@@ -72689,6 +72704,14 @@ export type TriggerProjectPipelineErrors = {
      * Invalid request
      */
     400: unknown;
+    /**
+     * Authentication required
+     */
+    401: unknown;
+    /**
+     * Deployment permission or scope denied
+     */
+    403: unknown;
     /**
      * Project not found
      */

@@ -50,7 +50,17 @@ export function groupPermissionsByCategory<T extends { category?: string | null 
   return categories
 }
 
+export function parseApiKeyScope(project?: string, environment?: string): { project_id: number | null, environment_id: number | null } | null {
+  const parse = (value: string) => /^\d+$/.test(value) && Number.isSafeInteger(Number(value)) && Number(value) > 0 && Number(value) <= 2147483647 ? Number(value) : null
+  const projectId = project === undefined ? null : parse(project)
+  const environmentId = environment === undefined ? null : parse(environment)
+  if ((project !== undefined && projectId === null) || (environment !== undefined && (environmentId === null || projectId === null))) return null
+  return {project_id: projectId, environment_id: environmentId}
+}
+
 interface CreateOptions {
+  projectId?: string
+  environmentId?: string
   name?: string
   role?: string
   expiresIn?: string
@@ -94,6 +104,8 @@ export function registerApiKeysCommands(program: Command): void {
     .option('-r, --role <role>', 'Role type (admin, platform_admin, user, reader, api_reader, custom, metrics_ingest)')
     .option('-e, --expires-in <days>', 'Expires in N days (7, 30, 90, 365)')
     .option('-p, --permissions <permissions>', 'Comma-separated list of permissions')
+    .option('--project-id <id>', 'Confine to one project’s deployment and environment APIs')
+    .option('--environment-id <id>', 'Confine to one environment (requires --project-id)')
     .option('-y, --yes', 'Skip confirmation prompts (for automation)')
     .action(createApiKeyAction)
 
@@ -176,6 +188,11 @@ async function listApiKeysAction(options: { json?: boolean }): Promise<void> {
 }
 
 async function createApiKeyAction(options: CreateOptions): Promise<void> {
+  const scope = parseApiKeyScope(options.projectId, options.environmentId)
+  if (!scope) {
+    warning('Use positive project/environment IDs; --environment-id requires --project-id')
+    return
+  }
   await requireAuth()
   await setupClient()
 
@@ -280,6 +297,7 @@ async function createApiKeyAction(options: CreateOptions): Promise<void> {
     const { data, error } = await createApiKey({
       client,
       body: {
+        ...scope,
         name,
         role_type: roleType,
         expires_at: expiresAt,
@@ -304,6 +322,7 @@ async function createApiKeyAction(options: CreateOptions): Promise<void> {
     keyValue('ID', result.id)
     keyValue('Name', result.name)
     keyValue('Role', result.role_type)
+    keyValue('Scope', result.project_id ? `Project #${result.project_id}${result.environment_id ? ` / Environment #${result.environment_id}` : ''}` : 'Account-wide')
     keyValue('Prefix', result.key_prefix)
     if (result.expires_at) {
       keyValue('Expires', new Date(result.expires_at).toLocaleString())

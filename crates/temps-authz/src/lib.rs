@@ -17,6 +17,8 @@ mod permission_decorator;
 mod permission_guard;
 pub mod permissions;
 
+pub mod api_key_scope;
+pub use api_key_scope::{enforce_api_key_path, ApiKeyScope};
 pub use context::*;
 pub use decorators::*;
 pub use macros::*;

@@ -234,3 +234,40 @@ Webhooks include an HMAC signature for verification. Temps signs the payload wit
 ### View delivery history
 
 On the webhook settings page, click on a webhook to see all delivery attempts. Each entry shows the HTTP status code, response time, and payload. Failed deliveries can be retried manually.
+
+## Scope an API key for deployment
+
+In **Settings → API Keys → Create API key**, choose a **Deployment scope**
+(project and optionally one environment), **Custom permissions**, and an expiry.
+For the manual pipeline endpoint, grant `deployments:create`:
+
+```http
+POST /api/projects/7/trigger-pipeline
+Authorization: Bearer <scoped-api-key>
+Content-Type: application/json
+
+{"environment_id":9,"branch":"main"}
+```
+
+The environment in the body must match an environment-scoped key. Project-scoped
+keys can manage deployment and environment APIs beneath that project's URL;
+environment-scoped keys can use explicit endpoints for that environment and the
+pipeline endpoint above. Instance settings, credential management, AI/tool APIs,
+global lists and deployment-by-ID URLs are outside this scope. Permissions still
+limit which operations are allowed. Scope is immutable; revoke and recreate to
+change it. The API accepts `project_id` and optional `environment_id` at creation.
+Keys expire after one year by default, or at the earlier expiry you select.
+
+Scoped API keys use the `tkp_` prefix. Older servers reject them, so rolling back
+the server does not silently broaden access. Deleting an environment deactivates
+its scoped API keys; recreating the environment does not reactivate them.
+Existing `tk_` keys retain their current account-wide scope. Runtime deployment
+tokens are also project/environment-scoped, with their own permissions and expiry.
+
+The CLI exposes the same boundary:
+
+```bash
+temps apikeys create --name deploy-preview --role custom \
+  --permissions deployments:create --expires-in 7 \
+  --project-id 7 --environment-id 9 --yes
+```

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+pub use super::api_key_scope::ApiKeyScope;
 use super::permissions::{Permission, Role};
 use serde::{Deserialize, Serialize};
 use temps_entities::deployment_tokens::DeploymentTokenPermission;
@@ -75,6 +76,8 @@ pub enum AuthSource {
         permissions: Option<Vec<Permission>>, // Some for custom permissions
         key_name: String,
         key_id: i32,
+        #[serde(default)]
+        scope: Option<ApiKeyScope>,
     },
     /// Deployment token for machine-to-machine API access
     /// Used by deployed applications to access Temps APIs
@@ -191,10 +194,25 @@ impl AuthContext {
                 permissions: permissions.clone(),
                 key_name,
                 key_id,
+                scope: None,
             },
             effective_role: role.unwrap_or(Role::Custom),
             custom_permissions: permissions,
             deployment_token_permissions: None,
+        }
+    }
+
+    pub fn with_api_key_scope(mut self, resource_scope: Option<ApiKeyScope>) -> Self {
+        if let AuthSource::ApiKey { scope, .. } = &mut self.source {
+            *scope = resource_scope;
+        }
+        self
+    }
+
+    pub fn api_key_scope(&self) -> Option<&ApiKeyScope> {
+        match &self.source {
+            AuthSource::ApiKey { scope, .. } => scope.as_ref(),
+            _ => None,
         }
     }
 
@@ -318,7 +336,7 @@ impl AuthContext {
     /// is standing in front of, which is precisely the class of bug this
     /// predicate exists to prevent.
     pub fn is_instance_admin(&self) -> bool {
-        self.is_admin() || self.has_role(&Role::PlatformAdmin)
+        self.api_key_scope().is_none() && (self.is_admin() || self.has_role(&Role::PlatformAdmin))
     }
 
     /// Get the user ID if available
@@ -423,6 +441,7 @@ impl AuthContext {
     pub fn project_id(&self) -> Option<i32> {
         match &self.source {
             AuthSource::DeploymentToken { project_id, .. } => Some(*project_id),
+            AuthSource::ApiKey { scope, .. } => scope.as_ref().map(|scope| scope.project_id),
             _ => None,
         }
     }
@@ -450,18 +469,18 @@ impl AuthContext {
     /// `permission_guard!` alone does NOT enforce: the guard proves the caller
     /// holds an explicitly mapped permission, not that the resource is theirs.
     ///
-    /// For user/API-key/CLI auth this returns `true` (project-level ACLs for
-    /// human principals are an Enterprise/RBAC concern handled elsewhere); the
-    /// check exists specifically to stop a project-scoped machine credential
+    /// Resource-scoped API keys obey the same project boundary. Unscoped keys
+    /// and user/CLI auth rely on project-level ACLs handled elsewhere. This
+    /// check stops a project-scoped machine credential
     /// from reaching another tenant's resources (cross-project IDOR).
     ///
     /// Handlers should prefer the [`project_scope_guard!`] macro, which turns a
     /// failure into an RFC 7807 403 response.
     pub fn is_scoped_to_project(&self, project_id: i32) -> bool {
         match self.project_id() {
-            // Deployment token: must match its bound project exactly.
+            // Scoped credential: must match its bound project exactly.
             Some(token_project_id) => token_project_id == project_id,
-            // Not a deployment token (user/API key/CLI/session): no per-project
+            // Unscoped credential (user/API key/CLI/session): no per-project
             // confinement at this layer.
             None => true,
         }
