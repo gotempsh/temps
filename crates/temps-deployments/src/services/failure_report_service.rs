@@ -373,9 +373,9 @@ impl FailureReportService {
         );
 
         let github_issue_title =
-            redact_report_identifiers(&redact_job_identifiers(&github_issue_title, &jobs));
+            redact_job_identifiers(&redact_report_identifiers(&github_issue_title), &jobs);
         let github_issue_body =
-            redact_report_identifiers(&redact_job_identifiers(&github_issue_body, &jobs));
+            redact_job_identifiers(&redact_report_identifiers(&github_issue_body), &jobs);
 
         Ok(FailureReportPreview {
             redacted_log,
@@ -449,7 +449,7 @@ fn append_redacted_section(
 /// Complete secret values must be removed before identifiers can alter them.
 fn redact_outbound_text(text: &str, secrets: &[String], jobs: &[deployment_jobs::Model]) -> String {
     let secrets_redacted = redact_common_secret_patterns(&redact_known_secrets(text, secrets));
-    redact_report_identifiers(&redact_job_identifiers(&secrets_redacted, jobs))
+    redact_job_identifiers(&redact_report_identifiers(&secrets_redacted), jobs)
 }
 
 /// Exact repository identifiers may also be printed without a URL or slash.
@@ -486,7 +486,9 @@ fn redact_job_identifiers(text: &str, jobs: &[deployment_jobs::Model]) -> String
         .map(regex::escape)
         .collect::<Vec<_>>()
         .join("|");
+    // Match existing markers whole so re-submitting a preview preserves them.
     // A single pass never matches text inserted by an earlier replacement.
+    let pattern = format!(r"\[redacted\]|{pattern}");
     match regex::RegexBuilder::new(&pattern)
         .case_insensitive(true)
         .size_limit(1024 * 1024)
@@ -631,6 +633,34 @@ mod tests {
         let mut preview = String::new();
         append_redacted_section(&mut preview, &input, &jobs, &[secret]);
         assert_eq!(preview, prepared);
+    }
+
+    #[test]
+    fn whole_addresses_are_removed_before_overlapping_repository_names() {
+        for (repository, address) in [("internal", "service.internal"), ("255", "192.0.2.255")] {
+            let jobs = [job_with_config(
+                77,
+                serde_json::json!({"repo_name": repository}),
+            )];
+            let input = format!("connection failed: {address}");
+            let safe = prepare_report_text(&input, &[], &jobs).unwrap();
+            assert_eq!(safe, "connection failed: [redacted]");
+            let mut preview = String::new();
+            append_redacted_section(&mut preview, &input, &jobs, &[]);
+            assert_eq!(preview, safe);
+        }
+    }
+
+    #[test]
+    fn submitting_a_preview_preserves_existing_redaction_markers() {
+        let jobs = [job_with_config(77, serde_json::json!({"repo_name": "e"}))];
+        let input = "connection to https://service.example.invalid failed for e";
+        let mut preview = String::new();
+        append_redacted_section(&mut preview, input, &jobs, &[]);
+        assert!(preview.contains("[redacted]"));
+        let sent = prepare_report_text(&preview, &[], &jobs).unwrap();
+        assert_eq!(sent, preview);
+        assert!(!sent.contains("[r[redacted]"));
     }
 
     #[test]
