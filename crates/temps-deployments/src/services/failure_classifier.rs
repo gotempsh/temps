@@ -1004,6 +1004,22 @@ fn classify_lowercase(raw: &str) -> DeploymentFailureClassification {
         return make(S::Platform, C::PlatformInternal);
     }
 
+    // Persistence failures belong to the platform even when their cause is a
+    // pool timeout. Match only the workflow error body, never embedded build
+    // diagnostics, before attributing timeout words to the current job phase.
+    if [
+        "failed to find deployment:",
+        "failed to find environment:",
+        "failed to find project:",
+        "failed to update project last_deployment:",
+        "database error:",
+    ]
+    .iter()
+    .any(|prefix| executor_error.starts_with(prefix))
+    {
+        return make(S::Platform, C::PlatformInternal);
+    }
+
     let timeout_signal = contains_any(
         r,
         &[
@@ -1383,19 +1399,6 @@ fn classify_lowercase(raw: &str) -> DeploymentFailureClassification {
         }
         let stage = phase.map(phase_stage).unwrap_or(S::Platform);
         return make(stage, C::Timeout);
-    }
-
-    if [
-        "failed to find deployment:",
-        "failed to find environment:",
-        "failed to find project:",
-        "failed to update project last_deployment:",
-        "database error:",
-    ]
-    .iter()
-    .any(|prefix| executor_error.starts_with(prefix))
-    {
-        return make(S::Platform, C::PlatformInternal);
     }
 
     // ── Static-site deploy (extract the output, publish it) ─────────────
@@ -1822,6 +1825,34 @@ mod tests {
         for (job, message, stage, code) in cases {
             assert_class(&wrapped(job, message), stage, code);
         }
+    }
+
+    #[test]
+    fn persistence_timeouts_stay_platform_failures() {
+        for prefix in [
+            "Failed to find deployment:",
+            "Failed to find environment:",
+            "Failed to find project:",
+            "Failed to update project last_deployment:",
+            "Database error:",
+        ] {
+            let message = format!("{prefix} Connection pool timed out after 30 seconds");
+            for reason in [
+                message.clone(),
+                wrapped("mark_deployment_complete", &message),
+            ] {
+                assert_class(&reason, S::Platform, C::PlatformInternal);
+                assert_eq!(legacy_failure_reason(Some(&reason)), "timeout");
+            }
+        }
+        assert_class(
+            &wrapped(
+                "build_image",
+                "Failed to build image: Build failed: Database error: Connection pool timed out after 30 seconds",
+            ),
+            S::Build,
+            C::BuildTimeout,
+        );
     }
 
     #[test]
