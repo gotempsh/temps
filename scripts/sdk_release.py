@@ -205,6 +205,11 @@ def build(packages, output):
                     run('node', str(entry), '--help', cwd=temporary)
 
         elif p['kind'] == 'pypi':
+            # A stale committed lockfile makes every local `uv run` in the
+            # package rewrite it, so fail here instead (e.g. after adding a
+            # [build-system], which turns the root from virtual to editable).
+            if (path / 'uv.lock').exists():
+                run('uv', 'lock', '--check', cwd=path)
             run('uv', 'run', '--no-project', '--with', 'build', 'python', '-m', 'build', str(path), '--outdir', str(dest))
             run('uv', 'run', '--no-project', '--with', 'twine', 'twine', 'check', *map(str, dest.iterdir()))
             wheel = next(dest.glob('*.whl'))

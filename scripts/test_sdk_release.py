@@ -120,6 +120,31 @@ class ReleaseTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             release.pending_files(package, directory, lambda _: {'dist': {'integrity': 'bad'}})
 
+    def build_python(self, *, locked):
+        package = {'kind': 'pypi', 'key': 'python', 'path': 'python', 'name': 'temps-workflows', 'version': '1.2.3b1'}
+        if locked:
+            (self.root / 'python/uv.lock').write_text('version = 1\n')
+        def command(*args, **kwargs):
+            if args[:2] == ('git', 'show'):
+                return '1234567890\n'
+            if args[:2] == ('git', 'rev-parse'):
+                return 'abc\n'
+            if '--outdir' in args:
+                (Path(args[args.index('--outdir') + 1]) / 'temps_workflows-1.2.3b1-py3-none-any.whl').write_bytes(b'wheel')
+            return ''
+        with patch.object(release, 'ROOT', self.root), patch.object(release, 'run', side_effect=command) as run:
+            release.build([package], self.root / 'artifacts')
+        return [(call.args, call.kwargs.get('cwd')) for call in run.call_args_list if call.args[0] == 'uv']
+
+    def test_python_build_rejects_a_stale_lockfile_before_packaging(self):
+        commands = self.build_python(locked=True)
+        self.assertEqual(commands[0], (('uv', 'lock', '--check'), self.root / 'python'))
+        self.assertIn('build', commands[1][0])
+
+    def test_python_build_without_a_lockfile_skips_the_lock_check(self):
+        commands = self.build_python(locked=False)
+        self.assertNotIn(('uv', 'lock', '--check'), [args for args, _ in commands])
+
     def test_rust_build_collects_verified_package_archive(self):
         package = {'kind': 'crate', 'key': 'rust', 'path': 'crates/temps-workflows-sdk',
                    'name': 'temps-workflows-sdk', 'version': '1.2.3'}
