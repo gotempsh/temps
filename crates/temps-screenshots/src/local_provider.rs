@@ -6,7 +6,7 @@
 use async_trait::async_trait;
 use headless_chrome::{Browser, LaunchOptions};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use temps_core::log_transitions::{FailureLatch, FailureLog, DEFAULT_REMINDER_INTERVAL};
@@ -139,36 +139,16 @@ fn report_chrome_available(status: &ChromeStatus) {
     }
 }
 
-/// When a sandboxed launch last failed while an unsandboxed one worked, in
-/// seconds since the Unix epoch; `0` while the sandbox is not known to fail.
-static SANDBOX_UNAVAILABLE_SINCE: AtomicU64 = AtomicU64::new(0);
-
-/// How long a failed sandboxed launch is believed before the sandbox is tried
-/// again. A launch can fail for reasons that have nothing to do with the
-/// sandbox (a debugging port already taken, a slow start), and the
-/// dependency does not say which, so the verdict must not last until restart.
-const SANDBOX_RETRY_AFTER_SECS: u64 = 15 * 60;
-
-/// Whether the next launch should try the sandbox first.
-fn sandbox_worth_trying(unavailable_since: u64, now: u64) -> bool {
-    unavailable_since == 0 || now.saturating_sub(unavailable_since) >= SANDBOX_RETRY_AFTER_SECS
-}
-
-fn unix_now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs())
-        // A clock before 1970 cannot be measured from; `1` keeps the value
-        // distinct from "not failing" and retries on the next sane reading.
-        .unwrap_or(1)
-        .max(1)
-}
+/// Whether Chromium's own sandbox can start on this host.
+const SANDBOX_UNKNOWN: u8 = 0;
+const SANDBOX_WORKS: u8 = 1;
+const SANDBOX_UNAVAILABLE: u8 = 2;
+static SANDBOX_STATE: AtomicU8 = AtomicU8::new(SANDBOX_UNKNOWN);
 
 /// Launch Chromium with its own sandbox on, falling back to no sandbox when it
 /// cannot start (typically as root inside a container, or without the user
-/// namespaces it needs). The fallback is logged at WARN when it starts, and
-/// remembered for [`SANDBOX_RETRY_AFTER_SECS`] so launches in between do not
-/// first try a sandbox that just failed.
+/// namespaces it needs). The fallback is logged once at WARN, and remembered
+/// so later launches do not first try a sandbox that is known not to start.
 fn launch_chrome(
     chrome_path: Option<PathBuf>,
     idle_timeout: Duration,
@@ -185,21 +165,18 @@ fn launch_chrome(
             .map_err(|error| format!("failed to build launch options: {error}"))
     };
 
-    if sandbox_worth_trying(
-        SANDBOX_UNAVAILABLE_SINCE.load(Ordering::Relaxed),
-        unix_now_secs(),
-    ) {
+    if SANDBOX_STATE.load(Ordering::Relaxed) != SANDBOX_UNAVAILABLE {
         match Browser::new(options(true)?) {
             Ok(browser) => {
-                if SANDBOX_UNAVAILABLE_SINCE.swap(0, Ordering::Relaxed) != 0 {
-                    info!("Chromium starts with its sandbox again; local screenshots use it");
-                }
+                SANDBOX_STATE.store(SANDBOX_WORKS, Ordering::Relaxed);
                 return Ok(browser);
             }
             Err(sandboxed_error) => {
                 return match Browser::new(options(false)?) {
                     Ok(browser) => {
-                        if SANDBOX_UNAVAILABLE_SINCE.swap(unix_now_secs(), Ordering::Relaxed) == 0 {
+                        if SANDBOX_STATE.swap(SANDBOX_UNAVAILABLE, Ordering::Relaxed)
+                            != SANDBOX_UNAVAILABLE
+                        {
                             warn!(
                                 "Chromium could not start with its sandbox ({sandboxed_error}); \
                                  local screenshots now run it without the sandbox. Requests the \
@@ -594,26 +571,6 @@ fn still_running_message(reason: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_failed_sandbox_is_retried_after_the_interval() {
-        // Not failing: always try it.
-        assert!(sandbox_worth_trying(0, 1_000_000));
-        // Just failed: skip it for the interval, then try again.
-        let failed_at = 1_000_000;
-        assert!(!sandbox_worth_trying(failed_at, failed_at));
-        assert!(!sandbox_worth_trying(
-            failed_at,
-            failed_at + SANDBOX_RETRY_AFTER_SECS - 1
-        ));
-        assert!(sandbox_worth_trying(
-            failed_at,
-            failed_at + SANDBOX_RETRY_AFTER_SECS
-        ));
-        // A clock that stepped backwards waits out the interval rather than
-        // retrying early.
-        assert!(!sandbox_worth_trying(failed_at, failed_at - 10));
-    }
 
     #[tokio::test]
     async fn lock_outlives_a_timed_out_caller_until_the_blocking_work_ends() {
