@@ -5,6 +5,7 @@ import { createAndLinkDescription } from '@/lib/service-link-copy'
 import {
   adminListNodesOptions,
   createServiceMutation,
+  listS3SourcesOptions,
   getProjectOptions,
   getProviderMetadataOptions,
   getProvidersMetadataOptions,
@@ -59,6 +60,8 @@ import {
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useNavigate, useSearchParams } from 'react-router'
 import { toast } from 'sonner'
+import { creationBackupHref } from '@/lib/creation-backup-schedule'
+import { Skeleton } from '@/components/ui/skeleton'
 
 /** Service types that support HA cluster topology */
 const CLUSTER_SERVICE_TYPES: ServiceTypeRoute[] = ['postgres']
@@ -294,6 +297,8 @@ function ClusterMemberConfig({
 export function CreateService() {
   usePageTitle('Create database')
   const navigate = useNavigate()
+  const [backupDestination, setBackupDestination] = useState('later')
+  const destinations = useQuery({ ...listS3SourcesOptions(), retry: false })
   const [searchParams] = useSearchParams()
   const requestedServiceType = searchParams.get('type')
   const projectId = serviceProjectId(searchParams.get('project_id'))
@@ -442,7 +447,7 @@ export function CreateService() {
       } else {
         toast.success('Service created successfully')
       }
-      navigate(`/storage/${data.id}`)
+      navigate(creationBackupHref(data.id, backupDestination))
     },
   })
 
@@ -844,6 +849,73 @@ export function CreateService() {
         {/* Type-specific preset (version/engine pills) */}
         {topology === 'standalone' && preset.ui}
 
+        <div className="space-y-3">
+          <Label htmlFor="backup-destination">Backups</Label>
+          {destinations.isPending ? (
+            <Skeleton className="h-10 w-full" />
+          ) : destinations.isError ? (
+            <Alert>
+              <AlertTitle>Backup destinations unavailable</AlertTitle>
+              <AlertDescription>
+                Check your permissions or{' '}
+                <Button
+                  type="button"
+                  variant="link"
+                  onClick={() => void destinations.refetch()}
+                >
+                  retry
+                </Button>
+                . You can set up backups after creation.
+              </AlertDescription>
+            </Alert>
+          ) : !destinations.data?.length ? (
+            <Alert>
+              <AlertTitle>No backup destination configured</AlertTitle>
+              <AlertDescription>
+                Add an S3-compatible destination for nightly backups.{' '}
+                <Link
+                  to="/backups/s3-sources/new"
+                  className="underline"
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  Create destination
+                </Link>{' '}
+                <Button
+                  type="button"
+                  variant="link"
+                  onClick={() => void destinations.refetch()}
+                >
+                  Refresh destinations
+                </Button>
+              </AlertDescription>
+            </Alert>
+          ) : (
+            <>
+              <p className="text-sm text-muted-foreground">
+                Choose a destination to configure a schedule after creation. No
+                backups are enabled until you save that schedule.
+              </p>
+              <Select
+                value={backupDestination}
+                onValueChange={setBackupDestination}
+              >
+                <SelectTrigger id="backup-destination">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="later">Set up backups later</SelectItem>
+                  {destinations.data.map((source) => (
+                    <SelectItem key={source.id} value={String(source.id)}>
+                      {source.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </>
+          )}
+        </div>
+
         {/* JSON Schema Form for Parameters */}
         <JsonSchemaForm
           schema={jsonSchema as any}
@@ -855,6 +927,10 @@ export function CreateService() {
               : 'Create database'
           }
           submitDisabled={
+            (backupDestination !== 'later' &&
+              !destinations.data?.some(
+                (source) => String(source.id) === backupDestination
+              )) ||
             !serviceName.trim() ||
             !!preset.error ||
             (topology === 'standalone' && standaloneNodeId === null)
