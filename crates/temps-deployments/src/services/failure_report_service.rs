@@ -24,6 +24,7 @@ use tracing::error;
 
 use super::log_redaction::{
     redact_common_secret_patterns, redact_known_secrets, redact_report_identifiers,
+    redact_report_identifiers_with_pattern,
 };
 use super::sensitive_envelope::{self, SensitiveEnvelopeError};
 use super::services::{DeploymentError, DeploymentService};
@@ -372,10 +373,8 @@ impl FailureReportService {
             "",
         );
 
-        let github_issue_title =
-            redact_job_identifiers(&redact_report_identifiers(&github_issue_title), &jobs);
-        let github_issue_body =
-            redact_job_identifiers(&redact_report_identifiers(&github_issue_body), &jobs);
+        let github_issue_title = redact_job_identifiers(&github_issue_title, &jobs);
+        let github_issue_body = redact_job_identifiers(&github_issue_body, &jobs);
 
         Ok(FailureReportPreview {
             redacted_log,
@@ -449,7 +448,7 @@ fn append_redacted_section(
 /// Complete secret values must be removed before identifiers can alter them.
 fn redact_outbound_text(text: &str, secrets: &[String], jobs: &[deployment_jobs::Model]) -> String {
     let secrets_redacted = redact_common_secret_patterns(&redact_known_secrets(text, secrets));
-    redact_job_identifiers(&redact_report_identifiers(&secrets_redacted), jobs)
+    redact_job_identifiers(&secrets_redacted, jobs)
 }
 
 /// Exact repository identifiers may also be printed without a URL or slash.
@@ -477,7 +476,7 @@ fn redact_job_identifiers(text: &str, jobs: &[deployment_jobs::Model]) -> String
         }
     }
     if values.is_empty() {
-        return text.to_string();
+        return redact_report_identifiers(text);
     }
     let mut values: Vec<_> = values.into_iter().collect();
     values.sort_by_key(|value| std::cmp::Reverse(value.len()));
@@ -494,7 +493,7 @@ fn redact_job_identifiers(text: &str, jobs: &[deployment_jobs::Model]) -> String
         .size_limit(1024 * 1024)
         .build()
     {
-        Ok(pattern) => pattern.replace_all(text, "[redacted]").into_owned(),
+        Ok(pattern) => redact_report_identifiers_with_pattern(text, Some(&pattern)),
         Err(_) => {
             "[Report withheld: repository identifier redaction exceeded safe pattern limits.]"
                 .to_string()
@@ -637,7 +636,11 @@ mod tests {
 
     #[test]
     fn whole_addresses_are_removed_before_overlapping_repository_names() {
-        for (repository, address) in [("internal", "service.internal"), ("255", "192.0.2.255")] {
+        for (repository, address) in [
+            ("internal", "service.internal"),
+            ("255", "192.0.2.255"),
+            ("sample.app.3d-viewer", "sample.app.3d-viewer"),
+        ] {
             let jobs = [job_with_config(
                 77,
                 serde_json::json!({"repo_name": repository}),

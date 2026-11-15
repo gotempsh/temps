@@ -118,24 +118,48 @@ pub fn redact_common_secret_patterns(text: &str) -> String {
 /// Remove identifying addresses and repository/path references from outbound reports.
 /// This deliberately favors privacy over retaining paths in diagnostic output.
 pub fn redact_report_identifiers(text: &str) -> String {
-    let text = IPV6_PATTERN.replace_all(text, |captures: &regex::Captures<'_>| {
-        match captures.get(0) {
-            Some(matched) => {
-                let candidate = matched.as_str().trim_matches(['[', ']']);
-                if candidate.parse::<std::net::Ipv6Addr>().is_ok() {
-                    "[redacted]".to_string()
-                } else {
-                    matched.as_str().to_string()
-                }
+    redact_report_identifiers_with_pattern(text, None)
+}
+
+/// Match every identifier against the same input, then merge overlapping spans.
+/// Sequential replacement can destroy a larger match and expose its suffix.
+pub(super) fn redact_report_identifiers_with_pattern(text: &str, extra: Option<&Regex>) -> String {
+    let mut ranges = Vec::new();
+    for pattern in IDENTIFIER_PATTERNS.iter().chain(extra) {
+        ranges.extend(
+            pattern
+                .find_iter(text)
+                .map(|matched| (matched.start(), matched.end())),
+        );
+    }
+    ranges.extend(IPV6_PATTERN.find_iter(text).filter_map(|matched| {
+        matched
+            .as_str()
+            .trim_matches(['[', ']'])
+            .parse::<std::net::Ipv6Addr>()
+            .ok()
+            .map(|_| (matched.start(), matched.end()))
+    }));
+    ranges.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in ranges {
+        if let Some(previous) = merged.last_mut() {
+            if start < previous.1 {
+                previous.1 = previous.1.max(end);
+                continue;
             }
-            None => "[redacted]".to_string(),
         }
-    });
-    IDENTIFIER_PATTERNS
-        .iter()
-        .fold(text.into_owned(), |text, pattern| {
-            pattern.replace_all(&text, "[redacted]").into_owned()
-        })
+        merged.push((start, end));
+    }
+    let mut safe = String::with_capacity(text.len());
+    let mut cursor = 0;
+    for (start, end) in merged {
+        safe.push_str(&text[cursor..start]);
+        safe.push_str("[redacted]");
+        cursor = end;
+    }
+    safe.push_str(&text[cursor..]);
+    safe
 }
 
 #[allow(
