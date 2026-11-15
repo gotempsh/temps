@@ -252,36 +252,46 @@ export function SecurityPage() {
               analytics and IP-based controls. Changes reach proxy processes
               within a few seconds.
             </p>
-            <Label htmlFor="trusted-proxy-cidrs">
-              Trusted proxy addresses and CIDRs
-            </Label>
-            <Textarea
-              id="trusted-proxy-cidrs"
-              placeholder={'10.20.0.0/16\n2001:db8:1::/48'}
-              className="font-mono text-sm"
-              aria-invalid={errors.trusted_proxy_cidrs_text ? true : undefined}
-              aria-describedby={
-                errors.trusted_proxy_cidrs_text
-                  ? 'trusted-proxy-error'
-                  : undefined
-              }
-              {...register('trusted_proxy_cidrs_text', {
-                validate: validateProxyRanges,
-              })}
-            />
-            {errors.trusted_proxy_cidrs_text && (
-              <p id="trusted-proxy-error" className="text-xs text-destructive">
-                {errors.trusted_proxy_cidrs_text.message}
+            <div
+              id="setting-trusted-proxy-cidrs"
+              className="space-y-3 scroll-mt-24"
+            >
+              <Label htmlFor="trusted-proxy-cidrs">
+                Trusted proxy addresses and CIDRs
+              </Label>
+              <Textarea
+                id="trusted-proxy-cidrs"
+                placeholder={'10.20.0.0/16\n2001:db8:1::/48'}
+                className="font-mono text-sm"
+                aria-invalid={
+                  errors.trusted_proxy_cidrs_text ? true : undefined
+                }
+                aria-describedby={
+                  errors.trusted_proxy_cidrs_text
+                    ? 'trusted-proxy-error'
+                    : undefined
+                }
+                {...register('trusted_proxy_cidrs_text', {
+                  validate: validateProxyRanges,
+                })}
+              />
+              {errors.trusted_proxy_cidrs_text && (
+                <p
+                  id="trusted-proxy-error"
+                  className="text-xs text-destructive"
+                >
+                  {errors.trusted_proxy_cidrs_text.message}
+                </p>
+              )}
+              <p className="text-sm text-muted-foreground">
+                One address or range per line, up to 64. Leave empty when
+                clients connect directly. Only list proxies you operate and
+                configure to append or overwrite X-Forwarded-For. Temps walks
+                trusted hops from right to left and ignores addresses before the
+                first untrusted hop. Changes are audited and reach every process
+                within a few seconds.
               </p>
-            )}
-            <p className="text-sm text-muted-foreground">
-              One address or range per line, up to 64. Leave empty when clients
-              connect directly. Only list proxies you operate and configure to
-              append or overwrite X-Forwarded-For. Temps walks trusted hops from
-              right to left and ignores addresses before the first untrusted
-              hop. Changes are audited and reach every process within a few
-              seconds.
-            </p>
+            </div>
             <Label htmlFor="loopback-ja4-header">
               JA4 fingerprint header (optional)
             </Label>
