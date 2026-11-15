@@ -2800,6 +2800,54 @@ mod tests {
         Ok(())
     }
 
+    /// A TLS wildcard custom route passes through names nothing else serves,
+    /// but never a project's or environment's exact hostname under it.
+    #[tokio::test]
+    async fn a_tls_wildcard_custom_route_does_not_take_an_exact_platform_hostname(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(database) = database_or_skip().await else {
+            return Ok(());
+        };
+        let test_db = TestDBMockOperations::new(database.db.clone()).await?;
+        let db = test_db.db.as_ref();
+        set_preview_domain(db).await?;
+        let (project, environment, deployment) = seed_environment(&test_db).await?;
+        project_custom_domains::ActiveModel {
+            domain: Set("store.example.org".to_string()),
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            status: Set("active".to_string()),
+            ..Default::default()
+        }
+        .insert(db)
+        .await?;
+        insert_custom_route(db, "*.example.org", "8.8.4.4", 8443, RouteType::Tls).await?;
+
+        let table = CachedPeerTable::new(test_db.db.clone());
+        table.load_routes().await?;
+
+        assert!(
+            table.get_route_by_sni("store.example.org").is_none(),
+            "the project's own hostname must not be passed through to the wildcard"
+        );
+        assert_eq!(
+            table
+                .resolve_route_for_sni("store.example.org")
+                .and_then(|route| route.deployment.as_ref().map(|d| d.id)),
+            Some(deployment.id)
+        );
+        assert_eq!(
+            table
+                .get_route_by_sni("other.example.org")
+                .map(|route| route.get_backend_addr()),
+            Some("8.8.4.4:8443".to_string()),
+            "a name nothing else serves still uses the wildcard"
+        );
+
+        test_db.cleanup().await?;
+        Ok(())
+    }
+
     /// An HTTP and a TLS custom route for the same name both load: placing
     /// the first must not make the second look like a platform hostname.
     #[tokio::test]

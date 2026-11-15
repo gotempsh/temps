@@ -1023,6 +1023,13 @@ struct RouteTableSnapshot {
 impl RouteTableSnapshot {
     /// Whether any routable map resolves `host`, in the same order as
     /// `resolve_route_for_sni`, without cloning a `RouteInfo`.
+    /// Whether some exact (non-wildcard) route serves `host`, live or not.
+    fn has_exact_route(&self, host: &str) -> bool {
+        self.http_routes.contains_key(host)
+            || self.legacy.exact.contains_key(host)
+            || self.unavailable.exact.contains_key(host)
+    }
+
     fn has_live_route(&self, host: &str) -> bool {
         self.tls_routes.contains_key(host)
             || self.tls_wildcards.match_domain(host).is_some()
@@ -1804,7 +1811,15 @@ impl CachedPeerTable {
             return Some(route.clone());
         }
 
-        // 2. Try wildcard match in TLS wildcards
+        // 2. A TLS wildcard never takes a name an exact route serves -- a
+        //    project or environment hostname, or an exact HTTP route --
+        //    including one with no live deployment right now. Passing that
+        //    name through would hand its traffic to the wildcard's upstream.
+        if snapshot.has_exact_route(sni) {
+            return None;
+        }
+
+        // 3. Try wildcard match in TLS wildcards
         if let Some(route) = snapshot.tls_wildcards.match_domain(sni) {
             return Some(route.clone());
         }
@@ -1823,12 +1838,14 @@ impl CachedPeerTable {
         if snapshot.legacy.is_reserved(sni) {
             return None;
         }
+        // Exact names first, whatever their kind, then wildcards: the order
+        // `get_route_by_sni` and the HTTP lookup resolve a name in.
         snapshot
             .tls_routes
             .get(sni)
-            .or_else(|| snapshot.tls_wildcards.match_domain(sni))
             .or_else(|| snapshot.http_routes.get(sni))
             .or_else(|| snapshot.legacy.exact.get(sni))
+            .or_else(|| snapshot.tls_wildcards.match_domain(sni))
             .or_else(|| snapshot.http_wildcards.match_domain(sni))
             .or_else(|| snapshot.legacy.wildcards.match_domain(sni))
             .cloned()
