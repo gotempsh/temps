@@ -474,17 +474,6 @@ export const deleteOidcRoleMapping = <ThrowOnError extends boolean = false>(opti
     ...options
 });
 
-/**
- * Public webhook endpoint. Authenticated via `X-Webhook-Token` header.
- *
- * `POST /api/agents/webhook/{webhook_id}`
- * Header: `X-Webhook-Token: <secret>`
- *
- * The `webhook_id` in the URL is a short non-secret identifier (safe to log).
- * The actual credential is the secret token in the header.
- *
- * Accepts any JSON body, which is passed as `user_context` to the agent run.
- */
 export const webhookTrigger = <ThrowOnError extends boolean = false>(options: Options<WebhookTriggerData, ThrowOnError>): RequestResult<WebhookTriggerResponses, WebhookTriggerErrors, ThrowOnError> => (options.client ?? client).post<WebhookTriggerResponses, WebhookTriggerErrors, ThrowOnError>({
     url: '/agents/webhook/{webhook_id}',
     ...options,

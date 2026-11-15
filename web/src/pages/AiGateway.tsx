@@ -270,6 +270,8 @@ interface ModelUsage {
   output_tokens: number
   total_tokens: number
   avg_latency_ms: number
+  /** Recorded cost of the model's requests in the window, in microcents. */
+  estimated_cost_microcents: number
 }
 
 interface UsageLogEntry {
@@ -292,17 +294,6 @@ interface UsageLogEntry {
 interface UsageLogPage {
   entries: UsageLogEntry[]
   total: number
-}
-
-interface ModelPricing {
-  model: string
-  provider: string
-  input_per_million: number
-  output_per_million: number
-}
-
-interface PricingResponse {
-  models: ModelPricing[]
 }
 
 async function fetchJson<T>(url: string): Promise<T> {
@@ -808,48 +799,14 @@ function formatCost(dollars: number): string {
   return `$${dollars.toFixed(6)}`
 }
 
-function findPricing(
-  model: string,
-  pricingMap: Map<string, ModelPricing>
-): ModelPricing | undefined {
-  // Exact match first
-  const exact = pricingMap.get(model)
-  if (exact) return exact
-
-  // Strip common suffixes: -preview, -latest, date stamps like -20250101
-  const stripped = model
-    .replace(/-preview$/, '')
-    .replace(/-latest$/, '')
-    .replace(/-\d{6,8}$/, '')
-  if (stripped !== model) {
-    const match = pricingMap.get(stripped)
-    if (match) return match
-  }
-
-  // Prefix match: find the longest pricing key that the model starts with
-  let best: ModelPricing | undefined
-  let bestLen = 0
-  for (const [key, pricing] of pricingMap) {
-    if (model.startsWith(key) && key.length > bestLen) {
-      best = pricing
-      bestLen = key.length
-    }
-  }
-  return best
-}
-
-function computeCost(
-  model: string,
-  inputTokens: number,
-  outputTokens: number,
-  pricingMap: Map<string, ModelPricing>
-): number {
-  const pricing = findPricing(model, pricingMap)
-  if (!pricing) return 0
-  return (
-    (inputTokens / 1_000_000) * pricing.input_per_million +
-    (outputTokens / 1_000_000) * pricing.output_per_million
-  )
+/**
+ * A recorded cost in dollars. Usage logs store each request's cost in
+ * microcents (1e-6 USD) as the spend caps and budgets count it, cache prices
+ * and long-context rates included, so the console shows that figure instead
+ * of recomputing one from list prices.
+ */
+function microcentsToDollars(microcents: number): number {
+  return microcents / 1_000_000
 }
 
 type TimeRange = { label: string; hours: number }
@@ -993,19 +950,8 @@ function UsageStatFailed() {
   return <p className="text-sm text-destructive">Couldn&apos;t load</p>
 }
 
-function LogCostCell({
-  log,
-  pricingMap,
-}: {
-  log: UsageLogEntry
-  pricingMap: Map<string, ModelPricing>
-}) {
-  const cost = computeCost(
-    log.model,
-    log.input_tokens,
-    log.output_tokens,
-    pricingMap
-  )
+function LogCostCell({ log }: { log: UsageLogEntry }) {
+  const cost = microcentsToDollars(log.estimated_cost_microcents)
   return <>{cost > 0 ? formatCost(cost) : '—'}</>
 }
 
@@ -1187,29 +1133,6 @@ export function UsageAnalytics() {
     setRecentPage(0)
   }
 
-  const { data: pricingData } = useQuery({
-    queryKey: ['aiPricing'],
-    queryFn: () => fetchJson<PricingResponse>('/api/ai/pricing'),
-    staleTime: 60 * 60 * 1000,
-  })
-
-  const pricingMap = useMemo(() => {
-    const map = new Map<string, ModelPricing>()
-    for (const m of pricingData?.models ?? []) {
-      map.set(m.model, m)
-    }
-    return map
-  }, [pricingData])
-
-  const totalEstimatedCost = useMemo(() => {
-    if (!topModels || pricingMap.size === 0) return 0
-    return topModels.reduce(
-      (sum, m) =>
-        sum + computeCost(m.model, m.input_tokens, m.output_tokens, pricingMap),
-      0
-    )
-  }, [topModels, pricingMap])
-
   // Failed with nothing to show: never rendered as zero usage.
   const summaryFailed = summaryError && !summary
   const timeseriesFailed = timeseriesError && !timeseries
@@ -1337,13 +1260,15 @@ export function UsageAnalytics() {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            {summaryLoading || topModelsLoading ? (
+            {summaryLoading ? (
               <Skeleton className="h-7 w-16" />
-            ) : topModelsFailed ? (
+            ) : summaryFailed ? (
               <UsageStatFailed />
             ) : (
               <div className="text-2xl font-bold">
-                {formatCost(totalEstimatedCost)}
+                {formatCost(
+                  microcentsToDollars(summary?.total_cost_microcents ?? 0)
+                )}
               </div>
             )}
           </CardContent>
@@ -1584,12 +1509,7 @@ export function UsageAnalytics() {
             ) : (
               <div className="space-y-3">
                 {topModels.map((m) => {
-                  const cost = computeCost(
-                    m.model,
-                    m.input_tokens,
-                    m.output_tokens,
-                    pricingMap
-                  )
+                  const cost = microcentsToDollars(m.estimated_cost_microcents)
                   return (
                     <div
                       key={m.model}
@@ -1820,7 +1740,7 @@ export function UsageAnalytics() {
                         {log.latency_ms}ms
                       </TableCell>
                       <TableCell className="hidden md:table-cell text-muted-foreground">
-                        <LogCostCell log={log} pricingMap={pricingMap} />
+                        <LogCostCell log={log} />
                       </TableCell>
                       <TableCell>
                         <div className="flex items-center gap-1.5">

@@ -21261,6 +21261,13 @@ export type ModelSpend = {
 
 export type ModelUsage = {
     avg_latency_ms: number;
+    /**
+     * Sum of the recorded cost of the model's requests in the window, in
+     * microcents (1e-6 USD), as the spend caps and budgets count it. Clients
+     * show this rather than recomputing from list prices, which cannot see
+     * cache prices or long-context rates.
+     */
+    estimated_cost_microcents: number;
     input_tokens: number;
     model: string;
     output_tokens: number;

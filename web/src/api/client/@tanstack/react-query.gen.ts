@@ -1003,17 +1003,6 @@ export const deleteOidcRoleMappingMutation = (options?: Partial<Options<DeleteOi
     return mutationOptions;
 };
 
-/**
- * Public webhook endpoint. Authenticated via `X-Webhook-Token` header.
- *
- * `POST /api/agents/webhook/{webhook_id}`
- * Header: `X-Webhook-Token: <secret>`
- *
- * The `webhook_id` in the URL is a short non-secret identifier (safe to log).
- * The actual credential is the secret token in the header.
- *
- * Accepts any JSON body, which is passed as `user_context` to the agent run.
- */
 export const webhookTriggerMutation = (options?: Partial<Options<WebhookTriggerData>>): UseMutationOptions<WebhookTriggerResponse2, DefaultError, Options<WebhookTriggerData>> => {
     const mutationOptions: UseMutationOptions<WebhookTriggerResponse2, DefaultError, Options<WebhookTriggerData>> = {
         mutationFn: async (fnOptions) => {

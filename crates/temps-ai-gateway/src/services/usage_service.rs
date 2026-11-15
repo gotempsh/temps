@@ -125,6 +125,11 @@ pub struct ModelUsage {
     pub output_tokens: i64,
     pub total_tokens: i64,
     pub avg_latency_ms: f64,
+    /// Sum of the recorded cost of the model's requests in the window, in
+    /// microcents (1e-6 USD), as the spend caps and budgets count it. Clients
+    /// show this rather than recomputing from list prices, which cannot see
+    /// cache prices or long-context rates.
+    pub estimated_cost_microcents: i64,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -312,6 +317,7 @@ struct ModelUsageRow {
     output_tokens: Option<i64>,
     total_tokens: Option<i64>,
     avg_latency_ms: Option<f64>,
+    estimated_cost_microcents: Option<i64>,
 }
 
 #[derive(Debug, FromQueryResult)]
@@ -876,7 +882,8 @@ impl UsageService {
                 COALESCE(SUM(input_tokens), 0)::INT8 as input_tokens,
                 COALESCE(SUM(output_tokens), 0)::INT8 as output_tokens,
                 COALESCE(SUM(input_tokens + output_tokens), 0)::INT8 as total_tokens,
-                COALESCE(AVG(latency_ms)::float8, 0) as avg_latency_ms
+                COALESCE(AVG(latency_ms)::float8, 0) as avg_latency_ms,
+                COALESCE(SUM(estimated_cost_microcents), 0)::INT8 as estimated_cost_microcents
             FROM ai_usage_logs
             WHERE {}
             GROUP BY model, provider
@@ -903,6 +910,7 @@ impl UsageService {
                 output_tokens: r.output_tokens.unwrap_or(0),
                 total_tokens: r.total_tokens.unwrap_or(0),
                 avg_latency_ms: r.avg_latency_ms.unwrap_or(0.0),
+                estimated_cost_microcents: r.estimated_cost_microcents.unwrap_or(0),
             })
             .collect())
     }
@@ -1573,6 +1581,45 @@ mod tests {
         assert_eq!(projects[0].project_id, 7);
         assert_eq!(projects[0].estimated_cost_microcents, 900);
         assert_eq!(projects[0].operator_cost_microcents, 600);
+    }
+
+    #[tokio::test]
+    async fn top_models_report_the_recorded_cost_of_their_requests() {
+        use sea_orm::{MockDatabase, Transaction, Value};
+        // A long-context Claude Haiku 5.5 request recorded at its long-context
+        // rate: 200,000 x 0.50 + 1,000 x 2.50 microcents.
+        let row = std::collections::BTreeMap::from([
+            ("model".to_string(), Value::from("claude-haiku-5-5")),
+            ("provider".to_string(), Value::from("anthropic")),
+            ("request_count".to_string(), Value::BigInt(Some(1))),
+            ("input_tokens".to_string(), Value::BigInt(Some(200_000))),
+            ("output_tokens".to_string(), Value::BigInt(Some(1_000))),
+            ("total_tokens".to_string(), Value::BigInt(Some(201_000))),
+            ("avg_latency_ms".to_string(), Value::Double(Some(12.0))),
+            (
+                "estimated_cost_microcents".to_string(),
+                Value::BigInt(Some(102_500)),
+            ),
+        ]);
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![row]])
+                .into_connection(),
+        );
+        let service = UsageService::new(db.clone());
+        let now = chrono::Utc::now();
+        let models = service.get_top_models(now, now, 10).await.unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].model, "claude-haiku-5-5");
+        assert_eq!(models[0].estimated_cost_microcents, 102_500);
+
+        drop(service);
+        let log: Vec<Transaction> = Arc::try_unwrap(db).unwrap().into_transaction_log();
+        let sql = format!("{log:?}");
+        assert!(
+            sql.contains("SUM(estimated_cost_microcents)"),
+            "top models must sum the recorded cost: {sql}"
+        );
     }
 
     #[tokio::test]

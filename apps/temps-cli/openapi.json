@@ -45943,6 +45943,11 @@
             "format": "double",
             "type": "number"
           },
+          "estimated_cost_microcents": {
+            "description": "Sum of the recorded cost of the model's requests in the window, in\nmicrocents (1e-6 USD), as the spend caps and budgets count it. Clients\nshow this rather than recomputing from list prices, which cannot see\ncache prices or long-context rates.",
+            "format": "int64",
+            "type": "integer"
+          },
           "input_tokens": {
             "format": "int64",
             "type": "integer"
@@ -45973,7 +45978,8 @@
           "input_tokens",
           "output_tokens",
           "total_tokens",
-          "avg_latency_ms"
+          "avg_latency_ms",
+          "estimated_cost_microcents"
         ],
         "type": "object"
       },
@@ -88669,7 +88675,6 @@
     },
     "/agents/webhook/{webhook_id}": {
       "post": {
-        "description": "`POST /api/agents/webhook/{webhook_id}`\nHeader: `X-Webhook-Token: <secret>`\n\nThe `webhook_id` in the URL is a short non-secret identifier (safe to log).\nThe actual credential is the secret token in the header.\n\nAccepts any JSON body, which is passed as `user_context` to the agent run.",
         "operationId": "webhook_trigger",
         "parameters": [
           {
@@ -88713,7 +88718,6 @@
             "description": "Agent disabled"
           }
         },
-        "summary": "Public webhook endpoint. Authenticated via `X-Webhook-Token` header.",
         "tags": [
           "Agents"
         ],
