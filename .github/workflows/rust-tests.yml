@@ -165,6 +165,13 @@ jobs:
           python3 scripts/test_source_attribution.py
           python3 scripts/test_release_attribution.py
 
+      # cliff.toml renders every release's CHANGELOG.md section: check that it
+      # lists repeated commits once without dropping a breaking marker or note.
+      - name: Test the changelog template
+        run: |
+          pipx install git-cliff==2.14.2
+          python3 scripts/test_changelog_template.py -v
+
       - name: Test CI test coverage tooling
         run: python3 scripts/test_ci_test_coverage.py
 

@@ -5,6 +5,467 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.0-beta.62] - 2026-11-15
+
+### Added
+
+- **ingress:** Name tunnel apps one level deep, as app-lab.example.com ([#1835](https://github.com/gotempsh/temps/issues/1835))
+- **ds:** Open records by clicking the row, without link styling ([#1840](https://github.com/gotempsh/temps/issues/1840))
+- **nodes:** Change a worker's labels after it joined with `temps agent labels` ([#1841](https://github.com/gotempsh/temps/issues/1841))
+- **proxy:** Stop advertising Temps in responses unless enabled ([#1843](https://github.com/gotempsh/temps/issues/1843))
+- **web:** Say why a worker service's container state, usage or WAL health is unavailable
+- **providers:** Back up and restore MongoDB, Redis, MariaDB and managed S3 on the worker that runs them
+- **node-agent:** Add backup and in-place restore routes for the services a node runs
+- **backup:** Back up a worker's WAL-G PostgreSQL with the control plane's engine through its agent
+- **backup:** Restore a worker's WAL-G PostgreSQL in place and to a point in time through its agent
+- **previews:** Retire a preview when its branch is deleted or its PR closes
+- **web:** Show retired preview environments in the audit log
+- **backup:** Re-point a worker PostgreSQL's WAL archiving through its agent
+- **backup:** Give worker nodes per-job S3 credentials limited to their own service
+- **web:** Show whether worker nodes get scoped or full S3 credentials
+- **dns:** Show internal DNS health, records, queries and traffic, and alert when it breaks
+- **web:** Add a DNS page in Settings with resolver health, records, queries, traffic and a test lookup
+- **plugins:** Run external plugins as a separate account through a launcher
+- **cloud:** End Temps Cloud console sessions when Cloud revokes the user (ADR-094)
+- **git:** Require a server-issued state on the GitHub App manifest callback ([#1846](https://github.com/gotempsh/temps/issues/1846))
+- **cloud:** Report active worker node count in background status
+- **web:** Offer one solution-first action to publish environments
+- **web:** Split Settings → DNS into Overview, Records, Queries and Test tabs
+- **plugins:** Add AI tool declaration index foundations
+- **plugins:** Connect marked tools to chat with consent and audited approvals
+- **plugins:** Add an installable AI tools playground
+- **nodes:** Change a worker's labels after it joined with `temps agent labels`
+- **nodes:** Report how each worker serves internal routing and when its port-80 redirect is missing
+- **web:** Show Redirected, Direct on port 80 or Down for each worker's internal routing on the DNS page
+- **nodes:** Let a cluster move its overlay to its own VXLAN network ID
+- **web:** Pick visitor and request-log columns, move through lists by keyboard, get help on Discord
+- **logs:** Count unsealed lines in log volume and facets; show live service status in project cards
+- **network-policy:** Store internal access grants with cleanup and route reload triggers
+- **routes:** Send each internal route's granted callers to node agents
+- **node-agent:** Let internal access grants admit callers from other projects
+- **network-policy:** API to grant another project internal access to a project
+- **nodes:** DNS test resolution says whether the asking project may call an internal name
+- **web:** Manage which projects may call a project's internal addresses
+- **backup:** Back up and restore a worker's MongoDB with the control plane's own engine through its agent
+- **backup:** Back up and restore a worker's Redis with the control plane's engine through its agent
+- **backup:** Back up and restore a worker's MariaDB with the control plane's engines
+- **sandbox:** Add timed GitHub and service access through worker proxies ([#1849](https://github.com/gotempsh/temps/issues/1849))
+- **mcp:** Expose the temps virtual CLI on the MCP endpoint ([#1860](https://github.com/gotempsh/temps/issues/1860)) [**BREAKING**]: replace endpoint-specific MCP tools with temps, temps_write and confirm_action. Existing clients must refresh discovery; edge-rule operations remain available through the console and REST API.
+- **postgres:** Offer TLS on managed PostgreSQL services ([#1871](https://github.com/gotempsh/temps/issues/1871))
+- **config:** Inspect installation secrets the way serve loads them, without creating them
+- **postgres:** Check the WAL archive target before archiving and repair walg.env on start
+- **monitoring:** Alert when PostgreSQL WAL archiving fails, stalls or backs up
+- **web:** Add a shared Refresh button for pages that show live data
+- **providers:** Check managed service containers every 30s once healthy instead of every 1-2s
+- **providers:** Let operators override managed service healthchecks for the instance and per service
+- **service-access:** General vaults and sandbox sessions with chat consent ([#1862](https://github.com/gotempsh/temps/issues/1862))
+- **workflows:** Add the durable workflow tables and entities
+- **workflows:** Add the workflow store with fenced leases and bounded claims
+- **workflows:** Add the scheduler, invoker and workflow service
+- **workflows:** Add the workflows API and its permissions
+- **workflows:** Run the workflow engine in temps serve
+- **workflows:** Add the TypeScript workflows SDK
+- **workflows:** Child workflows started exactly once, with their result delivered to the parent
+- **workflows:** Add persistent Temporal and Restate engine templates
+- **workflows:** Implement M2 and M3 orchestration, SDKs and console controls
+- **workflows:** Add CLI management, worker scaffolding and run navigation
+
+### Build
+
+- **api:** Regenerate the console and CLI clients for the DNS observability endpoints
+- **api:** Regenerate the console and CLI clients for the internal routing status fields
+- **deps:** Bump quinn-udp to 0.5.16 for RUSTSEC-2026-0538
+- **changelog:** Print the migration note of breaking changes
+- **changelog:** List repeated entries once and keep breaking notes on one line
+- **changelog:** Keep a breaking copy of a repeated entry with its marker
+
+### CI
+
+- **deps:** Ignore RUSTSEC-2026-0459 for sea-orm's bundled SQLite
+- **deps:** Correct RUSTSEC-2026-0459 reachability for the microsandbox catalog
+- **deps:** Cover temps edge's analytics.db in the RUSTSEC-2026-0459 note
+- Move pinned runner images to the newest GA labels
+
+### Documentation
+
+- **providers:** Document the remote and local paths of service create, start, stop and delete
+- **adr:** Run a worker's backups with the control plane's engines through its agent
+- **adr:** Renumber the worker backups ADR to 092
+- **previews:** Warn that closing one of several PRs on a branch retires its preview
+- **previews:** Note the Gitea webhook dispatch change
+- **adr:** Scope the S3 credentials a control plane gives its worker nodes (ADR-093)
+- **dns:** Renumber canary corrections to ADR-097
+- **health:** Design worker checks for environments without ingress
+- **plugins:** Explain default-off actor consent
+- **architecture:** Refresh plugin AI tools dependency map
+- **adr:** ADR-098, the worker's internal proxy gets its own port and a port-80 redirect
+- **adr:** Renumber the worker backups ADR to 099 so it no longer collides with plugin AI tools
+- **nodes:** Say a nightly install may lack commits newer than the latest nightly
+- **plans:** Add the dependency build-vs-buy audit
+- **adr:** ADR-100 internal access grants let another project call a project's internal routes
+- **adr:** Record the scoped credential each worker backup engine receives
+- **adr:** Renumber internal access grants to ADR-101
+- **adr:** ADR-100 records that both runtime images ship the PostgreSQL 18 client
+- Describe deploying from local files without a Git account
+- Correct the local-files page on entry point, secrets and static ZIPs
+- Tighten secret and availability claims on the local-files page
+- Note the .well-known exception for static ZIPs
+- Say which secret names a local-files upload actually catches
+- **web:** Require primary actions to finish their job in one click
+- **reference:** Say where admin commands find the database URL when none is set
+- **adr:** Durable workflows orchestrated by Temps
+- **workflows:** Specify executor protocol version 1
+- **ci:** Require minimizing runner allocations
+
+### Fixed
+
+- Console refusals reported as success, configurable stop timeout, rollback and multi-arch deploy fixes ([#1828](https://github.com/gotempsh/temps/issues/1828))
+- **nodes:** Run a Mac worker's runtime health probes from its mesh sidecar ([#1833](https://github.com/gotempsh/temps/issues/1833))
+- **nodes:** Pair a worker with the Add worker install command, pinned to this server's release ([#1834](https://github.com/gotempsh/temps/issues/1834))
+- **nodes:** A worker joining a plane built between releases installs the newest nightly, not the older tag ([#1837](https://github.com/gotempsh/temps/issues/1837))
+- **ingress:** Keep a tunnel's hostname suffix in long names and say setup publishes nothing yet ([#1839](https://github.com/gotempsh/temps/issues/1839))
+- **providers:** Create and manage worker-node services from a control-plane-profile server
+- **providers:** Publish internal DNS and cross-node links for worker services on a control-plane-profile server
+- **providers:** Report a refused worker service under its own ID with a remedy this server can apply
+- **node-agent:** Remove the container and volumes a failed service create left on the worker
+- **node-agent:** Finish a service create and its cleanup when the caller gives up
+- **node-agent:** Undo a service create its caller gave up on, and refuse a concurrent one for the same name
+- **providers:** Show runtime, stats, variables and WAL health of worker-node services on a control-plane server
+- **node-agent:** Provision a worker database's per-environment resources through the node's published address
+- **backup:** Back up a Postgres database on a worker node as a job on that node, without this server's Docker
+- **web:** Create a managed service on a worker when the control plane runs no containers
+- **backup:** Back up every managed service on a worker node through its agent, MariaDB included
+- **backup:** Restore worker services in place and report their real backup capability
+- **providers:** Refuse image and major-version upgrades of a worker service instead of acting on this server
+- **backup:** Answer the restore options of a service whose engine is not on this server with a specific problem
+- **backup:** Never read a MariaDB schema name as a dump option, and bound the worker dump helper
+- **providers:** Provision a linked app's Redis database on a worker, and prove every worker engine end to end
+- **backup:** Restore another service's backup into a worker database as on the control plane
+- **web:** Never offer a worker service the backup image upgrade
+- **providers:** Preview a worker service's per-environment variables on its node
+- **backup:** Name a restore's origin from its producer and describe a worker restore as it runs
+- **web:** Stop showing the Workload Plane setting on database pages
+- **web:** Stop showing the Workload Plane setting on environment pages
+- **git:** Retire previews only on projects that authenticated the delivery
+- **environments:** Keep preview teardown going through outages and restores
+- **environments:** Retire previews created while their branch was being retired
+- **git:** Only an all-zeros SHA retires a preview, never a missing commit
+- **git:** Keep the null SHA of a generic webhook deletion
+- **git:** Use GitLab's `after` only when it marks a deletion
+- **git:** Strip the refs/heads/ prefix only once
+- **git:** Bind GitHub App webhook deliveries to the signing App
+- **git:** Accept GitHub App webhooks when Apps share a secret
+- **git:** Retire previews of branches deleted on Gitea
+- **git:** Retire every branch deleted in one Bitbucket push
+- **git:** Keep a Gitea deleted branch name verbatim
+- **git:** Warn when GitHub Apps share webhook secrets
+- **git:** Use the supported atomic update API
+- **web:** Let users copy the name a destructive confirmation asks them to type
+- **backup:** Remove objects a backup does not have when restoring S3 storage on a worker
+- **backup:** Wait for a busy worker node instead of failing the backup or restore
+- **mariadb:** Default new MariaDB services to the pinned managed WAL-G image
+- **backup:** Plan MongoDB archive and S3 mirror restores as what they are
+- **mongodb:** Browse a managed MongoDB's application databases, not only admin
+- **providers:** List S3_BUCKET and other per-environment names in the variable-name preview
+- **redis:** Build redis-walg on trixie and default to the GHCR image ([#1845](https://github.com/gotempsh/temps/issues/1845))
+- **node-agent:** Keep retrying the internal proxy bind and report it on the heartbeat
+- **web:** Visit opens the address visitors reach, not localho.st
+- **backup:** Wait for the Temps Cloud link before refreshing worker WAL archive credentials
+- **dns:** Stop alarming that the control plane's resolver is down on planes that run none
+- **web:** Default server metrics to first node and omit cluster disk forecasts
+- **containers:** Keep first log connections alive and retry transient failures
+- **dns:** Correct internal names and resolver diagnostics
+- **health:** Use worker runtime health for environments without ingress
+- **web:** Open external pages without a reference back to the console ([#1847](https://github.com/gotempsh/temps/issues/1847))
+- **plugins:** Inherit shared AI tool path parameters
+- **plugins:** Resolve parameter references before applying overrides
+- **plugins:** Decode composite tool inputs and index AI settings
+- **plugins:** Refresh active tools and preserve referenced input schemas
+- **plugins:** Refresh read tools and preserve composite JSON inputs
+- **plugins:** Validate root bodies and rebase recursive tool schemas
+- **plugins:** Enforce declared routes and preserve query input types
+- **plugins:** Preserve composite query types and reject root maps
+- **web:** Keep plugin AI settings secondary to the workspace
+- **plugins:** Resolve tool routes by HTTP method
+- **ai:** Preserve execution receipts across plugin refreshes
+- **plugins:** Recover stale consent and decode composite strings
+- **plugins:** Redact proxy credentials from AI tool responses
+- **plugins:** Preserve tool inputs and expose CLI consent bindings
+- **ai:** Classify plugin consent endpoints in tool policy
+- **plugins:** Harden AI tool contracts and consent lifecycle
+- **plugins:** Protect credential boundaries and report publication failures
+- **plugins:** Honor declared query parameter serialization
+- **plugins:** Bound audits and preserve uninstall consent boundaries
+- **plugins:** Align consent errors and required query help with contracts
+- **plugins:** Recover consent and bind it to installed binaries
+- **plugins:** Reject unsupported path parameter encodings
+- **plugins:** Validate paths and revoke tools before uninstall writes
+- **plugins:** Reconcile startup consent and show partial activity totals
+- **plugins:** Match playground to the published runtime contract
+- **nodes:** Never let a root `temps agent labels` run leak or replace another user's agent config
+- **nodes:** Keep both changes when two `temps agent labels` edits overlap, and keep labels on a broken agent.json
+- **nodes:** Edit agent.json through its canonical directory and keep reloading a symlinked one
+- **nodes:** Catch quoted systemd label overrides and keep a re-joined worker's labels off the old control plane
+- **nodes:** Never let `temps join` write agent.json without the edit lock
+- **nodes:** Check only the worker being edited for label overrides, and keep a symlinked agent.json a link on join
+- **nodes:** Refuse a root `temps join` into a directory another user controls
+- **node-agent:** Serve internal routing on port 591 and redirect containers' port 80 to it
+- **plugins:** Allow the bootstrap secret-file path reads that keep plugins away from them
+- **ai:** Let the assistant read internal DNS health, records, queries and traffic
+- **auth:** Give OIDC login start and callback their own rate-limit budget
+- **web:** Give the active visitor filters row a group role
+- **backup:** Back up the control plane without Docker using the local PostgreSQL client
+- **mongodb:** Fail a restore whose archive mongorestore could not read
+- **backup:** Tighten worker credential reuse and restore grants after a security review
+- **docker:** Ship PostgreSQL 18 client tools so the control plane can back itself up without Docker
+- **node-agent:** Let a worker restore past its deadline finish its swap or rollback
+- **backup:** Mint a fresh S3 credential for each try after waiting for a busy worker
+- **web:** Never move a new service to another machine when the chosen one disappears
+- **providers:** Fail a legacy MongoDB or PostgreSQL restore whose restore tool failed
+- **backup:** Keep the target's login password through a worker PostgreSQL dump restore
+- **backup:** Give a MongoDB service the origin's username after a cross-service restore
+- **providers:** Show that WAL health stopped being checked once a worker's probe fails
+- **node-agent:** Never claim a service volume another create made at the same time
+- **deps:** Bump arrow to 60.1.0 for RUSTSEC-2026-0442 ([#1857](https://github.com/gotempsh/temps/issues/1857))
+- **deps:** Drop unmaintained pin-utils via aws-smithy updates ([#1856](https://github.com/gotempsh/temps/issues/1856))
+- **deps:** Pin astral-tokio-tar to final 0.6.4 and scope its advisory ([#1855](https://github.com/gotempsh/temps/issues/1855))
+- **backup:** Stop a PostgreSQL dump restore at its first failed statement
+- **node-agent:** Let a worker Redis or MariaDB restore past its deadline finish its swap or rollback
+- **web:** Stop a reconnected log stream from repeating the lines it already showed
+- **backup:** Keep a worker WAL-G restore's run active until its node reports the outcome
+- **web:** Keep the log lines on screen when a reconnected stream fails
+- **ai:** Let the assistant read internal access grants but not change them or the network ID
+- **backup:** Keep worker MongoDB, Redis and MariaDB restores active until the node reports their outcome
+- **cloud:** Keep the Cloud console session cutoff across restarts
+- **metrics:** Show the Postgres cache hit ratio over the last 15 minutes ([#1861](https://github.com/gotempsh/temps/issues/1861))
+- **backup:** Dump the control plane with host pg_dump when Docker is unreachable
+- **backup:** Stop host dump compression on timeout and reject empty SQL
+- **providers:** Send a temporary S3 source credential with its session token when full credentials are allowed
+- **backup:** Resume a worker restore from its node's outcome after a control-plane restart
+- **backup:** Hold a worker restore's service until its outcome is known, whatever path it took
+- **backup:** Honour a release accepted for a held worker restore, and read a run's jobs in one listing
+- **providers:** Show managed-service CPU in cores against the container limit ([#1873](https://github.com/gotempsh/temps/issues/1873))
+- **backup:** Settle a resumed worker restore with the login captured when it started
+- **backup:** Follow an unanswered worker WAL-G backup instead of overlapping it with a retry
+- **web:** Keep the remaining internal access grants reachable after removing the last one on a page
+- **backup:** Keep a restore run's recorded login out of serialized and debug output
+- **backup:** Keep a finished worker backup's outcome after the next backup of its service starts
+- **backup:** Never start a WAL-G base backup while an earlier backup-push still runs in the container
+- **web:** Disable "Delete service" for roles without projects:delete
+- **web:** Don't offer API-key roles the creator cannot grant
+- **web:** Don't report optional settings reads as a page failure
+- **web:** Stay quiet when the backup compatibility check is refused
+- **web:** Don't offer Redeploy for deployments built from an uploaded source
+- **web:** Let a role refused the backup destinations still back up and restore
+- **web:** Send "Upload source again" to the upload page and bound the lookup
+- **web:** Don't report the refused storage-source list as a page error
+- **web:** Report only real failures on role-gated reads and read every backup page
+- **web:** Carry the destination-list refusal opt-out on every reader
+- **web:** Let per-environment redeploy actions wrap on narrow screens
+- **web:** Follow the environments still to redeploy, and upload only archives
+- **web:** Explain deployments with no source instead of opening the deploy dialog
+- **web:** Don't redeploy an environment twice, or from the wrong source, after a link change
+- **web:** Send a service with Other sources off to that setting instead of an upload it would refuse
+- **web:** Tell a variable save to turn on Other sources before uploading again when the service refuses uploads
+- **analytics:** Stop page visitor lists timing out on very busy sessions
+- **analytics:** Bound visitor session, journey and session event reads to their time range
+- **analytics:** Keep page visitor entry and bounce exact for day-long sessions
+- **analytics:** Stop page detail timing out on pages visited by very busy sessions
+- **analytics:** Keep SDK sessions' last access current so page exits stay exact
+- **analytics:** Refresh an SDK session's last access once per interval under concurrent events
+- **backup:** Find a backup by the id its run returned
+- **backup:** Never start a MongoDB, MariaDB or Redis wal-g backup-push beside a surviving one
+- **backup:** Say why a MariaDB without binary logging cannot archive its binary logs
+- **backup:** Fail a MariaDB binlog archive run whose segment did not upload
+- **web:** Show a sandbox's time-limited access requests on its Services tab
+- **dns:** Answer bare names the host resolver refuses with NXDOMAIN, not a warning
+- **agent:** Stop ingress connector processes when the agent stops
+- **reachability:** Add a domain under a tunnel that publishes only chosen hostnames without a confirmation
+- **web:** Make the reachability banner's Add domain finish in one click
+- **web:** Confirm before Add domain opens a restricted address, and never claim HTTPS a tunnel cannot give
+- **reachability:** Never replace a hostname choice made while a run was routing it
+- **reachability:** Keep a hostname choice made after Make it reachable was applied
+- **cli:** Make doctor and migrate find the server's database and data directory without --database-url
+- **cli:** Never create the server's encryption key from an admin command, and read the service definition the way systemd does
+- **cli:** Refuse to guess the server's encryption key when its service URL is unreadable, and check it before setup-multi-node changes anything
+- **cli:** Say which encryption key admin commands use, and use only a shell-set key when the service's URL is unreadable
+- **cli:** When the service's URL is unreadable, use only an encryption key the shell sets, never the data directory's
+- **cli:** Read runtime drop-ins, UnsetEnvironment= and environment-file escapes as systemd does, and recognise the server's database however its URL is spelled
+- **cli:** Reject a malformed encryption key before an admin command changes anything, and name the unknown server rather than a missing key
+- **cli:** Let a unit-specific systemd drop-in override a type-wide one of the same name, as systemd does
+- **cli:** Say in doctor when the server's console never started, and what the installed service needs to create the first admin
+- **cli:** Stop doctor telling an installed server's operator to run `temps setup` for a data directory serve creates or this user cannot see
+- **cli:** Reject a service whose drop-in directory has an entry that cannot be listed, instead of reading it without that drop-in
+- **cli:** Refuse a shell secret variable that is not valid Unicode rather than falling back to the data directory's encryption key
+- **cli:** Create doctor's write probe exclusively so it never writes through a symlink in the data directory
+- **cli:** Refuse a pre-migration backup into ~/.temps when the installed server's data directory cannot be read
+- **cli:** Check the pre-migration backup's destination only when one is taken, and refuse one root would write into another account's data directory
+- **cli:** Expand ExecStart variables, repeated LoadCredential= and non-serve units as systemd does, and never pass doctor's checks on a guessed data directory
+- **cli:** Keep a unit's URL unknown when an unreadable environment file may supply its subcommand, and keep doctor's secret errors that no data directory changes
+- **postgres:** Import from a source on a recent PostgreSQL minor release into a service on an older one
+- **postgres:** Drop pg_attver only from real column-option statements, never from text inside a string, body or comment
+- **backup:** Give every S3 endpoint an explicit scheme and force path style for IP endpoints
+- **backup:** Never echo credentials typed into an S3 endpoint in validation errors
+- **postgres:** Check the WAL archive target with one fixed probe object
+- **monitoring:** Keep edited archiving alarms on rollback and flag a no-op archive_command
+- **backup:** Report only a scheme-shaped prefix as an S3 endpoint scheme
+- **postgres:** Keep every other line of walg.env when repairing its endpoint
+- **postgres:** Explain that clusters have no WAL archive target to test
+- **monitoring:** Never delete alarm rules when rolling back the archiving backfill
+- **postgres:** Replace walg.env atomically from one snapshot, never over a newer file
+- **backup:** Upload MariaDB binary logs with the path style backups use
+- **backup:** Don't re-verify an S3 source whose legacy endpoint is sent back unchanged
+- **backup:** Find a local object store published on port 80 or 443
+- **postgres:** Repair walg.env without downgrading TLS, and keep its credentials out of logs
+- **providers:** Refuse the archive target check as policy when local workloads are disabled
+- **postgres:** Tell unseen stalls, an empty archive_command and archive_library apart in WAL health
+- **web:** Keep the path-style box locked when the endpoint forces it
+- **postgres:** Only advise a restart when it is sure to fix walg.env
+- **postgres:** Never read a walg.env snapshot cut short as a file with no endpoint
+- **core:** Redact quoted secret environment names in error text
+- **backup:** Reach a store's STS over the scheme its S3 clients use
+- **postgres:** Read walg.env as the postgres user, never as root
+- **projects:** Remove a deleted project's built images
+- **projects:** Keep shared, retagged and in-use images when removing a deleted project's images
+- **projects:** Keep retagged images and match implicit latest tags in image cleanup
+- **projects:** Sweep worker nodes and keep copied installs apart when removing deleted projects' images
+- **deployments:** Sweep drained worker nodes and read them in one query
+- **projects:** Never remove another install's images and keep the image sweep moving
+- **deployments:** Bound the owner-ID read of deleted-project image cleanup by its deadline
+- **projects:** Skip offline nodes and keep unlabelled images on shared hosts when removing deleted projects' images
+- **postgres:** Import from PostgreSQL 16.16 into an 18.x service that rejects pg_attver
+- **postgres:** Only strip pg_attver from statements pg_dump wrote, never from quoted text
+- **docker-housekeeping:** Sweep images of deleted projects one project at a time, never the whole daemon
+- **docker-housekeeping:** Retire a deleted project's record only after a full listing, and keep the sweep fair
+- **web:** Refresh request logs in place, keeping filters and page
+- **web:** Make analytics, errors and API traffic Refresh fetch new data
+- **web:** Keep the page and filters when refreshing global errors, traces and analytics
+- **web:** Add Refresh to deployments, monitors, domains, backups, email and other live pages
+- **web:** Keep previous rows only while Refresh moves the window
+- **web:** Keep API traffic routes and callers on screen during Refresh
+- **web:** Keep the segment visitors page when refreshing
+- **web:** Refresh the latest deployment card with the project overview
+- **web:** Don't report a refusal the page expects as a failed Refresh
+- **web:** Show loading, not the previous range's numbers, after picking another range
+- **web:** Keep the API traffic AI summary on its window during Refresh
+- **web:** Keep the last loaded window on screen when a moved window fails
+- **web:** Keep loaded pages on screen when a refresh fails
+- **web:** Refresh everything these pages show
+- **web:** Move the monitor cards' 24-hour window with Refresh
+- **web:** Don't give Ask AI a mix of two windows while one loads
+- **web:** Go back to a page that exists when a refresh shrinks a list
+- **web:** Investigate the window the API traffic summary was made for
+- **web:** Keep the data when Refresh moves a short window after a long idle
+- **web:** Show a failed AI usage read as an error, not as zero usage
+- **web:** Keep Generate from relabelling an older API traffic summary
+- **web:** Keep earlier rows only for real window moves, and say when the latest did not load
+- **web:** Keep a failed window's earlier rows after the cache drops them
+- **web:** Read API traffic again before Refresh summary regenerates it
+- **web:** Show loading, not "No data", while AI usage breakdowns load
+- **web:** Say a database list refresh failed even when the list was empty
+- **web:** Go back to a page that exists when Refresh shrinks a paged list
+- **web:** Keep earlier rows while moved windows keep failing
+- **web:** Say when the traffic for an AI summary could not be read
+- **web:** Say a summary refresh failed when the previous summary stays
+- **web:** Refresh a database's health along with the rest of its page
+- **web:** Never pair counts of two windows in analytics ratios
+- **providers:** Keep healthcheck overrides from starting stopped services or timing out new containers
+- **ai:** Let the assistant read and propose managed service healthcheck settings
+- **providers:** Keep Apply now from undoing a stop and require healthchecks Temps can read in time
+- **providers:** Keep healthcheck overrides across rebuilds, renames and deletes
+- **providers:** Give other Temps processes saved healthcheck settings and keep late saves with their service
+- **providers:** Keep a worker database's healthcheck interval when an older Docker rebuilds it
+- **providers:** Send healthcheck changes to other Temps processes as they happen instead of polling
+- **providers:** Clear a reused container name's healthcheck overrides when a service is created
+- **providers:** Keep the newest healthcheck default and retry failed healthcheck reloads
+- **providers:** Refuse healthcheck timings whose start interval outlasts the start period
+- **providers:** Show and check a MinIO-type service running RustFS against RustFS timings
+- **web:** Stop showing a 0s running start interval on Docker without start interval support
+- **web:** Close an open Apply now confirmation when another service's page opens
+- **providers:** Save healthcheck defaults and overrides one at a time across Temps processes
+- **providers:** Remove the run of spaces from the healthcheck settings busy message
+- **deps:** Patch security vulnerabilities reported by Dependabot
+- **workflows:** Keep committed payloads, fence retention and enforce start and concurrency limits
+- **workflows:** Bind invocation tokens to the executor's environment and harden SDK invocations
+- **workflows:** Fence event delivery to the current wait and keep journal quotas exact
+- **workflows:** Remove unused Rust SDK dependency
+- **workflows:** Block executor endpoints at public ingress
+- **workflows:** Preserve child lifecycle and replay safety
+- **workflows:** Link executor onboarding to environment settings
+- **web:** Select available workflows when starting runs
+- **web:** Preserve padding around environment runtime summary
+- **workflows:** Retain child input cleanup and restore start metrics
+- **workflows:** Bound prepared input cleanup scans
+- **deployments:** Schedule registry images on every architecture their index offers ([#1895](https://github.com/gotempsh/temps/issues/1895))
+
+### Miscellaneous
+
+- **api:** Regenerate the OpenAPI spec and clients for unavailable_reason and the WAL not-checked 404
+- **api:** Regenerate the console and CLI clients for scoped worker credentials
+- **api:** Regenerate the web and CLI clients for internal access grants
+- **api:** Regenerate the web and CLI clients for the merged tree
+- **api:** Regenerate clients for the child workflow step kind
+
+### Performance
+
+- **docker-util:** Keep image cleanup's daemon reads bounded to the page and the candidates
+- **docker-util:** Read labelled image listings as a stream and hold only the page
+- **providers:** Refresh healthcheck overrides from changed services only
+
+### Refactor
+
+- **environments:** Move environment teardown into a service
+- **cli:** Split the locked read-edit-write out of `temps agent labels`
+- **cli:** Move the service definition reader's tests into a sibling tests.rs
+- **cli:** Move doctor's tests into a sibling tests.rs
+
+### Revert
+
+- **web:** Drop the test-wide API client and storage reset, which main now does per test file
+
+### Styling
+
+- **logs:** Format the unsealed-line counting in the chunk store
+- Format the auth and cloud crates with cargo fmt
+- **postgres:** Format the swap rebuild check in the managed TLS restore test
+- **postgres:** Format the data import test's image check
+- **deployments:** Format the deleted-project image removal deadline
+
+### Testing
+
+- **providers:** Stop the exec-credential log test losing its events to parallel tests ([#1842](https://github.com/gotempsh/temps/issues/1842))
+- **node-agent:** Keep the worker service golden fixture stable across create attempts
+- **backup:** Prove a cross-service WAL-G restore into a worker PostgreSQL
+- **plugin-sdk:** Run AI tool tests with Bun
+- **plugins:** Restore consent schema in actor rollback coverage
+- **plugins:** Check persisted actor consent after migration
+- **backup:** Build the MariaDB PITR and worker-data tests again with every feature
+- **network:** Expect the ADR 062 wording when another device holds the VXLAN ID
+- **node-agent:** Steady the worker engine proofs and the timing tests
+- **node-agent:** Prove each failed service-create step cleans up only what it made
+- **authz:** Register the internal access grant handlers in the project guard inventories
+- **deployments:** Expect a plane container's only resolver to be the internal one
+- **metrics,providers:** Scope the proxy delta-counter check to proxy names; expect the pinned MariaDB image
+- **analytics:** Move analytics tests to a sibling file and check generic plans
+- **analytics:** Check the chunk-exclusion bounds under generic plans too
+- **web:** Stop the reachability banner test leaking its mock fetch
+- **ingress:** Prove a run's tunnel choice never replaces one made meanwhile
+- **postgres:** Pin the data import test's PostgreSQL 16 source to 16.15
+- **web:** Stop test files leaking their fake API server into later files
+- **web:** Reset the API client's fetch and browser storage after every test, so one test file can no longer break another
+- **backup:** Cover S3 source updates that change only the TLS setting
+- **postgres:** Prove walg.env is read as postgres where exec defaults to root
+- **housekeeping:** Cover a deployment naming an image without its implicit latest tag
+- **web:** Click the shared Refresh button in the AI crawler browser tests
+- **providers:** Cover pending recreate on Docker daemons with and without the start interval
+- **providers:** Check that a failed healthcheck reload reconnects the listener
+- **web:** Stop the plugins page test's module mocks leaking into later test files
+- **sandbox:** Refresh the egress-sidecar golden fixture for the internal proxy address
+- **workflows:** Run the SDK's conformance suite and an end-to-end test against the real engine
+- **workflows:** Advance event replay to recorded wake time
+
+<!-- generated by git-cliff -->
+
 ## [0.1.0-beta.61] - 2026-11-06
 
 ### Added
