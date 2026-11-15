@@ -275,10 +275,8 @@ impl ExternalServiceManager {
                         // default stays `false` so existing rows and out-of-band inserts
                         // are unaffected.
                         metrics_enabled: Set(true),
-                        // New services use explicit backup setup. Mark the legacy
-                        // automatic-schedule decision handled so its reconciler
-                        // cannot override an operator who chose to set up later.
-                        // Existing instance-wide schedules still cover this service.
+                        // Explicit setup completes the legacy enrollment decision;
+                        // existing instance-wide schedules still apply.
                         default_backup_provisioned: Set(true),
                         created_by_user_id: Set(created_by_user_id),
                         created_at: Set(Utc::now()),
