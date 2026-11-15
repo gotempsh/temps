@@ -111,9 +111,6 @@ await blob.put('videos/clip.mp4', stream);
 |--------|------|---------|-------------|
 | `contentType` | `string` | Auto-detected | MIME type of the file |
 | `addRandomSuffix` | `boolean` | `true` | Append a random suffix to prevent name collisions |
-| `cacheControl` | `string` | - | Cache-Control header value |
-| `contentEncoding` | `string` | - | Content encoding (e.g., `'gzip'`) |
-| `contentDisposition` | `string` | - | Content disposition (e.g., `'attachment; filename="file.txt"'`) |
 
 **Returns `BlobInfo`:**
 
@@ -225,7 +222,6 @@ export async function POST(request: Request) {
     {
       contentType: file.type,
       addRandomSuffix: false,
-      cacheControl: 'public, max-age=31536000, immutable',
     }
   );
 
@@ -264,7 +260,6 @@ async function uploadAsset(filePath: string) {
 
   const { url } = await blob.put(`assets/${hash}.${ext}`, content, {
     addRandomSuffix: false,
-    cacheControl: 'public, max-age=31536000, immutable',
   });
 
   return url;

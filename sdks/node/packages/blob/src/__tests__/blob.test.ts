@@ -148,8 +148,7 @@ describe('BlobClient', () => {
 
       await client.put('file.txt', 'content', {
         addRandomSuffix: true,
-        cacheControl: 'max-age=31536000',
-        contentDisposition: 'attachment',
+        contentType: 'text/plain',
       });
 
       // The server accepts raw bytes and PutBlobQuery, not multipart FormData.

@@ -302,6 +302,64 @@ class ReleaseTests(unittest.TestCase):
             calls = [c.args for c in cmd.call_args_list if c.args[:2] == ('cargo', 'package')]
             self.assertEqual(calls, [('cargo', 'package', '--locked', '-p', 'temps-plugin-protocol', '-p', 'temps-plugin-sdk')])
 
+    def exercise_rust_publication(self, *, mismatch=False, protocol_published=False):
+        packages = [dict(key=name, name=name, kind='crate', path='crates/' + name, version='1.2.3')
+                    for name in ('temps-plugin-protocol', 'temps-plugin-sdk')]
+        output, target = self.root / 'artifacts', self.root / 'target'
+        (target / 'package').mkdir(parents=True)
+        for package in packages:
+            directory = output / package['key']
+            directory.mkdir(parents=True)
+            filename = package['name'] + '-1.2.3.crate'
+            (directory / filename).write_bytes(package['name'].encode())
+            (target / 'package' / filename).write_bytes(b'changed' if mismatch and package['name'] == 'temps-plugin-sdk' else package['name'].encode())
+        published = {packages[0]['name']} if protocol_published else set()
+        uploads = []
+        checked_after_upload = []
+        real_pending = release.pending_files
+        def pending(package, directory):
+            def fetch(url):
+                if package['name'] not in published:
+                    return None
+                if package['name'] in uploads:
+                    checked_after_upload.append(package['name'])
+                archive = directory / (package['name'] + '-1.2.3.crate')
+                return {'version': {'checksum': release.digest(archive), 'yanked': False}}
+            return real_pending(package, directory, fetch)
+        def command(*args, **kwargs):
+            if args[:2] == ('cargo', 'metadata'):
+                return json.dumps({'target_directory': str(target)})
+            if args[:2] == ('cargo', 'publish'):
+                name = args[-1]
+                self.assertNotIn(name, published)
+                if name == 'temps-plugin-sdk':
+                    self.assertIn('temps-plugin-protocol', published)
+                uploads.append(name)
+                published.add(name)
+            return ''
+        with patch.object(release, 'run', side_effect=command), patch.object(release, 'pending_files', side_effect=pending):
+            if mismatch:
+                with self.assertRaisesRegex(ValueError, 'differs from tested archive'):
+                    release.publish(packages, output, 'crate')
+                self.assertEqual(uploads, [])
+            else:
+                release.publish(packages, output, 'crate')
+                expected = ['temps-plugin-sdk'] if protocol_published else [p['name'] for p in packages]
+                self.assertEqual(uploads, expected)
+                self.assertTrue(set(expected).issubset(checked_after_upload))
+                # A second invocation reconciles the completed upload without duplicating it.
+                release.publish(packages, output, 'crate')
+                self.assertEqual(uploads, expected)
+
+    def test_rust_uploads_verified_archives_in_dependency_order(self):
+        self.exercise_rust_publication()
+
+    def test_rust_archive_mismatch_prevents_all_uploads(self):
+        self.exercise_rust_publication(mismatch=True)
+
+    def test_rust_retry_after_only_protocol_was_uploaded(self):
+        self.exercise_rust_publication(protocol_published=True)
+
     def test_release_preparation_updates_lockfile_and_signs_commit(self):
         script = (release.ROOT / 'scripts/release.sh').read_text()
         self.assertIn('cargo update --workspace', script)

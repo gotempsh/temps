@@ -41,21 +41,6 @@ export interface PutOptions {
    * @default true
    */
   addRandomSuffix?: boolean;
-
-  /**
-   * Custom cache control header
-   */
-  cacheControl?: string;
-
-  /**
-   * Content encoding (e.g., 'gzip')
-   */
-  contentEncoding?: string;
-
-  /**
-   * Content disposition (e.g., 'attachment; filename="file.txt"')
-   */
-  contentDisposition?: string;
 }
 
 /**
