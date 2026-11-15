@@ -50,7 +50,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **backup:** Back up and restore a worker's Redis with the control plane's engine through its agent
 - **backup:** Back up and restore a worker's MariaDB with the control plane's engines
 - **sandbox:** Add timed GitHub and service access through worker proxies ([#1849](https://github.com/gotempsh/temps/issues/1849))
-- **mcp:** Expose the temps virtual CLI on the MCP endpoint ([#1860](https://github.com/gotempsh/temps/issues/1860)) [**BREAKING**]
+- **mcp:** Expose the temps virtual CLI on the MCP endpoint ([#1860](https://github.com/gotempsh/temps/issues/1860)) [**BREAKING**]: replace endpoint-specific MCP tools with temps, temps_write and confirm_action. Existing clients must refresh discovery; edge-rule operations remain available through the console and REST API.
 - **postgres:** Offer TLS on managed PostgreSQL services ([#1871](https://github.com/gotempsh/temps/issues/1871))
 - **config:** Inspect installation secrets the way serve loads them, without creating them
 - **postgres:** Check the WAL archive target before archiving and repair walg.env on start
@@ -81,6 +81,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **api:** Regenerate the console and CLI clients for the DNS observability endpoints
 - **api:** Regenerate the console and CLI clients for the internal routing status fields
 - **deps:** Bump quinn-udp to 0.5.16 for RUSTSEC-2026-0538
+- **changelog:** Print the migration note of breaking changes
 
 ### CI
 
