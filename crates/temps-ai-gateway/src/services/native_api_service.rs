@@ -1104,6 +1104,7 @@ impl NativeApiService {
                 false,
                 record.provider_key_id.is_none(),
                 crate::types::PromptTokensDetails::default(),
+                crate::services::usage_service::TokenScope::Batch,
                 &context,
             )
             .await?;

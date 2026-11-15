@@ -6013,6 +6013,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 
 [[package]]
+name = "llm-prices"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9606d5d2a074a2de43ae1e9d76ffdb95e5ffb870533b89caccaa4aa2d4abf2d6"
+
+[[package]]
 name = "lock_api"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12644,6 +12650,7 @@ dependencies = [
  "http 1.5.0",
  "http-body-util",
  "jsonschema",
+ "llm-prices",
  "moka",
  "reqwest 0.12.28",
  "sea-orm 1.1.20",

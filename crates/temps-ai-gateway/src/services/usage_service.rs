@@ -58,6 +58,17 @@ pub(crate) fn cost_microcents_from_details(
     Some(cost.round().clamp(0.0, i64::MAX as f64) as i64)
 }
 
+/// What a usage record's token counts cover.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TokenScope {
+    /// One request: long-context prices apply when its prompt is over a
+    /// model's threshold.
+    Request,
+    /// Totals summed over many requests, such as a finished batch. The
+    /// long-context threshold is per prompt, so it is not applied.
+    Batch,
+}
+
 /// Cost of a request whose model the catalogue publishes no price for.
 ///
 /// A vendor model goes to the built-in price list, which charges a model it
@@ -72,11 +83,25 @@ fn unlisted_cost_microcents(
     model: &str,
     input_tokens: i64,
     output_tokens: i64,
+    scope: TokenScope,
 ) -> i64 {
     if crate::self_hosted::is_self_hosted(provider) {
         return 0;
     }
-    crate::services::pricing::estimate_cost_microcents(model, input_tokens, output_tokens)
+    match scope {
+        TokenScope::Request => crate::services::pricing::estimate_cost_microcents(
+            provider,
+            model,
+            input_tokens,
+            output_tokens,
+        ),
+        TokenScope::Batch => crate::services::pricing::estimate_batch_cost_microcents(
+            provider,
+            model,
+            input_tokens,
+            output_tokens,
+        ),
+    }
 }
 
 // ============================================================================
@@ -446,6 +471,7 @@ impl UsageService {
             is_streaming,
             is_byok,
             cache,
+            TokenScope::Request,
             context,
         )
         .await
@@ -505,6 +531,7 @@ impl UsageService {
         is_streaming: bool,
         is_byok: bool,
         cache: PromptTokensDetails,
+        scope: TokenScope,
         context: &AiRequestContext,
     ) -> Result<(), AiGatewayError> {
         // Callers that already priced the request keep their figure. Everything
@@ -521,7 +548,9 @@ impl UsageService {
                 .await
             {
                 Some(cost) => cost,
-                None => unlisted_cost_microcents(provider, model, input_tokens, output_tokens),
+                None => {
+                    unlisted_cost_microcents(provider, model, input_tokens, output_tokens, scope)
+                }
             }
         };
         let record = ai_usage_logs::ActiveModel {
@@ -1498,7 +1527,8 @@ mod tests {
                 crate::self_hosted::OPENAI_COMPATIBLE,
                 "local-flash",
                 7_000_000,
-                100_000
+                100_000,
+                TokenScope::Request
             ),
             0
         );
@@ -1507,10 +1537,44 @@ mod tests {
     #[test]
     fn an_unlisted_vendor_model_keeps_the_worst_case_price() {
         assert_eq!(
-            unlisted_cost_microcents("openrouter", "vendor/unknown", 1_000, 200),
-            crate::services::pricing::estimate_cost_microcents("vendor/unknown", 1_000, 200)
+            unlisted_cost_microcents(
+                "openrouter",
+                "vendor/unknown",
+                1_000,
+                200,
+                TokenScope::Request
+            ),
+            crate::services::pricing::estimate_cost_microcents(
+                "openrouter",
+                "vendor/unknown",
+                1_000,
+                200
+            )
         );
-        assert!(unlisted_cost_microcents("openrouter", "vendor/unknown", 1_000, 200) > 0);
+        assert!(
+            unlisted_cost_microcents(
+                "openrouter",
+                "vendor/unknown",
+                1_000,
+                200,
+                TokenScope::Request
+            ) > 0
+        );
+    }
+
+    #[test]
+    fn batch_totals_are_priced_without_the_per_prompt_long_context_threshold() {
+        // 300,000 input tokens summed over a batch of short prompts.
+        assert_eq!(
+            unlisted_cost_microcents("openai", "gpt-5.4", 300_000, 100, TokenScope::Batch),
+            crate::services::pricing::estimate_batch_cost_microcents(
+                "openai", "gpt-5.4", 300_000, 100
+            )
+        );
+        assert!(
+            unlisted_cost_microcents("openai", "gpt-5.4", 300_000, 100, TokenScope::Batch)
+                < unlisted_cost_microcents("openai", "gpt-5.4", 300_000, 100, TokenScope::Request)
+        );
     }
 
     #[tokio::test]

@@ -45,6 +45,7 @@ moka = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 tempfile = { workspace = true }
+llm-prices = { workspace = true }
 
 [dev-dependencies]
 temps-test-utils = { path = "../temps-test-utils" }

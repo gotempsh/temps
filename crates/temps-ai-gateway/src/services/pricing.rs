@@ -5,6 +5,8 @@
 //!
 //! Prices are USD per 1M tokens. The usage service prices requests that were
 //! logged without a cost from this catalog, and the pricing endpoint serves it.
+//! Rates for models the `llm-prices` crate lists come from it, so they follow
+//! provider price changes with a dependency bump instead of a hand edit.
 
 use serde::Serialize;
 use utoipa::ToSchema;
@@ -114,7 +116,19 @@ impl PricingBuilder {
     }
 }
 
+/// The model catalog. A model `llm-prices` lists under the same provider takes
+/// its rates (see `apply_listed_price`); the rates written in `table_pricing`
+/// apply to the rest: xAI, OpenRouter routes and models the crate does not list.
 pub fn build_pricing() -> Vec<ModelPricing> {
+    let mut models = table_pricing();
+    for model in &mut models {
+        apply_listed_price(model);
+    }
+    models
+}
+
+/// The hand-written rows, before `llm-prices` rates are applied.
+fn table_pricing() -> Vec<ModelPricing> {
     vec![
         // ── Anthropic ───────────────────────────────────────────────────
         PricingBuilder::new("anthropic", "claude-opus-5", "Claude Opus 5", 5.0, 25.0)
@@ -372,6 +386,36 @@ pub fn build_pricing() -> Vec<ModelPricing> {
     ]
 }
 
+/// The `llm-prices` row for a catalog model, when the crate lists that model
+/// under the same provider. The crate names Gemini's provider `google`.
+fn listed_price(provider: &str, model: &str) -> Option<&'static llm_prices::Price> {
+    let listed = llm_prices::lookup(model)?;
+    let same_provider = match provider {
+        "gemini" => listed.provider == "google",
+        other => listed.provider == other,
+    };
+    same_provider.then_some(listed)
+}
+
+/// Replace a catalog model's rates with the ones `llm-prices` lists for it.
+/// A rate the crate does not list keeps the value from the table.
+fn apply_listed_price(model: &mut ModelPricing) {
+    let Some(listed) = listed_price(&model.provider, &model.model) else {
+        return;
+    };
+    model.input_per_million = listed.input.unwrap_or(model.input_per_million);
+    model.output_per_million = listed.output.unwrap_or(model.output_per_million);
+    model.cache_write_5m_per_million = listed
+        .cache_write("5m")
+        .or(model.cache_write_5m_per_million);
+    model.cache_write_1h_per_million = listed
+        .cache_write("1h")
+        .or(model.cache_write_1h_per_million);
+    model.cache_hit_per_million = listed.cache_read.or(model.cache_hit_per_million);
+    model.batch_input_per_million = listed.batch_input.or(model.batch_input_per_million);
+    model.batch_output_per_million = listed.batch_output.or(model.batch_output_per_million);
+}
+
 // ============================================================================
 // Cost estimation
 // ============================================================================
@@ -382,8 +426,10 @@ pub fn build_pricing() -> Vec<ModelPricing> {
 /// token in that unit: `$2.50 / 1M tokens` is `2.5` microcents per token.
 struct RateTable {
     by_model: std::collections::HashMap<String, (f64, f64)>,
-    /// Most expensive listed rates, charged for models that are not priced so
-    /// an unlisted model can never be a way around a spend cap.
+    /// Most expensive rates in the hand-written table, charged for models that
+    /// are not priced so an unlisted model can never be a way around a spend
+    /// cap. Taken before `llm-prices` rates apply, so a crate update does not
+    /// move the fallback.
     worst_case: (f64, f64),
 }
 
@@ -392,9 +438,11 @@ fn rate_table() -> &'static RateTable {
     TABLE.get_or_init(|| {
         let mut by_model = std::collections::HashMap::new();
         let mut worst_case = (0.0_f64, 0.0_f64);
-        for model in build_pricing() {
+        for model in table_pricing() {
             worst_case.0 = worst_case.0.max(model.input_per_million);
             worst_case.1 = worst_case.1.max(model.output_per_million);
+        }
+        for model in build_pricing() {
             by_model.insert(
                 model.model,
                 (model.input_per_million, model.output_per_million),
@@ -407,34 +455,96 @@ fn rate_table() -> &'static RateTable {
     })
 }
 
-/// Estimate the provider cost of a request in microcents (1/10000 of a cent).
+/// Rates `llm-prices` lists for a model under the provider that served it, at
+/// its long-context prices when `prompt_tokens` is over the model's
+/// long-context threshold. `None` when the crate lists the id under another
+/// provider (an OpenRouter route, or the same name served elsewhere).
 ///
-/// Exact model ids win; otherwise the longest listed id the model extends at a
-/// `-`, `:` or `@` boundary applies (so a dated snapshot `gpt-4o-2025-01-01`
-/// is priced as `gpt-4o`). Unlisted models are charged at the most expensive
-/// listed rate. This is an estimate from list prices: it ignores cache
-/// discounts and batch pricing, so it errs on the high side.
-pub fn estimate_cost_microcents(model: &str, input_tokens: i64, output_tokens: i64) -> i64 {
+/// `prompt_tokens` is the size of one prompt. Batch totals pass `None`: the
+/// threshold is per request, so a total across many short prompts must not
+/// be charged at long-context prices.
+fn listed_rates(provider: &str, model: &str, prompt_tokens: Option<u64>) -> Option<(f64, f64)> {
+    let listed = listed_price(provider, model)?;
+    match (listed.long_context, prompt_tokens) {
+        (Some(long), Some(tokens)) if tokens > long.threshold_tokens => {
+            Some((long.input?, long.output?))
+        }
+        _ => Some((listed.input?, listed.output?)),
+    }
+}
+
+/// Per-token rates for a model, in the order `estimate_cost_microcents`
+/// documents.
+fn rates_for(provider: &str, model: &str, prompt_tokens: Option<u64>) -> (f64, f64) {
     let table = rate_table();
-    let (input_rate, output_rate) = table
+    if let Some(rates) = listed_rates(provider, model, prompt_tokens) {
+        return rates;
+    }
+    if let Some(rates) = table.by_model.get(model) {
+        return *rates;
+    }
+    table
         .by_model
-        .get(model)
-        .copied()
-        .or_else(|| {
-            table
-                .by_model
-                .iter()
-                .filter(|(id, _)| {
-                    model.strip_prefix(id.as_str()).is_some_and(|rest| {
-                        rest.starts_with('-') || rest.starts_with(':') || rest.starts_with('@')
-                    })
-                })
-                .max_by_key(|(id, _)| id.len())
-                .map(|(_, rates)| *rates)
+        .iter()
+        .filter(|(id, _)| {
+            model.strip_prefix(id.as_str()).is_some_and(|rest| {
+                rest.starts_with('-') || rest.starts_with(':') || rest.starts_with('@')
+            })
         })
-        .unwrap_or(table.worst_case);
+        .max_by_key(|(id, _)| id.len())
+        // A dated snapshot takes its base model's long-context prices too.
+        .map(|(id, rates)| listed_rates(provider, id, prompt_tokens).unwrap_or(*rates))
+        .unwrap_or(table.worst_case)
+}
+
+fn cost_microcents(
+    (input_rate, output_rate): (f64, f64),
+    input_tokens: i64,
+    output_tokens: i64,
+) -> i64 {
     let cost = input_tokens.max(0) as f64 * input_rate + output_tokens.max(0) as f64 * output_rate;
     cost.ceil() as i64
+}
+
+/// Estimate the provider cost of one request in microcents (1/10000 of a cent).
+///
+/// A model `llm-prices` lists under the same provider (including its dated
+/// and provider-prefixed ids) is priced from it, at long-context prices when
+/// the prompt is over the model's threshold. Otherwise exact model ids in the
+/// table win, then the longest listed id the model extends at a `-`, `:` or
+/// `@` boundary (so a dated snapshot `gpt-4o-2025-01-01` is priced as
+/// `gpt-4o`, long-context prices included). Unlisted models are charged at the
+/// most expensive hand-written rate (see `RateTable::worst_case`). This is an
+/// estimate from list prices: it ignores cache discounts and batch pricing, so
+/// it errs on the high side.
+pub fn estimate_cost_microcents(
+    provider: &str,
+    model: &str,
+    input_tokens: i64,
+    output_tokens: i64,
+) -> i64 {
+    let prompt_tokens = u64::try_from(input_tokens).unwrap_or(0);
+    cost_microcents(
+        rates_for(provider, model, Some(prompt_tokens)),
+        input_tokens,
+        output_tokens,
+    )
+}
+
+/// Estimate the cost of token totals summed across many requests, such as a
+/// finished batch. Priced like `estimate_cost_microcents`, except long-context
+/// prices never apply: the totals say nothing about any single prompt.
+pub fn estimate_batch_cost_microcents(
+    provider: &str,
+    model: &str,
+    input_tokens: i64,
+    output_tokens: i64,
+) -> i64 {
+    cost_microcents(
+        rates_for(provider, model, None),
+        input_tokens,
+        output_tokens,
+    )
 }
 
 #[cfg(test)]
@@ -445,7 +555,7 @@ mod tests {
     fn estimate_cost_uses_listed_rates_in_microcents() {
         // gpt-4o: $2.50 in / $10 out per 1M tokens => 2.5 and 10 microcents per token.
         assert_eq!(
-            estimate_cost_microcents("gpt-4o", 1_000, 100),
+            estimate_cost_microcents("openai", "gpt-4o", 1_000, 100),
             2_500 + 1_000
         );
     }
@@ -453,20 +563,20 @@ mod tests {
     #[test]
     fn estimate_cost_prices_dated_snapshots_as_their_base_model() {
         assert_eq!(
-            estimate_cost_microcents("gpt-4o-2025-01-01", 1_000, 100),
-            estimate_cost_microcents("gpt-4o", 1_000, 100)
+            estimate_cost_microcents("openai", "gpt-4o-2025-01-01", 1_000, 100),
+            estimate_cost_microcents("openai", "gpt-4o", 1_000, 100)
         );
         // A longer listed id must win over a shorter prefix of it.
         assert_eq!(
-            estimate_cost_microcents("gpt-4o-mini-2025-01-01", 1_000, 0),
-            estimate_cost_microcents("gpt-4o-mini", 1_000, 0)
+            estimate_cost_microcents("openai", "gpt-4o-mini-2025-01-01", 1_000, 0),
+            estimate_cost_microcents("openai", "gpt-4o-mini", 1_000, 0)
         );
     }
 
     #[test]
     fn estimate_cost_charges_unlisted_models_at_worst_case() {
-        let unlisted = estimate_cost_microcents("totally-unlisted-model", 1_000, 1_000);
-        let cheapest = estimate_cost_microcents("gpt-4o-mini", 1_000, 1_000);
+        let unlisted = estimate_cost_microcents("openai", "totally-unlisted-model", 1_000, 1_000);
+        let cheapest = estimate_cost_microcents("openai", "gpt-4o-mini", 1_000, 1_000);
         assert!(unlisted > cheapest);
         let table = rate_table();
         assert_eq!(
@@ -476,9 +586,148 @@ mod tests {
     }
 
     #[test]
+    fn catalog_takes_rates_from_llm_prices() {
+        let pricing = build_pricing();
+        let row = |id: &str| {
+            pricing
+                .iter()
+                .find(|p| p.model == id)
+                .expect("catalog lists the model")
+        };
+        for id in ["o3", "gpt-5.6-luna", "claude-haiku-4-5", "gemini-2.5-flash"] {
+            let listed = llm_prices::lookup(id).expect("llm-prices lists the model");
+            let model = row(id);
+            assert_eq!(Some(model.input_per_million), listed.input, "{id}");
+            assert_eq!(Some(model.output_per_million), listed.output, "{id}");
+            assert_eq!(model.cache_hit_per_million, listed.cache_read, "{id}");
+            assert_eq!(model.batch_input_per_million, listed.batch_input, "{id}");
+            assert_eq!(model.batch_output_per_million, listed.batch_output, "{id}");
+        }
+        let haiku = row("claude-haiku-4-5");
+        let listed = llm_prices::lookup("claude-haiku-4-5").expect("llm-prices lists Haiku 4.5");
+        assert_eq!(haiku.cache_write_5m_per_million, listed.cache_write("5m"));
+        assert_eq!(haiku.cache_write_1h_per_million, listed.cache_write("1h"));
+        // Models the crate does not list keep the table's rates.
+        assert_eq!(row("grok-4.5").input_per_million, 2.0);
+        assert_eq!(row("grok-4.5").output_per_million, 6.0);
+    }
+
+    #[test]
+    fn estimate_cost_prices_models_missing_from_the_table_from_llm_prices() {
+        let table = rate_table();
+        for (provider, id) in [("anthropic", "claude-haiku-5-5"), ("openai", "gpt-6-sol")] {
+            assert!(!table.by_model.contains_key(id), "{id} is in the table");
+            let listed = llm_prices::lookup(id).expect("llm-prices lists the model");
+            let (input, output) = (
+                listed.input.expect("input price"),
+                listed.output.expect("output price"),
+            );
+            let expected = (1_000.0 * input + 100.0 * output).ceil() as i64;
+            assert_eq!(
+                estimate_cost_microcents(provider, id, 1_000, 100),
+                expected,
+                "{id}"
+            );
+            assert!(
+                expected < estimate_cost_microcents("openai", "totally-unlisted-model", 1_000, 100),
+                "{id} must not fall back to the worst case"
+            );
+        }
+        // Dated and provider-prefixed ids resolve to the same row.
+        assert_eq!(
+            estimate_cost_microcents("anthropic", "anthropic/claude-haiku-5-5", 1_000, 100),
+            estimate_cost_microcents("anthropic", "claude-haiku-5-5", 1_000, 100)
+        );
+    }
+
+    #[test]
+    fn estimate_cost_uses_long_context_rates_over_the_threshold() {
+        let listed = llm_prices::lookup("claude-haiku-5-5").expect("llm-prices lists Haiku 5.5");
+        let long = listed
+            .long_context
+            .expect("Haiku 5.5 has a long-context tier");
+        let over = i64::try_from(long.threshold_tokens).expect("threshold fits i64") + 1;
+        let expected = (over as f64 * long.input.expect("long-context input price")
+            + 100.0 * long.output.expect("long-context output price"))
+        .ceil() as i64;
+        assert_eq!(
+            estimate_cost_microcents("anthropic", "claude-haiku-5-5", over, 100),
+            expected
+        );
+    }
+
+    #[test]
+    fn dated_snapshots_take_their_base_model_long_context_rates() {
+        // llm-prices matches dated ids only for Anthropic, so the snapshot
+        // goes through the prefix match and must still cross the threshold.
+        assert!(llm_prices::lookup("gpt-5.4-2026-03-05").is_none());
+        let over = 300_000;
+        assert_eq!(
+            estimate_cost_microcents("openai", "gpt-5.4-2026-03-05", over, 100),
+            estimate_cost_microcents("openai", "gpt-5.4", over, 100)
+        );
+        assert!(
+            estimate_cost_microcents("openai", "gpt-5.4", over, 100)
+                > estimate_batch_cost_microcents("openai", "gpt-5.4", over, 100)
+        );
+    }
+
+    #[test]
+    fn batch_totals_are_never_charged_long_context_rates() {
+        // 300,000 tokens summed over many short prompts: no single prompt
+        // crossed gpt-5.4's 272,000-token threshold.
+        let base = llm_prices::lookup("gpt-5.4").expect("llm-prices lists gpt-5.4");
+        let expected = (300_000.0 * base.input.expect("input price")
+            + 100.0 * base.output.expect("output price"))
+        .ceil() as i64;
+        for model in ["gpt-5.4", "gpt-5.4-2026-03-05"] {
+            assert_eq!(
+                estimate_batch_cost_microcents("openai", model, 300_000, 100),
+                expected,
+                "{model}"
+            );
+        }
+        // Under the threshold both paths agree.
+        assert_eq!(
+            estimate_batch_cost_microcents("openai", "gpt-5.4", 1_000, 100),
+            estimate_cost_microcents("openai", "gpt-5.4", 1_000, 100)
+        );
+    }
+
+    #[test]
+    fn estimate_cost_uses_llm_prices_only_under_the_same_provider() {
+        let worst_case = estimate_cost_microcents("openai", "totally-unlisted-model", 1_000, 100);
+        // An OpenRouter route is priced from its own row, not the upstream
+        // provider's list price.
+        assert_eq!(
+            estimate_cost_microcents("openrouter", "anthropic/claude-sonnet-5", 1_000, 100),
+            (1_000.0 * 2.0 + 100.0 * 10.0_f64).ceil() as i64
+        );
+        // A model the crate lists under another provider is not priced from it.
+        for provider in ["openrouter", "openai", "xai"] {
+            assert_eq!(
+                estimate_cost_microcents(provider, "claude-haiku-5-5", 1_000, 100),
+                worst_case,
+                "{provider}"
+            );
+        }
+    }
+
+    #[test]
+    fn unlisted_model_fallback_comes_from_the_hand_written_table() {
+        // o3-pro's $20/$80 row is the most expensive hand-written rate; a
+        // dearer `llm-prices` rate (gpt-5.4-pro) does not move the fallback.
+        assert_eq!(rate_table().worst_case, (20.0, 80.0));
+        assert_eq!(
+            estimate_cost_microcents("openai", "totally-unlisted-model", 1_000, 1_000),
+            20_000 + 80_000
+        );
+    }
+
+    #[test]
     fn estimate_cost_is_zero_for_no_tokens_and_ignores_negatives() {
-        assert_eq!(estimate_cost_microcents("gpt-4o", 0, 0), 0);
-        assert_eq!(estimate_cost_microcents("gpt-4o", -5, -5), 0);
+        assert_eq!(estimate_cost_microcents("openai", "gpt-4o", 0, 0), 0);
+        assert_eq!(estimate_cost_microcents("openai", "gpt-4o", -5, -5), 0);
     }
 
     #[test]

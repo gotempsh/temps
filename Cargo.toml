@@ -373,6 +373,9 @@ lettre = { version = "0.11.11", features = ["tokio1", "tokio1-rustls-tls", "smtp
 # Git Providers (GitHub, GitLab)
 octocrab = "0.54.1"
 
+# LLM API list prices (temps-ai-gateway cost estimates). No dependencies.
+llm-prices = "1.1"
+
 # ============================================================================
 # Container Management (Docker)
 # ============================================================================
