@@ -76,7 +76,7 @@ import {
   Shield,
   X,
 } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useForm, type UseFormReturn } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { z } from 'zod'
@@ -144,6 +144,10 @@ const healthNumberDraft = (max: number) =>
       `Enter a whole number from 1 to ${max}`
     )
 const healthDraftSchema = z.object({
+  maxInFlightPerReplica: z.union([
+    z.literal(''),
+    healthNumberDraft(4294967295),
+  ]),
   intervalSeconds: healthNumberDraft(3600),
   timeoutSeconds: healthNumberDraft(60),
   unhealthyThreshold: healthNumberDraft(100),
@@ -154,6 +158,7 @@ type HealthDrafts = z.infer<typeof healthDraftSchema>
 function healthDraftValues(policy?: LoadBalancingConfig | null): HealthDrafts {
   const health = policy?.healthCheck
   return {
+    maxInFlightPerReplica: policy?.maxInFlightPerReplica?.toString() ?? '',
     intervalSeconds: String(health?.intervalSeconds ?? 2),
     timeoutSeconds: String(health?.timeoutSeconds ?? 2),
     unhealthyThreshold: String(health?.unhealthyThreshold ?? 3),
@@ -169,7 +174,9 @@ export function EnvironmentConfigurationCard({
   const healthForm = useForm<HealthDrafts>({
     resolver: zodResolver(healthDraftSchema),
     mode: 'onChange',
-    values: healthDraftValues(environment.deployment_config?.loadBalancing),
+    defaultValues: healthDraftValues(
+      environment.deployment_config?.loadBalancing
+    ),
   })
   const nodesQuery = useQuery({
     ...adminListNodesOptions(),
@@ -258,11 +265,17 @@ export function EnvironmentConfigurationCard({
     } as SecurityConfig,
   })
 
+  const routingDirty = useRef({ policy: false, nodes: false })
+  const environmentId = useRef(environment.id)
   const { loadBalancing, preferredNodeIds } = formData
-  const setLoadBalancing = (value: LoadBalancingConfig | null) =>
+  const setLoadBalancing = (value: LoadBalancingConfig | null) => {
+    routingDirty.current.policy = true
     setFormData((previous) => ({ ...previous, loadBalancing: value }))
-  const setPreferredNodeIds = (value: string) =>
+  }
+  const setPreferredNodeIds = (value: string) => {
+    routingDirty.current.nodes = true
     setFormData((previous) => ({ ...previous, preferredNodeIds: value }))
+  }
 
   // Label editing state
   const [newLabelKey, setNewLabelKey] = useState('')
@@ -270,14 +283,29 @@ export function EnvironmentConfigurationCard({
 
   // Sync form data when environment changes
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    setFormData({
-      loadBalancing: (environment.deployment_config?.loadBalancing ??
-        null) as LoadBalancingConfig | null,
-      preferredNodeIds:
-        environment.deployment_config?.loadBalancing?.preferredNodeIds?.join(
-          ', '
-        ) ?? '',
+    const changedIdentity = environmentId.current !== environment.id
+    if (changedIdentity) {
+      environmentId.current = environment.id
+      routingDirty.current = { policy: false, nodes: false }
+    }
+    healthForm.reset(
+      healthDraftValues(environment.deployment_config?.loadBalancing),
+      {
+        keepDirtyValues: !changedIdentity,
+      }
+    )
+    const dirty = { ...routingDirty.current }
+
+    setFormData((previous) => ({
+      loadBalancing: dirty.policy
+        ? previous.loadBalancing
+        : ((environment.deployment_config?.loadBalancing ??
+            null) as LoadBalancingConfig | null),
+      preferredNodeIds: dirty.nodes
+        ? previous.preferredNodeIds
+        : (environment.deployment_config?.loadBalancing?.preferredNodeIds?.join(
+            ', '
+          ) ?? ''),
       branch: environment.branch ?? '',
       cpu_request: microToCores(environment.deployment_config?.cpuRequest),
       cpu_limit: microToCores(environment.deployment_config?.cpuLimit),
@@ -347,8 +375,8 @@ export function EnvironmentConfigurationCard({
               ?.maxRequestsPerHour ?? undefined,
         },
       } as SecurityConfig,
-    })
-  }, [environment])
+    }))
+  }, [environment, healthForm])
 
   const updateEnvironmentSettings = useMutation({
     ...updateEnvironmentSettingsMutation(),
@@ -376,6 +404,10 @@ export function EnvironmentConfigurationCard({
       const drafts = healthForm.getValues()
       routing = {
         ...routing,
+        maxInFlightPerReplica:
+          drafts.maxInFlightPerReplica === ''
+            ? null
+            : Number(drafts.maxInFlightPerReplica),
         healthCheck: {
           ...defaultLoadBalancing.healthCheck!,
           ...routing.healthCheck,
@@ -1685,25 +1717,23 @@ function LoadBalancingFields({
                 Use 0 for the control plane. Unlisted nodes form the final
                 fallback tier.
               </p>
-              <Label htmlFor={`lb-limit-${id}`}>
-                In-flight requests per replica before overflow
-              </Label>
-              <Input
-                id={`lb-limit-${id}`}
-                type="number"
-                min={1}
-                value={policy.maxInFlightPerReplica ?? ''}
-                placeholder="Unlimited"
-                onChange={(e) =>
-                  onChange({
-                    ...policy,
-                    maxInFlightPerReplica: e.target.value
-                      ? Number(e.target.value)
-                      : null,
-                  })
-                }
-              />
             </>
+          )}
+          <Label htmlFor={`lb-limit-${id}`}>
+            In-flight requests per replica before overflow
+          </Label>
+          <Input
+            id={`lb-limit-${id}`}
+            type="number"
+            min={1}
+            placeholder="Unlimited"
+            aria-invalid={!!healthForm.formState.errors.maxInFlightPerReplica}
+            {...healthForm.register('maxInFlightPerReplica')}
+          />
+          {healthForm.formState.errors.maxInFlightPerReplica && (
+            <p role="alert" className="text-sm text-destructive">
+              {healthForm.formState.errors.maxInFlightPerReplica.message}
+            </p>
           )}
           <div className="flex items-center gap-2">
             <Switch

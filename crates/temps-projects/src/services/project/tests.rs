@@ -8108,9 +8108,12 @@ async fn deployment_config_writers_lock_before_merging_and_commit_before_returni
             }),
             ..Default::default()
         });
+        let mut mock = MockDatabase::new(DatabaseBackend::Postgres);
+        if writer != "automatic" {
+            mock = mock.append_query_results([Vec::<temps_entities::settings::Model>::new()]);
+        }
         let db = Arc::new(
-            MockDatabase::new(DatabaseBackend::Postgres)
-                .append_query_results([vec![project.clone()], vec![project]])
+            mock.append_query_results([vec![project.clone()], vec![project]])
                 .into_connection(),
         );
         let service = create_test_services(db.clone(), Arc::new(MockJobQueue::new())).await;
@@ -8120,7 +8123,7 @@ async fn deployment_config_writers_lock_before_merging_and_commit_before_returni
                     .update_project_deployment_config(
                         10,
                         serde_json::from_value(serde_json::json!({"memoryLimit": 512})).unwrap(),
-                        temps_config::CeilingEnforcement::Bypass,
+                        temps_config::CeilingEnforcement::Enforce,
                         DeployCaller::ProjectWriter,
                     )
                     .await
@@ -8146,7 +8149,7 @@ async fn deployment_config_writers_lock_before_merging_and_commit_before_returni
                             memory_request: None,
                             memory_limit: Some(512),
                         },
-                        temps_config::CeilingEnforcement::Bypass,
+                        temps_config::CeilingEnforcement::Enforce,
                     )
                     .await
                     .unwrap();
@@ -8154,6 +8157,15 @@ async fn deployment_config_writers_lock_before_merging_and_commit_before_returni
         }
         drop(service);
         let transactions = Arc::try_unwrap(db).unwrap().into_transaction_log();
+        if writer != "automatic" {
+            let first = transactions[0].statements();
+            assert_eq!(
+                first.len(),
+                1,
+                "settings must be read outside the transaction"
+            );
+            assert!(first[0].sql.contains("settings"));
+        }
         let writes = transactions
             .iter()
             .map(|txn| format!("{txn:?}"))
@@ -8165,9 +8177,26 @@ async fn deployment_config_writers_lock_before_merging_and_commit_before_returni
             write.contains("BEGIN") && write.contains("FOR UPDATE") && write.contains("COMMIT"),
             "{writer} must merge and save in the same locked transaction: {write}"
         );
-        assert!(
-            write.contains("preferredNodeIds"),
-            "{writer} discarded the current routing policy: {write}"
-        );
+        let update = transactions
+            .iter()
+            .flat_map(|txn| txn.statements())
+            .find(|statement| statement.sql.starts_with("UPDATE "))
+            .unwrap();
+        let config = update
+            .values
+            .as_ref()
+            .unwrap()
+            .0
+            .iter()
+            .find_map(|value| {
+                if let sea_orm::Value::Json(Some(json)) = value {
+                    json.get("loadBalancing")
+                        .map(|policy| policy["preferredNodeIds"].clone())
+                } else {
+                    None
+                }
+            })
+            .expect("UPDATE must bind the routing config");
+        assert_eq!(config, serde_json::json!([7, 0]), "{writer}");
     }
 }

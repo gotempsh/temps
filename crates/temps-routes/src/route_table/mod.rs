@@ -1565,18 +1565,23 @@ impl CachedPeerTable {
         if self.probe_started.swap(true, Ordering::AcqRel) {
             return;
         }
-        let client = match reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-        {
-            Ok(client) => client,
-            Err(error) => {
-                error!(%error, "Cannot initialize replica health probes");
-                self.probe_started.store(false, Ordering::Release);
-                return;
+        struct StartedGuard<'a>(&'a std::sync::atomic::AtomicBool);
+        impl Drop for StartedGuard<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
             }
-        };
+        }
+        let _started = StartedGuard(&self.probe_started);
+        let client = crate::replica_policy::probe_client_with_retry(
+            || {
+                reqwest::Client::builder()
+                    .no_proxy()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()
+            },
+            temps_core::retry::RetryConfig::default(),
+        )
+        .await;
         use std::{cmp::Reverse, collections::BinaryHeap, time::Instant};
         let mut snapshot = Arc::new(Vec::new());
         let mut entries: HashMap<usize, (crate::replica_policy::Probe, Instant)> = HashMap::new();

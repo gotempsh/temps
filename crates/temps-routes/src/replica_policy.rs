@@ -108,6 +108,15 @@ fn select_candidate(
     cursor: usize,
     avoid: &[String],
 ) -> Option<(usize, bool)> {
+    select_candidate_after_snapshot(backends, cursor, avoid, || {})
+}
+
+fn select_candidate_after_snapshot(
+    backends: &[BackendEntry],
+    cursor: usize,
+    avoid: &[String],
+    after_snapshot: impl FnOnce(),
+) -> Option<(usize, bool)> {
     if backends.is_empty() {
         return None;
     }
@@ -116,6 +125,17 @@ fn select_candidate(
     let has_healthy = backends
         .iter()
         .any(|b| untried(b) && b.state.health.load(Ordering::Relaxed) == 1);
+    after_snapshot();
+    select_with_health(backends, cursor, &untried, has_healthy)
+        .or_else(|| select_with_health(backends, cursor, &untried, false))
+}
+
+fn select_with_health(
+    backends: &[BackendEntry],
+    cursor: usize,
+    untried: &impl Fn(&BackendEntry) -> bool,
+    has_healthy: bool,
+) -> Option<(usize, bool)> {
     let eligible = |b: &BackendEntry| {
         untried(b)
             && (!b.check_health || !has_healthy || b.state.health.load(Ordering::Relaxed) == 1)
@@ -162,6 +182,23 @@ fn select_candidate(
         .nth(cursor % count)
         .map(|(i, _)| (i, best.is_some()))
         .or(Some((chosen, best.is_some())))
+}
+
+/// Retry client initialization in bounded backoff cycles. Cancellation drops the
+/// future; no separate task is left retrying after the scheduler is stopped.
+pub(crate) async fn probe_client_with_retry(
+    mut build: impl FnMut() -> Result<reqwest::Client, reqwest::Error>,
+    retry: temps_core::retry::RetryConfig,
+) -> reqwest::Client {
+    loop {
+        match retry.retry(|| std::future::ready(build())).await {
+            Ok(client) => return client,
+            Err(error) => {
+                tracing::error!(%error, "Cannot initialize replica health probes; retrying");
+                tokio::time::sleep(retry.max_delay).await;
+            }
+        }
+    }
 }
 
 /// Treat every recorded readiness path as untrusted, including legacy job
@@ -258,6 +295,36 @@ mod tests {
             check_health: true,
         }
     }
+    #[tokio::test]
+    async fn probe_client_recovers_after_a_failed_retry_cycle() {
+        let mut attempts = 0;
+        let _client = probe_client_with_retry(
+            || {
+                attempts += 1;
+                if attempts < 4 {
+                    reqwest::Client::builder().user_agent("\n").build()
+                } else {
+                    reqwest::Client::builder().build()
+                }
+            },
+            temps_core::retry::RetryConfig::new(2)
+                .with_base_delay(std::time::Duration::from_millis(1))
+                .with_max_delay(std::time::Duration::from_millis(1)),
+        )
+        .await;
+        assert_eq!(attempts, 4);
+    }
+
+    #[test]
+    fn last_healthy_replica_failing_during_selection_still_routes_to_a_replica() {
+        let backends = vec![entry(0), entry(1)];
+        backends[0].state.health.store(1, Ordering::Relaxed);
+        let selected = select_candidate_after_snapshot(&backends, 0, &[], || {
+            backends[0].state.health.store(2, Ordering::Relaxed);
+        });
+        assert_eq!(selected, Some((0, true)));
+    }
+
     #[test]
     fn retries_avoid_a_failed_preferred_replica_even_when_it_is_healthy() {
         let backends = vec![entry(0), entry(1)];

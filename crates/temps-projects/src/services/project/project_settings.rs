@@ -1080,6 +1080,16 @@ impl ProjectService {
         settings: UpdateDeploymentSettingsRequest,
         ceiling_enforcement: temps_config::CeilingEnforcement,
     ) -> Result<Project, ProjectError> {
+        let app_settings = if ceiling_enforcement == temps_config::CeilingEnforcement::Enforce {
+            let app_settings = self.config_service.get_settings().await.map_err(|e| {
+                ProjectError::Other(format!(
+                    "Failed to read instance settings to check resource ceilings for project {project_id_or_slug}: {e}"
+                ))
+            })?;
+            Some(app_settings)
+        } else {
+            None
+        };
         let txn = self.db.begin().await?;
         // Find project by ID or slug
         let project = if let Ok(project_id_int) = project_id_or_slug.parse::<i32>() {
@@ -1114,13 +1124,8 @@ impl ProjectService {
         deployment_config.memory_request = settings.memory_request;
         deployment_config.memory_limit = settings.memory_limit;
 
-        if ceiling_enforcement == temps_config::CeilingEnforcement::Enforce {
-            let app_settings = self.config_service.get_settings().await.map_err(|e| {
-                ProjectError::Other(format!(
-                    "Failed to read instance settings to check resource ceilings for project {project_id_or_slug}: {e}"
-                ))
-            })?;
-            Self::enforce_tenant_ceilings(&deployment_config, &app_settings)?;
+        if let Some(app_settings) = &app_settings {
+            Self::enforce_tenant_ceilings(&deployment_config, app_settings)?;
         }
 
         active_project.deployment_config = Set(Some(deployment_config));
@@ -1163,6 +1168,16 @@ impl ProjectService {
         ceiling_enforcement: temps_config::CeilingEnforcement,
         caller: DeployCaller,
     ) -> Result<Project, ProjectError> {
+        let app_settings = if ceiling_enforcement == temps_config::CeilingEnforcement::Enforce {
+            let app_settings = self.config_service.get_settings().await.map_err(|e| {
+                ProjectError::Other(format!(
+                    "Failed to read instance settings to check resource ceilings for project {project_id}: {e}"
+                ))
+            })?;
+            Some(app_settings)
+        } else {
+            None
+        };
         let txn = self.db.begin().await?;
         // Find project by ID or slug
         let project = projects::Entity::find_by_id(project_id)
@@ -1268,13 +1283,8 @@ impl ProjectService {
         // Checked on the merged config, not on the request, so clearing an
         // override back to "inherit" is judged by what the project will
         // actually run with.
-        if ceiling_enforcement == temps_config::CeilingEnforcement::Enforce {
-            let app_settings = self.config_service.get_settings().await.map_err(|e| {
-                ProjectError::Other(format!(
-                    "Failed to read instance settings to check resource ceilings for project {project_id}: {e}"
-                ))
-            })?;
-            Self::enforce_tenant_ceilings(&deployment_config, &app_settings)?;
+        if let Some(app_settings) = &app_settings {
+            Self::enforce_tenant_ceilings(&deployment_config, app_settings)?;
         }
 
         // Update the project
