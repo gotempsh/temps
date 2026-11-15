@@ -77,6 +77,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps:** Bump quinn-udp to 0.5.16 for RUSTSEC-2026-0538
 - **changelog:** Print the migration note of breaking changes
 - **changelog:** List repeated entries once and keep breaking notes on one line
+- **changelog:** Keep a breaking copy of a repeated entry with its marker
 
 ### CI
 
