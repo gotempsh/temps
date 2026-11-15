@@ -296,3 +296,11 @@ describe('parseReplicaCount', () => {
     expect(parseReplicaCount('10')).toEqual({ replicas: 10 })
   })
 })
+
+
+test('invalid routing JSON fails before authentication or network requests', async () => {
+  const result = await runCommand(registerEnvironmentsCommands, ['environments', 'scale', '-p', 'my-app', '--load-balancing', '[3,5]'])
+  expect(result.exitCode).toBe(1)
+  expect(result.fetched).toBe(false)
+  expect(result.stderr).toContain('Invalid --load-balancing JSON')
+})

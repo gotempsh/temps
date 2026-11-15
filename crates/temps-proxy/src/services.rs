@@ -170,6 +170,8 @@ impl UpstreamResolver for UpstreamResolverImpl {
                     label, sni_or_host, selection.address
                 );
                 return Some(PeerSelection {
+                    in_flight: selection.in_flight,
+
                     peer: Box::new(HttpPeer::new(
                         selection.address.clone(),
                         false,
@@ -190,6 +192,8 @@ impl UpstreamResolver for UpstreamResolverImpl {
                     label, host, selection.address, project_id, env_id
                 );
                 return Some(PeerSelection {
+                    in_flight: selection.in_flight,
+
                     peer: Box::new(HttpPeer::new(
                         selection.address.clone(),
                         false,
@@ -210,6 +214,8 @@ impl UpstreamResolver for UpstreamResolverImpl {
                     label, host, selection.address, project_id, env_id
                 );
                 return Some(PeerSelection {
+                    in_flight: selection.in_flight,
+
                     peer: Box::new(HttpPeer::new(
                         selection.address.clone(),
                         false,
@@ -282,6 +288,8 @@ impl UpstreamResolver for UpstreamResolverImpl {
             if let Some(address) = self.server_config.internal_dns_sync_address.as_ref() {
                 debug!(%address, "Routing authenticated DNS sync request to proxy service");
                 return Ok(PeerSelection {
+                    in_flight: None,
+
                     peer: Box::new(HttpPeer::new(address.clone(), false, "".to_string())),
                     container_id: None,
                     container_name: None,
@@ -301,6 +309,7 @@ impl UpstreamResolver for UpstreamResolverImpl {
             "".to_string(),
         ));
         Ok(PeerSelection {
+            in_flight: None,
             peer,
             container_id: None,
             container_name: None,
@@ -363,6 +372,7 @@ impl UpstreamResolver for UpstreamResolverImpl {
 /// A plain-HTTP peer for one of the console's loopback listeners.
 fn console_peer(address: &str) -> PeerSelection {
     PeerSelection {
+        in_flight: None,
         peer: Box::new(HttpPeer::new(address.to_string(), false, "".to_string())),
         container_id: None,
         container_name: None,
@@ -472,6 +482,12 @@ mod public_ingress_tests {
                         address: "127.0.0.1:18080".into(),
                         container_id: None,
                         container_name: None,
+
+                        node_id: None,
+                        state: Default::default(),
+                        tier: 0,
+                        capacity: None,
+                        check_health: false,
                     }],
                     round_robin_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 },
@@ -640,6 +656,12 @@ mod dns_sync_tests {
                     address: "127.0.0.1:18080".into(),
                     container_id: Some("application-container".into()),
                     container_name: None,
+
+                    node_id: None,
+                    state: Default::default(),
+                    tier: 0,
+                    capacity: None,
+                    check_health: false,
                 }],
                 round_robin_counter: Arc::new(AtomicUsize::new(0)),
             },

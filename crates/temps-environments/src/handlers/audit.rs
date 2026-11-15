@@ -48,6 +48,8 @@ pub struct EnvironmentSettingsUpdatedFields {
     pub branch: Option<String>,
     pub replicas: Option<i32>,
     pub security_updated: bool,
+    /// Routing policy change, including explicit reset to project inheritance.
+    pub load_balancing: Option<Option<temps_entities::deployment_config::LoadBalancingConfig>>,
     /// Per-environment attack-mode override change (tri-state):
     /// `None` = unchanged, `Some(None)` = cleared (inherit project),
     /// `Some(Some(b))` = overridden.

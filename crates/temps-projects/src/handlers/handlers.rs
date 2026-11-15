@@ -2322,6 +2322,9 @@ pub async fn update_project_deployment_config(
             "updated".to_string(),
         );
     }
+    if config.load_balancing.is_some() {
+        updated_fields.insert("load_balancing".to_string(), "updated".to_string());
+    }
     if config.health_check_timeout_seconds.is_some() {
         updated_fields.insert(
             "health_check_timeout_seconds".to_string(),

@@ -1032,6 +1032,7 @@ pub struct ProxyContext {
     pub upstream_host: Option<String>,
     pub container_id: Option<String>,
     pub container_name: Option<String>,
+    pub replica_in_flight: Option<temps_routes::replica_policy::InFlightGuard>,
     pub tls_fingerprint: Option<String>,
     pub tls_version: Option<String>,
     pub tls_cipher: Option<String>,
@@ -4923,6 +4924,7 @@ impl ProxyHttp for LoadBalancer {
             error_message: None,
             upstream_host: None,
             container_id: None,
+            replica_in_flight: None,
             container_name: None,
             tls_fingerprint: None,
             tls_version: None,
@@ -7796,6 +7798,8 @@ impl ProxyHttp for LoadBalancer {
         };
         let selection = if let Some(ingress_address) = public_surface_address {
             PeerSelection {
+                in_flight: None,
+
                 peer: Box::new(HttpPeer::new(ingress_address, false, String::new())),
                 container_id: None,
                 container_name: None,
@@ -7811,6 +7815,8 @@ impl ProxyHttp for LoadBalancer {
             }
             let backend = target.select_backend();
             PeerSelection {
+                in_flight: backend.in_flight,
+
                 peer: Box::new(HttpPeer::new(
                     backend.address.as_str(),
                     false,
@@ -7832,6 +7838,7 @@ impl ProxyHttp for LoadBalancer {
                 .await?
         };
 
+        ctx.replica_in_flight = selection.in_flight;
         let mut peer = selection.peer;
 
         // The console failed to start: nothing is listening on its address
@@ -7942,6 +7949,7 @@ impl ProxyHttp for LoadBalancer {
         ctx: &mut Self::CTX,
         mut e: Box<Error>,
     ) -> Box<Error> {
+        ctx.replica_in_flight.take();
         // Retry once on connection failure — handles stale pooled connections
         // where the upstream closed the keep-alive connection before we sent
         // the request (TCP RST / "Connection reset by peer").
@@ -8343,6 +8351,8 @@ mod admin_gate_tests {
                 _sni: Option<&str>,
             ) -> pingora_core::Result<PeerSelection> {
                 Ok(PeerSelection {
+                    in_flight: None,
+
                     peer: Box::new(HttpPeer::new("127.0.0.1:1".to_string(), false, "".into())),
                     container_id: None,
                     container_name: None,
@@ -8399,6 +8409,12 @@ mod on_demand_http_tests {
                     address: "127.0.0.1:8080".to_string(),
                     container_id: None,
                     container_name: None,
+
+                    node_id: None,
+                    state: Default::default(),
+                    tier: 0,
+                    capacity: None,
+                    check_health: false,
                 }],
                 round_robin_counter: Arc::new(AtomicUsize::new(0)),
             },
@@ -8596,6 +8612,7 @@ mod markdown_tests {
             upstream_host: None,
             container_id: None,
             container_name: None,
+            replica_in_flight: None,
             tls_fingerprint: None,
             tls_version: None,
             tls_cipher: None,
@@ -9133,6 +9150,7 @@ mod markdown_pipeline_tests {
             upstream_host: None,
             container_id: None,
             container_name: None,
+            replica_in_flight: None,
             tls_fingerprint: None,
             tls_version: None,
             tls_cipher: None,

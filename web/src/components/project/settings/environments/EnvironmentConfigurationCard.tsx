@@ -2,7 +2,11 @@ import { SettingsSection } from '@/components/ui/settings-section'
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { EnvironmentResponse, ProjectResponse } from '@/api/client'
+import {
+  EnvironmentResponse,
+  ProjectResponse,
+  type LoadBalancingConfig,
+} from '@/api/client'
 import {
   updateEnvironmentSettingsMutation,
   adminListNodesOptions,
@@ -147,6 +151,24 @@ export function EnvironmentConfigurationCard({
   // Convert to cores for display so users can type "1", "0.5", "2".
   const microToCores = (u?: number | null): string =>
     u != null ? (u / 1_000_000).toString() : ''
+
+  const [loadBalancing, setLoadBalancing] =
+    useState<LoadBalancingConfig | null>(
+      environment.deployment_config?.loadBalancing ?? null
+    )
+  const [preferredNodeIds, setPreferredNodeIds] = useState(
+    environment.deployment_config?.loadBalancing?.preferredNodeIds?.join(
+      ', '
+    ) ?? ''
+  )
+  useEffect(() => {
+    setLoadBalancing(environment.deployment_config?.loadBalancing ?? null)
+    setPreferredNodeIds(
+      environment.deployment_config?.loadBalancing?.preferredNodeIds?.join(
+        ', '
+      ) ?? ''
+    )
+  }, [environment])
 
   const [formData, setFormData] = useState({
     branch: environment.branch ?? '',
@@ -307,6 +329,26 @@ export function EnvironmentConfigurationCard({
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
 
+    let routing = loadBalancing
+    if (routing?.strategy === 'preferred_nodes') {
+      const ids = preferredNodeIds
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .map(Number)
+      if (
+        ids.length > 100 ||
+        new Set(ids).size !== ids.length ||
+        !ids.every((n) => Number.isInteger(n) && n >= 0 && n <= 2147483647)
+      ) {
+        toast.error(
+          'Enter up to 100 distinct nonnegative node IDs separated by commas'
+        )
+        return
+      }
+      routing = { ...routing, preferredNodeIds: ids }
+    }
+
     updateEnvironmentSettings.mutateAsync({
       path: {
         project_id: project.id,
@@ -326,6 +368,7 @@ export function EnvironmentConfigurationCard({
         memory_limit: formData.memory_limit
           ? parseInt(formData.memory_limit)
           : null,
+        load_balancing: routing,
         replicas: formData.replicas ? parseInt(formData.replicas) : null,
         // Exposed port is managed by EnvironmentPortOverrideCard under
         // Build & Deploy → Deploy, not this form — omit it so submitting
@@ -584,6 +627,13 @@ export function EnvironmentConfigurationCard({
 
         {/* Scaling & Network */}
         <SettingsSection title="Scaling" icon={Network}>
+          <LoadBalancingFields
+            value={loadBalancing}
+            onChange={setLoadBalancing}
+            preferredNodeIds={preferredNodeIds}
+            onPreferredNodeIdsChange={setPreferredNodeIds}
+            id={String(environment.id)}
+          />
           <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
             <div>
               <Label>Replicas</Label>
@@ -1315,5 +1365,165 @@ export function EnvironmentConfigurationCard({
         </Button>
       </div>
     </form>
+  )
+}
+
+const defaultLoadBalancing: LoadBalancingConfig = {
+  strategy: 'round_robin',
+  preferredNodeIds: [],
+  maxInFlightPerReplica: null,
+  healthCheck: {
+    enabled: false,
+    path: null,
+    intervalSeconds: 2,
+    timeoutSeconds: 2,
+    unhealthyThreshold: 3,
+    healthyThreshold: 2,
+  },
+}
+
+function LoadBalancingFields({
+  value,
+  onChange,
+  preferredNodeIds,
+  onPreferredNodeIdsChange,
+  id,
+}: {
+  value: LoadBalancingConfig | null
+  onChange: (value: LoadBalancingConfig | null) => void
+  preferredNodeIds: string
+  onPreferredNodeIdsChange: (value: string) => void
+  id: string
+}) {
+  const policy = value ?? defaultLoadBalancing
+  const health = policy.healthCheck ?? defaultLoadBalancing.healthCheck!
+  return (
+    <div className="space-y-4">
+      <div className="space-y-2">
+        <Label htmlFor={`lb-${id}`}>Request routing</Label>
+        <Select
+          value={value ? policy.strategy : 'inherit'}
+          onValueChange={(v) =>
+            onChange(
+              v === 'inherit'
+                ? null
+                : { ...policy, strategy: v as LoadBalancingConfig['strategy'] }
+            )
+          }
+        >
+          <SelectTrigger id={`lb-${id}`}>
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="inherit">Use project default</SelectItem>
+            <SelectItem value="round_robin">Round robin</SelectItem>
+            <SelectItem value="preferred_nodes">Preferred nodes</SelectItem>
+          </SelectContent>
+        </Select>
+        <p className="text-sm text-muted-foreground">
+          Prefer replicas near your database, with overflow and failover to
+          other nodes. Project defaults use round robin unless configured.
+        </p>
+      </div>
+      {value && (
+        <>
+          {policy.strategy === 'preferred_nodes' && (
+            <>
+              <Label htmlFor={`lb-nodes-${id}`}>
+                Preferred node IDs, in priority order
+              </Label>
+              <Input
+                id={`lb-nodes-${id}`}
+                value={preferredNodeIds}
+                placeholder="3, 5"
+                onChange={(e) => onPreferredNodeIdsChange(e.target.value)}
+              />
+              <p className="text-sm text-muted-foreground">
+                Use 0 for the control plane. Unlisted nodes form the final
+                fallback tier.
+              </p>
+              <Label htmlFor={`lb-limit-${id}`}>
+                In-flight requests per replica before overflow
+              </Label>
+              <Input
+                id={`lb-limit-${id}`}
+                type="number"
+                min={1}
+                value={policy.maxInFlightPerReplica ?? ''}
+                placeholder="Unlimited"
+                onChange={(e) =>
+                  onChange({
+                    ...policy,
+                    maxInFlightPerReplica: e.target.value
+                      ? Number(e.target.value)
+                      : null,
+                  })
+                }
+              />
+            </>
+          )}
+          <div className="flex items-center gap-2">
+            <Switch
+              id={`lb-health-${id}`}
+              checked={health.enabled}
+              onCheckedChange={(enabled) =>
+                onChange({ ...policy, healthCheck: { ...health, enabled } })
+              }
+            />
+            <Label htmlFor={`lb-health-${id}`}>Active health checks</Label>
+          </div>
+          <p className="text-sm text-muted-foreground">
+            Stop routing to replicas that fail HTTP probes. If every replica is
+            unhealthy, traffic fails open to all replicas.
+          </p>
+          {health.enabled && (
+            <div className="grid gap-4 sm:grid-cols-2">
+              <div className="space-y-2">
+                <Label htmlFor={`lb-path-${id}`}>Probe path</Label>
+                <Input
+                  id={`lb-path-${id}`}
+                  value={health.path ?? ''}
+                  placeholder="Deployment health path"
+                  onChange={(e) =>
+                    onChange({
+                      ...policy,
+                      healthCheck: { ...health, path: e.target.value || null },
+                    })
+                  }
+                />
+              </div>
+              {(
+                [
+                  ['intervalSeconds', 'Interval (seconds)', 3600],
+                  ['timeoutSeconds', 'Timeout (seconds)', 60],
+                  ['unhealthyThreshold', 'Failures before removal', 100],
+                  ['healthyThreshold', 'Passes before recovery', 100],
+                ] as const
+              ).map(([key, label, max]) => (
+                <div key={key} className="space-y-2">
+                  <Label htmlFor={`lb-${key}-${id}`}>{label}</Label>
+                  <Input
+                    id={`lb-${key}-${id}`}
+                    type="number"
+                    min={1}
+                    max={max}
+                    value={health[key]}
+                    onChange={(e) =>
+                      onChange({
+                        ...policy,
+                        healthCheck: {
+                          ...health,
+                          [key]: Number(e.target.value),
+                        },
+                      })
+                    }
+                  />
+                </div>
+              ))}
+            </div>
+          )}
+        </>
+      )}
+    </div>
   )
 }

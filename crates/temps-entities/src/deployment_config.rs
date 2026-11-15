@@ -489,6 +489,92 @@ pub struct DeploymentConfig {
     /// value and may override it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health_check_timeout_seconds: Option<i32>,
+    /// Runtime replica routing, inherited from the project when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_balancing: Option<LoadBalancingConfig>,
+}
+
+/// Replica selection policy. Absent configuration preserves round robin.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LoadBalancingStrategy {
+    #[default]
+    RoundRobin,
+    PreferredNodes,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(default, rename_all = "camelCase")]
+pub struct LoadBalancingConfig {
+    pub strategy: LoadBalancingStrategy,
+    /// Ordered node preference; zero denotes the local control plane.
+    pub preferred_node_ids: Vec<i32>,
+    pub max_in_flight_per_replica: Option<u32>,
+    pub health_check: ActiveHealthCheck,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ActiveHealthCheck {
+    pub enabled: bool,
+    /// Origin-relative path; defaults to deployment readiness path, then `/`.
+    pub path: Option<String>,
+    pub interval_seconds: u32,
+    pub timeout_seconds: u32,
+    pub unhealthy_threshold: u32,
+    pub healthy_threshold: u32,
+}
+
+impl Default for ActiveHealthCheck {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path: None,
+            interval_seconds: 2,
+            timeout_seconds: 2,
+            unhealthy_threshold: 3,
+            healthy_threshold: 2,
+        }
+    }
+}
+
+impl LoadBalancingConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.preferred_node_ids.len() > 100 || self.preferred_node_ids.iter().any(|id| *id < 0) {
+            return Err("Load balancing accepts at most 100 nonnegative node IDs".into());
+        }
+        let mut ids = std::collections::HashSet::new();
+        if self.preferred_node_ids.iter().any(|id| !ids.insert(id)) {
+            return Err("Load balancing preferred node IDs must be unique".into());
+        }
+        if self.max_in_flight_per_replica == Some(0) {
+            return Err("Load balancing max in-flight requests must be positive".into());
+        }
+        let h = &self.health_check;
+        if !(1..=3600).contains(&h.interval_seconds)
+            || !(1..=60).contains(&h.timeout_seconds)
+            || !(1..=100).contains(&h.unhealthy_threshold)
+            || !(1..=100).contains(&h.healthy_threshold)
+        {
+            return Err(
+                "Active health checks require interval 1-3600s, timeout 1-60s and thresholds 1-100"
+                    .into(),
+            );
+        }
+        if h.path.as_ref().is_some_and(|p| {
+            !p.starts_with('/')
+                || p.starts_with("//")
+                || p.len() > 2048
+                || p.chars().any(char::is_control)
+                || p.contains('#')
+        }) {
+            return Err(
+                "Active health-check path must be an origin-relative path of at most 2048 bytes"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Default readiness budget for a new deployment's containers, in seconds.
@@ -616,6 +702,7 @@ impl Default for DeploymentConfig {
             websocket_idle_timeout_seconds: None,
             max_concurrent_connections: None,
             health_check_timeout_seconds: None,
+            load_balancing: None,
         }
     }
 }
@@ -753,6 +840,10 @@ impl DeploymentConfig {
             max_concurrent_connections: other
                 .max_concurrent_connections
                 .or(self.max_concurrent_connections),
+            load_balancing: other
+                .load_balancing
+                .clone()
+                .or_else(|| self.load_balancing.clone()),
             health_check_timeout_seconds: other
                 .health_check_timeout_seconds
                 .or(self.health_check_timeout_seconds),
@@ -761,6 +852,9 @@ impl DeploymentConfig {
 
     /// Validate the resource configuration
     pub fn validate(&self) -> Result<(), String> {
+        if let Some(policy) = &self.load_balancing {
+            policy.validate()?;
+        }
         // CPU request should not exceed CPU limit. A limit of 0 is the explicit
         // "uncapped" sentinel, so it never constrains the request.
         if let (Some(request), Some(limit)) = (self.cpu_request, self.cpu_limit) {
@@ -1031,6 +1125,36 @@ mod tests {
     /// Cross-architecture builds are emulated and slow, so they must stay off
     /// until someone asks for them — and an environment must be able to turn
     /// them off again for a project that has them on.
+    #[test]
+    fn load_balancing_inherits_overrides_and_validates() {
+        let parent = DeploymentConfig {
+            load_balancing: Some(LoadBalancingConfig {
+                strategy: LoadBalancingStrategy::PreferredNodes,
+                preferred_node_ids: vec![3, 5],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            parent.merge(&DeploymentConfig::default()).load_balancing,
+            parent.load_balancing
+        );
+        let child = DeploymentConfig {
+            load_balancing: Some(LoadBalancingConfig::default()),
+            ..Default::default()
+        };
+        assert_eq!(parent.merge(&child).load_balancing, child.load_balancing);
+        let mut policy = parent.load_balancing.unwrap();
+        assert!(policy.validate().is_ok());
+        policy.preferred_node_ids = vec![3, 3];
+        assert!(policy.validate().is_err());
+        policy.preferred_node_ids.clear();
+        policy.health_check.path = Some("//example.invalid/health".into());
+        assert!(policy.validate().is_err());
+        let legacy: DeploymentConfig = serde_json::from_str("{}").unwrap();
+        assert!(legacy.load_balancing.is_none());
+    }
+
     #[test]
     fn test_cross_architecture_builds_merge_semantics() {
         let project_on = DeploymentConfig {

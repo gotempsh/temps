@@ -152,3 +152,12 @@ bunx @temps-sdk/cli env timeouts <environment> --request 30 --sse-idle 900
 bunx @temps-sdk/cli env timeouts <environment> --request 0   # force no timeout
 bunx @temps-sdk/cli env timeouts <environment> --inherit      # clear all overrides
 ```
+
+
+### Ongoing replica health
+
+Deploy-time readiness checks do not detect a later application stall. Enable
+**Active health checks** in environment **Settings → Scaling → Request routing**
+for ongoing HTTP probes and automatic removal/recovery. The proxy fails open
+when no replica is healthy. See [preferred-node routing](/features/multi-node)
+for preference tiers, overflow thresholds, and worker-ingress limitations.

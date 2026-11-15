@@ -50,3 +50,6 @@ chrono = { workspace = true }
 # Constant-time byte comparison for the per-node bearer-token hash check.
 # Same crate already pulled in by temps-revenue.
 subtle = "2.6"
+
+reqwest.workspace = true
+futures.workspace = true

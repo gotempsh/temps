@@ -5495,10 +5495,13 @@ impl ProjectService {
         // republishes a *different* port of a host-root-equivalent container
         // on the node's private address -- both change the attack surface of
         // a granted project without going through a deploy at all.
-        if config.exposed_port.is_some() || config.automatic_deploy.is_some() {
+        if config.exposed_port.is_some()
+            || config.automatic_deploy.is_some()
+            || config.load_balancing.is_some()
+        {
             self.guard_granted_project_write(
                 &project.slug,
-                "the exposed port or whether pushes deploy automatically",
+                "the exposed port, replica routing, or whether pushes deploy automatically",
                 caller,
             )?;
         }
@@ -5542,6 +5545,9 @@ impl ProjectService {
         // override it.
         if let Some(cross_architecture_builds) = config.cross_architecture_builds {
             deployment_config.cross_architecture_builds = Some(cross_architecture_builds);
+        }
+        if let Some(policy) = config.load_balancing {
+            deployment_config.load_balancing = Some(policy);
         }
         if let Some(build_location) = config.build_location {
             deployment_config.build_location = Some(build_location);
@@ -11696,6 +11702,39 @@ templates:
             "hosting": "hosted"
         }))
         .expect("valid project fixture")
+    }
+
+    #[tokio::test]
+    async fn routing_defaults_require_admin_for_a_socket_granted_project() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![project_for_hosting_lock_test("node-daemon")]])
+                .into_connection(),
+        );
+        let service = create_test_services(db, Arc::new(MockJobQueue::new()))
+            .await
+            .with_docker_socket_grant(temps_core::docker_socket_grant::DockerSocketGrant::parse(
+                Some("node-daemon"),
+            ));
+        let config = serde_json::from_value(
+            serde_json::json!({"loadBalancing": {"strategy": "preferred_nodes"}}),
+        )
+        .unwrap();
+        let error = service
+            .update_project_deployment_config(
+                10,
+                config,
+                temps_core::CeilingEnforcement::Bypass,
+                DeployCaller::ProjectWriter,
+            )
+            .await
+            .err()
+            .expect("project writer must be denied");
+        assert!(
+            matches!(error, ProjectError::DockerSocketWriteRequiresAdmin { .. }),
+            "{error:?}"
+        );
     }
 
     #[tokio::test]

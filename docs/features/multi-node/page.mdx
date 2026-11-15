@@ -832,3 +832,40 @@ Multi-node is functional but still evolving. Known limitations:
 <Button href="/docs/scaling">Scaling strategies</Button>
 <Button href="/docs/resources">Resource allocation</Button>
 <Button href="/docs/docker-containers">Docker container management</Button>
+
+
+### Preferred-node request routing
+
+Environment **Settings → Scaling → Request routing** controls where the
+control-plane HTTP proxy sends traffic, independently of replica placement.
+Select **Preferred nodes** and enter node IDs in priority order (0 denotes the
+control plane). Replicas on each preferred node form a tier; unlisted nodes
+form the last tier. Requests rotate within the first healthy tier with spare
+capacity. An optional in-flight threshold spills traffic to the next tier;
+when all tiers are full, the least-loaded healthy replica receives the request.
+Long-lived streams count until their requests end. Counters are local to each
+proxy process, not a cluster-wide concurrency quota.
+
+Active HTTP health checks work with either routing strategy. Only 2xx responses
+pass; redirects are not followed. Timeouts and consecutive-failure/success
+thresholds remove and restore replicas. With no healthy replicas, selection
+fails open to all replicas. The default probe path is the deployment's health path (including source
+configuration), or `/` if none was recorded.
+
+Policies inherit from project deployment config to environment deployment
+config. Existing deployments retain round robin and no active checks. Clearing
+an environment override restores project inheritance. Settings apply on route
+refresh without redeploying. The policy applies at control-plane ingress;
+worker internal service routing remains round robin, and routes requiring this
+policy are excluded from direct worker public ingress.
+
+The CLI accepts the same camelCase policy object:
+
+```sh
+temps environments scale -p my-app -e production --load-balancing '{"strategy":"preferred_nodes","preferredNodeIds":[3,5],"maxInFlightPerReplica":100,"healthCheck":{"enabled":true,"path":"/health","intervalSeconds":2,"timeoutSeconds":2,"unhealthyThreshold":3,"healthyThreshold":2}}'
+```
+
+Use `--load-balancing null` to inherit the project policy again. Probes use at
+most 16 simultaneous requests per proxy; under saturation, probe intervals may
+be delayed. Routing state is O(active replicas), retained across reloads and
+released when replicas leave the route table.

@@ -29,6 +29,18 @@ export type ActivateProviderResponse = {
     default_provider: string;
 };
 
+export type ActiveHealthCheck = {
+    enabled?: boolean;
+    healthyThreshold?: number;
+    intervalSeconds?: number;
+    /**
+     * Origin-relative path; defaults to deployment readiness path, then `/`.
+     */
+    path?: string | null;
+    timeoutSeconds?: number;
+    unhealthyThreshold?: number;
+};
+
 export type ActiveVisitor = {
     current_page?: string | null;
     duration_seconds: number;
@@ -7603,6 +7615,7 @@ export type DeploymentConfig = {
      * Default: 300 (5 minutes).
      */
     idleTimeoutSeconds?: number;
+    loadBalancing?: LoadBalancingConfig | null;
     /**
      * Override for the proxy's cap on concurrent in-flight requests to this
      * project/environment's upstream, independent of the timeout overrides
@@ -15079,6 +15092,21 @@ export type LiveVisitorsListResponse = {
     window_minutes: number;
 };
 
+export type LoadBalancingConfig = {
+    healthCheck?: ActiveHealthCheck;
+    maxInFlightPerReplica?: number | null;
+    /**
+     * Ordered node preference; zero denotes the local control plane.
+     */
+    preferredNodeIds?: Array<number>;
+    strategy?: LoadBalancingStrategy;
+};
+
+/**
+ * Replica selection policy. Absent configuration preserves round robin.
+ */
+export type LoadBalancingStrategy = 'round_robin' | 'preferred_nodes';
+
 export type LocalCheckSpec = {
     /**
      * Warn when any expiring item in the value is this close to expiry.
@@ -17239,8 +17267,11 @@ export type OnDemandCertRow = {
  * console host) that have no active cert, rather than silently failing the
  * handshake. Ephemeral per-deployment hostnames are NEVER certed (ADR §2).
  *
- * Off by default — operators opt in explicitly, except QuickStart (`sslip.io`)
- * installs where `temps setup` auto-enables it and derives `zone`.
+ * New installations start with it on (`AppSettings::default`); the zone comes
+ * from `zone` or is derived from `external_url`/`preview_domain`, and nothing
+ * is issued while none can be derived or `external_url` is loopback. A settings
+ * row stored before this section existed stays off until the operator enables
+ * it.
  */
 export type OnDemandTlsSettings = {
     /**
@@ -28005,6 +28036,7 @@ export type UpdateDeploymentConfigRequest = {
      * 300 seconds.
      */
     healthCheckTimeoutSeconds?: number | null;
+    loadBalancing?: LoadBalancingConfig | null;
     /**
      * Project-level default cap on concurrent in-flight requests to a
      * single environment's upstream (0 = unlimited). Environments may
@@ -28109,6 +28141,9 @@ export type UpdateEnvironmentSettingsRequest = {
      * Enable/disable automatic deployments for this environment
      */
     automatic_deploy?: boolean | null;
+    /**
+     * Absent preserves the tracked branch; null explicitly clears it.
+     */
     branch?: string | null;
     build_location?: BuildLocation | null;
     /**
@@ -28156,6 +28191,7 @@ export type UpdateEnvironmentSettingsRequest = {
      * Seconds of inactivity before stopping containers (60-86400). Default: 300.
      */
     idle_timeout_seconds?: number | null;
+    load_balancing?: LoadBalancingConfig | null;
     /**
      * Override the proxy's cap on concurrent in-flight requests to this
      * environment's upstream (0 = unlimited). Absent leaves the current

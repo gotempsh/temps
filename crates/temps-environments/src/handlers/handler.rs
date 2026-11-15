@@ -1306,6 +1306,7 @@ pub async fn update_environment_settings(
     if settings.branch.is_some()
         || settings.automatic_deploy.is_some()
         || settings.protected.is_some()
+        || settings.load_balancing.is_some()
         || settings.target_nodes.is_some()
         || settings.target_labels.is_some()
         || settings.exposed_port.is_some()
@@ -1360,11 +1361,12 @@ pub async fn update_environment_settings(
         cpu_limit: settings.cpu_limit.flatten(),
         memory_request: settings.memory_request.flatten(),
         memory_limit: settings.memory_limit.flatten(),
-        branch: settings.branch,
+        branch: settings.branch.flatten(),
         replicas: settings.replicas,
         security_updated: settings.security.is_some(),
         attack_mode: settings.attack_mode,
         force_https: settings.force_https,
+        load_balancing: settings.load_balancing,
         build_location: settings.build_location,
     };
 

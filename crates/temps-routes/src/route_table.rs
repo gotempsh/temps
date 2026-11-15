@@ -95,6 +95,12 @@ fn build_backend_entry(
         address,
         container_id: Some(container.container_id.clone()),
         container_name: Some(container.container_name.clone()),
+
+        node_id: container.node_id,
+        state: Default::default(),
+        tier: 0,
+        capacity: None,
+        check_health: false,
     })
 }
 
@@ -198,6 +204,12 @@ fn build_public_compose_backend_entry(
         address,
         container_id: Some(container.container_id.clone()),
         container_name: Some(container.container_name.clone()),
+
+        node_id: container.node_id,
+        state: Default::default(),
+        tier: 0,
+        capacity: None,
+        check_health: false,
     })
 }
 
@@ -427,10 +439,15 @@ pub struct BackendEntry {
     pub container_id: Option<String>,
     /// Human-readable container name (e.g., "my-app-abc123")
     pub container_name: Option<String>,
+    pub node_id: Option<i32>,
+    pub state: Arc<crate::replica_policy::ReplicaState>,
+    pub tier: usize,
+    pub capacity: Option<u32>,
+    pub check_health: bool,
 }
 
 /// Result of selecting a backend via round-robin.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct BackendSelection {
     /// Network address to connect to
     pub address: String,
@@ -438,6 +455,7 @@ pub struct BackendSelection {
     pub container_id: Option<String>,
     /// Human-readable container name
     pub container_name: Option<String>,
+    pub in_flight: Option<crate::replica_policy::InFlightGuard>,
 }
 
 /// Backend type for a route
@@ -468,21 +486,19 @@ impl BackendType {
             } => {
                 if backends.is_empty() {
                     return Some(BackendSelection {
+                        in_flight: None,
                         address: "127.0.0.1:8080".to_string(),
                         container_id: None,
                         container_name: None,
                     });
                 }
 
-                let entry = if backends.len() == 1 {
-                    &backends[0]
-                } else {
-                    let index =
-                        round_robin_counter.fetch_add(1, Ordering::Relaxed) % backends.len();
-                    &backends[index]
-                };
+                let cursor = round_robin_counter.fetch_add(1, Ordering::Relaxed);
+                let (index, guard) = crate::replica_policy::reserve(backends, cursor)?;
+                let entry = &backends[index];
 
                 Some(BackendSelection {
+                    in_flight: Some(guard),
                     address: entry.address.clone(),
                     container_id: entry.container_id.clone(),
                     container_name: entry.container_name.clone(),
@@ -547,6 +563,7 @@ impl RouteInfo {
         self.backend
             .get_backend()
             .unwrap_or_else(|| BackendSelection {
+                in_flight: None,
                 address: "127.0.0.1:8080".to_string(),
                 container_id: None,
                 container_name: None,
@@ -1044,6 +1061,8 @@ pub struct CachedPeerTable {
     /// All route indexes and wake-gate ownership published as one immutable,
     /// lock-free snapshot. A reload can never expose mismatched generations.
     route_snapshot: ArcSwap<RouteTableSnapshot>,
+    active_probes: ArcSwap<Vec<crate::replica_policy::Probe>>,
+    probe_started: std::sync::atomic::AtomicBool,
 
     /// Serializes reloads so their three-phase snapshot publication cannot
     /// interleave, even when manual refresh and database notification race.
@@ -1128,6 +1147,8 @@ impl CachedPeerTable {
     ) -> Self {
         Self {
             route_snapshot: ArcSwap::from_pointee(RouteTableSnapshot::default()),
+            active_probes: ArcSwap::from_pointee(Vec::new()),
+            probe_started: std::sync::atomic::AtomicBool::new(false),
             route_reload_lock: tokio::sync::Mutex::new(()),
             db,
             runtime_context,
@@ -1301,6 +1322,102 @@ impl CachedPeerTable {
                 }
             }
         });
+    }
+
+    /// Bounded active HTTP probes. No redirects or ambient proxy settings:
+    /// probe only the concrete backend socket recorded by the route loader.
+    pub async fn run_active_probes(self: Arc<Self>) {
+        use futures::{stream::FuturesUnordered, StreamExt};
+        if self.probe_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let client = match reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+        {
+            Ok(client) => client,
+            Err(error) => {
+                error!(%error, "Cannot initialize replica health probes");
+                self.probe_started.store(false, Ordering::Release);
+                return;
+            }
+        };
+        use std::{cmp::Reverse, collections::BinaryHeap, time::Instant};
+        let mut snapshot = Arc::new(Vec::new());
+        let mut entries: HashMap<usize, (crate::replica_policy::Probe, Instant)> = HashMap::new();
+        let mut due = BinaryHeap::new();
+        let mut running = HashSet::new();
+        let mut tasks = FuturesUnordered::new();
+        loop {
+            let now = Instant::now();
+            let current = self.active_probes.load_full();
+            // Reconcile membership only when routes publish a new snapshot.
+            // Completions only update one deadline, never scan every replica.
+            if !Arc::ptr_eq(&snapshot, &current) {
+                snapshot = current;
+                let mut previous = std::mem::take(&mut entries);
+                due.clear();
+                for probe in snapshot.iter() {
+                    let key = Arc::as_ptr(&probe.state) as usize;
+                    let when = previous
+                        .remove(&key)
+                        .filter(|(old, _)| {
+                            old.url == probe.url
+                                && old.config.health_check.interval_seconds
+                                    == probe.config.health_check.interval_seconds
+                        })
+                        .map(|(_, when)| when)
+                        .unwrap_or(now);
+                    entries.insert(key, (probe.clone(), when));
+                    if !running.contains(&key) {
+                        due.push(Reverse((when, key)));
+                    }
+                }
+            }
+            // Earliest deadlines get the next free slot. At most one request
+            // per replica and 16 overall; overdue work stays in the bounded heap.
+            while running.len() < 16 {
+                let Some(&Reverse((when, key))) = due.peek() else {
+                    break;
+                };
+                if when > now {
+                    break;
+                }
+                due.pop();
+                let Some((probe, next)) = entries.get_mut(&key) else {
+                    continue;
+                };
+                *next = now
+                    + std::time::Duration::from_secs(u64::from(
+                        probe.config.health_check.interval_seconds,
+                    ));
+                running.insert(key);
+                let probe = probe.clone();
+                let client = client.clone();
+                tasks.push(async move {
+                    probe.check(&client).await;
+                    key
+                });
+            }
+            // Poll only the snapshot pointer when idle. With available slots,
+            // also wake at the earliest deadline; a full pool waits for a result.
+            let mut wake_at = now + std::time::Duration::from_millis(250);
+            if running.len() < 16 {
+                if let Some(Reverse((when, _))) = due.peek() {
+                    wake_at = wake_at.min(*when);
+                }
+            }
+            tokio::select! {
+                Some(key) = tasks.next(), if !tasks.is_empty() => {
+                    running.remove(&key);
+                    if let Some((_, when)) = entries.get(&key) {
+                        due.push(Reverse((*when, key)));
+                    }
+                }
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(wake_at)) => {}
+            }
+        }
     }
 
     /// Current in-memory route table generation. Bumped on every
@@ -1834,6 +1951,12 @@ impl CachedPeerTable {
                         address: backend_addr.clone(),
                         container_id: None,
                         container_name: None,
+
+                        node_id: None,
+                        state: Default::default(),
+                        tier: 0,
+                        capacity: None,
+                        check_health: false,
                     }],
                     round_robin_counter: Arc::new(AtomicUsize::new(0)),
                 },
@@ -2925,6 +3048,12 @@ impl CachedPeerTable {
                             address: address.clone(),
                             container_id: Some(discovered.target_container_id.clone()),
                             container_name: Some(discovered.target_container_name.clone()),
+
+                            node_id: None,
+                            state: Default::default(),
+                            tier: 0,
+                            capacity: None,
+                            check_health: false,
                         }],
                         round_robin_counter: Arc::new(AtomicUsize::new(0)),
                     },
@@ -3066,6 +3195,160 @@ impl CachedPeerTable {
         if let Some(ingress_host) = ingress_host.as_ref() {
             unavailable.exact.remove(ingress_host);
         }
+
+        // Prepare policy off the request path. Identity includes environment,
+        // container and address so removed/replaced replicas cannot inherit health.
+        let old = self.route_snapshot.load_full();
+        let mut states = HashMap::new();
+        for route in old
+            .legacy
+            .exact
+            .values()
+            .chain(old.http_routes.values())
+            .chain(old.tls_routes.values())
+        {
+            if let BackendType::Upstream { backends, .. } = &route.backend {
+                for b in backends {
+                    states.insert(
+                        (
+                            route.environment.as_ref().map(|e| e.id),
+                            b.container_id.clone(),
+                            b.address.clone(),
+                        ),
+                        b.state.clone(),
+                    );
+                }
+            }
+        }
+        let probe_deployments: HashSet<i32> = routes
+            .values()
+            .filter_map(|route| {
+                let project = route
+                    .project
+                    .as_ref()?
+                    .deployment_config
+                    .clone()
+                    .unwrap_or_default();
+                let config = route
+                    .environment
+                    .as_ref()?
+                    .get_effective_deployment_config(&project);
+                let policy = config.load_balancing?;
+                (policy.health_check.enabled && policy.health_check.path.is_none())
+                    .then(|| route.deployment.as_ref().map(|d| d.id))
+                    .flatten()
+            })
+            .collect();
+        let mut deployment_health_paths = HashMap::new();
+        if !probe_deployments.is_empty() {
+            use sea_orm::{ColumnTrait, QueryFilter, QueryOrder};
+            use temps_entities::deployment_jobs;
+            // Batch read only jobs of deployments that opted into probes. Later
+            // deploy-job output takes precedence over an earlier build output.
+            let jobs = deployment_jobs::Entity::find()
+                .filter(deployment_jobs::Column::DeploymentId.is_in(probe_deployments))
+                .order_by_desc(deployment_jobs::Column::ExecutionOrder)
+                .all(self.db.as_ref())
+                .await.unwrap_or_else(|error| {
+                    warn!(%error, "Unable to load deployment health paths; using explicit probe path or default");
+                    Vec::new()
+                });
+            for job in jobs {
+                if let Some(path) = job
+                    .outputs
+                    .as_ref()
+                    .and_then(|o| o.get("health_check_path"))
+                    .and_then(|v| v.as_str())
+                {
+                    deployment_health_paths
+                        .entry(job.deployment_id)
+                        .or_insert_with(|| path.to_owned());
+                }
+            }
+        }
+        let mut probes = HashMap::new();
+        for route in routes
+            .values_mut()
+            .chain(http_routes_map.values_mut())
+            .chain(tls_routes_map.values_mut())
+        {
+            let project_config = route
+                .project
+                .as_ref()
+                .and_then(|p| p.deployment_config.clone())
+                .unwrap_or_default();
+            let config = route
+                .environment
+                .as_ref()
+                .map(|e| e.get_effective_deployment_config(&project_config))
+                .unwrap_or(project_config);
+            let policy = config.load_balancing.unwrap_or_default();
+            if policy.validate().is_err() {
+                continue;
+            }
+            if let BackendType::Upstream { backends, .. } = &mut route.backend {
+                for b in backends {
+                    let key = (
+                        route.environment.as_ref().map(|e| e.id),
+                        b.container_id.clone(),
+                        b.address.clone(),
+                    );
+                    b.state = states
+                        .entry(key.clone())
+                        .or_insert_with(|| b.state.clone())
+                        .clone();
+                    b.tier = if policy.strategy
+                        == temps_entities::deployment_config::LoadBalancingStrategy::PreferredNodes
+                    {
+                        policy
+                            .preferred_node_ids
+                            .iter()
+                            .position(|id| *id == b.node_id.unwrap_or(0))
+                            .unwrap_or(policy.preferred_node_ids.len())
+                    } else {
+                        0
+                    };
+                    b.capacity = if policy.strategy
+                        == temps_entities::deployment_config::LoadBalancingStrategy::PreferredNodes
+                    {
+                        policy.max_in_flight_per_replica
+                    } else {
+                        None
+                    };
+                    b.check_health = policy.health_check.enabled;
+                    if b.check_health {
+                        let path = policy
+                            .health_check
+                            .path
+                            .as_deref()
+                            .or_else(|| {
+                                route
+                                    .deployment
+                                    .as_ref()
+                                    .and_then(|d| d.metadata.as_ref())
+                                    .and_then(|m| m.health_check_path.as_deref())
+                            })
+                            .or_else(|| {
+                                route
+                                    .deployment
+                                    .as_ref()
+                                    .and_then(|d| deployment_health_paths.get(&d.id))
+                                    .map(String::as_str)
+                            })
+                            .unwrap_or("/");
+                        probes
+                            .entry(key)
+                            .or_insert_with(|| crate::replica_policy::Probe {
+                                state: b.state.clone(),
+                                url: format!("http://{}{}", b.address, path),
+                                config: policy.clone(),
+                            });
+                    }
+                }
+            }
+        }
+        self.active_probes
+            .store(Arc::new(probes.into_values().collect()));
 
         // Build the wildcard index for legacy project/environment routes. A
         // concrete hostname resolved through a wildcard is deliberately not
@@ -3526,7 +3809,8 @@ impl CachedPeerTable {
             .filter(|(host, route)| {
                 !host.ends_with(".temps.local")
                     && route.redirect_to.is_none()
-                    && matches!(route.backend, BackendType::Upstream { .. })
+                    && matches!(&route.backend, BackendType::Upstream { backends, .. }
+                        if backends.iter().all(|b| b.tier == 0 && b.capacity.is_none() && !b.check_health))
                     && !route.environment.as_ref().is_some_and(|environment| {
                         snapshot
                             .path_routes
@@ -3981,6 +4265,131 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn active_probes_do_not_wait_for_an_unrelated_slow_replica() {
+        use crate::replica_policy::{Probe, ReplicaState};
+        use temps_entities::deployment_config::{ActiveHealthCheck, LoadBalancingConfig};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let slow = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fast = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let make_probe = |address| Probe {
+            state: Arc::new(ReplicaState::default()),
+            url: format!("http://{address}/health"),
+            config: LoadBalancingConfig {
+                health_check: ActiveHealthCheck {
+                    enabled: true,
+                    interval_seconds: 1,
+                    timeout_seconds: 60,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        };
+        let probes = vec![
+            make_probe(slow.local_addr().unwrap()),
+            make_probe(fast.local_addr().unwrap()),
+        ];
+        let slow_server = tokio::spawn(async move {
+            let (_socket, _) = slow.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        let fast_server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = fast.accept().await.unwrap();
+                let mut request = [0; 1024];
+                assert!(socket.read(&mut request).await.unwrap() > 0);
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+                tx.send(()).await.unwrap();
+            }
+        });
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection();
+        let table = Arc::new(CachedPeerTable::new(Arc::new(db)));
+        table.active_probes.store(Arc::new(probes));
+        let checker = tokio::spawn(table.run_active_probes());
+        let completed = tokio::time::timeout(std::time::Duration::from_secs(4), async {
+            assert!(rx.recv().await.is_some());
+            assert!(rx.recv().await.is_some());
+        })
+        .await;
+        checker.abort();
+        slow_server.abort();
+        fast_server.abort();
+        assert!(
+            completed.is_ok(),
+            "a slow replica blocked another replica's next probe"
+        );
+    }
+
+    #[tokio::test]
+    async fn active_probe_reload_applies_new_path_and_shorter_interval() {
+        use crate::replica_policy::{Probe, ReplicaState};
+        use temps_entities::deployment_config::{ActiveHealthCheck, LoadBalancingConfig};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(3);
+        let server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 1024];
+                let n = socket.read(&mut request).await.unwrap();
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+                tx.send(String::from_utf8_lossy(&request[..n]).into_owned())
+                    .await
+                    .unwrap();
+            }
+        });
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection();
+        let table = Arc::new(CachedPeerTable::new(Arc::new(db)));
+        let state = Arc::new(ReplicaState::default());
+        let make_probe = |path: &str, interval| Probe {
+            state: state.clone(),
+            url: format!("http://{address}{path}"),
+            config: LoadBalancingConfig {
+                health_check: ActiveHealthCheck {
+                    enabled: true,
+                    interval_seconds: interval,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        };
+        table
+            .active_probes
+            .store(Arc::new(vec![make_probe("/first", 3600)]));
+        let checker = tokio::spawn(table.clone().run_active_probes());
+        let first = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(first.starts_with("GET /first "));
+        table
+            .active_probes
+            .store(Arc::new(vec![make_probe("/second", 3600)]));
+        let second = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(second.starts_with("GET /second "));
+        table
+            .active_probes
+            .store(Arc::new(vec![make_probe("/second", 1)]));
+        let third = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(third.starts_with("GET /second "));
+        checker.abort();
+        server.await.unwrap();
+    }
+
     #[test]
     fn route_and_ownership_indexes_publish_as_one_generation() {
         let table = Arc::new(CachedPeerTable::new(Arc::new(
@@ -4075,6 +4484,12 @@ mod tests {
                         address: address.to_string(),
                         container_id: None,
                         container_name: None,
+
+                        node_id: None,
+                        state: Default::default(),
+                        tier: 0,
+                        capacity: None,
+                        check_health: false,
                     }],
                     round_robin_counter: Arc::new(AtomicUsize::new(0)),
                 },
@@ -4257,6 +4672,12 @@ mod tests {
                         address: address.to_string(),
                         container_id: None,
                         container_name: None,
+
+                        node_id: None,
+                        state: Default::default(),
+                        tier: 0,
+                        capacity: None,
+                        check_health: false,
                     }],
                     round_robin_counter: Arc::new(AtomicUsize::new(0)),
                 },
@@ -4592,6 +5013,12 @@ mod tests {
                     address: "127.0.0.1:8080".to_string(),
                     container_id: None,
                     container_name: None,
+
+                    node_id: None,
+                    state: Default::default(),
+                    tier: 0,
+                    capacity: None,
+                    check_health: false,
                 }],
                 round_robin_counter: Arc::new(AtomicUsize::new(0)),
             },
@@ -4619,6 +5046,12 @@ mod tests {
                     address: "127.0.0.1:8080".to_string(),
                     container_id: None,
                     container_name: None,
+
+                    node_id: None,
+                    state: Default::default(),
+                    tier: 0,
+                    capacity: None,
+                    check_health: false,
                 }],
                 round_robin_counter: Arc::new(AtomicUsize::new(0)),
             },
@@ -4642,6 +5075,12 @@ mod tests {
                     address: "192.168.1.100:3000".to_string(),
                     container_id: None,
                     container_name: None,
+
+                    node_id: None,
+                    state: Default::default(),
+                    tier: 0,
+                    capacity: None,
+                    check_health: false,
                 }],
                 round_robin_counter: Arc::new(AtomicUsize::new(0)),
             },
@@ -4669,16 +5108,34 @@ mod tests {
                         address: "127.0.0.1:8080".to_string(),
                         container_id: None,
                         container_name: None,
+
+                        node_id: None,
+                        state: Default::default(),
+                        tier: 0,
+                        capacity: None,
+                        check_health: false,
                     },
                     BackendEntry {
                         address: "127.0.0.1:8081".to_string(),
                         container_id: None,
                         container_name: None,
+
+                        node_id: None,
+                        state: Default::default(),
+                        tier: 0,
+                        capacity: None,
+                        check_health: false,
                     },
                     BackendEntry {
                         address: "127.0.0.1:8082".to_string(),
                         container_id: None,
                         container_name: None,
+
+                        node_id: None,
+                        state: Default::default(),
+                        tier: 0,
+                        capacity: None,
+                        check_health: false,
                     },
                 ],
                 round_robin_counter: Arc::new(AtomicUsize::new(0)),
@@ -4725,11 +5182,23 @@ mod tests {
                     address: "127.0.0.1:8080".to_string(),
                     container_id: None,
                     container_name: None,
+
+                    node_id: None,
+                    state: Default::default(),
+                    tier: 0,
+                    capacity: None,
+                    check_health: false,
                 },
                 BackendEntry {
                     address: "127.0.0.1:8081".to_string(),
                     container_id: None,
                     container_name: None,
+
+                    node_id: None,
+                    state: Default::default(),
+                    tier: 0,
+                    capacity: None,
+                    check_health: false,
                 },
             ],
             round_robin_counter: Arc::new(AtomicUsize::new(0)),
@@ -4784,6 +5253,12 @@ mod tests {
                 address: "192.168.1.100:3000".to_string(),
                 container_id: None,
                 container_name: None,
+
+                node_id: None,
+                state: Default::default(),
+                tier: 0,
+                capacity: None,
+                check_health: false,
             }],
             round_robin_counter: Arc::new(AtomicUsize::new(0)),
         };
@@ -4831,6 +5306,12 @@ mod tests {
                     address: "10.0.0.1:9000".to_string(),
                     container_id: None,
                     container_name: None,
+
+                    node_id: None,
+                    state: Default::default(),
+                    tier: 0,
+                    capacity: None,
+                    check_health: false,
                 }],
                 round_robin_counter: Arc::new(AtomicUsize::new(0)),
             },

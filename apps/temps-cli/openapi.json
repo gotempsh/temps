@@ -96,6 +96,47 @@
         ],
         "type": "object"
       },
+      "ActiveHealthCheck": {
+        "properties": {
+          "enabled": {
+            "default": false,
+            "type": "boolean"
+          },
+          "healthyThreshold": {
+            "default": 2,
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "intervalSeconds": {
+            "default": 2,
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "path": {
+            "default": null,
+            "description": "Origin-relative path; defaults to deployment readiness path, then `/`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "timeoutSeconds": {
+            "default": 2,
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "unhealthyThreshold": {
+            "default": 3,
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
       "ActiveVisitor": {
         "properties": {
           "current_page": {
@@ -3860,7 +3901,7 @@
             "$ref": "#/components/schemas/OnDemandTlsSettings",
             "default": {
               "deployment_url_mode": "http",
-              "enabled": false,
+              "enabled": true,
               "hourly_cap": 10,
               "max_concurrent": 3,
               "zone": null
@@ -15646,6 +15687,17 @@
             "description": "Seconds of inactivity before containers are stopped in on-demand mode.\nOnly used when `on_demand` is true. Min: 60, Max: 86400 (24h).\nDefault: 300 (5 minutes).",
             "format": "int32",
             "type": "integer"
+          },
+          "loadBalancing": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/LoadBalancingConfig",
+                "description": "Runtime replica routing, inherited from the project when absent."
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "maxConcurrentConnections": {
             "description": "Override for the proxy's cap on concurrent in-flight requests to this\nproject/environment's upstream, independent of the timeout overrides\nabove. `None` = inherit the global\n`connection_limits.default_max_concurrent_connections`. `Some(0)`\nexplicitly forces \"unlimited\" for this project/environment, overriding\na nonzero global default. `Some(n)` for `n > 0` sets an explicit cap —\nthere is no global ceiling clamp here (unlike the timeout settings):\nan operator who has explicitly set a per-project value has made a\ndeliberate choice and the platform should respect it.",
@@ -32113,6 +32165,52 @@
         ],
         "type": "object"
       },
+      "LoadBalancingConfig": {
+        "properties": {
+          "healthCheck": {
+            "$ref": "#/components/schemas/ActiveHealthCheck",
+            "default": {
+              "enabled": false,
+              "healthyThreshold": 2,
+              "intervalSeconds": 2,
+              "path": null,
+              "timeoutSeconds": 2,
+              "unhealthyThreshold": 3
+            }
+          },
+          "maxInFlightPerReplica": {
+            "default": null,
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "preferredNodeIds": {
+            "default": [],
+            "description": "Ordered node preference; zero denotes the local control plane.",
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "strategy": {
+            "$ref": "#/components/schemas/LoadBalancingStrategy",
+            "default": "round_robin"
+          }
+        },
+        "type": "object"
+      },
+      "LoadBalancingStrategy": {
+        "description": "Replica selection policy. Absent configuration preserves round robin.",
+        "enum": [
+          "round_robin",
+          "preferred_nodes"
+        ],
+        "type": "string"
+      },
       "LocalCheckSpec": {
         "properties": {
           "warning_days": {
@@ -36778,7 +36876,7 @@
         "type": "object"
       },
       "OnDemandTlsSettings": {
-        "description": "On-demand (lazy) HTTP-01 TLS issuance settings (ADR-018).\n\nWhen `enabled`, the proxy's `certificate_callback` triggers ACME HTTP-01\nissuance for allowlisted, STABLE hostnames (per-environment aliases and the\nconsole host) that have no active cert, rather than silently failing the\nhandshake. Ephemeral per-deployment hostnames are NEVER certed (ADR §2).\n\nOff by default — operators opt in explicitly, except QuickStart (`sslip.io`)\ninstalls where `temps setup` auto-enables it and derives `zone`.",
+        "description": "On-demand (lazy) HTTP-01 TLS issuance settings (ADR-018).\n\nWhen `enabled`, the proxy's `certificate_callback` triggers ACME HTTP-01\nissuance for allowlisted, STABLE hostnames (per-environment aliases and the\nconsole host) that have no active cert, rather than silently failing the\nhandshake. Ephemeral per-deployment hostnames are NEVER certed (ADR §2).\n\nNew installations start with it on (`AppSettings::default`); the zone comes\nfrom `zone` or is derived from `external_url`/`preview_domain`, and nothing\nis issued while none can be derived or `external_url` is loopback. A settings\nrow stored before this section existed stays off until the operator enables\nit.",
         "properties": {
           "deployment_url_mode": {
             "default": "http",
@@ -58845,6 +58943,16 @@
               "null"
             ]
           },
+          "loadBalancing": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/LoadBalancingConfig"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "maxConcurrentConnections": {
             "description": "Project-level default cap on concurrent in-flight requests to a\nsingle environment's upstream (0 = unlimited). Environments may\noverride this. Absent leaves the current value unchanged. See\nissue #646.",
             "format": "int32",
@@ -59086,6 +59194,7 @@
             ]
           },
           "branch": {
+            "description": "Absent preserves the tracked branch; null explicitly clears it.",
             "type": [
               "string",
               "null"
@@ -59147,6 +59256,17 @@
             "type": [
               "integer",
               "null"
+            ]
+          },
+          "load_balancing": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/LoadBalancingConfig",
+                "description": "Null restores project inheritance; an object replaces the routing policy."
+              },
+              {
+                "type": "null"
+              }
             ]
           },
           "max_concurrent_connections": {

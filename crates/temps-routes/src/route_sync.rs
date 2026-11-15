@@ -574,7 +574,7 @@ async fn build_snapshot(
             );
         }
         if public_route_count > supported_count && unsupported_reasons.is_empty() {
-            unsupported_reasons.push("some routes require redirects, static-file serving, wake-up, attack mode, project security policy, project-group path routing, or a remotely reachable backend".to_string());
+            unsupported_reasons.push("some routes require redirects, static-file serving, wake-up, attack mode, project security policy, project-group path routing, replica routing policies, or a remotely reachable backend".to_string());
         }
         PublicIngressSnapshot {
             enabled: true,
@@ -918,6 +918,12 @@ mod tests {
                         address: "192.0.2.7:32000".to_string(),
                         container_id: Some("worker-container".to_string()),
                         container_name: Some("worker-app".to_string()),
+
+                        node_id: None,
+                        state: Default::default(),
+                        tier: 0,
+                        capacity: None,
+                        check_health: false,
                     }],
                     round_robin_counter: Arc::new(AtomicUsize::new(0)),
                 },

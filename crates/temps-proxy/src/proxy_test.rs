@@ -209,6 +209,7 @@ pub mod proxy_tests {
                 "".to_string(),
             ));
             Ok(PeerSelection {
+                in_flight: None,
                 peer,
                 container_id: None,
                 container_name: None,
