@@ -60,6 +60,17 @@ impl TrustedProxyRanges {
                     .map_err(|_| invalid("expected an IP address or IPv4/IPv6 CIDR"))?
                     .trunc(),
             };
+            // Peers are canonicalized to IPv4, so mapped networks must use
+            // the same family. A mapped /96 would trust every IPv4 peer.
+            let range = match range {
+                IpNet::V6(net) if net.prefix_len() >= 96 => match net.addr().to_ipv4_mapped() {
+                    Some(ip) => IpNet::new(IpAddr::V4(ip), net.prefix_len() - 96)
+                        .map_err(|_| invalid("invalid IPv4-mapped prefix"))?
+                        .trunc(),
+                    None => range,
+                },
+                _ => range,
+            };
             if range.prefix_len() == 0 {
                 return Err(invalid("trusting every address would permit client IP spoofing; specify the proxy ranges"));
             }
@@ -187,6 +198,30 @@ mod tests {
             resolve("::ffff:10.20.0.2", &[("x-forwarded-for", "198.51.100.7")]),
             Some("198.51.100.7".parse().unwrap())
         );
+    }
+
+    #[test]
+    fn mapped_cidrs_match_canonical_peers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "198.51.100.7".parse().unwrap());
+        for (entry, canonical) in [
+            ("::ffff:10.20.0.0/112", "10.20.0.0/16"),
+            ("::ffff:10.20.0.2/128", "10.20.0.2/32"),
+        ] {
+            let ranges = TrustedProxyRanges::parse(&[entry.into()]).unwrap();
+            assert_eq!(ranges.canonical_ranges(), [canonical]);
+            for peer in ["10.20.0.2", "::ffff:10.20.0.2"] {
+                assert_eq!(
+                    ranges.resolve(peer.parse().unwrap(), &headers, false),
+                    Some("198.51.100.7".parse().unwrap())
+                );
+            }
+            assert_eq!(
+                ranges.resolve("10.21.0.2".parse().unwrap(), &headers, false),
+                None
+            );
+        }
+        assert!(TrustedProxyRanges::parse(&["::ffff:0.0.0.0/96".into()]).is_err());
     }
 
     #[test]

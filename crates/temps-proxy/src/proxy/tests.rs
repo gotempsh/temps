@@ -3436,6 +3436,24 @@ mod client_fingerprint_tests {
         (fingerprint.ja4.map(|j| j.to_string()), fingerprint.source)
     }
 
+    #[test]
+    fn configured_proxy_suppresses_its_direct_tls_fingerprint() {
+        use temps_core::trusted_proxies::{set_trusted_proxy_ranges, TrustedProxyRanges};
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                set_trusted_proxy_ranges(TrustedProxyRanges::default());
+            }
+        }
+        let _reset = Reset;
+        set_trusted_proxy_ranges(TrustedProxyRanges::parse(&["10.123.45.6/32".into()]).unwrap());
+        assert_eq!(resolve("10.123.45.6", &[], false), (None, Ja4Source::Local));
+        assert_eq!(
+            resolve("10.123.45.7", &[], false),
+            (Some(CURL_JA4.into()), Ja4Source::Direct)
+        );
+    }
+
     /// Behind Cloudflare the TLS client is Cloudflare, so its `cf-ja4` is
     /// the visitor's and the computed one is not; a malformed header gives
     /// no JA4 rather than Cloudflare's own.

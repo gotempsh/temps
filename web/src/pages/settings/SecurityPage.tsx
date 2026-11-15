@@ -5,6 +5,10 @@ import { PageHeader, SaveRow } from '@temps-sdk/ds'
 import { SettingsFormSkeleton } from '@/components/settings/SettingsFormSkeleton'
 import { SettingsLoadFailure } from '@/components/settings/SettingsLoadFailure'
 import { isForbiddenRead } from '@/lib/read-failure'
+import {
+  validateProxyRanges,
+  parseProxyRanges,
+} from '@/lib/trusted-proxy-ranges'
 import { validateLoopbackJa4Header } from '@/lib/loopback-ja4-header'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { SettingsSection } from '@/components/ui/settings-section'
@@ -42,10 +46,11 @@ export function SecurityPage() {
     register,
     handleSubmit,
     control,
-    formState: { errors, isDirty, isSubmitting, dirtyFields },
+    formState: { errors, isDirty, isSubmitting, isValid, dirtyFields },
     reset,
     setValue,
   } = useForm<SecurityFormData>({
+    mode: 'onChange',
     defaultValues: {
       security_headers: {
         enabled: true,
@@ -131,7 +136,7 @@ export function SecurityPage() {
       const saved = await updateSettings.mutateAsync({
         ...rest,
         ...(dirtyFields.trusted_proxy_cidrs_text
-          ? { trusted_proxy_cidrs: parseNetworkLines(trusted_proxy_cidrs_text) }
+          ? { trusted_proxy_cidrs: parseProxyRanges(trusted_proxy_cidrs_text) }
           : {}),
         loopback_ja4_header: loopback_ja4_header.trim() || null,
         trusted_private_networks: parseNetworkLines(
@@ -254,8 +259,21 @@ export function SecurityPage() {
               id="trusted-proxy-cidrs"
               placeholder={'10.20.0.0/16\n2001:db8:1::/48'}
               className="font-mono text-sm"
-              {...register('trusted_proxy_cidrs_text')}
+              aria-invalid={errors.trusted_proxy_cidrs_text ? true : undefined}
+              aria-describedby={
+                errors.trusted_proxy_cidrs_text
+                  ? 'trusted-proxy-error'
+                  : undefined
+              }
+              {...register('trusted_proxy_cidrs_text', {
+                validate: validateProxyRanges,
+              })}
             />
+            {errors.trusted_proxy_cidrs_text && (
+              <p id="trusted-proxy-error" className="text-xs text-destructive">
+                {errors.trusted_proxy_cidrs_text.message}
+              </p>
+            )}
             <p className="text-sm text-muted-foreground">
               One address or range per line, up to 64. Leave empty when clients
               connect directly. Only list proxies you operate and configure to
@@ -349,7 +367,12 @@ export function SecurityPage() {
           securityHeaders={securityHeaders}
           rateLimiting={rateLimiting}
         />
-        <SaveRow sticky dirty={isDirty} saving={isSubmitting} />
+        <SaveRow
+          sticky
+          dirty={isDirty}
+          saving={isSubmitting}
+          disabled={!isValid}
+        />
       </form>
     </div>
   )

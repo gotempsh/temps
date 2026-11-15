@@ -15,7 +15,6 @@ pub mod ai_tool_call;
 pub mod audit;
 mod clickhouse_compression;
 pub mod client_ip;
-pub mod trusted_proxies;
 /// The seam the purchase-triggered Cloud telemetry activation crosses
 /// (ADR-042 P3).
 pub mod cloud_telemetry_activation;
@@ -64,6 +63,7 @@ pub mod registry_prefix;
 #[cfg(test)]
 mod release_manifest;
 pub mod request_policy_gate;
+pub mod trusted_proxies;
 pub mod workflow_ingress;
 /// Immutable image references embedded at compile time in official releases.
 pub mod release_images {
