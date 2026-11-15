@@ -139,9 +139,9 @@ needed, and stop it before continuing with unrelated work.
 
 ## Automate in CI
 
-Store `TEMPS_TOKEN` and `TEMPS_API_URL` in the CI provider's secret store. Pin
-the exact package version in every invocation; never resolve the mutable latest
-release in CI.
+Store `TEMPS_TOKEN` and `TEMPS_API_URL` in the CI provider's secret store. Use
+`@temps-sdk/cli@latest` for the current stable release. Record `--version` in
+the job output and check command `--help` before relying on flags.
 
 Run an identity check before mutation:
 
