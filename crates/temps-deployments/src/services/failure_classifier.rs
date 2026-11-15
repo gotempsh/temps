@@ -1341,6 +1341,7 @@ fn classify_lowercase(raw: &str) -> DeploymentFailureClassification {
         r,
         &["task execution failed:", "internal error executing job"],
     ) || (phase != Some(JobPhase::Build)
+        && !r.contains("docker compose build failed")
         && contains_any(
             r,
             &[
@@ -1769,6 +1770,8 @@ mod tests {
             ("mark_deployment_complete", "Failed to find environment: query failed", S::Platform, C::PlatformInternal),
             ("mark_deployment_complete", "Failed to find project: query failed", S::Platform, C::PlatformInternal),
             ("mark_deployment_complete", "Failed to update project last_deployment: query failed", S::Platform, C::PlatformInternal),
+            ("deploy_compose", "Compose prepare/pull failed: Docker Compose command failed for project 'app': docker compose build failed: Database error: relation items does not exist", S::Build, C::ComposeBuildFailed),
+            ("deploy_compose", "Database error: connection pool closed", S::Platform, C::PlatformInternal),
             ("deploy_container", "Database error: connection pool closed", S::Platform, C::PlatformInternal),
             ("deploy_container", "Container candidate-1 is in terminal state Exited and will not become ready", S::Runtime, C::ContainerExited),
             ("deploy_container", "Container candidate-1 is in terminal state Dead and will not become ready", S::Runtime, C::ContainerExited),
