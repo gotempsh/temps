@@ -785,7 +785,7 @@ mod tests {
 
     use serde_json::json;
     use wiremock::{
-        matchers::{method, path, query_param},
+        matchers::{method, path, query_param, query_param_is_missing},
         Mock, MockServer, ResponseTemplate,
     };
 
@@ -1062,6 +1062,52 @@ mod tests {
         CloudflareProvider::retain_record_type(&mut records, DnsRecordType::CNAME);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].content.record_type(), DnsRecordType::CNAME);
+    }
+
+    #[tokio::test]
+    async fn get_records_sends_no_content_filter_and_keeps_matches_across_pages() {
+        // End to end: the first page holds only another record type, the
+        // second holds the CNAME. Both requests must omit `content` and
+        // `type` (the placeholder filter that caused the 400), and the type
+        // filter must run after every page is read, not end pagination early.
+        let server = MockServer::start().await;
+        mount_zone(
+            &server,
+            "example.com",
+            vec![zone_json("zone-1", "example.com", "active")],
+        )
+        .await;
+        let cname = json!({
+            "id": "rec-cname", "name": "app.example.com", "type": "CNAME",
+            "content": "tunnel.cfargotunnel.com",
+            "ttl": 1, "proxied": true, "proxiable": true, "meta": {},
+            "created_on": "2024-01-01T00:00:00Z", "modified_on": "2024-01-01T00:00:00Z"
+        });
+        for (page, record) in [("1", record_json("rec-a", "app.example.com")), ("2", cname)] {
+            Mock::given(method("GET"))
+                .and(path("/zones/zone-1/dns_records"))
+                .and(query_param("name", "app.example.com"))
+                .and(query_param("page", page))
+                .and(query_param_is_missing("content"))
+                .and(query_param_is_missing("type"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(envelope(
+                    vec![record],
+                    json!({"page":page.parse::<u32>().unwrap(),"per_page":1,"count":1,"total_count":2,"total_pages":2}),
+                )))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+
+        let records = mock_provider(&server)
+            .get_records("example.com", "app", DnsRecordType::CNAME)
+            .await
+            .unwrap();
+
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0].id.as_deref(), Some("rec-cname"));
+        assert_eq!(records[0].content.record_type(), DnsRecordType::CNAME);
+        // `expect(1)` on both pages is verified when `server` drops.
     }
 
     #[test]
