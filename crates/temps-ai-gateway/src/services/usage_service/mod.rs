@@ -8,7 +8,7 @@ use sea_orm::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use temps_entities::{ai_provider_models, ai_usage_logs};
+use temps_entities::{ai_provider_keys, ai_provider_models, ai_usage_logs};
 use utoipa::ToSchema;
 
 use crate::error::AiGatewayError;
@@ -58,6 +58,67 @@ pub(crate) fn cost_microcents_from_details(
     Some(cost.round().clamp(0.0, i64::MAX as f64) as i64)
 }
 
+/// What a usage record's token counts describe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UsageCount {
+    /// One request: its prompt length decides long-context pricing.
+    OneRequest,
+    /// The total of a batch of requests. The prompt length of each is not
+    /// known, so the total is never compared with a long-context threshold
+    /// (see `pricing::estimate_batch_total_cost_microcents`).
+    BatchTotal,
+}
+
+/// SQL condition for a usage row that used tokens but has no cost from a
+/// known price, shared with every other report that counts them. Mirrors
+/// `is_unpriced`.
+const UNPRICED_SQL: &str = temps_entities::ai_usage_logs::UNPRICED_CONDITION;
+
+/// Whether a usage row used tokens but has no cost from a known price; the
+/// same rule as `UNPRICED_SQL`.
+fn is_unpriced(
+    price_known: Option<bool>,
+    cost_microcents: i64,
+    input_tokens: i64,
+    output_tokens: i64,
+) -> bool {
+    (input_tokens > 0 || output_tokens > 0)
+        && match price_known {
+            Some(known) => !known,
+            None => cost_microcents <= 0,
+        }
+}
+
+/// The cost to record for a request the model catalogue priced.
+///
+/// The catalogue publishes one input and one output price, with no
+/// long-context tier, so a long prompt to a model the built-in price list
+/// bills higher above a threshold is raised to the listed long-context cost.
+/// A self-hosted server's model ids are the operator's own names and are
+/// never matched against vendor price lists.
+///
+/// A batch total is not raised: its requests' prompt lengths are not known.
+fn catalogue_cost_microcents(
+    provider: &str,
+    model: &str,
+    catalogue_cost: i64,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache: PromptTokensDetails,
+    count: UsageCount,
+) -> i64 {
+    if crate::self_hosted::is_self_hosted(provider) || count == UsageCount::BatchTotal {
+        return catalogue_cost;
+    }
+    crate::services::pricing::long_context_cost_microcents(
+        model,
+        input_tokens,
+        output_tokens,
+        cache,
+    )
+    .map_or(catalogue_cost, |long| catalogue_cost.max(long))
+}
+
 /// Cost of a request whose model the catalogue publishes no price for.
 ///
 /// A vendor model goes to the built-in price list, which charges a model it
@@ -65,18 +126,28 @@ pub(crate) fn cost_microcents_from_details(
 /// never be a way around a spend cap. A self-hosted server has no vendor price
 /// to approximate: its model ids are whatever the operator named them, and
 /// charging them as the dearest cloud model reports a bill nobody pays. It is
-/// recorded at zero instead, which reports read as "no published price" rather
-/// than as free.
+/// recorded at zero with no known price (`None`), which reports read as "no
+/// published price" rather than as free.
 fn unlisted_cost_microcents(
     provider: &str,
     model: &str,
     input_tokens: i64,
     output_tokens: i64,
-) -> i64 {
+    cache: PromptTokensDetails,
+    count: UsageCount,
+) -> Option<i64> {
+    use crate::services::pricing;
     if crate::self_hosted::is_self_hosted(provider) {
-        return 0;
+        return None;
     }
-    crate::services::pricing::estimate_cost_microcents(model, input_tokens, output_tokens)
+    Some(match count {
+        UsageCount::OneRequest => {
+            pricing::estimate_cost_microcents(model, input_tokens, output_tokens, cache)
+        }
+        UsageCount::BatchTotal => {
+            pricing::estimate_batch_total_cost_microcents(model, input_tokens, output_tokens, cache)
+        }
+    })
 }
 
 // ============================================================================
@@ -94,6 +165,18 @@ pub struct UsageSummary {
     pub error_count: i64,
     pub streaming_count: i64,
     pub byok_count: i64,
+    /// Requests that used tokens but whose cost no known price gave: logged
+    /// before costs were estimated, or served by a model with no published
+    /// price (a self-hosted server). A model with a published price of zero
+    /// is priced, not counted here. `total_cost_microcents` leaves these out,
+    /// so a client shows the total as partial, or unknown when every request
+    /// is unpriced, rather than as free.
+    pub unpriced_requests: i64,
+    /// Requests that used tokens and whose cost a known price gave, zero
+    /// included. With `unpriced_requests` it tells a window with no priced
+    /// request (no total to show) from one whose total is partial; requests
+    /// that used no tokens (failures) are in neither.
+    pub priced_requests: i64,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -125,6 +208,13 @@ pub struct ModelUsage {
     pub output_tokens: i64,
     pub total_tokens: i64,
     pub avg_latency_ms: f64,
+    /// Sum of the recorded cost of the model's requests in the window, in
+    /// microcents (1e-6 USD). Clients show this rather than recomputing from
+    /// list prices, which cannot see cache prices or long-context rates. It
+    /// includes requests made with a caller-supplied provider key, so it is
+    /// not the figure a project's budget is measured against (that is
+    /// `ProjectUsage::operator_cost_microcents`).
+    pub estimated_cost_microcents: i64,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -141,6 +231,10 @@ pub struct UsageLogEntry {
     pub cache_write_tokens: i64,
     pub latency_ms: i32,
     pub estimated_cost_microcents: i64,
+    /// The request used tokens but no known price gave its cost, so
+    /// `estimated_cost_microcents` (zero) is not a price: show it as unknown,
+    /// not as free.
+    pub unpriced: bool,
     pub status: i16,
     pub is_streaming: bool,
     pub is_byok: bool,
@@ -282,6 +376,8 @@ struct SummaryRow {
     error_count: Option<i64>,
     streaming_count: Option<i64>,
     byok_count: Option<i64>,
+    unpriced_requests: Option<i64>,
+    priced_requests: Option<i64>,
 }
 
 #[derive(Debug, FromQueryResult)]
@@ -312,6 +408,7 @@ struct ModelUsageRow {
     output_tokens: Option<i64>,
     total_tokens: Option<i64>,
     avg_latency_ms: Option<f64>,
+    estimated_cost_microcents: Option<i64>,
 }
 
 #[derive(Debug, FromQueryResult)]
@@ -335,6 +432,7 @@ struct UsageLogRow {
     trace_id: Option<String>,
     project_id: Option<i32>,
     token_id: Option<i32>,
+    price_known: Option<bool>,
 }
 
 #[derive(Debug, FromQueryResult)]
@@ -446,18 +544,21 @@ impl UsageService {
             is_streaming,
             is_byok,
             cache,
+            UsageCount::OneRequest,
             context,
         )
         .await
     }
 
-    /// Estimate a request's cost from the model catalogue's published price.
+    /// Estimate a request's cost from the model catalogue's published price,
+    /// read from entries of the serving `provider`'s keys only.
     /// `None` when the catalogue publishes no price for the model. A failed
     /// lookup is logged and treated as no price: usage logging must never fail
     /// a request over a missing estimate.
     async fn estimate_cost_microcents<C: sea_orm::ConnectionTrait>(
         &self,
         connection: &C,
+        provider: &str,
         model: &str,
         input_tokens: i64,
         output_tokens: i64,
@@ -466,7 +567,14 @@ impl UsageService {
         if input_tokens <= 0 && output_tokens <= 0 {
             return Some(0);
         }
+        // Only the serving provider's catalogue entries: a self-hosted
+        // server's ids are the operator's own names, so its `gpt-5.4` must not
+        // take a vendor key's price (and be recorded as priced), while its own
+        // priced entries still apply. Scoped by provider rather than key so a
+        // request on the caller's own key is priced from its vendor's catalogue.
         let rows = ai_provider_models::Entity::find()
+            .inner_join(ai_provider_keys::Entity)
+            .filter(ai_provider_keys::Column::Provider.eq(provider))
             .filter(ai_provider_models::Column::ModelId.eq(model))
             .filter(ai_provider_models::Column::Metadata.is_not_null())
             .order_by_desc(ai_provider_models::Column::UpdatedAt)
@@ -505,23 +613,56 @@ impl UsageService {
         is_streaming: bool,
         is_byok: bool,
         cache: PromptTokensDetails,
+        count: UsageCount,
         context: &AiRequestContext,
     ) -> Result<(), AiGatewayError> {
         // Callers that already priced the request keep their figure. Everything
         // else is priced here, once, so every path records the same estimate
         // and spend caps and per-project reports have a cost to work with:
-        // from the model catalogue first (it carries cache prices), then from
+        // from the model catalogue first (it carries cache prices; a long
+        // prompt is raised to the listed long-context cost), then from
         // the built-in price list (see `unlisted_cost_microcents`). BYOK
         // requests are priced too; reports separate them as non-operator cost.
-        let estimated_cost_microcents = if estimated_cost_microcents > 0 {
-            estimated_cost_microcents
+        // A batch total is never priced by long-context tiers, since its
+        // requests' prompt lengths are not known. Whether a known price gave
+        // the cost is recorded, so a free model is not reported as unpriced.
+        let (estimated_cost_microcents, price_known) = if estimated_cost_microcents > 0 {
+            (estimated_cost_microcents, true)
         } else {
             match self
-                .estimate_cost_microcents(connection, model, input_tokens, output_tokens, cache)
+                .estimate_cost_microcents(
+                    connection,
+                    provider,
+                    model,
+                    input_tokens,
+                    output_tokens,
+                    cache,
+                )
                 .await
             {
-                Some(cost) => cost,
-                None => unlisted_cost_microcents(provider, model, input_tokens, output_tokens),
+                Some(cost) => (
+                    catalogue_cost_microcents(
+                        provider,
+                        model,
+                        cost,
+                        input_tokens,
+                        output_tokens,
+                        cache,
+                        count,
+                    ),
+                    true,
+                ),
+                None => match unlisted_cost_microcents(
+                    provider,
+                    model,
+                    input_tokens,
+                    output_tokens,
+                    cache,
+                    count,
+                ) {
+                    Some(cost) => (cost, true),
+                    None => (0, false),
+                },
             }
         };
         let record = ai_usage_logs::ActiveModel {
@@ -544,6 +685,7 @@ impl UsageService {
             trace_id: Set(context.trace_id.clone()),
             project_id: Set(context.project_id),
             token_id: Set(context.token_id),
+            price_known: Set(Some(price_known)),
             ..Default::default()
         };
 
@@ -580,10 +722,14 @@ impl UsageService {
                 COALESCE(SUM(estimated_cost_microcents), 0)::INT8 as total_cost_microcents,
                 COUNT(*) FILTER (WHERE status >= 400) as error_count,
                 COUNT(*) FILTER (WHERE is_streaming = true) as streaming_count,
-                COUNT(*) FILTER (WHERE is_byok = true) as byok_count
+                COUNT(*) FILTER (WHERE is_byok = true) as byok_count,
+                COUNT(*) FILTER (WHERE {unpriced}) as unpriced_requests,
+                COUNT(*) FILTER (
+                    WHERE (input_tokens > 0 OR output_tokens > 0) AND NOT ({unpriced})
+                ) as priced_requests
             FROM ai_usage_logs
-            WHERE {}"#,
-            where_clause
+            WHERE {where_clause}"#,
+            unpriced = UNPRICED_SQL,
         );
 
         let row = SummaryRow::find_by_statement(Statement::from_sql_and_values(
@@ -604,6 +750,8 @@ impl UsageService {
             error_count: Some(0),
             streaming_count: Some(0),
             byok_count: Some(0),
+            unpriced_requests: Some(0),
+            priced_requests: Some(0),
         });
 
         Ok(UsageSummary {
@@ -616,6 +764,8 @@ impl UsageService {
             error_count: row.error_count.unwrap_or(0),
             streaming_count: row.streaming_count.unwrap_or(0),
             byok_count: row.byok_count.unwrap_or(0),
+            unpriced_requests: row.unpriced_requests.unwrap_or(0),
+            priced_requests: row.priced_requests.unwrap_or(0),
         })
     }
 
@@ -876,7 +1026,8 @@ impl UsageService {
                 COALESCE(SUM(input_tokens), 0)::INT8 as input_tokens,
                 COALESCE(SUM(output_tokens), 0)::INT8 as output_tokens,
                 COALESCE(SUM(input_tokens + output_tokens), 0)::INT8 as total_tokens,
-                COALESCE(AVG(latency_ms)::float8, 0) as avg_latency_ms
+                COALESCE(AVG(latency_ms)::float8, 0) as avg_latency_ms,
+                COALESCE(SUM(estimated_cost_microcents), 0)::INT8 as estimated_cost_microcents
             FROM ai_usage_logs
             WHERE {}
             GROUP BY model, provider
@@ -903,6 +1054,7 @@ impl UsageService {
                 output_tokens: r.output_tokens.unwrap_or(0),
                 total_tokens: r.total_tokens.unwrap_or(0),
                 avg_latency_ms: r.avg_latency_ms.unwrap_or(0.0),
+                estimated_cost_microcents: r.estimated_cost_microcents.unwrap_or(0),
             })
             .collect())
     }
@@ -970,7 +1122,8 @@ impl UsageService {
                 request_id,
                 trace_id,
                 project_id,
-                token_id
+                token_id,
+                price_known
             FROM ai_usage_logs
             WHERE {}
             ORDER BY timestamp DESC
@@ -1087,7 +1240,8 @@ impl UsageService {
                 request_id,
                 trace_id,
                 project_id,
-                token_id
+                token_id,
+                price_known
             FROM ai_usage_logs
             WHERE conversation_id = $1
               AND ($3::int IS NULL OR user_id = $3)
@@ -1260,6 +1414,12 @@ fn usage_log_from_row(r: UsageLogRow) -> UsageLogEntry {
         cache_write_tokens: r.cache_write_tokens.unwrap_or(0),
         latency_ms: r.latency_ms.unwrap_or(0),
         estimated_cost_microcents: r.estimated_cost_microcents.unwrap_or(0),
+        unpriced: is_unpriced(
+            r.price_known,
+            r.estimated_cost_microcents.unwrap_or(0),
+            r.input_tokens.unwrap_or(0),
+            r.output_tokens.unwrap_or(0),
+        ),
         status: r.status.unwrap_or(0),
         is_streaming: r.is_streaming.unwrap_or(false),
         is_byok: r.is_byok.unwrap_or(false),
@@ -1279,801 +1439,4 @@ fn usage_log_from_row(r: UsageLogRow) -> UsageLogEntry {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn priced(input: Option<f64>, output: Option<f64>) -> ModelDetails {
-        ModelDetails {
-            input_price_per_million: input,
-            output_price_per_million: output,
-            ..ModelDetails::default()
-        }
-    }
-
-    #[test]
-    fn cost_is_tokens_times_the_per_million_price_in_microcents() {
-        // $3 / $15 per million tokens: 1,000 in + 200 out = $0.003 + $0.003.
-        let details = priced(Some(3.0), Some(15.0));
-        assert_eq!(
-            cost_microcents_from_details(&details, 1_000, 200, PromptTokensDetails::default()),
-            Some(6_000)
-        );
-        // 6,000 microcents is $0.006.
-        assert_eq!(6_000.0 / 1_000_000.0, 0.006);
-    }
-
-    fn cached(read: i64, write: i64) -> PromptTokensDetails {
-        PromptTokensDetails {
-            cached_tokens: read,
-            cache_write_tokens: write,
-        }
-    }
-
-    #[test]
-    fn cached_input_is_priced_at_the_cache_rate_and_carved_out_of_the_prompt() {
-        // $3 in / $15 out, $0.30 cache read, $3.75 cache write per million.
-        let details = ModelDetails {
-            cache_read_price_per_million: Some(0.3),
-            cache_write_price_per_million: Some(3.75),
-            ..priced(Some(3.0), Some(15.0))
-        };
-        // 10,000-token prompt: 8,000 cached, 1,000 written, 1,000 fresh; 200 out.
-        // 1,000*3 + 8,000*0.3 + 1,000*3.75 + 200*15 = 3,000+2,400+3,750+3,000.
-        assert_eq!(
-            cost_microcents_from_details(&details, 10_000, 200, cached(8_000, 1_000)),
-            Some(12_150)
-        );
-        // Uncached, the same prompt costs 10,000*3 + 3,000.
-        assert_eq!(
-            cost_microcents_from_details(&details, 10_000, 200, cached(0, 0)),
-            Some(33_000)
-        );
-    }
-
-    #[test]
-    fn a_catalogue_without_cache_prices_charges_cached_tokens_as_input() {
-        let details = priced(Some(3.0), Some(15.0));
-        assert_eq!(
-            cost_microcents_from_details(&details, 10_000, 0, cached(8_000, 1_000)),
-            cost_microcents_from_details(&details, 10_000, 0, cached(0, 0)),
-        );
-    }
-
-    #[test]
-    fn cache_counts_larger_than_the_prompt_cannot_make_the_cost_negative_or_exceed_it() {
-        let details = ModelDetails {
-            cache_read_price_per_million: Some(0.3),
-            cache_write_price_per_million: Some(3.75),
-            ..priced(Some(3.0), Some(15.0))
-        };
-        // Claims 9,000 read + 9,000 written out of a 1,000-token prompt: the
-        // read share is capped at the prompt, nothing is left to write.
-        assert_eq!(
-            cost_microcents_from_details(&details, 1_000, 0, cached(9_000, 9_000)),
-            Some(300)
-        );
-        assert_eq!(
-            cost_microcents_from_details(&details, 1_000, 0, cached(-5, -5)),
-            Some(3_000)
-        );
-    }
-
-    #[test]
-    fn a_model_without_a_published_price_is_unpriced_not_free() {
-        assert_eq!(
-            cost_microcents_from_details(
-                &priced(None, None),
-                1_000,
-                200,
-                PromptTokensDetails::default()
-            ),
-            None
-        );
-        assert_eq!(
-            cost_microcents_from_details(
-                &priced(Some(3.0), None),
-                1_000,
-                200,
-                PromptTokensDetails::default()
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn a_free_model_is_priced_at_zero() {
-        assert_eq!(
-            cost_microcents_from_details(
-                &priced(Some(0.0), Some(0.0)),
-                5_000,
-                500,
-                PromptTokensDetails::default()
-            ),
-            Some(0)
-        );
-    }
-
-    #[test]
-    fn negative_tokens_and_non_finite_prices_cannot_produce_a_negative_or_wild_cost() {
-        let details = priced(Some(3.0), Some(15.0));
-        assert_eq!(
-            cost_microcents_from_details(&details, -50, -50, PromptTokensDetails::default()),
-            Some(0)
-        );
-        assert_eq!(
-            cost_microcents_from_details(
-                &priced(Some(f64::NAN), Some(1.0)),
-                10,
-                10,
-                PromptTokensDetails::default()
-            ),
-            None
-        );
-        assert_eq!(
-            cost_microcents_from_details(
-                &priced(Some(f64::MAX), Some(f64::MAX)),
-                i64::MAX,
-                1,
-                PromptTokensDetails::default()
-            ),
-            Some(i64::MAX)
-        );
-    }
-
-    fn catalogue_row(metadata: Option<serde_json::Value>) -> ai_provider_models::Model {
-        let now = chrono::Utc::now();
-        ai_provider_models::Model {
-            id: 1,
-            provider_key_id: 1,
-            model_id: "vendor/model".to_string(),
-            display_name: "Model".to_string(),
-            source: "discovered".to_string(),
-            is_available: true,
-            is_enabled: true,
-            owned_by: None,
-            metadata,
-            last_seen_at: None,
-            created_at: now,
-            updated_at: now,
-        }
-    }
-
-    fn service() -> UsageService {
-        // The lookup runs on the connection it is handed, so the service's own
-        // handle is not used by these tests.
-        UsageService::new(Arc::new(
-            sea_orm::MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
-        ))
-    }
-
-    #[tokio::test]
-    async fn a_logged_request_is_priced_from_the_newest_catalogue_entry_that_has_a_price() {
-        let db = sea_orm::MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results([vec![
-                // Newest entry publishes nothing; the next one does.
-                catalogue_row(Some(serde_json::json!({ "name": "Model" }))),
-                catalogue_row(Some(serde_json::json!({
-                    "input_price_per_million": 3.0,
-                    "output_price_per_million": 15.0
-                }))),
-            ]])
-            .into_connection();
-
-        let cost = service()
-            .estimate_cost_microcents(
-                &db,
-                "vendor/model",
-                1_000,
-                200,
-                PromptTokensDetails::default(),
-            )
-            .await;
-
-        assert_eq!(cost, Some(6_000));
-    }
-
-    #[tokio::test]
-    async fn an_unlisted_model_has_no_catalogue_price() {
-        let db = sea_orm::MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results([Vec::<ai_provider_models::Model>::new()])
-            .into_connection();
-
-        let cost = service()
-            .estimate_cost_microcents(
-                &db,
-                "vendor/unknown",
-                1_000,
-                200,
-                PromptTokensDetails::default(),
-            )
-            .await;
-
-        assert_eq!(cost, None);
-    }
-
-    #[test]
-    fn an_unlisted_self_hosted_model_is_recorded_as_unpriced() {
-        assert_eq!(
-            unlisted_cost_microcents(
-                crate::self_hosted::OPENAI_COMPATIBLE,
-                "local-flash",
-                7_000_000,
-                100_000
-            ),
-            0
-        );
-    }
-
-    #[test]
-    fn an_unlisted_vendor_model_keeps_the_worst_case_price() {
-        assert_eq!(
-            unlisted_cost_microcents("openrouter", "vendor/unknown", 1_000, 200),
-            crate::services::pricing::estimate_cost_microcents("vendor/unknown", 1_000, 200)
-        );
-        assert!(unlisted_cost_microcents("openrouter", "vendor/unknown", 1_000, 200) > 0);
-    }
-
-    #[tokio::test]
-    async fn a_failed_price_lookup_is_treated_as_no_catalogue_price() {
-        let db = sea_orm::MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_errors([sea_orm::DbErr::Custom("connection reset".to_string())])
-            .into_connection();
-
-        let cost = service()
-            .estimate_cost_microcents(
-                &db,
-                "vendor/model",
-                1_000,
-                200,
-                PromptTokensDetails::default(),
-            )
-            .await;
-
-        assert_eq!(cost, None);
-    }
-
-    #[tokio::test]
-    async fn a_request_with_no_tokens_skips_the_lookup() {
-        // No query results queued: a lookup would error and return no price,
-        // so `Some(0)` proves it returned early.
-        let db = sea_orm::MockDatabase::new(DatabaseBackend::Postgres).into_connection();
-        let cost = service()
-            .estimate_cost_microcents(&db, "vendor/model", 0, 0, PromptTokensDetails::default())
-            .await;
-        assert_eq!(cost, Some(0));
-    }
-
-    #[tokio::test]
-    async fn by_project_reports_operator_cost_apart_from_total_cost() {
-        use sea_orm::{MockDatabase, Value};
-        let row = std::collections::BTreeMap::from([
-            ("project_id".to_string(), Value::Int(Some(7))),
-            ("request_count".to_string(), Value::BigInt(Some(4))),
-            ("input_tokens".to_string(), Value::BigInt(Some(100))),
-            ("output_tokens".to_string(), Value::BigInt(Some(50))),
-            (
-                "estimated_cost_microcents".to_string(),
-                Value::BigInt(Some(900)),
-            ),
-            (
-                "operator_cost_microcents".to_string(),
-                Value::BigInt(Some(600)),
-            ),
-            ("byok_request_count".to_string(), Value::BigInt(Some(1))),
-            ("error_count".to_string(), Value::BigInt(Some(0))),
-        ]);
-        let service = UsageService::new(Arc::new(
-            MockDatabase::new(DatabaseBackend::Postgres)
-                .append_query_results([vec![row]])
-                .into_connection(),
-        ));
-        let now = chrono::Utc::now();
-        let projects = service.get_by_project(now, now, 10).await.unwrap();
-        assert_eq!(projects.len(), 1);
-        assert_eq!(projects[0].project_id, 7);
-        assert_eq!(projects[0].estimated_cost_microcents, 900);
-        assert_eq!(projects[0].operator_cost_microcents, 600);
-    }
-
-    #[tokio::test]
-    async fn a_key_route_resolves_to_the_key_provider() {
-        use sea_orm::MockDatabase;
-        let key = temps_entities::ai_provider_keys::Model {
-            id: 7,
-            provider: "anthropic".to_string(),
-            display_name: "Anthropic".to_string(),
-            api_key_encrypted: "enc".to_string(),
-            base_url: None,
-            default_model: None,
-            is_active: true,
-            trusted_private_address: None,
-            trusted_private_address_set_by: None,
-            trusted_private_address_set_at: None,
-            capabilities: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-        };
-        let service = UsageService::new(Arc::new(
-            MockDatabase::new(DatabaseBackend::Postgres)
-                .append_query_results([vec![key]])
-                .into_connection(),
-        ));
-        assert_eq!(
-            service.provider_name_for_route("gateway_key:7").await,
-            "anthropic"
-        );
-    }
-
-    #[tokio::test]
-    async fn routes_that_are_not_resolvable_keys_are_left_alone() {
-        use sea_orm::MockDatabase;
-        // No query results queued: a lookup that wrongly ran would error out.
-        let service = UsageService::new(Arc::new(
-            MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
-        ));
-        assert_eq!(service.provider_name_for_route("openai").await, "openai");
-        assert_eq!(
-            service.provider_name_for_route("gateway_key:abc").await,
-            "gateway_key:abc"
-        );
-        // A key that no longer exists, or a failing read, falls back to the route.
-        assert_eq!(
-            service.provider_name_for_route("gateway_key:9").await,
-            "gateway_key:9"
-        );
-    }
-
-    #[test]
-    fn test_shift_params_basic() {
-        assert_eq!(shift_params("$1 AND $2", 1), "$2 AND $3");
-    }
-
-    #[test]
-    fn test_shift_params_no_params() {
-        assert_eq!(shift_params("SELECT 1", 5), "SELECT 1");
-    }
-
-    #[test]
-    fn test_shift_params_multiple() {
-        assert_eq!(
-            shift_params("$1 = ANY(tags) AND $2 < $3", 2),
-            "$3 = ANY(tags) AND $4 < $5"
-        );
-    }
-
-    #[test]
-    fn test_shift_params_preserves_dollar_without_number() {
-        assert_eq!(shift_params("$$ BEGIN END $$", 1), "$$ BEGIN END $$");
-    }
-
-    #[test]
-    fn test_build_filter_clause_time_range_only() {
-        let db = sea_orm::DatabaseConnection::Disconnected;
-        let service = UsageService::new(Arc::new(db));
-        let from = Utc::now() - chrono::Duration::hours(1);
-        let to = Utc::now();
-        let filter = UsageFilter::default();
-
-        let (clause, values) = service.build_filter_clause(from, to, &filter);
-        assert_eq!(clause, "timestamp >= $1 AND timestamp < $2");
-        assert_eq!(values.len(), 2);
-    }
-
-    #[test]
-    fn test_build_filter_clause_with_user_id() {
-        let db = sea_orm::DatabaseConnection::Disconnected;
-        let service = UsageService::new(Arc::new(db));
-        let from = Utc::now() - chrono::Duration::hours(1);
-        let to = Utc::now();
-        let filter = UsageFilter {
-            user_id: Some(42),
-            ..Default::default()
-        };
-
-        let (clause, values) = service.build_filter_clause(from, to, &filter);
-        assert!(clause.contains("user_id = $3"));
-        assert_eq!(values.len(), 3);
-    }
-
-    #[test]
-    fn test_build_filter_clause_with_tags() {
-        let db = sea_orm::DatabaseConnection::Disconnected;
-        let service = UsageService::new(Arc::new(db));
-        let from = Utc::now() - chrono::Duration::hours(1);
-        let to = Utc::now();
-        let filter = UsageFilter {
-            tags: Some("agent:support,env:prod".to_string()),
-            ..Default::default()
-        };
-
-        let (clause, values) = service.build_filter_clause(from, to, &filter);
-        assert!(clause.contains("$3 = ANY(tags)"));
-        assert!(clause.contains("$4 = ANY(tags)"));
-        assert_eq!(values.len(), 4);
-    }
-
-    #[test]
-    fn test_build_filter_clause_all_filters() {
-        let db = sea_orm::DatabaseConnection::Disconnected;
-        let service = UsageService::new(Arc::new(db));
-        let from = Utc::now() - chrono::Duration::hours(1);
-        let to = Utc::now();
-        let filter = UsageFilter {
-            user_id: Some(42),
-            conversation_id: Some("conv_abc".to_string()),
-            tags: Some("agent:support".to_string()),
-            model: Some("claude-sonnet-4-6".to_string()),
-            provider: Some("anthropic".to_string()),
-            ..Default::default()
-        };
-
-        let (clause, values) = service.build_filter_clause(from, to, &filter);
-        assert!(clause.contains("user_id = $3"));
-        assert!(clause.contains("conversation_id = $4"));
-        assert!(clause.contains("$5 = ANY(tags)"));
-        assert!(clause.contains("model = $6"));
-        assert!(clause.contains("provider = $7"));
-        assert_eq!(values.len(), 7);
-    }
-
-    #[test]
-    fn test_build_filter_clause_with_status_and_cost_bounds() {
-        let db = sea_orm::DatabaseConnection::Disconnected;
-        let service = UsageService::new(Arc::new(db));
-        let from = Utc::now() - chrono::Duration::hours(1);
-        let to = Utc::now();
-        let filter = UsageFilter {
-            provider: Some("openai".to_string()),
-            status: Some(429),
-            cost_gte: Some(100),
-            cost_lt: Some(50_000),
-            ..Default::default()
-        };
-
-        let (clause, values) = service.build_filter_clause(from, to, &filter);
-        // $1/$2 are the time range; provider, status, cost_gte, cost_lt follow.
-        assert!(clause.contains("provider = $3"));
-        assert!(clause.contains("status = $4"));
-        assert!(clause.contains("estimated_cost_microcents >= $5"));
-        assert!(clause.contains("estimated_cost_microcents < $6"));
-        assert_eq!(values.len(), 6);
-    }
-
-    #[test]
-    fn test_build_filter_clause_with_token_bounds() {
-        let db = sea_orm::DatabaseConnection::Disconnected;
-        let service = UsageService::new(Arc::new(db));
-        let from = Utc::now() - chrono::Duration::hours(1);
-        let to = Utc::now();
-        let filter = UsageFilter {
-            tokens_gte: Some(500),
-            tokens_lt: Some(10_000),
-            ..Default::default()
-        };
-
-        let (clause, values) = service.build_filter_clause(from, to, &filter);
-        assert!(clause.contains("(input_tokens + output_tokens) >= $3"));
-        assert!(clause.contains("(input_tokens + output_tokens) < $4"));
-        assert_eq!(values.len(), 4);
-    }
-
-    #[test]
-    fn test_usage_log_from_row_with_context() {
-        let row = UsageLogRow {
-            id: Some(1),
-            timestamp: Some("2026-03-10T00:00:00Z".to_string()),
-            provider: Some("anthropic".to_string()),
-            model: Some("claude-sonnet-4-6".to_string()),
-            input_tokens: Some(100),
-            output_tokens: Some(50),
-            cache_read_tokens: Some(0),
-            cache_write_tokens: Some(0),
-            latency_ms: Some(500),
-            estimated_cost_microcents: Some(10),
-            status: Some(200),
-            is_streaming: Some(false),
-            is_byok: Some(false),
-            conversation_id: Some("conv_123".to_string()),
-            tags: Some("agent:support,env:prod".to_string()),
-            request_id: Some("req_abc".to_string()),
-            trace_id: Some("trace_xyz".to_string()),
-            project_id: Some(7),
-            token_id: Some(9),
-        };
-
-        let entry = usage_log_from_row(row);
-        assert_eq!(entry.conversation_id, Some("conv_123".to_string()));
-        assert_eq!(entry.tags, vec!["agent:support", "env:prod"]);
-        assert_eq!(entry.request_id, Some("req_abc".to_string()));
-        assert_eq!(entry.trace_id, Some("trace_xyz".to_string()));
-        assert_eq!((entry.cache_read_tokens, entry.cache_write_tokens), (0, 0));
-    }
-
-    #[test]
-    fn test_usage_log_from_row_empty_tags() {
-        let row = UsageLogRow {
-            id: Some(1),
-            timestamp: Some("2026-03-10T00:00:00Z".to_string()),
-            provider: Some("openai".to_string()),
-            model: Some("gpt-4o".to_string()),
-            input_tokens: Some(100),
-            output_tokens: Some(50),
-            cache_read_tokens: Some(0),
-            cache_write_tokens: Some(0),
-            latency_ms: Some(200),
-            estimated_cost_microcents: Some(5),
-            status: Some(200),
-            is_streaming: Some(true),
-            is_byok: Some(true),
-            conversation_id: None,
-            tags: Some("".to_string()),
-            request_id: None,
-            trace_id: None,
-            project_id: None,
-            token_id: None,
-        };
-
-        let entry = usage_log_from_row(row);
-        assert!(entry.conversation_id.is_none());
-        assert!(entry.tags.is_empty());
-        assert!(entry.request_id.is_none());
-        assert!(entry.trace_id.is_none());
-    }
-
-    #[test]
-    fn test_ai_request_context_default() {
-        let ctx = AiRequestContext::default();
-        assert!(ctx.conversation_id.is_none());
-        assert!(ctx.tags.is_empty());
-        assert!(ctx.request_id.is_none());
-        assert!(ctx.trace_id.is_none());
-    }
-
-    #[test]
-    fn test_usage_filter_default() {
-        let filter = UsageFilter::default();
-        assert!(filter.user_id.is_none());
-        assert!(filter.conversation_id.is_none());
-        assert!(filter.tags.is_none());
-        assert!(filter.model.is_none());
-        assert!(filter.provider.is_none());
-    }
-
-    #[test]
-    fn test_usage_log_entry_serialization_omits_none_fields() {
-        let entry = UsageLogEntry {
-            id: 1,
-            timestamp: "2026-03-10T00:00:00Z".to_string(),
-            provider: "anthropic".to_string(),
-            model: "claude-sonnet-4-6".to_string(),
-            input_tokens: 100,
-            output_tokens: 50,
-            cache_read_tokens: 0,
-            cache_write_tokens: 0,
-            latency_ms: 500,
-            estimated_cost_microcents: 10,
-            status: 200,
-            is_streaming: false,
-            is_byok: false,
-            conversation_id: None,
-            tags: vec![],
-            request_id: None,
-            trace_id: None,
-            project_id: None,
-            token_id: None,
-        };
-
-        let json = serde_json::to_string(&entry).unwrap();
-        assert!(!json.contains("conversation_id"));
-        assert!(!json.contains("request_id"));
-        assert!(!json.contains("trace_id"));
-    }
-
-    #[test]
-    fn test_usage_log_entry_serialization_includes_context() {
-        let entry = UsageLogEntry {
-            id: 1,
-            timestamp: "2026-03-10T00:00:00Z".to_string(),
-            provider: "anthropic".to_string(),
-            model: "claude-sonnet-4-6".to_string(),
-            input_tokens: 100,
-            output_tokens: 50,
-            cache_read_tokens: 0,
-            cache_write_tokens: 0,
-            latency_ms: 500,
-            estimated_cost_microcents: 10,
-            status: 200,
-            is_streaming: false,
-            is_byok: false,
-            conversation_id: Some("conv_abc".to_string()),
-            tags: vec!["agent:support".to_string()],
-            request_id: Some("req_123".to_string()),
-            trace_id: Some("trace_456".to_string()),
-            project_id: None,
-            token_id: None,
-        };
-
-        let json = serde_json::to_string(&entry).unwrap();
-        assert!(json.contains("conv_abc"));
-        assert!(json.contains("agent:support"));
-        assert!(json.contains("req_123"));
-        assert!(json.contains("trace_456"));
-    }
-
-    #[test]
-    fn test_conversation_summary_serialization() {
-        let summary = ConversationSummary {
-            conversation_id: "conv_abc".to_string(),
-            message_count: 5,
-            total_input_tokens: 1000,
-            total_output_tokens: 500,
-            total_tokens: 1500,
-            total_cost_microcents: 100,
-            avg_latency_ms: 450.5,
-            models_used: vec!["claude-sonnet-4-6".to_string(), "gpt-4o".to_string()],
-            first_at: "2026-03-10T00:00:00Z".to_string(),
-            last_at: "2026-03-10T01:00:00Z".to_string(),
-        };
-
-        let json = serde_json::to_string(&summary).unwrap();
-        assert!(json.contains("conv_abc"));
-        assert!(json.contains("\"message_count\":5"));
-        assert!(json.contains("claude-sonnet-4-6"));
-        assert!(json.contains("gpt-4o"));
-    }
-
-    fn usage_log_model(
-        project_id: Option<i32>,
-        token_id: Option<i32>,
-    ) -> temps_entities::ai_usage_logs::Model {
-        temps_entities::ai_usage_logs::Model {
-            id: 1,
-            timestamp: Utc::now(),
-            user_id: None,
-            provider: "openai".into(),
-            model: "gpt-4o".into(),
-            input_tokens: 1_000,
-            output_tokens: 100,
-            cache_read_tokens: 0,
-            cache_write_tokens: 0,
-            latency_ms: 10,
-            estimated_cost_microcents: 3_500,
-            status: 200,
-            is_streaming: false,
-            is_byok: false,
-            conversation_id: None,
-            tags: vec![],
-            request_id: None,
-            trace_id: None,
-            project_id,
-            token_id,
-        }
-    }
-
-    #[tokio::test]
-    async fn deployment_token_usage_is_stored_with_project_and_token() {
-        use sea_orm::MockDatabase;
-        let db = Arc::new(
-            MockDatabase::new(DatabaseBackend::Postgres)
-                // No catalogue price, so the static price table applies.
-                .append_query_results([Vec::<ai_provider_models::Model>::new()])
-                .append_query_results([vec![usage_log_model(Some(7), Some(11))]])
-                .into_connection(),
-        );
-        let service = UsageService::new(db.clone());
-        let context = AiRequestContext {
-            project_id: Some(7),
-            token_id: Some(11),
-            ..Default::default()
-        };
-
-        service
-            .log_usage_with_context(
-                None,
-                "openai",
-                "gpt-4o",
-                1_000,
-                100,
-                10,
-                0,
-                200,
-                false,
-                false,
-                PromptTokensDetails::default(),
-                &context,
-            )
-            .await
-            .expect("usage insert succeeds");
-
-        drop(service);
-        let log = Arc::try_unwrap(db).unwrap().into_transaction_log();
-        let sql = format!("{log:?}");
-        assert!(
-            sql.contains("project_id") && sql.contains("token_id"),
-            "{sql}"
-        );
-        assert!(sql.contains("Int(Some(7))"), "project id not bound: {sql}");
-        assert!(sql.contains("Int(Some(11))"), "token id not bound: {sql}");
-        // gpt-4o is $2.50/M in, $10/M out: 1000 * 2.5 + 100 * 10 microcents.
-        assert!(
-            sql.contains("BigInt(Some(3500))"),
-            "cost was not estimated: {sql}"
-        );
-    }
-
-    #[tokio::test]
-    async fn human_caller_usage_is_stored_without_project_attribution() {
-        use sea_orm::MockDatabase;
-        let db = Arc::new(
-            MockDatabase::new(DatabaseBackend::Postgres)
-                .append_query_results([Vec::<ai_provider_models::Model>::new()])
-                .append_query_results([vec![usage_log_model(None, None)]])
-                .into_connection(),
-        );
-        let service = UsageService::new(db.clone());
-
-        service
-            .log_usage(
-                Some(5),
-                "openai",
-                "gpt-4o",
-                10,
-                10,
-                10,
-                0,
-                200,
-                false,
-                false,
-            )
-            .await
-            .expect("usage insert succeeds");
-
-        drop(service);
-        let log = Arc::try_unwrap(db).unwrap().into_transaction_log();
-        let sql = format!("{log:?}");
-        assert!(
-            sql.contains("Int(None)"),
-            "project/token must bind NULL: {sql}"
-        );
-        assert!(!sql.contains("Int(Some(7))"), "{sql}");
-    }
-
-    #[tokio::test]
-    async fn an_explicit_cost_is_not_overridden_by_the_estimate() {
-        use sea_orm::MockDatabase;
-        let db = Arc::new(
-            MockDatabase::new(DatabaseBackend::Postgres)
-                .append_query_results([vec![usage_log_model(None, None)]])
-                .into_connection(),
-        );
-        let service = UsageService::new(db.clone());
-
-        service
-            .log_usage(
-                None, "openai", "gpt-4o", 1_000, 100, 10, 42, 200, false, false,
-            )
-            .await
-            .expect("usage insert succeeds");
-
-        drop(service);
-        let sql = format!("{:?}", Arc::try_unwrap(db).unwrap().into_transaction_log());
-        assert!(sql.contains("BigInt(Some(42))"), "{sql}");
-        assert!(!sql.contains("BigInt(Some(3500))"), "{sql}");
-    }
-
-    #[test]
-    fn project_filter_adds_a_bound_condition() {
-        let service = UsageService::new(Arc::new(
-            sea_orm::MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
-        ));
-        let to = Utc::now();
-        let from = to - chrono::Duration::hours(1);
-        let filter = UsageFilter {
-            project_id: Some(7),
-            ..Default::default()
-        };
-        let (clause, values) = service.build_filter_clause(from, to, &filter);
-        assert!(clause.contains("project_id = $3"), "{clause}");
-        assert_eq!(values.len(), 3);
-    }
-}
+mod tests;

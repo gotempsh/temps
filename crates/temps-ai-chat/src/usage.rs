@@ -9,9 +9,10 @@
 //! that log: it aggregates per model, bounded by the number of distinct models
 //! one chat has used, and never returns request content.
 //!
-//! The figures are estimates. A request whose model has no published price is
+//! The figures are estimates. A request whose model has no known price is
 //! logged at zero cost, and is counted in `unpriced_requests` so the total is
-//! never presented as complete when it is not.
+//! never presented as complete when it is not. A model with a published price
+//! of zero is priced: its requests are free, not unknown.
 
 use sea_orm::{
     ColumnTrait, DatabaseBackend, DatabaseConnection, DbErr, EntityTrait, FromQueryResult,
@@ -62,8 +63,10 @@ pub struct ConversationUsage {
     /// Estimated cost in microcents (1/10000 of a cent), summed over the
     /// requests that have a known price.
     pub cost_microcents: i64,
-    /// Requests that used tokens but were logged at zero cost because the
-    /// model has no known price. When this is not zero, the cost is a floor.
+    /// Requests that used tokens but whose model has no known price, so they
+    /// were logged at zero cost (the gateway's rule,
+    /// `ai_usage_logs::UNPRICED_CONDITION`). A model with a published price
+    /// of zero is priced. When this is not zero, the cost is a floor.
     pub unpriced_requests: i64,
     /// Requests made with the user's own provider key rather than the
     /// platform's, which Temps does not bill.
@@ -106,19 +109,14 @@ pub async fn conversation_usage(
     conversation_id: i64,
     user_id: i32,
 ) -> Result<ConversationUsage, DbErr> {
-    let rows = ModelRow::find_by_statement(Statement::from_sql_and_values(
-        DatabaseBackend::Postgres,
+    let sql = format!(
         r#"SELECT
                model,
                COUNT(*)::INT8 AS requests,
                COALESCE(SUM(input_tokens), 0)::INT8 AS input_tokens,
                COALESCE(SUM(output_tokens), 0)::INT8 AS output_tokens,
                COALESCE(SUM(estimated_cost_microcents), 0)::INT8 AS cost_microcents,
-               COUNT(*) FILTER (
-                   WHERE estimated_cost_microcents = 0
-                     AND input_tokens + output_tokens > 0
-                     AND NOT is_byok
-               )::INT8 AS unpriced_requests,
+               COUNT(*) FILTER (WHERE {unpriced} AND NOT is_byok)::INT8 AS unpriced_requests,
                COUNT(*) FILTER (WHERE is_byok)::INT8 AS byok_requests
            FROM ai_usage_logs
            WHERE conversation_id = $1
@@ -127,6 +125,11 @@ pub async fn conversation_usage(
            GROUP BY model
            ORDER BY cost_microcents DESC, model ASC
            LIMIT $3"#,
+        unpriced = temps_entities::ai_usage_logs::UNPRICED_CONDITION,
+    );
+    let rows = ModelRow::find_by_statement(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        &sql,
         [
             conversation_id.to_string().into(),
             user_id.into(),
@@ -350,6 +353,10 @@ mod tests {
         assert!(sql.contains("user_id = $2"));
         assert!(sql.contains("chat.%"));
         assert!(
+            sql.contains(temps_entities::ai_usage_logs::UNPRICED_CONDITION),
+            "unpriced requests follow the gateway's rule: {sql}"
+        );
+        assert!(
             sql.contains("\"42\""),
             "the conversation id is matched as its decimal string"
         );
@@ -357,6 +364,55 @@ mod tests {
             sql.contains("Int(Some(7))"),
             "the owner id is bound, not interpolated"
         );
+    }
+
+    #[tokio::test]
+    async fn a_free_model_is_priced_and_an_unknown_one_is_not_on_a_real_database() {
+        use sea_orm::ConnectionTrait;
+        // Skip only when no container runtime can be reached; a failed
+        // migration or schema check fails the test.
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error)
+                if temps_test_utils::is_container_runtime_unavailable(&format!("{error:#}")) =>
+            {
+                println!(
+                    "Skipping: no container runtime for the PostgreSQL test database: {error:#}"
+                );
+                return;
+            }
+            Err(error) => panic!("test database setup failed: {error:#}"),
+        };
+        let db = test_db.connection_arc();
+        // (cost, price_known, is_byok): a free model, a self-hosted model, a
+        // row older than the column with no cost and one with a cost, and a
+        // request on the user's own key.
+        for (cost, known, byok) in [
+            ("0", "true", "false"),
+            ("0", "false", "false"),
+            ("0", "NULL", "false"),
+            ("500", "NULL", "false"),
+            ("0", "false", "true"),
+        ] {
+            db.execute_unprepared(&format!(
+                "INSERT INTO ai_usage_logs \
+                 (provider, model, input_tokens, output_tokens, estimated_cost_microcents, \
+                  price_known, is_byok, conversation_id, user_id, tags) \
+                 VALUES ('openrouter', 'vendor/model', 100, 10, {cost}, {known}, {byok}, \
+                         '42', 7, ARRAY['chat.agent.tools'])"
+            ))
+            .await
+            .expect("usage row inserted");
+        }
+
+        let usage = conversation_usage(&db, 42, 7).await.expect("usage");
+
+        assert_eq!(usage.requests, 5);
+        assert_eq!(usage.cost_microcents, 500);
+        // The self-hosted request and the old zero-cost row; not the free
+        // model, and not the request on the user's own key.
+        assert_eq!(usage.unpriced_requests, 2);
+        assert_eq!(usage.byok_requests, 1);
     }
 
     #[tokio::test]
