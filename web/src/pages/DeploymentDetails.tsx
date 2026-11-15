@@ -493,7 +493,7 @@ function SecondaryActions({
 // deployments that didn't succeed. Failed deployments also carry a server-side
 // classification (stage, code, concrete fix and the settings page that fixes
 // it), which leads the banner; the raw error stays one click away.
-function CancelledReason({
+export function CancelledReason({
   deployment,
   projectSlug,
   onEditImage,
@@ -503,10 +503,11 @@ function CancelledReason({
   /** Opens the redeploy dialog, where a registry image can be edited. */
   onEditImage?: () => void
 }) {
-  const [isExpanded, setIsExpanded] = useState(
-    deployment.failure?.code === 'container_exited' ||
-      deployment.failure?.code === 'out_of_memory'
-  )
+  const [expandedByUser, setExpandedByUser] = useState<boolean | undefined>()
+  const isExpanded =
+    expandedByUser ??
+    (deployment.failure?.code === 'container_exited' ||
+      deployment.failure?.code === 'out_of_memory')
   if (!deployment.cancelled_reason) return null
   const isCancelled = deployment.status === 'cancelled'
   const failureReason = deploymentFailureSummary(deployment.cancelled_reason)
@@ -623,7 +624,7 @@ function CancelledReason({
               size="sm"
               className="mt-1 h-auto p-0 text-xs text-destructive underline-offset-4"
               aria-expanded={isExpanded}
-              onClick={() => setIsExpanded((expanded) => !expanded)}
+              onClick={() => setExpandedByUser(!isExpanded)}
             >
               {isExpanded ? 'Collapse error' : 'Show full error'}
             </Button>
