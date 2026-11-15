@@ -524,7 +524,7 @@ impl BackendType {
 
                 let (address, refused) = match &entry.pinned {
                     None => (entry.address.clone(), None),
-                    Some(pin) => match pin.pick() {
+                    Some(pin) => match pin.pick_avoiding(avoid) {
                         Ok(address) => (address.to_string(), None),
                         Err(reason) => (entry.address.clone(), Some(reason)),
                     },
@@ -1465,6 +1465,11 @@ pub struct CachedPeerTable {
     /// Serializes reloads so their three-phase snapshot publication cannot
     /// interleave, even when manual refresh and database notification race.
     route_reload_lock: tokio::sync::Mutex<()>,
+    /// The pins the last reload published for custom route upstream names,
+    /// by host and port. A reload that cannot resolve a name keeps the
+    /// addresses its previous pin was checked with. Weak: the route snapshot
+    /// owns the pins.
+    custom_route_pins: parking_lot::Mutex<HashMap<(String, u16), std::sync::Weak<PinnedUpstream>>>,
 
     /// Database connection for loading routes
     db: Arc<DatabaseConnection>,
@@ -1546,6 +1551,7 @@ impl CachedPeerTable {
         Self {
             route_snapshot: ArcSwap::from_pointee(RouteTableSnapshot::default()),
             route_reload_lock: tokio::sync::Mutex::new(()),
+            custom_route_pins: parking_lot::Mutex::new(HashMap::new()),
             db,
             runtime_context,
             on_sleeping_callback: parking_lot::Mutex::new(None),
@@ -2820,6 +2826,25 @@ mod pinned_backend_tests {
         .expect("upstream");
         assert_eq!(selection.address, "8.8.8.8:443");
         assert!(selection.refused.is_none());
+    }
+
+    /// A retry after a failed connect goes to another checked address when
+    /// there is one, whatever the shared round-robin counter says.
+    #[test]
+    fn a_retry_skips_the_checked_address_that_just_failed() {
+        let backend = backend(UpstreamAddresses::Allowed(vec![
+            "8.8.8.8:443".parse().expect("address"),
+            "8.8.4.4:443".parse().expect("address"),
+        ]));
+        let failed = vec!["8.8.8.8:443".to_string()];
+        for _ in 0..4 {
+            let selection = backend.get_backend_avoiding(&failed).expect("upstream");
+            assert_eq!(selection.address, "8.8.4.4:443");
+        }
+        // With every address failed, the normal choice is still made.
+        let all = vec!["8.8.8.8:443".to_string(), "8.8.4.4:443".to_string()];
+        let selection = backend.get_backend_avoiding(&all).expect("upstream");
+        assert!(all.contains(&selection.address));
     }
 
     #[test]

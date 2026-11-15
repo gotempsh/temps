@@ -796,6 +796,8 @@ impl CachedPeerTable {
             .map(|(domain, _, _)| Self::platform_owner_of(state, domain))
             .collect();
         let mut pins = Vec::new();
+        let previous_pins = std::mem::take(&mut *self.custom_route_pins.lock());
+        let mut published_pins = HashMap::new();
         for ((domain, custom_route, addresses), owner) in candidates.into_iter().zip(owners) {
             if let Some(owner) = owner {
                 warn!(
@@ -823,9 +825,21 @@ impl CachedPeerTable {
             let backend_addr = format!("{}:{}", custom_route.host, custom_route.port);
             // A name is dialled only at the addresses it passed the check
             // with (see `PinnedUpstream`); a literal is its own address.
+            // A name this reload could not resolve keeps what its previous
+            // pin was checked with (allowed or refused) rather than going
+            // back to `Pending`.
+            let addresses = match addresses {
+                UpstreamAddresses::Pending => u16::try_from(custom_route.port)
+                    .ok()
+                    .and_then(|port| previous_pins.get(&(custom_route.host.clone(), port)))
+                    .and_then(std::sync::Weak::upgrade)
+                    .map_or(UpstreamAddresses::Pending, |pin| pin.carried_over()),
+                other => other,
+            };
             let pinned = custom_route_pin(&custom_route.host, custom_route.port, addresses);
             if let Some(pin) = &pinned {
                 pins.push(Arc::downgrade(pin));
+                published_pins.insert((pin.host().to_string(), pin.port()), Arc::downgrade(pin));
             }
             let route_info = RouteInfo {
                 backend: BackendType::Upstream {
@@ -876,6 +890,7 @@ impl CachedPeerTable {
             primary_route_hosts.remove(&domain);
             routes.insert(domain, route_info);
         }
+        *self.custom_route_pins.lock() = published_pins;
         super::pinned_upstream::spawn_refresher(pins);
     }
 
@@ -2874,6 +2889,57 @@ mod tests {
             table.get_route_by_sni("unclaimed.example.net").is_some(),
             "a name nothing else serves still uses the wildcard"
         );
+
+        test_db.cleanup().await?;
+        Ok(())
+    }
+
+    /// A reload during which a custom route's upstream name cannot be
+    /// resolved keeps the addresses the name was last checked with, so an
+    /// unrelated route change does not take a working route down.
+    #[tokio::test]
+    async fn a_reload_keeps_the_checked_addresses_of_a_name_it_cannot_resolve(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(database) = database_or_skip().await else {
+            return Ok(());
+        };
+        let test_db = TestDBMockOperations::new(database.db.clone()).await?;
+        let db = test_db.db.as_ref();
+        // `.invalid` never resolves, standing in for a resolver outage.
+        insert_custom_route(
+            db,
+            "kept.example.net",
+            "upstream.invalid",
+            8080,
+            RouteType::Http,
+        )
+        .await?;
+
+        let table = CachedPeerTable::new(test_db.db.clone());
+        table.load_routes().await?;
+        // As if an earlier reload or refresh had resolved and checked it.
+        let pin = match &table
+            .get_route_by_host("kept.example.net")
+            .expect("route")
+            .backend
+        {
+            crate::BackendType::Upstream { backends, .. } => {
+                backends[0].pinned.clone().expect("pinned")
+            }
+            crate::BackendType::StaticDir { .. } => panic!("not an upstream"),
+        };
+        pin.apply_for_test(Ok(vec!["8.8.8.8:8080".parse()?]));
+
+        // An unrelated route change triggers a reload.
+        insert_custom_route(db, "other.example.net", "8.8.4.4", 8080, RouteType::Http).await?;
+        table.load_routes().await?;
+
+        let selection = table
+            .get_route_by_host("kept.example.net")
+            .expect("route")
+            .select_backend();
+        assert_eq!(selection.address, "8.8.8.8:8080");
+        assert!(selection.refused.is_none(), "{selection:?}");
 
         test_db.cleanup().await?;
         Ok(())

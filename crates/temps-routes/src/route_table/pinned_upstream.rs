@@ -97,9 +97,41 @@ impl PinnedUpstream {
         }
     }
 
+    /// [`Self::pick`], skipping addresses in `avoid` (ones this request
+    /// already failed to connect to) while another checked address is left.
+    pub fn pick_avoiding(&self, avoid: &[String]) -> Result<SocketAddr, String> {
+        let first = self.pick()?;
+        if avoid.is_empty() {
+            return Ok(first);
+        }
+        let addresses = self.addresses.load();
+        let UpstreamAddresses::Allowed(addresses) = &**addresses else {
+            return Ok(first);
+        };
+        let start = addresses.iter().position(|a| *a == first).unwrap_or(0);
+        Ok((0..addresses.len())
+            .map(|offset| addresses[(start + offset) % addresses.len()])
+            .find(|candidate| !avoid.iter().any(|failed| *failed == candidate.to_string()))
+            .unwrap_or(first))
+    }
+
+    /// The pin a reload creates for this name when the name could not be
+    /// resolved during that reload: it starts from the addresses in effect
+    /// here instead of from nothing, so an unrelated route change cannot take
+    /// a working route down while the resolver is briefly unavailable.
+    pub fn carried_over(&self) -> UpstreamAddresses {
+        (*self.addresses.load_full()).clone()
+    }
+
     /// Resolve and check the name again, and keep the result.
     pub async fn refresh(&self) {
         let verdict = resolve_upstream(&self.host, i32::from(self.port)).await;
+        self.apply(verdict);
+    }
+
+    /// Record a check outcome directly, for tests elsewhere in the crate.
+    #[cfg(test)]
+    pub(crate) fn apply_for_test(&self, verdict: Result<Vec<SocketAddr>, RouteUpstreamError>) {
         self.apply(verdict);
     }
 
