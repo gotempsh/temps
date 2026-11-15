@@ -55,6 +55,12 @@ fn stop_request_client(docker: &bollard::Docker, grace: std::time::Duration) -> 
         .with_timeout(needed.max(DEFAULT_DOCKER_CLIENT_TIMEOUT))
 }
 
+fn start_error(container_id: &str, source: bollard::errors::Error) -> DeployerError {
+    DeployerError::DeploymentFailed(format!(
+        "Failed to start container {container_id}: {source}"
+    ))
+}
+
 /// A failed stop as a deployer error. Only Docker's 404 means the container is
 /// gone, and so not running; any other failure may have left it running.
 fn stop_error(container_id: &str, error: bollard::errors::Error) -> DeployerError {
@@ -957,7 +963,7 @@ impl ContainerDeployer for DockerRuntime {
         self.require_docker()?
             .start_container(container_id, None::<StartContainerOptions>)
             .await
-            .map_err(|e| DeployerError::Other(format!("Failed to start container: {}", e)))?;
+            .map_err(|e| start_error(container_id, e))?;
         Ok(())
     }
 
