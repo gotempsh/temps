@@ -341,14 +341,10 @@ impl FailureReportService {
             match known_secret_values(&self.encryption_service, &jobs) {
                 Ok(secrets) => (
                     self.build_redacted_log(&jobs, &secrets).await?,
-                    failed_job.error_message.as_deref().map(|message| {
-                        redact_report_identifiers(&redact_common_secret_patterns(
-                            &redact_known_secrets(
-                                &redact_job_identifiers(message, &jobs),
-                                &secrets,
-                            ),
-                        ))
-                    }),
+                    failed_job
+                        .error_message
+                        .as_deref()
+                        .map(|message| redact_outbound_text(message, &secrets, &jobs)),
                 ),
                 Err(error) => (
                     format!(
@@ -422,7 +418,7 @@ impl FailureReportService {
             job_id: job_id.to_string(),
         })?;
         let secrets = known_secret_values(&self.encryption_service, &jobs)?;
-        let safe_text = prepare_report_text(&redact_job_identifiers(report_text, &jobs), &secrets)?;
+        let safe_text = prepare_report_text(report_text, &secrets, &jobs)?;
 
         let payload = FailureReportPayload {
             report_text: &safe_text,
@@ -445,17 +441,20 @@ fn append_redacted_section(
     jobs: &[deployment_jobs::Model],
     secrets: &[String],
 ) {
-    let safe = redact_report_identifiers(&redact_common_secret_patterns(&redact_known_secrets(
-        &redact_job_identifiers(section, jobs),
-        secrets,
-    )));
+    let safe = redact_outbound_text(section, secrets, jobs);
     combined.push_str(&safe);
     *combined = fit_report_text(combined);
 }
 
+/// Complete secret values must be removed before identifiers can alter them.
+fn redact_outbound_text(text: &str, secrets: &[String], jobs: &[deployment_jobs::Model]) -> String {
+    let secrets_redacted = redact_common_secret_patterns(&redact_known_secrets(text, secrets));
+    redact_report_identifiers(&redact_job_identifiers(&secrets_redacted, jobs))
+}
+
 /// Exact repository identifiers may also be printed without a URL or slash.
 fn redact_job_identifiers(text: &str, jobs: &[deployment_jobs::Model]) -> String {
-    let mut safe = text.to_string();
+    let mut values = std::collections::BTreeSet::new();
     for job in jobs {
         for data in [job.job_config.as_ref(), job.outputs.as_ref()]
             .into_iter()
@@ -472,12 +471,33 @@ fn redact_job_identifiers(text: &str, jobs: &[deployment_jobs::Model]) -> String
                     .and_then(serde_json::Value::as_str)
                     .filter(|value| !value.is_empty())
                 {
-                    safe = safe.replace(value, "[redacted]");
+                    values.insert(value);
                 }
             }
         }
     }
-    safe
+    if values.is_empty() {
+        return text.to_string();
+    }
+    let mut values: Vec<_> = values.into_iter().collect();
+    values.sort_by_key(|value| std::cmp::Reverse(value.len()));
+    let pattern = values
+        .into_iter()
+        .map(regex::escape)
+        .collect::<Vec<_>>()
+        .join("|");
+    // A single pass never matches text inserted by an earlier replacement.
+    match regex::RegexBuilder::new(&pattern)
+        .case_insensitive(true)
+        .size_limit(1024 * 1024)
+        .build()
+    {
+        Ok(pattern) => pattern.replace_all(text, "[redacted]").into_owned(),
+        Err(_) => {
+            "[Report withheld: repository identifier redaction exceeded safe pattern limits.]"
+                .to_string()
+        }
+    }
 }
 
 /// Every known secret/env value configured for the jobs in `jobs` -- the
@@ -543,14 +563,13 @@ fn known_secret_values(
 fn prepare_report_text(
     report_text: &str,
     secrets: &[String],
+    jobs: &[deployment_jobs::Model],
 ) -> Result<String, FailureReportError> {
-    let redacted = redact_known_secrets(report_text, secrets);
+    let redacted = redact_outbound_text(report_text, secrets, jobs);
     if redacted.trim().is_empty() {
         return Err(FailureReportError::EmptyReport);
     }
-    Ok(fit_report_text(&redact_report_identifiers(
-        &redact_common_secret_patterns(&redacted),
-    )))
+    Ok(fit_report_text(&redacted))
 }
 
 /// POST `payload` to the central endpoint. On a non-2xx answer the reason the
@@ -598,6 +617,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn complete_secrets_are_removed_before_overlapping_repository_names() {
+        let jobs = [job_with_config(
+            77,
+            serde_json::json!({"repo_owner": "sample"}),
+        )];
+        let secret = "sample-super-secret-value".to_string();
+        let input = format!("owner sample password {secret} Bearer sample_unknown_token_123");
+        let prepared = prepare_report_text(&input, std::slice::from_ref(&secret), &jobs).unwrap();
+        assert!(!prepared.contains("super-secret-value"), "{prepared}");
+        assert!(!prepared.contains("unknown_token"), "{prepared}");
+        assert!(!prepared.contains("sample"), "{prepared}");
+        let mut preview = String::new();
+        append_redacted_section(&mut preview, &input, &jobs, &[secret]);
+        assert_eq!(preview, prepared);
+    }
+
+    #[test]
+    fn repository_replacement_does_not_rewrite_its_own_markers() {
+        let job = job_with_config(77, serde_json::json!({"repo_owner": "e"}));
+        assert_eq!(
+            redact_job_identifiers("e", &[job.clone(), job]),
+            "[redacted]"
+        );
+    }
+
+    #[test]
     fn accumulated_log_sections_are_redacted_and_bounded() {
         let mut report = String::new();
         for _ in 0..3 {
@@ -624,6 +669,7 @@ mod tests {
         assert_eq!(safe, "owner [redacted] repo [redacted] failed");
         let sent = prepare_report_text(
             "https://forge.example/sample/repository dev@example.invalid 192.0.2.4",
+            &[],
             &[],
         )
         .unwrap();
@@ -916,7 +962,7 @@ mod tests {
     #[test]
     fn prepare_report_text_refuses_blank_reports() {
         assert!(matches!(
-            prepare_report_text("  \n\t ", &[]),
+            prepare_report_text("  \n\t ", &[], &[]),
             Err(FailureReportError::EmptyReport)
         ));
     }
@@ -927,7 +973,7 @@ mod tests {
     fn prepare_report_text_refuses_oversized_whitespace() {
         let blank = " \n".repeat(MAX_REPORT_TEXT_UTF16_UNITS);
         assert!(matches!(
-            prepare_report_text(&blank, &[]),
+            prepare_report_text(&blank, &[], &[]),
             Err(FailureReportError::EmptyReport)
         ));
     }
@@ -936,7 +982,7 @@ mod tests {
     fn prepare_report_text_redacts_then_bounds() {
         let secret = "s3cr3t-value-123".to_string();
         let text = format!("{}\nleaked {secret}", "line\n".repeat(60_000));
-        let prepared = prepare_report_text(&text, std::slice::from_ref(&secret)).unwrap();
+        let prepared = prepare_report_text(&text, std::slice::from_ref(&secret), &[]).unwrap();
         assert!(!prepared.contains(&secret));
         assert!(utf16_len(&prepared) <= MAX_REPORT_TEXT_UTF16_UNITS);
     }

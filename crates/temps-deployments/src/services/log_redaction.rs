@@ -33,11 +33,17 @@ pub fn redact_known_secrets(text: &str, secrets: &[String]) -> String {
         return String::new();
     }
 
-    let mut values: Vec<&str> = secrets
-        .iter()
-        .map(String::as_str)
-        .filter(|s| s.len() >= MIN_KNOWN_SECRET_LEN)
-        .collect();
+    let mut values = Vec::new();
+    for secret in secrets {
+        if secret.len() >= MIN_KNOWN_SECRET_LEN {
+            values.push(secret.as_str());
+        }
+        // A bounded log tail can start inside a configured multiline secret.
+        // Its surviving lines must be removed even without the complete value.
+        if secret.contains(['\r', '\n']) {
+            values.extend(secret.lines().filter(|line| !line.is_empty()));
+        }
+    }
     values.sort_unstable();
     values.dedup();
     // Longest first: if one known secret happens to be a substring of
@@ -87,6 +93,14 @@ static SECRET_PATTERNS: LazyLock<Vec<SecretPattern>> = LazyLock::new(|| {
                 r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
             )
             .expect("valid regex"),
+        },
+        // Fail closed when a bounded tail starts inside an unconfigured key.
+        SecretPattern {
+            regex: Regex::new(r"(?s)\A.*-----END [A-Z ]*PRIVATE KEY-----").expect("valid regex"),
+        },
+        // An incomplete key printed before a build stops has no END marker.
+        SecretPattern {
+            regex: Regex::new(r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*\z").expect("valid regex"),
         },
     ]
 });
@@ -161,6 +175,43 @@ static IPV6_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncated_multiline_secrets_are_withheld() {
+        let secret = "head-value\nsecret-body\nx".to_string();
+        assert_eq!(
+            redact_known_secrets("secret-body\nx\nfailed", &[secret]),
+            "***\n***\nfailed"
+        );
+    }
+
+    #[test]
+    fn key_material_is_removed_when_the_tail_loses_its_begin_marker() {
+        let material = "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo=";
+        let text = format!(
+            "-----BEGIN PRIVATE KEY-----\n{}-----END PRIVATE KEY-----\n{}failure",
+            format!("{material}\n").repeat(26),
+            "progress\n".repeat(1990)
+        );
+        let tail = text
+            .lines()
+            .rev()
+            .take(2000)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!tail.contains("BEGIN PRIVATE KEY"));
+        assert!(tail.contains(material));
+        let safe = redact_common_secret_patterns(&tail);
+        assert!(!safe.contains(material), "{safe}");
+        assert!(safe.ends_with("failure"));
+        assert!(!redact_common_secret_patterns(&format!(
+            "-----BEGIN PRIVATE KEY-----\n{material}"
+        ))
+        .contains(material));
+    }
 
     #[test]
     fn redacts_commit_trace_and_request_identifiers() {
