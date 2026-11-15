@@ -20,6 +20,7 @@
 //! that pass, and the proxy dials exactly those.
 
 use std::net::{IpAddr, SocketAddr};
+use std::time::Duration;
 
 use temps_core::url_validation::{validate_external_url, validate_outbound_ip};
 use url::Url;
@@ -39,7 +40,13 @@ pub enum RequestDecision {
 pub struct RequestPolicy {
     target_host: String,
     target_port: u16,
+    /// How long one DNS lookup in [`Self::resolve`] may take.
+    lookup_timeout: Duration,
 }
+
+/// How long a DNS lookup made for the captured page may take. A name that
+/// does not answer in time is refused, so it cannot hold a proxy slot.
+pub const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl RequestPolicy {
     /// A policy for capturing `target`. The target's own host and port are
@@ -56,6 +63,7 @@ impl RequestPolicy {
         Ok(Self {
             target_host: host.to_ascii_lowercase(),
             target_port: port,
+            lookup_timeout: LOOKUP_TIMEOUT,
         })
     }
 
@@ -124,8 +132,14 @@ impl RequestPolicy {
             return Ok(vec![SocketAddr::new(ip, port)]);
         }
 
-        let addresses = lookup(host.to_string(), port)
+        let addresses = tokio::time::timeout(self.lookup_timeout, lookup(host.to_string(), port))
             .await
+            .map_err(|_| {
+                format!(
+                    "'{host}' did not resolve within {}ms",
+                    self.lookup_timeout.as_millis()
+                )
+            })?
             .map_err(|error| format!("'{host}' does not resolve ({error})"))?;
         if addresses.is_empty() {
             return Err(format!("'{host}' does not resolve to any address"));
@@ -302,6 +316,24 @@ mod tests {
             literal.resolve("::1", 4100, &loopback).await,
             Ok(vec![address("[::1]:4100")])
         );
+    }
+
+    #[tokio::test]
+    async fn a_lookup_that_does_not_answer_is_refused_at_its_deadline() {
+        let mut policy = policy();
+        policy.lookup_timeout = Duration::from_millis(50);
+        let stalled: Lookup = std::sync::Arc::new(|_host: String, _port: u16| {
+            Box::pin(std::future::pending::<std::io::Result<Vec<SocketAddr>>>())
+        });
+        let started = std::time::Instant::now();
+        let verdict = tokio::time::timeout(
+            Duration::from_secs(5),
+            policy.resolve("slow.example.net", 443, &stalled),
+        )
+        .await
+        .expect("resolve must give up on its own");
+        assert!(verdict.is_err(), "{verdict:?}");
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[tokio::test]
