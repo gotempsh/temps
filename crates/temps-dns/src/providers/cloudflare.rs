@@ -371,37 +371,27 @@ impl CloudflareProvider {
         })
     }
 
-    /// Get the matching record type filter for Cloudflare API
-    fn record_type_to_cf_content(record_type: DnsRecordType) -> dns::dns::DnsContent {
-        match record_type {
-            DnsRecordType::A => dns::dns::DnsContent::A {
-                content: std::net::Ipv4Addr::new(0, 0, 0, 0),
-            },
-            DnsRecordType::AAAA => dns::dns::DnsContent::AAAA {
-                content: std::net::Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0),
-            },
-            DnsRecordType::CNAME => dns::dns::DnsContent::CNAME {
-                content: String::new(),
-            },
-            DnsRecordType::TXT => dns::dns::DnsContent::TXT {
-                content: String::new(),
-            },
-            DnsRecordType::MX => dns::dns::DnsContent::MX {
-                priority: 0,
-                content: String::new(),
-            },
-            DnsRecordType::NS => dns::dns::DnsContent::NS {
-                content: String::new(),
-            },
-            DnsRecordType::SRV => dns::dns::DnsContent::SRV {
-                content: String::new(),
-            },
-            // CAA and PTR not directly supported by cloudflare crate,
-            // return TXT as fallback (will be filtered by name anyway)
-            DnsRecordType::CAA | DnsRecordType::PTR => dns::dns::DnsContent::TXT {
-                content: String::new(),
-            },
+    /// Query parameters for listing the records at one name.
+    ///
+    /// Deliberately carries no record-type filter. `cloudflare` 0.14 can only
+    /// express one as a whole `DnsContent` value, flattened into the query
+    /// string, so a "CNAME" filter is sent as `type=CNAME&content=` (an `A`
+    /// filter as `content=0.0.0.0`). Cloudflare applies that placeholder as a
+    /// content filter, so an existing record never matches and callers that
+    /// create "when nothing is found" collide with it (HTTP 400). The type is
+    /// matched client side instead, see [`Self::retain_record_type`].
+    fn name_list_params(fqdn: &str, page: u32, per_page: u32) -> dns::dns::ListDnsRecordsParams {
+        dns::dns::ListDnsRecordsParams {
+            name: Some(fqdn.to_string()),
+            page: Some(page),
+            per_page: Some(per_page),
+            ..Default::default()
         }
+    }
+
+    /// Keep only the records of `record_type`.
+    fn retain_record_type(records: &mut Vec<DnsRecord>, record_type: DnsRecordType) {
+        records.retain(|record| record.content.record_type() == record_type);
     }
 }
 
@@ -556,13 +546,7 @@ impl DnsProvider for CloudflareProvider {
         for page in 1..=MAX_PAGES {
             let endpoint = dns::dns::ListDnsRecords {
                 zone_identifier: &zone.id,
-                params: dns::dns::ListDnsRecordsParams {
-                    name: Some(fqdn.clone()),
-                    record_type: Some(Self::record_type_to_cf_content(record_type)),
-                    page: Some(page),
-                    per_page: Some(PAGE_SIZE),
-                    ..Default::default()
-                },
+                params: Self::name_list_params(&fqdn, page, PAGE_SIZE),
             };
             let response = self
                 .client
@@ -579,6 +563,7 @@ impl DnsProvider for CloudflareProvider {
                     .filter_map(|record| Self::convert_cf_record(record, &zone.name)),
             );
             if !more_pages(&context, page, PAGE_SIZE, count, collected, &info)? {
+                Self::retain_record_type(&mut records, record_type);
                 return Ok(records);
             }
         }
@@ -1028,54 +1013,64 @@ mod tests {
         );
     }
 
-    // ==================== Record type conversion tests ====================
+    // ==================== Record lookup filter tests ====================
 
-    #[test]
-    fn test_record_type_conversion() {
-        // Test that we can convert record types to CF content types
-        let a_content = CloudflareProvider::record_type_to_cf_content(DnsRecordType::A);
-        assert!(matches!(a_content, dns::dns::DnsContent::A { .. }));
-
-        let txt_content = CloudflareProvider::record_type_to_cf_content(DnsRecordType::TXT);
-        assert!(matches!(txt_content, dns::dns::DnsContent::TXT { .. }));
+    fn cf_record(content: DnsRecordContent) -> DnsRecord {
+        DnsRecord {
+            id: Some("rec".to_string()),
+            zone: "example.com".to_string(),
+            name: "app".to_string(),
+            fqdn: "app.example.com".to_string(),
+            content,
+            ttl: 1,
+            proxied: true,
+            metadata: HashMap::new(),
+        }
     }
 
     #[test]
-    fn test_record_type_to_cf_content_all_types() {
-        // A record
-        let content = CloudflareProvider::record_type_to_cf_content(DnsRecordType::A);
-        assert!(matches!(content, dns::dns::DnsContent::A { .. }));
+    fn test_name_list_params_sends_no_placeholder_content_filter() {
+        // Regression: a CNAME lookup used to send `type=CNAME&content=`, which
+        // Cloudflare treats as "content equals the empty string", so an
+        // existing record was never found and re-publishing collided (400).
+        let params = CloudflareProvider::name_list_params("app.example.com", 1, 100);
+        let query =
+            cloudflare::framework::endpoint::serialize_query(&params).expect("query serializes");
+        assert!(
+            !query.contains("content"),
+            "unexpected content filter: {query}"
+        );
+        assert!(!query.contains("type="), "unexpected type filter: {query}");
+        assert!(query.contains("name=app.example.com"), "{query}");
+        assert!(query.contains("page=1"), "{query}");
+        assert!(query.contains("per_page=100"), "{query}");
+    }
 
-        // AAAA record
-        let content = CloudflareProvider::record_type_to_cf_content(DnsRecordType::AAAA);
-        assert!(matches!(content, dns::dns::DnsContent::AAAA { .. }));
+    #[test]
+    fn test_retain_record_type_keeps_only_requested_type() {
+        let mut records = vec![
+            cf_record(DnsRecordContent::CNAME {
+                target: "tunnel.cfargotunnel.com".to_string(),
+            }),
+            cf_record(DnsRecordContent::TXT {
+                content: "marker".to_string(),
+            }),
+            cf_record(DnsRecordContent::A {
+                address: "1.2.3.4".to_string(),
+            }),
+        ];
+        CloudflareProvider::retain_record_type(&mut records, DnsRecordType::CNAME);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].content.record_type(), DnsRecordType::CNAME);
+    }
 
-        // CNAME record
-        let content = CloudflareProvider::record_type_to_cf_content(DnsRecordType::CNAME);
-        assert!(matches!(content, dns::dns::DnsContent::CNAME { .. }));
-
-        // TXT record
-        let content = CloudflareProvider::record_type_to_cf_content(DnsRecordType::TXT);
-        assert!(matches!(content, dns::dns::DnsContent::TXT { .. }));
-
-        // MX record
-        let content = CloudflareProvider::record_type_to_cf_content(DnsRecordType::MX);
-        assert!(matches!(content, dns::dns::DnsContent::MX { .. }));
-
-        // NS record
-        let content = CloudflareProvider::record_type_to_cf_content(DnsRecordType::NS);
-        assert!(matches!(content, dns::dns::DnsContent::NS { .. }));
-
-        // SRV record
-        let content = CloudflareProvider::record_type_to_cf_content(DnsRecordType::SRV);
-        assert!(matches!(content, dns::dns::DnsContent::SRV { .. }));
-
-        // CAA and PTR fall back to TXT
-        let content = CloudflareProvider::record_type_to_cf_content(DnsRecordType::CAA);
-        assert!(matches!(content, dns::dns::DnsContent::TXT { .. }));
-
-        let content = CloudflareProvider::record_type_to_cf_content(DnsRecordType::PTR);
-        assert!(matches!(content, dns::dns::DnsContent::TXT { .. }));
+    #[test]
+    fn test_retain_record_type_no_match_is_empty() {
+        let mut records = vec![cf_record(DnsRecordContent::TXT {
+            content: "marker".to_string(),
+        })];
+        CloudflareProvider::retain_record_type(&mut records, DnsRecordType::CNAME);
+        assert!(records.is_empty());
     }
 
     // ==================== to_cf_content tests ====================
