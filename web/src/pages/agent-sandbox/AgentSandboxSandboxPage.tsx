@@ -162,7 +162,12 @@ export function AgentSandboxSandboxPage() {
 
   const [rebuilding, setRebuilding] = useState(false)
   const [buildLog, setBuildLog] = useState<string[]>([])
-  const [loadedSettings, setLoadedSettings] = useState(settings)
+  // Starts empty so the first settings value hydrates the form, including
+  // one already in the shared query cache on mount. Starting from `settings`
+  // skipped that, and the next save sent the empty defaults back.
+  const [loadedSettings, setLoadedSettings] = useState<
+    typeof settings | undefined
+  >(undefined)
 
   const {
     data: sandboxStatus = null,
@@ -179,7 +184,9 @@ export function AgentSandboxSandboxPage() {
     retry: false,
   })
 
-  if (settings !== loadedSettings) {
+  // A refetch while the form has unsaved edits keeps them: replacing the
+  // drafts would make the next save submit what the user did not type.
+  if (settings !== loadedSettings && !(isDirty && loadedSettings)) {
     setLoadedSettings(settings)
     if (settings?.agent_sandbox) {
       const s = settings.agent_sandbox
