@@ -888,7 +888,7 @@ function SettingsNav({ onBack }: { onBack: () => void }) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // AI nav — replaces the whole sidebar for the AI area (Providers, Usage,
-// Chats, Workflows, Skills, MCP Servers). Back button returns to root.
+// Limits, Activity). Back button returns to root.
 // ─────────────────────────────────────────────────────────────────────────────
 
 function AiNav({ onBack }: { onBack: () => void }) {

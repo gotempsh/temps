@@ -50,7 +50,7 @@ export function AuditLogs() {
     <PageContainer innerClassName="space-y-6">
       <PageHeader
         title="Audit logs"
-        description="Activity across the platform — authentication, service changes, skills, MCP servers, and more."
+        description="Activity across the platform — authentication, service changes, settings, and more."
       />
       <AuditLogView />
     </PageContainer>

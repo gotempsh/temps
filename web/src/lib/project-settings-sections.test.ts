@@ -41,6 +41,15 @@ describe('settings section links', () => {
   })
 })
 
+describe('integrations sections', () => {
+  test('linked vaults have a section on the Integrations page', () => {
+    expect(SETTINGS_SECTION_IDS.integrations).toContain('vaults')
+    expect(requestedSettingsSection('integrations', '?section=vaults')).toBe(
+      'vaults'
+    )
+  })
+})
+
 describe('legacyProjectRouteTarget', () => {
   test('every legacy settings route lands on a section that exists', () => {
     for (const target of Object.values(LEGACY_PROJECT_ROUTES)) {

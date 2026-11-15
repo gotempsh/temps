@@ -1101,6 +1101,12 @@ export const projectNavItems: NavigationItem[] = [
     keywords: ['webhooks', 'hooks', 'events', 'callbacks', 'integrations'],
   },
   {
+    title: 'Linked vaults',
+    url: settingsSectionPath('integrations', 'vaults'),
+    icon: KeyRound,
+    keywords: ['vault', 'vaults', 'access', 'sessions', 'bundles', 'services'],
+  },
+  {
     title: 'Metrics',
     url: 'metrics',
     icon: BarChart3,

@@ -21,7 +21,6 @@ export function ProjectVaultAccess({ projectId }: { projectId: number }) {
   }
   return (
     <section className="space-y-3" aria-label="Linked vaults">
-      <h2 className="font-semibold">Linked vaults</h2>
       {vaults.isError ? (
         <Callout tone="error" title="Could not load linked vaults">
           <Button onClick={() => void vaults.refetch()}>Retry</Button>

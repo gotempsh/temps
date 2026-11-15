@@ -13,6 +13,7 @@ import {
   Plug,
   Rocket,
   Settings2,
+  Vault,
   Webhook,
   Workflow,
 } from 'lucide-react'
@@ -39,6 +40,7 @@ import {
   useHostDockerAccess,
 } from '@/components/project/HostDockerAccessAlert'
 import { ProjectFeatureFlags } from '@/components/project/flags/ProjectFeatureFlags'
+import { ProjectVaultAccess } from '@/components/service-access/ProjectVaultAccess'
 import { Link } from 'react-router'
 import { usePluginsContext } from '@/contexts/PluginsContext'
 import { useConsoleExtensions } from '@temps-sdk/console-kit'
@@ -61,8 +63,7 @@ const descriptions: Record<CombinedSettingsPage, string> = {
   'deployment-tokens': '',
   automation:
     'Jobs the AI does on its own. Every run is a chat you can open and continue.',
-  integrations:
-    'Webhooks, skills, MCP servers and extensions for this service.',
+  integrations: 'Webhooks, vaults and extensions for this service.',
 }
 
 type Section = {
@@ -250,6 +251,14 @@ export function CombinedProjectSettings({
           description: 'Send deployment and error events to other systems.',
           icon: Webhook,
           content: <WebhooksSettings project={project} />,
+        },
+        {
+          id: 'vaults',
+          title: 'Vaults',
+          description:
+            'Shared services that sandboxes and AI chats in this service can request access to.',
+          icon: Vault,
+          content: <ProjectVaultAccess projectId={project.id} />,
         },
         {
           id: 'extensions',

@@ -40,7 +40,7 @@ export const SETTINGS_SECTION_IDS = {
   // list. `skills` and `mcp-servers` were retired with the harness-based AI
   // features; their old links open the page itself.
   automation: ['automations', 'agents', 'templates', 'chats', 'crash-autofix'],
-  integrations: ['webhooks', 'extensions'],
+  integrations: ['webhooks', 'vaults', 'extensions'],
 } as const satisfies Record<CombinedSettingsPage, readonly string[]>
 
 export type SettingsSectionId<P extends CombinedSettingsPage> =
