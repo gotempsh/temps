@@ -254,7 +254,11 @@ keys can manage deployment and environment APIs beneath that project's URL;
 environment-scoped keys can use explicit endpoints for that environment and the
 pipeline endpoint above. Instance settings, credential management, AI/tool APIs,
 global lists and deployment-by-ID URLs are outside this scope. Permissions still
-limit which operations are allowed. Scope is immutable; revoke and recreate to
+limit which operations are allowed. CLI login can read the authenticated owner’s identity at `/user/me`; this does
+not permit account changes. Image, image-upload, source, and static deployments
+under the bound environment are supported. Workflow APIs and workflow credential
+issuance remain blocked for both project-scoped and environment-scoped keys.
+Scope is immutable; revoke and recreate to
 change it. The API accepts `project_id` and optional `environment_id` at creation.
 Keys expire after one year by default, or at the earlier expiry you select.
 

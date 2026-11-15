@@ -56,48 +56,60 @@ impl ApiKeyScope {
         let path = path
             .strip_prefix("/api/")
             .unwrap_or_else(|| path.strip_prefix('/').unwrap_or(path));
+        // CLI login reads only the authenticated owner's existing identity.
+        // This GET-only route cannot mint credentials or mutate the account.
+        if path == "user/me" {
+            return true;
+        }
         let mut segments = path.split('/');
         if segments.next() != Some("projects")
             || segments.next().and_then(|id| id.parse::<i32>().ok()) != Some(self.project_id)
         {
             return false;
         }
-        let resource = segments.next();
-        let Some(environment_id) = self.environment_id else {
-            // Deployment credentials do not enter AI/tool/plugin APIs, whose
-            // delegated work can outlive the request and has its own authority.
-            return matches!(
+        match segments.next() {
+            Some("environments") => self.allows_environment_path(segments),
+            Some("trigger-pipeline") => segments.next().is_none(),
+            resource if self.environment_id.is_none() => matches!(
                 resource,
                 None | Some(
                     "deployments"
                         | "last-deployment"
-                        | "environments"
-                        | "trigger-pipeline"
                         | "deployment-config"
                         | "automatic-deploy"
                         | "containers"
                 )
-            );
+            ),
+            _ => false,
+        }
+    }
+
+    fn allows_environment_path<'a>(&self, mut segments: impl Iterator<Item = &'a str>) -> bool {
+        let Some(environment) = segments.next() else {
+            return self.environment_id.is_none();
         };
-        match resource {
-            // This endpoint carries its environment in a typed body. The
-            // handler checks it before any lookup, write or audit event.
-            Some("trigger-pipeline") => segments.next().is_none(),
-            Some("environments") => {
-                segments.next().and_then(|id| id.parse::<i32>().ok()) == Some(environment_id)
-                    && matches!(
-                        segments.next(),
-                        None | Some(
-                            "variables"
-                                | "domains"
-                                | "ip-access"
-                                | "deployments"
-                                | "logs"
-                                | "resource-limits"
-                                | "scaling"
-                        )
-                    )
-            }
+        let Some(environment_id) = environment.parse::<i32>().ok().filter(|id| *id > 0) else {
+            return false;
+        };
+        if !self.allows_environment(self.project_id, environment_id) {
+            return false;
+        }
+        match segments.next() {
+            None => true,
+            Some("deploy") => match segments.next() {
+                Some("source" | "image" | "static") => segments.next().is_none(),
+                Some("image-upload") => match segments.next() {
+                    None => true,
+                    Some(request_id) => !request_id.is_empty() && segments.next().is_none(),
+                },
+                _ => false,
+            },
+            // Both project and environment keys use the same reviewed route
+            // namespaces. In particular, workflows/credential is never admitted.
+            Some(
+                "variables" | "domains" | "ip-access" | "deployments" | "logs" | "resource-limits"
+                | "scaling",
+            ) => true,
             _ => false,
         }
     }
@@ -142,6 +154,87 @@ mod tests {
         assert_eq!(ApiKeyScope::from_ids(None, None).unwrap(), None);
         for (project, env) in [(None, Some(1)), (Some(0), None), (Some(1), Some(-1))] {
             assert!(ApiKeyScope::from_ids(project, env).is_err());
+        }
+    }
+
+    #[test]
+    fn project_scope_does_not_admit_environment_workflow_credentials() {
+        for environment_id in [None, Some(9)] {
+            let scope = ApiKeyScope {
+                project_id: 7,
+                environment_id,
+            };
+            for suffix in [
+                "workflows/credential",
+                "workflows/settings",
+                "workflows",
+                "new-credential-api",
+            ] {
+                assert!(
+                    !scope.allows_path(&format!("/api/projects/7/environments/9/{suffix}")),
+                    "{suffix}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scoped_keys_can_use_only_bound_reviewed_upload_deployment_routes() {
+        for environment_id in [None, Some(9)] {
+            let scope = ApiKeyScope {
+                project_id: 7,
+                environment_id,
+            };
+            for suffix in [
+                "source",
+                "image",
+                "static",
+                "image-upload",
+                "image-upload/attempt",
+            ] {
+                assert!(
+                    scope.allows_path(&format!("/api/projects/7/environments/9/deploy/{suffix}")),
+                    "{suffix}"
+                );
+                assert!(
+                    !scope.allows_path(&format!("/api/projects/8/environments/9/deploy/{suffix}"))
+                );
+                if environment_id.is_some() {
+                    assert!(!scope
+                        .allows_path(&format!("/api/projects/7/environments/8/deploy/{suffix}")));
+                }
+            }
+            for suffix in [
+                "credential",
+                "new-route",
+                "image/extra",
+                "image-upload/attempt/extra",
+            ] {
+                assert!(
+                    !scope.allows_path(&format!("/api/projects/7/environments/9/deploy/{suffix}"))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scoped_cli_login_can_read_own_identity_without_account_management() {
+        for environment_id in [None, Some(9)] {
+            let scope = ApiKeyScope {
+                project_id: 7,
+                environment_id,
+            };
+            assert!(scope.allows_path("/api/user/me"));
+            assert!(scope.allows_path("/user/me"));
+            for path in [
+                "/users",
+                "/user/8",
+                "/user/me/password",
+                "/api-keys",
+                "/api/settings",
+            ] {
+                assert!(!scope.allows_path(path));
+            }
         }
     }
 
