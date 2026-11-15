@@ -213,9 +213,7 @@ pub struct GitHubRelease {
         rename = "body",
         deserialize_with = "deserialize_security_release"
     )]
-    pub security_release: bool,
-    #[serde(skip)]
-    pub security_fix_versions: Vec<String>,
+    security: ReleaseSecurityMetadata,
     pub tag_name: String,
     pub prerelease: bool,
     pub draft: bool,
@@ -223,29 +221,68 @@ pub struct GitHubRelease {
     pub html_url: String,
 }
 
-/// Retain only the metadata flag, not every historical release's full notes.
-fn deserialize_security_release<'de, D>(deserializer: D) -> Result<bool, D::Error>
+/// Metadata belongs to this artifact. Version ordering alone cannot establish
+/// that it contains a fix published on another maintenance line.
+#[derive(Clone, Debug, Default)]
+struct ReleaseSecurityMetadata {
+    release: bool,
+    ranges_present: bool,
+    affected_ranges: Vec<(String, String)>,
+}
+
+/// Retain bounded metadata rather than historical release-note bodies.
+fn deserialize_security_release<'de, D>(
+    deserializer: D,
+) -> Result<ReleaseSecurityMetadata, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let body = Option::<String>::deserialize(deserializer)?;
-    Ok(body.as_deref().is_some_and(|body| {
-        body.lines()
-            .any(|line| line.trim() == "<!-- temps-security-release -->")
-    }))
+    let mut metadata = ReleaseSecurityMetadata::default();
+    for line in body.as_deref().unwrap_or_default().lines().map(str::trim) {
+        if line == "<!-- temps-security-release -->" {
+            metadata.release = true;
+        }
+        if let Some(ranges) = line
+            .strip_prefix("<!-- temps-security-affects: ")
+            .and_then(|line| line.strip_suffix(" -->"))
+        {
+            metadata.ranges_present = true;
+            for range in ranges.split(',').take(32) {
+                if metadata.affected_ranges.len() >= 32 {
+                    break;
+                }
+                if let Some((lower, upper)) = range.trim().split_once("..") {
+                    let (lower, upper) = (lower.trim(), upper.trim());
+                    if version_sort_key(lower).is_some() && is_newer_version(upper, lower) {
+                        metadata
+                            .affected_ranges
+                            .push((lower.to_string(), upper.to_string()));
+                    }
+                }
+            }
+        }
+    }
+    Ok(metadata)
 }
 
 impl GitHubRelease {
     pub fn is_security_update_for(&self, current: &str) -> bool {
-        is_newer_version(&self.tag_name, current)
-            && (self.is_security_release()
-                || self.security_fix_versions.iter().any(|fixed| {
-                    is_newer_version(fixed, current) && !is_newer_version(fixed, &self.tag_name)
-                }))
+        if !is_newer_version(&self.tag_name, current) {
+            return false;
+        }
+        if self.security.ranges_present {
+            return self.security.affected_ranges.iter().any(|(lower, upper)| {
+                !is_newer_version(lower, current)
+                    && is_newer_version(upper, current)
+                    && !is_newer_version(upper, &self.tag_name)
+            });
+        }
+        self.is_security_release()
     }
 
     pub fn is_security_release(&self) -> bool {
-        self.security_release
+        self.security.release || !self.security.affected_ranges.is_empty()
     }
 }
 
@@ -1223,17 +1260,7 @@ async fn fetch_latest_release_in_channel_from(
         page += 1;
     }
 
-    let security_fix_versions = releases
-        .iter()
-        .filter(|release| channel.includes(release) && release.is_security_release())
-        .map(|release| release.tag_name.clone())
-        .collect::<Vec<_>>();
-    let selected =
-        pick_installable_release_for_channel(releases, channel, target).map(|mut release| {
-            release.security_fix_versions = security_fix_versions;
-            release
-        });
-    selected.ok_or_else(|| match channel {
+    pick_installable_release_for_channel(releases, channel, target).ok_or_else(|| match channel {
         UpgradeChannel::Stable => anyhow::anyhow!(
             "No stable releases with a temps-{}.tar.gz asset found. Try `--channel beta` to include prereleases.",
             target
@@ -3093,8 +3120,7 @@ mod tests {
 
     fn release_with_assets(tag: &str, names: &[&str]) -> GitHubRelease {
         GitHubRelease {
-            security_release: false,
-            security_fix_versions: Vec::new(),
+            security: ReleaseSecurityMetadata::default(),
             tag_name: tag.to_string(),
             prerelease: true,
             draft: false,
@@ -4327,8 +4353,7 @@ mod tests {
 
     fn release(tag: &str, prerelease: bool, draft: bool) -> GitHubRelease {
         GitHubRelease {
-            security_release: false,
-            security_fix_versions: Vec::new(),
+            security: ReleaseSecurityMetadata::default(),
             tag_name: tag.to_string(),
             prerelease,
             draft,
@@ -4800,25 +4825,61 @@ mod tests {
 #[cfg(test)]
 mod security_release_tests {
     use super::*;
+
+    fn release(tag: &str, body: Option<&str>) -> GitHubRelease {
+        serde_json::from_value(serde_json::json!({
+            "tag_name": tag, "prerelease": false, "draft": false,
+            "assets": [{"name": "temps-linux-amd64.tar.gz", "browser_download_url": "https://example.invalid/asset", "size": 1}],
+            "html_url": "https://example.invalid/notes", "body": body,
+        })).unwrap()
+    }
+
     #[test]
     fn release_marker_is_explicit_and_backwards_compatible() {
-        let json = r#"{"tag_name":"v1.2.0","prerelease":false,"draft":false,"assets":[],"html_url":"https://example.invalid/notes"}"#;
-        let mut value: serde_json::Value = serde_json::from_str(json).unwrap();
-        let release: GitHubRelease = serde_json::from_value(value.clone()).unwrap();
-        assert!(!release.is_security_release());
-        value["body"] = serde_json::json!("Security improvements");
-        let release: GitHubRelease = serde_json::from_value(value.clone()).unwrap();
-        assert!(!release.is_security_release());
-        value["body"] = serde_json::json!("Release notes\n<!-- temps-security-release -->\n");
-        let mut release: GitHubRelease = serde_json::from_value(value).unwrap();
+        assert!(!release("v1.2.0", None).is_security_release());
+        assert!(!release("v1.2.0", Some("Security improvements")).is_security_release());
+        let release = release(
+            "v1.2.0",
+            Some("Release notes\n<!-- temps-security-release -->\n"),
+        );
         assert!(release.is_security_release());
         assert!(release.is_security_update_for("v1.1.0"));
         assert!(!release.is_security_update_for("v1.2.0"));
         assert!(!release.is_security_update_for("v1.3.0"));
-        release.security_release = false;
-        release.tag_name = "v1.3.0".into();
-        release.security_fix_versions = vec!["v1.2.0".into()];
+    }
+
+    #[test]
+    fn newer_release_does_not_inherit_a_fix_from_a_backport() {
+        let selected = pick_installable_release_for_channel(
+            vec![
+                release("v1.1.5", Some("<!-- temps-security-release -->")),
+                release("v1.2.0", None),
+            ],
+            UpgradeChannel::Stable,
+            "linux-amd64",
+        )
+        .unwrap();
+        assert_eq!(selected.tag_name, "v1.2.0");
+        assert!(!selected.is_security_update_for("v1.1.4"));
+    }
+
+    #[test]
+    fn selected_release_can_explicitly_declare_affected_ranges() {
+        let release = release(
+            "v1.3.0",
+            Some("<!-- temps-security-affects: v1.1.0..v1.1.5, v1.2.0..v1.2.2 -->"),
+        );
         assert!(release.is_security_update_for("v1.1.0"));
-        assert!(!release.is_security_update_for("v1.2.0"));
+        assert!(release.is_security_update_for("v1.1.4"));
+        assert!(!release.is_security_update_for("v1.1.5"));
+        assert!(release.is_security_update_for("v1.2.1"));
+        assert!(!release.is_security_update_for("v1.2.2"));
+        assert!(!release.is_security_update_for("v1.0.0"));
+    }
+
+    #[test]
+    fn malformed_or_future_fixed_bounds_cannot_claim_an_available_fix() {
+        let release = release("v1.2.0", Some("<!-- temps-security-release -->\n<!-- temps-security-affects: invalid..v1.2.0, v1.1.0..v1.3.0 -->"));
+        assert!(!release.is_security_update_for("v1.1.1"));
     }
 }
