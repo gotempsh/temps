@@ -400,8 +400,13 @@ export function EnvironmentConfigurationCard({
         }
         const current = healthForm.getValues()
         for (const field of Object.keys(current) as Array<keyof HealthDrafts>) {
-          if (current[field] === submitted.healthDrafts[field]) {
-            healthForm.resetField(field, { defaultValue: current[field] })
+          // The successful write is the new baseline, even if a pending edit
+          // returned to the previous default (which RHF considered clean).
+          healthForm.resetField(field, {
+            defaultValue: submitted.healthDrafts[field],
+          })
+          if (current[field] !== submitted.healthDrafts[field]) {
+            healthForm.setValue(field, current[field], { shouldDirty: true })
           }
         }
       }

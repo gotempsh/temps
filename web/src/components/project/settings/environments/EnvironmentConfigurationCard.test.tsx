@@ -415,3 +415,71 @@ for (const editDuringSave of [false, true]) {
     )
   })
 }
+
+for (const editDuringSave of [false, true]) {
+  test(`numeric drafts use the saved baseline without losing pending edits (${editDuringSave})`, async () => {
+    let finish!: () => void
+    const pending = new Promise<void>((resolve) => {
+      finish = resolve
+    })
+    let started = false
+    let saved = false
+    const initial = {
+      id: 1,
+      name: 'production',
+      branch: 'main',
+      deployment_config: {
+        loadBalancing: {
+          strategy: 'round_robin',
+          healthCheck: { enabled: true, intervalSeconds: 2 },
+        },
+      },
+    } as EnvironmentResponse
+    mockApi({
+      'GET /internal/nodes': () => jsonResponse({ nodes: [] }),
+      'PUT /projects/1/environments/1/settings': async () => {
+        started = true
+        await pending
+        return jsonResponse(initial)
+      },
+    })
+    const client = new QueryClient()
+    const card = (environment: EnvironmentResponse) => (
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          <EnvironmentConfigurationCard
+            project={{ id: 1, source_type: 'manual' } as ProjectResponse}
+            environment={environment}
+            onUpdate={() => {
+              saved = true
+            }}
+          />
+        </MemoryRouter>
+      </QueryClientProvider>
+    )
+    const view = render(card(initial))
+    const input = view.getByLabelText('Interval (seconds)') as HTMLInputElement
+    fireEvent.change(input, { target: { value: '5' } })
+    fireEvent.submit(input.closest('form')!)
+    await waitFor(() => expect(started).toBe(true))
+    if (editDuringSave) fireEvent.change(input, { target: { value: '2' } })
+    finish()
+    await waitFor(() => expect(saved).toBe(true))
+    for (const intervalSeconds of [5, 6]) {
+      await act(async () => {
+        view.rerender(
+          card({
+            ...initial,
+            deployment_config: {
+              loadBalancing: {
+                strategy: 'round_robin',
+                healthCheck: { enabled: true, intervalSeconds },
+              },
+            },
+          })
+        )
+      })
+      expect(input.value).toBe(editDuringSave ? '2' : String(intervalSeconds))
+    }
+  })
+}
