@@ -61,7 +61,12 @@ use utoipa::ToSchema;
 /// v7: a static bundle entry refused for its path (absolute, escaping the
 /// extraction directory, or a link) is `static_output_rejected` rather than
 /// `static_deploy_failed`.
-pub const FAILURE_CLASSIFIER_VERSION: u8 = 7;
+///
+/// v8: executor task failures and deployment persistence failures are platform
+/// errors, while terminal-state readiness errors are runtime container exits.
+/// Explicit Compose policy rejections take precedence over resource words in
+/// their diagnostics. Matching still ignores embedded application log tails.
+pub const FAILURE_CLASSIFIER_VERSION: u8 = 8;
 
 /// Marker Compose deployments put before embedded container log tails.
 const CONTAINER_LOGS_MARKER: &str = "container logs for unhealthy/stopped services:";
@@ -1051,6 +1056,20 @@ fn classify_lowercase(raw: &str) -> DeploymentFailureClassification {
         return make(S::Configuration, C::InvalidConfiguration);
     }
 
+    // An explicit policy rejection happened before any workload ran. Its
+    // diagnostic may name the OOM killer or other resources without exhausting them.
+    if is_compose
+        && contains_any(
+            r,
+            &[
+                "compose security policy rejected",
+                "invalid compose override",
+            ],
+        )
+    {
+        return make(S::Configuration, C::ComposePolicyRejected);
+    }
+
     // ── Resources ───────────────────────────────────────────────────────
     if contains_any(r, &["out of memory", "oomkilled", "exit code 137"]) || contains_word(r, "oom")
     {
@@ -1250,6 +1269,8 @@ fn classify_lowercase(raw: &str) -> DeploymentFailureClassification {
             "' dead",
             "exited with code",
             "exited before",
+            "is in terminal state exited",
+            "is in terminal state dead",
         ],
     ) {
         return make(S::Runtime, C::ContainerExited);
@@ -1314,6 +1335,24 @@ fn classify_lowercase(raw: &str) -> DeploymentFailureClassification {
         }
         let stage = phase.map(phase_stage).unwrap_or(S::Platform);
         return make(stage, C::Timeout);
+    }
+
+    if contains_any(
+        r,
+        &["task execution failed:", "internal error executing job"],
+    ) || (phase != Some(JobPhase::Build)
+        && contains_any(
+            r,
+            &[
+                "failed to find deployment:",
+                "failed to find environment:",
+                "failed to find project:",
+                "failed to update project last_deployment:",
+                "database error:",
+            ],
+        ))
+    {
+        return make(S::Platform, C::PlatformInternal);
     }
 
     // ── Static-site deploy (extract the output, publish it) ─────────────
@@ -1718,6 +1757,49 @@ mod tests {
     fn assert_class(reason: &str, stage: S, code: C) {
         let got = classify_failure_reason(Some(reason));
         assert_eq!((got.stage, got.code), (stage, code), "reason: {reason}");
+    }
+
+    #[test]
+    fn infrastructure_and_terminal_state_messages_do_not_fall_through() {
+        let cases = [
+            ("deploy_compose", "Compose security policy rejected oom_kill_disable for service 'app': disabling the OOM killer is not allowed", S::Configuration, C::ComposePolicyRejected),
+            ("deploy_container", "Task execution failed: task 7 panicked", S::Platform, C::PlatformInternal),
+            ("build_image", "Internal error executing job 'build_image' for deployment 42: task panicked", S::Platform, C::PlatformInternal),
+            ("mark_deployment_complete", "Failed to find deployment: query failed", S::Platform, C::PlatformInternal),
+            ("mark_deployment_complete", "Failed to find environment: query failed", S::Platform, C::PlatformInternal),
+            ("mark_deployment_complete", "Failed to find project: query failed", S::Platform, C::PlatformInternal),
+            ("mark_deployment_complete", "Failed to update project last_deployment: query failed", S::Platform, C::PlatformInternal),
+            ("deploy_container", "Database error: connection pool closed", S::Platform, C::PlatformInternal),
+            ("deploy_container", "Container candidate-1 is in terminal state Exited and will not become ready", S::Runtime, C::ContainerExited),
+            ("deploy_container", "Container candidate-1 is in terminal state Dead and will not become ready", S::Runtime, C::ContainerExited),
+        ];
+        for (job, message, stage, code) in cases {
+            assert_class(&wrapped(job, message), stage, code);
+        }
+    }
+
+    #[test]
+    fn application_log_tails_cannot_claim_platform_failures() {
+        for marker in [
+            "Last log lines:",
+            "Container logs for unhealthy/stopped services:",
+        ] {
+            let reason = wrapped("deploy_container", &format!("Container exited during startup (exit code 1). {marker} Database error: task execution failed: connection refused"));
+            assert_class(&reason, S::Runtime, C::ContainerExited);
+        }
+        assert_class(
+            &wrapped("deploy_container", "an entirely novel failure"),
+            S::Deploy,
+            C::Unknown,
+        );
+        assert_class(
+            &wrapped(
+                "build_image",
+                "Build failed: application generator: Database error: schema missing",
+            ),
+            S::Build,
+            C::BuildError,
+        );
     }
 
     #[test]
