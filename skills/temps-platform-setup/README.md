@@ -15,7 +15,7 @@ The skill guides an agent to:
 3. run a bounded QuickStart, advanced, or local installation;
 4. expose only allowlisted non-secret install results;
 5. verify the console URL and service health;
-6. start the pinned Temps CLI login itself;
+6. start the latest stable Temps CLI login itself;
 7. give the user the short-lived browser approval URL and code;
 8. keep polling until approval, then verify the named context with `whoami`.
 

@@ -61,7 +61,7 @@ Add a rule. New rules start in log-only mode unless --mode enforce is given
 | `--environment-id <id>` | Apply only to this environment | - | No |
 | `--project-id <id>` | Project ID | - | Yes |
 | `--json` | Output in JSON format | - | No |
-| `--mode <mode>` | enforce or log-only | `log-only` | No |
+| `--mode <mode>` | enforce or log-only (default: the file's mode, else log-only) | - | No |
 | `--disabled` | Create it disabled | - | No |
 | `--position <n>` | Insert at this 1-based position (default: last) | - | No |
 

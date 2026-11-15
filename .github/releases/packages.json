@@ -88,5 +88,10 @@
     "kind": "go",
     "path": "sdks/go/workflows",
     "name": "github.com/gotempsh/temps/sdks/go/workflows"
+  },
+  "cli": {
+    "kind": "npm",
+    "path": "apps/temps-cli",
+    "name": "@temps-sdk/cli"
   }
 }

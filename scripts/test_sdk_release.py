@@ -157,6 +157,13 @@ class ReleaseTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             release.pending_files(package, directory, lambda _: metadata)
 
+    def test_cli_is_available_for_main_release_selection(self):
+        catalog = release.read_json(release.ROOT / '.github/releases/packages.json')
+        self.assertEqual(catalog['cli'], {
+            'kind': 'npm', 'path': 'apps/temps-cli', 'name': '@temps-sdk/cli'})
+        package = next(p for p in release.catalog_packages() if p['key'] == 'cli')
+        self.assertEqual(release.plan(package['tag']), [package])
+
     def test_npm_archive_checks_manifest_dependencies_and_entrypoints(self):
         package = dict(self.catalog['cli'], key='cli', version='1.2.3')
         data = {'name': package['name'], 'version': '1.2.3', 'main': './dist/index.js'}

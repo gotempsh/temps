@@ -4,10 +4,10 @@
     {
       "id": 1,
       "prompt": "Deploy this existing Next.js app to my production Temps context. Keep the current package manager and don't add unrelated dependencies.",
-      "expected_output": "Inspects the app and target context, runs the capability detector, offers missing observability once without blocking deployment, uses pinned @temps-sdk/cli with --target-context, and verifies deployment health.",
+      "expected_output": "Inspects the app and target context, runs the capability detector, offers missing observability once without blocking deployment, uses @temps-sdk/cli@latest with --target-context, and verifies deployment health.",
       "files": [],
       "expectations": [
-        "Uses bunx or npx with @temps-sdk/cli@0.1.38 rather than a global temps command",
+        "Uses bunx or npx with @temps-sdk/cli@latest rather than a global temps command",
         "Names an explicit target context for state-changing commands",
         "Checks analytics, error tracking, and tracing before the final deploy step",
         "Treats observability as an opt-in offer rather than a deployment requirement",
@@ -30,11 +30,11 @@
     {
       "id": 3,
       "prompt": "Show me the latest errors for project 42 in staging. Do not change anything.",
-      "expected_output": "Routes directly to the errors command reference, uses an explicit staging context and a pinned CLI invocation, performs only read operations, and does not load deployment or observability setup guides.",
+      "expected_output": "Routes directly to the errors command reference, uses an explicit staging context and a latest stable CLI invocation, performs only read operations, and does not load deployment or observability setup guides.",
       "files": [],
       "expectations": [
         "Uses only the relevant errors command-group reference",
-        "Uses @temps-sdk/cli@0.1.38 with the staging target context",
+        "Uses @temps-sdk/cli@latest with the staging target context",
         "Performs no state-changing operation",
         "Does not offer instrumentation during a read-only error query"
       ]
@@ -68,11 +68,11 @@
     {
       "id": 6,
       "prompt": "Add a GitHub Actions workflow that deploys this app to Temps production on pushes to main.",
-      "expected_output": "Creates a pinned, explicit-context CI workflow with secret-store credentials, preflight identity, bounded deployment verification, and no developer-local state.",
+      "expected_output": "Creates an explicit-context CI workflow with secret-store credentials, preflight identity, bounded deployment verification, and no developer-local state.",
       "files": [],
       "expectations": [
         "Routes to ci-automation and deploy-application",
-        "Pins @temps-sdk/cli@0.1.38 and verifies the reviewed package integrity",
+        "Uses @temps-sdk/cli@latest and checks its version and runtime help",
         "Uses CI secrets rather than repository plaintext or local ~/.temps files",
         "Uses an explicit production target context and preflight whoami",
         "Waits for deployment health and fails on a bounded timeout"
@@ -100,7 +100,7 @@
         "Routes to curated-services before the repository deployment workflow and inspects the actual template requirements",
         "Uses the matching curated app template and native database bindings instead of creating a Dockerfile, custom project or duplicate PostgreSQL service",
         "Does not require a local checkout, Git connection or workspace project link for server-side template creation",
-        "Uses connected Temps tools when available, otherwise the pinned CLI with an explicit target context",
+        "Uses connected Temps tools when available, otherwise the current CLI with an explicit target context",
         "Reuses the existing managed database by ID without revealing or manually copying credentials",
         "Follows or retries the same instantiation after an interrupted wait rather than creating duplicates",
         "Queries the returned service and its own environment rather than inheriting an unrelated workspace link environment filter",

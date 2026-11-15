@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import tarfile
 import time
+import tempfile
 import tomllib
 import urllib.error
 import urllib.parse
@@ -183,6 +184,8 @@ def build(packages, output):
                 run('bun', 'test', cwd=path)
             elif data['scripts'].get('test') == 'vitest':
                 run('bun', 'x', '--no-install', 'vitest', 'run', cwd=path)
+            if p['key'] == 'cli':
+                run('bun', 'test', 'src/commands/docs.test.ts', cwd=path)
             run('bun', 'run', 'build', cwd=path)
             if p['key'] in ('node-sdk', 'api', 'workflows', 'kv', 'blob', 'sandbox', 'plugin'):
                 run('node', str(ROOT / 'scripts/sdk-package.test.mjs'), str(path))
@@ -190,6 +193,17 @@ def build(packages, output):
             run('bun', 'pm', 'pack', '--ignore-scripts', '--filename', str(artifact), cwd=path)
             check_npm_archive(artifact, p)
             run('npm', 'pack', str(artifact), '--dry-run', '--ignore-scripts', cwd=dest)
+            if p['key'] == 'cli':
+                # Exercise the distributable under Node, not Bun/source.
+                with tempfile.TemporaryDirectory(prefix='temps-cli-package-') as temporary:
+                    run('npm', 'install', '--ignore-scripts', '--no-audit', '--no-fund',
+                        str(artifact), cwd=temporary)
+                    entry = Path(temporary) / 'node_modules/@temps-sdk/cli/dist/index.js'
+                    version = run('node', str(entry), '--version', cwd=temporary, capture=True)
+                    if version.strip() != p['version']:
+                        raise ValueError('Packaged CLI reports the wrong version')
+                    run('node', str(entry), '--help', cwd=temporary)
+
         elif p['kind'] == 'pypi':
             run('uv', 'run', '--no-project', '--with', 'build', 'python', '-m', 'build', str(path), '--outdir', str(dest))
             run('uv', 'run', '--no-project', '--with', 'twine', 'twine', 'check', *map(str, dest.iterdir()))

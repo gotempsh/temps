@@ -1048,8 +1048,9 @@ releases:
 `scripts/sdk_release.py` reads `.github/releases/packages.json` (the SDK catalog)
 and `.github/releases/prepared.json` (explicit upcoming server-tag selections).
 The catalog covers Node/TypeScript libraries, the Python plugin and workflow
-SDKs, Go workflows, and the Rust protocol/plugin/workflow crates. The CLI retains
-its existing lifecycle; this catalog does not publish it.
+SDKs, Go workflows, the Rust protocol/plugin/workflow crates, and the TypeScript
+CLI (`cli` / `@temps-sdk/cli`). The CLI uses the same prepared-version selection,
+OIDC publisher, verification, retries, and package tags as the npm SDKs.
 
 Prepare SDK releases in a normal signed-off change **before** cutting the server
 tag: bump each selected package manifest, update lockfiles and local dependency
