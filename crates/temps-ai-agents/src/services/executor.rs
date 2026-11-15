@@ -321,14 +321,7 @@ async fn clone_with_scoped_token(
             .arg("--")
             .arg(format!("https://github.com/{owner}/{repo}.git"))
             .arg(target_dir)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GIT_CONFIG_COUNT", "1")
-            .env("GIT_CONFIG_KEY_0", "credential.helper")
-            .env(
-                "GIT_CONFIG_VALUE_0",
-                "!f() { echo username=x-access-token; echo \"password=$TEMPS_SCOPED_TOKEN\"; }; f",
-            )
-            .env("TEMPS_SCOPED_TOKEN", token)
+            .envs(scoped_token_git_env(token))
             .stdin(Stdio::null())
             .kill_on_drop(true)
             .output(),
@@ -346,6 +339,29 @@ async fn clone_with_scoped_token(
             String::from_utf8_lossy(&output.stderr).trim()
         ))
     }
+}
+
+/// Environment that makes `git` authenticate with `token` and nothing else.
+///
+/// `GIT_CONFIG_*` entries are added after the system and global config, so
+/// on their own they would only append a helper: one the host already has
+/// (`credential.helper=store`, a keychain) would still be asked first, and
+/// would be handed the scoped token to save once the clone succeeds. An
+/// empty `credential.helper` value clears the list before ours is added.
+fn scoped_token_git_env(token: &str) -> [(&'static str, String); 7] {
+    [
+        ("GIT_TERMINAL_PROMPT", "0".to_string()),
+        ("TEMPS_SCOPED_TOKEN", token.to_string()),
+        ("GIT_CONFIG_COUNT", "2".to_string()),
+        ("GIT_CONFIG_KEY_0", "credential.helper".to_string()),
+        ("GIT_CONFIG_VALUE_0", String::new()),
+        ("GIT_CONFIG_KEY_1", "credential.helper".to_string()),
+        (
+            "GIT_CONFIG_VALUE_1",
+            "!f() { echo username=x-access-token; echo \"password=$TEMPS_SCOPED_TOKEN\"; }; f"
+                .to_string(),
+        ),
+    ]
 }
 
 fn is_plain_token(token: &str) -> bool {
@@ -4284,6 +4300,63 @@ fn skipped_overlay_entries_message(
         owner,
         repo
     ))
+}
+
+#[cfg(test)]
+mod scoped_token_git_env_tests {
+    use super::scoped_token_git_env;
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    /// The credentials `git` would use for github.com with `env` applied, on
+    /// a host whose own config already has a credential stored.
+    fn credential_fill(env: &[(&'static str, String)]) -> Option<String> {
+        let home = tempfile::tempdir().ok()?;
+        std::fs::write(
+            home.path().join(".gitconfig"),
+            "[credential]\n\thelper = store\n",
+        )
+        .ok()?;
+        std::fs::write(
+            home.path().join(".git-credentials"),
+            "https://host-user:host-secret@github.com\n",
+        )
+        .ok()?;
+        let mut child = Command::new("git")
+            .args(["credential", "fill"])
+            .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", home.path().join(".config"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .envs(env.iter().map(|(k, v)| (*k, v.as_str())))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        child
+            .stdin
+            .take()?
+            .write_all(b"protocol=https\nhost=github.com\n\n")
+            .ok()?;
+        let output = child.wait_with_output().ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    #[test]
+    fn a_credential_the_host_has_stored_is_not_used_instead_of_the_scoped_token() {
+        if Command::new("git").arg("--version").output().is_err() {
+            println!("git is not installed, skipping");
+            return;
+        }
+        let filled = credential_fill(&scoped_token_git_env("scoped-token"))
+            .expect("git credential fill runs");
+        assert!(filled.contains("password=scoped-token"), "{filled}");
+        assert!(filled.contains("username=x-access-token"), "{filled}");
+        assert!(!filled.contains("host-secret"), "{filled}");
+    }
 }
 
 #[cfg(test)]
