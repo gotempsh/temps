@@ -35,8 +35,7 @@ use crate::services::DeploymentJobTracker;
 use temps_screenshots::ScreenshotService;
 
 use crate::services::failure_classifier::{
-    classify_failure_reason, compose_security_check, DeploymentFailureCode,
-    FAILURE_CLASSIFIER_VERSION,
+    classify_failure_reason, compose_security_check, FAILURE_CLASSIFIER_VERSION,
 };
 
 mod job_registry;
@@ -152,11 +151,7 @@ fn deploy_failed_telemetry_event(
         // so it does not increment the taxonomy's classifier_version.
         .with_opt(
             "compose_security_check",
-            if failure.code == DeploymentFailureCode::ComposePolicyRejected {
-                compose_security_check(reason).map(|check| check.as_str())
-            } else {
-                None
-            },
+            compose_security_check(reason).map(|check| check.as_str()),
         )
         .with_opt("source_type", source_type)
         .with_opt("preset", preset),
@@ -3383,6 +3378,42 @@ mod tests {
             "Compose security policy rejected [check=unclassified] private-field [check=privileged]",
             "Container exited during startup. Last log lines: Compose security policy rejected [check=privileged]",
             "Container exited during startup. Container logs for unhealthy/stopped services: Compose security policy rejected [check=privileged]",
+        ] {
+            let event = deploy_failed_telemetry_event(Some(reason), None, None, None);
+            assert!(!event.properties.contains_key("compose_security_check"), "{reason}");
+        }
+    }
+
+    #[test]
+    fn real_oom_policy_rejections_emit_the_check_without_changing_the_taxonomy() {
+        let error = temps_deployer::compose::ComposeError::SecurityPolicyViolation {
+            check: Some(temps_entities::compose_security::ComposeSecurityCheck::OomKiller),
+            service: "app".to_string(), field: "oom_kill_disable".to_string(),
+            reason: "disabling the OOM killer can turn container memory pressure into a host-wide denial of service".to_string(),
+        };
+        let reason = format!(
+            "Compose configuration check failed for project 42 (policy_violation): {error}"
+        );
+        let event = deploy_failed_telemetry_event(Some(&reason), None, None, None);
+        assert_eq!(event.properties["compose_security_check"], "oom_killer");
+        let old_reason = reason.replace("[check=oom_killer] ", "");
+        let old_classification = classify_failure_reason(Some(&old_reason));
+        assert_eq!(
+            event.properties["failure_code"],
+            old_classification.code.as_str()
+        );
+        assert_eq!(
+            event.properties["classifier_version"],
+            FAILURE_CLASSIFIER_VERSION
+        );
+    }
+
+    #[test]
+    fn build_output_cannot_claim_a_compose_security_check() {
+        for reason in [
+            "Compose prepare/pull failed: Docker Compose command failed for project 'app': build stderr: Compose security policy rejected [check=privileged]",
+            "Required job 'build_image' failed: Compose security policy rejected [check=privileged]",
+            "Compose deploy failed: service 'Compose security policy rejected [check=privileged]' exited",
         ] {
             let event = deploy_failed_telemetry_event(Some(reason), None, None, None);
             assert!(!event.properties.contains_key("compose_security_check"), "{reason}");

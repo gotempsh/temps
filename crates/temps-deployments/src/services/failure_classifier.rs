@@ -71,15 +71,57 @@ const COMPOSE_CHECK_MARKERS: [&str; 2] = [
     "invalid compose override [check=",
 ];
 
+/// Peel only wrappers produced by the workflow and Compose jobs. Never search
+/// arbitrary command output or user-controlled error fields for metadata.
+fn compose_policy_error_head(mut reason: &str) -> Option<&str> {
+    for _ in 0..16 {
+        reason = reason.trim_start();
+        if COMPOSE_CHECK_MARKERS
+            .iter()
+            .any(|marker| reason.starts_with(marker))
+        {
+            return Some(reason);
+        }
+        if let Some(inner) = [
+            "job execution failed: ",
+            "job failed: ",
+            "workflow error: ",
+            "compose prepare/pull failed: ",
+            "compose deploy failed: ",
+            "some(\"",
+        ]
+        .iter()
+        .find_map(|prefix| reason.strip_prefix(prefix))
+        {
+            reason = inner;
+            continue;
+        }
+        if let Some(inner) = reason.strip_prefix("required job 'deploy_compose' failed: ") {
+            reason = inner;
+            continue;
+        }
+        if let Some(inner) = reason.strip_prefix("compose configuration check failed for project ")
+        {
+            let (project_id, rest) = inner.split_once(" (")?;
+            project_id.parse::<i32>().ok()?;
+            let (_, inner) = rest.split_once("): ")?;
+            reason = inner;
+            continue;
+        }
+        return None;
+    }
+    None
+}
+
 /// Check labels are metadata, not failure signals (e.g. `oom_killer`).
 /// Removing only the newly introduced annotation preserves the existing
 /// stage/code matching semantics of the diagnostic text around it.
 fn without_compose_check_annotation(reason: &str) -> Option<String> {
-    let (start, marker) = COMPOSE_CHECK_MARKERS
+    let policy_error = compose_policy_error_head(reason)?;
+    let marker = COMPOSE_CHECK_MARKERS
         .iter()
-        .filter_map(|marker| reason.find(marker).map(|start| (start, marker)))
-        .min_by_key(|(start, _)| *start)?;
-    let label_start = start + marker.len();
+        .find(|marker| policy_error.starts_with(*marker))?;
+    let label_start = reason.len() - policy_error.len() + marker.len();
     let label_end = label_start + reason[label_start..].find(']')? + 1;
     let annotation_start = label_start - "[check=".len();
     Some(format!(
@@ -460,11 +502,12 @@ pub fn compose_security_check(
     use temps_entities::compose_security::ComposeSecurityCheck;
     let reason = reason?.to_lowercase();
     let head = classification_head(&reason);
-    let start = COMPOSE_CHECK_MARKERS
+    let policy_error = compose_policy_error_head(head)?;
+    let label = COMPOSE_CHECK_MARKERS
         .iter()
-        .filter_map(|marker| head.find(marker).map(|index| (index, marker.len())))
-        .min_by_key(|(index, _)| *index)?;
-    let label = head[start.0 + start.1..].split_once(']')?.0;
+        .find_map(|marker| policy_error.strip_prefix(marker))?
+        .split_once(']')?
+        .0;
     if label.len() > 64 || !label.bytes().all(|c| c.is_ascii_lowercase() || c == b'_') {
         return None;
     }
@@ -1770,6 +1813,22 @@ mod tests {
     fn assert_class(reason: &str, stage: S, code: C) {
         let got = classify_failure_reason(Some(reason));
         assert_eq!((got.stage, got.code), (stage, code), "reason: {reason}");
+    }
+
+    #[test]
+    fn compose_check_metadata_survives_workflow_wrappers() {
+        use temps_entities::compose_security::ComposeSecurityCheck;
+        let inner = "Compose configuration check failed for project 42 (policy_violation): Compose security policy rejected [check=privileged] privileged for service 'app': refused";
+        for reason in [
+            inner.to_string(),
+            wrapped("deploy_compose", inner),
+            format!("Job execution failed: Required job 'deploy_compose' failed: {inner}"),
+        ] {
+            assert_eq!(
+                compose_security_check(Some(&reason)),
+                Some(ComposeSecurityCheck::Privileged)
+            );
+        }
     }
 
     #[test]
