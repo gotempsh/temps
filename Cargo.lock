@@ -15038,7 +15038,7 @@ dependencies = [
 
 [[package]]
 name = "temps-plugin-protocol"
-version = "0.1.0-beta.61"
+version = "0.1.0-beta.62"
 dependencies = [
  "base64 0.23.1",
  "chrono",
@@ -15050,7 +15050,7 @@ dependencies = [
 
 [[package]]
 name = "temps-plugin-sdk"
-version = "0.1.0-beta.61"
+version = "0.1.0-beta.62"
 dependencies = [
  "axum",
  "clap",
