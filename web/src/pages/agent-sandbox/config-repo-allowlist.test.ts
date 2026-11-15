@@ -38,3 +38,20 @@ test('entries that could never match are reported', () => {
     ])
   ).toEqual(['org', 'org/a/b', '*/*', '../x', 'org/cf g'])
 })
+
+test('a GitHub URL for a repository is accepted, as the server accepts it', () => {
+  expect(
+    invalidConfigRepoEntries([
+      'https://github.com/org/config',
+      'https://github.com/org/config.git',
+      'github.com/org/config/',
+      'https://user:token@github.com/org/config',
+      'https://example.com/org/config',
+      'https://github.com/org/*',
+    ])
+  ).toEqual([
+    'https://user:token@github.com/org/config',
+    'https://example.com/org/config',
+    'https://github.com/org/*',
+  ])
+})
