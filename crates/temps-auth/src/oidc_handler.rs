@@ -106,6 +106,22 @@ fn cookie_header_value(cookie: &Cookie<'_>) -> Result<HeaderValue, String> {
         .map_err(|error| format!("failed to build login binding cookie: {error}"))
 }
 
+/// The forced password-change cookie an SSO sign-in hands the browser.
+///
+/// Built through [`crate::auth_cookies::builder`] so it is issued under the
+/// name `change_required_password` reads for the same request: on HTTPS that
+/// reader accepts only the host-only name, so a cookie built here under the
+/// bare name would never be read back.
+fn required_password_change_cookie(encrypted_token: String, secure: bool) -> Cookie<'static> {
+    crate::auth_cookies::builder(
+        crate::auth_cookies::PASSWORD_CHANGE_SESSION,
+        encrypted_token,
+        secure,
+    )
+    .max_age(cookie::time::Duration::minutes(15))
+    .build()
+}
+
 /// `Set-Cookie` that ties the login attempt `state` to the browser receiving it.
 fn login_binding_cookie(
     crypto: &CookieCrypto,
@@ -682,13 +698,8 @@ async fn complete_oidc_login(
                 ),
             }
         })?;
-        let password_change_cookie = Cookie::build(("password_change_session", encrypted_token))
-            .http_only(true)
-            .path("/")
-            .max_age(cookie::time::Duration::minutes(15))
-            .same_site(cookie::SameSite::Strict)
-            .secure(metadata.is_secure)
-            .build();
+        let password_change_cookie =
+            required_password_change_cookie(encrypted_token, metadata.is_secure);
         let cookie_header = password_change_cookie
             .to_string()
             .parse()
@@ -1336,6 +1347,42 @@ mod login_binding_tests {
             "access_denied\nforged log line",
         ] {
             assert_eq!(provider_error_code(crafted), "unregistered", "{crafted:?}");
+        }
+    }
+
+    /// The SSO branch that forces a password change must issue the cookie
+    /// under the name `change_required_password` reads back for the same
+    /// request. On HTTPS that reader accepts only the host-only name, so a
+    /// bare `password_change_session` left the user with "Password Change
+    /// Session Required" right after being sent to change it.
+    #[test]
+    fn the_password_change_cookie_is_read_back_by_the_password_change_handler() {
+        for secure in [true, false] {
+            let cookie = required_password_change_cookie("sealed-token".to_string(), secure);
+            let text = cookie.to_string();
+            let mut headers = HeaderMap::new();
+            headers.insert(COOKIE, text.split(';').next().unwrap().parse().unwrap());
+
+            assert_eq!(
+                crate::auth_cookies::read(
+                    &headers,
+                    crate::auth_cookies::PASSWORD_CHANGE_SESSION,
+                    secure
+                )
+                .as_deref(),
+                Some("sealed-token"),
+                "secure={secure}: {text}"
+            );
+            assert_eq!(
+                cookie.max_age(),
+                Some(cookie::time::Duration::minutes(15)),
+                "{text}"
+            );
+            assert_eq!(cookie.same_site(), Some(cookie::SameSite::Strict), "{text}");
+            assert_eq!(cookie.http_only(), Some(true), "{text}");
+            assert_eq!(cookie.secure(), Some(secure), "{text}");
+            assert_eq!(cookie.path(), Some("/"), "{text}");
+            assert_eq!(cookie.domain(), None, "{text}");
         }
     }
 
