@@ -1035,22 +1035,39 @@ impl AgentConfigService {
         // A config repository other than the project's own, and not on the
         // administrator's list, is kept on the agent but never used. Say so
         // now, where the YAML was just read, as well as in each run's log.
-        for a in &yaml_agents {
-            let Some(repo) = a.config_repo.as_deref().filter(|r| !r.is_empty()) else {
-                continue;
-            };
-            if let Err(error) = crate::services::config_repo_policy::check_project_config_repo(
+        // The project and the allow-list are read once, and only when some
+        // agent names a config repository.
+        let named_repos: Vec<(&AgentYamlConfig, &str)> = yaml_agents
+            .iter()
+            .filter_map(|a| {
+                a.config_repo
+                    .as_deref()
+                    .filter(|r| !r.is_empty())
+                    .map(|r| (a, r))
+            })
+            .collect();
+        if !named_repos.is_empty() {
+            match crate::services::config_repo_policy::ProjectConfigRepoPolicy::load(
                 self.db.as_ref(),
                 project_id,
-                repo,
             )
             .await
             {
-                tracing::warn!(
+                Ok(policy) => {
+                    for (a, repo) in named_repos {
+                        if let Err(error) = policy.check(repo) {
+                            tracing::warn!(
+                                project_id,
+                                agent = %a.slug(),
+                                "Agent config repo will not be used: {error}"
+                            );
+                        }
+                    }
+                }
+                Err(error) => tracing::warn!(
                     project_id,
-                    agent = %a.slug(),
-                    "Agent config repo will not be used: {error}"
-                );
+                    "Could not check the agents' config repositories while syncing: {error}"
+                ),
             }
         }
 
