@@ -168,6 +168,15 @@ enum RequestFilterError {
     EnableFetch { reason: String },
 }
 
+/// A loopback port nothing is listening on right now, for a launch that must
+/// not be retried by the browser library.
+fn free_loopback_port() -> Option<u16> {
+    std::net::TcpListener::bind(("127.0.0.1", 0))
+        .and_then(|listener| listener.local_addr())
+        .map(|address| address.port())
+        .ok()
+}
+
 /// Launch Chromium with its own sandbox on, falling back to no sandbox when it
 /// cannot start (typically as root inside a container, or without the user
 /// namespaces it needs). The fallback is logged once at WARN, and remembered
@@ -177,6 +186,13 @@ enum RequestFilterError {
 /// proxy (see [`crate::pinning_proxy`]): loopback included, which Chromium
 /// otherwise connects to directly, and WebRTC, which otherwise sends UDP
 /// straight to any address a page names.
+///
+/// The browser library waits up to 30 seconds for a starting Chromium to print
+/// its DevTools address, and when none comes it starts another process, up to
+/// eleven times. Chromium whose sandbox cannot start (no user namespaces, as a
+/// non-root user) exits without printing it, so the sandboxed trial is given a
+/// fixed port: the library then reports the failure after the one wait
+/// instead of repeating it, and the unsandboxed launch follows.
 fn launch_chrome(
     chrome_path: Option<PathBuf>,
     idle_timeout: Duration,
@@ -195,6 +211,7 @@ fn launch_chrome(
     proxy_args.extend(extra_args.iter().map(std::ffi::OsStr::new));
     let options = |sandbox: bool| {
         LaunchOptions::default_builder()
+            .port(if sandbox { free_loopback_port() } else { None })
             .path(chrome_path.clone())
             .headless(true) // Must be headless for server environments
             .sandbox(sandbox)
@@ -661,6 +678,13 @@ fn still_running_message(reason: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_free_loopback_port_can_be_bound_straight_away() {
+        let port = free_loopback_port().expect("a loopback port is free");
+        assert_ne!(port, 0);
+        std::net::TcpListener::bind(("127.0.0.1", port)).expect("the port is free to bind");
+    }
 
     #[test]
     fn launch_and_filter_failures_say_which_step_failed() {
