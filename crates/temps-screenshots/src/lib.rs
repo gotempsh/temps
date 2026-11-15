@@ -12,6 +12,7 @@ mod chromium_installer;
 pub mod error;
 pub mod local_provider;
 pub mod noop_provider;
+pub mod pinning_proxy;
 pub mod plugin;
 pub mod provider;
 pub mod remote_provider;

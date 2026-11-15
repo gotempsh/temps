@@ -15,6 +15,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::chromium_installer::chromium_executable;
 use crate::error::{ScreenshotError, ScreenshotResult};
+use crate::pinning_proxy::{system_lookup, Lookup, PinningProxy};
 use crate::provider::ScreenshotProvider;
 use crate::request_policy::{RequestDecision, RequestPolicy};
 
@@ -149,11 +150,27 @@ static SANDBOX_STATE: AtomicU8 = AtomicU8::new(SANDBOX_UNKNOWN);
 /// cannot start (typically as root inside a container, or without the user
 /// namespaces it needs). The fallback is logged once at WARN, and remembered
 /// so later launches do not first try a sandbox that is known not to start.
+///
+/// With `proxy_server`, every connection the browser opens goes through that
+/// proxy (see [`crate::pinning_proxy`]): loopback included, which Chromium
+/// otherwise connects to directly, and WebRTC, which otherwise sends UDP
+/// straight to any address a page names.
 fn launch_chrome(
     chrome_path: Option<PathBuf>,
     idle_timeout: Duration,
     window_size: Option<(u32, u32)>,
+    proxy_server: Option<&str>,
+    extra_args: &[String],
 ) -> Result<Browser, String> {
+    let mut proxy_args: Vec<&std::ffi::OsStr> = if proxy_server.is_some() {
+        vec![
+            std::ffi::OsStr::new("--proxy-bypass-list=<-loopback>"),
+            std::ffi::OsStr::new("--force-webrtc-ip-handling-policy=disable_non_proxied_udp"),
+        ]
+    } else {
+        Vec::new()
+    };
+    proxy_args.extend(extra_args.iter().map(std::ffi::OsStr::new));
     let options = |sandbox: bool| {
         LaunchOptions::default_builder()
             .path(chrome_path.clone())
@@ -161,6 +178,8 @@ fn launch_chrome(
             .sandbox(sandbox)
             .idle_browser_timeout(idle_timeout)
             .window_size(window_size)
+            .proxy_server(proxy_server)
+            .args(proxy_args.clone())
             .build()
             .map_err(|error| format!("failed to build launch options: {error}"))
     };
@@ -264,6 +283,11 @@ pub struct LocalScreenshotProvider {
     viewport_width: u32,
     /// Viewport height
     viewport_height: u32,
+    /// How the capture's proxy resolves names. The system resolver, except
+    /// in tests that need a name to answer with a chosen address.
+    lookup: Lookup,
+    /// Extra Chromium switches. Empty outside tests.
+    extra_chrome_args: Vec<String>,
 }
 
 impl LocalScreenshotProvider {
@@ -273,6 +297,8 @@ impl LocalScreenshotProvider {
             timeout_seconds: 30,
             viewport_width: 1920,
             viewport_height: 1080,
+            lookup: system_lookup(),
+            extra_chrome_args: Vec::new(),
         }
     }
 
@@ -282,6 +308,8 @@ impl LocalScreenshotProvider {
             timeout_seconds,
             viewport_width,
             viewport_height,
+            lookup: system_lookup(),
+            extra_chrome_args: Vec::new(),
         }
     }
 }
@@ -306,6 +334,16 @@ impl ScreenshotProvider for LocalScreenshotProvider {
         }
         // What the captured page may request: its own address and public ones.
         let policy = RequestPolicy::for_target(url)?;
+        // The browser's only route out. It checks the address each connection
+        // is actually made to, which the request filter below cannot see.
+        let refused = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let proxy = PinningProxy::start(policy.clone(), self.lookup.clone(), refused.clone())
+            .await
+            .map_err(|error| {
+                ScreenshotError::CaptureFailed(format!(
+                    "Failed to start the connection proxy for the capture of {url}: {error}"
+                ))
+            })?;
 
         // Hold the launch lock for the whole capture (not just the launch),
         // and inside the blocking task: a caller's timeout drops this future
@@ -319,8 +357,13 @@ impl ScreenshotProvider for LocalScreenshotProvider {
             let height = self.viewport_height;
             let url = url.to_string();
             let policy = policy.clone();
+            let extra_args = self.extra_chrome_args.clone();
 
             move || -> ScreenshotResult<Vec<u8>> {
+                // Owned here so the proxy outlives the browser: a caller's
+                // timeout drops the future, not this closure.
+                let proxy = proxy;
+                let proxy_server = proxy.proxy_server();
                 // Downloads Chromium on first use. Failing here means it
                 // could not be installed — reported once by the latch.
                 let chrome_path = chromium_executable().inspect_err(|e| {
@@ -335,6 +378,8 @@ impl ScreenshotProvider for LocalScreenshotProvider {
                     chrome_path,
                     Duration::from_secs(timeout),
                     Some((width, height)),
+                    Some(&proxy_server),
+                    &extra_args,
                 )
                 .map_err(|reason| {
                     report_chrome_unavailable(&CHROME_UNAVAILABLE, &reason);
@@ -425,11 +470,16 @@ impl ScreenshotProvider for LocalScreenshotProvider {
                     })?;
 
                 info!(
-                    "Successfully captured screenshot of {} ({} bytes, {} requests blocked)",
+                    "Successfully captured screenshot of {} ({} bytes, {} requests blocked, {} connections refused)",
                     url,
                     screenshot_data.len(),
-                    blocked.load(Ordering::Relaxed)
+                    blocked.load(Ordering::Relaxed),
+                    refused.load(Ordering::Relaxed)
                 );
+                // Shut the browser down before its proxy.
+                drop(tab);
+                drop(browser);
+                drop(proxy);
                 Ok(screenshot_data)
             }
         })
@@ -453,7 +503,7 @@ impl ScreenshotProvider for LocalScreenshotProvider {
             CHROME_PROBE_TIMEOUT,
             || {
                 let chrome_path = chromium_executable().map_err(|e| e.to_string())?;
-                launch_chrome(chrome_path, Duration::from_secs(5), None)
+                launch_chrome(chrome_path, Duration::from_secs(5), None, None, &[])
                     .map(|_| ())
                     .map_err(|reason| format!("Failed to launch Chrome browser: {reason}"))
             },
@@ -865,6 +915,75 @@ mod tests {
             other_hits.load(Ordering::SeqCst),
             0,
             "resources on other local addresses must not be requested"
+        );
+    }
+
+    /// DNS rebinding with a real browser. Chromium's own resolver is told that
+    /// `rebind.example.net` is 127.0.0.1, so a browser that connected by
+    /// itself would reach the internal server. The page's request has to go
+    /// through the capture's proxy, which judges the address it would dial
+    /// and refuses. Needs a launchable Chromium and skips without one.
+    #[tokio::test]
+    async fn a_name_chromium_resolves_to_loopback_is_not_reached() {
+        use std::net::SocketAddr;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let probe = LocalScreenshotProvider::with_config(15, 800, 600);
+        if !chrome_available(&probe).await {
+            return;
+        }
+
+        async fn serve(body: String) -> (u16, Arc<AtomicUsize>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind test server");
+            let port = listener.local_addr().expect("local addr").port();
+            let hits = Arc::new(AtomicUsize::new(0));
+            let counter = hits.clone();
+            tokio::spawn(async move {
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let mut buffer = [0u8; 4096];
+                    let _ = socket.read(&mut buffer).await;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/html\r\ncontent-length: {}\r\n\
+                         connection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                }
+            });
+            (port, hits)
+        }
+
+        let (internal_port, internal_hits) = serve("internal".to_string()).await;
+        let (page_port, page_hits) = serve(format!(
+            "<html><body><h1>page</h1>\
+             <img src=\"http://rebind.example.net:{internal_port}/secret\">\
+             </body></html>"
+        ))
+        .await;
+
+        let mut provider = LocalScreenshotProvider::with_config(15, 800, 600);
+        provider.extra_chrome_args =
+            vec!["--host-resolver-rules=MAP rebind.example.net 127.0.0.1".to_string()];
+        // What the proxy's own lookup answers: the same internal address.
+        provider.lookup = Arc::new(|_host: String, port: u16| {
+            Box::pin(async move { Ok(vec![SocketAddr::from(([127, 0, 0, 1], port))]) })
+        });
+
+        let png = provider
+            .capture_screenshot(&format!("http://127.0.0.1:{page_port}/"))
+            .await
+            .expect("the page itself is captured");
+        assert_eq!(&png[0..8], b"\x89PNG\r\n\x1a\n");
+        assert!(page_hits.load(Ordering::SeqCst) >= 1, "the page was loaded");
+        assert_eq!(
+            internal_hits.load(Ordering::SeqCst),
+            0,
+            "the browser must not connect to an address its own lookup returned"
         );
     }
 
