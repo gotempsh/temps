@@ -222,7 +222,7 @@ pub(crate) fn probe_url(address: &str, path: &str) -> Option<String> {
     Some(url.into())
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Probe {
     pub state: Arc<ReplicaState>,
     pub url: String,

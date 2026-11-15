@@ -2228,7 +2228,7 @@ impl CachedPeerTable {
         routes: &mut HashMap<String, RouteInfo>,
         http_routes_map: &mut HashMap<String, RouteInfo>,
         tls_routes_map: &mut HashMap<String, RouteInfo>,
-    ) {
+    ) -> Arc<Vec<crate::replica_policy::Probe>> {
         // Prepare policy off the request path. Identity includes environment,
         // container and address so removed/replaced replicas cannot inherit health.
         let old = self.route_snapshot.load_full();
@@ -2397,8 +2397,7 @@ impl CachedPeerTable {
                 }
             }
         }
-        self.active_probes
-            .store(Arc::new(probes.into_values().collect()));
+        Arc::new(probes.into_values().collect())
     }
 
     async fn assemble_snapshot(
@@ -2461,7 +2460,8 @@ impl CachedPeerTable {
         }
 
         // Private routes must carry policy too: workers cannot enforce it.
-        self.prepare_replica_policies(&mut routes, &mut http_routes_map, &mut tls_routes_map)
+        let active_probes = self
+            .prepare_replica_policies(&mut routes, &mut http_routes_map, &mut tls_routes_map)
             .await;
 
         // ADR 064 D5: a private address is served only by the private
@@ -2611,6 +2611,7 @@ impl CachedPeerTable {
         );
 
         let new_snapshot = Arc::new(RouteTableSnapshot {
+            active_probes,
             owned_hosts,
             http_routes: http_routes_map,
             tls_routes: tls_routes_map,
@@ -2716,6 +2717,40 @@ mod tests {
             );
         }
         assert_eq!(super::compose_probe_path(Some(&config), None), None);
+    }
+
+    #[tokio::test]
+    async fn failed_assembly_preserves_published_probe_membership() {
+        use crate::replica_policy::{Probe, ReplicaState};
+        use std::sync::Arc;
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_errors([sea_orm::DbErr::Custom("gate read failed".into())])
+            .into_connection();
+        let table = CachedPeerTable::new(Arc::new(db));
+        let original = Arc::new(super::RouteTableSnapshot {
+            active_probes: Arc::new(vec![Probe {
+                state: Arc::new(ReplicaState::default()),
+                url: "http://127.0.0.1:8080/ready".into(),
+                config: Default::default(),
+            }]),
+            ..Default::default()
+        });
+        table.route_snapshot.store(original.clone());
+        let state = super::RouteLoadState {
+            gated_meta: std::collections::HashMap::from([(
+                "signed.example.com".into(),
+                super::GatedMeta::from_row("custom:7".into(), None, None, None, None),
+            )]),
+            ..Default::default()
+        };
+        assert!(table.assemble_snapshot(state).await.is_err());
+        let retained = table.route_snapshot.load_full();
+        assert!(Arc::ptr_eq(&original, &retained));
+        assert!(Arc::ptr_eq(
+            &original.active_probes,
+            &retained.active_probes
+        ));
+        assert_eq!(retained.active_probes.len(), 1);
     }
 
     const PREVIEW_DOMAIN: &str = "preview.example.com";
@@ -2872,8 +2907,10 @@ mod tests {
         assert!(original.check_health);
         let alias = replica("shop-production.temps.local");
         assert!(Arc::ptr_eq(&original.state, &alias.state));
-        assert_eq!(table.active_probes.load().len(), 1);
-        assert!(table.active_probes.load()[0].url.ends_with("/ready"));
+        assert_eq!(table.route_snapshot.load().active_probes.len(), 1);
+        assert!(table.route_snapshot.load().active_probes[0]
+            .url
+            .ends_with("/ready"));
         assert!(table
             .snapshot_worker_public_routes(crate::route_table::ShieldPinning::Enforcing)
             .is_empty());

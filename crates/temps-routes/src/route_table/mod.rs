@@ -1038,6 +1038,8 @@ struct LegacyRouteTable {
 
 #[derive(Clone, Debug, Default)]
 struct RouteTableSnapshot {
+    /// Probe membership is committed atomically with the routes it checks.
+    active_probes: Arc<Vec<crate::replica_policy::Probe>>,
     /// Platform hostnames that may have no route at all right now (an
     /// undeployed environment's stored address, a sleeping environment's
     /// hostname), lower-cased. Only consulted to keep a TLS wildcard off them.
@@ -1479,7 +1481,6 @@ pub struct CachedPeerTable {
     /// All route indexes and wake-gate ownership published as one immutable,
     /// lock-free snapshot. A reload can never expose mismatched generations.
     route_snapshot: ArcSwap<RouteTableSnapshot>,
-    active_probes: ArcSwap<Vec<crate::replica_policy::Probe>>,
     probe_started: std::sync::atomic::AtomicBool,
 
     /// Serializes reloads so their three-phase snapshot publication cannot
@@ -1590,7 +1591,7 @@ impl CachedPeerTable {
         let mut tasks = FuturesUnordered::new();
         loop {
             let now = Instant::now();
-            let current = self.active_probes.load_full();
+            let current = self.route_snapshot.load().active_probes.clone();
             // Reconcile membership only when routes publish a new snapshot.
             // Completions only update one deadline, never scan every replica.
             if !Arc::ptr_eq(&snapshot, &current) {
@@ -1669,7 +1670,6 @@ impl CachedPeerTable {
     ) -> Self {
         Self {
             route_snapshot: ArcSwap::from_pointee(RouteTableSnapshot::default()),
-            active_probes: ArcSwap::from_pointee(Vec::new()),
             probe_started: std::sync::atomic::AtomicBool::new(false),
             route_reload_lock: tokio::sync::Mutex::new(()),
             custom_route_pins: parking_lot::Mutex::new(HashMap::new()),
@@ -3091,26 +3091,29 @@ mod tests {
                 ..Default::default()
             },
         };
-        table
-            .active_probes
-            .store(Arc::new(vec![make_probe("/first", 3600)]));
+        table.route_snapshot.store(Arc::new(RouteTableSnapshot {
+            active_probes: Arc::new(vec![make_probe("/first", 3600)]),
+            ..Default::default()
+        }));
         let checker = tokio::spawn(table.clone().run_active_probes());
         let first = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
             .await
             .unwrap()
             .unwrap();
         assert!(first.starts_with("GET /first "));
-        table
-            .active_probes
-            .store(Arc::new(vec![make_probe("/second", 3600)]));
+        table.route_snapshot.store(Arc::new(RouteTableSnapshot {
+            active_probes: Arc::new(vec![make_probe("/second", 3600)]),
+            ..Default::default()
+        }));
         let second = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
             .await
             .unwrap()
             .unwrap();
         assert!(second.starts_with("GET /second "));
-        table
-            .active_probes
-            .store(Arc::new(vec![make_probe("/second", 1)]));
+        table.route_snapshot.store(Arc::new(RouteTableSnapshot {
+            active_probes: Arc::new(vec![make_probe("/second", 1)]),
+            ..Default::default()
+        }));
         let third = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
             .await
             .unwrap()
@@ -3163,7 +3166,10 @@ mod tests {
         });
         let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection();
         let table = Arc::new(CachedPeerTable::new(Arc::new(db)));
-        table.active_probes.store(Arc::new(probes));
+        table.route_snapshot.store(Arc::new(RouteTableSnapshot {
+            active_probes: Arc::new(probes),
+            ..Default::default()
+        }));
         let checker = tokio::spawn(table.run_active_probes());
         let completed = tokio::time::timeout(std::time::Duration::from_secs(4), async {
             assert!(rx.recv().await.is_some());
