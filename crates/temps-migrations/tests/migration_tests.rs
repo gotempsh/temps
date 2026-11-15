@@ -9999,3 +9999,99 @@ async fn test_hash_credentials_at_rest_migration_up_and_down() -> anyhow::Result
     // on every early return above it.
     Ok(())
 }
+
+async fn price_known_column(
+    db: &DatabaseConnection,
+) -> Result<Option<sea_orm::QueryResult>, sea_orm::DbErr> {
+    db.query_one(sea_orm::Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        "SELECT is_nullable, column_default, data_type \
+         FROM information_schema.columns \
+         WHERE table_schema = 'public' \
+           AND table_name = 'ai_usage_logs' \
+           AND column_name = 'price_known'"
+            .to_string(),
+    ))
+    .await
+}
+
+/// `ai_usage_logs.price_known` is added nullable with no default, so existing
+/// rows read NULL (priced exactly when their cost is positive), and `down`
+/// removes it without touching the rows.
+#[tokio::test]
+async fn test_ai_usage_logs_price_known_is_nullable_and_reversible() -> anyhow::Result<()> {
+    const MIGRATION: &str = "m20261115_000001_ai_usage_logs_price_known";
+    if external_db_configured() {
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!("Skipping price_known migration test: Docker unavailable: {error}");
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    // An existing database with a usage row, one migration short.
+    Migrator::up(&db, None).await?;
+    Migrator::down(&db, Some(steps_back_to(MIGRATION))).await?;
+    assert!(
+        price_known_column(&db).await?.is_none(),
+        "column exists before the migration"
+    );
+    db.execute_unprepared(
+        "INSERT INTO ai_usage_logs (provider, model, input_tokens, output_tokens, estimated_cost_microcents) \
+         VALUES ('openai', 'gpt-4o', 1000, 100, 0)",
+    )
+    .await?;
+
+    Migrator::up(&db, None).await?;
+    let row = price_known_column(&db)
+        .await?
+        .expect("price_known exists after up");
+    assert_eq!(row.try_get::<String>("", "is_nullable")?, "YES");
+    assert_eq!(row.try_get::<Option<String>>("", "column_default")?, None);
+    assert_eq!(row.try_get::<String>("", "data_type")?, "boolean");
+    let existing = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*)::int AS count FROM ai_usage_logs WHERE price_known IS NULL"
+                .to_string(),
+        ))
+        .await?
+        .expect("count row");
+    assert_eq!(existing.try_get::<i32>("", "count")?, 1);
+
+    Migrator::down(&db, Some(steps_back_to(MIGRATION))).await?;
+    assert!(
+        price_known_column(&db).await?.is_none(),
+        "down leaves the column in place"
+    );
+    let kept = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*)::int AS count FROM ai_usage_logs".to_string(),
+        ))
+        .await?
+        .expect("count row");
+    assert_eq!(kept.try_get::<i32>("", "count")?, 1);
+    Ok(())
+}

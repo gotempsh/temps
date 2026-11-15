@@ -81279,6 +81279,10 @@
               "string",
               "null"
             ]
+          },
+          "unpriced": {
+            "description": "The request used tokens but no known price gave its cost, so\n`estimated_cost_microcents` (zero) is not a price: show it as unknown,\nnot as free.",
+            "type": "boolean"
           }
         },
         "required": [
@@ -81292,6 +81296,7 @@
           "cache_write_tokens",
           "latency_ms",
           "estimated_cost_microcents",
+          "unpriced",
           "status",
           "is_streaming",
           "is_byok",
@@ -81407,6 +81412,11 @@
             "format": "int64",
             "type": "integer"
           },
+          "priced_requests": {
+            "description": "Requests that used tokens and whose cost a known price gave, zero\nincluded. With `unpriced_requests` it tells a window with no priced\nrequest (no total to show) from one whose total is partial; requests\nthat used no tokens (failures) are in neither.",
+            "format": "int64",
+            "type": "integer"
+          },
           "streaming_count": {
             "format": "int64",
             "type": "integer"
@@ -81432,7 +81442,7 @@
             "type": "integer"
           },
           "unpriced_requests": {
-            "description": "Requests that used tokens but have no recorded cost: logged before\ncosts were estimated, or served by a model with no published price\n(a self-hosted server). `total_cost_microcents` leaves them out, so a\nclient shows the total as partial, or unknown when every request is\nunpriced, rather than as free.",
+            "description": "Requests that used tokens but whose cost no known price gave: logged\nbefore costs were estimated, or served by a model with no published\nprice (a self-hosted server). A model with a published price of zero\nis priced, not counted here. `total_cost_microcents` leaves these out,\nso a client shows the total as partial, or unknown when every request\nis unpriced, rather than as free.",
             "format": "int64",
             "type": "integer"
           }
@@ -81447,7 +81457,8 @@
           "error_count",
           "streaming_count",
           "byok_count",
-          "unpriced_requests"
+          "unpriced_requests",
+          "priced_requests"
         ],
         "type": "object"
       },

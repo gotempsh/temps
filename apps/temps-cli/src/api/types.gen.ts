@@ -37695,6 +37695,12 @@ export type UsageLogEntry = {
      */
     token_id?: number | null;
     trace_id?: string | null;
+    /**
+     * The request used tokens but no known price gave its cost, so
+     * `estimated_cost_microcents` (zero) is not a price: show it as unknown,
+     * not as free.
+     */
+    unpriced: boolean;
 };
 
 /**
@@ -37755,6 +37761,13 @@ export type UsageSummary = {
     avg_latency_ms: number;
     byok_count: number;
     error_count: number;
+    /**
+     * Requests that used tokens and whose cost a known price gave, zero
+     * included. With `unpriced_requests` it tells a window with no priced
+     * request (no total to show) from one whose total is partial; requests
+     * that used no tokens (failures) are in neither.
+     */
+    priced_requests: number;
     streaming_count: number;
     total_cost_microcents: number;
     total_input_tokens: number;
@@ -37762,11 +37775,12 @@ export type UsageSummary = {
     total_requests: number;
     total_tokens: number;
     /**
-     * Requests that used tokens but have no recorded cost: logged before
-     * costs were estimated, or served by a model with no published price
-     * (a self-hosted server). `total_cost_microcents` leaves them out, so a
-     * client shows the total as partial, or unknown when every request is
-     * unpriced, rather than as free.
+     * Requests that used tokens but whose cost no known price gave: logged
+     * before costs were estimated, or served by a model with no published
+     * price (a self-hosted server). A model with a published price of zero
+     * is priced, not counted here. `total_cost_microcents` leaves these out,
+     * so a client shows the total as partial, or unknown when every request
+     * is unpriced, rather than as free.
      */
     unpriced_requests: number;
 };

@@ -243,8 +243,10 @@ interface UsageSummary {
   error_count: number
   streaming_count: number
   byok_count: number
-  /** Requests that used tokens but have no recorded cost. */
+  /** Requests that used tokens but whose cost no known price gave. */
   unpriced_requests: number
+  /** Requests that used tokens and were priced, free models included. */
+  priced_requests: number
 }
 
 interface ProviderUsage {
@@ -285,6 +287,8 @@ interface UsageLogEntry {
   output_tokens: number
   latency_ms: number
   estimated_cost_microcents: number
+  /** Used tokens, but no known price gave its cost: unknown, not free. */
+  unpriced: boolean
   status: number
   is_streaming: boolean
   is_byok: boolean
@@ -958,9 +962,11 @@ function UsageStatFailed() {
  * the total, so it says so instead of reading as free.
  */
 function EstimatedCostStat({ summary }: { summary: UsageSummary | undefined }) {
-  const requests = summary?.total_requests ?? 0
   const unpriced = summary?.unpriced_requests ?? 0
-  if (requests > 0 && unpriced >= requests) {
+  const priced = summary?.priced_requests ?? 0
+  // Requests that used no tokens (failures) are neither, so they cannot turn
+  // a window with no priced request into a $0.00 total.
+  if (unpriced > 0 && priced === 0) {
     return (
       <>
         <div className="text-2xl font-bold">—</div>
@@ -984,8 +990,8 @@ function EstimatedCostStat({ summary }: { summary: UsageSummary | undefined }) {
 }
 
 function LogCostCell({ log }: { log: UsageLogEntry }) {
-  const cost = microcentsToDollars(log.estimated_cost_microcents)
-  return <>{cost > 0 ? formatCost(cost) : '—'}</>
+  if (log.unpriced) return <>—</>
+  return <>{formatCost(microcentsToDollars(log.estimated_cost_microcents))}</>
 }
 
 export function UsageAnalytics() {

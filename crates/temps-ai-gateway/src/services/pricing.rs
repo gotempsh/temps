@@ -1167,6 +1167,26 @@ pub fn estimate_cost_microcents(
     )
 }
 
+/// Estimate the provider cost of a batch's total usage, in microcents.
+///
+/// Like `estimate_cost_microcents`, but at the base tier: the total of many
+/// requests says nothing about each one's prompt length, and comparing it
+/// with a long-context threshold would bill a batch of short prompts at the
+/// long-context rate. Batches go to OpenAI, whose batch prices are half its
+/// standard ones and whose long-context rates are at most twice the base
+/// input and one and a half times the base output rate, so a long prompt's
+/// batch price never exceeds the standard base rate this charges.
+pub fn estimate_batch_total_cost_microcents(
+    model: &str,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache: PromptTokensDetails,
+) -> i64 {
+    let table = rate_table();
+    let rates = table.rates_for(model).unwrap_or(table.worst_case);
+    cost_at(rates.base, input_tokens, output_tokens, cache)
+}
+
 /// The listed long-context cost of a request whose prompt crosses its model's
 /// long-context threshold; `None` when the model is not listed, has no long
 /// tier, or the prompt is below it.
@@ -1527,6 +1547,49 @@ mod tests {
         );
         assert_eq!(own.base.input, 1.50);
         assert_eq!(own.base.max(successor.base), own.base);
+    }
+
+    #[test]
+    fn batch_totals_are_priced_at_the_base_tier() {
+        let none = PromptTokensDetails::default();
+        // A 300,000-token total is above gpt-5.4's 272,000 threshold, but it
+        // is many prompts: the base $2.50 applies.
+        assert_eq!(
+            estimate_batch_total_cost_microcents("gpt-5.4", 300_000, 0, none),
+            300_000 * 5 / 2
+        );
+        assert_eq!(
+            estimate_batch_total_cost_microcents("totally-unlisted-model", 300_000, 1_000, none),
+            300_000 * 30 + 1_000 * 180
+        );
+    }
+
+    #[test]
+    fn an_openai_long_prompt_in_a_batch_never_costs_more_than_the_standard_base_rate() {
+        // What `estimate_batch_total_cost_microcents` relies on: a batch
+        // total billed at the standard base rate never undercounts its long
+        // prompts.
+        for entry in catalog()
+            .into_iter()
+            .filter(|entry| entry.pricing.provider == "openai")
+        {
+            let (Some(long), Some(batch_in), Some(batch_out)) = (
+                entry.long_context,
+                entry.pricing.batch_input_per_million,
+                entry.pricing.batch_output_per_million,
+            ) else {
+                continue;
+            };
+            let pricing = &entry.pricing;
+            let in_discount = batch_in / pricing.input_per_million;
+            let out_discount = batch_out / pricing.output_per_million;
+            assert!(
+                long.input * in_discount <= pricing.input_per_million + 1e-9
+                    && long.output * out_discount <= pricing.output_per_million + 1e-9,
+                "{}: a long prompt's batch price exceeds the standard base rate",
+                pricing.model
+            );
+        }
     }
 
     #[test]

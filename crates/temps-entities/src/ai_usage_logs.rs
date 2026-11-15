@@ -43,6 +43,11 @@ pub struct Model {
     pub project_id: Option<i32>,
     /// Deployment token that made the call. NULL for non-deployment callers.
     pub token_id: Option<i32>,
+    /// Whether `estimated_cost_microcents` came from a known price, so a free
+    /// request (a published zero price) is told apart from an unpriced one (a
+    /// self-hosted model no price list covers). NULL for rows older than the
+    /// column, which are priced exactly when their cost is positive.
+    pub price_known: Option<bool>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

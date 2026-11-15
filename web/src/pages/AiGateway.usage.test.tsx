@@ -190,6 +190,7 @@ test('costs show what was recorded, not a recomputation from base list prices', 
     output_tokens: 0,
     latency_ms: 12,
     estimated_cost_microcents: 1_250_000,
+    unpriced: false,
     status: 200,
     is_streaming: false,
     is_byok: false,
@@ -275,6 +276,7 @@ test('a window whose requests have no recorded cost is not shown as free', async
     total_requests: 3,
     total_cost_microcents: 0,
     unpriced_requests: 3,
+    priced_requests: 0,
   })
   renderUsage()
 
@@ -282,14 +284,80 @@ test('a window whose requests have no recorded cost is not shown as free', async
   expect(screen.queryByText('$0.00')).toBeNull()
 })
 
+test('a failed request that used no tokens does not make an unpriced window read as free', async () => {
+  mockSummary({
+    total_requests: 4,
+    total_cost_microcents: 0,
+    unpriced_requests: 3,
+    priced_requests: 0,
+    error_count: 1,
+  })
+  renderUsage()
+
+  await screen.findByText('No recorded cost')
+  expect(screen.queryByText('$0.00')).toBeNull()
+})
+
+test('a window of free requests shows $0.00, not an unknown cost', async () => {
+  mockSummary({
+    total_requests: 2,
+    total_cost_microcents: 0,
+    unpriced_requests: 0,
+    priced_requests: 2,
+  })
+  renderUsage()
+
+  await screen.findByText('$0.00')
+  expect(screen.queryByText('No recorded cost')).toBeNull()
+  expect(screen.queryByText(/unpriced/)).toBeNull()
+})
+
 test('a total that leaves out unpriced requests says how many', async () => {
   mockSummary({
     total_requests: 5,
     total_cost_microcents: 1_500_000,
     unpriced_requests: 2,
+    priced_requests: 3,
   })
   renderUsage()
 
   await screen.findByText('$1.50')
   await screen.findByText('Excludes 2 unpriced requests')
+})
+
+test('the request log shows a free request as $0.00 and an unpriced one as unknown', async () => {
+  const entry = (id: number, model: string, unpriced: boolean) => ({
+    id,
+    timestamp: '2026-11-15T10:00:00Z',
+    provider: 'openrouter',
+    model,
+    input_tokens: 1_000,
+    output_tokens: 10,
+    latency_ms: 12,
+    estimated_cost_microcents: 0,
+    unpriced,
+    status: 200,
+    is_streaming: false,
+    is_byok: false,
+  })
+  globalThis.fetch = (async (input: Request | string | URL) => {
+    const url = new URL(String(input), 'http://localhost')
+    if (url.pathname === '/api/ai/usage/recent')
+      return json({
+        entries: [
+          entry(1, 'vendor/free-model', false),
+          entry(2, 'local-model', true),
+        ],
+        total: 2,
+      })
+    if (url.pathname.startsWith('/api/ai/usage/')) return json([])
+    return new Response('{}', { status: 404 })
+  }) as typeof fetch
+  renderUsage()
+
+  const free = (await screen.findByText('vendor/free-model')).closest('tr')!
+  const unpriced = screen.getByText('local-model').closest('tr')!
+  expect(within(free).getByText('$0.00')).toBeTruthy()
+  // No dollar figure at all: its cost cell reads "—".
+  expect(within(unpriced).queryByText(/\$/)).toBeNull()
 })
