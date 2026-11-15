@@ -39,6 +39,7 @@ import type {
 } from '@/api/client/types.gen'
 import { aiProviderCatalogQueryOptions } from '@/lib/ai-provider-catalog-query'
 import { settingsSectionHref } from '@/lib/project-settings-sections'
+import { buildTriggerConfig } from './triggerConfig'
 
 export interface TriggerConfig {
   error?: { new_issue?: boolean; regression?: boolean }
@@ -237,19 +238,12 @@ function AgentEditForm({
 
   const handleSubmit = () => {
     if (!agent) return
-    // Only include trigger blocks the user actually enabled. Writing every
-    // trigger unconditionally caused workflows to persist triggers they
-    // never asked for.
-    const triggerConfig: Record<string, unknown> = {}
-    if (triggerNewIssue || triggerRegression) {
-      triggerConfig.error = {
-        new_issue: triggerNewIssue,
-        regression: triggerRegression,
-      }
-    }
-    if (triggerManual) triggerConfig.manual = true
-    if (triggerCron.trim())
-      triggerConfig.schedule = { cron: triggerCron.trim() }
+    const triggerConfig = buildTriggerConfig(agent.trigger_config, {
+      newIssue: triggerNewIssue,
+      regression: triggerRegression,
+      manual: triggerManual,
+      cron: triggerCron,
+    })
 
     // The limit boxes may be empty while editing; an empty or invalid one is
     // an error on submit rather than silently becoming a default.

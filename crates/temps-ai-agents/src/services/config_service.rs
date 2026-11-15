@@ -76,6 +76,31 @@ fn generate_webhook_token() -> String {
     hex::encode(bytes)
 }
 
+/// The value `project_agents.webhook_token` holds for `presented`.
+///
+/// The token is a bearer credential that fires an agent run, and it used to
+/// be stored verbatim: anything able to read the column — a database dump, a
+/// backup, a read-only replica — could trigger every project's agents. The
+/// row keeps a SHA-256 digest instead, the same at-rest form API keys,
+/// deployment tokens and node tokens already use, and
+/// `handlers::trigger::webhook_trigger` hashes what the caller presented
+/// before comparing.
+pub(crate) fn stored_webhook_token(presented: &str) -> String {
+    temps_core::crypto::sha256_hex(presented)
+}
+
+/// A persisted agent, plus the webhook token this call minted, if any.
+///
+/// The plaintext exists only on the response that creates it — the row holds
+/// its digest — which is how every other credential Temps mints is handed
+/// over. Whoever loses it turns the webhook trigger off and on again to mint
+/// a new one.
+#[derive(Debug)]
+pub struct MintedAgent {
+    pub agent: project_agents::Model,
+    pub minted_webhook_token: Option<String>,
+}
+
 /// Check if webhook trigger is enabled in a trigger_config JSON value.
 fn is_webhook_enabled(trigger_config: &serde_json::Value) -> bool {
     trigger_config
@@ -593,8 +618,13 @@ impl AgentConfigService {
                 "manual": true
             });
             let trigger_config = request.trigger_config.unwrap_or(default_trigger_config);
+            // This path returns no token to anyone (the response masked it
+            // before this change too), so only the digest is kept.
             let (webhook_id, webhook_token) = if is_webhook_enabled(&trigger_config) {
-                (Some(generate_webhook_id()), Some(generate_webhook_token()))
+                (
+                    Some(generate_webhook_id()),
+                    Some(stored_webhook_token(&generate_webhook_token())),
+                )
             } else {
                 (None, None)
             };
@@ -686,11 +716,15 @@ impl AgentConfigService {
     }
 
     /// Create a new agent for a project (dashboard source).
+    ///
+    /// Returns the webhook token alongside the agent when this call minted
+    /// one: that response is the only place its plaintext exists (see
+    /// [`MintedAgent`]).
     pub async fn create_agent(
         &self,
         project_id: i32,
         request: UpsertAgentRequest,
-    ) -> Result<project_agents::Model, AgentError> {
+    ) -> Result<MintedAgent, AgentError> {
         validate_agent_request(&request)?;
 
         let slug = match &request.slug {
@@ -757,12 +791,14 @@ impl AgentConfigService {
 
         let trigger_config = request.trigger_config.unwrap_or(default_trigger_config);
 
-        // Auto-generate webhook token if webhook trigger is enabled
-        let (webhook_id, webhook_token) = if is_webhook_enabled(&trigger_config) {
+        // Auto-generate webhook token if webhook trigger is enabled. The
+        // plaintext goes back on this one response; the row keeps its digest.
+        let (webhook_id, minted_webhook_token) = if is_webhook_enabled(&trigger_config) {
             (Some(generate_webhook_id()), Some(generate_webhook_token()))
         } else {
             (None, None)
         };
+        let webhook_token = minted_webhook_token.as_deref().map(stored_webhook_token);
         if let Some(value) = request.mcp_servers_config.as_ref() {
             Self::reject_masked_agent_config(value, "MCP configuration")?;
         }
@@ -814,17 +850,25 @@ impl AgentConfigService {
             .await
             .map_err(AgentError::Database)?;
 
-        self.decrypt_agent_model(model)
+        Ok(MintedAgent {
+            agent: self.decrypt_agent_model(model)?,
+            minted_webhook_token,
+        })
     }
 
     /// Update an agent identified by slug for a project.
+    ///
+    /// Turning the webhook trigger on mints a token; like
+    /// [`Self::create_agent`], this response is the only place its plaintext
+    /// exists (see [`MintedAgent`]).
     pub async fn update_agent(
         &self,
         project_id: i32,
         slug: &str,
         request: UpsertAgentRequest,
-    ) -> Result<project_agents::Model, AgentError> {
+    ) -> Result<MintedAgent, AgentError> {
         validate_agent_request(&request)?;
+        let mut minted_webhook_token = None;
 
         let existing = self
             .get_agent_by_slug(project_id, slug)
@@ -926,8 +970,12 @@ impl AgentConfigService {
             // Auto-manage webhook ID + token when trigger_config changes
             if is_webhook_enabled(&trigger_config) {
                 if !existing_has_webhook {
+                    // Turning the trigger on mints a token: hand the
+                    // plaintext back on this response, keep its digest.
+                    let token = generate_webhook_token();
                     active.webhook_id = Set(Some(generate_webhook_id()));
-                    active.webhook_token = Set(Some(generate_webhook_token()));
+                    active.webhook_token = Set(Some(stored_webhook_token(&token)));
+                    minted_webhook_token = Some(token);
                 }
             } else {
                 active.webhook_id = Set(None);
@@ -988,7 +1036,10 @@ impl AgentConfigService {
             .await
             .map_err(AgentError::Database)?;
 
-        self.decrypt_agent_model(model)
+        Ok(MintedAgent {
+            agent: self.decrypt_agent_model(model)?,
+            minted_webhook_token,
+        })
     }
 
     /// Delete an agent identified by slug for a project.
@@ -1088,7 +1139,8 @@ impl AgentConfigService {
                 if yaml_agent.on.webhook {
                     if existing_agent.webhook_id.is_none() {
                         active.webhook_id = Set(Some(generate_webhook_id()));
-                        active.webhook_token = Set(Some(generate_webhook_token()));
+                        active.webhook_token =
+                            Set(Some(stored_webhook_token(&generate_webhook_token())));
                     }
                 } else {
                     active.webhook_id = Set(None);
@@ -1102,7 +1154,10 @@ impl AgentConfigService {
             } else {
                 // Insert
                 let (webhook_id, webhook_token) = if yaml_agent.on.webhook {
-                    (Some(generate_webhook_id()), Some(generate_webhook_token()))
+                    (
+                        Some(generate_webhook_id()),
+                        Some(stored_webhook_token(&generate_webhook_token())),
+                    )
                 } else {
                     (None, None)
                 };
@@ -1865,5 +1920,187 @@ mod tests {
         assert!(!resolve(Some(false), false));
         // Some(false) + global=true → false (per-agent overrides global)
         assert!(!resolve(Some(false), true));
+    }
+}
+
+/// The webhook token is a bearer credential, so the row keeps its digest and
+/// the plaintext goes back exactly once.
+#[cfg(test)]
+mod webhook_token_at_rest {
+    use super::*;
+    use sea_orm::{ActiveModelTrait, Set};
+    use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
+
+    async fn test_database() -> Option<TestDatabase> {
+        match TestDatabase::with_migrations().await {
+            Ok(database) => Some(database),
+            Err(error) if is_container_runtime_unavailable(&error.to_string()) => {
+                eprintln!("Docker not available, skipping webhook token test: {error}");
+                None
+            }
+            Err(error) => panic!("failed to start the webhook token test database: {error}"),
+        }
+    }
+
+    fn service(test_db: &TestDatabase) -> AgentConfigService {
+        AgentConfigService::new(
+            test_db.connection_arc(),
+            Arc::new(
+                temps_core::EncryptionService::new(
+                    "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+                )
+                .expect("valid test key"),
+            ),
+        )
+    }
+
+    async fn project(test_db: &TestDatabase, slug: &str) -> i32 {
+        projects::ActiveModel {
+            name: Set(slug.to_string()),
+            slug: Set(slug.to_string()),
+            repo_name: Set(slug.to_string()),
+            repo_owner: Set("owner".to_string()),
+            directory: Set(".".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(temps_entities::preset::Preset::NextJs),
+            git_provider_connection_id: Set(None),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(test_db.connection())
+        .await
+        .expect("insert project")
+        .id
+    }
+
+    /// `UpsertAgentRequest` has no `Default`, and every field is optional,
+    /// so build one from JSON the way the other tests here do.
+    fn request(value: serde_json::Value) -> UpsertAgentRequest {
+        serde_json::from_value(value).expect("the request shape is valid")
+    }
+
+    fn webhook_request(slug: &str) -> UpsertAgentRequest {
+        request(serde_json::json!({
+            "slug": slug,
+            "name": slug,
+            "trigger_config": { "webhook": true },
+        }))
+    }
+
+    #[tokio::test]
+    async fn creation_returns_the_token_once_and_stores_only_its_digest() {
+        let Some(test_db) = test_database().await else {
+            return;
+        };
+        let service = service(&test_db);
+        let project_id = project(&test_db, "webhook-create").await;
+
+        let minted = service
+            .create_agent(project_id, webhook_request("hooked"))
+            .await
+            .expect("create the agent");
+        let token = minted
+            .minted_webhook_token
+            .clone()
+            .expect("enabling the webhook trigger mints a token");
+        let stored = minted
+            .agent
+            .webhook_token
+            .clone()
+            .expect("the row records the token");
+
+        // What is on disk is not what the caller was handed, and hashing
+        // what the caller was handed is what the row holds -- which is what
+        // makes `webhook_trigger` able to accept it.
+        assert_ne!(stored, token);
+        assert!(!stored.contains(&token));
+        assert_eq!(stored, stored_webhook_token(&token));
+
+        // Reading the agent again never produces the token.
+        let reread = service
+            .get_agent_by_slug(project_id, "hooked")
+            .await
+            .expect("read the agent")
+            .expect("the agent exists");
+        assert_eq!(reread.webhook_token.as_deref(), Some(stored.as_str()));
+    }
+
+    #[tokio::test]
+    async fn turning_the_trigger_off_and_on_mints_a_replacement() {
+        let Some(test_db) = test_database().await else {
+            return;
+        };
+        let service = service(&test_db);
+        let project_id = project(&test_db, "webhook-rotate").await;
+
+        let first = service
+            .create_agent(project_id, webhook_request("hooked"))
+            .await
+            .expect("create the agent")
+            .minted_webhook_token
+            .expect("a token is minted");
+
+        // Off: the credential is gone, not merely hidden.
+        let disabled = service
+            .update_agent(
+                project_id,
+                "hooked",
+                request(serde_json::json!({ "trigger_config": { "webhook": false } })),
+            )
+            .await
+            .expect("disable the webhook trigger");
+        assert_eq!(disabled.agent.webhook_token, None);
+        assert_eq!(disabled.minted_webhook_token, None);
+
+        // On again: a new token, handed over once. This is how an operator
+        // who lost the first one gets a working token without the console
+        // ever being able to show a stored one.
+        let rotated = service
+            .update_agent(
+                project_id,
+                "hooked",
+                request(serde_json::json!({ "trigger_config": { "webhook": true } })),
+            )
+            .await
+            .expect("re-enable the webhook trigger");
+        let second = rotated
+            .minted_webhook_token
+            .expect("re-enabling mints a token");
+        assert_ne!(second, first);
+        assert_eq!(
+            rotated.agent.webhook_token.as_deref(),
+            Some(stored_webhook_token(&second).as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_update_neither_mints_nor_disturbs_the_token() {
+        let Some(test_db) = test_database().await else {
+            return;
+        };
+        let service = service(&test_db);
+        let project_id = project(&test_db, "webhook-keep").await;
+
+        let created = service
+            .create_agent(project_id, webhook_request("hooked"))
+            .await
+            .expect("create the agent");
+        let stored = created.agent.webhook_token.clone().expect("a token");
+
+        let renamed = service
+            .update_agent(
+                project_id,
+                "hooked",
+                request(serde_json::json!({ "name": "Renamed" })),
+            )
+            .await
+            .expect("rename the agent");
+
+        assert_eq!(renamed.minted_webhook_token, None);
+        assert_eq!(
+            renamed.agent.webhook_token.as_deref(),
+            Some(stored.as_str())
+        );
     }
 }

@@ -147,8 +147,13 @@ pub struct AgentConfigResponse {
     /// Only set when `on: { webhook: true }` is configured.
     /// Usage: `POST {webhook_url}` with header `X-Webhook-Token: {webhook_token}`
     pub webhook_url: Option<String>,
-    /// Secret token for the `X-Webhook-Token` header. Shown once when created,
-    /// masked with `***` prefix in subsequent reads.
+    /// Secret token for the `X-Webhook-Token` header.
+    ///
+    /// Returned in full exactly once, by the request that mints it (creating
+    /// an agent with the webhook trigger on, or turning that trigger on).
+    /// Every later read is `***`: the row holds only a digest, so the token
+    /// cannot be shown again. Turn the webhook trigger off and on to mint a
+    /// replacement.
     pub webhook_token: Option<String>,
     pub created_at: String,
     pub updated_at: String,
@@ -190,17 +195,25 @@ impl From<project_agents::Model> for AgentConfigResponse {
                 .webhook_id
                 .as_ref()
                 .map(|id| format!("/api/agents/webhook/{}", id)),
-            webhook_token: model.webhook_token.as_ref().map(|t| {
-                // Mask the token: show first 8 chars + ***
-                if t.len() > 8 {
-                    format!("{}***", &t[..8])
-                } else {
-                    "***".to_string()
-                }
-            }),
+            // What the row holds is a digest, not the token, so there is
+            // nothing to reveal a prefix of. `***` says "set, not shown".
+            webhook_token: model.webhook_token.as_ref().map(|_| "***".to_string()),
             created_at: model.created_at.to_rfc3339(),
             updated_at: model.updated_at.to_rfc3339(),
         }
+    }
+}
+
+impl AgentConfigResponse {
+    /// Carry the webhook token this request minted, in full, this once.
+    ///
+    /// `Cache-Control: no-store` goes on the response that uses this; see
+    /// the handlers.
+    fn with_minted_webhook_token(mut self, minted: Option<String>) -> Self {
+        if let Some(token) = minted {
+            self.webhook_token = Some(token);
+        }
+        self
     }
 }
 
@@ -393,11 +406,12 @@ pub async fn create_agent(
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, app_state.project_access_checker);
 
-    let agent = app_state
+    let minted = app_state
         .config_service
         .create_agent(project_id, request)
         .await
         .map_err(Problem::from)?;
+    let agent = minted.agent;
 
     let audit = AgentCreatedAudit {
         context: AuditContext {
@@ -418,7 +432,15 @@ pub async fn create_agent(
         );
     }
 
-    Ok((StatusCode::CREATED, Json(AgentConfigResponse::from(agent))))
+    // The webhook token is in this body in full and nowhere else, so keep
+    // it out of every cache between here and the caller.
+    Ok((
+        StatusCode::CREATED,
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(
+            AgentConfigResponse::from(agent).with_minted_webhook_token(minted.minted_webhook_token),
+        ),
+    ))
 }
 
 #[utoipa::path(
@@ -491,11 +513,12 @@ pub async fn update_agent(
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, app_state.project_access_checker);
 
-    let agent = app_state
+    let minted = app_state
         .config_service
         .update_agent(project_id, &slug, request)
         .await
         .map_err(Problem::from)?;
+    let agent = minted.agent;
 
     let audit = AgentUpdatedAudit {
         context: AuditContext {
@@ -516,7 +539,14 @@ pub async fn update_agent(
         );
     }
 
-    Ok(Json(AgentConfigResponse::from(agent)))
+    // Turning the webhook trigger on mints a token; same contract as
+    // creation -- in full once, never cached.
+    Ok((
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(
+            AgentConfigResponse::from(agent).with_minted_webhook_token(minted.minted_webhook_token),
+        ),
+    ))
 }
 
 #[utoipa::path(

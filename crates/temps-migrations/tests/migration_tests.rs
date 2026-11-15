@@ -9502,3 +9502,500 @@ async fn test_child_cleanup_cursor_up_down_preserves_prepared_inputs() -> anyhow
     assert_eq!(row.try_get::<Option<String>>("", "name")?, None);
     Ok(())
 }
+
+/// A pristine database to run partial migrations against, and how to reach it.
+///
+/// Prefers a scratch database on the server named by `TEMPS_TEST_DATABASE_URL`
+/// when one is configured — the tests that need partial migration control
+/// used to skip outright in that setup, which silently left every upgrade-path
+/// assertion unrun wherever Docker is not what provides the database. Falls
+/// back to a container of its own.
+struct ScratchDatabase {
+    db: DatabaseConnection,
+    /// Kept alive for the test's lifetime; dropping it stops the container.
+    _container: Option<testcontainers::ContainerAsync<GenericImage>>,
+    /// Present when the database lives on a server we do not own. Removing
+    /// it is this guard's `Drop`, not a step of this struct's, so it happens
+    /// even when `open` fails after creating it. Declared after `db` so the
+    /// connection closes first.
+    _external: Option<ScratchDatabaseName>,
+}
+
+/// A scratch database on a server we do not own, removed when this is
+/// dropped.
+///
+/// Owning the removal here rather than in a method is what makes it happen on
+/// every path: a `?` or a failed assertion in the test, a panic, and -- the
+/// case a method cannot reach -- a failure between `CREATE DATABASE`
+/// succeeding and `ScratchDatabase` being built. Repeated failing runs would
+/// otherwise pile databases up on a shared server.
+struct ScratchDatabaseName {
+    admin_url: String,
+    name: String,
+}
+
+impl Drop for ScratchDatabaseName {
+    fn drop(&mut self) {
+        // A dedicated thread with its own current-thread runtime and a fresh
+        // connection, the shape `TestDatabase`'s own `Drop` uses: the pool
+        // here belongs to the test's runtime, `block_in_place` panics on a
+        // current-thread runtime, and a spawned task would race the
+        // runtime's shutdown. `WITH (FORCE)` closes any session still on the
+        // database, so nothing has to be disconnected first.
+        let admin_url = std::mem::take(&mut self.admin_url);
+        let name = std::mem::take(&mut self.name);
+        let cleanup = std::thread::spawn(move || {
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                eprintln!("leaked scratch database {name}: no runtime for cleanup");
+                return;
+            };
+            runtime.block_on(async {
+                match Database::connect(&admin_url).await {
+                    Ok(admin) => {
+                        if let Err(error) = admin
+                            .execute_unprepared(&format!(
+                                "DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"
+                            ))
+                            .await
+                        {
+                            eprintln!("leaked scratch database {name}: {error}");
+                        }
+                    }
+                    Err(error) => eprintln!("leaked scratch database {name}: {error}"),
+                }
+            });
+        });
+        if cleanup.join().is_err() {
+            eprintln!("scratch database cleanup thread panicked");
+        }
+    }
+}
+
+impl ScratchDatabase {
+    /// `None` when neither an external server nor Docker is available, which
+    /// the caller reports as a skip.
+    async fn open(label: &str) -> anyhow::Result<Option<Self>> {
+        if let Some(admin_url) = external_database_url() {
+            let name = format!(
+                "temps_mig_{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_nanos())
+                    .unwrap_or_default()
+            );
+            let admin = connect_with_retries(&admin_url).await?;
+            // `CREATE DATABASE` copies a template and PostgreSQL serializes
+            // that against any other create or drop on the server. These
+            // tests run concurrently against one server, so a collision is
+            // transient rather than a real failure: retry briefly before
+            // giving up.
+            let mut attempt: u64 = 1;
+            loop {
+                match admin
+                    .execute_unprepared(&format!("CREATE DATABASE \"{name}\""))
+                    .await
+                {
+                    Ok(_) => break,
+                    Err(error) if attempt < 3 => {
+                        eprintln!("retrying CREATE DATABASE {name} after: {error}");
+                        attempt += 1;
+                        tokio::time::sleep(std::time::Duration::from_millis(250 * attempt)).await;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            // The database exists from here on, so hand it to its guard
+            // before anything else that can fail: both `?`s below would
+            // otherwise leave it behind, with no `ScratchDatabase` yet for a
+            // `Drop` of its own to run on.
+            let owned = ScratchDatabaseName {
+                admin_url: admin_url.clone(),
+                name: name.clone(),
+            };
+            let db = connect_with_retries(&replace_database(&admin_url, &name)).await?;
+            // `TestDatabase` installs these for its own databases; a scratch
+            // one needs them before the first migration asks for a `vector`
+            // column or a hypertable.
+            db.execute_unprepared(
+                "CREATE EXTENSION IF NOT EXISTS timescaledb WITH SCHEMA public CASCADE; \
+                 CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public CASCADE;",
+            )
+            .await?;
+            return Ok(Some(Self {
+                db,
+                _container: None,
+                _external: Some(owned),
+            }));
+        }
+
+        let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+            .with_wait_for(postgres_ready_wait_for())
+            .with_env_var("POSTGRES_DB", "postgres")
+            .with_env_var("POSTGRES_USER", "postgres")
+            .with_env_var("POSTGRES_PASSWORD", "postgres")
+            .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+            .with_cmd(vec![
+                "postgres",
+                "-c",
+                "timescaledb.max_background_workers=0",
+            ])
+            .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+            .start()
+            .await
+        {
+            Ok(container) => container,
+            Err(error) => {
+                eprintln!("⏭️  Skipping {label}: Docker unavailable ({error})");
+                return Ok(None);
+            }
+        };
+        let port = container.get_host_port_ipv4(5432).await?;
+        let db = connect_with_retries(&format!(
+            "postgresql://postgres:postgres@localhost:{port}/postgres"
+        ))
+        .await?;
+        Ok(Some(Self {
+            db,
+            _container: Some(container),
+            _external: None,
+        }))
+    }
+}
+
+/// The guard removes its database when it drops, which is what makes
+/// cleanup reach the paths a method cannot: a failed assertion, a panic, or a
+/// failure between `CREATE DATABASE` and `ScratchDatabase` being built.
+///
+/// Only meaningful against an external server, since that is the only case
+/// with a database to leak; it skips otherwise.
+#[tokio::test]
+async fn a_scratch_database_is_removed_when_its_guard_drops() -> anyhow::Result<()> {
+    let Some(admin_url) = external_database_url() else {
+        println!("⏭️  Skipping: no external database configured");
+        return Ok(());
+    };
+    let admin = connect_with_retries(&admin_url).await?;
+    let name = format!("temps_mig_guard_{}", std::process::id());
+    admin
+        .execute_unprepared(&format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"))
+        .await?;
+    admin
+        .execute_unprepared(&format!("CREATE DATABASE \"{name}\""))
+        .await?;
+
+    assert!(
+        database_exists(&admin, &name).await?,
+        "the fixture database exists"
+    );
+
+    // Dropping the guard is the whole cleanup path -- no method is called.
+    drop(ScratchDatabaseName {
+        admin_url: admin_url.clone(),
+        name: name.clone(),
+    });
+
+    assert!(
+        !database_exists(&admin, &name).await?,
+        "dropping the guard must remove {name}"
+    );
+    Ok(())
+}
+
+async fn database_exists(admin: &DatabaseConnection, name: &str) -> anyhow::Result<bool> {
+    let row = admin
+        .query_one(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1) AS present",
+            [name.into()],
+        ))
+        .await?
+        .expect("existence query returns a row");
+    Ok(row.try_get::<bool>("", "present")?)
+}
+
+fn external_database_url() -> Option<String> {
+    std::env::var("TEMPS_TEST_DATABASE_URL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Swap the database name in a `postgresql://` URL, keeping everything else.
+///
+/// Only the path after the authority is replaced. A connection URI may carry
+/// no database path at all, and `rsplit_once('/')` on such a URL splits
+/// inside `://` and throws the credentials, host and port away -- so the
+/// authority is located explicitly and the path appended or replaced after
+/// it.
+fn replace_database(url: &str, database: &str) -> String {
+    let (head, query) = match url.split_once('?') {
+        Some((head, query)) => (head, Some(query)),
+        None => (url, None),
+    };
+    // Everything up to the end of the authority: the scheme separator, then
+    // the first `/` after it (if any) begins the path.
+    let authority_end = match head.find("://") {
+        Some(scheme) => head[scheme + 3..]
+            .find('/')
+            .map(|slash| scheme + 3 + slash)
+            .unwrap_or(head.len()),
+        None => head.find('/').unwrap_or(head.len()),
+    };
+    let swapped = format!("{}/{database}", &head[..authority_end]);
+    match query {
+        Some(query) => format!("{swapped}?{query}"),
+        None => swapped,
+    }
+}
+
+#[test]
+fn replace_database_keeps_the_authority_and_query() {
+    // With a database path, the common case.
+    assert_eq!(
+        replace_database("postgresql://u:p@localhost:5432/testdb", "scratch"),
+        "postgresql://u:p@localhost:5432/scratch"
+    );
+    // Without one, which a connection URI is allowed to omit. The
+    // credentials, host and port must survive.
+    assert_eq!(
+        replace_database("postgresql://u:p@localhost:5432", "scratch"),
+        "postgresql://u:p@localhost:5432/scratch"
+    );
+    assert_eq!(
+        replace_database("postgresql://localhost", "scratch"),
+        "postgresql://localhost/scratch"
+    );
+    // Query parameters are preserved either way.
+    assert_eq!(
+        replace_database(
+            "postgresql://u:p@localhost:5432/testdb?sslmode=require",
+            "scratch"
+        ),
+        "postgresql://u:p@localhost:5432/scratch?sslmode=require"
+    );
+    assert_eq!(
+        replace_database("postgresql://u:p@localhost:5432?sslmode=require", "scratch"),
+        "postgresql://u:p@localhost:5432/scratch?sslmode=require"
+    );
+    // A trailing slash is a path, so it is replaced rather than doubled.
+    assert_eq!(
+        replace_database("postgresql://localhost:5432/", "scratch"),
+        "postgresql://localhost:5432/scratch"
+    );
+}
+
+/// How many `Migrator::up` steps stop just before `name`.
+fn steps_up_to(name: &str) -> u32 {
+    let migrations = Migrator::migrations();
+    migrations
+        .iter()
+        .position(|migration| migration.name() == name)
+        .unwrap_or_else(|| {
+            panic!(
+                "migration `{name}` is not registered in `Migrator`; update this test's constant \
+                 if it was renamed"
+            )
+        }) as u32
+}
+
+const LOGIN_THROTTLE_MIGRATION: &str = "m20261114_000004_login_throttle_guards";
+
+/// The per-account login throttle arrives on a populated database — users
+/// already signed up, already holding sessions — without touching any of it.
+#[tokio::test]
+async fn test_login_throttle_guards_migration_up_and_down() -> anyhow::Result<()> {
+    let Some(scratch) =
+        ScratchDatabase::open("test_login_throttle_guards_migration_up_and_down").await?
+    else {
+        return Ok(());
+    };
+    let db = &scratch.db;
+
+    Migrator::up(db, Some(steps_up_to(LOGIN_THROTTLE_MIGRATION))).await?;
+    assert!(!table_exists(db, "user_login_guards").await?);
+
+    // An existing install: accounts and live sessions predate the upgrade.
+    db.execute_unprepared(
+        "INSERT INTO users (id, name, email, email_verified, mfa_enabled) \
+         VALUES (9901, 'Existing', 'existing@example.com', TRUE, FALSE); \
+         INSERT INTO sessions (user_id, session_token, expires_at, mfa_pending) \
+         VALUES (9901, 'pre-upgrade-session', now() + interval '7 days', FALSE);",
+    )
+    .await?;
+
+    Migrator::up(db, Some(1)).await?;
+    assert!(table_exists(db, "user_login_guards").await?);
+
+    // Nothing was migrated away: the account and its session are untouched,
+    // so nobody is signed out by this upgrade.
+    let survivors = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*) AS sessions FROM sessions WHERE user_id = 9901".to_string(),
+        ))
+        .await?
+        .expect("session count");
+    assert_eq!(survivors.try_get::<i64>("", "sessions")?, 1);
+
+    // An account with no recorded failures is not throttled: the table
+    // starts empty and absence means "no failures".
+    let guards = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*) AS guards FROM user_login_guards".to_string(),
+        ))
+        .await?
+        .expect("guard count");
+    assert_eq!(guards.try_get::<i64>("", "guards")?, 0);
+
+    // Deleting the account takes its throttle state with it.
+    db.execute_unprepared(
+        "INSERT INTO user_login_guards (user_id, failed_attempts, locked_until) \
+         VALUES (9901, 4, now() + interval '1 minute')",
+    )
+    .await?;
+    db.execute_unprepared("DELETE FROM users WHERE id = 9901")
+        .await?;
+    let orphans = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*) AS guards FROM user_login_guards".to_string(),
+        ))
+        .await?
+        .expect("guard count");
+    assert_eq!(orphans.try_get::<i64>("", "guards")?, 0);
+
+    Migrator::down(db, Some(steps_back_to(LOGIN_THROTTLE_MIGRATION))).await?;
+    assert!(!table_exists(db, "user_login_guards").await?);
+
+    // `ScratchDatabase`'s `Drop` removes the database, on this path and
+    // on every early return above it.
+    Ok(())
+}
+
+const HASH_CREDENTIALS_MIGRATION: &str = "m20261114_000005_hash_credentials_at_rest";
+
+/// Hashing credentials at rest arrives on a populated database: signed-in
+/// users stay signed in, configured webhooks keep working, and only the
+/// short-lived reset credentials are invalidated.
+#[tokio::test]
+async fn test_hash_credentials_at_rest_migration_up_and_down() -> anyhow::Result<()> {
+    let Some(scratch) =
+        ScratchDatabase::open("test_hash_credentials_at_rest_migration_up_and_down").await?
+    else {
+        return Ok(());
+    };
+    let db = &scratch.db;
+
+    Migrator::up(db, Some(steps_up_to(HASH_CREDENTIALS_MIGRATION))).await?;
+
+    // An install in use before the upgrade: a signed-in browser, an agent
+    // whose webhook somebody already configured, and a reset email in flight.
+    db.execute_unprepared(
+        "INSERT INTO users (id, name, email, email_verified, mfa_enabled, \
+                            password_reset_token, password_reset_expires) \
+         VALUES (9911, 'Existing', 'existing@example.com', TRUE, FALSE, \
+                 'email-reset:in-flight-token', now() + interval '1 hour'); \
+         INSERT INTO sessions (user_id, session_token, expires_at, mfa_pending) \
+         VALUES (9911, 'live-session-token', now() + interval '7 days', FALSE); \
+         INSERT INTO projects (id, name, repo_name, repo_owner, directory, main_branch, \
+                               preset, slug, created_at, updated_at) \
+         VALUES (9911, 'Hashing', 'repo', 'owner', '/', 'main', 'nodejs', 'hashing', \
+                 now(), now()); \
+         INSERT INTO project_agents (project_id, slug, name, source, enabled, \
+                                     trigger_config, ai_provider, webhook_id, webhook_token) \
+         VALUES (9911, 'hooked', 'Hooked', 'dashboard', TRUE, '{\"webhook\": true}'::jsonb, \
+                 'claude', 'abcdef0123456789', 'configured-webhook-token');",
+    )
+    .await?;
+
+    Migrator::up(db, Some(1)).await?;
+
+    // The session row survives, holding the digest of the token the cookie
+    // still carries -- so nobody is signed out by the upgrade.
+    let session = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*) AS rows, \
+                    count(*) FILTER ( \
+                        WHERE session_token \
+                            = encode(sha256(convert_to('live-session-token', 'UTF8')), 'hex') \
+                    ) AS hashed \
+             FROM sessions WHERE user_id = 9911"
+                .to_string(),
+        ))
+        .await?
+        .expect("session row");
+    assert_eq!(session.try_get::<i64>("", "rows")?, 1);
+    assert_eq!(session.try_get::<i64>("", "hashed")?, 1);
+
+    // Same for the configured webhook: the caller's token keeps working.
+    let agent = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT webhook_token FROM project_agents WHERE project_id = 9911".to_string(),
+        ))
+        .await?
+        .expect("agent row");
+    let stored: String = agent.try_get("", "webhook_token")?;
+    assert_ne!(stored, "configured-webhook-token");
+    assert_eq!(stored.len(), 64, "{stored}");
+    assert!(
+        stored
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "{stored}"
+    );
+    let expected = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT encode(sha256(convert_to('configured-webhook-token', 'UTF8')), 'hex') \
+                    AS digest"
+                .to_string(),
+        ))
+        .await?
+        .expect("digest");
+    // That this is also what `temps_core::crypto::sha256_hex` computes is
+    // pinned where both halves are reachable: see
+    // `the_stored_digest_is_what_the_database_computes` in temps-auth.
+    assert_eq!(stored, expected.try_get::<String>("", "digest")?);
+
+    // The in-flight reset credential is gone: single-use and short-lived, so
+    // one more "forgot password" click is cheaper than carrying it over.
+    let user = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT password_reset_token IS NULL AS token_cleared, \
+                    password_reset_expires IS NULL AS expiry_cleared \
+             FROM users WHERE id = 9911"
+                .to_string(),
+        ))
+        .await?
+        .expect("user row");
+    assert!(user.try_get::<bool>("", "token_cleared")?);
+    assert!(user.try_get::<bool>("", "expiry_cleared")?);
+
+    // Rolling back cannot restore a token from a digest, so it revokes.
+    Migrator::down(db, Some(steps_back_to(HASH_CREDENTIALS_MIGRATION))).await?;
+    let after_down = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT (SELECT count(*) FROM sessions) AS sessions, \
+                    (SELECT count(*) FROM project_agents WHERE webhook_token IS NOT NULL) \
+                        AS webhooks"
+                .to_string(),
+        ))
+        .await?
+        .expect("counts");
+    assert_eq!(after_down.try_get::<i64>("", "sessions")?, 0);
+    assert_eq!(after_down.try_get::<i64>("", "webhooks")?, 0);
+
+    db.execute_unprepared("DELETE FROM users WHERE id = 9911")
+        .await?;
+    // `ScratchDatabase`'s `Drop` removes the database, on this path and
+    // on every early return above it.
+    Ok(())
+}

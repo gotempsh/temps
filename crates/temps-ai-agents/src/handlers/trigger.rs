@@ -277,6 +277,19 @@ pub struct WebhookTriggerResponse {
 /// The actual credential is the secret token in the header.
 ///
 /// Accepts any JSON body, which is passed as `user_context` to the agent run.
+/// Whether `presented` is the webhook token whose digest the row holds.
+///
+/// `project_agents.webhook_token` stores a SHA-256 digest, never the token,
+/// so the presented value is hashed before the comparison. Still constant
+/// time: how long the comparison takes must not say how much of a guess was
+/// right.
+fn webhook_token_matches(presented: &str, stored: &str) -> bool {
+    constant_time_eq(
+        crate::services::config_service::stored_webhook_token(presented).as_bytes(),
+        stored.as_bytes(),
+    )
+}
+
 #[utoipa::path(
     tag = "Agents",
     post,
@@ -327,7 +340,7 @@ pub async fn webhook_trigger(
             .with_detail("This agent does not have webhook triggers enabled")
     })?;
 
-    if !constant_time_eq(provided_token.as_bytes(), expected_token.as_bytes()) {
+    if !webhook_token_matches(provided_token, expected_token) {
         return Err(problemdetails::new(StatusCode::UNAUTHORIZED)
             .with_title("Invalid Webhook Token")
             .with_detail("The provided X-Webhook-Token does not match"));
@@ -1145,7 +1158,8 @@ pub async fn save_agent_token(
 
 #[cfg(test)]
 mod tests {
-    use super::invalidate_legacy_agent_token_caches;
+    use super::{invalidate_legacy_agent_token_caches, webhook_token_matches};
+    use crate::services::config_service::stored_webhook_token;
     use async_trait::async_trait;
     use futures::stream;
     use sea_orm::{DatabaseBackend, MockDatabase};
@@ -1233,6 +1247,36 @@ mod tests {
             .await
             .expect("settings cache was invalidated");
         assert_eq!(refreshed.agent_sandbox.default_provider, "new-provider");
+    }
+
+    /// The column holds a digest, so the token the caller was handed still
+    /// opens the webhook and what the column holds does not.
+    #[test]
+    fn only_the_minted_token_opens_the_webhook() {
+        let token = "d2f0ba2c2a0e4a2f8f1c3b4a5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80";
+        let stored = stored_webhook_token(token);
+
+        assert!(webhook_token_matches(token, &stored));
+
+        // Whoever read the column -- a dump, a backup, a replica -- holds
+        // the digest, and presenting it authenticates nothing.
+        assert!(!webhook_token_matches(&stored, &stored));
+
+        for wrong in [
+            "",
+            "not-the-token",
+            &token[..token.len() - 1],
+            &token.to_uppercase(),
+        ] {
+            assert!(!webhook_token_matches(wrong, &stored), "{wrong}");
+        }
+    }
+
+    /// A token minted for one agent must not open another's webhook.
+    #[test]
+    fn a_token_does_not_open_another_agents_webhook() {
+        let stored_for_a = stored_webhook_token("agent-a-token");
+        assert!(!webhook_token_matches("agent-b-token", &stored_for_a));
     }
 }
 
