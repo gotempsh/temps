@@ -267,6 +267,33 @@ Dir.mktmpdir("scanned-server-test-") do |directory|
   end
 end
 dependency_scan = YAML.safe_load(File.read(File.join(repository_root, ".github/workflows/dependency-scan.yml")), aliases: true)
+audit_job = dependency_scan.fetch("jobs").fetch("cargo-audit")
+audit_steps = audit_job.fetch("steps")
+pr_audit = audit_steps.find { |step| step["name"] == "Audit pull request dependencies" }
+abort "PR audit must run without Check API reporting" unless pr_audit &&
+  pr_audit["if"] == "github.event_name == 'pull_request'" && !pr_audit["continue-on-error"]
+report_audit = audit_steps.find { |step| step.fetch("uses", "").start_with?("rustsec/audit-check@") }
+abort "scheduled audit reporting must retain the shared advisory policy" unless report_audit &&
+  report_audit["if"] == "github.event_name != 'pull_request'" &&
+  report_audit.dig("with", "ignore") == '${{ env.AUDIT_IGNORE }}'
+Dir.mktmpdir do |directory|
+  File.write(File.join(directory, "cargo"), <<~SH)
+    #!/bin/bash
+    printf '%s\\n' "$@" > "$AUDIT_ARGS"
+    exit "$AUDIT_EXIT"
+  SH
+  File.chmod(0700, File.join(directory, "cargo"))
+  environment = {"PATH" => directory + File::PATH_SEPARATOR + ENV.fetch("PATH"),
+    "AUDIT_IGNORE" => audit_job.fetch("env").fetch("AUDIT_IGNORE"),
+    "AUDIT_ARGS" => File.join(directory, "args")}
+  [0, 1, 2].each do |exit_code|
+    _, error, status = Open3.capture3(environment.merge("AUDIT_EXIT" => exit_code.to_s),
+      "bash", "-euo", "pipefail", "-c", pr_audit.fetch("run"), chdir: directory)
+    abort "audit exit status was masked: #{error}" unless status.exitstatus == exit_code
+    expected = ["audit", "--file", "Cargo.lock"] + environment["AUDIT_IGNORE"].split(",").flat_map { |id| ["--ignore", id] }
+    abort "audit changed advisory policy" unless File.readlines(environment["AUDIT_ARGS"], chomp: true) == expected
+  end
+end
 channels = dependency_scan.dig("jobs", "container-scan", "strategy", "matrix", "include")
 abort "published channel scans must retain existing SARIF categories and cover nightly" unless
   channels == [
