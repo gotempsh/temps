@@ -184,9 +184,7 @@ export function AgentSandboxSandboxPage() {
     retry: false,
   })
 
-  // A refetch while the form has unsaved edits keeps them: replacing the
-  // drafts would make the next save submit what the user did not type.
-  if (settings !== loadedSettings && !(isDirty && loadedSettings)) {
+  if (settings !== loadedSettings) {
     setLoadedSettings(settings)
     if (settings?.agent_sandbox) {
       const s = settings.agent_sandbox
