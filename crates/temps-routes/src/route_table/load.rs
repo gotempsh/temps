@@ -41,6 +41,10 @@ struct RouteLoadState {
     /// Every hostname an `environment_domains` row holds (phase 1), live or
     /// not, lowercased. A project custom domain never takes one (phase 3).
     generated_hosts: HashSet<String>,
+    /// Every project custom domain (phase 3) that names an existing
+    /// environment, lowercased, whether or not a deployment serves it right
+    /// now. A custom route never takes one.
+    project_custom_domain_hosts: HashSet<String>,
     /// Operator custom routes (phase 2), by route type.
     http_routes_map: HashMap<String, RouteInfo>,
     tls_routes_map: HashMap<String, RouteInfo>,
@@ -242,6 +246,7 @@ impl CachedPeerTable {
             principals,
             tunnel_environment_hosts: HashMap::new(),
             generated_hosts: HashSet::new(),
+            project_custom_domain_hosts: HashSet::new(),
             http_routes_map: HashMap::new(),
             tls_routes_map: HashMap::new(),
             http_wildcards_matcher: WildcardMatcher::new(),
@@ -758,6 +763,9 @@ impl CachedPeerTable {
         if state.generated_hosts.contains(domain) {
             return Some("an environment's generated hostname");
         }
+        if state.project_custom_domain_hosts.contains(domain) {
+            return Some("a project's custom domain");
+        }
         let unavailable = match domain.strip_prefix("*.") {
             Some(base) => state.unavailable.wildcard_bases.contains_key(base),
             None => state.unavailable.exact.contains_key(domain),
@@ -889,6 +897,7 @@ impl CachedPeerTable {
             nodes_cache,
             principals,
             generated_hosts,
+            project_custom_domain_hosts,
             app_settings,
             ..
         } = state;
@@ -968,6 +977,9 @@ impl CachedPeerTable {
             }
 
             if let Some(environment) = environments_cache.get(&custom_domain.environment_id) {
+                // The project holds the name whether or not anything is
+                // deployed to it yet.
+                project_custom_domain_hosts.insert(host.clone());
                 if let Some(deployment_id) = environment.current_deployment_id {
                     // Skip sleeping on-demand environments — record them separately
                     if environment.sleeping {
@@ -2178,6 +2190,7 @@ impl CachedPeerTable {
             status_page_hosts,
             environments_cache,
             generated_hosts,
+            project_custom_domain_hosts,
             ..
         } = state;
 
@@ -2347,9 +2360,15 @@ impl CachedPeerTable {
         };
 
         // Hostnames the platform owns even with nothing serving them right
-        // now: every stored environment address, and the hostnames of
-        // sleeping environments. A TLS wildcard custom route never takes one.
+        // now: every stored environment address, every project custom domain,
+        // and the hostnames of sleeping environments. A TLS wildcard custom
+        // route never takes one.
         let mut owned_hosts = generated_hosts;
+        owned_hosts.extend(
+            project_custom_domain_hosts
+                .into_iter()
+                .filter(|host| !host.starts_with("*.")),
+        );
         owned_hosts.extend(
             sleeping_environments
                 .iter()
@@ -2853,6 +2872,55 @@ mod tests {
         assert!(table.get_route_by_sni("draft.example.net").is_none());
         assert!(
             table.get_route_by_sni("unclaimed.example.net").is_some(),
+            "a name nothing else serves still uses the wildcard"
+        );
+
+        test_db.cleanup().await?;
+        Ok(())
+    }
+
+    /// A project's custom domain belongs to the project before anything is
+    /// deployed to it: an operator custom route for the same name, or a TLS
+    /// wildcard over it, does not take it in the meantime.
+    #[tokio::test]
+    async fn a_custom_route_cannot_take_an_undeployed_projects_custom_domain(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(database) = database_or_skip().await else {
+            return Ok(());
+        };
+        let test_db = TestDBMockOperations::new(database.db.clone()).await?;
+        let db = test_db.db.as_ref();
+        set_preview_domain(db).await?;
+        let (project, environment, _) = seed_environment(&test_db).await?;
+        environments::ActiveModel {
+            id: Set(environment.id),
+            current_deployment_id: Set(None),
+            ..Default::default()
+        }
+        .update(db)
+        .await?;
+        project_custom_domains::ActiveModel {
+            domain: Set("shop.example.org".to_string()),
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            status: Set("active".to_string()),
+            ..Default::default()
+        }
+        .insert(db)
+        .await?;
+        insert_custom_route(db, "shop.example.org", "8.8.8.8", 8080, RouteType::Http).await?;
+        insert_custom_route(db, "*.example.org", "8.8.4.4", 8443, RouteType::Tls).await?;
+
+        let table = CachedPeerTable::new(test_db.db.clone());
+        table.load_routes().await?;
+
+        assert!(
+            table.get_route_by_host("shop.example.org").is_none(),
+            "an undeployed project's custom domain must not be served by a custom route"
+        );
+        assert!(table.get_route_by_sni("shop.example.org").is_none());
+        assert!(
+            table.get_route_by_sni("other.example.org").is_some(),
             "a name nothing else serves still uses the wildcard"
         );
 
