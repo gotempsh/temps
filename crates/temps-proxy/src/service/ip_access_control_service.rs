@@ -61,6 +61,12 @@ pub enum IpAccessControlError {
          acknowledge_lockout=true if that is intended"
     )]
     WouldLockOutCaller { rule: String, caller_ip: String },
+
+    #[error(
+        "IP access control rule {rule_id} was changed by another request while this update was \
+         being checked; reload the rule and apply the change again"
+    )]
+    RuleChanged { rule_id: i32 },
 }
 
 /// Response model for IP access control rules
@@ -431,7 +437,24 @@ impl IpAccessControlService {
     ) -> Result<ip_access_control::Model, IpAccessControlError> {
         // Verify the rule exists
         let existing = self.get_by_id(id).await?;
+        self.update_checked_against(id, &existing, request, caller_ip)
+            .await
+    }
 
+    /// Apply `request` to rule `id`, judging it against `existing` -- the rule
+    /// as it was read. When the change can widen what is blocked, the write
+    /// only lands if the stored address and action are still the ones that
+    /// were judged; otherwise it is refused with [`IpAccessControlError::RuleChanged`].
+    /// Without that, two overlapping edits (one setting `block`, one setting
+    /// a catch-all address) could each pass the check alone and together
+    /// store a catch-all block nobody confirmed.
+    async fn update_checked_against(
+        &self,
+        id: i32,
+        existing: &ip_access_control::Model,
+        request: UpdateIpAccessControlRequest,
+        caller_ip: Option<IpAddr>,
+    ) -> Result<ip_access_control::Model, IpAccessControlError> {
         // Validate inputs
         if let Some(ref ip_address) = request.ip_address {
             if !Self::is_valid_ip_or_cidr(ip_address) {
@@ -451,7 +474,8 @@ impl IpAccessControlService {
         // Judge the rule as it will be stored, but only when the change can
         // widen what is blocked. Editing a reason must not be refused because
         // of a rule that was saved before these checks existed.
-        if request.ip_address.is_some() || request.action.is_some() {
+        let judged = request.ip_address.is_some() || request.action.is_some();
+        if judged {
             let ip = request
                 .ip_address
                 .as_deref()
@@ -502,11 +526,24 @@ impl IpAccessControlService {
 
         // Add id for WHERE clause
         values.push(id.into());
+        let mut condition = format!("id = ${}", param_counter);
+        param_counter += 1;
+
+        // Only write over the address and action that were judged above.
+        if judged {
+            condition.push_str(&format!(
+                " AND ip_address = ${}::inet AND action = ${}",
+                param_counter,
+                param_counter + 1
+            ));
+            values.push(existing.ip_address.clone().into());
+            values.push(existing.action.clone().into());
+        }
 
         let sql = format!(
-            "UPDATE ip_access_control SET {} WHERE id = ${} RETURNING id, ip_address::text, action, reason, created_by, created_at, updated_at",
+            "UPDATE ip_access_control SET {} WHERE {} RETURNING id, ip_address::text, action, reason, created_by, created_at, updated_at",
             updates.join(", "),
-            param_counter
+            condition
         );
 
         let result = self
@@ -531,14 +568,41 @@ impl IpAccessControlService {
             self.refresh_blocklist_after_write().await;
             Ok(rule)
         } else {
-            Err(IpAccessControlError::NotFound(id.to_string()))
+            // Nothing matched: the rule is gone, or it changed since it was
+            // judged.
+            match self.get_by_id(id).await {
+                Ok(_) if judged => Err(IpAccessControlError::RuleChanged { rule_id: id }),
+                Ok(_) => Err(IpAccessControlError::NotFound(id.to_string())),
+                Err(error) => Err(error),
+            }
         }
     }
 
-    /// Delete an IP access control rule
+    /// Delete an IP access control rule, returning the row the database
+    /// removed -- not one read before, which a concurrent update may have
+    /// changed -- so the deletion is audited as what was actually deleted.
     pub async fn delete(&self, id: i32) -> Result<ip_access_control::Model, IpAccessControlError> {
-        let rule = self.get_by_id(id).await?;
-        rule.clone().delete(self.db.as_ref()).await?;
+        use sea_orm::{ConnectionTrait, Statement};
+
+        let row = self
+            .db
+            .query_one(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "DELETE FROM ip_access_control WHERE id = $1 RETURNING id, ip_address::text, \
+                 action, reason, created_by, created_at, updated_at",
+                [id.into()],
+            ))
+            .await?
+            .ok_or_else(|| IpAccessControlError::NotFound(id.to_string()))?;
+        let rule = ip_access_control::Model {
+            id: row.try_get("", "id")?,
+            ip_address: row.try_get("", "ip_address")?,
+            action: row.try_get("", "action")?,
+            reason: row.try_get("", "reason")?,
+            created_by: row.try_get("", "created_by")?,
+            created_at: row.try_get("", "created_at")?,
+            updated_at: row.try_get("", "updated_at")?,
+        };
         self.refresh_blocklist_after_write().await;
         Ok(rule)
     }
@@ -580,6 +644,107 @@ mod tests {
         assert!(!service.is_blocked("8.8.8.8").await.unwrap());
         // Unparsable IP fails open (not blocked)
         assert!(!service.is_blocked("not-an-ip").await.unwrap());
+    }
+
+    fn update_request(
+        ip_address: Option<&str>,
+        action: Option<&str>,
+    ) -> UpdateIpAccessControlRequest {
+        UpdateIpAccessControlRequest {
+            ip_address: ip_address.map(str::to_string),
+            action: action.map(str::to_string),
+            reason: None,
+            confirm_broad_range: false,
+            acknowledge_lockout: false,
+        }
+    }
+
+    /// Two overlapping edits -- one turns an allow rule into a block, the
+    /// other widens its address to everything -- each pass the safety check
+    /// against the rule they read. The second must not land on the row the
+    /// first changed, or a catch-all block is stored unconfirmed.
+    #[tokio::test]
+    async fn an_update_judged_against_a_stale_rule_is_refused() {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
+            Ok(test_db) => test_db,
+            Err(error)
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+            {
+                println!("Docker not available, skipping: {error}");
+                return;
+            }
+            Err(error) => panic!("test database setup failed: {error}"),
+        };
+        let service = IpAccessControlService::new(test_db.db.clone());
+        let created = service
+            .create(
+                CreateIpAccessControlRequest {
+                    ip_address: "198.51.100.0/24".to_string(),
+                    action: "allow".to_string(),
+                    reason: None,
+                    confirm_broad_range: false,
+                    acknowledge_lockout: false,
+                },
+                None,
+                None,
+            )
+            .await
+            .expect("create rule");
+        let read_by_second_request = service.get_by_id(created.id).await.expect("read rule");
+
+        service
+            .update(created.id, update_request(None, Some("block")), None)
+            .await
+            .expect("first edit");
+        let refused = service
+            .update_checked_against(
+                created.id,
+                &read_by_second_request,
+                update_request(Some("0.0.0.0/0"), None),
+                None,
+            )
+            .await;
+        assert!(
+            matches!(refused, Err(IpAccessControlError::RuleChanged { rule_id }) if rule_id == created.id),
+            "{refused:?}"
+        );
+        let stored = service.get_by_id(created.id).await.expect("read rule");
+        assert_eq!(
+            (stored.ip_address.as_str(), stored.action.as_str()),
+            ("198.51.100.0/24", "block")
+        );
+
+        // Judged against the current rule, the same edit gets the check.
+        let checked = service
+            .update(created.id, update_request(Some("0.0.0.0/0"), None), None)
+            .await;
+        assert!(
+            matches!(checked, Err(IpAccessControlError::RangeTooBroad { .. })),
+            "{checked:?}"
+        );
+
+        // A reason-only edit judges nothing and is not refused.
+        let mut reason_only = update_request(None, None);
+        reason_only.reason = Some("note".to_string());
+        assert!(service
+            .update_checked_against(created.id, &read_by_second_request, reason_only, None)
+            .await
+            .is_ok());
+
+        let deleted = service.delete(created.id).await.expect("delete rule");
+        assert_eq!(
+            (
+                deleted.ip_address.as_str(),
+                deleted.action.as_str(),
+                deleted.reason.as_deref()
+            ),
+            ("198.51.100.0/24", "block", Some("note")),
+            "the deleted row is reported as it was stored"
+        );
+        assert!(matches!(
+            service.delete(created.id).await,
+            Err(IpAccessControlError::NotFound(_))
+        ));
     }
 
     fn net(value: &str) -> IpNetwork {

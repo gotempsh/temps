@@ -106,6 +106,10 @@ impl From<IpAccessControlError> for Problem {
                     .with_detail(error.to_string())
             }
 
+            IpAccessControlError::RuleChanged { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("IP Access Control Rule Changed")
+                .with_detail(error.to_string()),
+
             IpAccessControlError::Database(_) | IpAccessControlError::Internal(_) => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Internal Server Error")
