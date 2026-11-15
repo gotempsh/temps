@@ -161,7 +161,7 @@ const store = new BlobClient({
 });
 ```
 
-`PutOptions`: `{ contentType?, addRandomSuffix? (default true), cacheControl?, contentEncoding?, contentDisposition? }`.
+`PutOptions`: `{ contentType?, addRandomSuffix? (default true) }`.
 
 > ⚠️ Methods are `put / del / head / list / download / copy`. There is **no** `blob.get()`, `blob.getStream()`, `blob.getSignedUrl()`, or `blob.createUploadUrl()` — to read content, call `download(url)` and consume the `Response`. Blob errors throw `BlobError`.
 
