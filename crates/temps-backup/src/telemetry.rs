@@ -103,13 +103,28 @@ impl BackupTelemetry {
     }
 }
 
-/// Engine keys are code-defined (`postgres_pgdump`, `redis`, ...). Anything
-/// that doesn't look like one is sent as `other` rather than verbatim.
+/// Forward only registered engine keys and known legacy service types.
 fn engine_label(engine: &str) -> String {
+    use crate::engines;
     match engine {
-        "control_plane" | "postgres" | "mariadb" | "mongodb" | "redis" | "s3"
-        | "postgres_pgdump" | "postgres_walg" | "postgres_cluster" | "worker_agent"
-        | "s3_mirror" | "mariadb_dump" | "mariadb_physical" => engine.to_string(),
+        engines::control_plane::ENGINE_KEY
+        | engines::postgres_pgdump::ENGINE_KEY
+        | engines::postgres_walg::ENGINE_KEY
+        | engines::postgres_cluster::ENGINE_KEY
+        | engines::workload_job::ENGINE_KEY
+        | engines::worker_agent::ENGINE_KEY
+        | engines::mongodb::ENGINE_KEY
+        | engines::redis::ENGINE_KEY
+        | engines::mariadb_physical::ENGINE_KEY
+        | engines::mariadb_dump::ENGINE_KEY
+        | engines::s3_mirror::ENGINE_KEY
+        | "postgres"
+        | "mariadb"
+        | "s3"
+        | "kv"
+        | "blob"
+        | "rustfs"
+        | "minio" => engine.to_string(),
         _ => "other".to_string(),
     }
 }
@@ -159,6 +174,34 @@ mod tests {
             backup_id: id,
             engine: "postgres_pgdump".to_string(),
         })
+    }
+
+    #[test]
+    fn registered_engine_keys_keep_their_attribution() {
+        use crate::engines;
+        for key in [
+            engines::control_plane::ENGINE_KEY,
+            engines::postgres_pgdump::ENGINE_KEY,
+            engines::postgres_walg::ENGINE_KEY,
+            engines::postgres_cluster::ENGINE_KEY,
+            engines::workload_job::ENGINE_KEY,
+            engines::worker_agent::ENGINE_KEY,
+            engines::mongodb::ENGINE_KEY,
+            engines::redis::ENGINE_KEY,
+            engines::mariadb_physical::ENGINE_KEY,
+            engines::mariadb_dump::ENGINE_KEY,
+            engines::s3_mirror::ENGINE_KEY,
+        ] {
+            let event = BackupTelemetry::new()
+                .on_job(&Job::BackupCompleted(BackupCompletedJob {
+                    backup_id: 7,
+                    engine: key.to_string(),
+                    s3_location: "s3://sample/backup".into(),
+                    size_bytes: None,
+                }))
+                .unwrap();
+            assert_eq!(event.properties["engine"], key);
+        }
     }
 
     #[tokio::test]
