@@ -30,6 +30,13 @@ import { SaveRow } from '@temps-sdk/ds'
 import { Input } from '@/components/ui/input'
 import { NumberInput } from '@/components/ui/number-input'
 import { Label } from '@/components/ui/label'
+import { Textarea } from '@/components/ui/textarea'
+import {
+  formatConfigRepoAllowlist,
+  configRepoAllowlistProblem,
+  invalidConfigRepoEntries,
+  parseConfigRepoAllowlist,
+} from './config-repo-allowlist'
 import { useSettingsPage, useUpdateSettings } from '@/hooks/useSettings'
 import {
   CPU_LIMIT_RANGE,
@@ -145,6 +152,7 @@ export function AgentSandboxSandboxPage() {
   const [resourcePreset, setResourcePreset] = useState('Standard')
   const [globalConfigRepo, setGlobalConfigRepo] = useState('')
   const [globalConfigRepoBranch, setGlobalConfigRepoBranch] = useState('main')
+  const [configRepoAllowlist, setConfigRepoAllowlist] = useState('')
   const [defaultProvider, setDefaultProvider] = useState('claude_cli')
   const [sandboxBackend, setSandboxBackend] = useState('docker')
   const [workspaceFileLimits, setWorkspaceFileLimits] =
@@ -155,7 +163,12 @@ export function AgentSandboxSandboxPage() {
 
   const [rebuilding, setRebuilding] = useState(false)
   const [buildLog, setBuildLog] = useState<string[]>([])
-  const [loadedSettings, setLoadedSettings] = useState(settings)
+  // Starts empty so the first settings value hydrates the form, including
+  // one already in the shared query cache on mount. Starting from `settings`
+  // skipped that, and the next save sent the empty defaults back.
+  const [loadedSettings, setLoadedSettings] = useState<
+    typeof settings | undefined
+  >(undefined)
 
   const {
     data: sandboxStatus = null,
@@ -193,6 +206,9 @@ export function AgentSandboxSandboxPage() {
     if (settings?.ai_config) {
       setGlobalConfigRepo(settings.ai_config.config_repo || '')
       setGlobalConfigRepoBranch(settings.ai_config.config_repo_branch || 'main')
+      setConfigRepoAllowlist(
+        formatConfigRepoAllowlist(settings.ai_config.config_repo_allowlist)
+      )
     }
     if (settings?.ai_workspace_file_limits) {
       setWorkspaceFileLimits({
@@ -280,6 +296,13 @@ export function AgentSandboxSandboxPage() {
       toast.error(apiLimitValues.message)
       return
     }
+    // An entry the server would never match is a typo, not a choice: hold
+    // the save until it is fixed rather than storing it.
+    const allowlistProblem = configRepoAllowlistProblem(configRepoAllowlist)
+    if (allowlistProblem) {
+      toast.error(allowlistProblem)
+      return
+    }
     try {
       // Per-provider credentials live on /agent-sandbox/providers/:id —
       // this mutation only touches platform-wide sandbox knobs. We pass
@@ -308,6 +331,7 @@ export function AgentSandboxSandboxPage() {
           ...(settings?.ai_config ?? {}),
           config_repo: globalConfigRepo,
           config_repo_branch: globalConfigRepoBranch,
+          config_repo_allowlist: parseConfigRepoAllowlist(configRepoAllowlist),
         },
         ai_workspace_file_limits: limits.workspaceFileLimits,
       })
@@ -779,6 +803,41 @@ export function AgentSandboxSandboxPage() {
                 GitHub repo path. The repo must be accessible via the
                 service&apos;s git provider connection. Leave empty to disable.
               </p>
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="config-repo-allowlist">
+                Allowed workflow config repositories
+              </Label>
+              <Textarea
+                id="config-repo-allowlist"
+                rows={3}
+                placeholder={'org/claude-config\nplatform/*'}
+                value={configRepoAllowlist}
+                onChange={(e) => {
+                  setConfigRepoAllowlist(e.target.value)
+                  setIsDirty(true)
+                }}
+              />
+              <p className="text-xs text-muted-foreground">
+                A workflow can name its own config repository in{' '}
+                <code className="text-xs bg-muted px-1 rounded">
+                  .temps.yaml
+                </code>
+                . It is used only when it is the project&apos;s own repository
+                or listed here, one <code>owner/repo</code> (or{' '}
+                <code>owner/*</code>) per line. Any other repository is skipped
+                and the run log says so.
+              </p>
+              {invalidConfigRepoEntries(
+                parseConfigRepoAllowlist(configRepoAllowlist)
+              ).length > 0 && (
+                <p className="text-xs text-destructive" role="alert">
+                  Not a repository name, so it will never match:{' '}
+                  {invalidConfigRepoEntries(
+                    parseConfigRepoAllowlist(configRepoAllowlist)
+                  ).join(', ')}
+                </p>
+              )}
             </div>
             <div className="space-y-2">
               <Label htmlFor="global-config-branch">Branch</Label>

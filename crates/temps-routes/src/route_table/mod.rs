@@ -41,6 +41,8 @@ use temps_entities::{deployments, environments, nodes, projects};
 use tracing::{debug, error, info, warn};
 
 mod load;
+mod pinned_upstream;
+pub use pinned_upstream::{PinnedUpstream, UpstreamAddresses, REFRESH_INTERVAL};
 
 /// Look up the address a container's node publishes its ports on (see
 /// `nodes::Model::data_address`: the mesh address for a node that joined with
@@ -98,6 +100,7 @@ fn build_backend_entry(
         address,
         container_id: Some(container.container_id.clone()),
         container_name: Some(container.container_name.clone()),
+        pinned: None,
     })
 }
 
@@ -201,6 +204,7 @@ fn build_public_compose_backend_entry(
         address,
         container_id: Some(container.container_id.clone()),
         container_name: Some(container.container_name.clone()),
+        pinned: None,
     })
 }
 
@@ -444,6 +448,10 @@ pub struct BackendEntry {
     pub container_id: Option<String>,
     /// Human-readable container name (e.g., "my-app-abc123")
     pub container_name: Option<String>,
+    /// Set for a custom route upstream named by hostname: requests go to the
+    /// checked addresses held here, never to `address`, which is kept for
+    /// display. `None` for every platform backend.
+    pub pinned: Option<Arc<PinnedUpstream>>,
 }
 
 /// Result of selecting a backend via round-robin.
@@ -455,6 +463,10 @@ pub struct BackendSelection {
     pub container_id: Option<String>,
     /// Human-readable container name
     pub container_name: Option<String>,
+    /// Why this backend must not be dialled right now (a pinned upstream with
+    /// no allowed address). The caller fails the request instead of
+    /// connecting to `address`.
+    pub refused: Option<String>,
 }
 
 /// Backend type for a route
@@ -492,6 +504,7 @@ impl BackendType {
             } => {
                 if backends.is_empty() {
                     return Some(BackendSelection {
+                        refused: None,
                         address: "127.0.0.1:8080".to_string(),
                         container_id: None,
                         container_name: None,
@@ -509,10 +522,18 @@ impl BackendType {
                         .unwrap_or(&backends[index])
                 };
 
+                let (address, refused) = match &entry.pinned {
+                    None => (entry.address.clone(), None),
+                    Some(pin) => match pin.pick_avoiding(avoid) {
+                        Ok(address) => (address.to_string(), None),
+                        Err(reason) => (entry.address.clone(), Some(reason)),
+                    },
+                };
                 Some(BackendSelection {
-                    address: entry.address.clone(),
+                    address,
                     container_id: entry.container_id.clone(),
                     container_name: entry.container_name.clone(),
+                    refused,
                 })
             }
             BackendType::StaticDir { .. } => None,
@@ -590,6 +611,7 @@ impl RouteInfo {
         self.backend
             .get_backend_avoiding(avoid)
             .unwrap_or_else(|| BackendSelection {
+                refused: None,
                 address: "127.0.0.1:8080".to_string(),
                 container_id: None,
                 container_name: None,
@@ -999,6 +1021,10 @@ struct LegacyRouteTable {
 
 #[derive(Clone, Debug, Default)]
 struct RouteTableSnapshot {
+    /// Platform hostnames that may have no route at all right now (an
+    /// undeployed environment's stored address, a sleeping environment's
+    /// hostname), lower-cased. Only consulted to keep a TLS wildcard off them.
+    owned_hosts: HashSet<String>,
     http_routes: HashMap<String, RouteInfo>,
     tls_routes: HashMap<String, RouteInfo>,
     http_wildcards: WildcardMatcher,
@@ -1023,9 +1049,19 @@ struct RouteTableSnapshot {
 impl RouteTableSnapshot {
     /// Whether any routable map resolves `host`, in the same order as
     /// `resolve_route_for_sni`, without cloning a `RouteInfo`.
+    /// Whether some exact (non-wildcard) route serves `host`, live or not.
+    fn has_exact_route(&self, host: &str) -> bool {
+        self.http_routes.contains_key(host)
+            || self.legacy.exact.contains_key(host)
+            || self.unavailable.exact.contains_key(host)
+            || self.owned_hosts.contains(host)
+    }
+
     fn has_live_route(&self, host: &str) -> bool {
         self.tls_routes.contains_key(host)
-            || self.tls_wildcards.match_domain(host).is_some()
+            // A TLS wildcard only serves a name no exact route claims; see
+            // `get_route_by_sni`.
+            || (self.tls_wildcards.match_domain(host).is_some() && !self.has_exact_route(host))
             || self.http_routes.contains_key(host)
             || self.legacy.exact.contains_key(host)
             || self.http_wildcards.match_domain(host).is_some()
@@ -1201,6 +1237,11 @@ impl RouteOwnershipSnapshot {
             return false;
         };
         !label.is_empty() && !base.is_empty() && self.wildcard_bases.contains(base)
+    }
+
+    /// Whether an exact route or a reserved name owns `host`, not a wildcard.
+    fn owns_exactly(&self, host: &str) -> bool {
+        self.reserved_hosts.contains(host) || self.exact.contains(host)
     }
 
     fn include(&mut self, other: &Self) {
@@ -1424,6 +1465,11 @@ pub struct CachedPeerTable {
     /// Serializes reloads so their three-phase snapshot publication cannot
     /// interleave, even when manual refresh and database notification race.
     route_reload_lock: tokio::sync::Mutex<()>,
+    /// The pins the last reload published for custom route upstream names,
+    /// by host and port. A reload that cannot resolve a name keeps the
+    /// addresses its previous pin was checked with. Weak: the route snapshot
+    /// owns the pins.
+    custom_route_pins: parking_lot::Mutex<HashMap<(String, u16), std::sync::Weak<PinnedUpstream>>>,
 
     /// Database connection for loading routes
     db: Arc<DatabaseConnection>,
@@ -1505,6 +1551,7 @@ impl CachedPeerTable {
         Self {
             route_snapshot: ArcSwap::from_pointee(RouteTableSnapshot::default()),
             route_reload_lock: tokio::sync::Mutex::new(()),
+            custom_route_pins: parking_lot::Mutex::new(HashMap::new()),
             db,
             runtime_context,
             on_sleeping_callback: parking_lot::Mutex::new(None),
@@ -1804,7 +1851,15 @@ impl CachedPeerTable {
             return Some(route.clone());
         }
 
-        // 2. Try wildcard match in TLS wildcards
+        // 2. A TLS wildcard never takes a name an exact route serves -- a
+        //    project or environment hostname, or an exact HTTP route --
+        //    including one with no live deployment right now. Passing that
+        //    name through would hand its traffic to the wildcard's upstream.
+        if snapshot.has_exact_route(sni) {
+            return None;
+        }
+
+        // 3. Try wildcard match in TLS wildcards
         if let Some(route) = snapshot.tls_wildcards.match_domain(sni) {
             return Some(route.clone());
         }
@@ -1823,12 +1878,14 @@ impl CachedPeerTable {
         if snapshot.legacy.is_reserved(sni) {
             return None;
         }
+        // Exact names first, whatever their kind, then wildcards: the order
+        // `get_route_by_sni` and the HTTP lookup resolve a name in.
         snapshot
             .tls_routes
             .get(sni)
-            .or_else(|| snapshot.tls_wildcards.match_domain(sni))
             .or_else(|| snapshot.http_routes.get(sni))
             .or_else(|| snapshot.legacy.exact.get(sni))
+            .or_else(|| snapshot.tls_wildcards.match_domain(sni))
             .or_else(|| snapshot.http_wildcards.match_domain(sni))
             .or_else(|| snapshot.legacy.wildcards.match_domain(sni))
             .cloned()
@@ -2145,7 +2202,19 @@ impl CachedPeerTable {
     /// `host`. This is a single lock-free snapshot load and does not clone a
     /// `RouteInfo`; it is intended for the per-request wake gate.
     pub fn owns_hostname(&self, host: &str) -> bool {
-        self.route_snapshot.load().ownership.owns(host)
+        let snapshot = self.route_snapshot.load();
+        if !snapshot.ownership.owns(host) {
+            return false;
+        }
+        if !snapshot.owned_hosts.contains(host) || snapshot.ownership.owns_exactly(host) {
+            return true;
+        }
+        // A platform hostname with no exact route (a sleeping or undeployed
+        // environment's) is claimed here only by a wildcard. A TLS wildcard
+        // never serves it (see `get_route_by_sni`), so it must not keep the
+        // environment from waking; an HTTP-side wildcard still does.
+        snapshot.http_wildcards.match_domain(host).is_some()
+            || snapshot.legacy.wildcards.match_domain(host).is_some()
     }
 
     /// Get current number of routes in the table
@@ -2729,11 +2798,74 @@ async fn load_tailnet_principals(
         .collect())
 }
 #[cfg(test)]
+mod pinned_backend_tests {
+    use super::*;
+
+    fn backend(pinned: UpstreamAddresses) -> BackendType {
+        BackendType::Upstream {
+            backends: vec![BackendEntry {
+                address: "upstream.example.net:443".to_string(),
+                container_id: None,
+                container_name: None,
+                pinned: Some(Arc::new(PinnedUpstream::new(
+                    "upstream.example.net",
+                    443,
+                    pinned,
+                ))),
+            }],
+            round_robin_counter: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    #[test]
+    fn a_pinned_backend_is_selected_at_its_checked_address_not_its_name() {
+        let selection = backend(UpstreamAddresses::Allowed(vec!["8.8.8.8:443"
+            .parse()
+            .expect("address")]))
+        .get_backend()
+        .expect("upstream");
+        assert_eq!(selection.address, "8.8.8.8:443");
+        assert!(selection.refused.is_none());
+    }
+
+    /// A retry after a failed connect goes to another checked address when
+    /// there is one, whatever the shared round-robin counter says.
+    #[test]
+    fn a_retry_skips_the_checked_address_that_just_failed() {
+        let backend = backend(UpstreamAddresses::Allowed(vec![
+            "8.8.8.8:443".parse().expect("address"),
+            "8.8.4.4:443".parse().expect("address"),
+        ]));
+        let failed = vec!["8.8.8.8:443".to_string()];
+        for _ in 0..4 {
+            let selection = backend.get_backend_avoiding(&failed).expect("upstream");
+            assert_eq!(selection.address, "8.8.4.4:443");
+        }
+        // With every address failed, the normal choice is still made.
+        let all = vec!["8.8.8.8:443".to_string(), "8.8.4.4:443".to_string()];
+        let selection = backend.get_backend_avoiding(&all).expect("upstream");
+        assert!(all.contains(&selection.address));
+    }
+
+    #[test]
+    fn a_pinned_backend_without_an_allowed_address_is_refused() {
+        for state in [
+            UpstreamAddresses::Pending,
+            UpstreamAddresses::Refused("resolves to 127.0.0.1".to_string()),
+        ] {
+            let selection = backend(state).get_backend().expect("upstream");
+            assert!(selection.refused.is_some(), "{selection:?}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod backend_avoiding_tests {
     use super::*;
 
     fn two_replicas() -> BackendType {
         let entry = |address: &str| BackendEntry {
+            pinned: None,
             address: address.to_string(),
             container_id: None,
             container_name: None,
@@ -2897,6 +3029,7 @@ mod tests {
             RouteInfo {
                 backend: BackendType::Upstream {
                     backends: vec![BackendEntry {
+                        pinned: None,
                         address: address.to_string(),
                         container_id: None,
                         container_name: None,
@@ -3079,6 +3212,7 @@ mod tests {
             RouteInfo {
                 backend: BackendType::Upstream {
                     backends: vec![BackendEntry {
+                        pinned: None,
                         address: address.to_string(),
                         container_id: None,
                         container_name: None,
@@ -3654,6 +3788,7 @@ mod tests {
         let route = RouteInfo {
             backend: BackendType::Upstream {
                 backends: vec![BackendEntry {
+                    pinned: None,
                     address: "127.0.0.1:8080".to_string(),
                     container_id: None,
                     container_name: None,
@@ -3681,6 +3816,7 @@ mod tests {
         let route = RouteInfo {
             backend: BackendType::Upstream {
                 backends: vec![BackendEntry {
+                    pinned: None,
                     address: "127.0.0.1:8080".to_string(),
                     container_id: None,
                     container_name: None,
@@ -3704,6 +3840,7 @@ mod tests {
         let route = RouteInfo {
             backend: BackendType::Upstream {
                 backends: vec![BackendEntry {
+                    pinned: None,
                     address: "192.168.1.100:3000".to_string(),
                     container_id: None,
                     container_name: None,
@@ -3731,16 +3868,19 @@ mod tests {
             backend: BackendType::Upstream {
                 backends: vec![
                     BackendEntry {
+                        pinned: None,
                         address: "127.0.0.1:8080".to_string(),
                         container_id: None,
                         container_name: None,
                     },
                     BackendEntry {
+                        pinned: None,
                         address: "127.0.0.1:8081".to_string(),
                         container_id: None,
                         container_name: None,
                     },
                     BackendEntry {
+                        pinned: None,
                         address: "127.0.0.1:8082".to_string(),
                         container_id: None,
                         container_name: None,
@@ -3787,11 +3927,13 @@ mod tests {
         let backend = BackendType::Upstream {
             backends: vec![
                 BackendEntry {
+                    pinned: None,
                     address: "127.0.0.1:8080".to_string(),
                     container_id: None,
                     container_name: None,
                 },
                 BackendEntry {
+                    pinned: None,
                     address: "127.0.0.1:8081".to_string(),
                     container_id: None,
                     container_name: None,
@@ -3846,6 +3988,7 @@ mod tests {
     fn test_backend_type_upstream_single_address() {
         let backend = BackendType::Upstream {
             backends: vec![BackendEntry {
+                pinned: None,
                 address: "192.168.1.100:3000".to_string(),
                 container_id: None,
                 container_name: None,
@@ -3893,6 +4036,7 @@ mod tests {
         let route = RouteInfo {
             backend: BackendType::Upstream {
                 backends: vec![BackendEntry {
+                    pinned: None,
                     address: "10.0.0.1:9000".to_string(),
                     container_id: None,
                     container_name: None,
@@ -4922,8 +5066,121 @@ mod unavailable_route_tests {
         Ok(())
     }
 
+    /// A sleeping environment whose hostname sits under a TLS wildcard custom
+    /// route still wakes: the wildcard never serves that hostname, so it must
+    /// not count as owning it either, or the request gets neither a route nor
+    /// a wake. Under an HTTP wildcard the hostname is still served by that
+    /// wildcard, as before.
     #[tokio::test]
-    async fn live_route_always_wins_over_an_unavailable_entry(
+    async fn a_sleeping_environment_under_a_tls_wildcard_still_wakes(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use temps_entities::environments;
+
+        let Some(database) = database_or_skip().await else {
+            return Ok(());
+        };
+        let test_db = TestDBMockOperations::new(database.db.clone()).await?;
+        let (_project, environment, deployment) = test_db
+            .create_test_project_with_domain("sleepy-tls.example.com")
+            .await?;
+        environments::ActiveModel {
+            id: Set(environment.id),
+            sleeping: Set(true),
+            ..Default::default()
+        }
+        .update(test_db.db.as_ref())
+        .await?;
+        insert_container(&test_db, deployment.id, "exited", Some(9705)).await?;
+        insert_environment_domain(&test_db, environment.id, "shop.tlssleep.example.com").await?;
+        insert_environment_domain(&test_db, environment.id, "shop.httpsleep.example.com").await?;
+        for (domain, route_type) in [
+            (
+                "*.tlssleep.example.com",
+                temps_entities::custom_routes::RouteType::Tls,
+            ),
+            (
+                "*.httpsleep.example.com",
+                temps_entities::custom_routes::RouteType::Http,
+            ),
+        ] {
+            custom_routes::ActiveModel {
+                domain: Set(domain.to_string()),
+                host: Set("8.8.4.4".to_string()),
+                port: Set(8443),
+                enabled: Set(true),
+                route_type: Set(route_type),
+                ..Default::default()
+            }
+            .insert(test_db.db.as_ref())
+            .await?;
+        }
+
+        let route_table = CachedPeerTable::new(test_db.db.clone());
+        route_table.load_routes().await?;
+
+        let host = "shop.tlssleep.example.com";
+        assert!(route_table.get_route_by_sni(host).is_none());
+        assert!(
+            !route_table.owns_hostname(host),
+            "the TLS wildcard must not keep the sleeping environment from waking"
+        );
+        // Another name under the same wildcard is still the wildcard's.
+        assert!(route_table.owns_hostname("other.tlssleep.example.com"));
+        // An HTTP wildcard still serves (and so owns) the name, as before.
+        assert!(route_table.owns_hostname("shop.httpsleep.example.com"));
+
+        test_db.cleanup().await?;
+        Ok(())
+    }
+
+    /// A TLS wildcard custom route does not take an app hostname that is down
+    /// right now: SNI lookup refuses it, and the host still reports the
+    /// unavailable page rather than looking routable.
+    #[tokio::test]
+    async fn a_tls_wildcard_does_not_hide_an_unavailable_app_hostname(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(database) = database_or_skip().await else {
+            return Ok(());
+        };
+        let test_db = TestDBMockOperations::new(database.db.clone()).await?;
+        let (_project, environment, deployment) = test_db
+            .create_test_project_with_domain("down-tls.example.com")
+            .await?;
+        insert_container(&test_db, deployment.id, "exited", Some(9704)).await?;
+        insert_environment_domain(&test_db, environment.id, "store.tlswild.example.com").await?;
+        custom_routes::ActiveModel {
+            domain: Set("*.tlswild.example.com".to_string()),
+            host: Set("8.8.4.4".to_string()),
+            port: Set(8443),
+            enabled: Set(true),
+            route_type: Set(temps_entities::custom_routes::RouteType::Tls),
+            ..Default::default()
+        }
+        .insert(test_db.db.as_ref())
+        .await?;
+
+        let route_table = CachedPeerTable::new(test_db.db.clone());
+        route_table.load_routes().await?;
+
+        assert!(route_table
+            .get_route_by_sni("store.tlswild.example.com")
+            .is_none());
+        assert!(
+            route_table
+                .get_unavailable_route("store.tlswild.example.com")
+                .is_some(),
+            "the down app hostname must still answer with its unavailable page"
+        );
+        assert!(route_table
+            .get_route_by_sni("other.tlswild.example.com")
+            .is_some());
+
+        test_db.cleanup().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_live_wildcard_route_wins_over_an_unavailable_entry_but_an_exact_custom_route_does_not(
     ) -> Result<(), Box<dyn std::error::Error>> {
         use crate::route_table::UnavailableReason;
 
@@ -4942,12 +5199,12 @@ mod unavailable_route_tests {
         ] {
             insert_environment_domain(&test_db, environment.id, domain).await?;
         }
-        // Operator routes that resolve two of those hosts to a live upstream:
-        // one exact, one through a wildcard.
+        // Operator routes aimed at two of those hosts: one exact, one through
+        // a wildcard.
         for domain in ["shared.example.com", "*.wild.example.com"] {
             custom_routes::ActiveModel {
                 domain: Set(domain.to_string()),
-                host: Set("localhost".to_string()),
+                host: Set("8.8.8.8".to_string()),
                 port: Set(8080),
                 enabled: Set(true),
                 ..Default::default()
@@ -4959,16 +5216,35 @@ mod unavailable_route_tests {
         let route_table = CachedPeerTable::new(test_db.db.clone());
         route_table.load_routes().await?;
 
-        for host in ["shared.example.com", "app.wild.example.com"] {
-            assert!(
-                route_table.get_route_by_host(host).is_some(),
-                "{host} has a live route"
-            );
-            assert!(
-                route_table.get_unavailable_route(host).is_none(),
-                "{host} has a live route and must not be reported unavailable"
-            );
-        }
+        // A wildcard route is the operator's catch-all and is what serves a host
+        // the platform has no live route for.
+        assert!(
+            route_table
+                .get_route_by_host("app.wild.example.com")
+                .is_some(),
+            "a live wildcard route serves the host"
+        );
+        assert!(
+            route_table
+                .get_unavailable_route("app.wild.example.com")
+                .is_none(),
+            "a live route must not be reported unavailable"
+        );
+        // An exact custom route never takes an environment's own hostname, even
+        // while that environment has nothing running: the platform keeps the
+        // name and answers it as unavailable.
+        assert!(
+            route_table
+                .get_route_by_host("shared.example.com")
+                .is_none(),
+            "an exact custom route must not displace an environment address"
+        );
+        assert!(
+            route_table
+                .get_unavailable_route("shared.example.com")
+                .is_some(),
+            "the environment address stays reported as unavailable"
+        );
         assert_unavailable(
             &route_table,
             "only-down.example.com",

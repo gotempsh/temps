@@ -315,6 +315,12 @@ impl TempsPlugin for ProxyPlugin {
                 project_access_checker: project_access_checker.clone(),
             });
 
+        let ip_access_control_state =
+            Arc::new(crate::handler::ip_access_control::IpAccessControlState {
+                service: ip_access_control_service,
+                audit_service: context.require_service::<dyn temps_core::AuditLogger>(),
+            });
+
         let edge_rules_state = Arc::new(crate::handler::edge_rules::EdgeRulesState {
             service: context
                 .require_service::<crate::service::edge_rule_service::EdgeRuleService>(),
@@ -331,7 +337,10 @@ impl TempsPlugin for ProxyPlugin {
         });
 
         // Create the app state directly
-        let app_state = Arc::new(crate::handler::types::AppState { lb_service });
+        let app_state = Arc::new(crate::handler::types::AppState {
+            lb_service,
+            audit_service: context.require_service::<dyn temps_core::AuditLogger>(),
+        });
 
         let proxy_logs_state = Arc::new(crate::handler::proxy_logs::ProxyLogsState {
             service: proxy_log_service,
@@ -344,7 +353,7 @@ impl TempsPlugin for ProxyPlugin {
             .merge(crate::handler::proxy_logs::create_routes().with_state(proxy_logs_state))
             .merge(
                 crate::handler::ip_access_control::create_routes()
-                    .with_state(ip_access_control_service),
+                    .with_state(ip_access_control_state),
             )
             .merge(
                 crate::handler::project_ip_access::create_routes()

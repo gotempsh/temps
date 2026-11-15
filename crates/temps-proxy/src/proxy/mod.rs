@@ -4364,16 +4364,9 @@ impl ProxyHttp for LoadBalancer {
                     "path route target is static and has no upstream",
                 ));
             }
-            let backend = target.select_backend_avoiding(&ctx.failed_upstreams);
-            PeerSelection {
-                peer: Box::new(HttpPeer::new(
-                    backend.address.as_str(),
-                    false,
-                    String::new(),
-                )),
-                container_id: backend.container_id,
-                container_name: backend.container_name,
-            }
+            crate::services::peer_for_selection(
+                target.select_backend_avoiding(&ctx.failed_upstreams),
+            )?
         } else {
             // Use the upstream resolver trait
             // Pass SNI hostname for TLS-based routing

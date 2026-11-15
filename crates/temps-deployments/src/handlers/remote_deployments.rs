@@ -891,40 +891,11 @@ async fn validate_uploaded_image_platform(
 }
 
 fn validate_health_check_path(path: &str) -> Result<(), Problem> {
-    let invalid = |detail: &str| {
+    temps_core::request_path::validate_request_path(path).map_err(|error| {
         problemdetails::new(StatusCode::BAD_REQUEST)
             .with_title("Invalid Health Check Path")
-            .with_detail(detail.to_string())
-    };
-
-    if path.len() > 2048 {
-        return Err(invalid(&format!(
-            "health_check_path length {} exceeds 2048 byte limit",
-            path.len()
-        )));
-    }
-    if !path.starts_with('/') {
-        return Err(invalid("health_check_path must start with '/'"));
-    }
-    if path.contains('@') {
-        return Err(invalid(
-            "health_check_path must not contain '@' (userinfo injection)",
-        ));
-    }
-    if path.contains("://") {
-        return Err(invalid(
-            "health_check_path must not contain '://' (scheme injection)",
-        ));
-    }
-    if path
-        .chars()
-        .any(|c| c == '\r' || c == '\n' || c == '\0' || c == '\t')
-    {
-        return Err(invalid(
-            "health_check_path must not contain control characters",
-        ));
-    }
-    Ok(())
+            .with_detail(format!("health_check_path {error}"))
+    })
 }
 
 fn validate_container_command(command: &[String]) -> Result<(), Problem> {

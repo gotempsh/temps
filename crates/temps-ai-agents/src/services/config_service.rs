@@ -1083,6 +1083,45 @@ impl AgentConfigService {
             }
         }
 
+        // A config repository other than the project's own, and not on the
+        // administrator's list, is kept on the agent but never used. Say so
+        // now, where the YAML was just read, as well as in each run's log.
+        // The project and the allow-list are read once, and only when some
+        // agent names a config repository.
+        let named_repos: Vec<(&AgentYamlConfig, &str)> = yaml_agents
+            .iter()
+            .filter_map(|a| {
+                a.config_repo
+                    .as_deref()
+                    .filter(|r| !r.is_empty())
+                    .map(|r| (a, r))
+            })
+            .collect();
+        if !named_repos.is_empty() {
+            match crate::services::config_repo_policy::ProjectConfigRepoPolicy::load(
+                self.db.as_ref(),
+                project_id,
+            )
+            .await
+            {
+                Ok(policy) => {
+                    for (a, repo) in named_repos {
+                        if let Err(error) = policy.check(repo) {
+                            tracing::warn!(
+                                project_id,
+                                agent = %a.slug(),
+                                "Agent config repo will not be used: {error}"
+                            );
+                        }
+                    }
+                }
+                Err(error) => tracing::warn!(
+                    project_id,
+                    "Could not check the agents' config repositories while syncing: {error}"
+                ),
+            }
+        }
+
         // 1. Load ALL existing agents for this project (not just yaml-sourced)
         let existing = project_agents::Entity::find()
             .filter(project_agents::Column::ProjectId.eq(project_id))

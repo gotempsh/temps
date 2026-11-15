@@ -44,7 +44,7 @@ mod route_table_tests {
         // Create a custom route
         let custom_route = custom_routes::ActiveModel {
             domain: Set("api.example.com".to_string()),
-            host: Set("localhost".to_string()),
+            host: Set("8.8.8.8".to_string()),
             port: Set(8080),
             enabled: Set(true),
             ..Default::default()
@@ -61,7 +61,7 @@ mod route_table_tests {
         assert!(route_info.is_some());
 
         let route_info = route_info.unwrap();
-        assert_eq!(route_info.get_backend_addr(), "localhost:8080");
+        assert_eq!(route_info.get_backend_addr(), "8.8.8.8:8080");
         assert!(route_info.project.is_none()); // Custom routes don't have projects
         assert!(route_info.environment.is_none());
         assert!(route_info.deployment.is_none());
@@ -194,7 +194,7 @@ mod route_table_tests {
         // which lookup API the proxy caller uses.
         custom_routes::ActiveModel {
             domain: Set("api.apps.example.com".to_string()),
-            host: Set("exact-backend".to_string()),
+            host: Set("8.8.4.4".to_string()),
             port: Set(7443),
             enabled: Set(true),
             ..Default::default()
@@ -239,7 +239,7 @@ mod route_table_tests {
                 .get_route_by_host("api.apps.example.com")
                 .expect("exact route must resolve")
                 .get_backend_addr(),
-            "exact-backend:7443"
+            "8.8.4.4:7443"
         );
         for host in [
             "apps.example.com",
@@ -492,7 +492,7 @@ mod route_table_tests {
         // Add a custom route
         let custom_route = custom_routes::ActiveModel {
             domain: Set("new-route.com".to_string()),
-            host: Set("localhost".to_string()),
+            host: Set("8.8.8.8".to_string()),
             port: Set(8888),
             enabled: Set(true),
             ..Default::default()
@@ -520,7 +520,7 @@ mod route_table_tests {
         for i in 0..5 {
             let custom_route = custom_routes::ActiveModel {
                 domain: Set(format!("route-{}.com", i)),
-                host: Set("localhost".to_string()),
+                host: Set("8.8.8.8".to_string()),
                 port: Set(8000 + i),
                 enabled: Set(true),
                 ..Default::default()
@@ -540,7 +540,7 @@ mod route_table_tests {
             let route_info = route_info.unwrap();
             assert_eq!(
                 route_info.get_backend_addr(),
-                format!("localhost:{}", 8000 + i)
+                format!("8.8.8.8:{}", 8000 + i)
             );
         }
 
@@ -557,7 +557,7 @@ mod route_table_tests {
         // Create disabled custom route
         let custom_route = custom_routes::ActiveModel {
             domain: Set("disabled-route.com".to_string()),
-            host: Set("localhost".to_string()),
+            host: Set("8.8.8.8".to_string()),
             port: Set(8080),
             enabled: Set(false), // Disabled
             ..Default::default()
@@ -1041,7 +1041,7 @@ mod route_table_tests {
 
         custom_routes::ActiveModel {
             domain: Set("contested.example.com".to_string()),
-            host: Set("10.0.0.1".to_string()),
+            host: Set("1.1.1.1".to_string()),
             port: Set(9999),
             enabled: Set(true),
             ..Default::default()
@@ -1068,7 +1068,7 @@ mod route_table_tests {
             .expect("the legitimate custom route must still resolve");
         assert_eq!(
             route.get_backend_addr(),
-            "10.0.0.1:9999",
+            "1.1.1.1:9999",
             "the operator's custom route must win the host, not the discovered container"
         );
 
@@ -1087,7 +1087,7 @@ mod route_table_tests {
 
         custom_routes::ActiveModel {
             domain: Set("*.wild.example.com".to_string()),
-            host: Set("10.0.0.2".to_string()),
+            host: Set("1.0.0.1".to_string()),
             port: Set(7777),
             enabled: Set(true),
             ..Default::default()
@@ -1116,7 +1116,7 @@ mod route_table_tests {
         let route = route_table
             .get_route_by_host("api.wild.example.com")
             .expect("the wildcard custom route must still resolve the host");
-        assert_eq!(route.get_backend_addr(), "10.0.0.2:7777");
+        assert_eq!(route.get_backend_addr(), "1.0.0.1:7777");
 
         test_db.cleanup().await?;
         Ok(())

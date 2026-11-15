@@ -415,9 +415,11 @@ async fn discovered_route_loses_a_host_collision_with_a_db_driven_route() {
     let host = "contested.example.test";
 
     // Pre-existing, legitimate, operator-configured route for the same host.
+    // The upstream is a public address: a custom route to a private one is
+    // refused when the route table loads, which would leave nothing to win.
     temps_entities::custom_routes::ActiveModel {
         domain: Set(host.to_string()),
-        host: Set("10.9.8.7".to_string()),
+        host: Set("8.8.8.8".to_string()),
         port: Set(9999),
         enabled: Set(true),
         route_type: Set(temps_entities::custom_routes::RouteType::Http),
@@ -481,7 +483,7 @@ async fn discovered_route_loses_a_host_collision_with_a_db_driven_route() {
     match &route.backend {
         BackendType::Upstream { backends, .. } => {
             assert_eq!(
-                backends[0].address, "10.9.8.7:9999",
+                backends[0].address, "8.8.8.8:9999",
                 "the operator's custom route must win the host"
             );
         }

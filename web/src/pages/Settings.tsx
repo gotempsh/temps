@@ -40,6 +40,7 @@ import { useForm, useWatch } from 'react-hook-form'
 import { useLocation } from 'react-router'
 import { toast } from 'sonner'
 import { PageHeader } from '@/components/layout/PageContainer'
+import { LocalScreenshotNote } from '@/components/settings/LocalScreenshotNote'
 
 type SettingsFormData = Pick<
   PlatformSettings,
@@ -593,6 +594,8 @@ export function Settings() {
                       </SelectContent>
                     </Select>
                   </div>
+
+                  {screenshots.provider === 'local' && <LocalScreenshotNote />}
 
                   {screenshots.provider === 'external' && (
                     <div className="space-y-2">

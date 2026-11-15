@@ -126,6 +126,16 @@ impl CronConfig {
                     describe()
                 )));
             }
+            // The path is appended to the address of the app's container on
+            // every run, so a repository must not be able to make it name
+            // another host.
+            if let Err(error) = temps_core::request_path::validate_request_path(&entry.path) {
+                return Err(CronConfigError::ConfigError(format!(
+                    "{}: invalid HTTP cron path '{}': path {error}",
+                    describe(),
+                    entry.path.escape_debug()
+                )));
+            }
             return Ok(Self {
                 path: entry.path.clone(),
                 schedule: entry.schedule.clone(),
@@ -1092,6 +1102,35 @@ cron:
             },
             "cannot start with 'workflow:'",
         );
+    }
+
+    #[test]
+    fn from_repo_refuses_an_http_path_that_names_another_host() {
+        let http = |path: &str| temps_core::CronJobConfig {
+            path: path.to_string(),
+            schedule: "0 3 * * *".into(),
+            ..Default::default()
+        };
+        for path in [
+            "@10.0.0.5:8500/v1/agent/self",
+            "//10.0.0.5:8500/x",
+            "x",
+            "api/cron",
+            "/x@10.0.0.5",
+            "/go?to=http://10.0.0.5/",
+            "/a\nb",
+            "/a\0b",
+            "/a\\b",
+        ] {
+            let error = CronConfig::from_repo(&http(path))
+                .expect_err(path)
+                .to_string();
+            assert!(error.contains("invalid HTTP cron path"), "{path}: {error}");
+        }
+        // Ordinary paths, with a query string, still pass.
+        for path in ["/", "/api/cron/report", "/api/run?job=nightly"] {
+            assert_eq!(CronConfig::from_repo(&http(path)).unwrap().path, path);
+        }
     }
 
     #[test]

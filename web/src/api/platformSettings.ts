@@ -110,6 +110,8 @@ export interface MultiNodeSettings {
 export interface AiConfigSettings {
   config_repo: string
   config_repo_branch: string
+  /** Config repositories projects may name besides their own. */
+  config_repo_allowlist?: string[]
 }
 
 export type MetricsStoreKind = 'timescale_db' | 'click_house'
