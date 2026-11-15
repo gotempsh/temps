@@ -65,12 +65,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **workflows:** Add the workflows API and its permissions
 - **workflows:** Run the workflow engine in temps serve
 - **workflows:** Add the TypeScript workflows SDK
-- **workflows:** Add the durable workflow tables and entities
-- **workflows:** Add the workflow store with fenced leases and bounded claims
-- **workflows:** Add the scheduler, invoker and workflow service
-- **workflows:** Add the workflows API and its permissions
-- **workflows:** Run the workflow engine in temps serve
-- **workflows:** Add the TypeScript workflows SDK
 - **workflows:** Child workflows started exactly once, with their result delivered to the parent
 - **workflows:** Add persistent Temporal and Restate engine templates
 - **workflows:** Implement M2 and M3 orchestration, SDKs and console controls
@@ -82,6 +76,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **api:** Regenerate the console and CLI clients for the internal routing status fields
 - **deps:** Bump quinn-udp to 0.5.16 for RUSTSEC-2026-0538
 - **changelog:** Print the migration note of breaking changes
+- **changelog:** List repeated entries once and keep breaking notes on one line
 
 ### CI
 
@@ -117,8 +112,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Say which secret names a local-files upload actually catches
 - **web:** Require primary actions to finish their job in one click
 - **reference:** Say where admin commands find the database URL when none is set
-- **adr:** Durable workflows orchestrated by Temps
-- **workflows:** Specify executor protocol version 1
 - **adr:** Durable workflows orchestrated by Temps
 - **workflows:** Specify executor protocol version 1
 - **ci:** Require minimizing runner allocations
@@ -467,8 +460,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **providers:** Check that a failed healthcheck reload reconnects the listener
 - **web:** Stop the plugins page test's module mocks leaking into later test files
 - **sandbox:** Refresh the egress-sidecar golden fixture for the internal proxy address
-- **sandbox:** Refresh the egress-sidecar golden fixture for the internal proxy address
-- **workflows:** Run the SDK's conformance suite and an end-to-end test against the real engine
 - **workflows:** Run the SDK's conformance suite and an end-to-end test against the real engine
 - **workflows:** Advance event replay to recorded wake time
 
