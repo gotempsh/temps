@@ -1693,6 +1693,9 @@ function LoadBalancingFields({
 }) {
   const policy = value ?? defaultLoadBalancing
   const health = policy.healthCheck ?? defaultLoadBalancing.healthCheck!
+  const limitDraft = healthForm.watch('maxInFlightPerReplica')
+  const invalidLimit =
+    !healthDraftSchema.shape.maxInFlightPerReplica.safeParse(limitDraft).success
   return (
     <div className="space-y-4">
       <div className="space-y-2">
@@ -1740,21 +1743,33 @@ function LoadBalancingFields({
               </p>
             </>
           )}
-          <Label htmlFor={`lb-limit-${id}`}>
-            In-flight requests per replica before overflow
-          </Label>
-          <Input
-            id={`lb-limit-${id}`}
-            type="number"
-            min={1}
-            placeholder="Unlimited"
-            aria-invalid={!!healthForm.formState.errors.maxInFlightPerReplica}
-            {...healthForm.register('maxInFlightPerReplica')}
-          />
-          {healthForm.formState.errors.maxInFlightPerReplica && (
-            <p role="alert" className="text-sm text-destructive">
-              {healthForm.formState.errors.maxInFlightPerReplica.message}
-            </p>
+          {(policy.strategy === 'preferred_nodes' || invalidLimit) && (
+            <>
+              <Label htmlFor={`lb-limit-${id}`}>
+                In-flight requests per replica before overflow
+              </Label>
+              <Input
+                id={`lb-limit-${id}`}
+                type="number"
+                min={1}
+                placeholder="Unlimited"
+                aria-invalid={
+                  !!healthForm.formState.errors.maxInFlightPerReplica
+                }
+                {...healthForm.register('maxInFlightPerReplica')}
+              />
+              {healthForm.formState.errors.maxInFlightPerReplica && (
+                <p role="alert" className="text-sm text-destructive">
+                  {healthForm.formState.errors.maxInFlightPerReplica.message}
+                </p>
+              )}
+              {policy.strategy !== 'preferred_nodes' && (
+                <p className="text-sm text-muted-foreground">
+                  Overflow limits apply only to preferred-node routing. Clear or
+                  correct this invalid saved value to continue.
+                </p>
+              )}
+            </>
           )}
           <div className="flex items-center gap-2">
             <Switch

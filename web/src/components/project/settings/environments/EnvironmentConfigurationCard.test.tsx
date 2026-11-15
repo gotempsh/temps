@@ -276,6 +276,37 @@ test('routing drafts survive refetch and reset for another environment', async (
   ).toBe('2')
 })
 
+for (const strategy of ['round_robin', 'preferred_nodes'] as const) {
+  for (const limit of [null, 12]) {
+    test(`${strategy} shows an overflow limit only when applicable (${limit})`, () => {
+      mockApi({ 'GET /internal/nodes': () => jsonResponse({ nodes: [] }) })
+      const view = render(
+        <QueryClientProvider client={new QueryClient()}>
+          <MemoryRouter>
+            <EnvironmentConfigurationCard
+              project={{ id: 1, source_type: 'manual' } as ProjectResponse}
+              environment={
+                {
+                  id: 1,
+                  name: 'production',
+                  deployment_config: {
+                    loadBalancing: { strategy, maxInFlightPerReplica: limit },
+                  },
+                } as EnvironmentResponse
+              }
+              onUpdate={() => {}}
+            />
+          </MemoryRouter>
+        </QueryClientProvider>
+      )
+      const input = view.queryByLabelText(
+        'In-flight requests per replica before overflow'
+      )
+      expect(input !== null).toBe(strategy === 'preferred_nodes')
+    })
+  }
+}
+
 test('round robin rejects an invalid limit and keeps it editable', async () => {
   let submissions = 0
   const environment = {
@@ -307,11 +338,12 @@ test('round robin rejects an invalid limit and keeps it editable', async () => {
   const limit = view.getByLabelText(
     'In-flight requests per replica before overflow'
   )
-  fireEvent.submit(limit.closest('form')!)
+  const form = limit.closest('form')!
+  fireEvent.submit(form)
   await waitFor(() => expect(limit.getAttribute('aria-invalid')).toBe('true'))
   expect(submissions).toBe(0)
   fireEvent.change(limit, { target: { value: '' } })
-  fireEvent.submit(limit.closest('form')!)
+  fireEvent.submit(form)
   await waitFor(() => expect(submissions).toBe(1))
 })
 
