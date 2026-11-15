@@ -116,6 +116,9 @@ pub struct AppSettings {
     /// This is the sole control surface — there is no CLI/env override.
     #[serde(default)]
     pub trust_loopback_forwarded_ip: Option<bool>,
+    /// Inbound reverse proxy IPs/CIDRs trusted to append or overwrite forwarded
+    /// client IP headers. Stored in the settings row; empty trusts no extra peers.
+    pub trusted_proxy_cidrs: Vec<String>,
     /// Opt in to platform identity in proxy responses. Missing values preserve the stored choice.
     #[serde(default)]
     pub expose_platform_identity: Option<bool>,
@@ -2529,6 +2532,7 @@ impl Default for AppSettings {
             security_headers: SecurityHeadersSettings::default(),
             rate_limiting: RateLimitSettings::default(),
             trust_loopback_forwarded_ip: None,
+            trusted_proxy_cidrs: Vec::new(),
             expose_platform_identity: None,
             loopback_ja4_header: None,
             docker_registry: DockerRegistrySettings::default(),

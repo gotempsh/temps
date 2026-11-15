@@ -292,3 +292,14 @@ test('Off hides the list; saving Off keeps the valid entries and drops a broken 
   })
   api.restore()
 })
+
+test('proxy trust setup is discoverable before any IP list is configured', () => {
+  const { view } = mount({
+    data: { ...base, configured: false, mode: 'disabled', cidrs: [] },
+  })
+  expect(
+    view
+      .getByRole('link', { name: 'Configure trusted proxies' })
+      .getAttribute('href')
+  ).toBe('/settings/security#trusted-proxy-cidrs')
+})

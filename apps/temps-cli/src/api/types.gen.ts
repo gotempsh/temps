@@ -2424,6 +2424,11 @@ export type AppSettings = {
      * `url_validation::set_trusted_private_networks`.
      */
     trusted_private_networks?: Array<string>;
+    /**
+     * Inbound reverse proxy IPs/CIDRs trusted to append or overwrite forwarded
+     * client IP headers. Stored in the settings row; empty trusts no extra peers.
+     */
+    trusted_proxy_cidrs?: Array<string>;
 };
 
 /**
@@ -2633,6 +2638,10 @@ export type AppSettingsResponse = {
      * requests may reach despite the SSRF guard. Empty means none.
      */
     trusted_private_networks: Array<string>;
+    /**
+     * Inbound proxy IP addresses/CIDRs trusted for forwarded client IP headers.
+     */
+    trusted_proxy_cidrs: Array<string>;
 };
 
 export type AppStartWorkflowRunResponse = {
@@ -39918,6 +39927,11 @@ export type AppSettingsWritable = {
      * `url_validation::set_trusted_private_networks`.
      */
     trusted_private_networks?: Array<string>;
+    /**
+     * Inbound reverse proxy IPs/CIDRs trusted to append or overwrite forwarded
+     * client IP headers. Stored in the settings row; empty trusts no extra peers.
+     */
+    trusted_proxy_cidrs?: Array<string>;
 };
 
 export type CiExecutorSettingsWritable = {
