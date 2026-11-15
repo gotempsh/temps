@@ -188,7 +188,7 @@ async fn handle(request: Request<Incoming>, shared: &Shared, slot: &Slot) -> Res
     if request.method() == Method::CONNECT {
         tunnel(request, shared, slot).await
     } else {
-        forward(request, shared).await
+        forward(request, shared, slot).await
     }
 }
 
@@ -228,7 +228,11 @@ async fn tunnel(
 }
 
 /// Send one plain HTTP request to a checked address of its own host.
-async fn forward(mut request: Request<Incoming>, shared: &Shared) -> Response<ProxyBody> {
+async fn forward(
+    mut request: Request<Incoming>,
+    shared: &Shared,
+    slot: &Slot,
+) -> Response<ProxyBody> {
     let (host, port) = match forward_target(request.uri()) {
         Ok(target) => target,
         Err(reason) => return shared.refuse(StatusCode::BAD_REQUEST, &reason),
@@ -281,7 +285,11 @@ async fn forward(mut request: Request<Incoming>, shared: &Shared) -> Response<Pr
     if response.status() == StatusCode::SWITCHING_PROTOCOLS {
         if let Some(client_upgrade) = client_upgrade {
             let upstream_upgrade = hyper::upgrade::on(&mut response);
+            // Like a `CONNECT` tunnel, the upgraded stream outlives this
+            // connection's HTTP handling, so it takes over the slot.
+            let permit = slot.lock().unwrap_or_else(PoisonError::into_inner).take();
             shared.spawn(async move {
+                let _permit = permit;
                 if let (Ok(client), Ok(upstream)) = (client_upgrade.await, upstream_upgrade.await) {
                     let _ = tokio::io::copy_bidirectional(
                         &mut TokioIo::new(client),
@@ -749,6 +757,79 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
         assert!(response.ends_with("on port 80"), "{response}");
         assert_eq!(app_hits.load(Ordering::SeqCst), 1);
+    }
+
+    /// An upgraded stream (a WebSocket) outlives the HTTP connection it came
+    /// from, so it keeps that connection's slot: with every slot held by
+    /// open upgrades, a further connection waits until one of them closes.
+    #[tokio::test]
+    async fn upgraded_streams_count_against_the_connection_limit() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind upstream");
+        let app = listener.local_addr().expect("upstream address");
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buffer = vec![0u8; 4096];
+                    let read = socket.read(&mut buffer).await.unwrap_or(0);
+                    let response = if buffer[..read].starts_with(b"GET /socket ") {
+                        "HTTP/1.1 101 Switching Protocols\r\nconnection: upgrade\r\n\
+                         upgrade: websocket\r\n\r\n"
+                    } else {
+                        "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok"
+                    };
+                    if socket.write_all(response.as_bytes()).await.is_ok() {
+                        // Hold the upgraded stream open until the peer closes.
+                        let _ = socket.read(&mut buffer).await;
+                    }
+                });
+            }
+        });
+        let port = app.port();
+        let policy =
+            RequestPolicy::for_target(&format!("http://app.example.test:{port}/")).expect("policy");
+        let proxy = PinningProxy::start(
+            policy,
+            exact_lookup("app.example.test", app),
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .await
+        .expect("start proxy");
+
+        let upgrade = format!(
+            "GET http://app.example.test:{port}/socket HTTP/1.1\r\nhost: app.example.test:{port}\r\n\
+             connection: upgrade\r\nupgrade: websocket\r\n\r\n"
+        );
+        let mut sockets = Vec::new();
+        for _ in 0..MAX_CONNECTIONS {
+            let mut stream = TcpStream::connect(proxy.address())
+                .await
+                .expect("connect proxy");
+            stream.write_all(upgrade.as_bytes()).await.expect("send");
+            let response = read_response(&mut stream).await;
+            assert!(response.starts_with("HTTP/1.1 101"), "{response}");
+            sockets.push(stream);
+        }
+
+        let plain = format!(
+            "GET http://app.example.test:{port}/page HTTP/1.1\r\nhost: app.example.test:{port}\r\n\r\n"
+        );
+        let mut waiting = TcpStream::connect(proxy.address())
+            .await
+            .expect("connect proxy");
+        waiting.write_all(plain.as_bytes()).await.expect("send");
+        let mut byte = [0u8; 1];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), waiting.read(&mut byte))
+                .await
+                .is_err(),
+            "a connection beyond the limit must wait while every slot is held by an upgrade"
+        );
+
+        drop(sockets.pop());
+        let response = read_response(&mut waiting).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     }
 
     #[tokio::test]
