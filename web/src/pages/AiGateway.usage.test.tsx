@@ -361,3 +361,27 @@ test('the request log shows a free request as $0.00 and an unpriced one as unkno
   // No dollar figure at all: its cost cell reads "—".
   expect(within(unpriced).queryByText(/\$/)).toBeNull()
 })
+
+test('a cost filter in dollars is sent in microcents, the unit costs are recorded in', async () => {
+  const recent: URLSearchParams[] = []
+  globalThis.fetch = (async (input: Request | string | URL) => {
+    const url = new URL(String(input), 'http://localhost')
+    if (url.pathname === '/api/ai/usage/recent') {
+      recent.push(url.searchParams)
+      return json({ entries: [], total: 0 })
+    }
+    if (url.pathname.startsWith('/api/ai/usage/')) return json([])
+    return new Response('{}', { status: 404 })
+  }) as typeof fetch
+  renderUsage()
+
+  fireEvent.click(await screen.findByRole('button', { name: 'Filters' }))
+  fireEvent.change(screen.getByLabelText('Filter by cost in dollars'), {
+    target: { value: '1.25' },
+  })
+
+  // $1.25 is 1,250,000 microcents, the figure a $1.25 request is recorded at.
+  await waitFor(() =>
+    expect(recent[recent.length - 1]?.get('cost_gte')).toBe('1250000')
+  )
+})

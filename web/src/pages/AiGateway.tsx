@@ -1102,11 +1102,12 @@ export function UsageAnalytics() {
   // The filter row is collapsed by default and only revealed on demand.
   const [recentFiltersOpen, setRecentFiltersOpen] = useState(false)
 
-  // Cost is entered by the user in dollars; the API expects microcents.
+  // Cost is entered by the user in dollars; the API expects microcents
+  // (1e-6 USD), the unit costs are recorded in.
   const recentCostMicrocents = useMemo(() => {
     const dollars = parseFloat(recentCostInput)
     if (!Number.isFinite(dollars) || dollars < 0) return undefined
-    return Math.round(dollars * 1_000_000 * 100)
+    return Math.round(dollars * 1_000_000)
   }, [recentCostInput])
 
   // Tokens are entered as a plain integer count.
