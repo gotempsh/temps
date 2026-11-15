@@ -66,6 +66,29 @@ pub const FAILURE_CLASSIFIER_VERSION: u8 = 7;
 /// Marker Compose deployments put before embedded container log tails.
 const CONTAINER_LOGS_MARKER: &str = "container logs for unhealthy/stopped services:";
 
+const COMPOSE_CHECK_MARKERS: [&str; 2] = [
+    "compose security policy rejected [check=",
+    "invalid compose override [check=",
+];
+
+/// Check labels are metadata, not failure signals (e.g. `oom_killer`).
+/// Removing only the newly introduced annotation preserves the existing
+/// stage/code matching semantics of the diagnostic text around it.
+fn without_compose_check_annotation(reason: &str) -> Option<String> {
+    let (start, marker) = COMPOSE_CHECK_MARKERS
+        .iter()
+        .filter_map(|marker| reason.find(marker).map(|start| (start, marker)))
+        .min_by_key(|(start, _)| *start)?;
+    let label_start = start + marker.len();
+    let label_end = label_start + reason[label_start..].find(']')? + 1;
+    let annotation_start = label_start - "[check=".len();
+    Some(format!(
+        "{}{}",
+        &reason[..annotation_start],
+        &reason[label_end..]
+    ))
+}
+
 /// The pipeline stage a deployment failed in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -426,6 +449,27 @@ pub fn describe_failure(reason: Option<&str>) -> Option<DeploymentFailureInfo> {
         timeout_elapsed_seconds: is_timeout.then(|| elapsed_seconds(head)).flatten(),
         classifier_version: FAILURE_CLASSIFIER_VERSION,
     })
+}
+
+/// Read only the typed check label written before any user-controlled error
+/// fields. Older failures and non-configurable validation errors have no label.
+/// Never infer a check from Compose content, service names or diagnostic text.
+pub fn compose_security_check(
+    reason: Option<&str>,
+) -> Option<temps_entities::compose_security::ComposeSecurityCheck> {
+    use temps_entities::compose_security::ComposeSecurityCheck;
+    let reason = reason?.to_lowercase();
+    let head = classification_head(&reason);
+    let start = COMPOSE_CHECK_MARKERS
+        .iter()
+        .filter_map(|marker| head.find(marker).map(|index| (index, marker.len())))
+        .min_by_key(|(index, _)| *index)?;
+    let label = head[start.0 + start.1..].split_once(']')?.0;
+    if label.len() > 64 || !label.bytes().all(|c| c.is_ascii_lowercase() || c == b'_') {
+        return None;
+    }
+    serde_json::from_value::<ComposeSecurityCheck>(serde_json::Value::String(label.to_string()))
+        .ok()
 }
 
 /// Static guidance per code. Never interpolates the raw reason.
@@ -885,7 +929,13 @@ pub fn legacy_failure_reason(reason: Option<&str>) -> &'static str {
     let Some(reason) = reason else {
         return "unknown";
     };
-    let reason = reason.to_lowercase();
+    let lower = reason.to_lowercase();
+    let head = classification_head(&lower);
+    let semantic_reason = without_compose_check_annotation(head).map(|mut reason| {
+        reason.push_str(&lower[head.len()..]);
+        reason
+    });
+    let reason = semantic_reason.as_deref().unwrap_or(&lower);
 
     if reason.contains("out of memory")
         || reason.contains("oom")
@@ -946,7 +996,9 @@ fn classify_lowercase(raw: &str) -> DeploymentFailureClassification {
     use DeploymentFailureStage as S;
 
     let full = raw.to_lowercase();
-    let r = classification_head(&full);
+    let head = classification_head(&full);
+    let semantic_reason = without_compose_check_annotation(head);
+    let r = semantic_reason.as_deref().unwrap_or(head);
     let phase = job_phase(failed_job_id(raw));
     let is_compose = phase == Some(JobPhase::Compose) || r.contains("compose");
     let make = DeploymentFailureClassification::new;
