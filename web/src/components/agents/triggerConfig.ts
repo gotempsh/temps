@@ -14,8 +14,10 @@ export interface EditableTriggers {
 /**
  * The `trigger_config` to save from the workflow edit form.
  *
- * Only blocks the user enabled are written for the triggers the form edits,
- * so a save never persists a trigger nobody asked for. Blocks the form does
+ * For the triggers the form edits, only the blocks the user enabled are
+ * written, so a save never persists a trigger nobody asked for -- except
+ * `manual`, which is always written because the server reads its absence
+ * as "on". Blocks the form does
  * not render -- the webhook, deploy and monitoring triggers -- are carried
  * over from `existing` unchanged. The server treats a missing `webhook` key
  * as "turned off" and deletes the webhook and its token, so dropping it here
@@ -34,7 +36,9 @@ export function buildTriggerConfig(
   if (edits.newIssue || edits.regression) {
     config.error = { new_issue: edits.newIssue, regression: edits.regression }
   }
-  if (edits.manual) config.manual = true
+  // Always written: the server reads a missing `manual` as enabled, so
+  // omitting it would turn the manual trigger on whenever it is off.
+  config.manual = edits.manual
   const cron = edits.cron.trim()
   if (cron) config.schedule = { cron }
   return config

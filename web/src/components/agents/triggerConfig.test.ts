@@ -28,11 +28,14 @@ test('triggers the form does not render are carried over unchanged', () => {
     monitoring: { downtime: true },
     webhook: false,
   }
-  expect(buildTriggerConfig(existing, noEdits)).toEqual(existing)
+  expect(buildTriggerConfig(existing, noEdits)).toEqual({
+    ...existing,
+    manual: false,
+  })
 })
 
 test('only the edited triggers the user enabled are written', () => {
-  expect(buildTriggerConfig(null, noEdits)).toEqual({})
+  expect(buildTriggerConfig(null, noEdits)).toEqual({ manual: false })
   expect(
     buildTriggerConfig(
       { error: { new_issue: true, regression: true }, manual: true },
@@ -40,6 +43,12 @@ test('only the edited triggers the user enabled are written', () => {
     )
   ).toEqual({
     error: { new_issue: false, regression: true },
+    manual: false,
     schedule: { cron: '0 * * * *' },
   })
+})
+
+test('a manual trigger that is off stays off after a save', () => {
+  // A missing `manual` key means "enabled" on the server.
+  expect(buildTriggerConfig({ manual: false }, noEdits).manual).toBe(false)
 })
