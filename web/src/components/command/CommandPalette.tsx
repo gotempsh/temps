@@ -277,7 +277,7 @@ const mainNavItems: NavigationItem[] = [
     keywords: ['workspace', 'context', 'persistent'],
   },
   {
-    title: 'Deploy your first app',
+    title: 'Get started',
     url: '/get-started',
     icon: Rocket,
     keywords: [
@@ -286,6 +286,11 @@ const mainNavItems: NavigationItem[] = [
       'sample',
       'demo',
       'first deploy',
+      'templates',
+      'sandbox',
+      'email',
+      'analytics',
+      'otel',
       'onboarding',
       'hello',
     ],

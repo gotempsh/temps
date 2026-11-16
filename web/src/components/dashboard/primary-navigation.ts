@@ -18,6 +18,7 @@ import {
   Network,
   Puzzle,
   Radio,
+  Rocket,
   ScrollText,
   ShieldAlert,
   type LucideIcon,
@@ -78,6 +79,7 @@ export const primaryPlatformGroups: PlatformNavGroup[] = [
   {
     label: 'Applications',
     items: [
+      { title: 'Get started', url: '/get-started', icon: Rocket },
       {
         title: 'Projects',
         url: '/projects',
