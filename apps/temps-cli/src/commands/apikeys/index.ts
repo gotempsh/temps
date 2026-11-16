@@ -191,6 +191,7 @@ async function createApiKeyAction(options: CreateOptions): Promise<void> {
   const scope = parseApiKeyScope(options.projectId, options.environmentId)
   if (!scope) {
     warning('Use positive project/environment IDs; --environment-id requires --project-id')
+    process.exitCode = 1
     return
   }
   await requireAuth()

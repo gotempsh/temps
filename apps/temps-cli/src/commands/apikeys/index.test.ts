@@ -1,8 +1,9 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { Command } from 'commander'
 import { test, expect, describe } from 'bun:test'
-import { computeExpiryIso, groupPermissionsByCategory, parseApiKeyScope } from './index.js'
+import { registerApiKeysCommands, computeExpiryIso, groupPermissionsByCategory, parseApiKeyScope } from './index.js'
 
 describe('computeExpiryIso', () => {
   test('advances by the given number of days from the reference date', () => {
@@ -54,4 +55,14 @@ describe('parseApiKeyScope', () => {
       expect(parseApiKeyScope(project,environment)).toBeNull()
     }
   })
+})
+
+test('invalid scope fails before authentication', async () => {
+  const previous = process.exitCode
+  try {
+    const program = new Command()
+    registerApiKeysCommands(program)
+    await program.parseAsync(['apikeys', 'create', '--environment-id', '9'], { from: 'user' })
+    expect(process.exitCode).toBe(1)
+  } finally { process.exitCode = previous }
 })

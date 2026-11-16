@@ -32,16 +32,18 @@ impl MigrationTrait for Migration {
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let row = manager.get_connection().query_one(sea_orm::Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT EXISTS(SELECT 1 FROM api_keys WHERE project_id IS NOT NULL OR environment_id IS NOT NULL) AS scoped".to_string()
-        )).await?.ok_or_else(|| DbErr::Custom("Cannot inspect scoped API keys before removing scope columns".into()))?;
-        if row.try_get::<bool>("", "scoped")? {
-            return Err(DbErr::Custom("Cannot remove API key scope columns while scoped keys exist; delete those keys before downgrading to avoid broadening their privileges".into()));
-        }
-        manager.get_connection().execute_unprepared(
-            "ALTER TABLE api_keys DROP COLUMN IF EXISTS environment_id; ALTER TABLE api_keys DROP COLUMN IF EXISTS project_id"
-        ).await?;
+        // Keep the refusal and schema change atomic even when called directly.
+        // ACCESS EXCLUSIVE also avoids a lock upgrade racing with active writers.
+        manager.get_connection().execute_unprepared(r#"
+            DO $$ BEGIN
+                LOCK TABLE api_keys IN ACCESS EXCLUSIVE MODE;
+                IF EXISTS (SELECT 1 FROM api_keys WHERE project_id IS NOT NULL OR environment_id IS NOT NULL) THEN
+                    RAISE EXCEPTION 'Cannot remove API key scope columns while scoped keys exist; delete those keys before downgrading to avoid broadening their privileges';
+                END IF;
+                ALTER TABLE api_keys DROP COLUMN IF EXISTS environment_id;
+                ALTER TABLE api_keys DROP COLUMN IF EXISTS project_id;
+            END $$;
+        "#).await?;
         Ok(())
     }
 }
@@ -49,9 +51,12 @@ impl MigrationTrait for Migration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sea_orm::TransactionTrait;
     #[tokio::test]
     async fn scoped_keys_survive_upgrade_and_refuse_unsafe_downgrade() {
-        if !temps_test_utils::external_database_configured() && !temps_test_utils::docker_available().await {
+        if !temps_test_utils::external_database_configured()
+            && !temps_test_utils::docker_available().await
+        {
             eprintln!("Skipping API key scope migration: database unavailable");
             return;
         }
@@ -61,16 +66,54 @@ mod tests {
         let manager = SchemaManager::new(db.as_ref());
         Migration.up(&manager).await.unwrap();
         Migration.up(&manager).await.unwrap();
-        db.execute_unprepared("INSERT INTO api_keys VALUES(2,'tkp_test',7,9)").await.unwrap();
+        // An uncommitted credential writer must finish before the downgrade
+        // checks scopes. Checking first would miss this row, then drop its scope.
+        let writer = db.begin().await.unwrap();
+        writer
+            .execute_unprepared("INSERT INTO api_keys VALUES(2,'tkp_test',7,9)")
+            .await
+            .unwrap();
+        let downgrade_db = db.clone();
+        let downgrade = tokio::spawn(async move {
+            Migration
+                .down(&SchemaManager::new(downgrade_db.as_ref()))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let row = db.query_one(sea_orm::Statement::from_string(
+                    sea_orm::DbBackend::Postgres,
+                    "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE relation = 'api_keys'::regclass AND NOT granted) AS waiting",
+                )).await.unwrap().unwrap();
+                if row.try_get::<bool>("", "waiting").unwrap() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
+        writer.commit().await.unwrap();
+        assert!(downgrade.await.unwrap().is_err());
+
         for sql in [
             "INSERT INTO api_keys VALUES(3,'tk_bad',7,9)",
             "INSERT INTO api_keys VALUES(3,'tkp_bad',NULL,9)",
             "INSERT INTO api_keys VALUES(3,'tkp_bad',8,9)",
             "UPDATE api_keys SET key_prefix='tk_old' WHERE id=2",
-        ] { assert!(db.execute_unprepared(sql).await.is_err(), "{sql}"); }
+        ] {
+            assert!(db.execute_unprepared(sql).await.is_err(), "{sql}");
+        }
         assert!(Migration.down(&manager).await.is_err());
-        db.execute_unprepared("DELETE FROM environments WHERE id=9").await.unwrap();
-        let row = db.query_one(sea_orm::Statement::from_string(sea_orm::DbBackend::Postgres, "SELECT count(*) AS count FROM api_keys")).await.unwrap().unwrap();
+        db.execute_unprepared("DELETE FROM environments WHERE id=9")
+            .await
+            .unwrap();
+        let row = db
+            .query_one(sea_orm::Statement::from_string(
+                sea_orm::DbBackend::Postgres,
+                "SELECT count(*) AS count FROM api_keys",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(row.try_get::<i64>("", "count").unwrap(), 1);
         Migration.down(&manager).await.unwrap();
         test.cleanup().await;

@@ -11,6 +11,7 @@ installBrowserWindow()
 afterEach(cleanup)
 
 test('project-scoped keys submit the selected resource boundary', async () => {
+  let attempts = 0
   const api = mockApi({
     'GET /projects': () =>
       jsonResponse({
@@ -20,7 +21,9 @@ test('project-scoped keys submit the selected resource boundary', async () => {
         per_page: 100,
       }),
     'GET /projects/7/environments': () =>
-      jsonResponse([{ id: 9, name: 'Preview' }]),
+      ++attempts === 1
+        ? jsonResponse({ title: 'Unavailable' }, 500)
+        : jsonResponse([{ id: 9, name: 'Preview' }]),
     'GET /api-keys/permissions': () =>
       jsonResponse({
         roles: [{ name: 'reader', permissions: ['projects:read'] }],
@@ -50,21 +53,35 @@ test('project-scoped keys submit the selected resource boundary', async () => {
     fireEvent.change(view.getByLabelText('Name'), {
       target: { value: 'Scoped key' },
     })
+    await waitFor(() => expect(view.getAllByRole('combobox').length).toBe(2))
+    const selects = view.getAllByRole('combobox')
+    fireEvent.click(selects[selects.length - 1]!)
+    fireEvent.click(await view.findByRole('option', { name: /reader/ }))
     fireEvent.click(
       await view.findByRole('combobox', { name: 'API key project scope' })
     )
     fireEvent.click(await view.findByText('App'))
     expect(await view.findByText('Environment scope')).toBeTruthy()
+    fireEvent.click(await view.findByRole('button', { name: 'Retry' }))
+    await waitFor(() => expect(attempts).toBe(2))
+    expect((view.getByLabelText('Name') as HTMLInputElement).value).toBe(
+      'Scoped key'
+    )
+    expect(
+      view.getByRole('combobox', { name: 'API key project scope' }).textContent
+    ).toContain('App')
+    const retainedSelects = view.getAllByRole('combobox')
+    expect(retainedSelects[retainedSelects.length - 1]?.textContent).toContain(
+      'reader'
+    )
     fireEvent.click(view.getByRole('combobox', { name: 'Environment scope' }))
     fireEvent.click(await view.findByRole('option', { name: 'Preview' }))
-    const selects = view.getAllByRole('combobox')
-    fireEvent.click(selects[selects.length - 1]!)
-    fireEvent.click(await view.findByRole('option', { name: /reader/ }))
     fireEvent.submit(
       view.getByRole('button', { name: 'Create' }).closest('form')!
     )
     await waitFor(() => expect(submitted?.project_id).toBe(7))
     expect(submitted?.environment_id).toBe(9)
+    expect(submitted?.role_type).toBe('reader')
     fireEvent.click(
       view.getByRole('combobox', { name: 'API key project scope' })
     )

@@ -3,8 +3,8 @@
 
 import { afterEach, expect, test } from 'bun:test'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { cleanup, fireEvent, render } from '@testing-library/react'
-import { MemoryRouter } from 'react-router'
+import { cleanup, fireEvent, render, waitFor } from '@testing-library/react'
+import { MemoryRouter, useLocation } from 'react-router'
 import type { UserResponse } from '@/api/client'
 import { AuthContext } from '@/contexts/AuthContext-shared'
 import { installBrowserWindow } from '@/test/dom'
@@ -31,6 +31,10 @@ const PERMISSIONS = {
   roles: [],
 }
 
+function Location() {
+  return <output data-testid="location">{useLocation().pathname}</output>
+}
+
 function renderPage(role?: string, entry = '/settings/keys/new') {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
@@ -52,6 +56,7 @@ function renderPage(role?: string, entry = '/settings/keys/new') {
       >
         <MemoryRouter initialEntries={[entry]}>
           <ApiKeyCreate />
+          <Location />
         </MemoryRouter>
       </AuthContext.Provider>
     </QueryClientProvider>
@@ -217,3 +222,54 @@ test('a role preselected from the link cannot be carried past a catalogue that h
   ).toBe(true)
   api.restore()
 })
+
+for (const environmentId of [null, 9]) {
+  test(`Settings creates a project key with environment ${environmentId} and preserves the result and returnTo`, async () => {
+    let submitted: Record<string, unknown> | undefined
+    const api = mockApi({
+      'GET /projects': () =>
+        jsonResponse({
+          projects: [{ id: 7, name: 'App', slug: 'app' }],
+          total: 1,
+        }),
+      'GET /projects/7/environments': () =>
+        jsonResponse([{ id: 9, name: 'Preview' }]),
+      'GET /api-keys/permissions': () => jsonResponse(CEILING_CATALOGUE),
+      'POST /api-keys': async (request) => {
+        submitted = await request.json()
+        return jsonResponse({ id: 42, api_key: 'tkp_once' })
+      },
+    })
+    try {
+      const view = renderPage(
+        'admin',
+        '/settings/keys/new?name=ci-key&role=user&returnTo=/setup/ai'
+      )
+      fireEvent.click(
+        await view.findByRole('combobox', { name: 'API key project scope' })
+      )
+      fireEvent.click(await view.findByText('App'))
+      if (environmentId !== null) {
+        fireEvent.click(
+          view.getByRole('combobox', { name: 'Environment scope' })
+        )
+        fireEvent.click(await view.findByRole('option', { name: 'Preview' }))
+      }
+      fireEvent.click(view.getByRole('button', { name: 'Next: Permissions' }))
+      await view.findByText('Standard access')
+      fireEvent.click(view.getByRole('button', { name: 'Next: Review' }))
+      fireEvent.click(view.getByRole('button', { name: 'Create API key' }))
+      await waitFor(() => expect(submitted?.project_id).toBe(7))
+      expect(submitted?.environment_id).toBe(environmentId)
+      expect(
+        ((await view.findByLabelText('Your API key')) as HTMLInputElement).value
+      ).toBe('tkp_once')
+      fireEvent.click(
+        view.getByRole('button', { name: 'Continue harness setup' })
+      )
+      expect(view.getByTestId('location').textContent).toBe('/setup/ai')
+    } finally {
+      api.restore()
+    }
+  })
+}

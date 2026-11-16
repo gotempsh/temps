@@ -26,7 +26,16 @@ import {
   CollapsibleTrigger,
 } from '@/components/ui/collapsible'
 import { cn } from '@/lib/utils'
-import { useMutation } from '@tanstack/react-query'
+import { ProjectSelect } from '@/components/project/ProjectSelect'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
+import { getEnvironmentsOptions } from '@/api/client/@tanstack/react-query.gen'
+import { useMutation, useQuery } from '@tanstack/react-query'
 import {
   AlertCircle,
   ArrowLeft,
@@ -63,6 +72,12 @@ export default function ApiKeyCreate() {
   const isHarnessSetup = returnTo === '/setup/ai'
   const [step, setStep] = useState(1)
   const [keyName, setKeyName] = useState(searchParams.get('name') ?? '')
+  const [projectId, setProjectId] = useState<number | null>(null)
+  const [environmentId, setEnvironmentId] = useState<number | null>(null)
+  const environments = useQuery({
+    ...getEnvironmentsOptions({ path: { project_id: projectId ?? 0 } }),
+    enabled: projectId !== null,
+  })
   const [expiresAt, setExpiresAt] = useState('')
   const [requestedRole, setSelectedRole] = useState<string>(
     searchParams.get('role') ?? ''
@@ -202,6 +217,8 @@ export default function ApiKeyCreate() {
 
     const data: CreateApiKeyRequest = {
       name: trimmedName,
+      project_id: projectId,
+      environment_id: projectId === null ? null : environmentId,
       role_type: useCustomPermissions ? 'custom' : selectedRole,
       permissions: useCustomPermissions
         ? Array.from(selectedPermissions)
@@ -299,6 +316,12 @@ export default function ApiKeyCreate() {
             <div className="space-y-4 p-4 bg-muted rounded-lg">
               <div className="text-sm">
                 <strong>Name:</strong> {keyName.trim()}
+              </div>
+              <div className="text-sm">
+                <strong>Scope:</strong>{' '}
+                {projectId === null
+                  ? 'Account-wide'
+                  : `Project #${projectId} · ${environmentId === null ? 'All environments' : `Environment #${environmentId}`}`}
               </div>
               <div className="text-sm">
                 <strong>Access level:</strong>{' '}
@@ -437,6 +460,66 @@ export default function ApiKeyCreate() {
                   for
                 </p>
               </div>
+
+              <div className="space-y-2">
+                <Label>Deployment scope</Label>
+                <ProjectSelect
+                  ariaLabel="API key project scope"
+                  value={projectId}
+                  allLabel="Account-wide access"
+                  onValueChange={(id) => {
+                    setProjectId(id)
+                    setEnvironmentId(null)
+                  }}
+                />
+                <p className="text-xs text-muted-foreground">
+                  Project keys are confined to deployment and environment APIs.
+                  Scope cannot be changed after creation.
+                </p>
+              </div>
+              {projectId !== null && (
+                <div className="space-y-2">
+                  <Label htmlFor="environment-scope">Environment scope</Label>
+                  <Select
+                    value={
+                      environmentId === null ? 'all' : String(environmentId)
+                    }
+                    onValueChange={(value) =>
+                      setEnvironmentId(value === 'all' ? null : Number(value))
+                    }
+                  >
+                    <SelectTrigger id="environment-scope">
+                      <SelectValue placeholder="All environments" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="all">
+                        All environments in this project
+                      </SelectItem>
+                      {environments.data?.map((env) => (
+                        <SelectItem key={env.id} value={String(env.id)}>
+                          {env.name}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  {environments.isError && (
+                    <div role="alert" className="text-sm text-destructive">
+                      Could not load environments.
+                      <Button
+                        type="button"
+                        variant="link"
+                        aria-disabled={environments.isFetching}
+                        onClick={() => {
+                          if (!environments.isFetching)
+                            void environments.refetch()
+                        }}
+                      >
+                        Retry
+                      </Button>
+                    </div>
+                  )}
+                </div>
+              )}
 
               <div className="space-y-2">
                 <Label htmlFor="expires">
@@ -716,6 +799,14 @@ export default function ApiKeyCreate() {
               <Separator />
 
               <div>
+                <Label className="text-muted-foreground">Scope</Label>
+                <p>
+                  {projectId === null
+                    ? 'Account-wide'
+                    : `Project #${projectId} · ${environmentId === null ? 'All environments' : `Environment #${environmentId}`}`}
+                </p>
+              </div>
+              <div className="space-y-2">
                 <Label className="text-muted-foreground">Access level</Label>
                 <p className="font-medium">
                   {useCustomPermissions ? 'Custom permissions' : selectedRole}

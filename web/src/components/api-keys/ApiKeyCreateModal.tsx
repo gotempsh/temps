@@ -318,8 +318,19 @@ export function ApiKeyCreateModal({
                               role="alert"
                               className="text-xs text-destructive"
                             >
-                              Could not load environments. Close and reopen this
-                              dialog to retry.
+                              Could not load environments.
+                              <Button
+                                type="button"
+                                variant="link"
+                                size="sm"
+                                aria-disabled={environments.isFetching}
+                                onClick={() => {
+                                  if (!environments.isFetching)
+                                    void environments.refetch()
+                                }}
+                              >
+                                Retry
+                              </Button>
                             </p>
                           )}
                           <p className="text-xs text-muted-foreground">
