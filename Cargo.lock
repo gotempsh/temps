@@ -14751,7 +14751,7 @@ dependencies = [
  "ipnet",
  "libc",
  "netlink-packet-core",
- "netlink-packet-route 0.33.0",
+ "netlink-packet-route 0.34.0",
  "nix 0.31.3",
  "rtnetlink",
  "sea-orm 1.1.20",
