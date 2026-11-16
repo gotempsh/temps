@@ -21,7 +21,6 @@ export function ProjectVaultAccess({ projectId }: { projectId: number }) {
   }
   return (
     <section className="space-y-3" aria-label="Linked vaults">
-      <h2 className="font-semibold">Linked vaults</h2>
       {vaults.isError ? (
         <Callout tone="error" title="Could not load linked vaults">
           <Button onClick={() => void vaults.refetch()}>Retry</Button>
@@ -43,9 +42,11 @@ export function ProjectVaultAccess({ projectId }: { projectId: number }) {
         </div>
       ) : vaults.data?.total === 0 ? (
         <Callout title="No vaults linked">
-          An administrator can link a vault to this project. Sandbox owners can
-          then request a session from a bundle.
-          <Button asChild variant="outline">
+          <p>
+            An administrator can link a vault to this project. Sandbox owners
+            can then request a session from a bundle.
+          </p>
+          <Button asChild variant="outline" size="sm" className="mt-3">
             <Link to="/vault">Open vaults</Link>
           </Button>
         </Callout>

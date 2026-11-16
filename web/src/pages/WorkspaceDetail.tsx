@@ -36,9 +36,12 @@ export default function WorkspaceDetail() {
         title={name}
         description="Manage services, persistent files, and the compute attached to this workspace."
         actions={
+          // Workspaces belonged to the retired harness AI workspace. This page
+          // stays reachable from the Sandboxes operator view so their compute
+          // can still be inspected and cleaned up.
           <Button variant="outline" asChild>
-            <Link to="/workspaces">
-              <ArrowLeft className="size-4" /> Workspaces
+            <Link to="/sandboxes">
+              <ArrowLeft className="size-4" /> Sandboxes
             </Link>
           </Button>
         }

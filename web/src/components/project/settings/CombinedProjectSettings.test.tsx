@@ -8,6 +8,7 @@ import { AuthProvider } from '@/contexts/AuthContext'
 import { PresetProvider } from '@/contexts/PresetContext'
 import { MemoryRouter } from 'react-router'
 import type { ProjectResponse } from '@/api/client'
+import { PluginsProvider } from '@/contexts/PluginsContext-components'
 import { CombinedProjectSettings } from './CombinedProjectSettings'
 
 test('intro cards keep their padding outside the settings section spacing rules', () => {
@@ -48,4 +49,36 @@ test('intro cards keep their padding outside the settings section spacing rules'
   )
   expect(summary.classList.contains('py-3')).toBe(true)
   client.clear()
+})
+
+test('the vault list spans the page while webhooks keep the settings columns', () => {
+  const client = new QueryClient()
+  const html = renderToStaticMarkup(
+    <MemoryRouter>
+      <QueryClientProvider client={client}>
+        <AuthProvider>
+          <PresetProvider>
+            <PluginsProvider>
+              <CombinedProjectSettings
+                page="integrations"
+                project={
+                  {
+                    id: 1,
+                    slug: 'example',
+                    hosting: 'external',
+                  } as ProjectResponse
+                }
+                refetch={() => {}}
+              />
+            </PluginsProvider>
+          </PresetProvider>
+        </AuthProvider>
+      </QueryClientProvider>
+    </MemoryRouter>
+  )
+  const sectionTag = (id: string) =>
+    html.match(new RegExp(`<section id="[^"]*${id}"[^>]*>`))?.[0] ?? ''
+  expect(sectionTag('vaults')).not.toBe('')
+  expect(sectionTag('vaults')).not.toContain('md:grid-cols')
+  expect(sectionTag('webhooks')).toContain('md:grid-cols')
 })

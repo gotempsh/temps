@@ -13,7 +13,7 @@ import {
   getAdminGateOptions,
   nodeMetricsGetAlertRulesOptions,
 } from '@/api/client/@tanstack/react-query.gen'
-import { AgentSandboxSandboxPage } from '@/pages/agent-sandbox/AgentSandboxSandboxPage'
+import { SandboxRuntimeSettings } from '@/pages/sandbox-settings/SandboxRuntimeSettings'
 import DeliveryProfiles from '@/pages/DeliveryProfiles'
 import { Settings } from '@/pages/Settings'
 import { NodeAlertRules } from '@/components/monitoring/NodeAlertRules'
@@ -89,7 +89,7 @@ const SETTINGS_PAGES: [string, ReactElement][] = [
   ['Docker registry', <DockerRegistryPage key="registry" />],
   ['Disk monitoring', <DiskMonitoringPage key="disk" />],
   ['Metrics monitoring', <MonitoringSettingsPage key="metrics" />],
-  ['Sandbox configuration', <AgentSandboxSandboxPage key="sandbox" />],
+  ['Sandbox configuration', <SandboxRuntimeSettings key="sandbox" />],
 ]
 
 describe('settings pages for a role that cannot read platform settings', () => {
