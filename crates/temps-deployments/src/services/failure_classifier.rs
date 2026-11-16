@@ -595,7 +595,7 @@ pub const fn guidance_for(code: DeploymentFailureCode) -> FailureGuidance {
         ),
         C::ContainerExited => (
             "Container exited during startup",
-            "The app process exited (or kept restarting) right after starting. Check the runtime logs for the crash, verify the start command and required environment variables, and that the image's entrypoint runs a long-lived server. If the logs report exec format error, use an image and application binaries built for the host CPU architecture, or publish a multi-architecture image.",
+            "The app process exited (or kept restarting) right after starting. Check the deployment's retained container logs, when they were captured, or the runtime logs for the startup crash or a missing environment variable. Verify the start command runs a long-lived server, HOST is 0.0.0.0, and the listen port matches the deployment port. Exit 137 can mean the process was OOM-killed; check the memory limit and runtime logs before raising the limit. If the logs report exec format error, use an image and application binaries built for the host CPU architecture, or publish a multi-architecture image.",
             Some(S::EnvironmentVariables),
         ),
         C::ImageNotFound => (
@@ -1895,6 +1895,29 @@ mod tests {
             C::PlatformInternal,
         );
         assert_class("Workflow execution failed: Job execution failed: Internal error executing job 'build_image' in workflow 'deployment-42' for deployment 42: task panicked", S::Platform, C::PlatformInternal);
+    }
+
+    #[test]
+    fn container_exit_guidance_covers_startup_diagnostics() {
+        let info = describe_failure(Some(
+            "Container exited during startup (exit code 1) after 2s",
+        ))
+        .unwrap();
+        assert_eq!(info.code, C::ContainerExited);
+        for hint in [
+            "retained container logs",
+            "environment variable",
+            "0.0.0.0",
+            "listen port",
+            "137",
+            "OOM",
+            "start command",
+        ] {
+            assert!(info.remediation.contains(hint), "missing hint: {hint}");
+        }
+        // Not every surface shows logs under the guidance (the compact row
+        // only has a tooltip, and logs are only present when captured).
+        assert!(!info.remediation.contains("below"));
     }
 
     #[test]
