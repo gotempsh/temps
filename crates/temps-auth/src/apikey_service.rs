@@ -5,7 +5,8 @@ use crate::permissions::{Permission, Role};
 use chrono::Utc;
 use rand::RngExt;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, Set,
+    ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
+    QuerySelect, Set, TransactionTrait,
 };
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -29,7 +30,7 @@ pub struct ApiKeyResponse {
     pub name: String,
     pub key_prefix: String,
     pub role_type: String,
-    pub permissions: Option<Vec<String>>, // Reserved for future use
+    pub permissions: Option<Vec<String>>,
     pub is_active: bool,
     #[schema(value_type = Option<String>, format = "date-time", example = "2024-12-31T23:59:59Z")]
     pub expires_at: Option<UtcDateTime>,
@@ -37,12 +38,17 @@ pub struct ApiKeyResponse {
     pub last_used_at: Option<UtcDateTime>,
     #[schema(value_type = String, format = "date-time", example = "2024-01-01T00:00:00Z")]
     pub created_at: UtcDateTime,
+    /// Immutable optional deployment resource scope.
+    pub project_id: Option<i32>,
+    pub environment_id: Option<i32>,
 }
 
 impl From<temps_entities::api_keys::Model> for ApiKeyResponse {
     fn from(model: temps_entities::api_keys::Model) -> Self {
         Self {
             id: model.id,
+            project_id: model.project_id,
+            environment_id: model.environment_id,
             name: model.name,
             key_prefix: model.key_prefix,
             role_type: model.role_type,
@@ -63,12 +69,15 @@ pub struct CreateApiKeyResponse {
     pub name: String,
     pub key_prefix: String,
     pub role_type: String,
-    pub permissions: Option<Vec<String>>, // Reserved for future use
-    pub api_key: String,                  // Only returned on creation
+    pub permissions: Option<Vec<String>>,
+    pub api_key: String, // Only returned on creation
     #[schema(value_type = Option<String>, format = "date-time", example = "2024-12-31T23:59:59Z")]
     pub expires_at: Option<UtcDateTime>,
     #[schema(value_type = String, format = "date-time", example = "2024-01-01T00:00:00Z")]
     pub created_at: UtcDateTime,
+    /// Immutable optional deployment resource scope.
+    pub project_id: Option<i32>,
+    pub environment_id: Option<i32>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -87,6 +96,9 @@ pub struct CreateApiKeyRequest {
     pub permissions: Option<Vec<String>>,
     #[schema(value_type = Option<String>, format = "date-time", example = "2024-12-31T23:59:59Z")]
     pub expires_at: Option<UtcDateTime>,
+    /// Immutable optional deployment resource scope.
+    pub project_id: Option<i32>,
+    pub environment_id: Option<i32>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -167,6 +179,29 @@ impl ApiKeyServiceError {
     }
 }
 
+/// A validated key retains its immutable scope through authentication adapters.
+pub struct ValidatedApiKey {
+    pub user: users::Model,
+    pub role: Option<Role>,
+    pub permissions: Option<Vec<Permission>>,
+    pub name: String,
+    pub id: i32,
+    pub scope: Option<temps_authz::ApiKeyScope>,
+}
+
+impl ValidatedApiKey {
+    pub fn into_auth_context(self) -> crate::context::AuthContext {
+        crate::context::AuthContext::new_api_key(
+            self.user,
+            self.role,
+            self.permissions,
+            self.name,
+            self.id,
+        )
+        .with_api_key_scope(self.scope)
+    }
+}
+
 pub struct ApiKeyService {
     db: Arc<DbConnection>,
     /// Throttles `last_used_at` writes so repeated validations of the same
@@ -183,6 +218,47 @@ impl ApiKeyService {
                 crate::last_used_throttle::LAST_USED_UPDATE_INTERVAL,
             ),
         }
+    }
+
+    async fn validate_scope<C: sea_orm::ConnectionTrait>(
+        connection: &C,
+        key_name: &str,
+        project_id: Option<i32>,
+        environment_id: Option<i32>,
+        lock: bool,
+    ) -> Result<(), ApiKeyServiceError> {
+        let Some(project_id) = project_id else {
+            if let Some(environment_id) = environment_id {
+                return Err(ApiKeyServiceError::ValidationError(format!(
+                    "API key '{key_name}' needs a project scope for environment {environment_id}"
+                )));
+            }
+            return Ok(());
+        };
+        if project_id <= 0 || environment_id.is_some_and(|id| id <= 0) {
+            return Err(ApiKeyServiceError::ValidationError(format!(
+                "API key '{key_name}' requires positive project and environment IDs"
+            )));
+        }
+        let query = temps_entities::projects::Entity::find_by_id(project_id)
+            .filter(temps_entities::projects::Column::DeletedAt.is_null())
+            .filter(temps_entities::projects::Column::IsDeleted.eq(false));
+        let query = if lock { query.lock_shared() } else { query };
+        if query.one(connection).await?.is_none() {
+            return Err(ApiKeyServiceError::NotFound(format!(
+                "Project {project_id} for API key '{key_name}' was not found"
+            )));
+        }
+        if let Some(environment_id) = environment_id {
+            let query = temps_entities::environments::Entity::find_by_id(environment_id)
+                .filter(temps_entities::environments::Column::ProjectId.eq(project_id))
+                .filter(temps_entities::environments::Column::DeletedAt.is_null());
+            let query = if lock { query.lock_shared() } else { query };
+            if query.one(connection).await?.is_none() {
+                return Err(ApiKeyServiceError::NotFound(format!("Active environment {environment_id} in project {project_id} for API key '{key_name}' was not found")));
+            }
+        }
+        Ok(())
     }
 
     pub async fn create_api_key(
@@ -229,11 +305,35 @@ impl ApiKeyService {
             None
         };
 
+        if request.project_id.is_some()
+            && request
+                .expires_at
+                .is_some_and(|expiry| expiry <= Utc::now())
+        {
+            return Err(ApiKeyServiceError::ValidationError(format!(
+                "Expiry for API key '{}' must be in the future",
+                request.name
+            )));
+        }
+        temps_authz::ApiKeyScope::from_ids(request.project_id, request.environment_id).map_err(
+            |error| {
+                ApiKeyServiceError::ValidationError(format!("API key '{}': {error}", request.name))
+            },
+        )?;
+        let txn = self.db.begin().await?;
+        Self::validate_scope(
+            &txn,
+            &request.name,
+            request.project_id,
+            request.environment_id,
+            true,
+        )
+        .await?;
         // Check if name is unique for this user
         let existing_key = ApiKeyEntity::find()
             .filter(temps_entities::api_keys::Column::UserId.eq(user_id))
             .filter(temps_entities::api_keys::Column::Name.eq(&request.name))
-            .one(self.db.as_ref())
+            .one(&txn)
             .await?;
 
         if existing_key.is_some() {
@@ -243,7 +343,7 @@ impl ApiKeyService {
         }
 
         // Generate API key
-        let api_key = self.generate_api_key();
+        let api_key = self.generate_api_key_for_scope(request.project_id);
         let key_hash = self.hash_api_key(&api_key);
         let key_prefix = api_key.chars().take(8).collect::<String>();
 
@@ -254,6 +354,8 @@ impl ApiKeyService {
         });
 
         let new_api_key = ApiKeyActiveModel {
+            project_id: Set(request.project_id),
+            environment_id: Set(request.environment_id),
             name: Set(request.name.clone()),
             key_hash: Set(key_hash),
             key_prefix: Set(key_prefix.clone()),
@@ -268,10 +370,13 @@ impl ApiKeyService {
             ..Default::default()
         };
 
-        let api_key_model = new_api_key.insert(self.db.as_ref()).await?;
+        let api_key_model = new_api_key.insert(&txn).await?;
+        txn.commit().await?;
 
         Ok(CreateApiKeyResponse {
             id: api_key_model.id,
+            project_id: api_key_model.project_id,
+            environment_id: api_key_model.environment_id,
             name: api_key_model.name,
             key_prefix,
             role_type: api_key_model.role_type,
@@ -402,6 +507,25 @@ impl ApiKeyService {
         ),
         ApiKeyServiceError,
     > {
+        let validated = self.validate_api_key_with_scope(api_key).await?;
+        if validated.scope.is_some() {
+            return Err(ApiKeyServiceError::Unauthorized(
+                "Scoped API keys require a scope-aware authentication adapter".into(),
+            ));
+        }
+        Ok((
+            validated.user,
+            validated.role,
+            validated.permissions,
+            validated.name,
+            validated.id,
+        ))
+    }
+
+    pub async fn validate_api_key_with_scope(
+        &self,
+        api_key: &str,
+    ) -> Result<ValidatedApiKey, ApiKeyServiceError> {
         let key_hash = self.hash_api_key(api_key);
         let key_prefix = api_key.chars().take(8).collect::<String>();
 
@@ -412,6 +536,28 @@ impl ApiKeyService {
             .one(self.db.as_ref())
             .await?
             .ok_or_else(|| ApiKeyServiceError::Unauthorized("Invalid API key".to_string()))?;
+
+        let scope = temps_authz::ApiKeyScope::from_ids(
+            api_key_model.project_id,
+            api_key_model.environment_id,
+        )
+        .map_err(|error| {
+            ApiKeyServiceError::Unauthorized(format!("API key {}: {error}", api_key_model.id))
+        })?;
+        if api_key.starts_with("tkp_") != scope.is_some() {
+            return Err(ApiKeyServiceError::Unauthorized(format!(
+                "API key {} has an incompatible scope prefix",
+                api_key_model.id
+            )));
+        }
+        Self::validate_scope(
+            self.db.as_ref(),
+            &api_key_model.name,
+            api_key_model.project_id,
+            api_key_model.environment_id,
+            false,
+        )
+        .await?;
 
         // Check if expired
         if let Some(expires_at) = api_key_model.expires_at {
@@ -473,13 +619,14 @@ impl ApiKeyService {
             let _ = api_key_active.update(self.db.as_ref()).await; // Don't fail if this fails
         }
 
-        Ok((
+        Ok(ValidatedApiKey {
             user,
             role,
             permissions,
-            api_key_model.name,
-            api_key_model.id,
-        ))
+            name: api_key_model.name,
+            id: api_key_model.id,
+            scope,
+        })
     }
 
     pub async fn deactivate_api_key(
@@ -530,7 +677,7 @@ impl ApiKeyService {
                 ApiKeyServiceError::NotFound(format!("API key {} not found", api_key_id))
             })?;
 
-        let new_secret = self.generate_api_key();
+        let new_secret = self.generate_api_key_for_scope(api_key.project_id);
         let key_hash = self.hash_api_key(&new_secret);
         let key_prefix = new_secret.chars().take(8).collect::<String>();
 
@@ -546,6 +693,8 @@ impl ApiKeyService {
 
         Ok(CreateApiKeyResponse {
             id: updated.id,
+            project_id: updated.project_id,
+            environment_id: updated.environment_id,
             name: updated.name,
             key_prefix,
             role_type: updated.role_type,
@@ -611,6 +760,16 @@ impl ApiKeyService {
             .await
             .map_err(ApiKeyServiceError::DatabaseError)?;
         Ok(())
+    }
+
+    fn generate_api_key_for_scope(&self, project_id: Option<i32>) -> String {
+        let secret = self.generate_api_key();
+        if project_id.is_some() {
+            // Older servers refuse this prefix instead of dropping the scope.
+            secret.replacen("tk_", "tkp_", 1)
+        } else {
+            secret
+        }
     }
 
     fn generate_api_key(&self) -> String {
@@ -708,7 +867,7 @@ pub fn cap_api_key_grant(
 mod tests {
     use super::*;
     use chrono::{Duration, Utc};
-    use sea_orm::{ActiveModelTrait, Set};
+    use sea_orm::{ActiveModelTrait, ConnectionTrait, Set};
     use temps_entities::{api_keys, users};
     use temps_test_utils::TestDatabase;
 
@@ -771,6 +930,164 @@ mod tests {
         api_key.insert(db.as_ref()).await.unwrap()
     }
 
+    #[tokio::test]
+    async fn api_key_scope_validation_precedes_database_and_retains_database_errors() {
+        let service = ApiKeyService::new(Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+        ));
+        for (project_id, environment_id) in [(None, Some(9)), (Some(0), None)] {
+            let error = service
+                .create_api_key(
+                    1,
+                    CreateApiKeyRequest {
+                        name: "invalid-scope".into(),
+                        role_type: "reader".into(),
+                        permissions: None,
+                        expires_at: None,
+                        project_id,
+                        environment_id,
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(error, ApiKeyServiceError::ValidationError(_)));
+        }
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_errors([sea_orm::DbErr::Custom("project lookup failed".into())])
+            .into_connection();
+        let service = ApiKeyService::new(Arc::new(db));
+        let error = service
+            .create_api_key(
+                1,
+                CreateApiKeyRequest {
+                    name: "project-scope".into(),
+                    role_type: "reader".into(),
+                    permissions: None,
+                    expires_at: None,
+                    project_id: Some(7),
+                    environment_id: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ApiKeyServiceError::DatabaseError(_)));
+    }
+
+    #[tokio::test]
+    async fn scoped_api_key_lifecycle_preserves_scope_and_permissions() {
+        let (db, service, user) = setup_test_env().await;
+        db.db.execute_unprepared("INSERT INTO projects(id,name,slug,repo_name,repo_owner,directory,main_branch,preset,created_at,updated_at) VALUES(7001,'scope-fixture','scope-fixture','app','example','.','main','static',now(),now()); INSERT INTO environments(id,name,slug,subdomain,host,project_id,created_at,updated_at,upstreams) VALUES(9001,'preview','preview','scope-preview','scope.example',7001,now(),now(),'[]')").await.unwrap();
+        let make_request = |name: &str, project_id, environment_id| CreateApiKeyRequest {
+            name: name.into(),
+            role_type: "custom".into(),
+            permissions: Some(vec!["deployments:create".into()]),
+            expires_at: Some(Utc::now() + Duration::days(1)),
+            project_id,
+            environment_id,
+        };
+        let key = service
+            .create_api_key(user.id, make_request("scoped", Some(7001), Some(9001)))
+            .await
+            .unwrap();
+        assert!(key.api_key.starts_with("tkp_"));
+        assert!(service.validate_api_key(&key.api_key).await.is_err());
+        let auth = service
+            .validate_api_key_with_scope(&key.api_key)
+            .await
+            .unwrap()
+            .into_auth_context();
+        assert_eq!(auth.project_id(), Some(7001));
+        assert_eq!(auth.api_key_scope().unwrap().environment_id, Some(9001));
+        assert!(auth.has_permission(&Permission::DeploymentsCreate));
+        assert!(!auth.has_permission(&Permission::ProjectsWrite));
+        assert!(!auth.is_instance_admin());
+        let scoped_admin = crate::AuthContext::new_api_key(
+            auth.user.clone().unwrap(),
+            Some(Role::Admin),
+            None,
+            "scoped-admin".into(),
+            99,
+        )
+        .with_api_key_scope(auth.api_key_scope().copied());
+        assert!(scoped_admin.is_admin());
+        assert!(!scoped_admin.is_instance_admin());
+        let serialized = serde_json::to_string(&auth).unwrap();
+        let restored: crate::AuthContext = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(restored.api_key_scope(), auth.api_key_scope());
+
+        assert!(
+            temps_authz::enforce_api_key_path(&auth, "/api/projects/7001/trigger-pipeline").is_ok()
+        );
+        assert!(
+            temps_authz::enforce_api_key_path(&auth, "/api/projects/7002/trigger-pipeline")
+                .is_err()
+        );
+        use axum::extract::FromRequestParts;
+        let mut parts = axum::http::Request::builder()
+            .uri("/projects/7001/trigger-pipeline")
+            .body(())
+            .unwrap()
+            .into_parts()
+            .0;
+        parts.extensions.insert(auth.clone());
+        assert!(
+            temps_authz::RequireAuth::from_request_parts(&mut parts, &())
+                .await
+                .is_ok()
+        );
+        parts
+            .extensions
+            .insert(axum::extract::OriginalUri("/api/settings".parse().unwrap()));
+        assert_eq!(
+            temps_authz::RequireAuth::from_request_parts(&mut parts, &())
+                .await
+                .err()
+                .unwrap()
+                .status_code,
+            StatusCode::FORBIDDEN
+        );
+        let rotated = service.rotate_api_key(user.id, key.id).await.unwrap();
+        assert!(rotated.api_key.starts_with("tkp_"));
+        assert_eq!(
+            (rotated.project_id, rotated.environment_id),
+            (Some(7001), Some(9001))
+        );
+        assert!(service
+            .validate_api_key_with_scope(&key.api_key)
+            .await
+            .is_err());
+        assert!(service
+            .validate_api_key_with_scope(&rotated.api_key)
+            .await
+            .is_ok());
+        for (name, project, env) in [
+            ("no-project", None, Some(9001)),
+            ("missing", Some(7002), None),
+            ("wrong-project", Some(7001), Some(9002)),
+            ("invalid", Some(0), None),
+        ] {
+            assert!(
+                service
+                    .create_api_key(user.id, make_request(name, project, env))
+                    .await
+                    .is_err(),
+                "{name}"
+            );
+        }
+        db.db
+            .execute_unprepared("UPDATE environments SET deleted_at=now() WHERE id=9001")
+            .await
+            .unwrap();
+        assert!(service
+            .validate_api_key_with_scope(&rotated.api_key)
+            .await
+            .is_err());
+        assert!(service
+            .create_api_key(user.id, make_request("deleted", Some(7001), Some(9001)))
+            .await
+            .is_err());
+    }
+
     // API Key Creation Tests
 
     #[tokio::test]
@@ -778,6 +1095,8 @@ mod tests {
         let (_db, api_key_service, user) = setup_test_env().await;
 
         let request = CreateApiKeyRequest {
+            project_id: None,
+            environment_id: None,
             name: "Admin API Key".to_string(),
             role_type: "admin".to_string(),
             permissions: None,
@@ -801,6 +1120,8 @@ mod tests {
         let (_db, api_key_service, user) = setup_test_env().await;
 
         let request = CreateApiKeyRequest {
+            project_id: None,
+            environment_id: None,
             name: "Custom API Key".to_string(),
             role_type: "custom".to_string(),
             permissions: Some(vec![
@@ -828,6 +1149,8 @@ mod tests {
         let (_db, api_key_service, user) = setup_test_env().await;
 
         let request = CreateApiKeyRequest {
+            project_id: None,
+            environment_id: None,
             name: "Invalid Custom Key".to_string(),
             role_type: "custom".to_string(),
             permissions: None,
@@ -845,6 +1168,8 @@ mod tests {
         let (_db, api_key_service, user) = setup_test_env().await;
 
         let request = CreateApiKeyRequest {
+            project_id: None,
+            environment_id: None,
             name: "Invalid Role Key".to_string(),
             role_type: "invalid_role".to_string(),
             permissions: None,
@@ -863,6 +1188,8 @@ mod tests {
 
         // Create first key
         let request1 = CreateApiKeyRequest {
+            project_id: None,
+            environment_id: None,
             name: "Duplicate Name".to_string(),
             role_type: "reader".to_string(),
             permissions: None,
@@ -876,6 +1203,8 @@ mod tests {
 
         // Try to create second key with same name
         let request2 = CreateApiKeyRequest {
+            project_id: None,
+            environment_id: None,
             name: "Duplicate Name".to_string(),
             role_type: "admin".to_string(),
             permissions: None,
@@ -893,6 +1222,8 @@ mod tests {
         let (_db, api_key_service, user) = setup_test_env().await;
 
         let request = CreateApiKeyRequest {
+            project_id: None,
+            environment_id: None,
             name: "Invalid Permission Key".to_string(),
             role_type: "custom".to_string(),
             permissions: Some(vec!["invalid:permission".to_string()]),
@@ -1164,6 +1495,8 @@ mod tests {
             .create_api_key(
                 user.id,
                 CreateApiKeyRequest {
+                    project_id: None,
+                    environment_id: None,
                     name: "Rotate Me".to_string(),
                     role_type: "admin".to_string(),
                     permissions: None,
@@ -1251,6 +1584,8 @@ mod tests {
         let (_db, api_key_service, user) = setup_test_env().await;
 
         let request = CreateApiKeyRequest {
+            project_id: None,
+            environment_id: None,
             name: "Valid Key".to_string(),
             role_type: "admin".to_string(),
             permissions: None,
@@ -1280,6 +1615,8 @@ mod tests {
         let (_db, api_key_service, user) = setup_test_env().await;
 
         let request = CreateApiKeyRequest {
+            project_id: None,
+            environment_id: None,
             name: "Custom Key".to_string(),
             role_type: "custom".to_string(),
             permissions: Some(vec!["projects:read".to_string()]),
@@ -1321,6 +1658,8 @@ mod tests {
         let (_db, api_key_service, user) = setup_test_env().await;
 
         let request = CreateApiKeyRequest {
+            project_id: None,
+            environment_id: None,
             name: "Expired Key".to_string(),
             role_type: "admin".to_string(),
             permissions: None,
@@ -1346,6 +1685,8 @@ mod tests {
 
         // Create and then deactivate key
         let request = CreateApiKeyRequest {
+            project_id: None,
+            environment_id: None,
             name: "Inactive Key".to_string(),
             role_type: "admin".to_string(),
             permissions: None,
@@ -1375,6 +1716,8 @@ mod tests {
         let (db, api_key_service, user) = setup_test_env().await;
 
         let request = CreateApiKeyRequest {
+            project_id: None,
+            environment_id: None,
             name: "Track Usage Key".to_string(),
             role_type: "admin".to_string(),
             permissions: None,
@@ -1407,6 +1750,8 @@ mod tests {
         let (db, api_key_service, user) = setup_test_env().await;
 
         let request = CreateApiKeyRequest {
+            project_id: None,
+            environment_id: None,
             name: "Throttled Usage Key".to_string(),
             role_type: "admin".to_string(),
             permissions: None,
@@ -1672,6 +2017,8 @@ mod tests {
             .create_api_key(
                 user_id,
                 CreateApiKeyRequest {
+                    project_id: None,
+                    environment_id: None,
                     name: name.to_string(),
                     role_type: role.to_string(),
                     permissions: None,

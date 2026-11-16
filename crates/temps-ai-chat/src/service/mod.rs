@@ -260,13 +260,16 @@ async fn refresh_tool_authorization(
             // owner's admin key must not drive tools with admin authority.
             let owner_role = current_user_role(db, user.id).await?;
             let (role, permissions) = temps_auth::cap_api_key_grant(role, permissions, &owner_role);
-            Ok(AuthContext::new_api_key(
-                user,
-                role,
-                permissions,
-                key.name,
-                key.id,
-            ))
+            Ok(
+                AuthContext::new_api_key(user, role, permissions, key.name, key.id)
+                    .with_api_key_scope(
+                        temps_auth::context::ApiKeyScope::from_ids(
+                            key.project_id,
+                            key.environment_id,
+                        )
+                        .map_err(|_| ToolAuthorizationRefreshError::InvalidPermissions)?,
+                    ),
+            )
         }
         AuthSource::CliToken { user } => {
             let user = active_user(db, user.id).await?;

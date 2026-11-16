@@ -129,18 +129,14 @@ impl AuthMiddleware {
                     let token = auth_str.trim_start_matches("Bearer ");
 
                     // Try API key first (they have a specific format: tk_...)
-                    if token.starts_with("tk_") {
-                        if let Ok((api_user, role, permissions, key_name, key_id)) =
-                            self.api_key_service.validate_api_key(token).await
+                    if token.starts_with("tk_") || token.starts_with("tkp_") {
+                        if let Ok(validated) = self
+                            .api_key_service
+                            .validate_api_key_with_scope(token)
+                            .await
                         {
-                            user = Some(api_user.clone());
-                            Some(crate::context::AuthContext::new_api_key(
-                                api_user,
-                                role,
-                                permissions,
-                                key_name,
-                                key_id,
-                            ))
+                            user = Some(validated.user.clone());
+                            Some(validated.into_auth_context())
                         } else {
                             None
                         }
@@ -226,6 +222,12 @@ impl AuthMiddleware {
         // anonymous: there is no implicit promotion to a Reader role for
         // unauthenticated callers. Issue an authenticated reader API key
         // if you want read-only programmatic access.
+        if let Some(auth) = &auth_context {
+            if let Err(problem) = temps_authz::enforce_api_key_path(auth, req.uri().path()) {
+                return Ok(problem.into_response());
+            }
+        }
+
         if let Some(user) = user {
             req.extensions_mut().insert(user);
         }
@@ -914,6 +916,8 @@ mod tests {
                 .create_api_key(
                     user.id,
                     CreateApiKeyRequest {
+                        project_id: None,
+                        environment_id: None,
                         name: "cli".to_string(),
                         role_type: "admin".to_string(),
                         permissions: None,

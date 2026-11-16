@@ -73,6 +73,13 @@ where
                     .into_response()
             })?;
 
+        let path = parts
+            .extensions
+            .get::<axum::extract::OriginalUri>()
+            .map(|original| original.0.path())
+            .unwrap_or_else(|| parts.uri.path());
+        crate::enforce_api_key_path(&context, path).map_err(IntoResponse::into_response)?;
+
         // Check if the user has the required permission
         if !context.has_permission(&P::PERMISSION) {
             return Err(ErrorBuilder::new(StatusCode::FORBIDDEN)

@@ -79,3 +79,19 @@ test('the reachability step asks for an address, not a wildcard domain', () => {
     'Make your apps reachable|/settings#preview-domain|false'
   )
 })
+
+function DeployStep() {
+  const step = useGettingStarted().items.find((item) => item.key === 'deploy')
+  return (
+    <p>
+      {step?.href}|{step?.description}
+    </p>
+  )
+}
+
+test('the deployment checklist reuses template project creation', () => {
+  const html = renderAs('admin', <DeployStep />)
+  expect(html).toContain('/projects/new?source=templates')
+  expect(html).toContain('Choose a starter template')
+  expect(html).not.toContain('one click')
+})

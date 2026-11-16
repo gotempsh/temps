@@ -1707,6 +1707,8 @@ async fn authorization_revocation_stops_an_active_native_provider_stream() {
     let now = Utc::now();
     let user = test_auth().user.expect("test user");
     let key = temps_entities::api_keys::Model {
+        project_id: None,
+        environment_id: None,
         id: 74,
         name: "active-turn".to_string(),
         key_hash: "hash".to_string(),
@@ -1786,6 +1788,8 @@ async fn project_revocation_stops_an_active_native_provider_stream() {
     let now = Utc::now();
     let user = test_auth().user.expect("test user");
     let key = temps_entities::api_keys::Model {
+        project_id: None,
+        environment_id: None,
         id: 75,
         name: "project-turn".to_string(),
         key_hash: "hash".to_string(),
@@ -1880,6 +1884,8 @@ async fn runtime_permission_downgrade_stops_an_active_native_provider_stream() {
     let now = Utc::now();
     let user = test_auth().user.expect("test user");
     let active_key = temps_entities::api_keys::Model {
+        project_id: None,
+        environment_id: None,
         id: 76,
         name: "runtime-turn".to_string(),
         key_hash: "hash".to_string(),
@@ -1968,6 +1974,8 @@ async fn newly_linked_project_is_authorized_during_an_active_native_provider_str
     let now = Utc::now();
     let user = test_auth().user.expect("test user");
     let key = temps_entities::api_keys::Model {
+        project_id: None,
+        environment_id: None,
         id: 77,
         name: "topology-turn".to_string(),
         key_hash: "hash".to_string(),
@@ -2106,6 +2114,8 @@ async fn tool_authorization_uses_current_api_key_permissions() {
     let now = Utc::now();
     let user = test_auth().user.expect("test user");
     let key = temps_entities::api_keys::Model {
+        project_id: None,
+        environment_id: None,
         id: 72,
         name: "current".to_string(),
         key_hash: "hash".to_string(),
@@ -2146,6 +2156,8 @@ async fn tool_authorization_caps_an_admin_key_whose_owner_was_demoted() {
     let now = Utc::now();
     let user = test_auth().user.expect("test user");
     let key = temps_entities::api_keys::Model {
+        project_id: None,
+        environment_id: None,
         id: 73,
         name: "former-admin".to_string(),
         key_hash: "hash".to_string(),
@@ -2402,6 +2414,8 @@ fn service_with_current_tool_auth_and_session_clear(
     let now = Utc::now();
     let user = test_auth().user.expect("test user");
     let key = temps_entities::api_keys::Model {
+        project_id: None,
+        environment_id: None,
         id: 73,
         name: "tool-loop".to_string(),
         key_hash: "hash".to_string(),

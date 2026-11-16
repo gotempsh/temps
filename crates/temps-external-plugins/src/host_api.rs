@@ -287,7 +287,9 @@ impl RouterHostApi {
                     permissions,
                     key.name,
                     key.id,
-                ))
+                ).with_api_key_scope(temps_auth::context::ApiKeyScope::from_ids(key.project_id, key.environment_id)
+                    .map_err(|error| ChannelError::new(ChannelErrorCode::Unauthenticated,
+                        format!("API key {key_id} has an invalid resource scope for plugin '{plugin}': {error}")))?))
             }
         }
     }
@@ -568,6 +570,8 @@ mod tests {
     fn api_key(expires_at: Option<chrono::DateTime<Utc>>) -> temps_entities::api_keys::Model {
         let now = Utc::now();
         temps_entities::api_keys::Model {
+            project_id: None,
+            environment_id: None,
             id: 9,
             name: "restricted-plugin-key".to_string(),
             key_hash: "hash".to_string(),

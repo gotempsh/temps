@@ -98,6 +98,7 @@ fn test_auth_context_new_api_key_with_role() {
         permissions,
         key_name,
         key_id,
+        ..
     } = &context.source
     {
         assert_eq!(source_user.id, user.id);

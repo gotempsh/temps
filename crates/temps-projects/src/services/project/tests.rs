@@ -14,12 +14,12 @@ use temps_core::{JobQueue, QueueError};
 use temps_entities::preset::Preset;
 use temps_test_utils::TestDatabase;
 // Mock JobQueue for testing
-struct MockJobQueue {
+pub(super) struct MockJobQueue {
     jobs: Arc<Mutex<Vec<Job>>>,
 }
 
 impl MockJobQueue {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             jobs: Arc::new(Mutex::new(Vec::new())),
         }
@@ -43,7 +43,7 @@ impl JobQueue for MockJobQueue {
 }
 
 // Helper function to create test services
-async fn create_test_services(
+pub(super) async fn create_test_services(
     db: Arc<temps_database::DbConnection>,
     mock_queue: Arc<MockJobQueue>,
 ) -> ProjectService {

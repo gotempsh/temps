@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { useComposedSearchParams } from '@temps-sdk/ds'
 import { Checkbox } from '@/components/ui/checkbox'
 import { useEffect, useMemo, useState } from 'react'
 import { Link, useNavigate } from 'react-router'
@@ -176,7 +177,19 @@ export default function Sandboxes() {
   const [page, setPage] = useState(1)
   const [filter, setFilter] = useState<StatusFilter>('active')
   const [stopTarget, setStopTarget] = useState<SandboxView | null>(null)
-  const [createOpen, setCreateOpen] = useState(false)
+  const [searchParams, updateSearchParams] = useComposedSearchParams()
+  const createOpen = searchParams.get('new') === 'sandbox'
+  const setCreateOpen = (open: boolean) => {
+    updateSearchParams(
+      (current) => {
+        const next = new URLSearchParams(current)
+        if (open) next.set('new', 'sandbox')
+        else next.delete('new')
+        return next
+      },
+      { replace: !open }
+    )
+  }
   const queryClient = useQueryClient()
 
   const listQuery = listSandboxesOptions({
