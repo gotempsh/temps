@@ -485,7 +485,7 @@ ipnetwork = "0.21"
 js-sys = "0.3"
 jsonwebtoken = { version = "11.0.0", features = ["rust_crypto"] }
 lol_html = "3"
-lopdf = { version = "0.46", default-features = false }
+lopdf = { version = "0.47", default-features = false }
 maplit = "1.0"
 maxminddb = { version = "0.32.0", features = ["mmap"] }
 md5 = "0.8"
