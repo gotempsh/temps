@@ -5,6 +5,7 @@ import { createAndLinkDescription } from '@/lib/service-link-copy'
 import {
   adminListNodesOptions,
   createServiceMutation,
+  listS3SourcesOptions,
   getProjectOptions,
   getProviderMetadataOptions,
   getProvidersMetadataOptions,
@@ -59,6 +60,8 @@ import {
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useNavigate, useSearchParams } from 'react-router'
 import { toast } from 'sonner'
+import { creationBackupHref } from '@/lib/creation-backup-schedule'
+import { CreationBackupSetup } from '@/components/storage/CreationBackupSetup'
 
 /** Service types that support HA cluster topology */
 const CLUSTER_SERVICE_TYPES: ServiceTypeRoute[] = ['postgres']
@@ -294,6 +297,8 @@ function ClusterMemberConfig({
 export function CreateService() {
   usePageTitle('Create database')
   const navigate = useNavigate()
+  const [backupDestination, setBackupDestination] = useState('later')
+  const destinations = useQuery({ ...listS3SourcesOptions(), retry: false })
   const [searchParams] = useSearchParams()
   const requestedServiceType = searchParams.get('type')
   const projectId = serviceProjectId(searchParams.get('project_id'))
@@ -442,7 +447,7 @@ export function CreateService() {
       } else {
         toast.success('Service created successfully')
       }
-      navigate(`/storage/${data.id}`)
+      navigate(creationBackupHref(data.id, backupDestination))
     },
   })
 
@@ -844,6 +849,12 @@ export function CreateService() {
         {/* Type-specific preset (version/engine pills) */}
         {topology === 'standalone' && preset.ui}
 
+        <CreationBackupSetup
+          query={destinations}
+          destination={backupDestination}
+          onDestinationChange={setBackupDestination}
+        />
+
         {/* JSON Schema Form for Parameters */}
         <JsonSchemaForm
           schema={jsonSchema as any}
@@ -855,6 +866,10 @@ export function CreateService() {
               : 'Create database'
           }
           submitDisabled={
+            (backupDestination !== 'later' &&
+              !destinations.data?.some(
+                (source) => String(source.id) === backupDestination
+              )) ||
             !serviceName.trim() ||
             !!preset.error ||
             (topology === 'standalone' && standaloneNodeId === null)
