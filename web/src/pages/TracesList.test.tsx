@@ -80,3 +80,69 @@ test('the traces list keeps the environment the bar put in the URL', async () =>
     ).toBe(true)
   )
 })
+
+/** Renders the traces page for a service that has already received traces. */
+function renderWithTraces(entry: string) {
+  client.setConfig({
+    baseUrl: 'https://console.example.test/api',
+    fetch: Object.assign(
+      (input: RequestInfo | URL) => {
+        const url = new URL(input instanceof Request ? input.url : input)
+        if (url.pathname.endsWith('/otel/has-traces/17'))
+          return Promise.resolve(Response.json({ has_traces: true }))
+        return new Promise<Response>(() => {})
+      },
+      { preconnect: fetch.preconnect }
+    ),
+  })
+  const bar = {
+    environments: [],
+    selection: { environment: null, all: true, source: 'default' },
+    select: () => {},
+  } as unknown as ProjectEnvironmentContextValue
+  return render(
+    <QueryClientProvider
+      client={
+        new QueryClient({ defaultOptions: { queries: { retry: false } } })
+      }
+    >
+      <MemoryRouter initialEntries={[entry]}>
+        <BreadcrumbProvider>
+          <ProjectEnvironmentContext.Provider value={bar}>
+            <TracesList
+              project={{ id: 17, slug: 'synthetic' } as ProjectResponse}
+            />
+          </ProjectEnvironmentContext.Provider>
+        </BreadcrumbProvider>
+      </MemoryRouter>
+    </QueryClientProvider>
+  )
+}
+
+test('a link to #traces-setup opens the setup and scrolls to it even when traces exist', async () => {
+  const scrolled: string[] = []
+  // Stub where the method is defined, so restoring it leaves no copy on a
+  // subclass prototype that would hide other tests' stubs.
+  const original = Element.prototype.scrollIntoView
+  Element.prototype.scrollIntoView = function (this: Element) {
+    scrolled.push(this.id)
+  }
+  try {
+    const view = renderWithTraces('/traces#traces-setup')
+    await waitFor(() =>
+      expect(view.container.querySelector('#traces-setup')).not.toBeNull()
+    )
+    // The filter sync rewrites the URL without the hash on mount; the scroll
+    // still has to happen.
+    await waitFor(() => expect(scrolled).toContain('traces-setup'))
+  } finally {
+    Element.prototype.scrollIntoView = original
+  }
+})
+
+test('without the hash a service with traces keeps the setup closed', async () => {
+  const view = renderWithTraces('/traces')
+  // Give the has-traces probe time to answer before asserting absence.
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  expect(view.container.querySelector('#traces-setup')).toBeNull()
+})

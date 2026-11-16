@@ -113,8 +113,6 @@ import Metrics from './Metrics'
 import { ProjectTour } from '@/components/project/ProjectTour'
 import { ProjectAgentActivity } from './AiGateway'
 import { AutofixRedirect } from '@/components/autofixer/AutofixRedirect'
-import { AgentDetailPage } from '@/components/agents/AgentDetailPage'
-import { AgentEditPage } from '@/components/agents/AgentEditPage'
 import { AutopilotRunDetail } from '@/components/agents/AutopilotRunDetail'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { type ReactNode, useEffect, useRef, useState } from 'react'
@@ -1029,13 +1027,16 @@ export function ProjectDetail() {
                     />
                   }
                 />
+                {/* Workflow definitions were retired; autofix runs still open
+                    at agents/:runId below. */}
                 <Route
-                  path="agents/detail/:agentSlug"
-                  element={<AgentDetailPage project={project} />}
-                />
-                <Route
-                  path="agents/detail/:agentSlug/edit"
-                  element={<AgentEditPage project={project} />}
+                  path="agents/detail/*"
+                  element={
+                    <LegacyProjectRouteRedirect
+                      projectSlug={project.slug}
+                      route="agents"
+                    />
+                  }
                 />
                 <Route
                   path="agents/:runId"

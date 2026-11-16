@@ -47,6 +47,44 @@ export const ASSISTANT_EXAMPLE_PROMPTS: readonly string[] = [
   'Deploy a public Git repository and give me its URL',
 ]
 
+/**
+ * Things to ask once the user has services running: questions the assistant
+ * answers from what Temps already records (deployments, errors, traffic), so
+ * the chat starts from the user's own platform rather than a demo app.
+ */
+export const ASSISTANT_OPERATE_PROMPTS: readonly string[] = [
+  'Check my services for failed deployments and explain why they failed',
+  'Which services had the most errors in the last 24 hours?',
+  'Summarize what changed across my services this week',
+]
+
+/** The same questions, about one project the new chat is scoped to. */
+export function projectExamplePrompts(projectName: string): string[] {
+  return [
+    `Why did the latest deployment of ${projectName} fail, if it did?`,
+    `What are the most frequent errors in ${projectName} this week?`,
+    `How is traffic to ${projectName} trending compared to last week?`,
+  ]
+}
+
+/**
+ * The suggestions under the composer. A new instance gets complete goals that
+ * need nothing yet; once services exist the suggestions turn to them, keeping
+ * one build goal so the assistant's other half stays visible; a chat scoped to
+ * one project asks about that project.
+ */
+export function assistantExamplePrompts({
+  hasProjects,
+  projectName,
+}: {
+  hasProjects: boolean
+  projectName?: string | null
+}): readonly string[] {
+  if (projectName) return projectExamplePrompts(projectName)
+  if (!hasProjects) return ASSISTANT_EXAMPLE_PROMPTS
+  return [...ASSISTANT_OPERATE_PROMPTS, ASSISTANT_EXAMPLE_PROMPTS[1]]
+}
+
 const LAST_MODEL_KEY = 'temps.assistant.last-model'
 
 /** The model the user last started or switched a chat to, if any. */

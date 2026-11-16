@@ -134,3 +134,32 @@ test('an untitled workspace chat shows its kind, not an internal id', async () =
   await view.findByText('Workspace chat')
   expect(view.queryByText(/global-context/)).toBeNull()
 })
+
+test('the chat search survives opening a chat and coming back', async () => {
+  serve(
+    [],
+    [
+      chat('conv_application', 'application', 'Plan the migration'),
+      chat('conv_global', 'global', 'Tidy the sandbox'),
+    ]
+  )
+  const view = renderDock()
+
+  await view.findByText('Tidy the sandbox')
+  fireEvent.change(view.getByLabelText('Search chats'), {
+    target: { value: 'migration' },
+  })
+  await waitFor(() => expect(view.queryByText('Tidy the sandbox')).toBeNull())
+  fireEvent.click(view.getByText('Plan the migration'))
+  // The list unmounts while the chat is open.
+  await waitFor(() => expect(view.queryByLabelText('Search chats')).toBeNull())
+
+  fireEvent.click(view.getByLabelText('Back to all conversations'))
+
+  const search = (await view.findByLabelText(
+    'Search chats'
+  )) as HTMLInputElement
+  expect(search.value).toBe('migration')
+  expect(view.queryByText('Tidy the sandbox')).toBeNull()
+  expect(view.getByText('Plan the migration')).toBeTruthy()
+})

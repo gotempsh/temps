@@ -41,6 +41,15 @@ describe('settings section links', () => {
   })
 })
 
+describe('integrations sections', () => {
+  test('linked vaults have a section on the Integrations page', () => {
+    expect(SETTINGS_SECTION_IDS.integrations).toContain('vaults')
+    expect(requestedSettingsSection('integrations', '?section=vaults')).toBe(
+      'vaults'
+    )
+  })
+})
+
 describe('legacyProjectRouteTarget', () => {
   test('every legacy settings route lands on a section that exists', () => {
     for (const target of Object.values(LEGACY_PROJECT_ROUTES)) {
@@ -48,7 +57,26 @@ describe('legacyProjectRouteTarget', () => {
       if (!path.startsWith('settings/')) continue
       const page = path.slice('settings/'.length) as CombinedSettingsPage
       expect(SETTINGS_SECTION_IDS[page]).toBeDefined()
-      expect(requestedSettingsSection(page, query ?? '')).toBeDefined()
+      // Routes of retired sections open the page itself, with no section.
+      if (query === undefined) continue
+      expect(requestedSettingsSection(page, query)).toBeDefined()
+    }
+  })
+
+  test('retired AI sections open their former page without a section', () => {
+    expect(legacyProjectRouteTarget('settings/skills', '')).toBe(
+      'settings/integrations'
+    )
+    expect(legacyProjectRouteTarget('settings/mcp-servers', '')).toBe(
+      'settings/integrations'
+    )
+    for (const retired of ['skills', 'mcp-servers']) {
+      expect(
+        requestedSettingsSection('automation', `?section=${retired}`)
+      ).toBeUndefined()
+      expect(
+        requestedSettingsSection('integrations', `?section=${retired}`)
+      ).toBeUndefined()
     }
   })
 

@@ -37,9 +37,10 @@ export const SETTINGS_SECTION_IDS = {
   variables: ['environment-variables', 'secrets'],
   'deployment-tokens': ['deployment-tokens'],
   // `agents` is the old "Agents & runs" section; it now opens the automation
-  // list, which holds the repository workflows.
+  // list. `skills` and `mcp-servers` were retired with the harness-based AI
+  // features; their old links open the page itself.
   automation: ['automations', 'agents', 'templates', 'chats', 'crash-autofix'],
-  integrations: ['webhooks', 'skills', 'mcp-servers', 'extensions'],
+  integrations: ['webhooks', 'vaults', 'extensions'],
 } as const satisfies Record<CombinedSettingsPage, readonly string[]>
 
 export type SettingsSectionId<P extends CombinedSettingsPage> =
@@ -103,8 +104,8 @@ export const LEGACY_PROJECT_ROUTES = {
   // Cron jobs call your app over HTTP; they live under Monitoring.
   'settings/cron-jobs': 'cron-jobs',
   'settings/webhooks': settingsSectionPath('integrations', 'webhooks'),
-  'settings/skills': settingsSectionPath('integrations', 'skills'),
-  'settings/mcp-servers': settingsSectionPath('integrations', 'mcp-servers'),
+  'settings/skills': 'settings/integrations',
+  'settings/mcp-servers': 'settings/integrations',
   'settings/secrets': settingsSectionPath('variables', 'secrets'),
   'settings/domains': 'domains',
   'settings/environment-variables': 'environment-variables',

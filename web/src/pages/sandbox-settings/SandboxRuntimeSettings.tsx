@@ -16,7 +16,6 @@ import {
   XCircle,
 } from 'lucide-react'
 
-import { usePageTitle } from '@/hooks/usePageTitle'
 import {
   Card,
   CardContent,
@@ -140,8 +139,7 @@ function getResourcePresetLabel(cpu: number, memory: number): string {
   return match ? match.label : 'Custom'
 }
 
-export function AgentSandboxSandboxPage() {
-  usePageTitle('Sandbox configuration')
+export function SandboxRuntimeSettings() {
   const { data: settings, isLoading, error, refetch } = useSettingsPage()
   const updateSettings = useUpdateSettings()
 
@@ -304,15 +302,16 @@ export function AgentSandboxSandboxPage() {
       return
     }
     try {
-      // Per-provider credentials live on /agent-sandbox/providers/:id —
-      // this mutation only touches platform-wide sandbox knobs. We pass
+      // Per-provider harness credentials are no longer edited in the console
+      // but are still stored — this mutation only touches platform-wide
+      // sandbox knobs. We pass
       // through default_provider so we don't accidentally clobber it on
       // save (it's also editable from the providers list).
       await updateSettings.mutateAsync({
         agent_sandbox: {
           // Carry forward fields we don't edit on this page (providers map,
           // legacy auth_type / api_key_encrypted) so a save here doesn't wipe
-          // per-provider credentials configured on /agent-sandbox/providers/:id.
+          // stored per-provider credentials.
           ...settings?.agent_sandbox,
           default_provider: defaultProvider,
           enabled: true,
@@ -336,7 +335,7 @@ export function AgentSandboxSandboxPage() {
         ai_workspace_file_limits: limits.workspaceFileLimits,
       })
       setIsDirty(false)
-      toast.success('Workflow sandbox settings saved')
+      toast.success('Sandbox settings saved')
     } catch {
       // useUpdateSettings already toasts this failure, with the server's reason.
     }
@@ -366,12 +365,11 @@ export function AgentSandboxSandboxPage() {
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
               <Bot className="h-5 w-5" />
-              Workflow sandbox
+              Sandbox runtime
             </CardTitle>
             <CardDescription>
-              When sandbox is enabled, workflows run inside isolated Docker
-              containers. Code changes are contained and can&apos;t affect your
-              server.
+              Sandboxes and autofix runs execute inside isolated containers.
+              Code changes are contained and can&apos;t affect your server.
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-6">
@@ -471,8 +469,8 @@ export function AgentSandboxSandboxPage() {
             <Alert>
               <AlertTriangle className="h-4 w-4" />
               <AlertDescription>
-                Agents always run in an isolated Docker container — there is no
-                host-execution mode. Docker must be available for any session to
+                Sandboxes always run in an isolated container — there is no
+                host-execution mode. Docker must be available for any sandbox to
                 start.
               </AlertDescription>
             </Alert>
@@ -552,7 +550,7 @@ export function AgentSandboxSandboxPage() {
               On the control plane a sandbox also cannot be given more memory
               than the host has. Sandboxes already created are not changed, and
               the per-user cap counts a user&apos;s sandboxes that are not
-              destroyed; AI application workspaces and agent runs are exempt.
+              destroyed; workspace-owned sandboxes and autofix runs are exempt.
             </p>
           </CardContent>
         </Card>
@@ -561,7 +559,7 @@ export function AgentSandboxSandboxPage() {
           <CardHeader>
             <CardTitle className="text-base">Isolation backend</CardTitle>
             <CardDescription>
-              Default sandbox isolation technology for new workflow runs.
+              Default isolation technology for new sandboxes and autofix runs.
               Firecracker provides stronger isolation via KVM microVMs;
               microsandbox is an experimental microVM backend that also runs on
               Apple Silicon Macs; Docker is the standard default.
@@ -781,10 +779,9 @@ export function AgentSandboxSandboxPage() {
               Global config repository
             </CardTitle>
             <CardDescription>
-              A shared config repository applied to all workflow runs. Contains
-              a <code className="text-xs bg-muted px-1 rounded">.claude/</code>{' '}
-              directory with skills, MCP servers, and settings. Per-workflow
-              config repos override conflicting files.
+              A shared config repository copied into every autofix run. Its{' '}
+              <code className="text-xs bg-muted px-1 rounded">.claude/</code>{' '}
+              directory supplies the coding agent&apos;s settings.
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">

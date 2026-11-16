@@ -23,7 +23,6 @@ import {
   ArrowLeft,
   BadgeCheck,
   BarChart3,
-  Bot,
   ChevronsUpDown,
   Check,
   Folder,
@@ -32,13 +31,9 @@ import {
   Monitor,
   Moon,
   Search,
-  MessageSquare,
-  Server,
   Settings,
   Sun,
   Sparkles,
-  Terminal,
-  Wand2,
   X,
 } from 'lucide-react'
 import { toast } from 'sonner'
@@ -96,25 +91,12 @@ import {
   type SettingsNavigationIcon,
 } from '@/components/settings/settings-navigation'
 
-// AI drill-down — swapped in for /ai-gateway, /chat, /agent-sandbox,
-// /skills, /mcp-servers, /ai-workflows, mirroring the Settings sidebar
-// swap so AI's several pages read as one coherent area instead of a
-// scattered set of sidebar entries.
-const AI_MODE_PREFIXES = [
-  '/ai-gateway',
-  '/chat',
-  '/agent-sandbox',
-  '/skills',
-  '/mcp-servers',
-  '/ai-workflows',
-]
+// AI drill-down — swapped in for /ai-gateway and /chat, mirroring the
+// Settings sidebar swap so AI's pages read as one coherent area instead of a
+// scattered set of sidebar entries. The assistant itself is reached from the
+// header's AI button, so the area holds only the gateway's pages.
+const AI_MODE_PREFIXES = ['/ai-gateway', '/chat']
 const aiNavItems: PlatformNavItem[] = [
-  {
-    title: 'Harnesses',
-    url: '/agent-sandbox/providers',
-    icon: Terminal,
-    featureKey: 'ai-chat',
-  },
   {
     title: 'Providers',
     url: '/ai-gateway',
@@ -139,31 +121,6 @@ const aiNavItems: PlatformNavItem[] = [
     icon: Activity,
     featureKey: 'ai-gateway',
   },
-  {
-    title: 'Setup',
-    url: '/ai-gateway/setup',
-    icon: Terminal,
-    featureKey: 'ai-gateway',
-  },
-  {
-    title: 'Chats',
-    url: '/chat',
-    icon: MessageSquare,
-    featureKey: 'ai-chat',
-  },
-  {
-    title: 'Workflows',
-    url: '/ai-workflows',
-    icon: Bot,
-    featureKey: 'ai-agents-workflows',
-  },
-  {
-    title: 'Skills',
-    url: '/skills',
-    icon: Wand2,
-    featureKey: 'ai-foundation-api-tools',
-  },
-  { title: 'MCP servers', url: '/mcp-servers', icon: Server },
 ]
 
 function NavPlugins({
@@ -932,7 +889,7 @@ function SettingsNav({ onBack }: { onBack: () => void }) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // AI nav — replaces the whole sidebar for the AI area (Providers, Usage,
-// Chats, Workflows, Skills, MCP Servers). Back button returns to root.
+// Limits, Activity). Back button returns to root.
 // ─────────────────────────────────────────────────────────────────────────────
 
 function AiNav({ onBack }: { onBack: () => void }) {

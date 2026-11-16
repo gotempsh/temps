@@ -34,11 +34,9 @@ import {
   type ProviderCatalogResponse,
 } from '@/api/client'
 import { AiHarnessLogo } from '@/components/ui/ai-harness-logo'
-import {
-  backToWorkspaceLabel,
-  harnessSetupHref,
-  workspaceReturnTo,
-} from './harness-onboarding'
+import { harnessSetupHref } from './harness-onboarding'
+import { returnToFromSearch } from '@/lib/safe-return-to'
+import { PageContainer } from '@/components/layout/PageContainer'
 import { refreshAiProviderModelsMutation } from '@/api/client/@tanstack/react-query.gen'
 import { problemDetail } from '@/lib/api-problem'
 import { HarnessConnectionForm } from './HarnessConnectionForm'
@@ -52,8 +50,8 @@ import {
 export function AgentSandboxProviderDetail() {
   const { id } = useParams<{ id: string }>()
   const [params] = useSearchParams()
-  const returnTo = workspaceReturnTo(params.get('returnTo'))
-  usePageTitle(id ? `Harness · ${id}` : 'Harness')
+  const returnTo = returnToFromSearch(params)
+  usePageTitle(id ? `Autofix agent · ${id}` : 'Autofix agent')
   const { data, isPending, isError } = useQuery({
     ...aiProviderCatalogQueryOptions,
     staleTime: 60 * 1000,
@@ -61,51 +59,57 @@ export function AgentSandboxProviderDetail() {
 
   if (isPending) {
     return (
-      <div role="status" className="space-y-4" aria-label="Loading harness">
-        <Skeleton className="h-8 w-48" />
-        <Skeleton className="h-48 w-full" />
-      </div>
+      <PageContainer>
+        <div role="status" className="space-y-4" aria-label="Loading agent">
+          <Skeleton className="h-8 w-48" />
+          <Skeleton className="h-48 w-full" />
+        </div>
+      </PageContainer>
     )
   }
 
   if (isError || !data) {
     return (
-      <Card>
-        <CardContent className="py-8 text-sm text-destructive">
-          Failed to load the harness catalog.
-        </CardContent>
-      </Card>
+      <PageContainer>
+        <Card>
+          <CardContent className="py-8 text-sm text-destructive">
+            Failed to load the agent catalog.
+          </CardContent>
+        </Card>
+      </PageContainer>
     )
   }
 
   const provider = data.providers.find((p) => p.id === id)
   if (!provider) {
     return (
-      <Card>
-        <CardContent className="py-8 space-y-3">
-          <p className="text-sm">
-            Harness <code className="font-mono">{id}</code> is not in the
-            catalog.
-          </p>
-          <Button asChild variant="outline" size="sm">
-            <Link to={harnessSetupHref(null, returnTo)}>
-              <ArrowLeft className="h-3.5 w-3.5 mr-1.5" />
-              Back to harnesses
-            </Link>
-          </Button>
-        </CardContent>
-      </Card>
+      <PageContainer>
+        <Card>
+          <CardContent className="py-8 space-y-3">
+            <p className="text-sm">
+              Agent <code className="font-mono">{id}</code> is not in the
+              catalog.
+            </p>
+            <Button asChild variant="outline" size="sm">
+              <Link to={harnessSetupHref(null, returnTo)}>
+                <ArrowLeft className="h-3.5 w-3.5 mr-1.5" />
+                Back to agent credentials
+              </Link>
+            </Button>
+          </CardContent>
+        </Card>
+      </PageContainer>
     )
   }
 
   return (
-    <div className="space-y-4">
+    <PageContainer>
       <Link
         to={harnessSetupHref(null, returnTo)}
         className="inline-flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground"
       >
         <ArrowLeft className="h-3.5 w-3.5" />
-        All harnesses
+        All agent credentials
       </Link>
 
       <ProviderEditor
@@ -114,7 +118,7 @@ export function AgentSandboxProviderDetail() {
         isActive={provider.id === data.default_provider}
         returnTo={returnTo}
       />
-    </div>
+    </PageContainer>
   )
 }
 
@@ -126,33 +130,17 @@ export function AgentSandboxProviderDetail() {
 interface ProviderEditorProps {
   provider: ProviderCatalogDto
   isActive: boolean
-  /** The workspace page setup was opened from; no way back without one. */
+  /** Validated path of the task that sent the user here, if any. */
   returnTo?: string | null
-  embedded?: boolean
   onVerificationPending?: (pending: boolean) => void
 }
 
 export function ProviderEditor({
   provider,
   isActive,
-  returnTo = null,
-  embedded = false,
+  returnTo,
   onVerificationPending,
 }: ProviderEditorProps) {
-  if (embedded) {
-    return (
-      <div className="space-y-4">
-        <p className="text-sm text-muted-foreground">
-          Connect once. Reuse this account across your workspaces.
-        </p>
-        <HarnessConnectionForm
-          provider={provider}
-          onVerificationPending={onVerificationPending}
-        />
-      </div>
-    )
-  }
-
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -162,7 +150,7 @@ export function ProviderEditor({
         </div>
         {returnTo && (
           <Button asChild variant="outline" size="sm">
-            <Link to={returnTo}>{backToWorkspaceLabel(returnTo)}</Link>
+            <Link to={returnTo}>Back</Link>
           </Button>
         )}
       </div>
@@ -366,8 +354,8 @@ function DefaultModelSetting({ provider }: { provider: ProviderCatalogDto }) {
         title="Default model"
         description={
           provider.models_refreshed_at
-            ? `Used by autofix and the smoke test. Workspaces pick a model per chat. Last refreshed ${new Date(provider.models_refreshed_at).toLocaleString()}.`
-            : 'Used by autofix and the smoke test. Workspaces pick a model per chat.'
+            ? `Used by autofix and the smoke test. Last refreshed ${new Date(provider.models_refreshed_at).toLocaleString()}.`
+            : 'Used by autofix and the smoke test.'
         }
       >
         <div className="flex items-center gap-2">
@@ -508,7 +496,7 @@ function InstanceDefaultSetting({
     <section>
       <SettingHeading
         title="Instance default"
-        description="Server-side workflows use this harness. It does not change the harness selected in an existing workspace thread."
+        description="Autofix runs use this agent when more than one is connected."
       >
         <Button
           variant="outline"
