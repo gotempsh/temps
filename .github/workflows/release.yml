@@ -266,7 +266,7 @@ jobs:
           no-cache: true
       - name: Install Node for SDK packaging
         if: needs.validate-release-ref.outputs.sdk_selected == 'true'
-        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '24'
           package-manager-cache: false
@@ -324,7 +324,7 @@ jobs:
         with:
           name: sdk-packages
           path: sdk-artifacts/
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         if: contains(fromJSON(needs.validate-release-ref.outputs.sdk_kinds), 'npm')
         with:
           node-version: '24'
