@@ -595,7 +595,7 @@ pub const fn guidance_for(code: DeploymentFailureCode) -> FailureGuidance {
         ),
         C::ContainerExited => (
             "Container exited during startup",
-            "The app process exited (or kept restarting) right after starting. Read the retained container logs below for the startup crash or a missing environment variable. Verify the start command runs a long-lived server, HOST is 0.0.0.0, and the listen port matches the deployment port. Exit 137 can mean the process was OOM-killed; check the memory limit and runtime logs before raising the limit. If the logs report exec format error, use an image and application binaries built for the host CPU architecture, or publish a multi-architecture image.",
+            "The app process exited (or kept restarting) right after starting. Check the deployment's retained container logs, when they were captured, or the runtime logs for the startup crash or a missing environment variable. Verify the start command runs a long-lived server, HOST is 0.0.0.0, and the listen port matches the deployment port. Exit 137 can mean the process was OOM-killed; check the memory limit and runtime logs before raising the limit. If the logs report exec format error, use an image and application binaries built for the host CPU architecture, or publish a multi-architecture image.",
             Some(S::EnvironmentVariables),
         ),
         C::ImageNotFound => (
@@ -1915,6 +1915,9 @@ mod tests {
         ] {
             assert!(info.remediation.contains(hint), "missing hint: {hint}");
         }
+        // Not every surface shows logs under the guidance (the compact row
+        // only has a tooltip, and logs are only present when captured).
+        assert!(!info.remediation.contains("below"));
     }
 
     #[test]
