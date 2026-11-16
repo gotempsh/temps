@@ -49,6 +49,9 @@ export function AllWorkflows() {
     getNextPageParam: (last) => last.next_cursor ?? undefined,
   })
   const rows = query.data?.pages.flatMap((page) => page.runs) ?? []
+  const failure = query.isError
+    ? problemDetail(query.error, 'The server did not answer.')
+    : null
   return (
     <Ledger<WorkflowRunResponse>
       title="All workflows"
@@ -84,12 +87,11 @@ export function AllWorkflows() {
               {query.isFetchingNextPage ? 'Loading runs…' : 'Load more runs'}
             </Button>
           )}
-          {query.isError && (
+          {/* With nothing loaded the failure state below says why; this
+              line only covers a refresh failing over runs already shown. */}
+          {failure && rows.length > 0 && (
             <p role="alert" className="text-sm text-destructive">
-              {problemDetail(
-                query.error,
-                'Could not load workflow runs. Refresh to retry.'
-              )}
+              Could not refresh workflow runs: {failure}
             </p>
           )}
         </div>
@@ -136,28 +138,39 @@ export function AllWorkflows() {
       rowKey={(run) => run.id}
       isLoading={query.isPending}
       empty={
-        <PageState
-          variant={query.isError ? 'failed' : 'empty'}
-          size="compact"
-          icon={Workflow}
-          title={
-            query.isError
-              ? 'Could not load workflows'
-              : status
-                ? 'No matching runs'
-                : 'No workflow runs yet'
-          }
-          description={
-            query.isError
-              ? 'Refresh to try again.'
-              : 'Start a workflow in a project environment to see its progress here.'
-          }
-          action={
-            <Button asChild variant="outline">
-              <Link to="/projects">Open projects</Link>
-            </Button>
-          }
-        />
+        failure ? (
+          <PageState
+            variant="failed"
+            size="compact"
+            icon={Workflow}
+            title="Could not load workflow runs"
+            description={`The server answered: ${failure}`}
+            action={
+              <Button
+                variant="outline"
+                aria-disabled={query.isFetching}
+                onClick={() => {
+                  if (!query.isFetching) void query.refetch()
+                }}
+              >
+                {query.isFetching ? 'Trying again…' : 'Try again'}
+              </Button>
+            }
+          />
+        ) : (
+          <PageState
+            variant="empty"
+            size="compact"
+            icon={Workflow}
+            title={status ? 'No matching runs' : 'No workflow runs yet'}
+            description="Start a workflow in a project environment to see its progress here."
+            action={
+              <Button asChild variant="outline">
+                <Link to="/projects">Open projects</Link>
+              </Button>
+            }
+          />
+        )
       }
     />
   )

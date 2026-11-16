@@ -49,6 +49,7 @@ import { problemDetail } from '@/lib/api-problem'
 import { WORKER_NODES_URL } from '@/lib/worker-nodes'
 import { PlatformFeatureNotice } from '@/components/platform/PlatformFeatureNotice'
 import { WorkerNodeRequiredAlert } from './WorkerNodeRequiredBanner'
+import { SANDBOX_SETTINGS_PATH } from '@/pages/sandbox-settings/sections'
 import {
   CONTROL_PLANE_RUNS_NO_SANDBOXES_MESSAGE,
   isControlPlaneWithoutWorkloads,
@@ -64,7 +65,7 @@ import {
   type EvictionReport,
 } from './node-eviction'
 
-const SANDBOX_SETTINGS_URL = '/agent-sandbox/sandbox'
+const SANDBOX_SETTINGS_URL = SANDBOX_SETTINGS_PATH
 
 /**
  * Every live sandbox on a worker node, from all users (ADR-048). The query
@@ -499,7 +500,11 @@ function createdAgo(createdAt: number): string {
 /** Placeholder rows matching the loaded table, so the tab does not jump. */
 export function NodeSandboxesSkeleton() {
   return (
-    <Card role="status" aria-busy="true" aria-label="Loading sandboxes on this node">
+    <Card
+      role="status"
+      aria-busy="true"
+      aria-label="Loading sandboxes on this node"
+    >
       <CardContent className="px-0 pb-0 pt-0">
         <div className="flex flex-wrap items-center justify-between gap-2 border-b px-4 py-3">
           <Skeleton className="h-4 w-56" />
@@ -600,9 +605,9 @@ export function EvictionReportAlert({
             <p>
               The node did not confirm removing the containers of{' '}
               {containersUnconfirmed.length} destroyed sandbox(es). They may
-              still be running there, and nothing in Temps tracks them any
-              more. If the node comes back, run these on it to remove them. If
-              it is gone for good, remove the node.
+              still be running there, and nothing in Temps tracks them any more.
+              If the node comes back, run these on it to remove them. If it is
+              gone for good, remove the node.
             </p>
             <ul className="space-y-1">
               {containersUnconfirmed.map((c) => (
@@ -627,8 +632,7 @@ export function EvictionReportAlert({
         )}
         {report.partial && destroyed.length > 0 && (
           <p className="text-xs text-muted-foreground">
-            Destroyed:{' '}
-            <span className="font-mono">{destroyed.join(', ')}</span>
+            Destroyed: <span className="font-mono">{destroyed.join(', ')}</span>
           </p>
         )}
         <Button size="sm" variant="outline" onClick={onDismiss}>
