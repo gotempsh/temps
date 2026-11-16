@@ -1904,6 +1904,8 @@ async fn revoke_enrollment_token(
 /// `update_available` is true.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct UpdateStatusResponse {
+    /// A newer release explicitly marks security fixes for earlier versions.
+    pub security_update: bool,
     /// True when a newer release than the running binary has been published
     /// on this install's channel.
     pub update_available: bool,
@@ -1943,6 +1945,7 @@ async fn get_update_status(
     let update = app_state.update_status.as_ref().and_then(|slot| slot.get());
     let response = match update {
         Some(update) => UpdateStatusResponse {
+            security_update: update.security_update,
             update_available: true,
             current_version: Some(update.current_version),
             latest_version: Some(update.latest_version),
@@ -1958,6 +1961,7 @@ async fn get_update_status(
         // Covers both "up to date" and "no check has succeeded yet" — the
         // banner is advisory, so the UI treats them identically.
         None => UpdateStatusResponse {
+            security_update: false,
             update_available: false,
             current_version: None,
             latest_version: None,

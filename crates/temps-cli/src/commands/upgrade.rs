@@ -206,11 +206,84 @@ pub struct UpgradeCommand {
 
 #[derive(Clone, Deserialize, Debug)]
 pub struct GitHubRelease {
+    /// Release-note metadata: <!-- temps-security-release --> marks a release
+    /// whose security fixes apply to earlier versions on this channel.
+    #[serde(
+        default,
+        rename = "body",
+        deserialize_with = "deserialize_security_release"
+    )]
+    security: ReleaseSecurityMetadata,
     pub tag_name: String,
     pub prerelease: bool,
     pub draft: bool,
     pub assets: Vec<GitHubAsset>,
     pub html_url: String,
+}
+
+/// Metadata belongs to this artifact. Version ordering alone cannot establish
+/// that it contains a fix published on another maintenance line.
+#[derive(Clone, Debug, Default)]
+struct ReleaseSecurityMetadata {
+    release: bool,
+    ranges_present: bool,
+    affected_ranges: Vec<(String, String)>,
+}
+
+/// Retain bounded metadata rather than historical release-note bodies.
+fn deserialize_security_release<'de, D>(
+    deserializer: D,
+) -> Result<ReleaseSecurityMetadata, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let body = Option::<String>::deserialize(deserializer)?;
+    let mut metadata = ReleaseSecurityMetadata::default();
+    for line in body.as_deref().unwrap_or_default().lines().map(str::trim) {
+        if line == "<!-- temps-security-release -->" {
+            metadata.release = true;
+        }
+        if let Some(ranges) = line
+            .strip_prefix("<!-- temps-security-affects: ")
+            .and_then(|line| line.strip_suffix(" -->"))
+        {
+            metadata.ranges_present = true;
+            for range in ranges.split(',').take(32) {
+                if metadata.affected_ranges.len() >= 32 {
+                    break;
+                }
+                if let Some((lower, upper)) = range.trim().split_once("..") {
+                    let (lower, upper) = (lower.trim(), upper.trim());
+                    if version_sort_key(lower).is_some() && is_newer_version(upper, lower) {
+                        metadata
+                            .affected_ranges
+                            .push((lower.to_string(), upper.to_string()));
+                    }
+                }
+            }
+        }
+    }
+    Ok(metadata)
+}
+
+impl GitHubRelease {
+    pub fn is_security_update_for(&self, current: &str) -> bool {
+        if !is_newer_version(&self.tag_name, current) {
+            return false;
+        }
+        if self.security.ranges_present {
+            return self.security.affected_ranges.iter().any(|(lower, upper)| {
+                !is_newer_version(lower, current)
+                    && is_newer_version(upper, current)
+                    && !is_newer_version(upper, &self.tag_name)
+            });
+        }
+        self.is_security_release()
+    }
+
+    pub fn is_security_release(&self) -> bool {
+        self.security.release || !self.security.affected_ranges.is_empty()
+    }
 }
 
 #[derive(Clone, Deserialize, Debug)]
@@ -882,6 +955,7 @@ pub fn configured_update_check_interval() -> std::time::Duration {
 
 /// A newer release the background notifier found for this install's channel.
 pub struct UpdateNotice {
+    pub security_update: bool,
     pub current_version: String,
     pub latest_version: String,
     pub channel: UpgradeChannel,
@@ -1047,6 +1121,7 @@ pub async fn check_for_newer_release(configured_channel: Option<&str>) -> Option
 
     if is_newer_version(&release.tag_name, &current_version) {
         Some(UpdateNotice {
+            security_update: release.is_security_update_for(&current_version),
             current_version,
             latest_version: release.tag_name,
             channel,
@@ -1096,6 +1171,7 @@ pub async fn update_notifier_loop(
                 temps_core::UPGRADE_DOCS_URL
             );
             slot.set(temps_core::AvailableUpdate {
+                security_update: notice.security_update,
                 current_version: notice.current_version,
                 latest_version: notice.latest_version,
                 channel: notice.channel.as_str().to_string(),
@@ -3044,6 +3120,7 @@ mod tests {
 
     fn release_with_assets(tag: &str, names: &[&str]) -> GitHubRelease {
         GitHubRelease {
+            security: ReleaseSecurityMetadata::default(),
             tag_name: tag.to_string(),
             prerelease: true,
             draft: false,
@@ -4276,6 +4353,7 @@ mod tests {
 
     fn release(tag: &str, prerelease: bool, draft: bool) -> GitHubRelease {
         GitHubRelease {
+            security: ReleaseSecurityMetadata::default(),
             tag_name: tag.to_string(),
             prerelease,
             draft,
@@ -4743,3 +4821,6 @@ mod tests {
         format!("{header}.{payload}.{}", encode_base64url_for_test(b"sig"))
     }
 }
+
+#[cfg(test)]
+mod security_release_tests;

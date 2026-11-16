@@ -17,6 +17,8 @@ pub const UPGRADE_DOCS_URL: &str = "https://temps.sh/docs/upgrade-temps";
 /// A newer published release found for this install's channel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AvailableUpdate {
+    /// Explicit release metadata marks security fixes for earlier versions.
+    pub security_update: bool,
     /// Version tag of the running binary, e.g. `v0.1.0-beta.45`.
     pub current_version: String,
     /// Newest published tag on this install's channel, e.g. `v0.1.0-beta.46`.
@@ -88,6 +90,7 @@ mod tests {
 
     fn notice(latest: &str) -> AvailableUpdate {
         AvailableUpdate {
+            security_update: false,
             current_version: "v0.1.0".to_string(),
             latest_version: latest.to_string(),
             channel: "stable".to_string(),
