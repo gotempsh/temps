@@ -786,6 +786,10 @@ impl DeployImageJob {
         let context = replica.context;
         let deployer = replica.deployer;
         let container_id = replica.result.container_id.as_str();
+        // An inspection that stalls until the deadline says nothing about why;
+        // the error from the attempt before it usually does (e.g. permission
+        // denied), so carry it until an inspection succeeds.
+        let mut last_inspection_error: Option<temps_deployer::DeployerError> = None;
         loop {
             // Try to get container info, but don't fail hard if it can't be found
             // (container might have been removed by Docker or other processes)
@@ -799,10 +803,13 @@ impl DeployImageJob {
                     replica,
                     clock,
                     "waiting for the container to run",
-                    None,
+                    last_inspection_error.as_ref(),
                 )
             })? {
-                Ok(info) => info,
+                Ok(info) => {
+                    last_inspection_error = None;
+                    info
+                }
                 Err(e) => {
                     // Container not found - might have been removed, but that's okay
                     // Log a warning but don't fail the deployment
@@ -829,6 +836,7 @@ impl DeployImageJob {
                             Some(&e),
                         ));
                     }
+                    last_inspection_error = Some(e);
                     clock.pause(Duration::from_secs(5)).await;
                     continue;
                 }
@@ -1200,6 +1208,9 @@ mod tests {
         /// Host port the agent reports it picked; the request's otherwise.
         reported_host_port: Option<u16>,
         inspections: Mutex<VecDeque<Result<ContainerInfo, String>>>,
+        /// Once the scripted inspections are used up, never answer again
+        /// (instead of repeating the last one).
+        stall_after_inspections: bool,
         logs: Option<String>,
         created: Arc<AtomicBool>,
         requests: Mutex<Vec<DeployRequest>>,
@@ -1291,12 +1302,17 @@ mod tests {
         }
 
         async fn get_container_info(&self, _: &str) -> Result<ContainerInfo, DeployerError> {
-            let mut inspections = self.inspections.lock().unwrap();
-            let next = if inspections.len() > 1 {
-                inspections.pop_front()
-            } else {
-                inspections.front().cloned()
+            let next = {
+                let mut inspections = self.inspections.lock().unwrap();
+                if self.stall_after_inspections || inspections.len() > 1 {
+                    inspections.pop_front()
+                } else {
+                    inspections.front().cloned()
+                }
             };
+            if next.is_none() && self.stall_after_inspections {
+                std::future::pending::<()>().await;
+            }
             match next {
                 Some(Ok(info)) => Ok(info),
                 Some(Err(reason)) => Err(DeployerError::Other(reason)),
@@ -1947,6 +1963,31 @@ mod tests {
         ] {
             assert!(message.contains(&detail), "missing {detail}: {message}");
         }
+        assert_tracked_and_removable(&job, &context, &deployer).await;
+    }
+
+    #[tokio::test]
+    async fn a_stalled_inspection_keeps_the_earlier_inspection_error() {
+        let deployer = Arc::new(ScriptedDeployer {
+            stall_after_inspections: true,
+            ..ScriptedDeployer::inspecting([Err("permission denied".to_string())])
+        });
+        let job = builder().build(deployer.clone()).unwrap();
+        let context = context_writing_to(&Arc::default());
+
+        let error = deploy(&job, &context, &deployer, &NodeAssignment::Local, false)
+            .await
+            .unwrap_err();
+
+        let message = execution_message(error);
+        assert!(
+            message.contains("could not be inspected within the startup timeout"),
+            "{message}"
+        );
+        assert!(
+            message.contains("Last inspection failed: ") && message.contains("permission denied"),
+            "the earlier cause must survive the stalled retry: {message}"
+        );
         assert_tracked_and_removable(&job, &context, &deployer).await;
     }
 
