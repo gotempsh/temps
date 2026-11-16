@@ -68,6 +68,18 @@ fn invalid(boot_id: Uuid, operation: &'static str, reason: &'static str) -> Auth
         reason,
     }
 }
+/// A new Ed25519 signing key drawn from the operating system's CSPRNG.
+///
+/// ed25519-dalek 3 only accepts `rand_core` 0.10 generators, so the secret is
+/// drawn with the `rand` 0.8 `OsRng` this crate already uses and loaded with
+/// `from_bytes` -- which is all `SigningKey::generate` does. The intermediate
+/// buffer is zeroized on drop.
+fn fresh_signing_key() -> SigningKey {
+    let mut secret = Zeroizing::new([0u8; 32]);
+    rand08::RngCore::fill_bytes(&mut rand08::rngs::OsRng, &mut *secret);
+    SigningKey::from_bytes(&secret)
+}
+
 fn database(boot_id: Uuid, operation: &'static str, source: sea_orm::DbErr) -> AuthorityError {
     AuthorityError::Database {
         boot_id,
@@ -240,8 +252,8 @@ impl AuthorityStore {
                     source,
                 })
         };
-        let snapshot_key = SigningKey::generate(&mut rand08::rngs::OsRng);
-        let session_key = SigningKey::generate(&mut rand08::rngs::OsRng);
+        let snapshot_key = fresh_signing_key();
+        let session_key = fresh_signing_key();
         let certificate = |source| AuthorityError::Certificate { boot_id, source };
         let ca_key = rcgen::KeyPair::generate().map_err(certificate)?;
         let mut params =

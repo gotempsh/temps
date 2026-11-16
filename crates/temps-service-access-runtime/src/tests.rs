@@ -159,7 +159,9 @@ impl Fixture {
                 credentials: store.clone(),
                 policy: store.clone(),
                 audit: store.clone(),
-                nodes: store,
+                nodes: store.clone(),
+                alerts: store.clone(),
+                tripwires: store,
             },
             Arc::new(RbacAuthorizer),
             cipher,
@@ -893,7 +895,7 @@ async fn worker_rejects_an_overflowing_signed_lease_without_panicking() {
     let snapshot = f.control.nodes.build_snapshot(&f.node).await.unwrap();
     let mut body = snapshot.verify(&f.proxy.snapshot_key).unwrap();
     body.issued_at = chrono::DateTime::<Utc>::MAX_UTC;
-    let key = ed25519_dalek::SigningKey::generate(&mut rand08::rngs::OsRng);
+    let key = ed25519_dalek::SigningKey::from_bytes(&rand08::random());
     let worker = WorkerControl::new(Arc::new(Audit));
     let identity = worker.identity();
     worker

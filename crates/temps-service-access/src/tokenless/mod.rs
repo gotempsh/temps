@@ -25,7 +25,7 @@ use crate::{error::AccessError, types::SandboxAccessPolicy};
 
 /// The immutable SDK contract this adapter is compiled against. Upgrading the
 /// dependency does not by itself enable live access.
-pub const SDK_REVISION: &str = "1e2e2946e448dc4bb7c8f778241ad0279fc6bb34";
+pub const SDK_REVISION: &str = "b4cd17ce252d162d82eb695fba3d06ee56fae08d";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IntegrationBlocker {
