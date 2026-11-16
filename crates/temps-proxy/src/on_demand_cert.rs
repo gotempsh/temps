@@ -709,10 +709,17 @@ mod tests {
         RouteInfo {
             backend: BackendType::Upstream {
                 backends: vec![BackendEntry {
+                    compose_service: None,
                     pinned: None,
                     address: "127.0.0.1:3000".to_string(),
                     container_id: None,
                     container_name: None,
+
+                    node_id: None,
+                    state: Default::default(),
+                    tier: 0,
+                    capacity: None,
+                    check_health: false,
                 }],
                 round_robin_counter: Arc::new(AtomicUsize::new(0)),
             },

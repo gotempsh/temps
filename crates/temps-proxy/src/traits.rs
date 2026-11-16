@@ -58,6 +58,8 @@ impl Default for CookieConfig {
 
 /// Result of resolving an upstream peer, including optional container metadata
 pub struct PeerSelection {
+    pub in_flight: Option<temps_routes::replica_policy::InFlightGuard>,
+
     pub peer: Box<HttpPeer>,
     pub container_id: Option<String>,
     pub container_name: Option<String>,

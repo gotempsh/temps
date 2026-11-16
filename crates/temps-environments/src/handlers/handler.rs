@@ -1524,7 +1524,8 @@ fn environment_variable_value_response(
 
 /// Whether an environment settings write can change a granted runtime.
 fn settings_change_granted_runtime(settings: &UpdateEnvironmentSettingsRequest) -> bool {
-    settings.branch.is_some()
+    settings.load_balancing.is_some()
+        || settings.branch.is_some()
         || settings.automatic_deploy.is_some()
         || settings.protected.is_some()
         || settings.target_nodes.is_some()
@@ -1648,7 +1649,7 @@ pub async fn update_environment_settings(
         cpu_limit: settings.cpu_limit.flatten(),
         memory_request: settings.memory_request.flatten(),
         memory_limit: settings.memory_limit.flatten(),
-        branch: settings.branch,
+        branch: settings.branch.flatten(),
         replicas: settings.replicas,
         security_updated: settings.security.is_some(),
         health_updated: settings.health.is_some(),
@@ -1665,6 +1666,7 @@ pub async fn update_environment_settings(
             .is_some()
             .then(|| updated_environment.shield_exempt_paths.0.clone()),
         force_https: settings.force_https,
+        load_balancing: settings.load_balancing,
         build_location: settings.build_location,
     };
 
@@ -3332,17 +3334,19 @@ mod tests {
         use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 
         #[tokio::test]
-        async fn health_probe_only_settings_enforce_granted_project_authority() {
+        async fn health_and_routing_only_settings_enforce_granted_project_authority() {
             use sea_orm::{DatabaseBackend, MockDatabase};
             for body in [
                 serde_json::json!({"health":{"type":"exec","command":["check-worker"]}}),
                 serde_json::json!({"health":null}),
+                serde_json::json!({"load_balancing":{"strategy":"preferred_nodes"}}),
+                serde_json::json!({"load_balancing":null}),
             ] {
                 let request: UpdateEnvironmentSettingsRequest =
                     serde_json::from_value(body).unwrap();
                 assert!(
                     settings_change_granted_runtime(&request),
-                    "setting and clearing health must both be guarded"
+                    "setting and clearing health or routing must both be guarded"
                 );
                 for (slug, role, allowed) in [
                     ("node-daemon", temps_auth::Role::User, false),

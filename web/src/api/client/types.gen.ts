@@ -264,6 +264,18 @@ export type ActivateProviderResponse = {
     default_provider: string;
 };
 
+export type ActiveHealthCheck = {
+    enabled?: boolean;
+    healthyThreshold?: number;
+    intervalSeconds?: number;
+    /**
+     * Origin-relative path; defaults to deployment readiness path, then `/`.
+     */
+    path?: string | null;
+    timeoutSeconds?: number;
+    unhealthyThreshold?: number;
+};
+
 export type ActiveVisitor = {
     current_page?: string | null;
     duration_seconds: number;
@@ -10515,6 +10527,7 @@ export type DeploymentConfig = {
      * Default: 300 (5 minutes).
      */
     idleTimeoutSeconds?: number;
+    loadBalancing?: LoadBalancingConfig | null;
     /**
      * Override for the proxy's cap on concurrent in-flight requests to this
      * project/environment's upstream, independent of the timeout overrides
@@ -20062,6 +20075,21 @@ export type LiveVisitorsListResponse = {
     visitors: Array<LiveVisitorInfo>;
     window_minutes: number;
 };
+
+export type LoadBalancingConfig = {
+    healthCheck?: ActiveHealthCheck;
+    maxInFlightPerReplica?: number | null;
+    /**
+     * Ordered node preference; zero denotes the local control plane.
+     */
+    preferredNodeIds?: Array<number>;
+    strategy?: LoadBalancingStrategy;
+};
+
+/**
+ * Replica selection policy. Absent configuration preserves round robin.
+ */
+export type LoadBalancingStrategy = 'round_robin' | 'preferred_nodes';
 
 export type LocalCheckSpec = {
     /**
@@ -36754,6 +36782,7 @@ export type UpdateDeploymentConfigRequest = {
      * 300 seconds.
      */
     healthCheckTimeoutSeconds?: number | null;
+    loadBalancing?: LoadBalancingConfig | null;
     /**
      * Project-level default cap on concurrent in-flight requests to a
      * single environment's upstream (0 = unlimited). Environments may
@@ -36892,6 +36921,9 @@ export type UpdateEnvironmentSettingsRequest = {
      * Enable/disable automatic deployments for this environment
      */
     automatic_deploy?: boolean | null;
+    /**
+     * Absent preserves the tracked branch; null explicitly clears it.
+     */
     branch?: string | null;
     build_location?: BuildLocation | null;
     /**
@@ -36941,6 +36973,7 @@ export type UpdateEnvironmentSettingsRequest = {
      * Seconds of inactivity before stopping containers (60-86400). Default: 300.
      */
     idle_timeout_seconds?: number | null;
+    load_balancing?: LoadBalancingConfig | null;
     /**
      * Override the proxy's cap on concurrent in-flight requests to this
      * environment's upstream (0 = unlimited). Absent leaves the current

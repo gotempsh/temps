@@ -7,10 +7,37 @@
 
 use super::*;
 use sea_orm::{ColumnTrait, QueryFilter};
+use temps_config::deployment_config::EnvironmentDeploymentConfigExt;
 use temps_entities::{custom_routes, environment_domains, project_custom_domains, settings};
+
+/// Port overrides take precedence over the matching Compose service's
+/// detected path. Never borrow the first public service's path for another.
+fn compose_probe_path<'a>(
+    config: Option<&'a temps_entities::preset::PresetConfig>,
+    target: Option<&(String, i32)>,
+) -> Option<&'a str> {
+    let (service, port) = target?;
+    let Some(temps_entities::preset::PresetConfig::DockerCompose(config)) = config else {
+        return Some("/");
+    };
+    config
+        .public_ports
+        .iter()
+        .find(|public| public.service == *service && i32::from(public.port) == *port)
+        .and_then(|public| public.health_check_path.as_deref())
+        .or_else(|| {
+            config
+                .compose_services
+                .iter()
+                .find(|candidate| candidate.name == *service)
+                .and_then(|candidate| candidate.health_check_path.as_deref())
+        })
+        .or(Some("/"))
+}
 
 /// Everything one rebuild accumulates while its phases run, in the order
 /// `load_routes` threads it through them.
+#[cfg_attr(test, derive(Default))]
 struct RouteLoadState {
     /// Settings read once per rebuild.
     app_settings: AppSettings,
@@ -844,6 +871,12 @@ impl CachedPeerTable {
             let route_info = RouteInfo {
                 backend: BackendType::Upstream {
                     backends: vec![BackendEntry {
+                        compose_service: None,
+                        node_id: None,
+                        state: Default::default(),
+                        tier: 0,
+                        capacity: None,
+                        check_health: false,
                         pinned,
                         address: backend_addr.clone(),
                         container_id: None,
@@ -2070,6 +2103,12 @@ impl CachedPeerTable {
                 RouteInfo {
                     backend: BackendType::Upstream {
                         backends: vec![BackendEntry {
+                            compose_service: None,
+                            node_id: None,
+                            state: Default::default(),
+                            tier: 0,
+                            capacity: None,
+                            check_health: false,
                             pinned: None,
                             address: address.clone(),
                             container_id: Some(discovered.target_container_id.clone()),
@@ -2183,9 +2222,185 @@ impl CachedPeerTable {
         Ok(())
     }
 
-    /// Withdraw reserved, private and status-page hostnames from what the
-    /// phases loaded, resolve gates, path routes and ingress endpoints, and
-    /// build the snapshot to publish.
+    /// Attach shared replica state and resolve each backend's probe policy.
+    async fn prepare_replica_policies(
+        &self,
+        routes: &mut HashMap<String, RouteInfo>,
+        http_routes_map: &mut HashMap<String, RouteInfo>,
+        tls_routes_map: &mut HashMap<String, RouteInfo>,
+    ) -> Arc<Vec<crate::replica_policy::Probe>> {
+        // Prepare policy off the request path. Identity includes environment,
+        // container and address so removed/replaced replicas cannot inherit health.
+        let old = self.route_snapshot.load_full();
+        let mut states = HashMap::new();
+        for route in old
+            .legacy
+            .exact
+            .values()
+            .chain(old.http_routes.values())
+            .chain(old.tls_routes.values())
+            .chain(old.private.values().map(|private| &private.route))
+        {
+            if let BackendType::Upstream { backends, .. } = &route.backend {
+                for b in backends {
+                    states.insert(
+                        (
+                            route.environment.as_ref().map(|e| e.id),
+                            b.container_id.clone(),
+                            b.address.clone(),
+                        ),
+                        b.state.clone(),
+                    );
+                }
+            }
+        }
+        let probe_deployments: HashSet<i32> = routes
+            .values()
+            .filter_map(|route| {
+                let project = route
+                    .project
+                    .as_ref()?
+                    .deployment_config
+                    .clone()
+                    .unwrap_or_default();
+                let config = route
+                    .environment
+                    .as_ref()?
+                    .get_effective_deployment_config(&project);
+                let policy = config.load_balancing?;
+                (policy.health_check.enabled && policy.health_check.path.is_none())
+                    .then(|| route.deployment.as_ref().map(|d| d.id))
+                    .flatten()
+            })
+            .collect();
+        let mut deployment_health_paths = HashMap::new();
+        if !probe_deployments.is_empty() {
+            use sea_orm::{ColumnTrait, QueryFilter, QueryOrder};
+            use temps_entities::deployment_jobs;
+            // Batch read only jobs of deployments that opted into probes. Later
+            // deploy-job output takes precedence over an earlier build output.
+            let jobs = deployment_jobs::Entity::find()
+                .filter(deployment_jobs::Column::DeploymentId.is_in(probe_deployments))
+                .order_by_desc(deployment_jobs::Column::ExecutionOrder)
+                .all(self.db.as_ref())
+                .await.unwrap_or_else(|error| {
+                    warn!(%error, "Unable to load deployment health paths; using explicit probe path or default");
+                    Vec::new()
+                });
+            for job in jobs {
+                if let Some(path) = job
+                    .outputs
+                    .as_ref()
+                    .and_then(|o| o.get("health_check_path"))
+                    .and_then(|v| v.as_str())
+                {
+                    deployment_health_paths
+                        .entry(job.deployment_id)
+                        .or_insert_with(|| path.to_owned());
+                }
+            }
+        }
+        let mut probes = HashMap::new();
+        for route in routes
+            .values_mut()
+            .chain(http_routes_map.values_mut())
+            .chain(tls_routes_map.values_mut())
+        {
+            let project_config = route
+                .project
+                .as_ref()
+                .and_then(|p| p.deployment_config.clone())
+                .unwrap_or_default();
+            let config = route
+                .environment
+                .as_ref()
+                .map(|e| e.get_effective_deployment_config(&project_config))
+                .unwrap_or(project_config);
+            let policy = config.load_balancing.unwrap_or_default();
+            if policy.validate().is_err() {
+                continue;
+            }
+            if let BackendType::Upstream { backends, .. } = &mut route.backend {
+                for b in backends {
+                    let key = (
+                        route.environment.as_ref().map(|e| e.id),
+                        b.container_id.clone(),
+                        b.address.clone(),
+                    );
+                    b.state = states
+                        .entry(key.clone())
+                        .or_insert_with(|| b.state.clone())
+                        .clone();
+                    b.tier = if policy.strategy
+                        == temps_entities::deployment_config::LoadBalancingStrategy::PreferredNodes
+                    {
+                        policy
+                            .preferred_node_ids
+                            .iter()
+                            .position(|id| *id == b.node_id.unwrap_or(0))
+                            .unwrap_or(policy.preferred_node_ids.len())
+                    } else {
+                        0
+                    };
+                    b.capacity = if policy.strategy
+                        == temps_entities::deployment_config::LoadBalancingStrategy::PreferredNodes
+                    {
+                        policy.max_in_flight_per_replica
+                    } else {
+                        None
+                    };
+                    b.check_health = policy.health_check.enabled;
+                    if b.check_health {
+                        let path = policy
+                            .health_check
+                            .path
+                            .as_deref()
+                            .or_else(|| {
+                                compose_probe_path(
+                                    route
+                                        .project
+                                        .as_ref()
+                                        .and_then(|project| project.preset_config.as_ref()),
+                                    b.compose_service.as_ref(),
+                                )
+                            })
+                            .or_else(|| {
+                                route
+                                    .deployment
+                                    .as_ref()
+                                    .and_then(|d| d.metadata.as_ref())
+                                    .and_then(|m| m.health_check_path.as_deref())
+                            })
+                            .or_else(|| {
+                                route
+                                    .deployment
+                                    .as_ref()
+                                    .and_then(|d| deployment_health_paths.get(&d.id))
+                                    .map(String::as_str)
+                            })
+                            .unwrap_or("/");
+                        let Some(url) = crate::replica_policy::probe_url(&b.address, path) else {
+                            // Do not emit untrusted paths, which can contain credentials.
+                            warn!(environment_id = ?route.environment.as_ref().map(|e| e.id),
+                                deployment_id = ?route.deployment.as_ref().map(|d| d.id),
+                                "Skipping active probe with an invalid readiness path or backend URL");
+                            b.check_health = false;
+                            continue;
+                        };
+                        probes
+                            .entry(key)
+                            .or_insert_with(|| crate::replica_policy::Probe {
+                                state: b.state.clone(),
+                                url,
+                                config: policy.clone(),
+                            });
+                    }
+                }
+            }
+        }
+        Arc::new(probes.into_values().collect())
+    }
+
     async fn assemble_snapshot(
         &self,
         state: RouteLoadState,
@@ -2244,6 +2459,11 @@ impl CachedPeerTable {
                 );
             }
         }
+
+        // Private routes must carry policy too: workers cannot enforce it.
+        let active_probes = self
+            .prepare_replica_policies(&mut routes, &mut http_routes_map, &mut tls_routes_map)
+            .await;
 
         // ADR 064 D5: a private address is served only by the private
         // listener of the worker recorded for it. Take it out of every map
@@ -2392,6 +2612,7 @@ impl CachedPeerTable {
         );
 
         let new_snapshot = Arc::new(RouteTableSnapshot {
+            active_probes,
             owned_hosts,
             http_routes: http_routes_map,
             tls_routes: tls_routes_map,
@@ -2437,6 +2658,168 @@ mod tests {
         settings,
     };
     use temps_test_utils::TestDatabase;
+
+    #[test]
+    fn compose_probe_paths_match_each_service_and_container_port() {
+        use temps_entities::preset::{
+            ComposePublicPort, ComposeServiceSnapshot, DockerComposeConfig, PresetConfig,
+        };
+        let config = PresetConfig::DockerCompose(DockerComposeConfig {
+            public_ports: vec![
+                ComposePublicPort {
+                    service: "frontend".into(),
+                    port: 8080,
+                    health_check_path: Some("/ready".into()),
+                    ..Default::default()
+                },
+                ComposePublicPort {
+                    service: "api".into(),
+                    port: 3000,
+                    health_check_path: Some("/healthz".into()),
+                    ..Default::default()
+                },
+                ComposePublicPort {
+                    service: "api".into(),
+                    port: 9000,
+                    health_check_path: Some("/admin-ready".into()),
+                    ..Default::default()
+                },
+                ComposePublicPort {
+                    service: "worker".into(),
+                    port: 4000,
+                    ..Default::default()
+                },
+            ],
+            compose_services: vec![
+                ComposeServiceSnapshot {
+                    name: "api".into(),
+                    health_check_path: Some("/detected-api".into()),
+                    ..Default::default()
+                },
+                ComposeServiceSnapshot {
+                    name: "worker".into(),
+                    health_check_path: Some("/detected-worker".into()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+        for (service, port, expected) in [
+            ("frontend", 8080, Some("/ready")),
+            ("api", 3000, Some("/healthz")),
+            ("api", 9000, Some("/admin-ready")),
+            ("api", 3001, Some("/detected-api")),
+            ("worker", 4000, Some("/detected-worker")),
+            ("unknown", 8080, Some("/")),
+        ] {
+            assert_eq!(
+                super::compose_probe_path(Some(&config), Some(&(service.into(), port))),
+                expected
+            );
+        }
+        assert_eq!(super::compose_probe_path(Some(&config), None), None);
+    }
+
+    #[tokio::test]
+    async fn private_only_replica_retains_state_on_reload() {
+        use super::*;
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection();
+        let table = CachedPeerTable::new(Arc::new(db));
+        let make_route = || RouteInfo {
+            backend: BackendType::Upstream {
+                backends: vec![BackendEntry {
+                    address: "127.0.0.1:9000".into(),
+                    container_id: Some("private-replica".into()),
+                    container_name: None,
+                    pinned: None,
+                    compose_service: Some(("internal".into(), 9000)),
+                    node_id: Some(3),
+                    state: Arc::default(),
+                    tier: 0,
+                    capacity: None,
+                    check_health: false,
+                }],
+                round_robin_counter: Arc::new(AtomicUsize::new(0)),
+            },
+            redirect_to: None,
+            status_code: None,
+            project: None,
+            environment: None,
+            deployment: None,
+            cert_eligible: false,
+        };
+        let old_route = make_route();
+        let BackendType::Upstream { backends, .. } = &old_route.backend else {
+            panic!("upstream")
+        };
+        let original = backends[0].state.clone();
+        original.health.store(1, Ordering::Relaxed);
+        let request = old_route.select_backend();
+        table.route_snapshot.store(Arc::new(RouteTableSnapshot {
+            private: HashMap::from([(
+                "private.example.com".into(),
+                PrivateRoute {
+                    route: old_route,
+                    address: PrivateAddress {
+                        address_id: "custom:7".into(),
+                        range: None,
+                        node_id: Some(3),
+                        listener: None,
+                        via: None,
+                        principals: None,
+                    },
+                },
+            )]),
+            ..Default::default()
+        }));
+        let mut routes = HashMap::from([("private.example.com".into(), make_route())]);
+        table
+            .prepare_replica_policies(&mut routes, &mut HashMap::new(), &mut HashMap::new())
+            .await;
+        let BackendType::Upstream { backends, .. } = &routes["private.example.com"].backend else {
+            panic!("upstream")
+        };
+        let retained = &backends[0].state;
+        assert!(Arc::ptr_eq(&original, retained));
+        assert_eq!(retained.health.load(Ordering::Relaxed), 1);
+        assert_eq!(retained.in_flight.load(Ordering::Relaxed), 1);
+        drop(request);
+        assert_eq!(retained.in_flight.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn failed_assembly_preserves_published_probe_membership() {
+        use crate::replica_policy::{Probe, ReplicaState};
+        use std::sync::Arc;
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_errors([sea_orm::DbErr::Custom("gate read failed".into())])
+            .into_connection();
+        let table = CachedPeerTable::new(Arc::new(db));
+        let original = Arc::new(super::RouteTableSnapshot {
+            active_probes: Arc::new(vec![Probe {
+                state: Arc::new(ReplicaState::default()),
+                url: "http://127.0.0.1:8080/ready".into(),
+                config: Default::default(),
+            }]),
+            ..Default::default()
+        });
+        table.route_snapshot.store(original.clone());
+        let state = super::RouteLoadState {
+            gated_meta: std::collections::HashMap::from([(
+                "signed.example.com".into(),
+                super::GatedMeta::from_row("custom:7".into(), None, None, None, None),
+            )]),
+            ..Default::default()
+        };
+        assert!(table.assemble_snapshot(state).await.is_err());
+        let retained = table.route_snapshot.load_full();
+        assert!(Arc::ptr_eq(&original, &retained));
+        assert!(Arc::ptr_eq(
+            &original.active_probes,
+            &retained.active_probes
+        ));
+        assert_eq!(retained.active_probes.len(), 1);
+    }
 
     const PREVIEW_DOMAIN: &str = "preview.example.com";
     const DISCOVERY_NETWORK: &str = "phase-test-network";
@@ -2542,6 +2925,107 @@ mod tests {
         table
             .get_route(host)
             .and_then(|route| route.deployment.as_ref().map(|d| d.id))
+    }
+
+    #[tokio::test]
+    async fn routing_policy_is_inherited_shared_across_aliases_and_retained_on_reload(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use std::sync::{atomic::Ordering, Arc};
+        use temps_entities::deployment_config::{
+            ActiveHealthCheck, DeploymentConfig, LoadBalancingConfig, LoadBalancingStrategy,
+        };
+        let Some(database) = database_or_skip().await else {
+            return Ok(());
+        };
+        let test_db = TestDBMockOperations::new(database.db.clone()).await?;
+        set_preview_domain(test_db.db.as_ref()).await?;
+        let (project, _, _) = seed_environment(&test_db).await?;
+        temps_entities::projects::ActiveModel {
+            id: Set(project.id),
+            deployment_config: Set(Some(DeploymentConfig {
+                load_balancing: Some(LoadBalancingConfig {
+                    strategy: LoadBalancingStrategy::PreferredNodes,
+                    preferred_node_ids: vec![7, 0],
+                    max_in_flight_per_replica: Some(2),
+                    health_check: ActiveHealthCheck {
+                        enabled: true,
+                        path: Some("/ready".into()),
+                        ..Default::default()
+                    },
+                }),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }
+        .update(test_db.db.as_ref())
+        .await?;
+        let table = CachedPeerTable::new(test_db.db.clone());
+        table.load_routes().await?;
+        let replica = |host: &str| {
+            let route = table.get_route(host).expect("environment route");
+            let crate::BackendType::Upstream { backends, .. } = route.backend else {
+                panic!("upstream");
+            };
+            backends[0].clone()
+        };
+        let original = replica("shop-production");
+        assert_eq!(original.node_id, None);
+        assert_eq!(original.tier, 1);
+        assert_eq!(original.capacity, Some(2));
+        assert!(original.check_health);
+        let alias = replica("shop-production.temps.local");
+        assert!(Arc::ptr_eq(&original.state, &alias.state));
+        assert_eq!(table.route_snapshot.load().active_probes.len(), 1);
+        assert!(table.route_snapshot.load().active_probes[0]
+            .url
+            .ends_with("/ready"));
+        assert!(table
+            .snapshot_worker_public_routes(crate::route_table::ShieldPinning::Enforcing)
+            .is_empty());
+        let selection = table.get_route("shop-production").unwrap().select_backend();
+        assert_eq!(original.state.in_flight.load(Ordering::Relaxed), 1);
+        table.load_routes().await?;
+        assert!(Arc::ptr_eq(
+            &original.state,
+            &replica("shop-production").state
+        ));
+        drop(selection);
+        assert_eq!(original.state.in_flight.load(Ordering::Relaxed), 0);
+        let mut raw_route = table.get_route("shop-production").unwrap();
+        if let crate::BackendType::Upstream { backends, .. } = &mut raw_route.backend {
+            for backend in backends {
+                backend.tier = 0;
+                backend.capacity = None;
+                backend.check_health = false;
+            }
+        }
+        let private_host = "private.example.com".to_string();
+        let state = super::RouteLoadState {
+            routes: std::collections::HashMap::from([(private_host.clone(), raw_route)]),
+            private_meta: std::collections::HashMap::from([(
+                private_host,
+                super::PrivateAddress {
+                    address_id: "custom:7".into(),
+                    range: Some("100.64.0.0/10".into()),
+                    node_id: Some(3),
+                    listener: Some("100.101.102.103".into()),
+                    via: Some("listener".into()),
+                    principals: None,
+                },
+            )]),
+            ..Default::default()
+        };
+        table
+            .route_snapshot
+            .store(table.assemble_snapshot(state).await?.snapshot);
+        let private = table.snapshot_worker_private_routes(3);
+        assert_eq!(private.len(), 1);
+        assert!(
+            !private[0].2,
+            "workers must not serve a private route requiring replica policy"
+        );
+        test_db.cleanup().await?;
+        Ok(())
     }
 
     /// Phase 4 serves an environment's subdomain as-is, under the preview

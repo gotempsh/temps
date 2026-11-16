@@ -1176,6 +1176,9 @@ impl EnvironmentService {
             });
             deployment_config.security = Some(security);
         }
+        if let Some(policy) = settings.load_balancing {
+            deployment_config.load_balancing = policy;
+        }
         if let Some(target_nodes) = settings.target_nodes {
             Self::ensure_target_nodes_exist(&txn, env_id, &target_nodes).await?;
             deployment_config.target_nodes = normalize_target_nodes(target_nodes);
@@ -1256,7 +1259,9 @@ impl EnvironmentService {
         // Multiple environments can track the same branch (Vercel-like model).
 
         active_model.deployment_config = Set(Some(deployment_config));
-        active_model.branch = Set(settings.branch);
+        if let Some(branch) = settings.branch {
+            active_model.branch = Set(branch);
+        }
         if let Some(protected) = settings.protected {
             active_model.protected = Set(protected);
         }
@@ -2497,10 +2502,12 @@ mod tests {
                 10,
                 1,
                 crate::handlers::UpdateEnvironmentSettingsRequest {
+                    load_balancing: None,
+
+                    branch: Some(Some("main".to_string())),
                     health: None,
                     health_check_timeout_seconds: None,
                     stop_timeout_seconds: None,
-                    branch: Some("main".to_string()),
                     cpu_request: None,
                     cpu_limit: None,
                     memory_request: None,
@@ -2541,6 +2548,63 @@ mod tests {
             "Should allow keeping the same branch: {:?}",
             result.err()
         );
+    }
+
+    #[tokio::test]
+    async fn routing_only_update_preserves_branch_and_explicit_null_clears_it() {
+        for (json, writes_branch) in [
+            (
+                r#"{"load_balancing":{"strategy":"preferred_nodes"}}"#,
+                false,
+            ),
+            (r#"{"load_balancing":null,"branch":null}"#, true),
+        ] {
+            let environment = make_env_model(false, false);
+            let db = MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![environment.clone()]])
+                .append_query_results(vec![vec![environment]])
+                .append_exec_results(vec![MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .into_connection();
+            let svc = make_service(db);
+            let db = svc.db.clone();
+            let settings = serde_json::from_str(json).unwrap();
+            svc.update_environment_settings(
+                10,
+                1,
+                settings,
+                temps_config::CeilingEnforcement::Bypass,
+            )
+            .await
+            .unwrap();
+            drop(svc);
+            let statements: Vec<_> = Arc::try_unwrap(db)
+                .unwrap()
+                .into_transaction_log()
+                .into_iter()
+                .flat_map(|transaction| transaction.statements().to_vec())
+                .collect();
+            let update = statements
+                .iter()
+                .find(|s| s.sql.starts_with("UPDATE"))
+                .unwrap();
+            // Only inspect SET: RETURNING legitimately includes the branch column.
+            let set = update.sql.split(" RETURNING ").next().unwrap();
+            assert_eq!(set.contains("\"branch\" ="), writes_branch, "{update:?}");
+            if writes_branch {
+                assert!(
+                    update
+                        .values
+                        .as_ref()
+                        .unwrap()
+                        .0
+                        .contains(&sea_orm::Value::String(None)),
+                    "{update:?}"
+                );
+            }
+        }
     }
 
     /// Double-Option clearing (`Some(None)`) must actually remove the override
@@ -2613,6 +2677,8 @@ mod tests {
                 10,
                 1,
                 crate::handlers::UpdateEnvironmentSettingsRequest {
+                    load_balancing: None,
+
                     health: None,
                     health_check_timeout_seconds: None,
                     stop_timeout_seconds: None,
@@ -2675,6 +2741,7 @@ mod tests {
     /// can set exactly the one field it is about.
     fn empty_settings_request() -> crate::handlers::UpdateEnvironmentSettingsRequest {
         crate::handlers::UpdateEnvironmentSettingsRequest {
+            load_balancing: None,
             health: None,
             health_check_timeout_seconds: None,
             stop_timeout_seconds: None,
@@ -3778,6 +3845,7 @@ mod tests {
         target_nodes: Vec<i32>,
     ) -> crate::handlers::UpdateEnvironmentSettingsRequest {
         crate::handlers::UpdateEnvironmentSettingsRequest {
+            load_balancing: None,
             health: None,
             health_check_timeout_seconds: None,
             stop_timeout_seconds: None,

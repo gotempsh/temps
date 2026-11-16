@@ -314,6 +314,10 @@ impl DeploymentConfigExt for DeploymentConfig {
                 .max_concurrent_connections
                 .or(self.max_concurrent_connections),
             health: other.health.clone().or_else(|| self.health.clone()),
+            load_balancing: other
+                .load_balancing
+                .clone()
+                .or_else(|| self.load_balancing.clone()),
             health_check_timeout_seconds: other
                 .health_check_timeout_seconds
                 .or(self.health_check_timeout_seconds),
@@ -322,6 +326,9 @@ impl DeploymentConfigExt for DeploymentConfig {
     }
 
     fn validate(&self) -> Result<(), String> {
+        if let Some(policy) = &self.load_balancing {
+            policy.validate()?;
+        }
         // CPU request should not exceed CPU limit. A limit of 0 is the explicit
         // "uncapped" sentinel, so it never constrains the request.
         if let (Some(request), Some(limit)) = (self.cpu_request, self.cpu_limit) {
@@ -618,6 +625,36 @@ impl EnvironmentDeploymentConfigExt for environments::Model {
 
 #[cfg(test)]
 mod tests {
+    use temps_entities::deployment_config::{LoadBalancingConfig, LoadBalancingStrategy};
+    #[test]
+    fn load_balancing_inherits_overrides_and_validates() {
+        let parent = DeploymentConfig {
+            load_balancing: Some(LoadBalancingConfig {
+                strategy: LoadBalancingStrategy::PreferredNodes,
+                preferred_node_ids: vec![3, 5],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            parent.merge(&DeploymentConfig::default()).load_balancing,
+            parent.load_balancing
+        );
+        let child = DeploymentConfig {
+            load_balancing: Some(LoadBalancingConfig::default()),
+            ..Default::default()
+        };
+        assert_eq!(parent.merge(&child).load_balancing, child.load_balancing);
+        let mut policy = parent.load_balancing.unwrap();
+        assert!(policy.validate().is_ok());
+        policy.preferred_node_ids = vec![3, 3];
+        assert!(policy.validate().is_err());
+        policy.preferred_node_ids.clear();
+        policy.health_check.path = Some("//example.invalid/health".into());
+        assert!(policy.validate().is_err());
+        let legacy: DeploymentConfig = serde_json::from_str("{}").unwrap();
+        assert!(legacy.load_balancing.is_none());
+    }
     use super::*;
 
     #[test]

@@ -941,9 +941,11 @@ impl ProjectService {
         automatic_deploy: bool,
         caller: DeployCaller,
     ) -> Result<Project, ProjectError> {
+        let txn = self.db.begin().await?;
         // Get the current project
         let project = projects::Entity::find_by_id(project_id)
-            .one(self.db.as_ref())
+            .lock_exclusive()
+            .one(&txn)
             .await?
             .ok_or(ProjectError::NotFound(format!(
                 "Project {} not found",
@@ -966,7 +968,8 @@ impl ProjectService {
         deployment_config.automatic_deploy = Some(automatic_deploy);
         active_project.deployment_config = Set(Some(deployment_config));
 
-        let updated_project = active_project.update(self.db.as_ref()).await?;
+        let updated_project = active_project.update(&txn).await?;
+        txn.commit().await?;
 
         Ok(self.map_written_project(updated_project).await)
     }
@@ -1077,10 +1080,22 @@ impl ProjectService {
         settings: UpdateDeploymentSettingsRequest,
         ceiling_enforcement: temps_config::CeilingEnforcement,
     ) -> Result<Project, ProjectError> {
+        let app_settings = if ceiling_enforcement == temps_config::CeilingEnforcement::Enforce {
+            let app_settings = self.config_service.get_settings().await.map_err(|e| {
+                ProjectError::Other(format!(
+                    "Failed to read instance settings to check resource ceilings for project {project_id_or_slug}: {e}"
+                ))
+            })?;
+            Some(app_settings)
+        } else {
+            None
+        };
+        let txn = self.db.begin().await?;
         // Find project by ID or slug
         let project = if let Ok(project_id_int) = project_id_or_slug.parse::<i32>() {
             projects::Entity::find_by_id(project_id_int)
-                .one(self.db.as_ref())
+                .lock_exclusive()
+                .one(&txn)
                 .await?
                 .ok_or_else(|| {
                     ProjectError::NotFound(format!("Project with id {} not found", project_id_int))
@@ -1088,7 +1103,8 @@ impl ProjectService {
         } else {
             projects::Entity::find()
                 .filter(projects::Column::Slug.eq(project_id_or_slug))
-                .one(self.db.as_ref())
+                .lock_exclusive()
+                .one(&txn)
                 .await?
                 .ok_or_else(|| {
                     ProjectError::NotFound(format!(
@@ -1108,18 +1124,14 @@ impl ProjectService {
         deployment_config.memory_request = settings.memory_request;
         deployment_config.memory_limit = settings.memory_limit;
 
-        if ceiling_enforcement == temps_config::CeilingEnforcement::Enforce {
-            let app_settings = self.config_service.get_settings().await.map_err(|e| {
-                ProjectError::Other(format!(
-                    "Failed to read instance settings to check resource ceilings for project {project_id_or_slug}: {e}"
-                ))
-            })?;
-            Self::enforce_tenant_ceilings(&deployment_config, &app_settings)?;
+        if let Some(app_settings) = &app_settings {
+            Self::enforce_tenant_ceilings(&deployment_config, app_settings)?;
         }
 
         active_project.deployment_config = Set(Some(deployment_config));
 
-        let updated_project = active_project.update(self.db.as_ref()).await?;
+        let updated_project = active_project.update(&txn).await?;
+        txn.commit().await?;
 
         // Emit ProjectUpdated job
         let project_updated_job = Job::ProjectUpdated(ProjectUpdatedJob {
@@ -1156,9 +1168,21 @@ impl ProjectService {
         ceiling_enforcement: temps_config::CeilingEnforcement,
         caller: DeployCaller,
     ) -> Result<Project, ProjectError> {
+        let app_settings = if ceiling_enforcement == temps_config::CeilingEnforcement::Enforce {
+            let app_settings = self.config_service.get_settings().await.map_err(|e| {
+                ProjectError::Other(format!(
+                    "Failed to read instance settings to check resource ceilings for project {project_id}: {e}"
+                ))
+            })?;
+            Some(app_settings)
+        } else {
+            None
+        };
+        let txn = self.db.begin().await?;
         // Find project by ID or slug
         let project = projects::Entity::find_by_id(project_id)
-            .one(self.db.as_ref())
+            .lock_exclusive()
+            .one(&txn)
             .await?
             .ok_or_else(|| {
                 ProjectError::NotFound(format!("Project with id {} not found", project_id))
@@ -1173,10 +1197,11 @@ impl ProjectService {
         if config.exposed_port.is_some()
             || config.automatic_deploy.is_some()
             || config.health.is_some()
+            || config.load_balancing.is_some()
         {
             self.guard_granted_project_write(
                 &project.slug,
-                "the exposed port, health command or whether pushes deploy automatically",
+                "the exposed port, health command, replica routing or whether pushes deploy automatically",
                 caller,
             )?;
         }
@@ -1218,6 +1243,9 @@ impl ProjectService {
         // Absent leaves it unset (disabled, and inheritable); an explicit value
         // — including `false` — pins it for every environment that doesn't
         // override it.
+        if let Some(policy) = config.load_balancing {
+            deployment_config.load_balancing = Some(policy);
+        }
         if let Some(cross_architecture_builds) = config.cross_architecture_builds {
             deployment_config.cross_architecture_builds = Some(cross_architecture_builds);
         }
@@ -1255,20 +1283,16 @@ impl ProjectService {
         // Checked on the merged config, not on the request, so clearing an
         // override back to "inherit" is judged by what the project will
         // actually run with.
-        if ceiling_enforcement == temps_config::CeilingEnforcement::Enforce {
-            let app_settings = self.config_service.get_settings().await.map_err(|e| {
-                ProjectError::Other(format!(
-                    "Failed to read instance settings to check resource ceilings for project {project_id}: {e}"
-                ))
-            })?;
-            Self::enforce_tenant_ceilings(&deployment_config, &app_settings)?;
+        if let Some(app_settings) = &app_settings {
+            Self::enforce_tenant_ceilings(&deployment_config, app_settings)?;
         }
 
         // Update the project
         let mut active_project: projects::ActiveModel = project.clone().into();
         active_project.deployment_config = Set(Some(deployment_config));
 
-        let updated_project = active_project.update(self.db.as_ref()).await?;
+        let updated_project = active_project.update(&txn).await?;
+        txn.commit().await?;
 
         // Emit ProjectUpdated job
         let project_updated_job = Job::ProjectUpdated(ProjectUpdatedJob {

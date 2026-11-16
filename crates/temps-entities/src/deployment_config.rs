@@ -409,6 +409,9 @@ pub struct DeploymentConfig {
     /// Deploy-time probe; environment overrides project, repository config overrides both.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health: Option<temps_core::repo_config::HealthCheckConfig>,
+    /// Runtime replica routing, inherited from the project when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_balancing: Option<LoadBalancingConfig>,
 }
 
 /// Default readiness budget for a new deployment's containers, in seconds.
@@ -528,6 +531,7 @@ impl Default for DeploymentConfig {
             health_check_timeout_seconds: None,
             stop_timeout_seconds: None,
             health: None,
+            load_balancing: None,
         }
     }
 }
@@ -579,9 +583,139 @@ impl DeploymentConfigSnapshot {
     }
 }
 
+/// Replica selection policy. Absent configuration preserves round robin.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LoadBalancingStrategy {
+    #[default]
+    RoundRobin,
+    PreferredNodes,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(default, rename_all = "camelCase")]
+pub struct LoadBalancingConfig {
+    pub strategy: LoadBalancingStrategy,
+    /// Ordered node preference; zero denotes the local control plane.
+    pub preferred_node_ids: Vec<i32>,
+    #[schema(minimum = 1)]
+    pub max_in_flight_per_replica: Option<u32>,
+    pub health_check: ActiveHealthCheck,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ActiveHealthCheck {
+    pub enabled: bool,
+    /// Origin-relative path; defaults to deployment readiness path, then `/`.
+    pub path: Option<String>,
+    #[schema(minimum = 1, maximum = 3600)]
+    pub interval_seconds: u32,
+    #[schema(minimum = 1, maximum = 60)]
+    pub timeout_seconds: u32,
+    #[schema(minimum = 1, maximum = 100)]
+    pub unhealthy_threshold: u32,
+    #[schema(minimum = 1, maximum = 100)]
+    pub healthy_threshold: u32,
+}
+
+impl Default for ActiveHealthCheck {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path: None,
+            interval_seconds: 2,
+            timeout_seconds: 2,
+            unhealthy_threshold: 3,
+            healthy_threshold: 2,
+        }
+    }
+}
+
+impl LoadBalancingConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.preferred_node_ids.len() > 100 || self.preferred_node_ids.iter().any(|id| *id < 0) {
+            return Err("Load balancing accepts at most 100 nonnegative node IDs".into());
+        }
+        let mut ids = std::collections::HashSet::new();
+        if self.preferred_node_ids.iter().any(|id| !ids.insert(id)) {
+            return Err("Load balancing preferred node IDs must be unique".into());
+        }
+        if self.max_in_flight_per_replica == Some(0) {
+            return Err("Load balancing max in-flight requests must be positive".into());
+        }
+        let h = &self.health_check;
+        if !(1..=3600).contains(&h.interval_seconds)
+            || !(1..=60).contains(&h.timeout_seconds)
+            || !(1..=100).contains(&h.unhealthy_threshold)
+            || !(1..=100).contains(&h.healthy_threshold)
+        {
+            return Err(
+                "Active health checks require interval 1-3600s, timeout 1-60s and thresholds 1-100"
+                    .into(),
+            );
+        }
+        if h.path.as_ref().is_some_and(|p| {
+            !p.starts_with('/')
+                || p.starts_with("//")
+                || p.len() > 2048
+                || p.chars().any(char::is_control)
+                || p.contains('#')
+                || p.contains('\\')
+        }) {
+            return Err(
+                "Active health-check path must be an origin-relative path of at most 2048 bytes"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_health_paths_the_probe_url_builder_cannot_use() {
+        let mut policy = LoadBalancingConfig::default();
+        policy.health_check.enabled = true;
+        for path in [
+            "/health\\ready",
+            "//elsewhere/ready",
+            "/ready#fragment",
+            "relative",
+        ] {
+            policy.health_check.path = Some(path.into());
+            assert!(policy.validate().is_err(), "{path}");
+        }
+        policy.health_check.path = Some("/ready?full=true".into());
+        assert!(policy.validate().is_ok());
+    }
+
+    #[test]
+    fn routing_schema_bounds_match_validation() {
+        let health =
+            serde_json::to_value(<ActiveHealthCheck as utoipa::PartialSchema>::schema()).unwrap();
+        for (name, maximum) in [
+            ("intervalSeconds", 3600),
+            ("timeoutSeconds", 60),
+            ("unhealthyThreshold", 100),
+            ("healthyThreshold", 100),
+        ] {
+            assert_eq!(health["properties"][name]["minimum"].as_f64(), Some(1.0));
+            assert_eq!(
+                health["properties"][name]["maximum"].as_f64(),
+                Some(f64::from(maximum))
+            );
+        }
+        let policy =
+            serde_json::to_value(<LoadBalancingConfig as utoipa::PartialSchema>::schema()).unwrap();
+        assert_eq!(
+            policy["properties"]["maxInFlightPerReplica"]["minimum"].as_f64(),
+            Some(1.0)
+        );
+    }
 
     /// The stop timeout's field docs are its OpenAPI description, so they
     /// spell the bounds out instead of linking the constants; this keeps the

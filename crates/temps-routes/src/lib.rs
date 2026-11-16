@@ -16,6 +16,7 @@ pub mod internal_access_grants;
 pub mod project_change_listener;
 pub mod public_ingress_store;
 pub mod public_ingress_sync;
+pub mod replica_policy;
 pub mod route_reload_subscriber;
 pub mod route_sync;
 pub mod route_table;

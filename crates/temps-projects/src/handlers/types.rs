@@ -692,6 +692,10 @@ impl ProjectResponse {
                     .deployment_config
                     .clone()
                     .and_then(|c| c.max_concurrent_connections),
+                load_balancing: project
+                    .deployment_config
+                    .as_ref()
+                    .and_then(|c| c.load_balancing.clone()),
                 health: project
                     .deployment_config
                     .as_ref()
@@ -851,6 +855,7 @@ pub struct UpdateDeploymentSettingsRequest {
 #[derive(Serialize, Deserialize, Clone, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateDeploymentConfigRequest {
+    pub load_balancing: Option<temps_entities::deployment_config::LoadBalancingConfig>,
     pub cpu_request: Option<i32>,
     pub cpu_limit: Option<i32>,
     pub memory_request: Option<i32>,

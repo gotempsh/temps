@@ -1128,6 +1128,7 @@ View or set the number of replicas for an environment
 | `-p, --project <project>` | Project slug or ID | - | No |
 | `-e, --environment <env>` | Environment name or slug | `production` | No |
 | `-r, --replicas <count>` | Number of replicas to set | - | No |
+| `--load-balancing <json>` | Replica routing policy as JSON; null restores project inheritance | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `environments placement`

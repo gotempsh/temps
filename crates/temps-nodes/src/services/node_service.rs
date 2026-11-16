@@ -2793,6 +2793,7 @@ impl NodeService {
     async fn placements_targeting<C: sea_orm::ConnectionTrait>(
         conn: &C,
         node_id: i32,
+        lock_projects: bool,
     ) -> Result<Vec<(NodePlacementReference, PlacementRow)>, sea_orm::DbErr> {
         let names_node = |table: &str| {
             Expr::cust_with_values(
@@ -2808,12 +2809,16 @@ impl NodeService {
             .order_by_asc(environments::Column::Id)
             .all(conn)
             .await?;
-        let projects = projects::Entity::find()
+        let mut project_query = projects::Entity::find()
             .filter(projects::Column::IsDeleted.eq(false))
             .filter(names_node("projects"))
-            .order_by_asc(projects::Column::Id)
-            .all(conn)
-            .await?;
+            .order_by_asc(projects::Column::Id);
+        // A removal rewrites the entire config; serialize with settings writers
+        // before reading the JSON that will be merged and saved.
+        if lock_projects {
+            project_query = project_query.lock_exclusive();
+        }
+        let projects = project_query.all(conn).await?;
 
         let mut placements = Vec::with_capacity(environments.len() + projects.len());
         for (environment, project) in environments {
@@ -2861,7 +2866,7 @@ impl NodeService {
         &self,
         node_id: i32,
     ) -> Result<Vec<NodePlacementReference>, NodeError> {
-        Ok(Self::placements_targeting(self.db.as_ref(), node_id)
+        Ok(Self::placements_targeting(self.db.as_ref(), node_id, false)
             .await?
             .into_iter()
             .map(|(placement, _)| placement)
@@ -2874,7 +2879,7 @@ impl NodeService {
         node_id: i32,
         node_name: &str,
     ) -> Result<Vec<NodePlacementReference>, NodeError> {
-        let placements = Self::placements_targeting(txn, node_id).await?;
+        let placements = Self::placements_targeting(txn, node_id, true).await?;
         let only_target: Vec<NodePlacementReference> = placements
             .iter()
             .filter(|(placement, _)| remaining_targets(&placement.target_nodes, node_id).is_empty())
@@ -3863,6 +3868,22 @@ impl AffectedDeployment {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn removing_node_placements_locks_project_configs_before_reading() {
+        for lock_projects in [false, true] {
+            let db = MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<projects::Model>::new(), Vec::new()])
+                .into_connection();
+            let txn = db.begin().await.unwrap();
+            NodeService::placements_targeting(&txn, 7, lock_projects)
+                .await
+                .unwrap();
+            txn.commit().await.unwrap();
+            let log = format!("{:?}", db.into_transaction_log());
+            assert_eq!(log.contains("FOR UPDATE"), lock_projects, "{log}");
+        }
+    }
+
     #[test]
     fn a_drain_decision_replaces_the_row_count() {
         use super::{AffectedDeployment, DrainDecision, RetireReason};

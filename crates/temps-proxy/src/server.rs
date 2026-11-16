@@ -597,6 +597,7 @@ pub fn setup_proxy_server(
     // LbService and never reach this object directly. Route changes become
     // visible to real traffic within at most 60 seconds via that loop.
     refresh_runtime()?.spawn(lb_service.clone().run_refresh_loop());
+    refresh_runtime()?.spawn(route_table.clone().run_active_probes());
 
     let upstream_resolver = Arc::new(UpstreamResolverImpl::new(
         Arc::new(proxy_config.clone()),
@@ -1082,6 +1083,7 @@ pub fn create_proxy_service(
     // Keep the custom-route snapshot in memory so `has_custom_route` and
     // `has_route_for_host` never query Postgres on the request hot path (WS6-G).
     refresh_runtime()?.spawn(lb_service.clone().run_refresh_loop());
+    refresh_runtime()?.spawn(route_table.clone().run_active_probes());
 
     let upstream_resolver = Arc::new(UpstreamResolverImpl::new(
         Arc::new(proxy_config.clone()),

@@ -97,6 +97,12 @@ fn build_backend_entry(
         runtime_context,
     );
     Some(BackendEntry {
+        compose_service: container.service_name.clone().zip(container.container_port),
+        node_id: container.node_id,
+        state: Default::default(),
+        tier: 0,
+        capacity: None,
+        check_health: false,
         address,
         container_id: Some(container.container_id.clone()),
         container_name: Some(container.container_name.clone()),
@@ -201,6 +207,12 @@ fn build_public_compose_backend_entry(
         runtime_context,
     )?;
     Some(BackendEntry {
+        compose_service: Some((public_port.service.clone(), target)),
+        node_id: container.node_id,
+        state: Default::default(),
+        tier: 0,
+        capacity: None,
+        check_health: false,
         address,
         container_id: Some(container.container_id.clone()),
         container_name: Some(container.container_name.clone()),
@@ -452,10 +464,17 @@ pub struct BackendEntry {
     /// checked addresses held here, never to `address`, which is kept for
     /// display. `None` for every platform backend.
     pub pinned: Option<Arc<PinnedUpstream>>,
+    /// Compose service and container port, independent of the published dial port.
+    pub compose_service: Option<(String, i32)>,
+    pub node_id: Option<i32>,
+    pub state: Arc<crate::replica_policy::ReplicaState>,
+    pub tier: usize,
+    pub capacity: Option<u32>,
+    pub check_health: bool,
 }
 
 /// Result of selecting a backend via round-robin.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct BackendSelection {
     /// Network address to connect to
     pub address: String,
@@ -467,6 +486,7 @@ pub struct BackendSelection {
     /// no allowed address). The caller fails the request instead of
     /// connecting to `address`.
     pub refused: Option<String>,
+    pub in_flight: Option<crate::replica_policy::InFlightGuard>,
 }
 
 /// Backend type for a route
@@ -504,6 +524,7 @@ impl BackendType {
             } => {
                 if backends.is_empty() {
                     return Some(BackendSelection {
+                        in_flight: None,
                         refused: None,
                         address: "127.0.0.1:8080".to_string(),
                         container_id: None,
@@ -511,16 +532,10 @@ impl BackendType {
                     });
                 }
 
-                let entry = if backends.len() == 1 {
-                    &backends[0]
-                } else {
-                    let index =
-                        round_robin_counter.fetch_add(1, Ordering::Relaxed) % backends.len();
-                    (0..backends.len())
-                        .map(|offset| &backends[(index + offset) % backends.len()])
-                        .find(|entry| !avoid.contains(&entry.address))
-                        .unwrap_or(&backends[index])
-                };
+                let cursor = round_robin_counter.fetch_add(1, Ordering::Relaxed);
+                let (index, guard) =
+                    crate::replica_policy::reserve_avoiding(backends, cursor, avoid)?;
+                let entry = &backends[index];
 
                 let (address, refused) = match &entry.pinned {
                     None => (entry.address.clone(), None),
@@ -530,6 +545,7 @@ impl BackendType {
                     },
                 };
                 Some(BackendSelection {
+                    in_flight: Some(guard),
                     address,
                     container_id: entry.container_id.clone(),
                     container_name: entry.container_name.clone(),
@@ -611,6 +627,7 @@ impl RouteInfo {
         self.backend
             .get_backend_avoiding(avoid)
             .unwrap_or_else(|| BackendSelection {
+                in_flight: None,
                 refused: None,
                 address: "127.0.0.1:8080".to_string(),
                 container_id: None,
@@ -1021,6 +1038,8 @@ struct LegacyRouteTable {
 
 #[derive(Clone, Debug, Default)]
 struct RouteTableSnapshot {
+    /// Probe membership is committed atomically with the routes it checks.
+    active_probes: Arc<Vec<crate::replica_policy::Probe>>,
     /// Platform hostnames that may have no route at all right now (an
     /// undeployed environment's stored address, a sleeping environment's
     /// hostname), lower-cased. Only consulted to keep a TLS wildcard off them.
@@ -1193,7 +1212,8 @@ fn worker_servable(
     shield: ShieldPinning,
 ) -> bool {
     route.redirect_to.is_none()
-        && matches!(route.backend, BackendType::Upstream { .. })
+        && matches!(&route.backend, BackendType::Upstream { backends, .. }
+            if backends.iter().all(|b| b.tier == 0 && b.capacity.is_none() && !b.check_health))
         && !route.environment.as_ref().is_some_and(|environment| {
             snapshot
                 .path_routes
@@ -1461,6 +1481,7 @@ pub struct CachedPeerTable {
     /// All route indexes and wake-gate ownership published as one immutable,
     /// lock-free snapshot. A reload can never expose mismatched generations.
     route_snapshot: ArcSwap<RouteTableSnapshot>,
+    probe_started: std::sync::atomic::AtomicBool,
 
     /// Serializes reloads so their three-phase snapshot publication cannot
     /// interleave, even when manual refresh and database notification race.
@@ -1540,6 +1561,105 @@ pub struct CachedPeerTable {
 }
 
 impl CachedPeerTable {
+    pub async fn run_active_probes(self: Arc<Self>) {
+        use futures::{stream::FuturesUnordered, StreamExt};
+        if self.probe_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        struct StartedGuard<'a>(&'a std::sync::atomic::AtomicBool);
+        impl Drop for StartedGuard<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let _started = StartedGuard(&self.probe_started);
+        let client = crate::replica_policy::probe_client_with_retry(
+            || {
+                reqwest::Client::builder()
+                    .no_proxy()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()
+            },
+            temps_core::retry::RetryConfig::default(),
+        )
+        .await;
+        use std::{cmp::Reverse, collections::BinaryHeap, time::Instant};
+        let mut snapshot = Arc::new(Vec::new());
+        let mut entries: HashMap<usize, (crate::replica_policy::Probe, Instant)> = HashMap::new();
+        let mut due = BinaryHeap::new();
+        let mut running = HashSet::new();
+        let mut tasks = FuturesUnordered::new();
+        loop {
+            let now = Instant::now();
+            let current = self.route_snapshot.load().active_probes.clone();
+            // Reconcile membership only when routes publish a new snapshot.
+            // Completions only update one deadline, never scan every replica.
+            if !Arc::ptr_eq(&snapshot, &current) {
+                snapshot = current;
+                let mut previous = std::mem::take(&mut entries);
+                due.clear();
+                for probe in snapshot.iter() {
+                    let key = Arc::as_ptr(&probe.state) as usize;
+                    let when = previous
+                        .remove(&key)
+                        .filter(|(old, _)| {
+                            old.url == probe.url
+                                && old.config.health_check.interval_seconds
+                                    == probe.config.health_check.interval_seconds
+                        })
+                        .map(|(_, when)| when)
+                        .unwrap_or(now);
+                    entries.insert(key, (probe.clone(), when));
+                    if !running.contains(&key) {
+                        due.push(Reverse((when, key)));
+                    }
+                }
+            }
+            // Earliest deadlines get the next free slot. At most one request
+            // per replica and 16 overall; overdue work stays in the bounded heap.
+            while running.len() < 16 {
+                let Some(&Reverse((when, key))) = due.peek() else {
+                    break;
+                };
+                if when > now {
+                    break;
+                }
+                due.pop();
+                let Some((probe, next)) = entries.get_mut(&key) else {
+                    continue;
+                };
+                *next = now
+                    + std::time::Duration::from_secs(u64::from(
+                        probe.config.health_check.interval_seconds,
+                    ));
+                running.insert(key);
+                let probe = probe.clone();
+                let client = client.clone();
+                tasks.push(async move {
+                    probe.check(&client).await;
+                    key
+                });
+            }
+            // Poll only the snapshot pointer when idle. With available slots,
+            // also wake at the earliest deadline; a full pool waits for a result.
+            let mut wake_at = now + std::time::Duration::from_millis(250);
+            if running.len() < 16 {
+                if let Some(Reverse((when, _))) = due.peek() {
+                    wake_at = wake_at.min(*when);
+                }
+            }
+            tokio::select! {
+                Some(key) = tasks.next(), if !tasks.is_empty() => {
+                    running.remove(&key);
+                    if let Some((_, when)) = entries.get(&key) {
+                        due.push(Reverse((*when, key)));
+                    }
+                }
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(wake_at)) => {}
+            }
+        }
+    }
+
     pub fn new(db: Arc<DatabaseConnection>) -> Self {
         Self::new_with_runtime_context(db, Arc::new(RuntimeContext::host()))
     }
@@ -1550,6 +1670,7 @@ impl CachedPeerTable {
     ) -> Self {
         Self {
             route_snapshot: ArcSwap::from_pointee(RouteTableSnapshot::default()),
+            probe_started: std::sync::atomic::AtomicBool::new(false),
             route_reload_lock: tokio::sync::Mutex::new(()),
             custom_route_pins: parking_lot::Mutex::new(HashMap::new()),
             db,
@@ -2804,6 +2925,12 @@ mod pinned_backend_tests {
     fn backend(pinned: UpstreamAddresses) -> BackendType {
         BackendType::Upstream {
             backends: vec![BackendEntry {
+                compose_service: None,
+                node_id: None,
+                state: Default::default(),
+                tier: 0,
+                capacity: None,
+                check_health: false,
                 address: "upstream.example.net:443".to_string(),
                 container_id: None,
                 container_name: None,
@@ -2865,6 +2992,12 @@ mod backend_avoiding_tests {
 
     fn two_replicas() -> BackendType {
         let entry = |address: &str| BackendEntry {
+            compose_service: None,
+            node_id: None,
+            state: Default::default(),
+            tier: 0,
+            capacity: None,
+            check_health: false,
             pinned: None,
             address: address.to_string(),
             container_id: None,
@@ -2921,6 +3054,137 @@ mod backend_avoiding_tests {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn active_probe_reload_applies_new_path_and_shorter_interval() {
+        use crate::replica_policy::{Probe, ReplicaState};
+        use temps_entities::deployment_config::{ActiveHealthCheck, LoadBalancingConfig};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(3);
+        let server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 1024];
+                let n = socket.read(&mut request).await.unwrap();
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+                tx.send(String::from_utf8_lossy(&request[..n]).into_owned())
+                    .await
+                    .unwrap();
+            }
+        });
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection();
+        let table = Arc::new(CachedPeerTable::new(Arc::new(db)));
+        let state = Arc::new(ReplicaState::default());
+        let make_probe = |path: &str, interval| Probe {
+            state: state.clone(),
+            url: format!("http://{address}{path}"),
+            config: LoadBalancingConfig {
+                health_check: ActiveHealthCheck {
+                    enabled: true,
+                    interval_seconds: interval,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        };
+        table.route_snapshot.store(Arc::new(RouteTableSnapshot {
+            active_probes: Arc::new(vec![make_probe("/first", 3600)]),
+            ..Default::default()
+        }));
+        let checker = tokio::spawn(table.clone().run_active_probes());
+        let first = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(first.starts_with("GET /first "));
+        table.route_snapshot.store(Arc::new(RouteTableSnapshot {
+            active_probes: Arc::new(vec![make_probe("/second", 3600)]),
+            ..Default::default()
+        }));
+        let second = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(second.starts_with("GET /second "));
+        table.route_snapshot.store(Arc::new(RouteTableSnapshot {
+            active_probes: Arc::new(vec![make_probe("/second", 1)]),
+            ..Default::default()
+        }));
+        let third = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(third.starts_with("GET /second "));
+        checker.abort();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn active_probes_do_not_wait_for_an_unrelated_slow_replica() {
+        use crate::replica_policy::{Probe, ReplicaState};
+        use temps_entities::deployment_config::{ActiveHealthCheck, LoadBalancingConfig};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let slow = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fast = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let make_probe = |address| Probe {
+            state: Arc::new(ReplicaState::default()),
+            url: format!("http://{address}/health"),
+            config: LoadBalancingConfig {
+                health_check: ActiveHealthCheck {
+                    enabled: true,
+                    interval_seconds: 1,
+                    timeout_seconds: 60,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        };
+        let probes = vec![
+            make_probe(slow.local_addr().unwrap()),
+            make_probe(fast.local_addr().unwrap()),
+        ];
+        let slow_server = tokio::spawn(async move {
+            let (_socket, _) = slow.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        let fast_server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = fast.accept().await.unwrap();
+                let mut request = [0; 1024];
+                assert!(socket.read(&mut request).await.unwrap() > 0);
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+                tx.send(()).await.unwrap();
+            }
+        });
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection();
+        let table = Arc::new(CachedPeerTable::new(Arc::new(db)));
+        table.route_snapshot.store(Arc::new(RouteTableSnapshot {
+            active_probes: Arc::new(probes),
+            ..Default::default()
+        }));
+        let checker = tokio::spawn(table.run_active_probes());
+        let completed = tokio::time::timeout(std::time::Duration::from_secs(4), async {
+            assert!(rx.recv().await.is_some());
+            assert!(rx.recv().await.is_some());
+        })
+        .await;
+        checker.abort();
+        slow_server.abort();
+        fast_server.abort();
+        assert!(
+            completed.is_ok(),
+            "a slow replica blocked another replica's next probe"
+        );
+    }
+
     use super::*;
 
     fn snapshot_test_route() -> RouteInfo {
@@ -3029,6 +3293,12 @@ mod tests {
             RouteInfo {
                 backend: BackendType::Upstream {
                     backends: vec![BackendEntry {
+                        compose_service: None,
+                        node_id: None,
+                        state: Default::default(),
+                        tier: 0,
+                        capacity: None,
+                        check_health: false,
                         pinned: None,
                         address: address.to_string(),
                         container_id: None,
@@ -3212,6 +3482,12 @@ mod tests {
             RouteInfo {
                 backend: BackendType::Upstream {
                     backends: vec![BackendEntry {
+                        compose_service: None,
+                        node_id: None,
+                        state: Default::default(),
+                        tier: 0,
+                        capacity: None,
+                        check_health: false,
                         pinned: None,
                         address: address.to_string(),
                         container_id: None,
@@ -3788,6 +4064,12 @@ mod tests {
         let route = RouteInfo {
             backend: BackendType::Upstream {
                 backends: vec![BackendEntry {
+                    compose_service: None,
+                    node_id: None,
+                    state: Default::default(),
+                    tier: 0,
+                    capacity: None,
+                    check_health: false,
                     pinned: None,
                     address: "127.0.0.1:8080".to_string(),
                     container_id: None,
@@ -3816,6 +4098,12 @@ mod tests {
         let route = RouteInfo {
             backend: BackendType::Upstream {
                 backends: vec![BackendEntry {
+                    compose_service: None,
+                    node_id: None,
+                    state: Default::default(),
+                    tier: 0,
+                    capacity: None,
+                    check_health: false,
                     pinned: None,
                     address: "127.0.0.1:8080".to_string(),
                     container_id: None,
@@ -3840,6 +4128,12 @@ mod tests {
         let route = RouteInfo {
             backend: BackendType::Upstream {
                 backends: vec![BackendEntry {
+                    compose_service: None,
+                    node_id: None,
+                    state: Default::default(),
+                    tier: 0,
+                    capacity: None,
+                    check_health: false,
                     pinned: None,
                     address: "192.168.1.100:3000".to_string(),
                     container_id: None,
@@ -3868,18 +4162,36 @@ mod tests {
             backend: BackendType::Upstream {
                 backends: vec![
                     BackendEntry {
+                        compose_service: None,
+                        node_id: None,
+                        state: Default::default(),
+                        tier: 0,
+                        capacity: None,
+                        check_health: false,
                         pinned: None,
                         address: "127.0.0.1:8080".to_string(),
                         container_id: None,
                         container_name: None,
                     },
                     BackendEntry {
+                        compose_service: None,
+                        node_id: None,
+                        state: Default::default(),
+                        tier: 0,
+                        capacity: None,
+                        check_health: false,
                         pinned: None,
                         address: "127.0.0.1:8081".to_string(),
                         container_id: None,
                         container_name: None,
                     },
                     BackendEntry {
+                        compose_service: None,
+                        node_id: None,
+                        state: Default::default(),
+                        tier: 0,
+                        capacity: None,
+                        check_health: false,
                         pinned: None,
                         address: "127.0.0.1:8082".to_string(),
                         container_id: None,
@@ -3927,12 +4239,24 @@ mod tests {
         let backend = BackendType::Upstream {
             backends: vec![
                 BackendEntry {
+                    compose_service: None,
+                    node_id: None,
+                    state: Default::default(),
+                    tier: 0,
+                    capacity: None,
+                    check_health: false,
                     pinned: None,
                     address: "127.0.0.1:8080".to_string(),
                     container_id: None,
                     container_name: None,
                 },
                 BackendEntry {
+                    compose_service: None,
+                    node_id: None,
+                    state: Default::default(),
+                    tier: 0,
+                    capacity: None,
+                    check_health: false,
                     pinned: None,
                     address: "127.0.0.1:8081".to_string(),
                     container_id: None,
@@ -3988,6 +4312,12 @@ mod tests {
     fn test_backend_type_upstream_single_address() {
         let backend = BackendType::Upstream {
             backends: vec![BackendEntry {
+                compose_service: None,
+                node_id: None,
+                state: Default::default(),
+                tier: 0,
+                capacity: None,
+                check_health: false,
                 pinned: None,
                 address: "192.168.1.100:3000".to_string(),
                 container_id: None,
@@ -4036,6 +4366,12 @@ mod tests {
         let route = RouteInfo {
             backend: BackendType::Upstream {
                 backends: vec![BackendEntry {
+                    compose_service: None,
+                    node_id: None,
+                    state: Default::default(),
+                    tier: 0,
+                    capacity: None,
+                    check_health: false,
                     pinned: None,
                     address: "10.0.0.1:9000".to_string(),
                     container_id: None,

@@ -11,6 +11,7 @@ pub(in crate::proxy) mod markdown_tests {
     // ── Helper: build a minimal ProxyContext for testing ──────────────────────
     pub(in crate::proxy) fn make_ctx() -> ProxyContext {
         ProxyContext {
+            replica_in_flight: None,
             response_modified: false,
             response_compressed: false,
             upstream_response_headers: None,
@@ -557,6 +558,7 @@ mod markdown_pipeline_tests {
 
     fn make_ctx() -> ProxyContext {
         ProxyContext {
+            replica_in_flight: None,
             response_modified: false,
             response_compressed: false,
             upstream_response_headers: None,

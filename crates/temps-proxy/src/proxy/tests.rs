@@ -797,6 +797,7 @@ mod admin_gate_tests {
                 _sni: Option<&str>,
             ) -> pingora_core::Result<PeerSelection> {
                 Ok(PeerSelection {
+                    in_flight: None,
                     peer: Box::new(HttpPeer::new("127.0.0.1:1".to_string(), false, "".into())),
                     container_id: None,
                     container_name: None,
@@ -2169,6 +2170,12 @@ pub(super) mod status_page_host_tests {
             temps_routes::RouteInfo {
                 backend: temps_routes::BackendType::Upstream {
                     backends: vec![temps_routes::BackendEntry {
+                        compose_service: None,
+                        node_id: None,
+                        state: Default::default(),
+                        tier: 0,
+                        capacity: None,
+                        check_health: false,
                         pinned: None,
                         address: "127.0.0.1:2".to_string(),
                         container_id: None,
@@ -2528,6 +2535,12 @@ mod shield_enforcement_tests {
             temps_routes::RouteInfo {
                 backend: temps_routes::BackendType::Upstream {
                     backends: vec![temps_routes::BackendEntry {
+                        compose_service: None,
+                        node_id: None,
+                        state: Default::default(),
+                        tier: 0,
+                        capacity: None,
+                        check_health: false,
                         pinned: None,
                         address: "127.0.0.1:9".to_string(),
                         container_id: None,

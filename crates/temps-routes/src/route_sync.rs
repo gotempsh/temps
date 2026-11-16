@@ -820,9 +820,9 @@ pub async fn worker_public_routes(
     let mut unsupported_reasons = blocking_policies.clone();
     if public_route_count > routes.len() && unsupported_reasons.is_empty() {
         unsupported_reasons.push(if shield {
-            "some routes require redirects, static-file serving, wake-up, project security policy, project-group path routing, or a remotely reachable backend".to_string()
+            "some routes require redirects, static-file serving, wake-up, project security policy, project-group path routing, replica routing policies, or a remotely reachable backend".to_string()
         } else {
-            "some routes require redirects, static-file serving, wake-up, a Shield mode that acts on verdicts (selective or attack), project security policy, project-group path routing, or a remotely reachable backend; update the agent to serve Shield routes on workers".to_string()
+            "some routes require redirects, static-file serving, wake-up, a Shield mode that acts on verdicts (selective or attack), project security policy, project-group path routing, replica routing policies, or a remotely reachable backend; update the agent to serve Shield routes on workers".to_string()
         });
     }
     Ok(WorkerPublicRoutes {
@@ -2002,6 +2002,12 @@ pub(crate) mod tests {
             RouteInfo {
                 backend: BackendType::Upstream {
                     backends: vec![BackendEntry {
+                        compose_service: None,
+                        node_id: None,
+                        state: Default::default(),
+                        tier: 0,
+                        capacity: None,
+                        check_health: false,
                         pinned: None,
                         address: "192.0.2.7:32000".to_string(),
                         container_id: Some("worker-container".to_string()),

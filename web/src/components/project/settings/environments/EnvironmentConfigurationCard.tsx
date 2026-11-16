@@ -9,7 +9,11 @@ import {
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { EnvironmentResponse, ProjectResponse } from '@/api/client'
+import {
+  EnvironmentResponse,
+  ProjectResponse,
+  type LoadBalancingConfig,
+} from '@/api/client'
 import {
   updateEnvironmentSettingsMutation,
   adminListNodesOptions,
@@ -72,7 +76,10 @@ import {
   Shield,
   X,
 } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
+import { useForm, type UseFormReturn } from 'react-hook-form'
+import { zodResolver } from '@hookform/resolvers/zod'
+import { z } from 'zod'
 import { Link } from 'react-router'
 import { toast } from 'sonner'
 
@@ -125,11 +132,71 @@ function forceHttpsToPayload(value: ForceHttpsSelect): boolean | null {
   return null
 }
 
+const healthNumberDraft = (max: number) =>
+  z
+    .string()
+    .refine(
+      (value) =>
+        value.trim() !== '' &&
+        Number.isInteger(Number(value)) &&
+        Number(value) >= 1 &&
+        Number(value) <= max,
+      `Enter a whole number from 1 to ${max}`
+    )
+const probePathDraft = z
+  .string()
+  .refine(
+    (path) =>
+      path === '' ||
+      (path.startsWith('/') &&
+        !path.startsWith('//') &&
+        !path.includes('\\') &&
+        !path.includes('#') &&
+        new TextEncoder().encode(path).length <= 2048 &&
+        !Array.from(path).some(
+          (char) =>
+            char.charCodeAt(0) < 32 ||
+            (char.charCodeAt(0) >= 127 && char.charCodeAt(0) <= 159)
+        )),
+    'Use a path starting with /, without fragments or backslashes (maximum 2048 bytes)'
+  )
+const healthDraftSchema = z.object({
+  path: probePathDraft,
+  maxInFlightPerReplica: z.union([
+    z.literal(''),
+    healthNumberDraft(4294967295),
+  ]),
+  intervalSeconds: healthNumberDraft(3600),
+  timeoutSeconds: healthNumberDraft(60),
+  unhealthyThreshold: healthNumberDraft(100),
+  healthyThreshold: healthNumberDraft(100),
+})
+type HealthDrafts = z.infer<typeof healthDraftSchema>
+
+function healthDraftValues(policy?: LoadBalancingConfig | null): HealthDrafts {
+  const health = policy?.healthCheck
+  return {
+    path: health?.path ?? '',
+    maxInFlightPerReplica: policy?.maxInFlightPerReplica?.toString() ?? '',
+    intervalSeconds: String(health?.intervalSeconds ?? 2),
+    timeoutSeconds: String(health?.timeoutSeconds ?? 2),
+    unhealthyThreshold: String(health?.unhealthyThreshold ?? 3),
+    healthyThreshold: String(health?.healthyThreshold ?? 2),
+  }
+}
+
 export function EnvironmentConfigurationCard({
   project,
   environment,
   onUpdate,
 }: EnvironmentConfigurationCardProps) {
+  const healthForm = useForm<HealthDrafts>({
+    resolver: zodResolver(healthDraftSchema),
+    mode: 'onChange',
+    defaultValues: healthDraftValues(
+      environment.deployment_config?.loadBalancing
+    ),
+  })
   const nodesQuery = useQuery({
     ...adminListNodesOptions(),
   })
@@ -142,6 +209,12 @@ export function EnvironmentConfigurationCard({
     u != null ? (u / 1_000_000).toString() : ''
 
   const [formData, setFormData] = useState({
+    loadBalancing: (environment.deployment_config?.loadBalancing ??
+      null) as LoadBalancingConfig | null,
+    preferredNodeIds:
+      environment.deployment_config?.loadBalancing?.preferredNodeIds?.join(
+        ', '
+      ) ?? '',
     branch: environment.branch ?? '',
     cpu_request: microToCores(environment.deployment_config?.cpuRequest),
     cpu_limit: microToCores(environment.deployment_config?.cpuLimit),
@@ -211,14 +284,50 @@ export function EnvironmentConfigurationCard({
     } as SecurityConfig,
   })
 
+  const routingDirty = useRef({ policy: false, nodes: false })
+  const routingRevision = useRef({ policy: 0, nodes: 0 })
+  const environmentId = useRef(environment.id)
+  const { loadBalancing, preferredNodeIds } = formData
+  const setLoadBalancing = (value: LoadBalancingConfig | null) => {
+    routingRevision.current.policy += 1
+    routingDirty.current.policy = true
+    setFormData((previous) => ({ ...previous, loadBalancing: value }))
+  }
+  const setPreferredNodeIds = (value: string) => {
+    routingRevision.current.nodes += 1
+    routingDirty.current.nodes = true
+    setFormData((previous) => ({ ...previous, preferredNodeIds: value }))
+  }
+
   // Label editing state
   const [newLabelKey, setNewLabelKey] = useState('')
   const [newLabelValue, setNewLabelValue] = useState('')
 
   // Sync form data when environment changes
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    setFormData({
+    const changedIdentity = environmentId.current !== environment.id
+    if (changedIdentity) {
+      environmentId.current = environment.id
+      routingDirty.current = { policy: false, nodes: false }
+    }
+    healthForm.reset(
+      healthDraftValues(environment.deployment_config?.loadBalancing),
+      {
+        keepDirtyValues: !changedIdentity,
+      }
+    )
+    const dirty = { ...routingDirty.current }
+
+    setFormData((previous) => ({
+      loadBalancing: dirty.policy
+        ? previous.loadBalancing
+        : ((environment.deployment_config?.loadBalancing ??
+            null) as LoadBalancingConfig | null),
+      preferredNodeIds: dirty.nodes
+        ? previous.preferredNodeIds
+        : (environment.deployment_config?.loadBalancing?.preferredNodeIds?.join(
+            ', '
+          ) ?? ''),
       branch: environment.branch ?? '',
       cpu_request: microToCores(environment.deployment_config?.cpuRequest),
       cpu_limit: microToCores(environment.deployment_config?.cpuLimit),
@@ -288,15 +397,38 @@ export function EnvironmentConfigurationCard({
               ?.maxRequestsPerHour ?? undefined,
         },
       } as SecurityConfig,
-    })
-  }, [environment])
+    }))
+  }, [environment, healthForm])
 
   const updateEnvironmentSettings = useMutation({
     ...updateEnvironmentSettingsMutation(),
     meta: {
       errorTitle: 'Failed to update environment configuration',
     },
-    onSuccess: (updated) => {
+    onMutate: () => ({
+      environmentId: environmentId.current,
+      revision: { ...routingRevision.current },
+      healthDrafts: healthForm.getValues(),
+    }),
+    onSuccess: (updated, _variables, submitted) => {
+      if (submitted?.environmentId === environmentId.current) {
+        for (const field of ['policy', 'nodes'] as const) {
+          if (routingRevision.current[field] === submitted.revision[field]) {
+            routingDirty.current[field] = false
+          }
+        }
+        const current = healthForm.getValues()
+        for (const field of Object.keys(current) as Array<keyof HealthDrafts>) {
+          // The successful write is the new baseline, even if a pending edit
+          // returned to the previous default (which RHF considered clean).
+          healthForm.resetField(field, {
+            defaultValue: submitted.healthDrafts[field],
+          })
+          if (current[field] !== submitted.healthDrafts[field]) {
+            healthForm.setValue(field, current[field], { shouldDirty: true })
+          }
+        }
+      }
       toast.success('Environment configuration updated successfully')
       if (updated.placement_warning) {
         toast.warning(updated.placement_warning)
@@ -310,6 +442,46 @@ export function EnvironmentConfigurationCard({
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
+
+    let routing = loadBalancing
+    if (routing) {
+      if (!(await healthForm.trigger())) return
+      const drafts = healthForm.getValues()
+      routing = {
+        ...routing,
+        maxInFlightPerReplica:
+          drafts.maxInFlightPerReplica === ''
+            ? null
+            : Number(drafts.maxInFlightPerReplica),
+        healthCheck: {
+          ...defaultLoadBalancing.healthCheck!,
+          ...routing.healthCheck,
+          path: drafts.path || null,
+          intervalSeconds: Number(drafts.intervalSeconds),
+          timeoutSeconds: Number(drafts.timeoutSeconds),
+          unhealthyThreshold: Number(drafts.unhealthyThreshold),
+          healthyThreshold: Number(drafts.healthyThreshold),
+        },
+      }
+    }
+    if (routing?.strategy === 'preferred_nodes') {
+      const ids = preferredNodeIds
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .map(Number)
+      if (
+        ids.length > 100 ||
+        new Set(ids).size !== ids.length ||
+        !ids.every((n) => Number.isInteger(n) && n >= 0 && n <= 2147483647)
+      ) {
+        toast.error(
+          'Enter up to 100 distinct nonnegative node IDs separated by commas'
+        )
+        return
+      }
+      routing = { ...routing, preferredNodeIds: ids }
+    }
 
     const exemptPaths = parseExemptPathsText(formData.shield_exempt_paths)
     const exemptProblem = validateExemptPaths(exemptPaths)
@@ -341,6 +513,7 @@ export function EnvironmentConfigurationCard({
         memory_limit: formData.memory_limit
           ? parseInt(formData.memory_limit)
           : null,
+        load_balancing: routing,
         replicas: formData.replicas ? parseInt(formData.replicas) : null,
         // Exposed port is managed by EnvironmentPortOverrideCard under
         // Build & Deploy → Deploy, not this form — omit it so submitting
@@ -626,6 +799,14 @@ export function EnvironmentConfigurationCard({
           title="Scaling"
           icon={Network}
         >
+          <LoadBalancingFields
+            value={loadBalancing}
+            healthForm={healthForm}
+            onChange={setLoadBalancing}
+            preferredNodeIds={preferredNodeIds}
+            onPreferredNodeIdsChange={setPreferredNodeIds}
+            id={String(environment.id)}
+          />
           <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
             <div>
               <Label>Replicas</Label>
@@ -1503,5 +1684,191 @@ export function EnvironmentConfigurationCard({
         </Button>
       </div>
     </form>
+  )
+}
+
+const defaultLoadBalancing: LoadBalancingConfig = {
+  strategy: 'round_robin',
+  preferredNodeIds: [],
+  maxInFlightPerReplica: null,
+  healthCheck: {
+    enabled: false,
+    path: null,
+    intervalSeconds: 2,
+    timeoutSeconds: 2,
+    unhealthyThreshold: 3,
+    healthyThreshold: 2,
+  },
+}
+
+function LoadBalancingFields({
+  healthForm,
+  value,
+  onChange,
+  preferredNodeIds,
+  onPreferredNodeIdsChange,
+  id,
+}: {
+  healthForm: UseFormReturn<HealthDrafts>
+  value: LoadBalancingConfig | null
+  onChange: (value: LoadBalancingConfig | null) => void
+  preferredNodeIds: string
+  onPreferredNodeIdsChange: (value: string) => void
+  id: string
+}) {
+  const policy = value ?? defaultLoadBalancing
+  const health = policy.healthCheck ?? defaultLoadBalancing.healthCheck!
+  const invalidPath = !probePathDraft.safeParse(healthForm.watch('path'))
+    .success
+  const limitDraft = healthForm.watch('maxInFlightPerReplica')
+  const invalidLimit =
+    !healthDraftSchema.shape.maxInFlightPerReplica.safeParse(limitDraft).success
+  return (
+    <div className="space-y-4">
+      <div className="space-y-2">
+        <Label htmlFor={`lb-${id}`}>Request routing</Label>
+        <Select
+          value={value ? policy.strategy : 'inherit'}
+          onValueChange={(v) =>
+            onChange(
+              v === 'inherit'
+                ? null
+                : { ...policy, strategy: v as LoadBalancingConfig['strategy'] }
+            )
+          }
+        >
+          <SelectTrigger id={`lb-${id}`}>
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="inherit">Use project default</SelectItem>
+            <SelectItem value="round_robin">Round robin</SelectItem>
+            <SelectItem value="preferred_nodes">Preferred nodes</SelectItem>
+          </SelectContent>
+        </Select>
+        <p className="text-sm text-muted-foreground">
+          Prefer replicas near your database, with overflow and failover to
+          other nodes. Project defaults use round robin unless configured.
+        </p>
+      </div>
+      {value && (
+        <>
+          {policy.strategy === 'preferred_nodes' && (
+            <>
+              <Label htmlFor={`lb-nodes-${id}`}>
+                Preferred node IDs, in priority order
+              </Label>
+              <Input
+                id={`lb-nodes-${id}`}
+                value={preferredNodeIds}
+                placeholder="3, 5"
+                onChange={(e) => onPreferredNodeIdsChange(e.target.value)}
+              />
+              <p className="text-sm text-muted-foreground">
+                Use 0 for the control plane. Unlisted nodes form the final
+                fallback tier.
+              </p>
+            </>
+          )}
+          {(policy.strategy === 'preferred_nodes' || invalidLimit) && (
+            <>
+              <Label htmlFor={`lb-limit-${id}`}>
+                In-flight requests per replica before overflow
+              </Label>
+              <Input
+                id={`lb-limit-${id}`}
+                type="number"
+                min={1}
+                placeholder="Unlimited"
+                aria-invalid={
+                  !!healthForm.formState.errors.maxInFlightPerReplica
+                }
+                {...healthForm.register('maxInFlightPerReplica')}
+              />
+              {healthForm.formState.errors.maxInFlightPerReplica && (
+                <p role="alert" className="text-sm text-destructive">
+                  {healthForm.formState.errors.maxInFlightPerReplica.message}
+                </p>
+              )}
+              {policy.strategy !== 'preferred_nodes' && (
+                <p className="text-sm text-muted-foreground">
+                  Overflow limits apply only to preferred-node routing. Clear or
+                  correct this invalid saved value to continue.
+                </p>
+              )}
+            </>
+          )}
+          <div className="flex items-center gap-2">
+            <Switch
+              id={`lb-health-${id}`}
+              checked={health.enabled}
+              onCheckedChange={(enabled) =>
+                onChange({ ...policy, healthCheck: { ...health, enabled } })
+              }
+            />
+            <Label htmlFor={`lb-health-${id}`}>Active health checks</Label>
+          </div>
+          <p className="text-sm text-muted-foreground">
+            Stop routing to replicas that fail HTTP probes. If every replica is
+            unhealthy, traffic fails open to all replicas.
+          </p>
+          {(health.enabled ||
+            invalidPath ||
+            Object.keys(healthForm.formState.errors).length > 0) && (
+            <div className="grid gap-4 sm:grid-cols-2">
+              <div className="space-y-2">
+                <Label htmlFor={`lb-path-${id}`}>Probe path</Label>
+                <Input
+                  id={`lb-path-${id}`}
+                  placeholder="Deployment health path"
+                  {...healthForm.register('path')}
+                  aria-invalid={!!healthForm.formState.errors.path}
+                  aria-describedby={`lb-path-${id}-error`}
+                />
+                {healthForm.formState.errors.path && (
+                  <p
+                    id={`lb-path-${id}-error`}
+                    role="alert"
+                    className="text-sm text-destructive"
+                  >
+                    {healthForm.formState.errors.path.message}
+                  </p>
+                )}
+              </div>
+              {(
+                [
+                  ['intervalSeconds', 'Interval (seconds)', 3600],
+                  ['timeoutSeconds', 'Timeout (seconds)', 60],
+                  ['unhealthyThreshold', 'Failures before removal', 100],
+                  ['healthyThreshold', 'Passes before recovery', 100],
+                ] as const
+              ).map(([key, label, max]) => (
+                <div key={key} className="space-y-2">
+                  <Label htmlFor={`lb-${key}-${id}`}>{label}</Label>
+                  <Input
+                    id={`lb-${key}-${id}`}
+                    type="number"
+                    min={1}
+                    max={max}
+                    {...healthForm.register(key)}
+                    aria-invalid={!!healthForm.formState.errors[key]}
+                    aria-describedby={`lb-${key}-${id}-error`}
+                  />
+                  {healthForm.formState.errors[key] && (
+                    <p
+                      id={`lb-${key}-${id}-error`}
+                      role="alert"
+                      className="text-sm text-destructive"
+                    >
+                      {healthForm.formState.errors[key]?.message}
+                    </p>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </>
+      )}
+    </div>
   )
 }

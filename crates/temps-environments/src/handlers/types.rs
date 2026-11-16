@@ -416,6 +416,18 @@ where
     }
 }
 
+fn deserialize_load_balancing<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<Option<temps_entities::deployment_config::LoadBalancingConfig>>, D::Error> {
+    Option::deserialize(d).map(Some)
+}
+
+fn deserialize_optional_branch<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<Option<String>>, D::Error> {
+    Option::deserialize(d).map(Some)
+}
+
 fn deserialize_optional_optional_shield_mode<'de, D>(
     deserializer: D,
 ) -> Result<Option<Option<ShieldMode>>, D::Error>
@@ -445,6 +457,13 @@ where
 
 #[derive(Serialize, Deserialize, Clone, ToSchema)]
 pub struct UpdateEnvironmentSettingsRequest {
+    /// Null restores project inheritance; an object replaces the routing policy.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_load_balancing",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub load_balancing: Option<Option<temps_entities::deployment_config::LoadBalancingConfig>>,
     /// Deploy-time probe override. Null restores project inheritance; omitted leaves it unchanged.
     #[serde(
         default,
@@ -477,7 +496,13 @@ pub struct UpdateEnvironmentSettingsRequest {
     /// Absent leaves the current value unchanged.
     #[serde(default, deserialize_with = "deserialize_optional_optional_i32")]
     pub memory_limit: Option<Option<i32>>,
-    pub branch: Option<String>,
+    /// Absent preserves the tracked branch; null explicitly clears it.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_branch",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub branch: Option<Option<String>>,
     pub replicas: Option<i32>,
     /// Port exposed by the container (overrides project-level port for this environment)
     ///
@@ -730,6 +755,18 @@ pub struct GetProjectSecretsQuery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn load_balancing_distinguishes_inheritance_reset_and_override() {
+        let absent: UpdateEnvironmentSettingsRequest = serde_json::from_str("{}").unwrap();
+        assert_eq!(absent.load_balancing, None);
+        let reset: UpdateEnvironmentSettingsRequest =
+            serde_json::from_str(r#"{"load_balancing":null}"#).unwrap();
+        assert_eq!(reset.load_balancing, Some(None));
+        let explicit: UpdateEnvironmentSettingsRequest =
+            serde_json::from_str(r#"{"load_balancing":{"strategy":"round_robin"}}"#).unwrap();
+        assert_eq!(explicit.load_balancing, Some(Some(Default::default())));
+    }
 
     #[test]
     fn env_var_preview_inclusion_requires_explicit_opt_in() {

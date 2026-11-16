@@ -272,6 +272,12 @@ fn app_route(project_id: i32, configure: impl FnOnce(&mut environments::Model)) 
     RouteInfo {
         backend: BackendType::Upstream {
             backends: vec![BackendEntry {
+                compose_service: None,
+                node_id: None,
+                state: Default::default(),
+                tier: 0,
+                capacity: None,
+                check_health: false,
                 pinned: None,
                 address: "127.0.0.1:9".to_string(),
                 container_id: None,

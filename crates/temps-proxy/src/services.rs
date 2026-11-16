@@ -304,6 +304,8 @@ impl UpstreamResolver for UpstreamResolverImpl {
             if let Some(address) = self.server_config.internal_dns_sync_address.as_ref() {
                 debug!(%address, "Routing authenticated DNS sync request to proxy service");
                 return Ok(PeerSelection {
+                    in_flight: None,
+
                     peer: Box::new(HttpPeer::new(address.clone(), false, "".to_string())),
                     container_id: None,
                     container_name: None,
@@ -323,6 +325,7 @@ impl UpstreamResolver for UpstreamResolverImpl {
             "".to_string(),
         ));
         Ok(PeerSelection {
+            in_flight: None,
             peer,
             container_id: None,
             container_name: None,
@@ -394,6 +397,7 @@ pub(crate) fn peer_for_selection(
         return Err(Error::explain(ErrorType::HTTPStatus(502), reason).into_up());
     }
     Ok(PeerSelection {
+        in_flight: selection.in_flight,
         peer: Box::new(HttpPeer::new(selection.address, false, String::new())),
         container_id: selection.container_id,
         container_name: selection.container_name,
@@ -403,6 +407,7 @@ pub(crate) fn peer_for_selection(
 /// A plain-HTTP peer for one of the console's loopback listeners.
 fn console_peer(address: &str) -> PeerSelection {
     PeerSelection {
+        in_flight: None,
         peer: Box::new(HttpPeer::new(address.to_string(), false, "".to_string())),
         container_id: None,
         container_name: None,
@@ -511,6 +516,12 @@ mod public_ingress_tests {
         temps_routes::RouteInfo {
             backend: temps_routes::BackendType::Upstream {
                 backends: vec![temps_routes::BackendEntry {
+                    compose_service: None,
+                    node_id: None,
+                    state: Default::default(),
+                    tier: 0,
+                    capacity: None,
+                    check_health: false,
                     pinned: None,
                     address: address.into(),
                     container_id: None,
@@ -817,10 +828,17 @@ mod dns_sync_tests {
         RouteInfo {
             backend: BackendType::Upstream {
                 backends: vec![BackendEntry {
+                    compose_service: None,
                     pinned: None,
                     address: "127.0.0.1:18080".into(),
                     container_id: Some("application-container".into()),
                     container_name: None,
+
+                    node_id: None,
+                    state: Default::default(),
+                    tier: 0,
+                    capacity: None,
+                    check_health: false,
                 }],
                 round_robin_counter: Arc::new(AtomicUsize::new(0)),
             },
@@ -1184,6 +1202,7 @@ mod peer_for_selection_tests {
 
     fn selection(address: &str, refused: Option<&str>) -> temps_routes::BackendSelection {
         temps_routes::BackendSelection {
+            in_flight: None,
             address: address.to_string(),
             container_id: None,
             container_name: None,
@@ -1201,6 +1220,24 @@ mod peer_for_selection_tests {
             Err(error) => error,
         };
         assert_eq!(error.etype(), &ErrorType::HTTPStatus(502));
+    }
+
+    #[test]
+    fn peer_selection_retains_the_reservation_and_releases_it_on_refusal() {
+        use std::sync::atomic::Ordering;
+        use temps_routes::replica_policy::{InFlightGuard, ReplicaState};
+        let state = Arc::new(ReplicaState::default());
+        let mut backend = selection("127.0.0.1:8080", None);
+        backend.in_flight = Some(InFlightGuard::acquire(state.clone()));
+        let peer = peer_for_selection(backend).expect("allowed peer");
+        assert_eq!(state.in_flight.load(Ordering::Relaxed), 1);
+        drop(peer);
+        assert_eq!(state.in_flight.load(Ordering::Relaxed), 0);
+
+        let mut backend = selection("upstream.example.net:80", Some("upstream refused"));
+        backend.in_flight = Some(InFlightGuard::acquire(state.clone()));
+        assert!(peer_for_selection(backend).is_err());
+        assert_eq!(state.in_flight.load(Ordering::Relaxed), 0);
     }
 
     #[test]

@@ -366,6 +366,7 @@ pub struct ProxyContext {
     pub upstream_host: Option<String>,
     pub container_id: Option<String>,
     pub container_name: Option<String>,
+    pub replica_in_flight: Option<temps_routes::replica_policy::InFlightGuard>,
     pub tls_fingerprint: Option<String>,
     pub tls_version: Option<String>,
     pub tls_cipher: Option<String>,
@@ -3604,6 +3605,7 @@ impl ProxyHttp for LoadBalancer {
 
     fn new_ctx(&self) -> Self::CTX {
         ProxyContext {
+            replica_in_flight: None,
             response_modified: false,
             response_compressed: false,
             upstream_response_headers: None,
@@ -4377,6 +4379,7 @@ impl ProxyHttp for LoadBalancer {
         };
         let selection = if let Some(ingress_address) = public_surface_address {
             PeerSelection {
+                in_flight: None,
                 peer: Box::new(HttpPeer::new(ingress_address, false, String::new())),
                 container_id: None,
                 container_name: None,
@@ -4407,6 +4410,7 @@ impl ProxyHttp for LoadBalancer {
                 .await?
         };
 
+        ctx.replica_in_flight = selection.in_flight;
         let mut peer = selection.peer;
 
         // The console failed to start: nothing is listening on its address
@@ -4517,6 +4521,7 @@ impl ProxyHttp for LoadBalancer {
         ctx: &mut Self::CTX,
         mut e: Box<Error>,
     ) -> Box<Error> {
+        ctx.replica_in_flight.take();
         // Retry on connection failure — handles stale pooled connections where
         // the upstream closed the keep-alive connection before we sent the
         // request (TCP RST / "Connection reset by peer"), and a replica that's

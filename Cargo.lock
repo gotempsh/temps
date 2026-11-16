@@ -15625,6 +15625,7 @@ dependencies = [
  "base64 0.23.1",
  "chrono",
  "flate2",
+ "futures",
  "hex",
  "ipnetwork",
  "parking_lot 0.13.0",
