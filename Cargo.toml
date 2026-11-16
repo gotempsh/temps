@@ -516,7 +516,7 @@ relay-event-schema = { git = "https://github.com/getsentry/relay", rev = "ca7e20
 relay-protocol = { git = "https://github.com/getsentry/relay", rev = "ca7e20d" }
 reqwest-otlp = { package = "reqwest", version = "0.13", default-features = false, features = ["blocking", "rustls"] }
 rsa = "0.9"
-rtnetlink = "0.23"
+rtnetlink = "0.24"
 russh = "0.65"
 rustix = { version = "1.1.4", features = ["fs"] }
 rustls-native-certs = "0.8"
