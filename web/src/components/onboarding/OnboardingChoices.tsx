@@ -76,9 +76,8 @@ export function OnboardingChoices({
                 </ChoiceHeading>
                 <Badge variant="outline" className="gap-1.5 sm:ml-auto">
                   <Clock className="size-3" aria-hidden />
-                  <span
-                    aria-label={`Estimated hands-on effort: ${choice.estimate}`}
-                  >
+                  <span>
+                    <span className="sr-only">Estimated hands-on effort: </span>
                     {choice.estimate}
                   </span>
                 </Badge>

@@ -51,3 +51,20 @@ test('the standalone page supplies its own question without a duplicate heading'
   expect(markup()).toContain('What would you like to try first?')
   expect(markup(false)).not.toContain('What would you like to try first?')
 })
+
+test('effort estimates include a readable explanation for assistive technology', () => {
+  const dom = new DOMParser().parseFromString(markup(), 'text/html')
+  const explanations = Array.from(dom.querySelectorAll('.sr-only')).filter(
+    (element) => element.textContent === 'Estimated hands-on effort: '
+  )
+
+  expect(explanations).toHaveLength(4)
+  expect(
+    explanations.map((element) => element.parentElement?.textContent)
+  ).toEqual([
+    'Estimated hands-on effort: 5–10 min',
+    'Estimated hands-on effort: 5–10 min',
+    'Estimated hands-on effort: 3–5 min',
+    'Estimated hands-on effort: 5–15 min',
+  ])
+})
