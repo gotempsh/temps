@@ -173,6 +173,16 @@ impl AuthorityStore {
                     .map_err(|source| sdk("seal interception key", source))?,
             },
             rules: Vec::new(),
+            // Temps does not use tokenless' quarantine, tripwire or rate-limit
+            // policies. These are the values tokenless reads from a snapshot
+            // that omits them, so the signed body is unchanged: none of these
+            // fields are serialized, and the node keeps redacting injected
+            // credentials from responses (`scrub_responses` is written only
+            // when an admin turns it off).
+            quarantine: None,
+            tripwires: None,
+            rate_limit: None,
+            scrub_responses: true,
         };
         let mut snapshot_bytes = serde_json::to_vec(&body)
             .map_err(|source| AuthorityError::Encoding {

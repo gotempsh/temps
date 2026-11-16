@@ -22,7 +22,7 @@ fn authority(control: &WorkerControl) -> WorkerAuthority {
     WorkerAuthority {
         boot_id: control.identity().boot_id,
         node_id: Uuid::new_v4(),
-        snapshot_verify_key: SigningKey::generate(&mut rand08::rngs::OsRng)
+        snapshot_verify_key: SigningKey::from_bytes(&rand08::random())
             .verifying_key()
             .to_bytes(),
     }
