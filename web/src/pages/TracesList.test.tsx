@@ -121,8 +121,10 @@ function renderWithTraces(entry: string) {
 
 test('a link to #traces-setup opens the setup and scrolls to it even when traces exist', async () => {
   const scrolled: string[] = []
-  const original = HTMLElement.prototype.scrollIntoView
-  HTMLElement.prototype.scrollIntoView = function (this: HTMLElement) {
+  // Stub where the method is defined, so restoring it leaves no copy on a
+  // subclass prototype that would hide other tests' stubs.
+  const original = Element.prototype.scrollIntoView
+  Element.prototype.scrollIntoView = function (this: Element) {
     scrolled.push(this.id)
   }
   try {
@@ -134,7 +136,7 @@ test('a link to #traces-setup opens the setup and scrolls to it even when traces
     // still has to happen.
     await waitFor(() => expect(scrolled).toContain('traces-setup'))
   } finally {
-    HTMLElement.prototype.scrollIntoView = original
+    Element.prototype.scrollIntoView = original
   }
 })
 
