@@ -36,6 +36,9 @@
     clippy::expect_used,
     reason = "integration-test helpers: panicking is how a test fails"
 )]
+// The async test bodies nest deeply enough that computing their layout
+// exceeds rustc's default query depth of 128 with current dependencies.
+#![recursion_limit = "256"]
 
 use std::path::PathBuf;
 use std::sync::Arc;

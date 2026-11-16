@@ -61,7 +61,7 @@ pub const PROVIDER_NAME: &str = "microsandbox";
 /// SDK's own default runtime version so a dependency bump that forgets this
 /// constant fails CI instead of shipping a backend that installs a runtime
 /// the SDK then rejects.
-pub const MICROSANDBOX_VERSION: &str = "0.7.11";
+pub const MICROSANDBOX_VERSION: &str = "0.7.15";
 
 /// Console page that shows backend status and setup instructions.
 pub const SETUP_PATH: &str = "/agent-sandbox/sandbox";
