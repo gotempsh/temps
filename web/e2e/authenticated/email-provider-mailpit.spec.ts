@@ -44,10 +44,11 @@ test.describe('Email provider via Mailpit (SMTP)', () => {
       ).toBeVisible()
       // exact: true -- getByLabel does substring matching, and "Username
       // (optional)" contains "name" (case-insensitively), so a plain
-      // getByLabel('Name') resolves to two elements.
+      // getByLabel('Name') resolves to two elements. Likewise the sidebar's
+      // "What Temps supports" link contains "port".
       await page.getByLabel('Name', { exact: true }).fill(name)
       await page.getByLabel('SMTP host').fill('localhost')
-      await page.getByLabel('Port').fill('1025')
+      await page.getByLabel('Port', { exact: true }).fill('1025')
       await page.getByLabel('Encryption').click()
       await page
         .getByRole('option', { name: 'No encryption (local testing only)' })

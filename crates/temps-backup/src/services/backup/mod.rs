@@ -194,6 +194,7 @@ fn json_contains_backup_identity(value: &serde_json::Value, backup_id: &str) -> 
 
 #[derive(Clone)]
 pub struct BackupService {
+    telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
     db: Arc<DatabaseConnection>,
     external_service_manager: Arc<ExternalServiceManager>,
     alarm_service: Arc<AlarmService>,
@@ -209,6 +210,14 @@ pub struct BackupService {
 }
 
 impl BackupService {
+    pub fn with_telemetry(
+        mut self,
+        telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
+    ) -> Self {
+        self.telemetry = telemetry;
+        self
+    }
+
     /// Why running a backup of external service `service_id` with
     /// `engine_key` would restart its database now, or `None`. Only the
     /// WAL-G PostgreSQL engine can restart a service (to turn archiving on).
@@ -253,6 +262,7 @@ impl BackupService {
         queue: Arc<dyn temps_core::JobQueue>,
     ) -> Self {
         Self {
+            telemetry: Arc::new(temps_core::telemetry::NoopTelemetryReporter),
             db,
             external_service_manager,
             alarm_service,

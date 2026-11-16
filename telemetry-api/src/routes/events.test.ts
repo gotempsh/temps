@@ -7,8 +7,8 @@ import type { Pool } from "pg";
 
 describe("KNOWN_EVENT_TYPES", () => {
   it("includes the runtime events plus the CLI setup event", () => {
-    // 48 runtime events plus one CLI-only event.
-    expect(KNOWN_EVENT_TYPES.size).toBe(49);
+    // 51 runtime events plus one CLI-only event.
+    expect(KNOWN_EVENT_TYPES.size).toBe(52);
   });
 
   it("uses only snake_case names", () => {
@@ -38,6 +38,39 @@ function makeReq(body: unknown, method = "POST"): Request {
     body: JSON.stringify(body),
   });
 }
+
+describe("onboarding milestone ingest", () => {
+  for (const eventType of [
+    "first_deploy_attempted",
+    "first_project_created",
+    "first_git_provider_connected",
+  ]) {
+    for (const batch of [false, true]) {
+      it(`stores ${eventType} through ${batch ? "batch" : "single"} ingest`, async () => {
+        const pool = makePool();
+        const routes = createEventsRoutes(pool, {
+          backfill: noBackfill,
+          resolveCountry: () => null,
+        });
+        const event = {
+          anonymous_id: "inst_sample",
+          event_type: eventType,
+          properties: {},
+        };
+        const res = batch
+          ? await routes.postBatch(makeReq({ events: [event] }))
+          : await routes.postEvent(makeReq(event));
+
+        expect(res.status).toBe(201);
+        const calls = (pool.query as ReturnType<typeof mock>).mock.calls as unknown as
+          Array<[string, unknown[]]>;
+        expect(calls).toHaveLength(2);
+        expect(calls[0][1][1]).toBe(eventType);
+        expect(JSON.parse(calls[0][1][2] as string)).toEqual({});
+      });
+    }
+  }
+});
 
 describe("POST /v1/events", () => {
   const setupEvent = {

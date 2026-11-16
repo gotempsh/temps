@@ -116,6 +116,7 @@ export interface SecuritySettingsFormData {
   loopback_ja4_header: string
   /** Edited by SecurityPage itself; carried here so both share one form. */
   trusted_private_networks_text: string
+  trusted_proxy_cidrs_text: string
 }
 
 interface SecuritySettingsProps {

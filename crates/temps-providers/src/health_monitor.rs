@@ -165,6 +165,7 @@ fn binlog_credential_reuse_window(
 /// Background loop that keeps `external_services.health_status` in sync with
 /// reality and sends alerts when a service stays down for 3+ consecutive checks.
 pub struct ExternalServiceHealthMonitor {
+    telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
     db: Arc<DatabaseConnection>,
     manager: Arc<ExternalServiceManager>,
     alarm_service: Arc<AlarmService>,
@@ -199,7 +200,52 @@ pub struct ExternalServiceHealthMonitor {
     stats_baselines: Arc<StatsBaselines>,
 }
 
+/// Idle polls are not backup operations; one event per completed shipping batch.
+fn binlog_archive_outcome(
+    outcome: Result<bool, &str>,
+    elapsed: Duration,
+) -> Option<temps_core::telemetry::TelemetryEvent> {
+    use temps_core::telemetry::{TelemetryEvent, TelemetryEventKind};
+    let event = match outcome {
+        Ok(false) => return None,
+        Ok(true) => TelemetryEvent::new(TelemetryEventKind::BackupSucceeded),
+        Err(message) => {
+            TelemetryEvent::new(TelemetryEventKind::BackupFailed).with_failure_from_message(message)
+        }
+    };
+    Some(
+        event
+            .with("engine", "mariadb_binlog")
+            .with_duration(elapsed),
+    )
+}
+
+#[cfg(test)]
+mod archive_telemetry_tests {
+    use super::*;
+    #[test]
+    fn reports_shipping_once_and_skips_idle_ticks() {
+        assert!(binlog_archive_outcome(Ok(false), Duration::ZERO).is_none());
+        let success = binlog_archive_outcome(Ok(true), Duration::from_secs(90)).unwrap();
+        assert_eq!(success.event_type, "backup_succeeded");
+        assert_eq!(success.properties["engine"], "mariadb_binlog");
+        assert_eq!(success.properties["duration_bucket"], "1-5m");
+        let failure =
+            binlog_archive_outcome(Err("private.example AccessDenied"), Duration::ZERO).unwrap();
+        assert_eq!(failure.event_type, "backup_failed");
+        assert!(!serde_json::to_string(&failure).unwrap().contains("private"));
+    }
+}
+
 impl ExternalServiceHealthMonitor {
+    pub fn with_telemetry(
+        mut self,
+        telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
+    ) -> Self {
+        self.telemetry = telemetry;
+        self
+    }
+
     pub fn new(
         db: Arc<DatabaseConnection>,
         manager: Arc<ExternalServiceManager>,
@@ -209,6 +255,7 @@ impl ExternalServiceHealthMonitor {
         encryption_service: Arc<EncryptionService>,
     ) -> Self {
         Self {
+            telemetry: Arc::new(temps_core::telemetry::NoopTelemetryReporter),
             db,
             manager,
             alarm_service,
@@ -732,6 +779,7 @@ impl ExternalServiceHealthMonitor {
             crate::services::ServiceExecutionRoute::Remote(node_id) => Some(node_id),
             _ => None,
         };
+        let archive_started = Instant::now();
         let shipped = match worker_node {
             None => {
                 let Some(docker_client) = self.docker.get() else {
@@ -751,6 +799,15 @@ impl ExternalServiceHealthMonitor {
                 .await
                 .map_err(|reason| format!("on worker node {node_id}: {reason}")),
         };
+        if let Some(event) = binlog_archive_outcome(
+            shipped
+                .as_ref()
+                .map(|count| *count > 0)
+                .map_err(String::as_str),
+            archive_started.elapsed(),
+        ) {
+            self.telemetry.report(event);
+        }
         match shipped {
             Ok(shipped) => {
                 if shipped > 0 {

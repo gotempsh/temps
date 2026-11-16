@@ -218,15 +218,24 @@ impl TempsPlugin for BackupPlugin {
             // panicking on the first backup trigger.
             let job_queue = context.require_service::<dyn temps_core::JobQueue>();
 
+            let telemetry = context
+                .get_service::<dyn temps_core::telemetry::TelemetryReporter>()
+                .unwrap_or_else(|| {
+                    std::sync::Arc::new(temps_core::telemetry::NoopTelemetryReporter)
+                });
+
             // Create BackupService.
-            let backup_service = Arc::new(BackupService::new(
-                db.clone(),
-                external_service_manager.clone(),
-                alarm_service.clone(),
-                config_service.clone(),
-                encryption_service.clone(),
-                Arc::clone(&job_queue),
-            ));
+            let backup_service = Arc::new(
+                BackupService::new(
+                    db.clone(),
+                    external_service_manager.clone(),
+                    alarm_service.clone(),
+                    config_service.clone(),
+                    encryption_service.clone(),
+                    Arc::clone(&job_queue),
+                )
+                .with_telemetry(Arc::clone(&telemetry)),
+            );
             context.register_service(backup_service.clone());
             // The Cloud plugin creates and releases the managed destination's
             // nightly schedule through this seam (ADR-044).
@@ -235,12 +244,6 @@ impl TempsPlugin for BackupPlugin {
                 backup_service.clone(),
             ))
                 as Arc<dyn temps_core::ManagedBackupScheduleProvisioner>);
-
-            let telemetry = context
-                .get_service::<dyn temps_core::telemetry::TelemetryReporter>()
-                .unwrap_or_else(|| {
-                    std::sync::Arc::new(temps_core::telemetry::NoopTelemetryReporter)
-                });
 
             // The workload plane, bound once `temps serve` starts it (the
             // deployments plugin registers the slot). Backups and restores
@@ -556,26 +559,7 @@ impl TempsPlugin for BackupPlugin {
 
             // Anonymous backup_succeeded / backup_failed telemetry, derived from
             // the executor's lifecycle events so every run is covered.
-            if telemetry.is_enabled() {
-                let reporter = Arc::clone(&telemetry);
-                let mut receiver = job_queue.subscribe();
-                tokio::spawn(async move {
-                    let mut backup_telemetry = crate::telemetry::BackupTelemetry::new();
-                    loop {
-                        match receiver.recv().await {
-                            Ok(job) => {
-                                if let Some(event) = backup_telemetry.on_job(&job) {
-                                    reporter.report(event);
-                                }
-                            }
-                            Err(temps_core::QueueError::ChannelClosed) => break,
-                            // Lagged: some events were missed. Telemetry is
-                            // best-effort, so keep consuming.
-                            Err(_) => continue,
-                        }
-                    }
-                });
-            }
+            crate::telemetry::spawn_backup_telemetry(job_queue.as_ref(), Arc::clone(&telemetry));
 
             // Thread the telemetry reporter into the pg upgrade service so
             // orchestrators it spawns can emit PgMajorUpgradeCompleted.

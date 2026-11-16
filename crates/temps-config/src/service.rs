@@ -61,8 +61,16 @@ pub enum TrustedPrivateNetworksIntent {
     Replace(Vec<String>),
 }
 
+/// Whether a settings write explicitly changes inbound proxy trust.
+pub enum TrustedProxyRangesIntent {
+    Unchanged,
+    Replace(Vec<String>),
+}
+
 /// Values from the locked row and the committed update, for accurate auditing.
 pub struct SettingsUpdateResult {
+    pub previous_trusted_proxy_cidrs: Vec<String>,
+    pub trusted_proxy_cidrs: Vec<String>,
     pub previous_trusted_private_networks: Vec<String>,
     pub trusted_private_networks: Vec<String>,
 }
@@ -969,6 +977,16 @@ pub struct ConfigService {
 /// (TLS verification and the outbound SSRF trust list), so they never await
 /// a DB lookup. Always called under the settings-cache generation guard.
 fn publish_process_wide_settings(settings: &AppSettings) {
+    let proxy_ranges = match temps_core::trusted_proxies::TrustedProxyRanges::parse(
+        &settings.trusted_proxy_cidrs,
+    ) {
+        Ok(ranges) => ranges,
+        Err(error) => {
+            warn!(%error, "Invalid stored trusted proxy ranges; forwarded headers from those peers are ignored");
+            temps_core::trusted_proxies::TrustedProxyRanges::default()
+        }
+    };
+    temps_core::trusted_proxies::set_trusted_proxy_ranges(proxy_ranges);
     temps_core::tls::set_insecure_tls(settings.insecure_tls);
     // Auth cookies take `Secure` from this trusted value rather than from
     // client-supplied headers (see `temps_core::secure_cookie_for_request`).
@@ -1757,10 +1775,38 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
     /// must never restore trust that an administrator has since revoked.
     pub async fn update_settings_with_intents(
         &self,
-        mut settings: AppSettings,
+        settings: AppSettings,
         geo_license_key_intent: GeoLicenseKeyIntent,
         trusted_private_networks_intent: TrustedPrivateNetworksIntent,
     ) -> Result<SettingsUpdateResult, ConfigServiceError> {
+        self.update_settings_with_proxy_intent(
+            settings,
+            geo_license_key_intent,
+            trusted_private_networks_intent,
+            TrustedProxyRangesIntent::Unchanged,
+        )
+        .await
+    }
+
+    /// Rebase omitted proxy trust on the locked settings row, so an unrelated
+    /// write cannot restore a range revoked by a concurrent administrator.
+    pub async fn update_settings_with_proxy_intent(
+        &self,
+        mut settings: AppSettings,
+        geo_license_key_intent: GeoLicenseKeyIntent,
+        trusted_private_networks_intent: TrustedPrivateNetworksIntent,
+        proxy_intent: TrustedProxyRangesIntent,
+    ) -> Result<SettingsUpdateResult, ConfigServiceError> {
+        let proxy_ranges = match proxy_intent {
+            TrustedProxyRangesIntent::Unchanged => None,
+            TrustedProxyRangesIntent::Replace(entries) => Some(
+                temps_core::trusted_proxies::TrustedProxyRanges::parse(&entries)
+                    .map_err(|error| ConfigServiceError::InvalidConfiguration {
+                        details: error.to_string(),
+                    })?
+                    .canonical_ranges(),
+            ),
+        };
         let now = Utc::now();
         let cache_generation = self.settings_cache.read().await.generation;
 
@@ -1821,7 +1867,11 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
             }
             TrustedPrivateNetworksIntent::Replace(networks) => networks,
         };
+        settings.trusted_proxy_cidrs =
+            proxy_ranges.unwrap_or_else(|| locked_settings.trusted_proxy_cidrs.clone());
         let result = SettingsUpdateResult {
+            previous_trusted_proxy_cidrs: locked_settings.trusted_proxy_cidrs.clone(),
+            trusted_proxy_cidrs: settings.trusted_proxy_cidrs.clone(),
             previous_trusted_private_networks: locked_settings.trusted_private_networks.clone(),
             trusted_private_networks: settings.trusted_private_networks.clone(),
         };
@@ -2083,6 +2133,7 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
             // Fail closed until the authoritative row has been reloaded. This
             // is important when the invalidated value had insecure TLS enabled
             // or trusted private networks the operator has since removed.
+            temps_core::trusted_proxies::set_trusted_proxy_ranges(Default::default());
             temps_core::tls::set_insecure_tls(false);
             temps_core::url_validation::set_trusted_private_networks(Vec::new());
         }
@@ -6383,6 +6434,75 @@ mod tests {
                 "revoked network restored: {sql}"
             );
             assert!(sql.contains("new-console"), "unrelated update lost: {sql}");
+        }
+    }
+
+    #[tokio::test]
+    async fn proxy_trust_rebases_omissions_and_audits_locked_values() {
+        for submitted in [None, Some(vec![]), Some(vec!["10.30.1.9/16".to_string()])] {
+            let mut locked = settings_row("example.test");
+            locked.data["trusted_proxy_cidrs"] = serde_json::json!(["10.20.0.0/16"]);
+            let db = Arc::new(
+                MockDatabase::new(DatabaseBackend::Sqlite)
+                    .append_query_results(vec![vec![locked]; 4])
+                    .append_exec_results([sea_orm::MockExecResult {
+                        last_insert_id: 1,
+                        rows_affected: 1,
+                    }])
+                    .into_connection(),
+            );
+            let service = ConfigService::new(test_config(), db);
+            let stale = AppSettings {
+                trusted_proxy_cidrs: vec!["192.168.0.0/16".into()],
+                ..AppSettings::default()
+            };
+            let intent = match submitted.clone() {
+                None => TrustedProxyRangesIntent::Unchanged,
+                Some(entries) => TrustedProxyRangesIntent::Replace(entries),
+            };
+            let saved = service
+                .update_settings_with_proxy_intent(
+                    stale,
+                    GeoLicenseKeyIntent::Unchanged,
+                    TrustedPrivateNetworksIntent::Unchanged,
+                    intent,
+                )
+                .await
+                .unwrap();
+            let expected = match submitted {
+                None => vec!["10.20.0.0/16".to_string()],
+                Some(entries) if entries.is_empty() => vec![],
+                Some(_) => vec!["10.30.0.0/16".to_string()],
+            };
+            assert_eq!(saved.previous_trusted_proxy_cidrs, ["10.20.0.0/16"]);
+            assert_eq!(saved.trusted_proxy_cidrs, expected);
+            assert_eq!(
+                service.get_settings().await.unwrap().trusted_proxy_cidrs,
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_proxy_trust_is_rejected_before_database_access() {
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Sqlite).into_connection());
+        let service = ConfigService::new(test_config(), db);
+        for cidr in ["invalid", "0.0.0.0/0"] {
+            let error = service
+                .update_settings_with_proxy_intent(
+                    AppSettings::default(),
+                    GeoLicenseKeyIntent::Unchanged,
+                    TrustedPrivateNetworksIntent::Unchanged,
+                    TrustedProxyRangesIntent::Replace(vec![cidr.into()]),
+                )
+                .await
+                .err()
+                .unwrap();
+            assert!(matches!(
+                error,
+                ConfigServiceError::InvalidConfiguration { .. }
+            ));
+            assert!(error.to_string().contains(cidr));
         }
     }
 

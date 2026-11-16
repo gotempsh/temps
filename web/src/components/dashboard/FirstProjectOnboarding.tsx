@@ -46,6 +46,8 @@ export function FirstProjectOnboarding() {
       aria-label="Get started with services"
       className="w-full min-w-0 space-y-6"
     >
+      {/* Start with a working app before asking for code or credentials. */}
+      <SampleDeployCard />
       <div className="flex flex-wrap items-center justify-between gap-3 border-b pb-4">
         <p className="text-sm text-muted-foreground">
           Already hosting your application elsewhere?
@@ -56,15 +58,6 @@ export function FirstProjectOnboarding() {
           </Link>
         </Button>
       </div>
-      <p className="text-sm text-muted-foreground">
-        Each app you deploy becomes a service. Services that ship together, like
-        a frontend, an API and a worker, can later be grouped into a project
-        that shares their repository, variables and routes.
-      </p>
-      {/* The do-this-first path: something live in one click, before any
-          credentials. The same card lives on /get-started, which the Platform
-          setup checklist links to once this empty state is gone. */}
-      <SampleDeployCard />
       <div className="grid min-w-0 gap-4 lg:grid-cols-2">
         <ConnectedRepository />
         <div className="min-w-0 self-start rounded-lg border p-5">

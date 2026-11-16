@@ -597,6 +597,7 @@ impl SelfUpdater for BinarySelfUpdater {
         let update_available = is_newer_version(&release.tag_name, &current_version);
         if update_available {
             self.update_status.set(AvailableUpdate {
+                security_update: release.is_security_update_for(&current_version),
                 current_version: current_version.clone(),
                 latest_version: release.tag_name.clone(),
                 channel: channel.as_str().to_string(),

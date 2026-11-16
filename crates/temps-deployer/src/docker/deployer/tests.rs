@@ -1264,3 +1264,19 @@ async fn image_inventory_failures_keep_the_docker_error_as_their_source() {
         "{removal:?}"
     );
 }
+
+#[test]
+fn start_failure_preserves_container_and_daemon_cause() {
+    for cause in ["permission denied", "request timed out"] {
+        let error = start_error(
+            "candidate-42",
+            bollard::errors::Error::DockerResponseServerError {
+                status_code: 500,
+                message: cause.to_string(),
+            },
+        );
+        let message = error.to_string();
+        assert!(message.contains("Failed to start container candidate-42"));
+        assert!(message.contains(cause));
+    }
+}

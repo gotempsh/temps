@@ -33,11 +33,17 @@ pub fn redact_known_secrets(text: &str, secrets: &[String]) -> String {
         return String::new();
     }
 
-    let mut values: Vec<&str> = secrets
-        .iter()
-        .map(String::as_str)
-        .filter(|s| s.len() >= MIN_KNOWN_SECRET_LEN)
-        .collect();
+    let mut values = Vec::new();
+    for secret in secrets {
+        if secret.len() >= MIN_KNOWN_SECRET_LEN {
+            values.push(secret.as_str());
+        }
+        // A bounded log tail can start inside a configured multiline secret.
+        // Its surviving lines must be removed even without the complete value.
+        if secret.contains(['\r', '\n']) {
+            values.extend(secret.lines().filter(|line| !line.is_empty()));
+        }
+    }
     values.sort_unstable();
     values.dedup();
     // Longest first: if one known secret happens to be a substring of
@@ -88,6 +94,14 @@ static SECRET_PATTERNS: LazyLock<Vec<SecretPattern>> = LazyLock::new(|| {
             )
             .expect("valid regex"),
         },
+        // Fail closed when a bounded tail starts inside an unconfigured key.
+        SecretPattern {
+            regex: Regex::new(r"(?s)\A.*-----END [A-Z ]*PRIVATE KEY-----").expect("valid regex"),
+        },
+        // An incomplete key printed before a build stops has no END marker.
+        SecretPattern {
+            regex: Regex::new(r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*\z").expect("valid regex"),
+        },
     ]
 });
 
@@ -101,9 +115,166 @@ pub fn redact_common_secret_patterns(text: &str) -> String {
     redacted
 }
 
+/// Remove identifying addresses and repository/path references from outbound reports.
+/// This deliberately favors privacy over retaining paths in diagnostic output.
+pub fn redact_report_identifiers(text: &str) -> String {
+    redact_report_identifiers_with_pattern(text, None)
+}
+
+/// Match every identifier against the same input, then merge overlapping spans.
+/// Sequential replacement can destroy a larger match and expose its suffix.
+pub(super) fn redact_report_identifiers_with_pattern(text: &str, extra: Option<&Regex>) -> String {
+    let mut ranges = Vec::new();
+    for pattern in IDENTIFIER_PATTERNS.iter().chain(extra) {
+        ranges.extend(
+            pattern
+                .find_iter(text)
+                .map(|matched| (matched.start(), matched.end())),
+        );
+    }
+    ranges.extend(IPV6_PATTERN.find_iter(text).filter_map(|matched| {
+        matched
+            .as_str()
+            .trim_matches(['[', ']'])
+            .parse::<std::net::Ipv6Addr>()
+            .ok()
+            .map(|_| (matched.start(), matched.end()))
+    }));
+    ranges.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in ranges {
+        if let Some(previous) = merged.last_mut() {
+            if start < previous.1 {
+                previous.1 = previous.1.max(end);
+                continue;
+            }
+        }
+        merged.push((start, end));
+    }
+    let mut safe = String::with_capacity(text.len());
+    let mut cursor = 0;
+    for (start, end) in merged {
+        safe.push_str(&text[cursor..start]);
+        safe.push_str("[redacted]");
+        cursor = end;
+    }
+    safe.push_str(&text[cursor..]);
+    safe
+}
+
+#[allow(
+    clippy::expect_used,
+    reason = "literal patterns exercised by adjacent tests"
+)]
+static IDENTIFIER_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+    [
+        // Whole URLs first, including scp-style Git remotes.
+        r#"(?i)(?:[a-z][a-z0-9+.-]*://|git@)[^\s<>"']+"#,
+        // Emails, bare domains (including internal hostnames), IPv4.
+        r#"[^\s@<>"']+@[^\s@<>"']+"#,
+        r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b",
+        r"(?i)\b(?:[\p{L}\p{N}_-]+\.)+[\p{L}][\p{L}\p{N}_-]*\b",
+        // Commit, trace and request identifiers can identify a repository or captured operation.
+        r"(?i)\b[0-9a-f]{16,64}\b",
+        r"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
+        // Bare owner/repository, absolute paths and nested checkout paths.
+        r"(?:[\p{L}\p{N}_.@~-]+)?(?:/[\p{L}\p{N}_.@~-]+)+",
+        r#"(?i)(?:[a-z]:\\|\\\\)[^\s<>"']+"#,
+    ]
+    .into_iter()
+    .map(|pattern| Regex::new(pattern).expect("valid identifier pattern"))
+    .collect()
+});
+
+// Validate candidates with the standard parser so timestamps are retained.
+#[allow(
+    clippy::expect_used,
+    reason = "literal IPv6 candidate pattern exercised by adjacent tests"
+)]
+static IPV6_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\[?(?:[a-f0-9]{0,4}:){2,}[a-f0-9:.]*\]?")
+        .expect("valid IPv6 candidate pattern")
+});
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncated_multiline_secrets_are_withheld() {
+        let secret = "head-value\nsecret-body\nx".to_string();
+        assert_eq!(
+            redact_known_secrets("secret-body\nx\nfailed", &[secret]),
+            "***\n***\nfailed"
+        );
+    }
+
+    #[test]
+    fn key_material_is_removed_when_the_tail_loses_its_begin_marker() {
+        let material = "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo=";
+        let text = format!(
+            "-----BEGIN PRIVATE KEY-----\n{}-----END PRIVATE KEY-----\n{}failure",
+            format!("{material}\n").repeat(26),
+            "progress\n".repeat(1990)
+        );
+        let tail = text
+            .lines()
+            .rev()
+            .take(2000)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!tail.contains("BEGIN PRIVATE KEY"));
+        assert!(tail.contains(material));
+        let safe = redact_common_secret_patterns(&tail);
+        assert!(!safe.contains(material), "{safe}");
+        assert!(safe.ends_with("failure"));
+        assert!(!redact_common_secret_patterns(&format!(
+            "-----BEGIN PRIVATE KEY-----\n{material}"
+        ))
+        .contains(material));
+    }
+
+    #[test]
+    fn redacts_commit_trace_and_request_identifiers() {
+        let safe = redact_report_identifiers("commit 1111111111111111111111111111111111111111 request 11111111-2222-4333-8444-555555555555");
+        assert_eq!(safe, "commit [redacted] request [redacted]");
+    }
+
+    #[test]
+    fn redacts_unicode_addresses_and_windows_checkout_paths() {
+        let text = r"contact opérateur@exemple.invalid hôte.exemple.invalid C:\work\sample-org\sample-repo";
+        let safe = redact_report_identifiers(text);
+        for identifying in ["opérateur", "exemple", "sample-org", "sample-repo"] {
+            assert!(!safe.contains(identifying), "{safe}");
+        }
+    }
+
+    #[test]
+    fn preserves_versions_and_failure_diagnostics() {
+        let text = "Temps version 0.1.0-beta.62: 12:34:56 build failed with exit code 127";
+        assert_eq!(redact_report_identifiers(text), text);
+    }
+
+    #[test]
+    fn outbound_reports_remove_addresses_and_repository_paths() {
+        let text = "clone https://github.com/sample-org/sample-repo.git git@forge.example:sample-org/sample-repo.git sample-org/sample-repo /workspace/sample-repo contact dev@example.invalid 192.0.2.10 [2001:db8::1] ::1 api.internal";
+        let safe = redact_report_identifiers(text);
+        for identifying in [
+            "sample-org",
+            "sample-repo",
+            "dev@",
+            "192.0.2",
+            "2001",
+            "::1",
+            "api.internal",
+        ] {
+            assert!(!safe.contains(identifying), "{safe}");
+        }
+        assert!(safe.contains("clone"));
+    }
 
     #[test]
     fn redacts_known_secret_values() {

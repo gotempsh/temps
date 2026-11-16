@@ -756,6 +756,26 @@ impl DeployImageJob {
         Ok(())
     }
 
+    fn replica_inspection_timeout(
+        &self,
+        replica: &CreatedReplica<'_>,
+        clock: &StartupClock,
+        operation: &str,
+        last_error: Option<&temps_deployer::DeployerError>,
+    ) -> WorkflowError {
+        let (node_name, node_id) = replica_node_identity(replica.assignment);
+        let cause = last_error.map_or_else(
+            || "The inspection did not complete before the startup deadline".to_string(),
+            |error| format!("Last inspection failed: {error}"),
+        );
+        WorkflowError::JobExecutionFailed(format!(
+            "Deployment {} job '{}': container {} could not be inspected within the startup timeout \
+             while {operation} on node '{node_name}' (id={node_id}; limit {}s, waited {}s). {cause}",
+            replica.context.deployment_id, self.job_id, replica.result.container_id,
+            clock.limit_secs(), clock.elapsed_secs(),
+        ))
+    }
+
     /// Wait-for-running phase: poll until Docker reports the container running,
     /// failing on an exit, a crash loop, or the startup budget running out.
     async fn wait_for_replica_running(
@@ -775,10 +795,12 @@ impl DeployImageJob {
             )
             .await
             .map_err(|_| {
-                WorkflowError::JobExecutionFailed(format!(
-                    "Container {} inspection exceeded startup timeout",
-                    container_id
-                ))
+                self.replica_inspection_timeout(
+                    replica,
+                    clock,
+                    "waiting for the container to run",
+                    None,
+                )
             })? {
                 Ok(info) => info,
                 Err(e) => {
@@ -800,10 +822,12 @@ impl DeployImageJob {
 
                     // Wait a bit and try again, but don't fail if we can't verify
                     if clock.expired() {
-                        return Err(WorkflowError::JobExecutionFailed(format!(
-                            "Container {} could not be inspected within the startup timeout",
-                            container_id
-                        )));
+                        return Err(self.replica_inspection_timeout(
+                            replica,
+                            clock,
+                            "waiting for the container to run",
+                            Some(&e),
+                        ));
                     }
                     clock.pause(Duration::from_secs(5)).await;
                     continue;
@@ -1122,10 +1146,7 @@ impl DeployImageJob {
         )
         .await
         .map_err(|_| {
-            WorkflowError::JobExecutionFailed(format!(
-                "Container {} inspection exceeded startup timeout",
-                container_id
-            ))
+            self.replica_inspection_timeout(replica, clock, "inspecting before an HTTP probe", None)
         })?
         .map_err(|error| {
             WorkflowError::JobExecutionFailed(format!(
@@ -1915,6 +1936,17 @@ mod tests {
             message.contains("could not be inspected within the startup timeout"),
             "{message}"
         );
+        for detail in [
+            format!("Deployment {}", context.deployment_id),
+            job.job_id.clone(),
+            "waiting for the container to run".to_string(),
+            "control-plane".to_string(),
+            "limit ".to_string(),
+            "waited ".to_string(),
+            "no such container".to_string(),
+        ] {
+            assert!(message.contains(&detail), "missing {detail}: {message}");
+        }
         assert_tracked_and_removable(&job, &context, &deployer).await;
     }
 

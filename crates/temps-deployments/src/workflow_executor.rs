@@ -653,7 +653,7 @@ impl WorkflowExecutor {
                 // Create job execution record if tracker is available
                 if let Some(ref tracker) = self.job_tracker {
                     let execution_id = tracker
-                        .create_job_execution(&context.workflow_run_id, &job_id, JobStatus::Running)
+                        .create_job_execution(&context.workflow_run_id, &job_id, JobStatus::Pending)
                         .await?;
                     job_state.execution_id = Some(execution_id);
                 }
@@ -664,10 +664,11 @@ impl WorkflowExecutor {
                 let semaphore_clone = semaphore.clone();
                 let job_id_clone = job_id.clone();
                 let tracker_clone = self.job_tracker.clone();
+                let execution_id = job_state.execution_id;
 
-                // Spawn async task for job execution
+                // Prepare execution now; spawn only after the whole batch passes preflight.
                 let cancellation_provider_clone = cancellation_provider.clone();
-                let task = tokio::spawn(async move {
+                let task = async move {
                     // Acquire semaphore permit. The semaphore is owned by this
                     // workflow run and never closed, so `Err` is unreachable in
                     // practice; if it ever happens, run the job anyway rather
@@ -686,9 +687,14 @@ impl WorkflowExecutor {
                     info!("🏃 Starting job: {} ({})", job.name(), job_id_clone);
 
                     // Mark job as started if tracker is available
-                    if let Some(ref _tracker) = tracker_clone {
-                        // Note: We'd need the execution_id here, but it's complex to pass
-                        // In practice, this would be handled differently
+                    if let (Some(tracker), Some(execution_id)) = (&tracker_clone, execution_id) {
+                        if let Err(error) = tracker
+                            .update_job_status(execution_id, JobStatus::Running, None)
+                            .await
+                        {
+                            error!(workflow_run_id = %context_clone.workflow_run_id, job_id = %job_id_clone, execution_id, %error,
+                                "Failed to mark workflow job running");
+                        }
                     }
 
                     // Create a separate context clone for error handling
@@ -709,12 +715,19 @@ impl WorkflowExecutor {
                                 job_id_clone, job_result.status
                             );
 
-                            // Add logs to tracker if available
-                            if let Some(ref _tracker) = tracker_clone {
-                                // Note: Same issue with execution_id
+                            if let (Some(tracker), Some(execution_id)) =
+                                (&tracker_clone, execution_id)
+                            {
                                 if !job_result.logs.is_empty() {
-                                    let _ = _tracker.add_job_logs(0, job_result.logs.clone()).await;
-                                    // Would use real execution_id
+                                    if let Err(error) = tracker
+                                        .add_job_logs(execution_id, job_result.logs.clone())
+                                        .await
+                                    {
+                                        error!(workflow_run_id = %job_result.context.workflow_run_id,
+                                            deployment_id = job_result.context.deployment_id,
+                                            job_id = %job_id_clone, execution_id, %error,
+                                            "Failed to persist workflow job logs");
+                                    }
                                 }
                             }
 
@@ -780,32 +793,36 @@ impl WorkflowExecutor {
                             )
                         }
                     }
+                };
+
+                let join_context = context.clone();
+                let join_job = job_state.job_config.job.clone();
+                tasks.push(async move {
+                    match tokio::spawn(task).await {
+                        Ok(result) => result,
+                        Err(error) => {
+                            let message = format!(
+                                "Internal error executing job '{job_id}' in workflow '{}' for deployment {}: {error}",
+                                join_context.workflow_run_id, join_context.deployment_id,
+                            );
+                            error!(workflow_run_id = %join_context.workflow_run_id,
+                                deployment_id = join_context.deployment_id, job_id = %job_id, %error,
+                                "Workflow job task failed to join");
+                            if let Err(cleanup_error) = join_job.cleanup(&join_context).await {
+                                error!(workflow_run_id = %join_context.workflow_run_id,
+                                    deployment_id = join_context.deployment_id, job_id = %job_id, %cleanup_error,
+                                    "Failed to clean up workflow job after task failure");
+                            }
+                            (job_id, JobResult::failure(join_context, message))
+                        }
+                    }
                 });
-
-                tasks.push(task);
             }
         }
 
-        // Wait for all tasks to complete
-        let results = join_all(tasks).await;
-        let mut job_results = Vec::new();
-
-        for result in results {
-            match result {
-                Ok((job_id, job_result)) => {
-                    job_results.push((job_id, job_result));
-                }
-                Err(e) => {
-                    error!("Task join error: {}", e);
-                    return Err(WorkflowError::Other(format!(
-                        "Task execution failed: {}",
-                        e
-                    )));
-                }
-            }
-        }
-
-        Ok(job_results)
+        // Task failures become ordinary failed job results, so the tracker,
+        // required-job policy and downstream cancellation use the same path.
+        Ok(join_all(tasks).await)
     }
 }
 
@@ -1126,6 +1143,7 @@ mod tests {
         statuses: std::sync::Mutex<Vec<(String, JobStatus, Option<String>)>>,
         ids: std::sync::Mutex<HashMap<i32, String>>,
         cancellations: std::sync::Mutex<Vec<String>>,
+        logs: std::sync::Mutex<Vec<(i32, Vec<String>)>>,
     }
 
     impl RecordingJobTracker {
@@ -1195,7 +1213,12 @@ mod tests {
             Ok(())
         }
 
-        async fn add_job_logs(&self, _id: i32, _logs: Vec<String>) -> Result<(), WorkflowError> {
+        async fn add_job_logs(&self, id: i32, logs: Vec<String>) -> Result<(), WorkflowError> {
+            assert!(
+                self.ids.lock().unwrap().contains_key(&id),
+                "logs must name an allocated execution ID"
+            );
+            self.logs.lock().unwrap().push((id, logs));
             Ok(())
         }
 
@@ -1255,6 +1278,162 @@ mod tests {
             .await;
 
         (tracker, result)
+    }
+
+    #[derive(Debug)]
+    struct LoggedJob {
+        panic: bool,
+        cleanups: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl WorkflowTask for LoggedJob {
+        fn job_id(&self) -> &str {
+            "deploy_container"
+        }
+        fn name(&self) -> &str {
+            "Deploy test container"
+        }
+        fn description(&self) -> &str {
+            "Exercise executor diagnostics"
+        }
+        async fn execute(&self, context: WorkflowContext) -> Result<JobResult, WorkflowError> {
+            assert!(!self.panic, "scripted task panic");
+            let mut result = JobResult::success(context);
+            result.logs.push("container started".to_string());
+            Ok(result)
+        }
+        async fn cleanup(&self, _: &WorkflowContext) -> Result<(), WorkflowError> {
+            self.cleanups.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn returned_job_logs_use_the_allocated_execution_id() {
+        let (tracker, result) = run_with_tracker(
+            Arc::new(LoggedJob {
+                panic: false,
+                cleanups: Arc::new(AtomicUsize::new(0)),
+            }),
+            true,
+            false,
+        )
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(
+            *tracker.logs.lock().unwrap(),
+            vec![(1, vec!["container started".to_string()])]
+        );
+    }
+
+    #[tokio::test]
+    async fn task_panics_identify_job_workflow_and_deployment() {
+        let job = Arc::new(LoggedJob {
+            panic: true,
+            cleanups: Arc::new(AtomicUsize::new(0)),
+        });
+        let (tracker, result) = run_with_tracker(job.clone(), true, false).await;
+        assert_eq!(job.cleanups.load(Ordering::SeqCst), 1);
+        let message = result.unwrap_err().to_string();
+        assert_eq!(
+            tracker.final_status("deploy_container").unwrap().0,
+            JobStatus::Failure
+        );
+        for context in [
+            "deploy_container",
+            "test-workflow",
+            "deployment 1",
+            "scripted task panic",
+        ] {
+            assert!(message.contains(context), "missing {context}: {message}");
+        }
+    }
+
+    #[derive(Debug)]
+    struct FailedBatchPreflight;
+
+    #[async_trait::async_trait]
+    impl WorkflowTask for FailedBatchPreflight {
+        fn job_id(&self) -> &str {
+            "validate_candidate"
+        }
+        fn name(&self) -> &str {
+            "Validate candidate"
+        }
+        fn description(&self) -> &str {
+            "Fail after giving a spawned sibling a chance to run"
+        }
+        async fn execute(&self, context: WorkflowContext) -> Result<JobResult, WorkflowError> {
+            Ok(JobResult::success(context))
+        }
+        async fn validate_prerequisites(&self, _: &WorkflowContext) -> Result<(), WorkflowError> {
+            tokio::task::yield_now().await;
+            Err(WorkflowError::JobValidationFailed(
+                "candidate configuration refused".to_string(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_preflight_failure_never_starts_a_sibling() {
+        let executed = Arc::new(AtomicUsize::new(0));
+        let first: Arc<dyn WorkflowTask> = Arc::new(NonRunningJob {
+            id: "prepare_candidate".to_string(),
+            skip: false,
+            prerequisite_error: None,
+            executed: executed.clone(),
+        });
+        let config = WorkflowBuilder::new()
+            .with_workflow_run_id("batch-preflight".to_string())
+            .with_deployment_context(42, 1, 1)
+            .with_log_writer(Arc::new(MockLogWriter))
+            .with_job_config(first, vec![], true)
+            .with_job_config(Arc::new(FailedBatchPreflight), vec![], true)
+            .build()
+            .unwrap();
+        let executor = WorkflowExecutor::new(None);
+        let mut states = executor.build_job_dependency_graph(&config.jobs).unwrap();
+        let mut context =
+            WorkflowContext::new(config.workflow_run_id, 42, 1, 1, Arc::new(MockLogWriter));
+        let result = executor
+            .execute_job_batch(
+                vec![
+                    "prepare_candidate".to_string(),
+                    "validate_candidate".to_string(),
+                ],
+                &mut states,
+                &mut context,
+                &Arc::new(Semaphore::new(2)),
+                Arc::new(TestCancellationProvider { cancelled: false }),
+                false,
+            )
+            .await;
+        assert!(result.is_err());
+        tokio::task::yield_now().await;
+        assert_eq!(
+            executed.load(Ordering::SeqCst),
+            0,
+            "a refused batch must not leave detached jobs running"
+        );
+    }
+
+    #[tokio::test]
+    async fn optional_task_panic_is_recorded_without_failing_the_workflow() {
+        let (tracker, result) = run_with_tracker(
+            Arc::new(LoggedJob {
+                panic: true,
+                cleanups: Arc::new(AtomicUsize::new(0)),
+            }),
+            false,
+            false,
+        )
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(
+            tracker.final_status("deploy_container").unwrap().0,
+            JobStatus::Failure
+        );
     }
 
     /// Regression test for #477: an optional job whose prerequisites fail (e.g.

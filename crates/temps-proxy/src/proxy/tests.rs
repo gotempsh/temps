@@ -3436,6 +3436,31 @@ mod client_fingerprint_tests {
         (fingerprint.ja4.map(|j| j.to_string()), fingerprint.source)
     }
 
+    #[test]
+    fn configured_proxy_suppresses_its_direct_tls_fingerprint() {
+        use temps_core::trusted_proxies::TrustedProxyRanges;
+        let ranges = TrustedProxyRanges::parse(&["10.123.45.6/32".into()]).unwrap();
+        for (peer, expected) in [
+            ("10.123.45.6", (None, Ja4Source::Local)),
+            ("10.123.45.7", (Some(CURL_JA4.into()), Ja4Source::Direct)),
+        ] {
+            // Header contents do not affect whether this socket peer's own
+            // TLS fingerprint must be suppressed.
+            let result = super::resolve_client_fingerprint_with_proxy_trust(
+                Some(ip(peer)),
+                &headers(&[("x-forwarded-for", "malformed")]),
+                false,
+                None,
+                Some(ja4(CURL_JA4)),
+                |address| ranges.trusts_peer(address),
+            );
+            assert_eq!(
+                (result.ja4.map(|value| value.to_string()), result.source),
+                expected
+            );
+        }
+    }
+
     /// Behind Cloudflare the TLS client is Cloudflare, so its `cf-ja4` is
     /// the visitor's and the computed one is not; a malformed header gives
     /// no JA4 rather than Cloudflare's own.
