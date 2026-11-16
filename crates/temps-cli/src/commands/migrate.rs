@@ -49,7 +49,7 @@ use colored::Colorize;
 use std::future::Future;
 use std::io::{IsTerminal, Write};
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Args)]
 pub struct MigrateCommand {
@@ -169,12 +169,28 @@ async fn interrupted_maintenance_error(
     }
 }
 
+/// How post-migration maintenance ended, when it was not interrupted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MaintenanceOutcome {
+    Complete,
+    /// An index build failed and was left to `temps serve`, which retries it
+    /// in the background from startup.
+    IndexesDeferred,
+}
+
+/// `maintenance_indexes_deferred` NDJSON line for `--progress-format=json`.
+#[derive(serde::Serialize)]
+struct IndexesDeferredLine {
+    event: &'static str,
+    error: String,
+}
+
 async fn run_post_migration_maintenance(
     db: &Arc<temps_database::DbConnection>,
     database_url: &str,
     backend_pid: i32,
     use_json: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<MaintenanceOutcome> {
     // Announce the phase BEFORE any work starts. Concurrent index builds and
     // continuous-aggregate refreshes routinely take minutes on a large install;
     // without a header and per-step lines the operator stares at a terminal that
@@ -218,13 +234,48 @@ async fn run_post_migration_maintenance(
     };
     let current_pid = || phase_pid.load(std::sync::atomic::Ordering::SeqCst);
 
+    let mut outcome = MaintenanceOutcome::Complete;
     match race_maintenance(
         temps_schema::run_post_migration_indexes_streaming(db, &report_progress),
         tokio::signal::ctrl_c(),
     )
     .await
     {
-        MaintenanceRace::Completed(result) => result?,
+        MaintenanceRace::Completed(Ok(())) => {}
+        // Every migration is committed by now, so this is deferred work, not a
+        // failed upgrade: `temps serve` builds these indexes in the background
+        // from startup and retries until they exist. A concurrent build has to
+        // wait for every transaction older than it, and on a live install a
+        // long query, export or backup can outlast the build's lock timeout.
+        // Failing here made an online update stop on a fully migrated schema
+        // and keep the previous release running against it.
+        MaintenanceRace::Completed(Err(error)) => {
+            outcome = MaintenanceOutcome::IndexesDeferred;
+            warn!(
+                "Post-migration index build did not finish; every migration is applied and \
+                 the server builds the remaining indexes at startup: {error}"
+            );
+            if use_json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&IndexesDeferredLine {
+                        event: "maintenance_indexes_deferred",
+                        error: error.to_string(),
+                    })?
+                );
+                let _ = std::io::stdout().flush();
+            } else {
+                println!(
+                    "  {} {}",
+                    "!".yellow(),
+                    format!(
+                        "Index build deferred: {error} (every migration is applied; the server \
+                         builds the remaining indexes at startup, or re-run `temps migrate`)"
+                    )
+                    .yellow()
+                );
+            }
+        }
         MaintenanceRace::Interrupted => {
             return Err(interrupted_maintenance_error(
                 database_url,
@@ -309,7 +360,7 @@ async fn run_post_migration_maintenance(
         }
     }
 
-    Ok(())
+    Ok(outcome)
 }
 
 impl MigrateCommand {
@@ -433,9 +484,10 @@ impl MigrateCommand {
                     }
                     // Non-transactional maintenance must remain retryable even
                     // after every schema migration is already recorded.
-                    run_post_migration_maintenance(&db, &database_url, backend_pid, use_json)
-                        .await?;
-                    if !use_json {
+                    let outcome =
+                        run_post_migration_maintenance(&db, &database_url, backend_pid, use_json)
+                            .await?;
+                    if !use_json && outcome == MaintenanceOutcome::Complete {
                         println!("{}", "✓ Post-migration maintenance complete.".green());
                     }
                 }
@@ -1158,6 +1210,73 @@ fn format_elapsed(d: std::time::Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::{race_maintenance, MaintenanceRace};
+
+    /// An online update runs `temps migrate` while the previous release keeps
+    /// serving. A concurrent index build waits for every older transaction,
+    /// so one long reader (an export, a backup, a slow report) used to turn a
+    /// fully applied schema into a failed migrate, and the update then kept
+    /// the old binary running on the new schema. The build is left to the
+    /// server instead, which finishes it once that reader is gone.
+    #[tokio::test]
+    async fn an_index_build_blocked_by_a_long_reader_is_deferred_not_failed() {
+        use sea_orm::{ConnectionTrait, DatabaseBackend, Statement, TransactionTrait};
+        if !temps_test_utils::external_database_configured()
+            && !temps_test_utils::docker_available().await
+        {
+            eprintln!("Skipping deferred index build: database unavailable");
+            return;
+        }
+        let mut test = temps_test_utils::TestDatabase::with_migrations()
+            .await
+            .unwrap();
+        let db = test.connection_arc();
+        // A cancelled concurrent build leaves an invalid index behind, so ask
+        // for a usable one rather than any relation of that name.
+        let index_exists = || async {
+            db.query_one(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT COALESCE((SELECT indisvalid FROM pg_index WHERE indexrelid = \
+                 to_regclass('idx_audit_logs_permission_denied_retention')), false) AS present",
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<bool>("", "present")
+            .unwrap()
+        };
+        db.execute_unprepared(
+            "DROP INDEX CONCURRENTLY IF EXISTS idx_audit_logs_permission_denied_retention",
+        )
+        .await
+        .unwrap();
+
+        // A reader on its own connection whose snapshot predates the build.
+        let reader_db = sea_orm::Database::connect(test.database_url.as_str())
+            .await
+            .unwrap();
+        let reader = reader_db
+            .begin_with_config(Some(sea_orm::IsolationLevel::RepeatableRead), None)
+            .await
+            .unwrap();
+        reader.execute_unprepared("SELECT 1").await.unwrap();
+
+        let outcome = super::run_post_migration_maintenance(&db, &test.database_url, 0, true)
+            .await
+            .expect("an index build that has to wait must not fail the migrate");
+        assert_eq!(outcome, super::MaintenanceOutcome::IndexesDeferred);
+        assert!(!index_exists().await, "the reader was still open");
+
+        // Once the reader is gone a retry builds it: the server's background
+        // one, or `temps migrate` run again.
+        reader.commit().await.unwrap();
+        reader_db.close().await.unwrap();
+        let outcome = super::run_post_migration_maintenance(&db, &test.database_url, 0, true)
+            .await
+            .unwrap();
+        assert_eq!(outcome, super::MaintenanceOutcome::Complete);
+        assert!(index_exists().await);
+        test.cleanup().await;
+    }
 
     #[tokio::test]
     async fn migrate_command_resumes_links_with_no_pending_schema_and_dry_run_does_not_write() {
