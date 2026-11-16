@@ -273,3 +273,58 @@ for (const environmentId of [null, 9]) {
     }
   })
 }
+
+test('the result shows the scope that was created, not a selection changed while the request was in flight', async () => {
+  let respond: (() => void) | undefined
+  const api = mockApi({
+    'GET /projects': () =>
+      jsonResponse({
+        projects: [{ id: 7, name: 'App', slug: 'app' }],
+        total: 1,
+      }),
+    'GET /projects/7/environments': () =>
+      jsonResponse([{ id: 9, name: 'Preview' }]),
+    'GET /api-keys/permissions': () => jsonResponse(CEILING_CATALOGUE),
+    'POST /api-keys': async (request) => {
+      const submitted = await request.json()
+      // The server echoes what it stored, like the real endpoint.
+      await new Promise<void>((resolve) => (respond = resolve))
+      return jsonResponse({
+        ...submitted,
+        id: 42,
+        api_key: 'tkp_once',
+        key_prefix: 'tkp_',
+        created_at: '2026-01-01T00:00:00Z',
+      })
+    },
+  })
+  try {
+    const view = renderPage('admin', '/settings/keys/new?name=ci-key&role=user')
+    await view.findByRole('combobox', { name: 'API key project scope' })
+    fireEvent.click(view.getByRole('button', { name: 'Next: Permissions' }))
+    await view.findByText('Standard access')
+    fireEvent.click(view.getByRole('button', { name: 'Next: Review' }))
+    fireEvent.click(view.getByRole('button', { name: 'Create API key' }))
+    await waitFor(() => expect(respond).toBeDefined())
+
+    // While the account-wide key is being created, go back and pick a project.
+    // The step's own Back button, not the header arrow that leaves the page.
+    const stepBack = () =>
+      view
+        .getAllByRole('button', { name: 'Back' })
+        .find((button) => !button.hasAttribute('aria-label'))!
+    fireEvent.click(stepBack())
+    fireEvent.click(stepBack())
+    fireEvent.click(
+      await view.findByRole('combobox', { name: 'API key project scope' })
+    )
+    fireEvent.click(await view.findByText('App'))
+
+    respond!()
+    await view.findByLabelText('Your API key')
+    expect(view.getByText('Account-wide')).toBeTruthy()
+    expect(view.queryByText(/Project #7/)).toBeNull()
+  } finally {
+    api.restore()
+  }
+})

@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { type CreateApiKeyRequest } from '@/api/client'
+import {
+  type CreateApiKeyRequest,
+  type CreateApiKeyResponse,
+} from '@/api/client'
 import { createApiKeyMutation } from '@/api/client/@tanstack/react-query.gen'
 import { useApiKeyPermissions } from '@/components/api-keys/useApiKeyPermissions'
 import { PageHeader } from '@/components/layout/PageContainer'
@@ -86,9 +89,14 @@ export default function ApiKeyCreate() {
     new Set()
   )
   const [useCustomPermissions, setUseCustomPermissions] = useState(false)
-  const [newKeySecret, setNewKeySecret] = useState<string | null>(null)
+  // The created key as the server stored it. The success summary reads from
+  // this, never from the form: the form stays editable while the request is in
+  // flight, so it may no longer describe the key that was created.
+  const [createdKey, setCreatedKey] = useState<CreateApiKeyResponse | null>(
+    null
+  )
+  const newKeySecret = createdKey?.api_key ?? null
   const [openCategories, setOpenCategories] = useState<Set<string>>(new Set())
-  const [createdKeyId, setCreatedKeyId] = useState<number | null>(null)
   const isSubmittingRef = useRef(false)
   const resultHeadingRef = useRef<HTMLDivElement | null>(null)
 
@@ -122,8 +130,7 @@ export default function ApiKeyCreate() {
       errorTitle: 'Failed to create API key',
     },
     onSuccess: (response) => {
-      setNewKeySecret(response.api_key)
-      setCreatedKeyId(response.id)
+      setCreatedKey(response)
       setStep(4) // Show success step
       toast.success('API key created successfully')
     },
@@ -315,33 +322,34 @@ export default function ApiKeyCreate() {
 
             <div className="space-y-4 p-4 bg-muted rounded-lg">
               <div className="text-sm">
-                <strong>Name:</strong> {keyName.trim()}
+                <strong>Name:</strong> {createdKey?.name}
               </div>
               <div className="text-sm">
                 <strong>Scope:</strong>{' '}
-                {projectId === null
-                  ? 'Account-wide'
-                  : `Project #${projectId} · ${environmentId === null ? 'All environments' : `Environment #${environmentId}`}`}
+                {apiKeyScopeLabel(
+                  createdKey?.project_id ?? null,
+                  createdKey?.environment_id ?? null
+                )}
               </div>
               <div className="text-sm">
                 <strong>Access level:</strong>{' '}
-                {useCustomPermissions
-                  ? `Custom (${selectedPermissions.size} permissions)`
-                  : selectedRole}
+                {createdKey?.role_type === 'custom'
+                  ? `Custom (${createdKey.permissions?.length ?? 0} permissions)`
+                  : createdKey?.role_type}
               </div>
-              {expiresAt && (
+              {createdKey?.expires_at && (
                 <div className="text-sm">
                   <strong>Expires:</strong>{' '}
-                  {new Date(expiresAt).toLocaleDateString()}
+                  {new Date(createdKey.expires_at).toLocaleDateString()}
                 </div>
               )}
             </div>
 
             <div className="flex justify-end gap-3">
-              {createdKeyId && (
+              {createdKey && (
                 <Button
                   variant="outline"
-                  onClick={() => navigate(`/settings/keys/${createdKeyId}`)}
+                  onClick={() => navigate(`/settings/keys/${createdKey.id}`)}
                 >
                   <Edit className="mr-2 h-4 w-4" />
                   Edit permissions
@@ -800,11 +808,7 @@ export default function ApiKeyCreate() {
 
               <div>
                 <Label className="text-muted-foreground">Scope</Label>
-                <p>
-                  {projectId === null
-                    ? 'Account-wide'
-                    : `Project #${projectId} · ${environmentId === null ? 'All environments' : `Environment #${environmentId}`}`}
-                </p>
+                <p>{apiKeyScopeLabel(projectId, environmentId)}</p>
               </div>
               <div className="space-y-2">
                 <Label className="text-muted-foreground">Access level</Label>
@@ -880,4 +884,16 @@ export default function ApiKeyCreate() {
       )}
     </div>
   )
+}
+
+function apiKeyScopeLabel(
+  projectId: number | null,
+  environmentId: number | null
+): string {
+  if (projectId === null) return 'Account-wide'
+  const environment =
+    environmentId === null
+      ? 'All environments'
+      : `Environment #${environmentId}`
+  return `Project #${projectId} · ${environment}`
 }
