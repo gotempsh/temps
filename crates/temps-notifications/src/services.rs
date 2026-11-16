@@ -1960,27 +1960,14 @@ impl NotificationProvider for SlackProvider {
     }
 }
 
-#[async_trait]
-impl NotificationProvider for WebhookProvider {
-    async fn initialize(&mut self, _db: Arc<DatabaseConnection>) -> Result<()> {
-        // Validate webhook URL with full SSRF protection (blocks private IPs,
-        // loopback, cloud metadata, link-local, etc.)
-        validate_webhook_url(&self.url).await?;
-
-        // Validate HTTP method
-        let method = self.method.to_uppercase();
-        if !["POST", "PUT", "PATCH"].contains(&method.as_str()) {
-            return Err(NotificationError::InvalidWebhookMethod {
-                method: self.method.clone(),
-            });
-        }
-
-        Ok(())
-    }
-
-    async fn send(&self, notification: &Notification) -> Result<()> {
-        let client = webhook_http_client(&self.url, self.timeout_secs).await?;
-
+impl WebhookProvider {
+    /// Production supplies an SSRF-checked client; tests can inspect delivery
+    /// against a local mock server without weakening the production checks.
+    async fn send_with_client(
+        &self,
+        client: &reqwest::Client,
+        notification: &Notification,
+    ) -> Result<()> {
         // Build the payload with all notification data. `_`-prefixed keys are
         // channel-specific payloads (e.g. the email's `_chart_svg`). Drop them
         // and the already-selected text alternative
@@ -2033,6 +2020,31 @@ impl NotificationProvider for WebhookProvider {
         }
 
         Ok(())
+    }
+}
+
+#[async_trait]
+impl NotificationProvider for WebhookProvider {
+    async fn initialize(&mut self, _db: Arc<DatabaseConnection>) -> Result<()> {
+        // Validate webhook URL with full SSRF protection (blocks private IPs,
+        // loopback, cloud metadata, link-local, etc.)
+        validate_webhook_url(&self.url).await?;
+
+        // Validate HTTP method
+        let method = self.method.to_uppercase();
+        if !["POST", "PUT", "PATCH"].contains(&method.as_str()) {
+            return Err(NotificationError::InvalidWebhookMethod {
+                method: self.method.clone(),
+            });
+        }
+
+        Ok(())
+    }
+
+    async fn send(&self, notification: &Notification) -> Result<()> {
+        let client = webhook_http_client(&self.url, self.timeout_secs).await?;
+
+        self.send_with_client(&client, notification).await
     }
 
     async fn health_check(&self) -> Result<bool> {
@@ -2424,10 +2436,18 @@ impl NotificationService {
         // Modify the notification message if there were batched occurrences
         let mut notification = notification.clone();
         if occurrence_count_val > 1 {
-            notification.message = format!(
-                "{}\n\nThis issue has occurred {} times since the last notification.",
-                notification.message, occurrence_count_val
+            let occurrence_suffix = format!(
+                "\n\nThis issue has occurred {} times since the last notification.",
+                occurrence_count_val
             );
+            notification.message.push_str(&occurrence_suffix);
+            if let Some(text_body) = notification
+                .metadata
+                .get_mut("text_body")
+                .filter(|body| !body.trim().is_empty())
+            {
+                text_body.push_str(&occurrence_suffix);
+            }
         }
 
         // Resolve routes and deliver once to each matching provider.
@@ -3895,6 +3915,96 @@ mod tests {
             .expect("service released the mock database")
             .into_transaction_log();
         assert_eq!(log.len(), 1, "no update for an episode already closed");
+    }
+
+    #[tokio::test]
+    async fn repeated_notification_keeps_occurrences_in_text_alternative() {
+        for alternative in [Some("Readable body"), None, Some("  \n")] {
+            let mut previous = episode_row("{}");
+            previous.occurrence_count = 3;
+            previous.next_allowed_at = Utc::now() - Duration::seconds(1);
+            let db = Arc::new(
+                MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                    .append_query_results([vec![previous]])
+                    .append_query_results([vec![episode_row("{}")]])
+                    .append_query_results([Vec::<notification_routes::Model>::new()])
+                    .append_query_results([vec![episode_row("{}")]])
+                    .into_connection(),
+            );
+            let cloud = Arc::new(MockManagedNotificationSender::new(true, true));
+            let encryption = Arc::new(temps_core::EncryptionService::new_from_password(
+                "repeated-notification-test",
+            ));
+            let service = service_with_managed_sender(db, encryption, cloud.clone());
+            let mut notification = Notification::new("Repeated alert", "Original body");
+            if let Some(body) = alternative {
+                notification
+                    .metadata
+                    .insert("text_body".into(), body.into());
+            }
+            service.send_notification(notification).await.unwrap();
+            let requests = cloud.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            let expected = if alternative == Some("Readable body") {
+                "Readable body"
+            } else {
+                "Original body"
+            };
+            assert_eq!(
+                requests[0].message,
+                format!(
+                    "{expected}\n\nThis issue has occurred 4 times since the last notification."
+                )
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn webhook_payload_selects_text_and_preserves_ordinary_metadata() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let provider = WebhookProvider {
+            url: server.uri(),
+            method: "POST".into(),
+            headers: Default::default(),
+            timeout_secs: 10,
+        };
+        for alternative in [Some("Readable body"), None, Some(" \n")] {
+            let mut notification = Notification::new("Digest", "Original body")
+                .with_metadata("project_id", "42")
+                .with_metadata("environment", "production")
+                .with_metadata("_chart_svg", "<svg/>");
+            if let Some(body) = alternative {
+                notification
+                    .metadata
+                    .insert("text_body".into(), body.into());
+            }
+            provider
+                .send_with_client(&reqwest::Client::new(), &notification)
+                .await
+                .unwrap();
+        }
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 3);
+        for (request, expected) in
+            requests
+                .iter()
+                .zip(["Readable body", "Original body", "Original body"])
+        {
+            let payload: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(payload["message"], expected);
+            assert_eq!(
+                payload["metadata"],
+                serde_json::json!({
+                    "project_id": "42", "environment": "production"
+                })
+            );
+        }
     }
 
     #[tokio::test]
