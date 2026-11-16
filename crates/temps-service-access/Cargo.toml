@@ -21,7 +21,7 @@ temps-service-access-runtime = { path = "../temps-service-access-runtime" }
 base64.workspace = true
 rcgen.workspace = true
 zeroize.workspace = true
-ed25519-dalek = "2"
+ed25519-dalek = "3"
 rand08 = { package = "rand", version = "0.8" }
 axum.workspace = true
 serde.workspace = true
