@@ -79,7 +79,7 @@ import {
   Workflow,
 } from 'lucide-react'
 import { ReactElement, useCallback, useEffect, useMemo, useState } from 'react'
-import { useNavigate, useSearchParams } from 'react-router'
+import { useLocation, useNavigate, useSearchParams } from 'react-router'
 
 interface TracesListProps {
   project: ProjectResponse
@@ -774,6 +774,25 @@ export default function TracesList({ project }: TracesListProps) {
     searchParams.get('dir') === 'asc' ? 'asc' : 'desc'
   )
   const [showSetup, setShowSetup] = useState(false)
+  // Links elsewhere ("Configure telemetry", the logs and metrics empty states)
+  // point at `#traces-setup`. A service that already has traces hides the
+  // setup section, so arriving with that hash has to open it, not just try to
+  // scroll to an element that is not there.
+  const { hash } = useLocation()
+  const [seenHash, setSeenHash] = useState<string | null>(null)
+  if (hash !== seenHash) {
+    setSeenHash(hash)
+    if (hash === '#traces-setup') setShowSetup(true)
+  }
+  useEffect(() => {
+    if (!showSetup || hash !== '#traces-setup') return
+    const frame = requestAnimationFrame(() => {
+      document
+        .getElementById('traces-setup')
+        ?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    })
+    return () => cancelAnimationFrame(frame)
+  }, [showSetup, hash])
   // Bumped by Refresh so relative ranges recompute against "now". Without
   // this, start/end freeze at mount (or last range change) and newly ingested
   // traces that land after that frozen end_time stay invisible until a full
