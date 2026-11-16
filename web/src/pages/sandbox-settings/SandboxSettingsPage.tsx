@@ -51,11 +51,13 @@ export function SandboxSettingsPage() {
           ))}
         </TabsList>
       </Tabs>
-      {current === 'preview' ? (
-        <PreviewGatewayCard />
-      ) : (
+      {/* Both sections stay mounted so unsaved edits survive a tab switch. */}
+      <div data-section="runtime" hidden={current === 'preview'}>
         <SandboxRuntimeSettings />
-      )}
+      </div>
+      <div data-section="preview" hidden={current !== 'preview'}>
+        <PreviewGatewayCard />
+      </div>
     </PageContainer>
   )
 }
