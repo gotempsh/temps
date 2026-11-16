@@ -5120,6 +5120,14 @@
               "type": "string"
             },
             "type": "array"
+          },
+          "trusted_proxy_cidrs": {
+            "default": [],
+            "description": "Inbound reverse proxy IPs/CIDRs trusted to append or overwrite forwarded\nclient IP headers. Stored in the settings row; empty trusts no extra peers.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
           }
         },
         "type": "object"
@@ -5352,6 +5360,13 @@
               "type": "string"
             },
             "type": "array"
+          },
+          "trusted_proxy_cidrs": {
+            "description": "Inbound proxy IP addresses/CIDRs trusted for forwarded client IP headers.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
           }
         },
         "required": [
@@ -5367,6 +5382,7 @@
           "security_headers",
           "rate_limiting",
           "trust_loopback_forwarded_ip",
+          "trusted_proxy_cidrs",
           "expose_platform_identity",
           "docker_registry",
           "disk_space_alert",

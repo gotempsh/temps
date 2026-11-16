@@ -2355,9 +2355,11 @@ fn resolve_session_client_ip(
 
     crate::bunny_ips::BUNNY_TRUST.ensure_refresh_started();
 
-    if let Some(client_ip) =
-        crate::client_ip::resolve_loopback_client_ip(peer, headers, trust_loopback_forwarded_ip)
-    {
+    if let Some(client_ip) = temps_core::trusted_proxies::resolve_trusted_proxy_ip(
+        peer,
+        headers,
+        trust_loopback_forwarded_ip,
+    ) {
         return Some(client_ip.to_string());
     }
 
@@ -2409,6 +2411,26 @@ fn resolve_client_fingerprint(
     loopback_ja4_header: Option<&axum::http::HeaderName>,
     direct: Option<temps_shield::ja4::Ja4>,
 ) -> temps_shield::ja4::ClientFingerprint {
+    resolve_client_fingerprint_with_proxy_trust(
+        peer,
+        headers,
+        trust_loopback_forwarded_ip,
+        loopback_ja4_header,
+        direct,
+        temps_core::trusted_proxies::is_trusted_proxy_peer,
+    )
+}
+
+/// Keep fingerprint policy testable with a local trust snapshot, rather than
+/// writing the process-wide settings that other requests and tests consume.
+fn resolve_client_fingerprint_with_proxy_trust(
+    peer: Option<std::net::IpAddr>,
+    headers: &axum::http::HeaderMap,
+    trust_loopback_forwarded_ip: bool,
+    loopback_ja4_header: Option<&axum::http::HeaderName>,
+    direct: Option<temps_shield::ja4::Ja4>,
+    configured_proxy: impl Fn(std::net::IpAddr) -> bool,
+) -> temps_shield::ja4::ClientFingerprint {
     use temps_shield::ja4::{ClientFingerprint, Ja4, Ja4Source};
 
     let forwarded = |name: &axum::http::HeaderName| {
@@ -2433,6 +2455,10 @@ fn resolve_client_fingerprint(
         }
         Some(peer) if crate::bunny_ips::BUNNY_TRUST.is_bunny(peer) => {
             (forwarded(&CDN_JA4), Ja4Source::Bunny)
+        }
+        Some(peer) if configured_proxy(peer) => {
+            // A configured proxy's TLS fingerprint is not the visitor's.
+            (None, Ja4Source::Local)
         }
         Some(_) | None => (direct, Ja4Source::Direct),
     };

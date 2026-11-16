@@ -78,6 +78,19 @@ export const PLATFORM_SETTINGS_INDEX: readonly Pick<
   'anchor' | 'title' | 'page' | 'keywords'
 >[] = [
   {
+    anchor: settingAnchor('trusted-proxy-cidrs'),
+    title: 'Resolve client IPs through trusted proxies',
+    page: '/settings/security',
+    keywords: [
+      'trusted proxy',
+      'CIDR',
+      'load balancer',
+      'reverse proxy',
+      'client IP',
+      'forwarded headers',
+    ],
+  },
+  {
     anchor: settingAnchor('response-branding'),
     title: 'Show Temps branding in responses',
     page: '/settings/security',

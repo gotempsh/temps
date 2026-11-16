@@ -23,6 +23,20 @@ describe('buildPlatformSettingsUpdateBody', () => {
     expect(body.trust_loopback_forwarded_ip).toBe(true)
   })
 
+  test('only sends proxy CIDRs when explicitly changed, including clearing', () => {
+    const stored = { trusted_proxy_cidrs: ['10.20.0.0/16'] } as PlatformSettings
+    expect(
+      buildPlatformSettingsUpdateBody(stored, {}).trusted_proxy_cidrs
+    ).toBeUndefined()
+    expect(
+      buildPlatformSettingsUpdateBody(stored, { trusted_proxy_cidrs: [] })
+        .trusted_proxy_cidrs
+    ).toEqual([])
+    expect(buildPlatformSettingsUpdateBody(stored).trusted_proxy_cidrs).toEqual(
+      ['10.20.0.0/16']
+    )
+  })
+
   test('round-trips the loopback JA4 header on unrelated saves', () => {
     const body = buildPlatformSettingsUpdateBody({
       loopback_ja4_header: 'x-ja4',

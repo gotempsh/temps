@@ -35,7 +35,10 @@ use temps_config::ScreenshotSettings;
 use temps_config::SecurityHeadersSettings;
 use temps_config::MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR;
 use temps_config::MIN_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR;
-use temps_config::{ConfigService, EffectiveTelemetryPolicies, TrustedPrivateNetworksIntent};
+use temps_config::{
+    ConfigService, EffectiveTelemetryPolicies, TrustedPrivateNetworksIntent,
+    TrustedProxyRangesIntent,
+};
 use temps_core::crypto::sha256_hex;
 use temps_core::error_builder::ErrorBuilder;
 use temps_core::{
@@ -254,6 +257,8 @@ struct ForwardedIpTrustUpdatedAudit {
     context: AuditContext,
     previous_enabled: bool,
     new_enabled: bool,
+    previous_cidrs: Vec<String>,
+    new_cidrs: Vec<String>,
 }
 
 impl AuditOperation for ForwardedIpTrustUpdatedAudit {
@@ -475,6 +480,8 @@ pub struct AppSettingsResponse {
     /// Database-backed opt-in; this is the sole control surface for every
     /// proxy process, including a standalone `temps proxy`.
     pub trust_loopback_forwarded_ip: bool,
+    /// Inbound proxy IP addresses/CIDRs trusted for forwarded client IP headers.
+    pub trusted_proxy_cidrs: Vec<String>,
     /// Opt in to proxy-added platform branding in public application responses.
     pub expose_platform_identity: bool,
     /// The header a trusted loopback proxy sends the visitor's JA4 in.
@@ -1161,6 +1168,7 @@ impl From<AppSettings> for AppSettingsResponse {
             security_headers: settings.security_headers,
             rate_limiting: settings.rate_limiting,
             trust_loopback_forwarded_ip,
+            trusted_proxy_cidrs: settings.trusted_proxy_cidrs,
             expose_platform_identity,
             loopback_ja4_header: settings.loopback_ja4_header,
             docker_registry: DockerRegistrySettingsMasked {
@@ -3604,6 +3612,7 @@ async fn update_settings(
     discard_plugin_reporting_consent(&mut body);
     // Capture presence before omitted fields are filled from the cached GET.
     let trusted_private_networks_sent = body.get("trusted_private_networks").is_some();
+    let trusted_proxy_cidrs_sent = body.get("trusted_proxy_cidrs").is_some();
     let cloud_fields_sent = CloudFieldsSent::from_settings_body(&body);
     let node_failover_sent =
         SettingsWritePresence::from_settings_body(&body).node_failover_after_secs_sent();
@@ -3919,12 +3928,18 @@ async fn update_settings(
         TrustedPrivateNetworksIntent::Unchanged
     };
 
+    let body_proxy_cidrs = settings.trusted_proxy_cidrs.clone();
     match app_state
         .config_service
-        .update_settings_with_intents(
+        .update_settings_with_proxy_intent(
             settings,
             geo_license_key_intent,
             trusted_private_networks_intent,
+            if trusted_proxy_cidrs_sent {
+                TrustedProxyRangesIntent::Replace(body_proxy_cidrs)
+            } else {
+                TrustedProxyRangesIntent::Unchanged
+            },
         )
         .await
     {
@@ -4062,7 +4077,9 @@ async fn update_settings(
                     );
                 }
             }
-            if next_trust_loopback_forwarded_ip != previous_trust_loopback_forwarded_ip {
+            if next_trust_loopback_forwarded_ip != previous_trust_loopback_forwarded_ip
+                || saved.trusted_proxy_cidrs != saved.previous_trusted_proxy_cidrs
+            {
                 info!(
                     previous_enabled = previous_trust_loopback_forwarded_ip,
                     new_enabled = next_trust_loopback_forwarded_ip,
@@ -4076,6 +4093,8 @@ async fn update_settings(
                     },
                     previous_enabled: previous_trust_loopback_forwarded_ip,
                     new_enabled: next_trust_loopback_forwarded_ip,
+                    previous_cidrs: saved.previous_trusted_proxy_cidrs,
+                    new_cidrs: saved.trusted_proxy_cidrs,
                 };
                 if let Err(e) = app_state
                     .audit_service
@@ -4159,6 +4178,12 @@ async fn update_settings(
                     message: "Settings updated successfully".to_string(),
                 }),
             ))
+        }
+        Err(temps_config::ConfigServiceError::InvalidConfiguration { details }) => {
+            Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                .title("Invalid Settings Configuration")
+                .detail(details)
+                .build())
         }
         Err(temps_config::ConfigServiceError::PublicIngressHostnameInUse { hostname }) => {
             // A status page claimed the hostname after this request checked
@@ -7611,6 +7636,106 @@ mod tests {
                 && payload["previous_enabled"] == false
                 && payload["new_enabled"] == true
         }));
+    }
+
+    #[tokio::test]
+    async fn trusted_proxy_settings_validate_authorize_and_audit() {
+        use tower::ServiceExt;
+        for (role, payload, expected) in [
+            (
+                temps_auth::Role::Reader,
+                r#"{"trusted_proxy_cidrs":["10.20.0.0/16"]}"#,
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                temps_auth::Role::Admin,
+                r#"{"trusted_proxy_cidrs":["invalid"]}"#,
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                temps_auth::Role::Admin,
+                r#"{"trusted_proxy_cidrs":["0.0.0.0/0"]}"#,
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                temps_auth::Role::Admin,
+                r#"{"trusted_proxy_cidrs":["10.20.1.2/16"]}"#,
+                StatusCode::OK,
+            ),
+        ] {
+            let now = chrono::Utc::now();
+            let row = temps_entities::settings::Model {
+                id: 1,
+                data: AppSettings::default().to_json(),
+                created_at: now,
+                updated_at: now,
+            };
+            let db = Arc::new(
+                sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Sqlite)
+                    .append_query_results(vec![vec![row]; 8])
+                    .append_exec_results([sea_orm::MockExecResult {
+                        last_insert_id: 1,
+                        rows_affected: 1,
+                    }])
+                    .into_connection(),
+            );
+            let audit = Arc::new(IdentityAudit::default());
+            let state = settings_test_state(db, audit.clone());
+            let request = axum::http::Request::builder()
+                .method("PUT")
+                .uri("/settings")
+                .header(header::CONTENT_TYPE, "application/json")
+                .extension(guard_principal(role))
+                .extension(RequestMetadata {
+                    ip_address: "127.0.0.1".into(),
+                    user_agent: "test".into(),
+                    headers: Default::default(),
+                    visitor_id_cookie: None,
+                    session_id_cookie: None,
+                    base_url: "http://localhost".into(),
+                    scheme: "http".into(),
+                    host: "localhost".into(),
+                    is_secure: false,
+                })
+                .body(axum::body::Body::from(payload))
+                .unwrap();
+            let response = configure_routes()
+                .with_state(state.clone())
+                .oneshot(request)
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 65536)
+                .await
+                .unwrap();
+            assert_eq!(status, expected, "{}", String::from_utf8_lossy(&body));
+            if expected == StatusCode::OK {
+                assert_eq!(
+                    state
+                        .config_service
+                        .get_settings()
+                        .await
+                        .unwrap()
+                        .trusted_proxy_cidrs,
+                    ["10.20.0.0/16"]
+                );
+                assert!(audit.0.lock().unwrap().iter().any(|(event, payload)| {
+                    let data: serde_json::Value = serde_json::from_str(payload).unwrap();
+                    event == "FORWARDED_IP_TRUST_UPDATED"
+                        && data["previous_cidrs"] == serde_json::json!([])
+                        && data["new_cidrs"] == serde_json::json!(["10.20.0.0/16"])
+                }));
+            } else if expected == StatusCode::BAD_REQUEST {
+                let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(problem["title"], "Invalid Settings Configuration");
+                assert!(!audit
+                    .0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(event, _)| event == "FORWARDED_IP_TRUST_UPDATED"));
+            }
+        }
     }
 
     #[tokio::test]

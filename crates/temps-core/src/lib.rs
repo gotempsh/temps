@@ -63,6 +63,7 @@ pub mod registry_prefix;
 #[cfg(test)]
 mod release_manifest;
 pub mod request_policy_gate;
+pub mod trusted_proxies;
 pub mod workflow_ingress;
 /// Immutable image references embedded at compile time in official releases.
 pub mod release_images {
