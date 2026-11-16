@@ -1129,7 +1129,15 @@ fn describe_container_exit(info: &temps_deployer::ContainerInfo) -> String {
         return "OOMKilled (exit code 137)".to_string();
     }
     match (info.exit_reason.as_deref(), info.exit_code) {
-        (Some(reason), _) if !reason.trim().is_empty() => reason.trim().to_string(),
+        (Some(reason), Some(code)) if !reason.trim().is_empty() => {
+            let reason = reason.trim();
+            if reason.eq_ignore_ascii_case(&format!("exit code {code}")) {
+                reason.to_string()
+            } else {
+                format!("exit code {code}: {reason}")
+            }
+        }
+        (Some(reason), None) if !reason.trim().is_empty() => reason.trim().to_string(),
         (_, Some(code)) => format!("exit code {code}"),
         _ => "no exit code reported".to_string(),
     }
@@ -5134,13 +5142,22 @@ mod tests {
     }
 
     #[test]
-    fn exit_description_prefers_oom_then_reason_then_code() {
+    fn exit_description_preserves_code_alongside_reason() {
         let oom = temps_deployer::ContainerInfo {
             oom_killed: Some(true),
             exit_code: Some(137),
             ..Default::default()
         };
         assert_eq!(describe_container_exit(&oom), "OOMKilled (exit code 137)");
+        let with_reason = temps_deployer::ContainerInfo {
+            exit_code: Some(126),
+            exit_reason: Some("entrypoint could not execute".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            describe_container_exit(&with_reason),
+            "exit code 126: entrypoint could not execute"
+        );
         let code_only = temps_deployer::ContainerInfo {
             exit_code: Some(3),
             ..Default::default()
