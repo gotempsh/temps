@@ -547,10 +547,15 @@ impl CloudflareProvider {
     /// Plain-text fallback body. Cloudflare requires a `text` part alongside the
     /// HTML one, so derive a readable version from the notification.
     fn render_text_body(notification: &Notification) -> String {
-        let mut body = format!("{}\n\n{}", notification.title, notification.message);
-        if !notification.metadata.is_empty() {
+        let mut body = format!("{}\n\n{}", notification.title, notification.text_body());
+        let mut metadata = notification
+            .metadata
+            .iter()
+            .filter(|(key, _)| is_human_visible_metadata_key(key, &notification.metadata))
+            .peekable();
+        if metadata.peek().is_some() {
             body.push_str("\n\n---\n");
-            for (key, value) in &notification.metadata {
+            for (key, value) in metadata {
                 body.push_str(&format!("{}: {}\n", key, value));
             }
         }
@@ -720,7 +725,7 @@ fn is_human_visible_metadata_key(
     key: &str,
     metadata: &std::collections::HashMap<String, String>,
 ) -> bool {
-    if key.starts_with('_') {
+    if key.starts_with('_') || key == "text_body" {
         return false;
     }
     if let Some(prefix) = key.strip_suffix("_id") {
@@ -1061,7 +1066,7 @@ impl NotificationProvider for TempsCloudProvider {
             .send_managed_notification(&ManagedNotificationRequest {
                 source_notification_id,
                 title: bound_cloud_text(&notification.title, CLOUD_TITLE_MAX_CHARS),
-                message: bound_cloud_text(&notification.message, CLOUD_MESSAGE_MAX_CHARS),
+                message: bound_cloud_text(notification.text_body(), CLOUD_MESSAGE_MAX_CHARS),
                 severity,
                 metadata: cloud_metadata(notification),
             })
@@ -1891,7 +1896,7 @@ impl SlackProvider {
             .collect::<Vec<_>>();
 
         let safe_title = slack_escape(&notification.title);
-        let safe_message = slack_escape(&notification.message);
+        let safe_message = slack_escape(notification.text_body());
         let payload = serde_json::json!({
             "attachments": [{
                 "color": color,
@@ -1977,17 +1982,18 @@ impl NotificationProvider for WebhookProvider {
         let client = webhook_http_client(&self.url, self.timeout_secs).await?;
 
         // Build the payload with all notification data. `_`-prefixed keys are
-        // channel-specific payloads (e.g. the email's `_chart_svg`) — drop them
+        // channel-specific payloads (e.g. the email's `_chart_svg`). Drop them
+        // and the already-selected text alternative
         // so they don't bloat the webhook body.
         let metadata: std::collections::HashMap<&String, &String> = notification
             .metadata
             .iter()
-            .filter(|(k, _)| !k.starts_with('_'))
+            .filter(|(k, _)| !k.starts_with('_') && k.as_str() != "text_body")
             .collect();
         let payload = serde_json::json!({
             "id": notification.id,
             "title": notification.title,
-            "message": notification.message,
+            "message": notification.text_body(),
             "type": notification.notification_type.to_string(),
             "priority": notification.priority.to_string(),
             "severity": notification.effective_severity().to_string(),
@@ -3957,6 +3963,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cloud_provider_uses_readable_digest_alternative() {
+        let cloud = Arc::new(MockManagedNotificationSender::new(true, true));
+        let provider = TempsCloudProvider {
+            cloud: cloud.clone(),
+        };
+        let mut notification = create_test_notification();
+        notification.message = "<!DOCTYPE html><html><body>Weekly Digest</body></html>".into();
+        notification.metadata.insert(
+            "text_body".into(),
+            "Weekly Digest\n\nDeployments: 3\nhttps://example.test/projects".into(),
+        );
+        provider.send(&notification).await.unwrap();
+        let requests = cloud.requests.lock().unwrap();
+        assert_eq!(requests[0].message, notification.metadata["text_body"]);
+        assert!(!requests[0].metadata.contains_key("text_body"));
+    }
+
+    #[tokio::test]
+    async fn cloud_provider_text_alternative_is_redacted_and_bounded() {
+        let cloud = Arc::new(MockManagedNotificationSender::new(true, true));
+        let provider = TempsCloudProvider {
+            cloud: cloud.clone(),
+        };
+        let mut notification = create_test_notification();
+        notification.metadata.insert(
+            "text_body".into(),
+            format!(
+                "password=private-value {}",
+                "x".repeat(CLOUD_MESSAGE_MAX_CHARS)
+            ),
+        );
+        provider.send(&notification).await.unwrap();
+        let requests = cloud.requests.lock().unwrap();
+        assert!(requests[0].message.contains("[redacted]"));
+        assert!(!requests[0].message.contains("private-value"));
+        assert!(requests[0].message.chars().count() <= CLOUD_MESSAGE_MAX_CHARS);
+    }
+
+    #[tokio::test]
+    async fn cloud_provider_empty_text_alternative_preserves_message() {
+        let cloud = Arc::new(MockManagedNotificationSender::new(true, true));
+        let provider = TempsCloudProvider {
+            cloud: cloud.clone(),
+        };
+        let mut notification = create_test_notification();
+        notification
+            .metadata
+            .insert("text_body".into(), "  \n".into());
+        provider.send(&notification).await.unwrap();
+        let requests = cloud.requests.lock().unwrap();
+        assert_eq!(requests[0].message, notification.message);
+    }
+
+    #[tokio::test]
     async fn cloud_provider_redacts_bounds_and_allowlists_payload() {
         let cloud = Arc::new(MockManagedNotificationSender::new(true, true));
         let provider = TempsCloudProvider {
@@ -5627,6 +5687,59 @@ mod tests {
             body.contains("&lt;!channel&gt;"),
             "mrkdwn @channel mention must be escaped to literal entities: {body}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_slack_digest_uses_text_alternative_without_duplicate_field() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let provider = SlackProvider {
+            webhook_url: server.uri(),
+            channel: None,
+        };
+        let notification = Notification::new(
+            "Weekly Digest",
+            "<!DOCTYPE html><html><body>HTML-only marker</body></html>",
+        )
+        .with_metadata(
+            "text_body",
+            "Deployments: 3\nhttps://example.test/projects\n<!channel>",
+        )
+        .with_metadata("project", "demo");
+        provider
+            .send_with_client(&reqwest::Client::new(), &notification)
+            .await
+            .unwrap();
+        let requests = server.received_requests().await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let attachment = &payload["attachments"][0];
+        assert_eq!(
+            attachment["text"],
+            "Deployments: 3\nhttps://example.test/projects\n&lt;!channel&gt;"
+        );
+        assert_eq!(attachment["fields"].as_array().unwrap().len(), 1);
+        assert!(!payload.to_string().contains("HTML-only marker"));
+        assert!(!payload.to_string().contains("text_body"));
+    }
+
+    #[test]
+    fn test_cloudflare_digest_plain_text_does_not_include_html_or_duplicate_body() {
+        let notification = Notification::new(
+            "Weekly Digest",
+            "<!DOCTYPE html><html>HTML-only marker</html>",
+        )
+        .with_metadata("text_body", "Deployments: 3\nhttps://example.test/projects");
+        let text = CloudflareProvider::render_text_body(&notification);
+        assert!(text.contains("Deployments: 3\nhttps://example.test/projects"));
+        assert!(!text.contains("HTML-only marker"));
+        assert!(!text.contains("text_body:"));
+        assert_eq!(text.matches("Deployments: 3").count(), 1);
     }
 
     #[tokio::test]
