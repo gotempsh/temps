@@ -17,5 +17,6 @@ test('jumps instantly when the user prefers reduced motion', () => {
 })
 
 test('scrolls smoothly where the system cannot say', () => {
-  expect(preferredScrollBehavior(undefined)).toBe('smooth')
+  // `null`, not `undefined`: undefined would fall back to the real system.
+  expect(preferredScrollBehavior(null)).toBe('smooth')
 })
