@@ -29,8 +29,8 @@ const AI_SETTINGS_LINKS: readonly SettingsLink[] = [
     Icon: KeyRound,
   },
   {
-    to: '/agent-sandbox',
-    label: 'Sandboxes',
+    to: '/sandboxes/settings',
+    label: 'Sandbox settings',
     detail: 'Where the assistant builds and runs code',
     Icon: Box,
   },

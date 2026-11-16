@@ -493,7 +493,7 @@ function SecondaryActions({
 // deployments that didn't succeed. Failed deployments also carry a server-side
 // classification (stage, code, concrete fix and the settings page that fixes
 // it), which leads the banner; the raw error stays one click away.
-function CancelledReason({
+export function CancelledReason({
   deployment,
   projectSlug,
   onEditImage,
@@ -503,7 +503,21 @@ function CancelledReason({
   /** Opens the redeploy dialog, where a registry image can be edited. */
   onEditImage?: () => void
 }) {
-  const [isExpanded, setIsExpanded] = useState(false)
+  // The user's choice belongs to the deployment it was made on: opening a
+  // different deployment falls back to that failure's own default, while
+  // refreshes of the same deployment keep the choice.
+  const [expandedChoice, setExpandedChoice] = useState<{
+    deploymentId: number
+    expanded: boolean
+  }>()
+  const expandedByUser =
+    expandedChoice?.deploymentId === deployment.id
+      ? expandedChoice.expanded
+      : undefined
+  const isExpanded =
+    expandedByUser ??
+    (deployment.failure?.code === 'container_exited' ||
+      deployment.failure?.code === 'out_of_memory')
   if (!deployment.cancelled_reason) return null
   const isCancelled = deployment.status === 'cancelled'
   const failureReason = deploymentFailureSummary(deployment.cancelled_reason)
@@ -620,7 +634,12 @@ function CancelledReason({
               size="sm"
               className="mt-1 h-auto p-0 text-xs text-destructive underline-offset-4"
               aria-expanded={isExpanded}
-              onClick={() => setIsExpanded((expanded) => !expanded)}
+              onClick={() =>
+                setExpandedChoice({
+                  deploymentId: deployment.id,
+                  expanded: !isExpanded,
+                })
+              }
             >
               {isExpanded ? 'Collapse error' : 'Show full error'}
             </Button>
@@ -1577,6 +1596,10 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
           environmentId={deployment.environment_id}
           deploymentId={deployment.id}
           deploymentStatus={deployment.status}
+          showLogsInitially={
+            deployment.failure?.code === 'container_exited' ||
+            deployment.failure?.code === 'out_of_memory'
+          }
         />
 
         <DeployFailureReport project={project} deployment={deployment} />

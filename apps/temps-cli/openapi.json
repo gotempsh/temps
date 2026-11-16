@@ -88853,7 +88853,7 @@
         "tags": [
           "AI Applications"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       },
       "post": {
         "operationId": "create_application",
@@ -88889,7 +88889,7 @@
         "tags": [
           "AI Applications"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/applications/{application_public_id}": {
@@ -88922,7 +88922,7 @@
         "tags": [
           "AI Applications"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       },
       "get": {
         "operationId": "get_application",
@@ -88967,7 +88967,7 @@
         "tags": [
           "AI Applications"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       },
       "patch": {
         "description": "Changes the application's name. Its id, chats, workspace and projects are unchanged.",
@@ -89018,7 +89018,7 @@
         "tags": [
           "AI Applications"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/applications/{application_public_id}/conversations": {
@@ -89093,7 +89093,7 @@
         "tags": [
           "AI Applications"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       },
       "post": {
         "operationId": "create_application_conversation",
@@ -89139,7 +89139,7 @@
         "tags": [
           "AI Applications"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/applications/{application_public_id}/conversations/{conversation_public_id}/artifacts": {
@@ -89188,7 +89188,7 @@
         "tags": [
           "AI Applications"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       },
       "post": {
         "operationId": "create_thread_artifact",
@@ -89243,7 +89243,7 @@
         "tags": [
           "AI Applications"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/applications/{application_public_id}/git-connections": {
@@ -89281,7 +89281,7 @@
         "tags": [
           "AI Applications"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       },
       "post": {
         "operationId": "bindApplicationGitConnection",
@@ -89329,7 +89329,7 @@
         "tags": [
           "AI Applications"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/applications/{application_public_id}/git-connections/{binding_id}": {
@@ -89368,7 +89368,7 @@
         "tags": [
           "AI Applications"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/applications/{application_public_id}/preview-link": {
@@ -89419,7 +89419,7 @@
         "tags": [
           "AI Applications"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/applications/{application_public_id}/projects": {
@@ -89470,7 +89470,7 @@
         "tags": [
           "AI Applications"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/applications/{application_public_id}/projects/link": {
@@ -89520,7 +89520,7 @@
         "tags": [
           "AI Applications"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/applications/{application_public_id}/projects/{project_id}": {
@@ -89570,7 +89570,7 @@
         "tags": [
           "AI Applications"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/applications/{application_public_id}/projects/{project_id}/deploy": {
@@ -89633,7 +89633,7 @@
         "tags": [
           "AI Applications"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/applications/{application_public_id}/projects/{project_id}/primary": {
@@ -89681,7 +89681,7 @@
         "tags": [
           "AI Applications"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/applications/{application_public_id}/projects/{project_id}/workspace/files": {
@@ -89742,7 +89742,7 @@
         "tags": [
           "AI Applications"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/applications/{application_public_id}/projects/{project_id}/workspace/source": {
@@ -89796,7 +89796,7 @@
         "tags": [
           "AI Applications"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/applications/{application_public_id}/restore": {
@@ -89836,7 +89836,7 @@
         "tags": [
           "AI Applications"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/applications/{application_public_id}/workspace": {
@@ -89875,7 +89875,7 @@
         "tags": [
           "AI Applications"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       },
       "patch": {
         "description": "Persists desired runtime and resource settings server-side, then replaces compute while retaining the application files.",
@@ -89924,7 +89924,7 @@
         "tags": [
           "AI Applications"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/applications/{application_public_id}/workspace/actions": {
@@ -89976,7 +89976,7 @@
         "tags": [
           "AI Applications"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/applications/{application_public_id}/workspace/changes": {
@@ -90037,7 +90037,7 @@
         "tags": [
           "AI Applications"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/applications/{application_public_id}/workspace/diff": {
@@ -90087,7 +90087,7 @@
         "tags": [
           "AI Applications"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/applications/{application_public_id}/workspace/directory": {
@@ -90156,7 +90156,7 @@
         "tags": [
           "AI Applications"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/applications/{application_public_id}/workspace/file": {
@@ -90204,7 +90204,7 @@
         "tags": [
           "AI Applications"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/applications/{application_public_id}/workspace/file/download": {
@@ -90259,7 +90259,7 @@
         "tags": [
           "AI Applications"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/applications/{application_public_id}/workspace/files": {
@@ -90312,7 +90312,7 @@
         "tags": [
           "AI Applications"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/applications/{application_public_id}/workspace/terminal": {
@@ -90390,7 +90390,7 @@
         "tags": [
           "AI Applications"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/applications/{public_id}/blueprint": {
@@ -90468,7 +90468,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/applications/{public_id}/blueprint/bindings/{component_id}": {
@@ -90555,7 +90555,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       },
       "put": {
         "operationId": "bind_blueprint_component",
@@ -90660,7 +90660,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/applications/{public_id}/blueprint/versions": {
@@ -90766,7 +90766,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       },
       "post": {
         "operationId": "save_blueprint_version",
@@ -90862,7 +90862,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/applications/{public_id}/blueprint/versions/{version}/accept": {
@@ -90960,7 +90960,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/applications/{public_id}/blueprint/versions/{version}/reject": {
@@ -91058,7 +91058,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/assistant/conversations": {
@@ -91108,7 +91108,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/conversations": {
@@ -91195,7 +91195,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       },
       "post": {
         "operationId": "create_global_conversation",
@@ -91234,7 +91234,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/conversations/{public_id}": {
@@ -91294,7 +91294,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       },
       "patch": {
         "operationId": "rename_user_conversation",
@@ -91341,7 +91341,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/conversations/{public_id}/archive": {
@@ -91371,7 +91371,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/conversations/{public_id}/attachment-uploads": {
@@ -91489,7 +91489,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/conversations/{public_id}/attachment-uploads/{upload_id}": {
@@ -91549,7 +91549,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/conversations/{public_id}/attachment-uploads/{upload_id}/chunk": {
@@ -91667,7 +91667,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/conversations/{public_id}/attachment-uploads/{upload_id}/complete": {
@@ -91764,7 +91764,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/conversations/{public_id}/attachments": {
@@ -91815,7 +91815,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/conversations/{public_id}/attachments/{attachment_id}": {
@@ -91875,7 +91875,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/conversations/{public_id}/compact": {
@@ -91973,7 +91973,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/conversations/{public_id}/diagnostics": {
@@ -92026,7 +92026,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/conversations/{public_id}/goals": {
@@ -92107,7 +92107,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/conversations/{public_id}/goals/{goal_id}/cancel": {
@@ -92204,7 +92204,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/conversations/{public_id}/goals/{goal_id}/retry": {
@@ -92301,7 +92301,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/conversations/{public_id}/messages": {
@@ -92351,7 +92351,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/conversations/{public_id}/operations": {
@@ -92429,7 +92429,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/conversations/{public_id}/pending-actions": {
@@ -92470,7 +92470,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/conversations/{public_id}/permission-mode": {
@@ -92520,7 +92520,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/conversations/{public_id}/permissions/{permission_id}/resolve": {
@@ -92571,7 +92571,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/conversations/{public_id}/resources": {
@@ -92649,7 +92649,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/conversations/{public_id}/restore": {
@@ -92680,7 +92680,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/conversations/{public_id}/sandbox": {
@@ -92768,7 +92768,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       },
       "get": {
         "operationId": "get_chat_sandbox",
@@ -92844,7 +92844,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       },
       "post": {
         "operationId": "link_chat_sandbox",
@@ -92960,7 +92960,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/conversations/{public_id}/sandbox/changes": {
@@ -93068,7 +93068,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/conversations/{public_id}/sandbox/changes/diff": {
@@ -93216,7 +93216,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/conversations/{public_id}/sandbox/changes/track": {
@@ -93344,7 +93344,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/conversations/{public_id}/sandbox/file": {
@@ -93471,7 +93471,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/conversations/{public_id}/sandbox/files": {
@@ -93601,7 +93601,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/conversations/{public_id}/sandbox/projects": {
@@ -93720,7 +93720,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/conversations/{public_id}/sandbox/projects/{project_id}": {
@@ -93828,7 +93828,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/conversations/{public_id}/sandbox/services": {
@@ -93946,7 +93946,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/conversations/{public_id}/sandbox/services/{service_id}": {
@@ -94054,7 +94054,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/conversations/{public_id}/sandbox/wake": {
@@ -94152,7 +94152,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/conversations/{public_id}/secrets": {
@@ -94233,7 +94233,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/conversations/{public_id}/secrets/{secret_id}": {
@@ -94360,7 +94360,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/conversations/{public_id}/secrets/{secret_id}/discard": {
@@ -94447,7 +94447,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/conversations/{public_id}/stop": {
@@ -94477,7 +94477,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/conversations/{public_id}/suggestion-mode": {
@@ -94555,7 +94555,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       },
       "put": {
         "operationId": "update_chat_suggestion_mode",
@@ -94661,7 +94661,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/conversations/{public_id}/suggestions": {
@@ -94779,7 +94779,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/conversations/{public_id}/usage": {
@@ -94819,7 +94819,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/conversations/{public_id}/workspace": {
@@ -94907,7 +94907,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       },
       "get": {
         "operationId": "get_chat_workspace",
@@ -94983,7 +94983,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       },
       "put": {
         "operationId": "set_chat_workspace",
@@ -95079,7 +95079,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/limits": {
@@ -95149,7 +95149,7 @@
         "tags": [
           "AI Gateway Limits"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/limits/instance": {
@@ -95215,7 +95215,7 @@
         "tags": [
           "AI Gateway Limits"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/limits/projects/{project_id}": {
@@ -95276,7 +95276,7 @@
         "tags": [
           "AI Gateway Limits"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       },
       "get": {
         "operationId": "get_project_limits",
@@ -95332,7 +95332,7 @@
         "tags": [
           "AI Gateway Limits"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       },
       "put": {
         "operationId": "update_project_limits",
@@ -95418,7 +95418,7 @@
         "tags": [
           "AI Gateway Limits"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/pending-actions/{action_public_id}": {
@@ -95456,7 +95456,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/pending-actions/{action_public_id}/confirm": {
@@ -95495,7 +95495,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/pending-actions/{action_public_id}/reject": {
@@ -95534,7 +95534,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/preferences/suggestions": {
@@ -95591,7 +95591,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       },
       "put": {
         "operationId": "update_suggestion_default",
@@ -95666,7 +95666,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/preview/authorize": {
@@ -95707,7 +95707,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/pricing": {
@@ -95753,7 +95753,7 @@
         "tags": [
           "AI Gateway Pricing"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/provider-status": {
@@ -95809,7 +95809,7 @@
         "tags": [
           "AI Provider Status"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/provider-status/refresh": {
@@ -95865,7 +95865,7 @@
         "tags": [
           "AI Provider Status"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/providers": {
@@ -95914,7 +95914,7 @@
         "tags": [
           "AI Gateway Admin"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       },
       "post": {
         "operationId": "create_provider_key",
@@ -95978,7 +95978,7 @@
         "tags": [
           "AI Gateway Admin"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/providers/discover": {
@@ -96044,7 +96044,7 @@
         "tags": [
           "AI Gateway Admin"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/providers/test": {
@@ -96110,7 +96110,7 @@
         "tags": [
           "AI Gateway Admin"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/providers/{id}": {
@@ -96170,7 +96170,7 @@
         "tags": [
           "AI Gateway Admin"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       },
       "get": {
         "operationId": "get_provider_key",
@@ -96214,7 +96214,7 @@
         "tags": [
           "AI Gateway Admin"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       },
       "patch": {
         "operationId": "update_provider_key",
@@ -96299,7 +96299,7 @@
         "tags": [
           "AI Gateway Admin"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/providers/{id}/models": {
@@ -96355,7 +96355,7 @@
         "tags": [
           "AI Gateway Admin"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/providers/{id}/models/refresh": {
@@ -96404,7 +96404,7 @@
         "tags": [
           "AI Gateway Admin"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/providers/{id}/models/{model_row_id}": {
@@ -96450,7 +96450,7 @@
         "tags": [
           "AI Gateway Admin"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       },
       "patch": {
         "operationId": "update_provider_model",
@@ -96512,7 +96512,7 @@
         "tags": [
           "AI Gateway Admin"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/providers/{id}/test": {
@@ -96579,7 +96579,7 @@
         "tags": [
           "AI Gateway Admin"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/summary-preference": {
@@ -96645,7 +96645,7 @@
         "tags": [
           "AI Provider Status"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/usage/by-project": {
@@ -96735,7 +96735,7 @@
         "tags": [
           "AI Gateway Usage"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/usage/by-provider": {
@@ -96824,7 +96824,7 @@
         "tags": [
           "AI Gateway Usage"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/usage/conversations": {
@@ -96952,7 +96952,7 @@
         "tags": [
           "AI Gateway Usage"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/usage/conversations/{conversation_id}": {
@@ -97023,7 +97023,7 @@
         "tags": [
           "AI Gateway Usage"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/usage/recent": {
@@ -97211,7 +97211,7 @@
         "tags": [
           "AI Gateway Usage"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/usage/summary": {
@@ -97297,7 +97297,7 @@
         "tags": [
           "AI Gateway Usage"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/usage/timeseries": {
@@ -97395,7 +97395,7 @@
         "tags": [
           "AI Gateway Usage"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/usage/top-models": {
@@ -97495,7 +97495,7 @@
         "tags": [
           "AI Gateway Usage"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/v1/batches": {
@@ -97561,7 +97561,7 @@
         "tags": [
           "AI Gateway"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/v1/batches/{batch_id}": {
@@ -97618,7 +97618,7 @@
         "tags": [
           "AI Gateway"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/v1/batches/{batch_id}/cancel": {
@@ -97675,7 +97675,7 @@
         "tags": [
           "AI Gateway"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/v1/chat/completions": {
@@ -97751,7 +97751,7 @@
         "tags": [
           "AI Gateway"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/v1/embeddings": {
@@ -97817,7 +97817,7 @@
         "tags": [
           "AI Gateway"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/v1/files": {
@@ -97913,7 +97913,7 @@
         "tags": [
           "AI Gateway"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/v1/files/{file_id}": {
@@ -97973,7 +97973,7 @@
         "tags": [
           "AI Gateway"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       },
       "get": {
         "operationId": "retrieve_file",
@@ -98028,7 +98028,7 @@
         "tags": [
           "AI Gateway"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/v1/files/{file_id}/content": {
@@ -98081,7 +98081,7 @@
         "tags": [
           "AI Gateway"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/v1/models": {
@@ -98117,7 +98117,7 @@
         "tags": [
           "AI Gateway"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/v1/responses": {
@@ -98208,7 +98208,7 @@
         "tags": [
           "AI Gateway"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/v1/responses/json": {
@@ -98255,7 +98255,7 @@
         "tags": [
           "AI Gateway"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/v1/responses/stream": {
@@ -98302,7 +98302,7 @@
         "tags": [
           "AI Gateway"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/workspace": {
@@ -98330,7 +98330,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/workspace-activity": {
@@ -98373,7 +98373,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/workspace/changes": {
@@ -98425,7 +98425,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/workspace/diff": {
@@ -98467,7 +98467,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/workspace/directory": {
@@ -98528,7 +98528,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/workspace/file": {
@@ -98568,7 +98568,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/workspace/file-limits": {
@@ -98598,7 +98598,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/workspace/file/download": {
@@ -98645,7 +98645,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/workspace/files": {
@@ -98687,7 +98687,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/workspace/preview-link": {
@@ -98727,7 +98727,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/ai/workspace/terminal": {
@@ -98796,7 +98796,7 @@
         "tags": [
           "AI Chat"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/analytics/active-visitors": {
@@ -134172,7 +134172,7 @@
         "tags": [
           "GenAI"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/otel/genai/traces/{project_id}/{trace_id}": {
@@ -134269,7 +134269,7 @@
         "tags": [
           "GenAI"
         ],
-        "x-maturity": "experimental"
+        "x-maturity": "beta"
       }
     },
     "/otel/global/spans": {

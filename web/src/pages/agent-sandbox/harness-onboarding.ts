@@ -3,6 +3,7 @@
 
 import type { AuthFlavorDto, ProviderCatalogDto } from '@/api/client'
 import { problemDetail } from '@/lib/api-problem'
+import { withReturnTo } from '@/lib/safe-return-to'
 
 export const LOCAL_LOGIN_METHOD = 'local'
 /** One-click subscription sign-in run by the server's own CLI. */
@@ -141,47 +142,22 @@ export function harnessSetupStatus(
 }
 
 /**
- * The workspace page a harness setup was opened from, if it is one: the
- * workspaces list or a single workspace. Anything else (missing, external,
- * malformed, another page) is null, and the setup pages show no way back.
+ * Where the agent credentials autofix runs with are managed. Not in the
+ * navigation: harnesses were retired as a console feature, and these pages
+ * remain only as the setup step autofix links to.
  */
-export function workspaceReturnTo(value: string | null): string | null {
-  if (
-    !value ||
-    !value.startsWith('/') ||
-    value.startsWith('//') ||
-    /[\\\s]/.test(value)
-  )
-    return null
-  const url = new URL(value, 'https://temps.invalid')
-  if (url.origin !== 'https://temps.invalid') return null
-  if (
-    url.pathname !== '/workspaces' &&
-    !/^\/workspaces\/[a-zA-Z0-9_-]+$/.test(url.pathname)
-  )
-    return null
-  return `${url.pathname}${url.search}`
-}
+export const AUTOFIX_CREDENTIALS_PATH = '/agent-sandbox/providers'
 
-/** "Back to workspaces" for the list, "Back to workspace" for one. */
-export function backToWorkspaceLabel(returnTo: string): string {
-  return new URL(returnTo, 'https://temps.invalid').pathname === '/workspaces'
-    ? 'Back to workspaces'
-    : 'Back to workspace'
-}
-
+/**
+ * The credentials list, or one harness's page, carrying a validated
+ * `returnTo` so finishing setup can send the user back to their task.
+ */
 export function harnessSetupHref(
   providerId: string | null,
-  returnTo: string | null
-) {
+  returnTo?: string | null
+): string {
   const path =
-    '/agent-sandbox/providers' +
+    AUTOFIX_CREDENTIALS_PATH +
     (providerId ? `/${encodeURIComponent(providerId)}` : '')
-  const back = workspaceReturnTo(returnTo)
-  return back ? `${path}?returnTo=${encodeURIComponent(back)}` : path
-}
-
-export function harnessSectionHref(path: string, search: string): string {
-  const back = workspaceReturnTo(new URLSearchParams(search).get('returnTo'))
-  return back ? `${path}?${new URLSearchParams({ returnTo: back })}` : path
+  return withReturnTo(path, returnTo)
 }

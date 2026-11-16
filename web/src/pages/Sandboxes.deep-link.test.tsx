@@ -3,7 +3,13 @@
 
 import { afterEach, expect, test } from 'bun:test'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { cleanup, fireEvent, render, waitFor } from '@testing-library/react'
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  waitFor,
+} from '@testing-library/react'
 import {
   MemoryRouter,
   Route,
@@ -14,10 +20,18 @@ import {
 import { AuthContext } from '@/contexts/AuthContext-shared'
 import { installBrowserWindow } from '@/test/dom'
 import { jsonResponse, mockApi } from '@/test/fetch-mock'
+import { RedirectWithQuery } from '@/components/routing/RedirectWithQuery'
 import Sandboxes from './Sandboxes'
 
 installBrowserWindow()
-afterEach(cleanup)
+const clients = new Set<QueryClient>()
+afterEach(async () => {
+  await act(async () => {
+    cleanup()
+    for (const client of clients) client.clear()
+    clients.clear()
+  })
+})
 
 function LocationProbe() {
   const location = useLocation()
@@ -33,11 +47,7 @@ function LocationProbe() {
   )
 }
 
-function setup(
-  entry = '/sandboxes?new=sandbox&keep=value',
-  workspacesOnly = false,
-  available = true
-) {
+function setup(entry = '/sandboxes?new=sandbox&keep=value', available = true) {
   const api = mockApi({
     'GET /platform/features': () => jsonResponse({ sandboxes: available }),
     'GET /v1/sandboxes': () =>
@@ -65,6 +75,7 @@ function setup(
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   })
+  clients.add(client)
   const view = render(
     <QueryClientProvider client={client}>
       <AuthContext.Provider
@@ -79,9 +90,10 @@ function setup(
         <MemoryRouter initialEntries={[entry]}>
           <Routes>
             <Route
-              path="/sandboxes"
-              element={<Sandboxes workspacesOnly={workspacesOnly} />}
+              path="/workspaces"
+              element={<RedirectWithQuery to="/sandboxes" />}
             />
+            <Route path="/sandboxes" element={<Sandboxes />} />
             <Route
               path="/sandboxes/:id"
               element={<p>Created sandbox detail</p>}
@@ -92,11 +104,11 @@ function setup(
       </AuthContext.Provider>
     </QueryClientProvider>
   )
-  return { view, api, client }
+  return { view, api }
 }
 
 test('onboarding opens the existing creation form and creation follows the existing detail navigation', async () => {
-  const { view, api, client } = setup()
+  const { view, api } = setup()
   await view.findByRole('dialog', { name: 'New sandbox' })
   fireEvent.change(view.getByLabelText('Name'), {
     target: { value: 'example' },
@@ -107,11 +119,10 @@ test('onboarding opens the existing creation form and creation follows the exist
     '/sandboxes/sbx_example'
   )
   expect(api.called('POST', '/v1/sandboxes')).toBe(true)
-  client.clear()
 })
 
 test('closing removes only the creation parameter', async () => {
-  const { view, client } = setup()
+  const { view } = setup()
   await view.findByRole('dialog', { name: 'New sandbox' })
   fireEvent.click(view.getByRole('button', { name: 'Close' }))
   await waitFor(() =>
@@ -119,11 +130,10 @@ test('closing removes only the creation parameter', async () => {
       '/sandboxes?keep=value'
     )
   )
-  client.clear()
 })
 
 test('the normal New sandbox action uses the same bookmarkable form', async () => {
-  const { view, client } = setup('/sandboxes?keep=value')
+  const { view } = setup('/sandboxes?keep=value')
   const back = view.getByRole('button', { name: 'Back in history' })
   expect(view.queryByRole('dialog')).toBeNull()
   fireEvent.click(view.getByRole('button', { name: 'New sandbox' }))
@@ -133,19 +143,24 @@ test('the normal New sandbox action uses the same bookmarkable form', async () =
   fireEvent.click(back)
   await waitFor(() => expect(view.queryByRole('dialog')).toBeNull())
   expect(view.getByTestId('location').textContent).toBe('/sandboxes?keep=value')
-  client.clear()
 })
 
 test('a server without sandbox support explains the missing capability without creating anything', async () => {
-  const { view, api, client } = setup(undefined, false, false)
+  const { view, api } = setup(undefined, false)
   await view.findByText(/Sandboxes are not available on this server/)
   expect(api.called('POST', '/v1/sandboxes')).toBe(false)
-  client.clear()
 })
 
-test('workspace lists ignore sandbox creation parameters', () => {
-  const { view, api, client } = setup(undefined, true)
-  expect(view.queryByRole('dialog')).toBeNull()
+test('legacy workspace links preserve sandbox creation through the existing redirect', async () => {
+  let fixture: ReturnType<typeof setup> | undefined
+  await act(async () => {
+    fixture = setup('/workspaces?new=sandbox&keep=value')
+  })
+  if (!fixture) throw new Error('Legacy workspace route did not render')
+  const { view, api } = fixture
+  await view.findByRole('dialog', { name: 'New sandbox' })
+  expect(view.getByTestId('location').textContent).toBe(
+    '/sandboxes?new=sandbox&keep=value'
+  )
   expect(api.called('POST', '/v1/sandboxes')).toBe(false)
-  client.clear()
 })

@@ -145,3 +145,38 @@ test("the returning rate never divides the previous window's returning visitors 
   expect(view.queryByText('25%')).toBeNull()
   expect(view.queryByText('50%')).toBeNull()
 })
+
+test('the overview leaves linked vaults to Settings → Integrations', async () => {
+  let lastDeploymentReads = 0
+  let vaultReads = 0
+  mockApi({
+    'GET /projects/7/last-deployment': () => {
+      lastDeploymentReads += 1
+      return jsonResponse({ deployment: null })
+    },
+    'GET /projects/7/linked-vaults': () => {
+      vaultReads += 1
+      return jsonResponse({ items: [], total: 0, page: 1, page_size: 20 })
+    },
+  })
+  const project = { id: 7, slug: 'example', name: 'Example' } as ProjectResponse
+  function ProjectPage() {
+    useQuery(getLastDeploymentOptions({ path: { id: project.id } }))
+    return <ProjectOverview project={project} />
+  }
+  const view = render(
+    <QueryClientProvider
+      client={
+        new QueryClient({ defaultOptions: { queries: { retry: false } } })
+      }
+    >
+      <MemoryRouter>
+        <ProjectPage />
+      </MemoryRouter>
+    </QueryClientProvider>
+  )
+  await waitFor(() => expect(lastDeploymentReads).toBe(1))
+  expect(view.queryByLabelText('Linked vaults')).toBeNull()
+  expect(view.queryByText('No vaults linked')).toBeNull()
+  expect(vaultReads).toBe(0)
+})

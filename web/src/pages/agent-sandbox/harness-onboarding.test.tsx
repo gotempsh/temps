@@ -11,7 +11,6 @@ import { ProviderEditor } from './AgentSandboxProviderDetail'
 import { SetupWizardShell } from '@/components/project/setup/SetupWizardShell'
 import {
   harnessSetupHref,
-  harnessSectionHref,
   harnessCheckError,
   harnessSetupStatus,
   harnessConnectionMethods,
@@ -19,8 +18,6 @@ import {
   openAiCompatibleCredential,
   openAiCompatibleModelSelection,
   openAiCompatibleUpstreamModel,
-  workspaceReturnTo,
-  backToWorkspaceLabel,
   credentialVerificationMessage,
 } from './harness-onboarding'
 
@@ -75,7 +72,6 @@ describe('harness onboarding', () => {
               credential_saved: true,
             }}
             isActive={false}
-            embedded
           />
         </MemoryRouter>
       </QueryClientProvider>
@@ -84,29 +80,18 @@ describe('harness onboarding', () => {
     expect(html).toContain('Verify saved login')
     expect(html).toContain('not verified')
   })
-  test('section navigation preserves only an allowlisted workspace return path', () => {
-    const returnTo = '/workspaces/app_example?tab=files'
-    for (const path of [
-      '/agent-sandbox',
-      '/agent-sandbox/providers',
-      '/agent-sandbox/sandbox',
-      '/agent-sandbox/preview',
-      '/agent-sandbox/secrets',
-    ]) {
-      const href = harnessSectionHref(
-        path,
-        `?returnTo=${encodeURIComponent(returnTo)}&credential=ignored`
-      )
-      expect(
-        new URL(href, 'https://temps.invalid').searchParams.get('returnTo')
-      ).toBe(returnTo)
-      expect(href).not.toContain('credential')
-      expect(harnessSectionHref(path, '')).toBe(path)
-      // Not a workspace page: no return path is carried at all.
-      expect(harnessSectionHref(path, '?returnTo=https://example.com')).toBe(
-        path
-      )
-    }
+  test('setup links carry only a safe in-app return path', () => {
+    expect(harnessSetupHref(null)).toBe('/agent-sandbox/providers')
+    expect(harnessSetupHref('claude_cli')).toBe(
+      '/agent-sandbox/providers/claude_cli'
+    )
+    const returnTo = '/projects/demo/settings/automation?section=autofixer'
+    const link = new URL(
+      harnessSetupHref('claude_cli', returnTo),
+      'https://temps.invalid'
+    )
+    expect(link.pathname).toBe('/agent-sandbox/providers/claude_cli')
+    expect(link.searchParams.get('returnTo')).toBe(returnTo)
   })
   test('Codex shows one method at a time and prefers a detected host login', () => {
     const codex: ProviderCatalogDto = {
@@ -360,37 +345,19 @@ describe('harness onboarding', () => {
     ).toBe('Needs attention')
   })
 
-  test('returns to the original workspace after setup', () => {
-    const destination = '/workspaces/app_example?tab=files'
-    expect(workspaceReturnTo(destination)).toBe(destination)
-    const link = new URL(
-      harnessSetupHref('claude_cli', destination),
-      'https://temps.invalid'
-    )
-    expect(link.pathname).toBe('/agent-sandbox/providers/claude_cli')
-    expect(link.searchParams.get('returnTo')).toBe(destination)
-  })
-
-  test('rejects external, malformed, and unrelated setup return paths', () => {
+  test('drops external and malformed return paths instead of forwarding them', () => {
     for (const value of [
       null,
       '//example.com',
       'https://example.com',
       '/\\example.com',
-      '/settings',
-      '/workspaces/../../settings',
-      // The retired AI workspace page is no longer a destination.
-      '/ai-first',
-      '/ai-first?application=app_example',
-      '/workspaces\n',
+      '/projects\n',
       'javascript:alert(1)',
     ]) {
-      expect(workspaceReturnTo(value)).toBeNull()
+      expect(harnessSetupHref('claude_cli', value)).toBe(
+        '/agent-sandbox/providers/claude_cli'
+      )
     }
-    expect(workspaceReturnTo('/workspaces')).toBe('/workspaces')
-    expect(workspaceReturnTo('/workspaces/app_example')).toBe(
-      '/workspaces/app_example'
-    )
   })
 
   const renderRow = (row: ProviderCatalogDto) =>
@@ -398,7 +365,7 @@ describe('harness onboarding', () => {
       <MemoryRouter>
         <table>
           <tbody>
-            <HarnessSetupRow provider={row} returnTo={null} />
+            <HarnessSetupRow provider={row} />
           </tbody>
         </table>
       </MemoryRouter>
@@ -435,7 +402,7 @@ describe('harness onboarding', () => {
     })
     expect(html).toContain('<tr')
     expect(html).toContain('aria-label="Manage Claude Code"')
-    expect(html).toContain('href="/agent-sandbox/providers/claude_cli"')
+    expect(html).toContain(`href="${harnessSetupHref('claude_cli')}"`)
     expect(html).toContain('Claude subscription')
     expect(html).toContain('Credential saved')
     // The name is the only link: no separate Connect/Manage button.
@@ -494,17 +461,20 @@ describe('harness onboarding', () => {
     expect(html).not.toContain('reusable credential is never injected')
   })
 
-  test('a setup link carries no return path unless it came from a workspace', () => {
+  test('a setup link carries a return path only when one is given and safe', () => {
     expect(harnessSetupHref('claude_cli', null)).toBe(
       '/agent-sandbox/providers/claude_cli'
     )
-    expect(harnessSetupHref(null, '/ai-first')).toBe('/agent-sandbox/providers')
-    expect(harnessSetupHref(null, '/workspaces')).toBe(
-      `/agent-sandbox/providers?returnTo=${encodeURIComponent('/workspaces')}`
+    expect(harnessSetupHref(null, 'https://example.com')).toBe(
+      '/agent-sandbox/providers'
+    )
+    const returnTo = '/projects/demo/settings/automation'
+    expect(harnessSetupHref(null, returnTo)).toBe(
+      `/agent-sandbox/providers?returnTo=${encodeURIComponent(returnTo)}`
     )
   })
 
-  test('harness setup only offers a way back when it was opened from a workspace', () => {
+  test('harness setup only offers a way back when it was opened from a task', () => {
     const editor = (returnTo?: string | null) =>
       renderToStaticMarkup(
         <QueryClientProvider client={new QueryClient()}>
@@ -517,13 +487,9 @@ describe('harness onboarding', () => {
           </MemoryRouter>
         </QueryClientProvider>
       )
-    expect(editor()).not.toContain('Back to workspace')
-    expect(editor('/workspaces')).toContain('Back to workspaces')
-    const one = editor('/workspaces/app_example')
-    expect(one).toContain('Back to workspace<')
-    expect(one).toContain('href="/workspaces/app_example"')
-    expect(backToWorkspaceLabel('/workspaces?view=grid')).toBe(
-      'Back to workspaces'
-    )
+    expect(editor()).not.toContain('>Back<')
+    const back = editor('/projects/demo/settings/automation')
+    expect(back).toContain('>Back<')
+    expect(back).toContain('href="/projects/demo/settings/automation"')
   })
 })

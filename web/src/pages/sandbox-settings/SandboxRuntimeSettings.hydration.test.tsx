@@ -7,7 +7,7 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { MemoryRouter } from 'react-router'
 
 import { AuthContext } from '@/contexts/AuthContext-shared'
-import { AgentSandboxSandboxPage } from './AgentSandboxSandboxPage'
+import { SandboxRuntimeSettings } from './SandboxRuntimeSettings'
 
 /**
  * Settings are often already cached when this page mounts (another settings
@@ -37,7 +37,7 @@ test('settings already in the cache fill the form on the first render', () => {
     <QueryClientProvider client={client}>
       <AuthContext.Provider value={auth}>
         <MemoryRouter>
-          <AgentSandboxSandboxPage />
+          <SandboxRuntimeSettings />
         </MemoryRouter>
       </AuthContext.Provider>
     </QueryClientProvider>

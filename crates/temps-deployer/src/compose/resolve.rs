@@ -427,6 +427,7 @@ impl ComposeExecutor {
             return Ok(override_content.to_string());
         }
         yaml_serde::to_string(&overlay).map_err(|error| ComposeError::InvalidOverride {
+            check: None,
             project: project_name.to_string(),
             reason: format!(
                 "failed to re-serialize the override after removing duplicate list items: {error}"
@@ -479,10 +480,12 @@ impl ComposeExecutor {
                 }
             }
             ComposeError::SecurityPolicyViolation {
+                check,
                 service,
                 field,
                 reason,
             } => ComposeError::SecurityPolicyViolation {
+                check,
                 service,
                 field,
                 reason: redact(reason),
@@ -496,7 +499,12 @@ impl ComposeExecutor {
                 path: redact(path),
                 reason: redact(reason),
             },
-            ComposeError::InvalidOverride { project, reason } => ComposeError::InvalidOverride {
+            ComposeError::InvalidOverride {
+                check,
+                project,
+                reason,
+            } => ComposeError::InvalidOverride {
+                check,
                 project,
                 reason: redact(reason),
             },

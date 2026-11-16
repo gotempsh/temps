@@ -4,8 +4,6 @@
 import { useIsInstanceAdmin } from '@/hooks/useIsInstanceAdmin'
 import {
   getProjectsInfiniteOptions,
-  listGlobalMcpsOptions,
-  listGlobalSkillsOptions,
   listProjectGroupsOptions,
   listServicesInfiniteOptions,
 } from '@/api/client/@tanstack/react-query.gen'
@@ -269,12 +267,6 @@ const mainNavItems: NavigationItem[] = [
       'terminal',
       'environment',
     ],
-  },
-  {
-    title: 'Workspaces',
-    url: '/workspaces',
-    icon: Folder,
-    keywords: ['workspace', 'context', 'persistent'],
   },
   {
     title: 'Get started',
@@ -579,35 +571,6 @@ const settingsNavItems: NavigationItem[] = [
     keywords: ['ai', 'activity', 'traces', 'telemetry', 'otel', 'spans'],
   },
   {
-    title: 'AI Gateway setup',
-    url: '/ai-gateway/setup',
-    icon: Sparkles,
-    keywords: [
-      'ai',
-      'setup',
-      'quickstart',
-      'code examples',
-      'curl',
-      'sdk',
-      'endpoint',
-      'byok',
-    ],
-  },
-  {
-    title: 'Workflows',
-    url: '/ai-workflows',
-    icon: Bot,
-    keywords: [
-      'ai',
-      'ai workflows',
-      'workflows',
-      'agents',
-      'sandbox',
-      'automation',
-      'autopilot',
-    ],
-  },
-  {
     // Always listed: the sidebar's setup card can be hidden, and this is the
     // way back to the checklist.
     title: 'Finish setting up',
@@ -634,36 +597,6 @@ const settingsNavItems: NavigationItem[] = [
       'claude code',
       'cursor',
       'agent setup',
-    ],
-  },
-  {
-    title: 'Skills',
-    url: '/skills',
-    icon: Wand2,
-    keywords: [
-      'skills',
-      'ai',
-      'agents',
-      'claude',
-      'instructions',
-      'prompts',
-      'global',
-    ],
-  },
-  {
-    title: 'MCP servers',
-    url: '/mcp-servers',
-    icon: Server,
-    keywords: [
-      'mcp',
-      'model',
-      'context',
-      'protocol',
-      'tools',
-      'servers',
-      'agents',
-      'claude',
-      'global',
     ],
   },
   {
@@ -1173,33 +1106,10 @@ export const projectNavItems: NavigationItem[] = [
     keywords: ['webhooks', 'hooks', 'events', 'callbacks', 'integrations'],
   },
   {
-    title: 'Service skills',
-    url: settingsSectionPath('integrations', 'skills'),
-    icon: Wand2,
-    keywords: [
-      'skills',
-      'ai',
-      'agents',
-      'claude',
-      'instructions',
-      'service',
-      'project',
-    ],
-  },
-  {
-    title: 'Service MCP servers',
-    url: settingsSectionPath('integrations', 'mcp-servers'),
-    icon: Server,
-    keywords: [
-      'mcp',
-      'model',
-      'context',
-      'protocol',
-      'tools',
-      'servers',
-      'service',
-      'project',
-    ],
+    title: 'Linked vaults',
+    url: settingsSectionPath('integrations', 'vaults'),
+    icon: KeyRound,
+    keywords: ['vault', 'vaults', 'access', 'sessions', 'bundles', 'services'],
   },
   {
     title: 'Metrics',
@@ -1387,26 +1297,6 @@ export function CommandPalette() {
   })
   const groups = useMemo(() => groupsData?.groups ?? [], [groupsData])
 
-  const { data: globalSkillsData, refetch: refetchSkills } = useQuery({
-    ...listGlobalSkillsOptions(),
-    enabled: open,
-    staleTime: 60_000,
-  })
-  const globalSkills = useMemo(
-    () => globalSkillsData?.items ?? [],
-    [globalSkillsData]
-  )
-
-  const { data: globalMcpServersData, refetch: refetchMcp } = useQuery({
-    ...listGlobalMcpsOptions(),
-    enabled: open,
-    staleTime: 60_000,
-  })
-  const globalMcpServers = useMemo(
-    () => globalMcpServersData?.items ?? [],
-    [globalMcpServersData]
-  )
-
   const {
     data: serviceResponse,
     refetch: refetchServices,
@@ -1476,18 +1366,9 @@ export function CommandPalette() {
     if (open) {
       refetchProjects()
       refetchGroups()
-      refetchSkills()
-      refetchMcp()
       refetchServices()
     }
-  }, [
-    open,
-    refetchProjects,
-    refetchGroups,
-    refetchSkills,
-    refetchMcp,
-    refetchServices,
-  ])
+  }, [open, refetchProjects, refetchGroups, refetchServices])
 
   useEffect(() => {
     const down = (e: KeyboardEvent) => {
@@ -1662,20 +1543,6 @@ export function CommandPalette() {
     })
   }, [groups])
 
-  const skillsFuse = useMemo(() => {
-    return new Fuse(globalSkills, {
-      keys: [
-        { name: 'name', weight: 2 },
-        { name: 'slug', weight: 1.5 },
-        { name: 'description', weight: 1 },
-      ],
-      threshold: 0.3,
-      includeScore: true,
-      shouldSort: true,
-      minMatchCharLength: 1,
-    })
-  }, [globalSkills])
-
   // Every project x a bounded set of its pages, so the palette can jump
   // straight to "<project> Deployments" from anywhere instead of only offering
   // project sub-pages once you are already inside that project.
@@ -1714,20 +1581,6 @@ export function CommandPalette() {
     })
   }, [crossProjectItems])
 
-  const mcpFuse = useMemo(() => {
-    return new Fuse(globalMcpServers, {
-      keys: [
-        { name: 'name', weight: 2 },
-        { name: 'slug', weight: 1.5 },
-        { name: 'description', weight: 1 },
-      ],
-      threshold: 0.3,
-      includeScore: true,
-      shouldSort: true,
-      minMatchCharLength: 1,
-    })
-  }, [globalMcpServers])
-
   // Browse mode: the full, sectioned lists shown when the input is empty.
   // Once the user types, `rankedResults` takes over — see the comment there.
   const browseResults = useMemo(() => {
@@ -1750,15 +1603,11 @@ export function CommandPalette() {
       projectNav: projectNavigation,
       groups,
       projects,
-      skills: globalSkills,
-      mcpServers: globalMcpServers,
       actions: commandActions,
     }
   }, [
     groups,
     projects,
-    globalSkills,
-    globalMcpServers,
     pluginNavItems,
     projectPluginNavItems,
     currentProjectSlug,
@@ -1875,40 +1724,13 @@ export function CommandPalette() {
       ],
     }))
 
-    const skillPages: CommandDestination[] = globalSkills.map((skill) => ({
-      id: `skill:${skill.slug}`,
-      title: skill.name,
-      description: skill.description || `Open skill ${skill.name}`,
-      url: `/skills/${skill.slug}`,
-      category: 'Skill',
-      keywords: ['skill', skill.name, skill.slug],
-    }))
-    const mcpPages: CommandDestination[] = globalMcpServers.map((mcp) => ({
-      id: `mcp:${mcp.slug}`,
-      title: mcp.name,
-      description: mcp.description || `Open MCP server ${mcp.name}`,
-      url: `/mcp-servers/${mcp.slug}`,
-      category: 'MCP Server',
-      keywords: ['mcp', 'server', mcp.name, mcp.slug],
-    }))
-
     return dedupeCommandDestinations([
       ...instancePages,
       ...groupPages,
       ...projectPages,
       ...servicePages,
-      ...skillPages,
-      ...mcpPages,
     ])
-  }, [
-    browseResults,
-    currentProject,
-    groups,
-    projects,
-    services,
-    globalSkills,
-    globalMcpServers,
-  ])
+  }, [browseResults, currentProject, groups, projects, services])
 
   const commandDestinationFuse = useMemo(
     () =>
@@ -2005,32 +1827,6 @@ export function CommandPalette() {
       }
     }
 
-    for (const result of skillsFuse.search(search)) {
-      const skill = result.item
-      out.push({
-        key: `skill:${skill.slug}`,
-        title: skill.name,
-        subtitle: skill.slug,
-        category: 'Skill',
-        icon: <Wand2 className="h-4 w-4" />,
-        score: rank(`skill:${skill.slug}`, skill.name, result.score),
-        run: () => navigate(`/skills/${skill.slug}`),
-      })
-    }
-
-    for (const result of mcpFuse.search(search)) {
-      const mcp = result.item
-      out.push({
-        key: `mcp:${mcp.slug}`,
-        title: mcp.name,
-        subtitle: mcp.slug,
-        category: 'MCP Server',
-        icon: <Server className="h-4 w-4" />,
-        score: rank(`mcp:${mcp.slug}`, mcp.name, result.score),
-        run: () => navigate(`/mcp-servers/${mcp.slug}`),
-      })
-    }
-
     for (const action of commandActions) {
       const actionFuse = new Fuse([action.title, ...action.keywords], {
         threshold: 0.4,
@@ -2066,8 +1862,6 @@ export function CommandPalette() {
     groupsFuse,
     projectsFuse,
     crossProjectFuse,
-    skillsFuse,
-    mcpFuse,
     currentProject,
     rank,
     navigate,
@@ -2181,8 +1975,6 @@ export function CommandPalette() {
     )
     const groupsById = new Map(groups.map((g) => [String(g.id), g]))
     const projectsById = new Map(projects.map((p) => [String(p.id), p]))
-    const skillsBySlug = new Map(globalSkills.map((s) => [s.slug, s]))
-    const mcpBySlug = new Map(globalMcpServers.map((m) => [m.slug, m]))
 
     const out: RecentEntry[] = []
     for (const key of recent(7)) {
@@ -2204,26 +1996,6 @@ export function CommandPalette() {
           title: project.slug,
           icon: <ServiceIcon service={project} size="xs" />,
           run: () => navigate(`/projects/${project.slug}`),
-        })
-      } else if (key.startsWith('skill:')) {
-        const skill = skillsBySlug.get(key.slice('skill:'.length))
-        if (!skill) continue
-        out.push({
-          key,
-          title: skill.name,
-          subtitle: skill.slug,
-          icon: <Wand2 className="h-4 w-4" />,
-          run: () => navigate(`/skills/${skill.slug}`),
-        })
-      } else if (key.startsWith('mcp:')) {
-        const mcp = mcpBySlug.get(key.slice('mcp:'.length))
-        if (!mcp) continue
-        out.push({
-          key,
-          title: mcp.name,
-          subtitle: mcp.slug,
-          icon: <Server className="h-4 w-4" />,
-          run: () => navigate(`/mcp-servers/${mcp.slug}`),
         })
       } else if (key.startsWith('action:')) {
         const action = commandActions.find(
@@ -2260,8 +2032,6 @@ export function CommandPalette() {
     currentProject,
     groups,
     projects,
-    globalSkills,
-    globalMcpServers,
     canViewAuditLogs,
     visibleObserveNavItems,
     extensionSettingsNavItems,
@@ -2568,62 +2338,6 @@ export function CommandPalette() {
                     >
                       <item.icon className="h-4 w-4" />
                       <span>{item.title}</span>
-                    </CommandItem>
-                  ))}
-                </CommandGroup>
-                <CommandSeparator />
-              </>
-            )}
-
-          {/* Skills */}
-          {showFullBrowseCatalog &&
-            !search &&
-            browseResults.skills.length > 0 && (
-              <>
-                <CommandGroup heading="Skills">
-                  {browseResults.skills.slice(0, 10).map((skill) => (
-                    <CommandItem
-                      key={`skill-${skill.id}`}
-                      onSelect={() =>
-                        runWithFrecency(`skill:${skill.slug}`, () =>
-                          navigate(`/skills/${skill.slug}`)
-                        )
-                      }
-                      className="flex items-center gap-2"
-                    >
-                      <Wand2 className="h-4 w-4" />
-                      <span className="truncate">{skill.name}</span>
-                      <span className="text-xs text-muted-foreground font-mono truncate">
-                        {skill.slug}
-                      </span>
-                    </CommandItem>
-                  ))}
-                </CommandGroup>
-                <CommandSeparator />
-              </>
-            )}
-
-          {/* MCP Servers */}
-          {showFullBrowseCatalog &&
-            !search &&
-            browseResults.mcpServers.length > 0 && (
-              <>
-                <CommandGroup heading="MCP servers">
-                  {browseResults.mcpServers.slice(0, 10).map((mcp) => (
-                    <CommandItem
-                      key={`mcp-${mcp.id}`}
-                      onSelect={() =>
-                        runWithFrecency(`mcp:${mcp.slug}`, () =>
-                          navigate(`/mcp-servers/${mcp.slug}`)
-                        )
-                      }
-                      className="flex items-center gap-2"
-                    >
-                      <Server className="h-4 w-4" />
-                      <span className="truncate">{mcp.name}</span>
-                      <span className="text-xs text-muted-foreground font-mono truncate">
-                        {mcp.slug}
-                      </span>
                     </CommandItem>
                   ))}
                 </CommandGroup>

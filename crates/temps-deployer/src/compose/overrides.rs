@@ -535,6 +535,7 @@ impl ComposeExecutor {
             .find(|service| relaxed_capability_services.contains(service))
         {
             return Err(ComposeError::SecurityPolicyViolation {
+                check: None,
                 service: service.clone(),
                 field: "sandbox".to_string(),
                 reason:
