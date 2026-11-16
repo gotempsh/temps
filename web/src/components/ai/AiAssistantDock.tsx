@@ -612,6 +612,9 @@ export function DockBody({
   // When true, the body shows the project picker for starting a fresh
   // project-scoped chat (a new thread, not tied to a deployment/alert).
   const [picking, setPicking] = useState(false)
+  // The chat search lives here, not in the list: on narrow screens the list
+  // unmounts while a chat is open, and coming back must keep the search.
+  const [chatQuery, setChatQuery] = useState('')
 
   const listedCount = useCallback(
     () =>
@@ -1182,6 +1185,8 @@ export function DockBody({
         <ConversationList
           loading={loadingList && conversations.length === 0}
           conversations={conversations}
+          query={chatQuery}
+          onQueryChange={setChatQuery}
           hasMore={hasMoreChats}
           loadingMore={loadingMoreChats}
           onLoadMore={loadOlderChats}
@@ -1576,6 +1581,8 @@ export function DockBody({
             <ConversationList
               loading={loadingList && conversations.length === 0}
               conversations={conversations}
+              query={chatQuery}
+              onQueryChange={setChatQuery}
               hasMore={hasMoreChats}
               loadingMore={loadingMoreChats}
               onLoadMore={loadOlderChats}
@@ -1772,9 +1779,11 @@ export function DockBody({
   )
 }
 
-function ConversationList({
+export function ConversationList({
   loading,
   conversations,
+  query,
+  onQueryChange,
   hasMore,
   loadingMore,
   onLoadMore,
@@ -1787,6 +1796,9 @@ function ConversationList({
 }: {
   loading: boolean
   conversations: ProjectConversation[]
+  /** The search text, owned by the caller so it outlives this list. */
+  query: string
+  onQueryChange: (query: string) => void
   /** Whether older chats than the ones shown exist. */
   hasMore: boolean
   loadingMore: boolean
@@ -1800,7 +1812,6 @@ function ConversationList({
   /** Starts a new chat that joins the given workspace. */
   onNewChatIn: (workspace: NewChatWorkspaceChoice) => void
 }) {
-  const [query, setQuery] = useState('')
   const shown = useMemo(
     () => filterChats(conversations, query),
     [conversations, query]
@@ -1845,7 +1856,7 @@ function ConversationList({
         <Input
           type="search"
           value={query}
-          onChange={(e) => setQuery(e.target.value)}
+          onChange={(e) => onQueryChange(e.target.value)}
           placeholder="Search chats"
           aria-label="Search chats"
           className="h-8 pl-8 text-sm"
