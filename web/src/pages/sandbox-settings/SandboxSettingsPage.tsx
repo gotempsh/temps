@@ -24,10 +24,9 @@ export function SandboxSettingsPage() {
   usePageTitle(section?.title ?? 'Sandbox settings')
 
   return (
-    <PageContainer>
+    <PageContainer width="form">
       <PageHeader
         title="Sandbox settings"
-        description="The runtime new sandboxes start with, and the gateway that serves their preview URLs."
         actions={
           <Button variant="outline" size="sm" asChild>
             <Link to="/sandboxes">

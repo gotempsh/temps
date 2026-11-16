@@ -45,7 +45,7 @@ export function AgentSandboxProvidersList() {
     <PageContainer>
       <PageHeader
         title="Autofix agent credentials"
-        description="Autofix runs a coding agent in a sandbox to propose a fix for a crash. Connect the account it signs in with; one is enough."
+        description="Connect one account for autofix's coding agent to sign in with."
         actions={
           returnTo ? (
             <Button asChild variant="outline" size="sm">

@@ -80,6 +80,12 @@ type Section = {
    * action on the right), so the page adds no title of its own.
    */
   ownsPageHeader?: boolean
+  /**
+   * The content is a record list or operational panel, not a form, so it
+   * spans the page under its heading instead of sitting in the settings
+   * column.
+   */
+  fullWidth?: boolean
 }
 
 /**
@@ -259,6 +265,7 @@ export function CombinedProjectSettings({
             'Shared services that sandboxes and AI chats in this service can request access to.',
           icon: Vault,
           content: <ProjectVaultAccess projectId={project.id} />,
+          fullWidth: true,
         },
         {
           id: 'extensions',
@@ -300,6 +307,7 @@ export function CombinedProjectSettings({
               id={settingsSectionDomId(section.id)}
               title={section.title}
               description={section.description}
+              fullWidth={section.fullWidth}
             >
               {section.content}
             </SettingsBlock>
@@ -314,17 +322,20 @@ export function CombinedProjectSettings({
  * One always-open group of settings, laid out like `SettingsGroup`: what it
  * is on the left, the settings on the right. The content is marked as being
  * on a settings surface, so cards and sections inside it render flat instead
- * of as a box in a box.
+ * of as a box in a box. A `fullWidth` group (a record list, not a form) puts
+ * its heading above and spans the page instead.
  */
-function SettingsBlock({
+export function SettingsBlock({
   id,
   title,
   description,
+  fullWidth = false,
   children,
 }: {
   id: string
   title: string
   description?: string
+  fullWidth?: boolean
   children: ReactNode
 }) {
   const headingId = `${id}-heading`
@@ -332,7 +343,11 @@ function SettingsBlock({
     <section
       id={id}
       aria-labelledby={headingId}
-      className="grid min-w-0 scroll-mt-4 gap-5 md:grid-cols-[minmax(0,1fr)_minmax(0,2fr)] md:gap-10"
+      className={
+        fullWidth
+          ? 'min-w-0 scroll-mt-4 space-y-5'
+          : 'grid min-w-0 scroll-mt-4 gap-5 md:grid-cols-[minmax(0,1fr)_minmax(0,2fr)] md:gap-10'
+      }
     >
       <div className="min-w-0">
         <h2 id={headingId} className="text-base font-semibold">
