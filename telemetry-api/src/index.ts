@@ -9,6 +9,8 @@ import { initGeo } from "./geo.js";
 import { CountryBackfiller } from "./backfill.js";
 import { gracefulShutdown } from "./shutdown.js";
 import { errorFields, log } from "./log.js";
+import { conflictingLimits, ingestLimitsFromEnv } from "./limits.js";
+import { createRateLimiter } from "./rate-limit.js";
 
 const PORT = parseInt(process.env.PORT ?? "4200", 10);
 
@@ -29,12 +31,30 @@ async function main() {
   const backfill = new CountryBackfiller(pool);
   backfill.start();
 
-  const events = createEventsRoutes(pool, { backfill });
+  // Abuse limits for the public ingest routes; see limits.ts for each
+  // variable and its default.
+  const limits = ingestLimitsFromEnv();
+  log("info", "server", "ingest limits", { ...limits });
+  for (const conflict of conflictingLimits(limits)) {
+    log("warn", "config", "ingest limits contradict each other", { conflict });
+  }
+
+  const events = createEventsRoutes(pool, {
+    backfill,
+    rateLimiter: createRateLimiter(limits.eventsPerMinute),
+    limits,
+  });
   const stats = createStatsRoutes(pool);
-  const failureReports = createFailureReportsRoutes(pool);
+  const failureReports = createFailureReportsRoutes(pool, {
+    rateLimiter: createRateLimiter(limits.failureReportsPerMinute),
+    maxTextChars: limits.failureReportMaxChars,
+  });
 
   const server = Bun.serve({
     port: PORT,
+    // Bun answers 413 above this before a handler reads the body. Its own
+    // default (128 MiB) would let one request write that much into Postgres.
+    maxRequestBodySize: limits.maxRequestBodyBytes,
     async fetch(req) {
       const url = new URL(req.url);
       const method = req.method.toUpperCase();

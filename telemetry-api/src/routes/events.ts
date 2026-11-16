@@ -2,10 +2,20 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import type { Pool } from "pg";
-import { countryForRequest } from "../geo.js";
+import { clientIpFromHeaders, countryForRequest } from "../geo.js";
 import { backfillTargets, insertEvent, type IngestBody } from "../db/events.js";
 import type { CountryBackfillQueue } from "../backfill.js";
 import { errorFields, log } from "../log.js";
+import { ingestLimitsFromEnv, type IngestLimits } from "../limits.js";
+import { createRateLimiter, rateLimitedResponse, type RateLimiter } from "../rate-limit.js";
+
+// The limits the event routes enforce (see limits.ts for each variable).
+// temps_version is capped as well as properties, or it could carry what the
+// properties cap refuses.
+export type EventLimits = Pick<
+  IngestLimits,
+  "eventPropertiesMaxBytes" | "eventsBatchMaxEvents" | "tempsVersionMaxChars"
+>;
 
 // Runtime event types are kept in lockstep with the Rust binary's
 // `TelemetryEventKind::as_str()` (temps-core/src/telemetry.rs). The validator
@@ -122,7 +132,11 @@ function sanitizeProperties(raw: Record<string, unknown>): Record<string, unknow
   );
 }
 
-function parseEvent(raw: unknown): IngestBody | { error: string } {
+function jsonByteLength(value: unknown): number {
+  return Buffer.byteLength(JSON.stringify(value), "utf8");
+}
+
+function parseEvent(raw: unknown, limits: EventLimits): IngestBody | { error: string } {
   if (typeof raw !== "object" || raw === null) {
     return { error: "event must be an object" };
   }
@@ -141,6 +155,16 @@ function parseEvent(raw: unknown): IngestBody | { error: string } {
     obj.properties !== undefined && isValidProperties(obj.properties)
       ? sanitizeProperties(obj.properties)
       : {};
+
+  if (jsonByteLength(properties) > limits.eventPropertiesMaxBytes) {
+    return { error: `properties exceeds ${limits.eventPropertiesMaxBytes} bytes` };
+  }
+  if (
+    typeof obj.temps_version === "string" &&
+    obj.temps_version.length > limits.tempsVersionMaxChars
+  ) {
+    return { error: `temps_version exceeds ${limits.tempsVersionMaxChars} chars` };
+  }
 
   if (obj.event_type === "cli_setup_step") {
     const allowed: Record<string, readonly string[]> = {
@@ -191,14 +215,34 @@ export interface EventsRoutesDeps {
   // the database on the request path (see backfill.ts).
   backfill: CountryBackfillQueue;
   resolveCountry?: (req: Request) => string | null;
+  // Per-IP event budget shared by both routes; a batch spends one per event.
+  rateLimiter?: RateLimiter;
+  resolveClientIp?: (req: Request) => string | null;
+  limits?: EventLimits;
 }
 
 export function createEventsRoutes(pool: Pool, deps: EventsRoutesDeps) {
   const resolveCountry = deps.resolveCountry ?? countryForRequest;
+  const resolveClientIp = deps.resolveClientIp ?? clientIpFromHeaders;
+  const rateLimiter =
+    deps.rateLimiter ?? createRateLimiter(ingestLimitsFromEnv().eventsPerMinute);
+  const limits: EventLimits = deps.limits ?? ingestLimitsFromEnv();
+  const batchMax = limits.eventsBatchMaxEvents;
+
+  // No resolvable IP (a direct connection with no proxy headers) fails open
+  // rather than blocking every request behind a misconfigured proxy; the body
+  // and properties caps still apply either way.
+  const overBudget = (req: Request, cost: number): boolean => {
+    const ip = resolveClientIp(req);
+    return ip !== null && rateLimiter.isLimited(ip, cost);
+  };
 
   return {
     // POST /v1/events — single event
     async postEvent(req: Request): Promise<Response> {
+      // Budget first, so rejected payloads spend it too.
+      if (overBudget(req, 1)) return rateLimitedResponse();
+
       let body: unknown;
       try {
         body = await req.json();
@@ -206,7 +250,7 @@ export function createEventsRoutes(pool: Pool, deps: EventsRoutesDeps) {
         return Response.json({ error: "invalid JSON body" }, { status: 400 });
       }
 
-      const parsed = parseEvent(body);
+      const parsed = parseEvent(body, limits);
       if ("error" in parsed) {
         return Response.json({ error: parsed.error }, { status: 422 });
       }
@@ -235,20 +279,31 @@ export function createEventsRoutes(pool: Pool, deps: EventsRoutesDeps) {
       }
 
       const b = body as BatchIngestBody;
+      // Spend one unit per event before validating, so neither batching nor a
+      // stream of rejected batches gets more than the per-event budget. A
+      // malformed body costs one, an oversized batch the maximum.
+      const cost = Array.isArray(b?.events)
+        ? Math.min(Math.max(b.events.length, 1), batchMax)
+        : 1;
+      if (overBudget(req, cost)) return rateLimitedResponse();
+
       if (!Array.isArray(b?.events)) {
         return Response.json({ error: "body must have an 'events' array" }, { status: 422 });
       }
       if (b.events.length === 0) {
         return Response.json({ error: "events array must not be empty" }, { status: 422 });
       }
-      if (b.events.length > 100) {
-        return Response.json({ error: "max 100 events per batch" }, { status: 422 });
+      if (b.events.length > batchMax) {
+        return Response.json(
+          { error: `max ${batchMax} events per batch` },
+          { status: 422 }
+        );
       }
 
       const parsed: IngestBody[] = [];
       const errors: { index: number; error: string }[] = [];
       for (let i = 0; i < b.events.length; i++) {
-        const result = parseEvent(b.events[i]);
+        const result = parseEvent(b.events[i], limits);
         if ("error" in result) {
           errors.push({ index: i, error: result.error });
         } else {
