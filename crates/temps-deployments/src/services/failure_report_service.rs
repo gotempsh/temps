@@ -22,7 +22,10 @@ use temps_entities::deployment_jobs;
 use thiserror::Error;
 use tracing::error;
 
-use super::log_redaction::{redact_common_secret_patterns, redact_known_secrets};
+use super::log_redaction::{
+    redact_common_secret_patterns, redact_known_secrets, redact_report_identifiers,
+    redact_report_identifiers_with_pattern,
+};
 use super::sensitive_envelope::{self, SensitiveEnvelopeError};
 use super::services::{DeploymentError, DeploymentService};
 
@@ -292,7 +295,7 @@ impl FailureReportService {
             // failure of this report: treat a missing log file as "no output
             // for this stage" and keep going, rather than aborting the whole
             // preview over one job's silence.
-            let content = match self.log_service.get_log_content(&job.log_id).await {
+            let content = match self.log_service.get_log_tail(&job.log_id, 2_000).await {
                 Ok(content) => content,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     "(no log output for this stage)".to_string()
@@ -304,16 +307,14 @@ impl FailureReportService {
                     })
                 }
             };
-            combined.push_str(&format!(
-                "=== {} ({}) — {:?} ===\n{}\n\n",
+            let section = format!(
+                "=== {} ({}) — {:?} (last 2000 log lines) ===\n{}\n\n",
                 job.name, job.job_id, job.status, content
-            ));
+            );
+            append_redacted_section(&mut combined, &section, jobs, secrets);
         }
 
-        let redacted = redact_known_secrets(&combined, secrets);
-        // Bound it here so the preview shows exactly what would be sent: the
-        // central endpoint rejects oversized reports outright.
-        Ok(fit_report_text(&redact_common_secret_patterns(&redacted)))
+        Ok(combined)
     }
 
     /// Build the redacted, editable preview shown to the user before they
@@ -341,7 +342,10 @@ impl FailureReportService {
             match known_secret_values(&self.encryption_service, &jobs) {
                 Ok(secrets) => (
                     self.build_redacted_log(&jobs, &secrets).await?,
-                    failed_job.error_message.clone(),
+                    failed_job
+                        .error_message
+                        .as_deref()
+                        .map(|message| redact_outbound_text(message, &secrets, &jobs)),
                 ),
                 Err(error) => (
                     format!(
@@ -352,14 +356,6 @@ impl FailureReportService {
                 ),
             };
 
-        // Only ever included when the project's repo is public -- a private
-        // repo's URL/branch must never be pasted into an issue on the
-        // public gotempsh/temps tracker.
-        let repo_reference = self
-            .deployment_service
-            .get_public_repo_reference(project_id, deployment_id)
-            .await?;
-
         let github_issue_title = format!(
             "Deploy failure: {}{}",
             failed_job.name,
@@ -368,22 +364,17 @@ impl FailureReportService {
                 .map(|m| format!(" — {}", truncate_for_title(m)))
                 .unwrap_or_default()
         );
-        let repo_line = repo_reference
-            .map(|r| {
-                format!(
-                    "**Repository:** https://github.com/{}/{} @ {}\n",
-                    r.owner, r.repo, r.branch
-                )
-            })
-            .unwrap_or_default();
         let github_issue_body = format!(
             "**Temps version:** {}\n**Failed stage:** {} ({})\n{}\n\
              Paste your (redacted) deployment log below:\n\n```\n[paste here]\n```\n",
             env!("CARGO_PKG_VERSION"),
             failed_job.name,
             failed_job_type,
-            repo_line,
+            "",
         );
+
+        let github_issue_title = redact_job_identifiers(&github_issue_title, &jobs);
+        let github_issue_body = redact_job_identifiers(&github_issue_body, &jobs);
 
         Ok(FailureReportPreview {
             redacted_log,
@@ -396,10 +387,8 @@ impl FailureReportService {
     }
 
     /// Send a user-reviewed (and possibly user-edited) report. Re-applies
-    /// only the known-secret exact-match pass to whatever the client
-    /// submits — defense in depth against an accidentally-reintroduced
-    /// literal secret value — but NOT the heuristic pattern pass, which
-    /// could otherwise mangle text the user added themselves.
+    /// secret and identifier redaction to whatever the client submits, including
+    /// text added while editing the preview.
     ///
     /// Refused when the known secrets cannot be read: nothing could then check
     /// the submitted text for them, and this path is the one that leaves the box.
@@ -428,7 +417,7 @@ impl FailureReportService {
             job_id: job_id.to_string(),
         })?;
         let secrets = known_secret_values(&self.encryption_service, &jobs)?;
-        let safe_text = prepare_report_text(report_text, &secrets)?;
+        let safe_text = prepare_report_text(report_text, &secrets, &jobs)?;
 
         let payload = FailureReportPayload {
             report_text: &safe_text,
@@ -440,6 +429,75 @@ impl FailureReportService {
         };
 
         post_report(&self.client, &self.endpoint, deployment_id, &payload).await
+    }
+}
+
+/// Bound each accumulated section after redacting it, so neither the number
+/// of stages nor a large log can grow the report without limit.
+fn append_redacted_section(
+    combined: &mut String,
+    section: &str,
+    jobs: &[deployment_jobs::Model],
+    secrets: &[String],
+) {
+    let safe = redact_outbound_text(section, secrets, jobs);
+    combined.push_str(&safe);
+    *combined = fit_report_text(combined);
+}
+
+/// Complete secret values must be removed before identifiers can alter them.
+fn redact_outbound_text(text: &str, secrets: &[String], jobs: &[deployment_jobs::Model]) -> String {
+    let secrets_redacted = redact_common_secret_patterns(&redact_known_secrets(text, secrets));
+    redact_job_identifiers(&secrets_redacted, jobs)
+}
+
+/// Exact repository identifiers may also be printed without a URL or slash.
+fn redact_job_identifiers(text: &str, jobs: &[deployment_jobs::Model]) -> String {
+    let mut values = std::collections::BTreeSet::new();
+    for job in jobs {
+        for data in [job.job_config.as_ref(), job.outputs.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            for key in [
+                "repo_owner",
+                "repo_name",
+                "repository_owner",
+                "repository_name",
+            ] {
+                if let Some(value) = data
+                    .get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| !value.is_empty())
+                {
+                    values.insert(value);
+                }
+            }
+        }
+    }
+    if values.is_empty() {
+        return redact_report_identifiers(text);
+    }
+    let mut values: Vec<_> = values.into_iter().collect();
+    values.sort_by_key(|value| std::cmp::Reverse(value.len()));
+    let pattern = values
+        .into_iter()
+        .map(regex::escape)
+        .collect::<Vec<_>>()
+        .join("|");
+    // Match existing markers whole so re-submitting a preview preserves them.
+    // A single pass never matches text inserted by an earlier replacement.
+    let pattern = format!(r"\[redacted\]|{pattern}");
+    match regex::RegexBuilder::new(&pattern)
+        .case_insensitive(true)
+        .size_limit(1024 * 1024)
+        .build()
+    {
+        Ok(pattern) => redact_report_identifiers_with_pattern(text, Some(&pattern)),
+        Err(_) => {
+            "[Report withheld: repository identifier redaction exceeded safe pattern limits.]"
+                .to_string()
+        }
     }
 }
 
@@ -506,8 +564,9 @@ fn known_secret_values(
 fn prepare_report_text(
     report_text: &str,
     secrets: &[String],
+    jobs: &[deployment_jobs::Model],
 ) -> Result<String, FailureReportError> {
-    let redacted = redact_known_secrets(report_text, secrets);
+    let redacted = redact_outbound_text(report_text, secrets, jobs);
     if redacted.trim().is_empty() {
         return Err(FailureReportError::EmptyReport);
     }
@@ -557,6 +616,100 @@ async fn post_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn complete_secrets_are_removed_before_overlapping_repository_names() {
+        let jobs = [job_with_config(
+            77,
+            serde_json::json!({"repo_owner": "sample"}),
+        )];
+        let secret = "sample-super-secret-value".to_string();
+        let input = format!("owner sample password {secret} Bearer sample_unknown_token_123");
+        let prepared = prepare_report_text(&input, std::slice::from_ref(&secret), &jobs).unwrap();
+        assert!(!prepared.contains("super-secret-value"), "{prepared}");
+        assert!(!prepared.contains("unknown_token"), "{prepared}");
+        assert!(!prepared.contains("sample"), "{prepared}");
+        let mut preview = String::new();
+        append_redacted_section(&mut preview, &input, &jobs, &[secret]);
+        assert_eq!(preview, prepared);
+    }
+
+    #[test]
+    fn whole_addresses_are_removed_before_overlapping_repository_names() {
+        for (repository, address) in [
+            ("internal", "service.internal"),
+            ("255", "192.0.2.255"),
+            ("sample.app.3d-viewer", "sample.app.3d-viewer"),
+        ] {
+            let jobs = [job_with_config(
+                77,
+                serde_json::json!({"repo_name": repository}),
+            )];
+            let input = format!("connection failed: {address}");
+            let safe = prepare_report_text(&input, &[], &jobs).unwrap();
+            assert_eq!(safe, "connection failed: [redacted]");
+            let mut preview = String::new();
+            append_redacted_section(&mut preview, &input, &jobs, &[]);
+            assert_eq!(preview, safe);
+        }
+    }
+
+    #[test]
+    fn submitting_a_preview_preserves_existing_redaction_markers() {
+        let jobs = [job_with_config(77, serde_json::json!({"repo_name": "e"}))];
+        let input = "connection to https://service.example.invalid failed for e";
+        let mut preview = String::new();
+        append_redacted_section(&mut preview, input, &jobs, &[]);
+        assert!(preview.contains("[redacted]"));
+        let sent = prepare_report_text(&preview, &[], &jobs).unwrap();
+        assert_eq!(sent, preview);
+        assert!(!sent.contains("[r[redacted]"));
+    }
+
+    #[test]
+    fn repository_replacement_does_not_rewrite_its_own_markers() {
+        let job = job_with_config(77, serde_json::json!({"repo_owner": "e"}));
+        assert_eq!(
+            redact_job_identifiers("e", &[job.clone(), job]),
+            "[redacted]"
+        );
+    }
+
+    #[test]
+    fn accumulated_log_sections_are_redacted_and_bounded() {
+        let mut report = String::new();
+        for _ in 0..3 {
+            append_redacted_section(
+                &mut report,
+                &format!(
+                    "{}\nclone sample-owner/sample-repo\n",
+                    "x".repeat(MAX_REPORT_TEXT_UTF16_UNITS)
+                ),
+                &[],
+                &[],
+            );
+            assert!(utf16_len(&report) <= MAX_REPORT_TEXT_UTF16_UNITS);
+        }
+        assert!(!report.contains("sample-owner"));
+        assert!(report.ends_with("clone [redacted]\n"));
+    }
+
+    #[test]
+    fn bare_repository_identifiers_are_redacted_even_when_short() {
+        let mut job = job_with_config(77, serde_json::json!({"repo_owner": "ab"}));
+        job.outputs = Some(serde_json::json!({"repo_name": "sample-app"}));
+        let safe = redact_job_identifiers("owner ab repo sample-app failed", &[job]);
+        assert_eq!(safe, "owner [redacted] repo [redacted] failed");
+        let sent = prepare_report_text(
+            "https://forge.example/sample/repository dev@example.invalid 192.0.2.4",
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert!(!sent.contains("sample"));
+        assert!(!sent.contains("example"));
+        assert!(!sent.contains("192.0.2"));
+    }
 
     #[test]
     #[serial_test::serial(temps_telemetry_env)]
@@ -842,7 +995,7 @@ mod tests {
     #[test]
     fn prepare_report_text_refuses_blank_reports() {
         assert!(matches!(
-            prepare_report_text("  \n\t ", &[]),
+            prepare_report_text("  \n\t ", &[], &[]),
             Err(FailureReportError::EmptyReport)
         ));
     }
@@ -853,7 +1006,7 @@ mod tests {
     fn prepare_report_text_refuses_oversized_whitespace() {
         let blank = " \n".repeat(MAX_REPORT_TEXT_UTF16_UNITS);
         assert!(matches!(
-            prepare_report_text(&blank, &[]),
+            prepare_report_text(&blank, &[], &[]),
             Err(FailureReportError::EmptyReport)
         ));
     }
@@ -862,7 +1015,7 @@ mod tests {
     fn prepare_report_text_redacts_then_bounds() {
         let secret = "s3cr3t-value-123".to_string();
         let text = format!("{}\nleaked {secret}", "line\n".repeat(60_000));
-        let prepared = prepare_report_text(&text, std::slice::from_ref(&secret)).unwrap();
+        let prepared = prepare_report_text(&text, std::slice::from_ref(&secret), &[]).unwrap();
         assert!(!prepared.contains(&secret));
         assert!(utf16_len(&prepared) <= MAX_REPORT_TEXT_UTF16_UNITS);
     }

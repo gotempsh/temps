@@ -7,6 +7,18 @@ use super::*;
 
 impl BackupService {
     pub async fn restore_backup(&self, backup_id: &str) -> Result<(), BackupError> {
+        let started = std::time::Instant::now();
+        let result = self.restore_backup_inner(backup_id).await;
+        self.telemetry.report(crate::telemetry::operation_outcome(
+            true,
+            "control_plane",
+            started.elapsed(),
+            result.as_ref().map(|_| ()).map_err(ToString::to_string),
+        ));
+        result
+    }
+
+    async fn restore_backup_inner(&self, backup_id: &str) -> Result<(), BackupError> {
         use sea_orm::{ConnectionTrait, DatabaseBackend};
 
         info!(
@@ -962,6 +974,33 @@ mod tests {
     use super::super::test_support::*;
     use super::*;
     use temps_core::EncryptionService;
+
+    #[tokio::test]
+    async fn legacy_restore_reports_one_failure_on_early_database_error() {
+        #[derive(Default)]
+        struct Recorder(std::sync::Mutex<Vec<temps_core::telemetry::TelemetryEvent>>);
+        impl temps_core::telemetry::TelemetryReporter for Recorder {
+            fn report(&self, event: temps_core::telemetry::TelemetryEvent) {
+                self.0.lock().unwrap().push(event);
+            }
+            fn is_enabled(&self) -> bool {
+                true
+            }
+        }
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_errors([sea_orm::DbErr::Custom("database unavailable".into())])
+            .into_connection();
+        let recorder = Arc::new(Recorder::default());
+        let service = make_scope_test_service(Arc::new(db)).with_telemetry(recorder.clone());
+        assert!(service.restore_backup("sample-backup").await.is_err());
+        let events = recorder.0.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "restore_failed");
+        assert_eq!(events[0].properties["engine"], "control_plane");
+        assert!(!serde_json::to_string(&events[0])
+            .unwrap()
+            .contains("sample-backup"));
+    }
 
     #[tokio::test]
     async fn test_restore_postgres_from_url() {

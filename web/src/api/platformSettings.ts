@@ -257,6 +257,7 @@ export interface PlatformSettings extends AppSettingsResponse {
   expose_platform_identity: boolean
   /** Database-backed proxy forwarded-IP trust opt-in. */
   trust_loopback_forwarded_ip: boolean
+  trusted_proxy_cidrs: string[]
   /** Header a trusted loopback proxy sends the visitor's JA4 in; null = none. */
   loopback_ja4_header?: string | null
   disk_space_alert: DiskSpaceAlertSettings
@@ -326,7 +327,7 @@ export async function updatePlatformSettings(
 
   validateSettings(updated)
 
-  const body = buildPlatformSettingsUpdateBody(updated)
+  const body = buildPlatformSettingsUpdateBody(updated, settings)
   const result = await updateSettings({ body })
   if (result.error) {
     // The generated client resolves (rather than throws) on non-2xx
@@ -357,7 +358,8 @@ export async function updatePlatformSettings(
 }
 
 export function buildPlatformSettingsUpdateBody(
-  updated: PlatformSettings
+  updated: PlatformSettings,
+  changed: Partial<PlatformSettings> = updated
 ): AppSettings & Pick<PlatformSettings, 'expose_platform_identity'> {
   const body: AppSettings & Pick<PlatformSettings, 'expose_platform_identity'> =
     {
@@ -381,6 +383,7 @@ export function buildPlatformSettingsUpdateBody(
       rate_limiting: updated.rate_limiting,
       expose_platform_identity: updated.expose_platform_identity,
       trust_loopback_forwarded_ip: updated.trust_loopback_forwarded_ip,
+      trusted_proxy_cidrs: changed.trusted_proxy_cidrs,
       loopback_ja4_header: updated.loopback_ja4_header ?? null,
       // Edited on the Security page; the server also preserves an omitted
       // value, but the page's own save must carry it to take effect.

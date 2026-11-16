@@ -63,6 +63,26 @@ impl BackupService {
         backup_type: &str,
         created_by: i32,
     ) -> Result<Backup, BackupError> {
+        let started = std::time::Instant::now();
+        let result = self
+            .create_backup_inner(schedule_id, s3_source_id, backup_type, created_by)
+            .await;
+        self.telemetry.report(crate::telemetry::operation_outcome(
+            false,
+            "control_plane",
+            started.elapsed(),
+            result.as_ref().map(|_| ()).map_err(ToString::to_string),
+        ));
+        result
+    }
+
+    async fn create_backup_inner(
+        &self,
+        schedule_id: Option<i32>,
+        s3_source_id: i32,
+        backup_type: &str,
+        created_by: i32,
+    ) -> Result<Backup, BackupError> {
         info!("Starting backup process");
 
         // Get S3 source configuration

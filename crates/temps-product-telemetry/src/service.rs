@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serde::Serialize;
-use temps_core::telemetry::{TelemetryEvent, TelemetryReporter};
+use temps_core::telemetry::{TelemetryEvent, TelemetryEventKind, TelemetryReporter};
 use thiserror::Error;
 
 /// File (relative to the data dir) holding the stable anonymous instance id.
@@ -72,6 +72,18 @@ struct EventPayload<'a> {
     properties: &'a std::collections::BTreeMap<String, serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temps_version: Option<&'a str>,
+}
+
+/// Derive onboarding milestones at the shared reporter so all existing creation
+/// paths participate. Deliberately copy no properties: presets and other inputs
+/// on the original event must never become onboarding payloads.
+fn onboarding_milestone(event: &TelemetryEvent) -> Option<TelemetryEventKind> {
+    match event.event_type.as_str() {
+        "project_created" => Some(TelemetryEventKind::FirstProjectCreated),
+        "git_provider_connected" => Some(TelemetryEventKind::FirstGitProviderConnected),
+        "deploy_attempted" => Some(TelemetryEventKind::FirstDeployAttempted),
+        _ => None,
+    }
 }
 
 /// Anonymous product-telemetry reporter.
@@ -374,6 +386,16 @@ impl TelemetryReporter for TelemetryService {
             return;
         }
 
+        if let Some(kind) = onboarding_milestone(&event) {
+            // These actions happen after plugin initialization, with the DB
+            // wired. If called earlier, skip rather than emit a non-durable
+            // first-time event that could be repeated after restart.
+            let durable = self.inner.db.lock().is_ok_and(|db| db.is_some());
+            if durable {
+                self.report_once(kind.as_str(), TelemetryEvent::new(kind));
+            }
+        }
+
         // Clone the small amount of state the background task needs. The whole
         // point is to return immediately; all network work happens in a
         // detached task with its own timeout (the client is configured with
@@ -520,6 +542,114 @@ impl TelemetryReporter for TelemetryService {
 mod tests {
     use super::*;
     use temps_core::telemetry::TelemetryEventKind;
+
+    #[test]
+    fn onboarding_payloads_are_property_free_and_do_not_recurse() {
+        for (source, expected) in [
+            (
+                TelemetryEventKind::ProjectCreated,
+                TelemetryEventKind::FirstProjectCreated,
+            ),
+            (
+                TelemetryEventKind::GitProviderConnected,
+                TelemetryEventKind::FirstGitProviderConnected,
+            ),
+            (
+                TelemetryEventKind::DeployAttempted,
+                TelemetryEventKind::FirstDeployAttempted,
+            ),
+        ] {
+            let original = TelemetryEvent::new(source).with("preset", "private-input");
+            let kind = onboarding_milestone(&original).unwrap();
+            assert_eq!(kind, expected);
+            let milestone = TelemetryEvent::new(kind);
+            assert!(milestone.properties.is_empty());
+            assert!(onboarding_milestone(&milestone).is_none());
+        }
+        assert!(onboarding_milestone(&TelemetryEvent::new(
+            TelemetryEventKind::GitProviderConnectFailed
+        ))
+        .is_none());
+    }
+
+    #[tokio::test]
+    async fn onboarding_claims_survive_restart_and_honor_opt_out() {
+        use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
+        for source in [
+            TelemetryEventKind::ProjectCreated,
+            TelemetryEventKind::GitProviderConnected,
+            TelemetryEventKind::DeployAttempted,
+        ] {
+            let dir = temp_dir();
+            let (endpoint, hits) = spawn_counting_sink().await;
+            let db = Arc::new(
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_exec_results([
+                        MockExecResult {
+                            last_insert_id: 0,
+                            rows_affected: 1,
+                        },
+                        MockExecResult {
+                            last_insert_id: 0,
+                            rows_affected: 0,
+                        },
+                    ])
+                    .into_connection(),
+            );
+            for restart in 0..2 {
+                let svc = service_with_endpoint(&dir, &endpoint, false);
+                svc.set_db(db.clone());
+                svc.apply_admin_preference(Some(false));
+                svc.report(TelemetryEvent::new(source));
+                assert!(svc.inner.claimed.lock().unwrap().is_empty());
+                svc.apply_admin_preference(Some(true));
+                // Concurrent actions in one process claim only once.
+                svc.report(TelemetryEvent::new(source));
+                svc.report(TelemetryEvent::new(source));
+                let expected = if restart == 0 { 3 } else { 5 };
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while hits.load(Ordering::SeqCst) < expected {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert_eq!(hits.load(Ordering::SeqCst), expected);
+                assert_eq!(svc.inner.claimed.lock().unwrap().len(), 1);
+            }
+            // Sink hits arrive before the HTTP tasks release their service
+            // clones. Wait for those owners before consuming the mock log.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while Arc::strong_count(&db) > 1 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let db = Arc::try_unwrap(db).ok().unwrap();
+            assert_eq!(db.into_transaction_log().len(), 2);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    #[tokio::test]
+    async fn onboarding_skips_without_durable_storage_or_when_claim_fails() {
+        use sea_orm::{DatabaseBackend, DbErr, MockDatabase};
+        let dir = temp_dir();
+        let (endpoint, hits) = spawn_counting_sink().await;
+        let svc = service_with_endpoint(&dir, &endpoint, false);
+        svc.report(TelemetryEvent::new(TelemetryEventKind::ProjectCreated));
+        assert!(svc.inner.claimed.lock().unwrap().is_empty());
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_exec_errors([DbErr::Custom("claim unavailable".into())])
+            .into_connection();
+        svc.set_db(Arc::new(db));
+        svc.report(TelemetryEvent::new(TelemetryEventKind::DeployAttempted));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Original action events still flow, but neither milestone is sent.
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     /// `TEMPS_TELEMETRY` is process-wide, and the test harness runs tests in
     /// parallel: one test opting out would flip another's `enabled` mid-run.

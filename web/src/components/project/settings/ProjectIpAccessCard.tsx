@@ -454,6 +454,15 @@ export function ProjectIpAccessCard({
       description={description}
       icon={Network}
     >
+      <p className="text-sm text-muted-foreground">
+        <a
+          href="/settings/security#trusted-proxy-cidrs"
+          className="underline underline-offset-4"
+        >
+          Configure trusted proxies
+        </a>{' '}
+        when Temps sits behind a load balancer.
+      </p>
       <form onSubmit={onSubmit} className="space-y-5" noValidate>
         <div className="flex flex-wrap items-center gap-2">
           <Badge variant={policy.mode === 'disabled' ? 'secondary' : 'default'}>

@@ -28,7 +28,6 @@ import {
   Check,
   Folder,
   Gauge,
-  HelpCircle,
   LogOut,
   Monitor,
   Moon,
@@ -65,7 +64,7 @@ import {
   resolveNodeSection,
 } from '@/lib/node-detail'
 import { WORKER_NODES_URL } from '@/lib/worker-nodes'
-import { DISCORD_INVITE_URL } from '@/lib/support'
+import { SIDEBAR_HELP_LINKS } from '@/lib/support'
 import {
   isSettingsSidebarRoute,
   primaryPlatformGroups,
@@ -391,23 +390,25 @@ export default function AppSidebar() {
       </SidebarContent>
       <SidebarFooter>
         <SidebarMenu>
-          <SidebarMenuItem>
-            <SidebarMenuButton
-              asChild
-              tooltip="Need help? Join Discord"
-              className={compact ? 'justify-center' : 'justify-start'}
-            >
-              <a
-                href={DISCORD_INVITE_URL}
-                target="_blank"
-                rel="noopener noreferrer"
-                aria-label="Need help? Join Discord (opens in a new tab)"
+          {SIDEBAR_HELP_LINKS.map((link) => (
+            <SidebarMenuItem key={link.id}>
+              <SidebarMenuButton
+                asChild
+                tooltip={link.label}
+                className={compact ? 'justify-center' : 'justify-start'}
               >
-                <HelpCircle aria-hidden="true" />
-                {!compact && <span>Need help? Join Discord</span>}
-              </a>
-            </SidebarMenuButton>
-          </SidebarMenuItem>
+                <a
+                  href={link.href}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  aria-label={`${link.label} (opens in a new tab)`}
+                >
+                  <link.icon aria-hidden="true" />
+                  {!compact && <span>{link.label}</span>}
+                </a>
+              </SidebarMenuButton>
+            </SidebarMenuItem>
+          ))}
         </SidebarMenu>
         <NavUser />
       </SidebarFooter>

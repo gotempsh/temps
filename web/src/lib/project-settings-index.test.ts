@@ -46,6 +46,18 @@ const ALL_SETTINGS = [
 ]
 
 describe('settings indexes', () => {
+  test('trusted proxies can be found by operator vocabulary and deep-linked', () => {
+    const entry = PLATFORM_SETTINGS_INDEX.find((entry) =>
+      entry.keywords.includes('trusted proxy')
+    )
+    expect(entry).toBeDefined()
+    expect(entry?.keywords).toContain('CIDR')
+    expect(entry?.keywords).toContain('load balancer')
+    expect(entry && projectSettingUrl(entry)).toBe(
+      '/settings/security#setting-trusted-proxy-cidrs'
+    )
+  })
+
   test('every anchor is rendered by some component', async () => {
     const sources = await componentSources()
     const missing = ALL_SETTINGS.filter(({ anchor, page }) => {

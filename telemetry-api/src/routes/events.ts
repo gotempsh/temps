@@ -30,9 +30,11 @@ export const KNOWN_EVENT_TYPES = new Set([
   "deploy_cancelled",
   "rollback_triggered",
   "first_deploy_succeeded",
+  "first_deploy_attempted",
 
   // Project & environment
   "project_created",
+  "first_project_created",
   "project_created_from_template",
   "environment_created",
   "scale_to_zero_configured",
@@ -41,6 +43,7 @@ export const KNOWN_EVENT_TYPES = new Set([
 
   // Git & source
   "git_provider_connected",
+  "first_git_provider_connected",
   "git_provider_connect_failed",
 
   // Domains & networking
