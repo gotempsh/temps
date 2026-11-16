@@ -72,9 +72,16 @@ export function RetainedFailedContainers({
   deploymentStatus,
   showLogsInitially = false,
 }: RetainedFailedContainersProps) {
-  const [expandedContainerId, setExpandedContainerId] = useState<
-    string | null | undefined
-  >(undefined)
+  // Scoped to the deployment it was made on, so a choice made on one
+  // deployment never hides (or points at) another deployment's containers.
+  const [expandedChoice, setExpandedChoice] = useState<{
+    deploymentId: number
+    containerId: string | null
+  }>()
+  const expandedContainerId =
+    expandedChoice?.deploymentId === deploymentId
+      ? expandedChoice.containerId
+      : undefined
   const isFailed = deploymentStatus === 'failed'
   const { data, isPending, isError, refetch } = useQuery({
     ...listContainerHistoryOptions({
@@ -161,14 +168,13 @@ export function RetainedFailedContainers({
                       aria-expanded={isExpanded}
                       aria-controls={panelId}
                       onClick={() =>
-                        setExpandedContainerId((current) =>
-                          toggleRetainedContainerLogs(
-                            current === undefined
-                              ? visibleContainerId
-                              : current,
+                        setExpandedChoice({
+                          deploymentId,
+                          containerId: toggleRetainedContainerLogs(
+                            visibleContainerId,
                             container.container_id
-                          )
-                        )
+                          ),
+                        })
                       }
                     >
                       {isExpanded ? 'Hide logs' : 'Show logs'}

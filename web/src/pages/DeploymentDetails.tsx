@@ -503,7 +503,17 @@ export function CancelledReason({
   /** Opens the redeploy dialog, where a registry image can be edited. */
   onEditImage?: () => void
 }) {
-  const [expandedByUser, setExpandedByUser] = useState<boolean | undefined>()
+  // The user's choice belongs to the deployment it was made on: opening a
+  // different deployment falls back to that failure's own default, while
+  // refreshes of the same deployment keep the choice.
+  const [expandedChoice, setExpandedChoice] = useState<{
+    deploymentId: number
+    expanded: boolean
+  }>()
+  const expandedByUser =
+    expandedChoice?.deploymentId === deployment.id
+      ? expandedChoice.expanded
+      : undefined
   const isExpanded =
     expandedByUser ??
     (deployment.failure?.code === 'container_exited' ||
@@ -624,7 +634,12 @@ export function CancelledReason({
               size="sm"
               className="mt-1 h-auto p-0 text-xs text-destructive underline-offset-4"
               aria-expanded={isExpanded}
-              onClick={() => setExpandedByUser(!isExpanded)}
+              onClick={() =>
+                setExpandedChoice({
+                  deploymentId: deployment.id,
+                  expanded: !isExpanded,
+                })
+              }
             >
               {isExpanded ? 'Collapse error' : 'Show full error'}
             </Button>

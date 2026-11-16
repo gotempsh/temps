@@ -62,3 +62,45 @@ test.each(['container_exited', 'out_of_memory'] as const)(
     ).toBe('false')
   }
 )
+
+test("a collapse on one deployment does not hide the next deployment's startup error", () => {
+  const client = new QueryClient({
+    defaultOptions: { queries: { staleTime: Infinity } },
+  })
+  const failed = (id: number) =>
+    ({
+      id,
+      project_id: 1,
+      environment_id: 2,
+      status: 'failed',
+      cancelled_reason: `Container exited during startup (exit code 1).\nContainer logs for unhealthy/stopped services:\ncrash in deployment ${id}`,
+      failure: {
+        code: 'container_exited',
+        stage: 'runtime',
+        title: 'Container exited',
+        remediation: 'Check the startup logs.',
+        classifier_version: 7,
+      },
+    }) as DeploymentResponse
+  for (const id of [3, 4]) {
+    client.setQueryData(['lastSuccessfulDeployment', 1, 2, id], null)
+  }
+  const view = (deployment: DeploymentResponse) => (
+    <QueryClientProvider client={client}>
+      <MemoryRouter>
+        <CancelledReason deployment={deployment} projectSlug="app" />
+      </MemoryRouter>
+    </QueryClientProvider>
+  )
+  const screen = render(view(failed(3)))
+  fireEvent.click(screen.getByRole('button', { name: 'Collapse error' }))
+  expect(screen.queryByText(/crash in deployment 3/)).toBeNull()
+
+  screen.rerender(view(failed(4)))
+  expect(screen.getByText(/crash in deployment 4/)).toBeTruthy()
+  expect(
+    screen
+      .getByRole('button', { name: 'Collapse error' })
+      .getAttribute('aria-expanded')
+  ).toBe('true')
+})
