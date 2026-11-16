@@ -28,8 +28,6 @@ export interface ChatDateGroup<T extends GroupableChat> {
   chats: T[]
 }
 
-const DAY_MS = 24 * 60 * 60 * 1000
-
 /**
  * Which heading a chat's last activity falls under, by the viewer's calendar
  * days rather than rolling 24-hour windows, so "Yesterday" means yesterday. An
@@ -41,16 +39,20 @@ export function chatDateBucket(
 ): ChatDateBucket {
   const at = new Date(lastActivityAt)
   if (Number.isNaN(at.getTime())) return 'older'
-  const startOfToday = new Date(
-    now.getFullYear(),
-    now.getMonth(),
-    now.getDate()
-  ).getTime()
+  // Local midnight `daysAgo` calendar days back. Built from the date parts,
+  // not by subtracting 24-hour periods, because a day that changes daylight
+  // saving time lasts 23 or 25 hours.
+  const startOfDay = (daysAgo: number) =>
+    new Date(
+      now.getFullYear(),
+      now.getMonth(),
+      now.getDate() - daysAgo
+    ).getTime()
   const time = at.getTime()
-  if (time >= startOfToday) return 'today'
-  if (time >= startOfToday - DAY_MS) return 'yesterday'
-  if (time >= startOfToday - 7 * DAY_MS) return 'week'
-  if (time >= startOfToday - 30 * DAY_MS) return 'month'
+  if (time >= startOfDay(0)) return 'today'
+  if (time >= startOfDay(1)) return 'yesterday'
+  if (time >= startOfDay(7)) return 'week'
+  if (time >= startOfDay(30)) return 'month'
   return 'older'
 }
 

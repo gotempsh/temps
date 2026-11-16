@@ -45,6 +45,27 @@ describe('chatDateBucket', () => {
     expect(chatDateBucket(at(-1), NOW)).toBe('today')
     expect(chatDateBucket('not a date', NOW)).toBe('older')
   })
+
+  test('a 25-hour daylight-saving day still starts at local midnight', () => {
+    // Central European clocks went back on 2026-10-25, so that day lasted 25
+    // hours. Subtracting 24 hours from the next midnight lands at 01:00 and
+    // files 00:30 that day under "Previous 7 days" instead of "Yesterday".
+    const previousTz = process.env.TZ
+    process.env.TZ = 'Europe/Madrid'
+    try {
+      const now = new Date(2026, 9, 26, 10, 0)
+      const halfPastMidnight = new Date(2026, 9, 25, 0, 30).toISOString()
+      expect(
+        new Date(2026, 9, 26).getTime() - new Date(2026, 9, 25).getTime()
+      ).toBe(25 * 60 * 60 * 1000)
+      expect(chatDateBucket(halfPastMidnight, now)).toBe('yesterday')
+      const lateOnTheTwentyFourth = new Date(2026, 9, 24, 23, 30).toISOString()
+      expect(chatDateBucket(lateOnTheTwentyFourth, now)).toBe('week')
+    } finally {
+      if (previousTz === undefined) delete process.env.TZ
+      else process.env.TZ = previousTz
+    }
+  })
 })
 
 describe('groupChatsByDate', () => {
