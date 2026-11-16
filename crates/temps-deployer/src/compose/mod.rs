@@ -17,6 +17,8 @@
 //! - `files`: writing the compose files and env files Temps generates
 //! - `resolve`: resolving and checking the effective configuration, and
 //!   snapshotting the files it includes or references
+//! - `normalize`: the narrowing rewrites applied before the policy judges a
+//!   model (loopback ports, container names as network aliases)
 //! - `security_policy`: the deny-list applied to compose documents and overrides
 //! - `fs_confinement`: keeping every host path inside the project directory
 //! - `overrides`: generated env, network, security and label overrides
@@ -28,6 +30,7 @@ mod exec;
 mod files;
 mod fs_confinement;
 mod lifecycle;
+mod normalize;
 mod overrides;
 mod readiness;
 mod resolve;
@@ -40,6 +43,7 @@ mod test_support;
 pub use diagnostics::{redact_variable_text, SubstitutedValues};
 pub use exec::{ComposeOutputCallback, ComposeOutputSink};
 pub use files::{EnvFilePlan, EnvFileSource};
+pub use normalize::ComposeRewrite;
 pub use resolve::{CheckedComposeConfiguration, ComposeCheckInput, ResolvedComposeConfiguration};
 pub use support::{
     ComposeSupport, COMPOSE_CONFIG_FLAGS, COMPOSE_CONSISTENCY_FLAGS, MIN_COMPOSE_VERSION,

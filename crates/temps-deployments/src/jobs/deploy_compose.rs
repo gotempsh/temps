@@ -24,7 +24,7 @@ use std::sync::Arc;
 use temps_database::DbConnection;
 use temps_deployer::compose::{
     ComposeCheckInput, ComposeDeployRequest, ComposeError, ComposeExecutor, ComposeOutputSink,
-    EnvFileSource, ResolvedComposeConfiguration,
+    ComposeRewrite, EnvFileSource, ResolvedComposeConfiguration,
 };
 use temps_deployer::compose_translation::{
     self, ComposeTranslation, ComposeTranslationInput, EnvFileContent,
@@ -1075,6 +1075,23 @@ impl DeployComposeJob {
         }
     }
 
+    /// Report every setting Temps narrowed so the file could deploy. A
+    /// warning, not an info line: the stack runs, but it does not run exactly
+    /// as the file asks — a fixed host port is gone, a container name is now
+    /// an in-stack alias — and the person reading this log is the only one
+    /// who can tell whether that matters.
+    async fn log_compose_rewrites(&self, rewrites: &[ComposeRewrite]) {
+        let Some(ref log_id) = self.log_id else {
+            return;
+        };
+        for rewrite in rewrites {
+            let _ = self
+                .log_service
+                .log_warning(log_id, &rewrite.message())
+                .await;
+        }
+    }
+
     async fn log_line(&self, level: LogLevel, message: &str) {
         let Some(ref log_id) = self.log_id else {
             return;
@@ -1472,6 +1489,7 @@ impl DeployComposeJob {
             }
         };
         self.log_compose_resolution(&checked.resolution).await;
+        self.log_compose_rewrites(&checked.rewrites).await;
 
         // Full service list, *before* exclusion stripping — so excluded
         // services still show up as re-includable options in the

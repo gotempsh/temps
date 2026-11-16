@@ -19,6 +19,7 @@ use super::diagnostics::{
 };
 use super::exec::isolated_docker_command;
 use super::files::render_env_file;
+use super::normalize::ComposeRewrite;
 use super::support::{COMPOSE_CONFIG_FLAGS, COMPOSE_CONSISTENCY_FLAGS};
 use super::{
     ComposeCommandDiagnostics, ComposeError, ComposeExecutor, COMPOSE_CONFIG_TIMEOUT,
@@ -170,6 +171,9 @@ pub struct CheckedComposeConfiguration {
     /// Resolved model with excluded services removed — what deploys.
     pub content: String,
     pub override_content: Option<String>,
+    /// Narrowing rewrites applied to the model, for the deployment log and
+    /// the check report. Empty when the file needed none.
+    pub rewrites: Vec<ComposeRewrite>,
     pub resolution: ResolvedComposeConfiguration,
 }
 
@@ -521,17 +525,40 @@ impl ComposeExecutor {
 
     /// Every deploy-time configuration check, in deploy order and without
     /// touching Docker state: resolution (see [`Self::resolve_configuration`]),
-    /// removal of excluded services, the security policy, and — for a
-    /// checkout — filesystem confinement. The deploy job, the "Run compose
-    /// check" action and the settings preview all call this, so they accept
-    /// and reject the same files with the same error class.
+    /// the narrowing rewrites (see [`Self::normalize_for_policy`]), removal of
+    /// excluded services, the security policy, and — for a checkout —
+    /// filesystem confinement. The deploy job, the "Run compose check" action
+    /// and the settings preview all call this, so they accept and reject the
+    /// same files with the same error class, and a rewrite the deploy applies
+    /// is one the preview already showed.
     pub async fn check_configuration(
         &self,
         input: &ComposeCheckInput<'_>,
     ) -> Result<CheckedComposeConfiguration, ComposeError> {
         let variables = Self::interpolation_variables(input)?;
         let result = async {
-            let resolution = self.resolve_configuration_inner(input, &variables).await?;
+            let mut resolution = self.resolve_configuration_inner(input, &variables).await?;
+            // After interpolation, so a rewrite sees the values that will
+            // deploy, and before validation, which then judges the rewritten
+            // model as defense in depth.
+            let normalized = self.normalize_for_policy(&resolution.content)?;
+            resolution.content = normalized.content;
+            let rewrites = normalized
+                .rewrites
+                .into_iter()
+                // An excluded service does not deploy, so reporting a rewrite
+                // in it would describe work that never happens.
+                .filter(|rewrite| !input.excluded_services.contains(&rewrite.service))
+                // A port or a service name can hold a substituted variable
+                // value, and the deployment log is readable without
+                // permission to see those.
+                .map(|rewrite| ComposeRewrite {
+                    service: resolution.substituted_values.redact(&rewrite.service),
+                    before: resolution.substituted_values.redact(&rewrite.before),
+                    after: resolution.substituted_values.redact(&rewrite.after),
+                    ..rewrite
+                })
+                .collect();
             let content =
                 self.strip_excluded_services(&resolution.content, input.excluded_services)?;
             let override_content = resolution.override_content.clone();
@@ -550,6 +577,7 @@ impl ComposeExecutor {
                 resolved_content: resolution.content.clone(),
                 content,
                 override_content,
+                rewrites,
                 resolution,
             })
         }
@@ -624,6 +652,12 @@ impl ComposeExecutor {
         match result {
             Ok(checked) => {
                 let mut resolution = checked.resolution;
+                // The same rewrites the deploy would log, so the preview and
+                // the "Run compose check" action say up front what Temps
+                // will change in the file.
+                resolution
+                    .notes
+                    .extend(checked.rewrites.iter().map(ComposeRewrite::message));
                 if !resolution.deferred_required_variables.is_empty() {
                     let names: Vec<&str> = resolution
                         .deferred_required_variables

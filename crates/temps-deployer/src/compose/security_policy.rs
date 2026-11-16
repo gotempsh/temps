@@ -1317,21 +1317,7 @@ impl ComposeExecutor {
             });
         };
         for port in ports {
-            let loopback_only = match port {
-                YamlValue::String(binding) => {
-                    !Self::contains_interpolation(binding)
-                        && binding.starts_with("127.0.0.1:")
-                        && binding.split(':').count() >= 3
-                }
-                YamlValue::Mapping(binding) => {
-                    binding
-                        .get(YamlValue::String("host_ip".to_string()))
-                        .and_then(YamlValue::as_str)
-                        == Some("127.0.0.1")
-                }
-                _ => false,
-            };
-            if !loopback_only {
+            if !Self::port_entry_is_loopback_only(port) {
                 return Err(ComposeError::SecurityPolicyViolation {
                     check: Some(PolicyCheck::PublishedPorts),
                     service: service_name.to_string(),
@@ -1343,9 +1329,36 @@ impl ComposeExecutor {
         Ok(())
     }
 
+    /// Whether one `ports` entry publishes on loopback only, in either the
+    /// short or the long form. Shared with
+    /// [`ComposeExecutor::normalize_for_policy`], which rewrites the entries
+    /// this rejects: the rewrite and the rule it satisfies must agree, or a
+    /// rewritten model would still fail validation.
+    pub(super) fn port_entry_is_loopback_only(port: &YamlValue) -> bool {
+        match port {
+            YamlValue::String(binding) => {
+                !Self::contains_interpolation(binding)
+                    && binding.starts_with("127.0.0.1:")
+                    && binding.split(':').count() >= 3
+            }
+            YamlValue::Mapping(binding) => {
+                binding
+                    .get(YamlValue::String("host_ip".to_string()))
+                    .and_then(YamlValue::as_str)
+                    == Some("127.0.0.1")
+            }
+            _ => false,
+        }
+    }
+
     /// Rejection text for a published port that is not loopback-only, naming
-    /// the exact entry and the exact replacement. Temps does not rewrite the
-    /// file itself: which ports a stack exposes is the author's decision.
+    /// the exact entry and the exact replacement.
+    ///
+    /// A file is normally rewritten before it reaches this rule
+    /// ([`ComposeExecutor::normalize_for_policy`]), so this text is what an
+    /// entry the rewrite could not parse — a variable, an unknown protocol —
+    /// or a file validated without normalization (an inline override that no
+    /// Compose CLI merged) reports.
     fn loopback_port_remediation(port: &YamlValue) -> String {
         const WHY: &str = "published ports must explicitly bind to 127.0.0.1 so traffic cannot \
                            bypass the Temps proxy";
@@ -1382,7 +1395,7 @@ impl ComposeExecutor {
     /// Restricts to the Compose spec character set (alphanumeric start, then
     /// letters/digits/`.`/`_`/`-`), rejecting names with newlines, colons, or
     /// spaces that could corrupt the generated security override.
-    fn is_valid_service_name(name: &str) -> bool {
+    pub(super) fn is_valid_service_name(name: &str) -> bool {
         let mut chars = name.chars();
         match chars.next() {
             Some(c) if c.is_ascii_alphanumeric() => {}
