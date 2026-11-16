@@ -23,6 +23,7 @@ import { CloudAiMetadataNotice } from '@/components/ai/CloudAiMetadataNotice'
 import { problemDetail } from '@/lib/api-problem'
 import { AiProviderSelect } from '@/components/ai/AiProviderSelect'
 import { AiActivityEmptyState } from '@/components/ai/AiActivityEmptyState'
+import { aiTracesSetupHref } from '@/components/ai/ai-traces-setup'
 import { DateTimeRange } from '@/components/ui/date-time-range'
 import { RefreshButton } from '@/components/ui/refresh-button'
 import { queryKeyPrefix } from '@/lib/refresh'
@@ -3469,6 +3470,7 @@ export function AgentActivity() {
   }
 
   const projectId = selectedProjectId ?? projects[0]?.id
+  const projectSlug = projects.find((project) => project.id === projectId)?.slug
 
   const timeParams = useMemo(() => {
     const to = new Date(endMs).toISOString()
@@ -3575,9 +3577,7 @@ export function AgentActivity() {
       {projectId && (
         <CloudAiMetadataNotice
           projectId={projectId}
-          projectSlug={
-            projects.find((project) => project.id === projectId)?.slug
-          }
+          projectSlug={projectSlug}
         />
       )}
 
@@ -3626,7 +3626,7 @@ export function AgentActivity() {
           )}
         />
       ) : traces.length === 0 ? (
-        <AiActivityEmptyState setupHref="/ai-gateway" />
+        <AiActivityEmptyState setupHref={aiTracesSetupHref(projectSlug)} />
       ) : (
         <Card>
           <CardContent className="p-0">
