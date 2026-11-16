@@ -71,6 +71,71 @@ pub const FAILURE_CLASSIFIER_VERSION: u8 = 8;
 /// Marker Compose deployments put before embedded container log tails.
 const CONTAINER_LOGS_MARKER: &str = "container logs for unhealthy/stopped services:";
 
+const COMPOSE_CHECK_MARKERS: [&str; 2] = [
+    "compose security policy rejected [check=",
+    "invalid compose override [check=",
+];
+
+/// Peel only wrappers produced by the workflow and Compose jobs. Never search
+/// arbitrary command output or user-controlled error fields for metadata.
+fn compose_policy_error_head(mut reason: &str) -> Option<&str> {
+    for _ in 0..16 {
+        reason = reason.trim_start();
+        if COMPOSE_CHECK_MARKERS
+            .iter()
+            .any(|marker| reason.starts_with(marker))
+        {
+            return Some(reason);
+        }
+        if let Some(inner) = [
+            "job execution failed: ",
+            "job failed: ",
+            "workflow error: ",
+            "compose prepare/pull failed: ",
+            "compose deploy failed: ",
+            "some(\"",
+        ]
+        .iter()
+        .find_map(|prefix| reason.strip_prefix(prefix))
+        {
+            reason = inner;
+            continue;
+        }
+        if let Some(inner) = reason.strip_prefix("required job 'deploy_compose' failed: ") {
+            reason = inner;
+            continue;
+        }
+        if let Some(inner) = reason.strip_prefix("compose configuration check failed for project ")
+        {
+            let (project_id, rest) = inner.split_once(" (")?;
+            project_id.parse::<i32>().ok()?;
+            let (_, inner) = rest.split_once("): ")?;
+            reason = inner;
+            continue;
+        }
+        return None;
+    }
+    None
+}
+
+/// Check labels are metadata, not failure signals (e.g. `oom_killer`).
+/// Removing only the newly introduced annotation preserves the existing
+/// stage/code matching semantics of the diagnostic text around it.
+fn without_compose_check_annotation(reason: &str) -> Option<String> {
+    let policy_error = compose_policy_error_head(reason)?;
+    let marker = COMPOSE_CHECK_MARKERS
+        .iter()
+        .find(|marker| policy_error.starts_with(*marker))?;
+    let label_start = reason.len() - policy_error.len() + marker.len();
+    let label_end = label_start + reason[label_start..].find(']')? + 1;
+    let annotation_start = label_start - "[check=".len();
+    Some(format!(
+        "{}{}",
+        &reason[..annotation_start],
+        &reason[label_end..]
+    ))
+}
+
 /// The pipeline stage a deployment failed in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -431,6 +496,28 @@ pub fn describe_failure(reason: Option<&str>) -> Option<DeploymentFailureInfo> {
         timeout_elapsed_seconds: is_timeout.then(|| elapsed_seconds(head)).flatten(),
         classifier_version: FAILURE_CLASSIFIER_VERSION,
     })
+}
+
+/// Read only the typed check label written before any user-controlled error
+/// fields. Older failures and non-configurable validation errors have no label.
+/// Never infer a check from Compose content, service names or diagnostic text.
+pub fn compose_security_check(
+    reason: Option<&str>,
+) -> Option<temps_entities::compose_security::ComposeSecurityCheck> {
+    use temps_entities::compose_security::ComposeSecurityCheck;
+    let reason = reason?.to_lowercase();
+    let head = classification_head(&reason);
+    let policy_error = compose_policy_error_head(head)?;
+    let label = COMPOSE_CHECK_MARKERS
+        .iter()
+        .find_map(|marker| policy_error.strip_prefix(marker))?
+        .split_once(']')?
+        .0;
+    if label.len() > 64 || !label.bytes().all(|c| c.is_ascii_lowercase() || c == b'_') {
+        return None;
+    }
+    serde_json::from_value::<ComposeSecurityCheck>(serde_json::Value::String(label.to_string()))
+        .ok()
 }
 
 /// Static guidance per code. Never interpolates the raw reason.
@@ -929,7 +1016,13 @@ pub fn legacy_failure_reason(reason: Option<&str>) -> &'static str {
     let Some(reason) = reason else {
         return "unknown";
     };
-    let reason = reason.to_lowercase();
+    let lower = reason.to_lowercase();
+    let head = classification_head(&lower);
+    let semantic_reason = without_compose_check_annotation(head).map(|mut reason| {
+        reason.push_str(&lower[head.len()..]);
+        reason
+    });
+    let reason = semantic_reason.as_deref().unwrap_or(&lower);
 
     if reason.contains("out of memory")
         || reason.contains("oom")
@@ -990,7 +1083,9 @@ fn classify_lowercase(raw: &str) -> DeploymentFailureClassification {
     use DeploymentFailureStage as S;
 
     let full = raw.to_lowercase();
-    let r = classification_head(&full);
+    let head = classification_head(&full);
+    let semantic_reason = without_compose_check_annotation(head);
+    let r = semantic_reason.as_deref().unwrap_or(head);
     let phase = job_phase(failed_job_id(raw));
     let is_compose = phase == Some(JobPhase::Compose) || r.contains("compose");
     let make = DeploymentFailureClassification::new;
@@ -1895,6 +1990,22 @@ mod tests {
             C::PlatformInternal,
         );
         assert_class("Workflow execution failed: Job execution failed: Internal error executing job 'build_image' in workflow 'deployment-42' for deployment 42: task panicked", S::Platform, C::PlatformInternal);
+    }
+
+    #[test]
+    fn compose_check_metadata_survives_workflow_wrappers() {
+        use temps_entities::compose_security::ComposeSecurityCheck;
+        let inner = "Compose configuration check failed for project 42 (policy_violation): Compose security policy rejected [check=privileged] privileged for service 'app': refused";
+        for reason in [
+            inner.to_string(),
+            wrapped("deploy_compose", inner),
+            format!("Job execution failed: Required job 'deploy_compose' failed: {inner}"),
+        ] {
+            assert_eq!(
+                compose_security_check(Some(&reason)),
+                Some(ComposeSecurityCheck::Privileged)
+            );
+        }
     }
 
     #[test]

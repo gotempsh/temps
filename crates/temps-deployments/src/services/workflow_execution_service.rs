@@ -34,7 +34,9 @@ use crate::jobs::{
 use crate::services::DeploymentJobTracker;
 use temps_screenshots::ScreenshotService;
 
-use crate::services::failure_classifier::{classify_failure_reason, FAILURE_CLASSIFIER_VERSION};
+use crate::services::failure_classifier::{
+    classify_failure_reason, compose_security_check, FAILURE_CLASSIFIER_VERSION,
+};
 
 mod job_registry;
 
@@ -145,6 +147,12 @@ fn deploy_failed_telemetry_event(
         .with("failure_stage", failure.stage.as_str())
         .with("failure_code", failure.code.as_str())
         .with("classifier_version", FAILURE_CLASSIFIER_VERSION)
+        // An additive property does not change stage/code matching semantics,
+        // so it does not increment the taxonomy's classifier_version.
+        .with_opt(
+            "compose_security_check",
+            compose_security_check(reason).map(|check| check.as_str()),
+        )
         .with_opt("source_type", source_type)
         .with_opt("preset", preset),
         template_slug.as_deref(),
@@ -3329,6 +3337,86 @@ mod tests {
             let classification = classify_failure_reason(Some(message));
             assert_eq!(classification.stage, expected_stage, "message: {message}");
             assert_eq!(classification.code, expected_code, "message: {message}");
+        }
+    }
+
+    #[test]
+    fn compose_failure_telemetry_only_emits_catalog_check_labels() {
+        use temps_entities::compose_security::ComposeSecurityCheck;
+        use temps_presets::compose_security::ComposeSecurityCheckExt;
+        for definition in ComposeSecurityCheck::catalog() {
+            let check = definition.id;
+            assert_eq!(serde_json::to_value(check).unwrap(), check.as_str());
+            for prefix in [
+                "Compose security policy rejected",
+                "Invalid compose override",
+            ] {
+                let reason = format!("{prefix} [check={}] private-field for service 'private-service': private-value", check.as_str());
+                let event = deploy_failed_telemetry_event(Some(&reason), None, None, None);
+                assert_eq!(
+                    event.properties["failure_code"], "compose_policy_rejected",
+                    "{reason}"
+                );
+                let old_reason =
+                    format!("{prefix} private-field for service 'private-service': private-value");
+                assert_eq!(
+                    classify_failure_reason(Some(&reason)),
+                    classify_failure_reason(Some(&old_reason)),
+                    "metadata must not change matching: {reason}"
+                );
+                assert_eq!(event.properties["compose_security_check"], check.as_str());
+                assert_eq!(
+                    event.properties["classifier_version"],
+                    FAILURE_CLASSIFIER_VERSION
+                );
+                assert!(!serde_json::to_string(&event).unwrap().contains("private-"));
+            }
+        }
+        for reason in [
+            "Compose security policy rejected privileged for service 'app': old failure",
+            "Compose security policy rejected [check=private-value] private-field",
+            "Compose security policy rejected [check=unclassified] private-field [check=privileged]",
+            "Container exited during startup. Last log lines: Compose security policy rejected [check=privileged]",
+            "Container exited during startup. Container logs for unhealthy/stopped services: Compose security policy rejected [check=privileged]",
+        ] {
+            let event = deploy_failed_telemetry_event(Some(reason), None, None, None);
+            assert!(!event.properties.contains_key("compose_security_check"), "{reason}");
+        }
+    }
+
+    #[test]
+    fn real_oom_policy_rejections_emit_the_check_without_changing_the_taxonomy() {
+        let error = temps_deployer::compose::ComposeError::SecurityPolicyViolation {
+            check: Some(temps_entities::compose_security::ComposeSecurityCheck::OomKiller),
+            service: "app".to_string(), field: "oom_kill_disable".to_string(),
+            reason: "disabling the OOM killer can turn container memory pressure into a host-wide denial of service".to_string(),
+        };
+        let reason = format!(
+            "Compose configuration check failed for project 42 (policy_violation): {error}"
+        );
+        let event = deploy_failed_telemetry_event(Some(&reason), None, None, None);
+        assert_eq!(event.properties["compose_security_check"], "oom_killer");
+        let old_reason = reason.replace("[check=oom_killer] ", "");
+        let old_classification = classify_failure_reason(Some(&old_reason));
+        assert_eq!(
+            event.properties["failure_code"],
+            old_classification.code.as_str()
+        );
+        assert_eq!(
+            event.properties["classifier_version"],
+            FAILURE_CLASSIFIER_VERSION
+        );
+    }
+
+    #[test]
+    fn build_output_cannot_claim_a_compose_security_check() {
+        for reason in [
+            "Compose prepare/pull failed: Docker Compose command failed for project 'app': build stderr: Compose security policy rejected [check=privileged]",
+            "Required job 'build_image' failed: Compose security policy rejected [check=privileged]",
+            "Compose deploy failed: service 'Compose security policy rejected [check=privileged]' exited",
+        ] {
+            let event = deploy_failed_telemetry_event(Some(reason), None, None, None);
+            assert!(!event.properties.contains_key("compose_security_check"), "{reason}");
         }
     }
 

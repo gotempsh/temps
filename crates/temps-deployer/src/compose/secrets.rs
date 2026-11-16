@@ -225,6 +225,7 @@ impl ComposeExecutor {
             || service.contains('\0');
         if invalid {
             return Err(ComposeError::SecurityPolicyViolation {
+                check: None,
                 service: service.to_string(),
                 field: "service name".to_string(),
                 reason: "compose service name cannot be used as a directory name; \
@@ -267,6 +268,7 @@ impl ComposeExecutor {
             && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
         if !valid {
             return Err(ComposeError::SecurityPolicyViolation {
+                check: None,
                 service: "<secrets>".to_string(),
                 field: "secret key".to_string(),
                 reason: format!(
