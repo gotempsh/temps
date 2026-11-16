@@ -487,7 +487,7 @@ jsonwebtoken = { version = "11.0.0", features = ["rust_crypto"] }
 lol_html = "3"
 lopdf = { version = "0.47", default-features = false }
 maplit = "1.0"
-maxminddb = { version = "0.32.0", features = ["mmap"] }
+maxminddb = { version = "0.33.0", features = ["mmap"] }
 md5 = "0.8"
 memchr = "2.7"
 microsandbox = { version = "=0.7.11", default-features = false, features = ["local", "net"] }
