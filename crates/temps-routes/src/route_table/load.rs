@@ -2239,6 +2239,7 @@ impl CachedPeerTable {
             .values()
             .chain(old.http_routes.values())
             .chain(old.tls_routes.values())
+            .chain(old.private.values().map(|private| &private.route))
         {
             if let BackendType::Upstream { backends, .. } = &route.backend {
                 for b in backends {
@@ -2717,6 +2718,73 @@ mod tests {
             );
         }
         assert_eq!(super::compose_probe_path(Some(&config), None), None);
+    }
+
+    #[tokio::test]
+    async fn private_only_replica_retains_state_on_reload() {
+        use super::*;
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection();
+        let table = CachedPeerTable::new(Arc::new(db));
+        let make_route = || RouteInfo {
+            backend: BackendType::Upstream {
+                backends: vec![BackendEntry {
+                    address: "127.0.0.1:9000".into(),
+                    container_id: Some("private-replica".into()),
+                    container_name: None,
+                    pinned: None,
+                    compose_service: Some(("internal".into(), 9000)),
+                    node_id: Some(3),
+                    state: Arc::default(),
+                    tier: 0,
+                    capacity: None,
+                    check_health: false,
+                }],
+                round_robin_counter: Arc::new(AtomicUsize::new(0)),
+            },
+            redirect_to: None,
+            status_code: None,
+            project: None,
+            environment: None,
+            deployment: None,
+            cert_eligible: false,
+        };
+        let old_route = make_route();
+        let BackendType::Upstream { backends, .. } = &old_route.backend else {
+            panic!("upstream")
+        };
+        let original = backends[0].state.clone();
+        original.health.store(1, Ordering::Relaxed);
+        let request = old_route.select_backend();
+        table.route_snapshot.store(Arc::new(RouteTableSnapshot {
+            private: HashMap::from([(
+                "private.example.com".into(),
+                PrivateRoute {
+                    route: old_route,
+                    address: PrivateAddress {
+                        address_id: "custom:7".into(),
+                        range: None,
+                        node_id: Some(3),
+                        listener: None,
+                        via: None,
+                        principals: None,
+                    },
+                },
+            )]),
+            ..Default::default()
+        }));
+        let mut routes = HashMap::from([("private.example.com".into(), make_route())]);
+        table
+            .prepare_replica_policies(&mut routes, &mut HashMap::new(), &mut HashMap::new())
+            .await;
+        let BackendType::Upstream { backends, .. } = &routes["private.example.com"].backend else {
+            panic!("upstream")
+        };
+        let retained = &backends[0].state;
+        assert!(Arc::ptr_eq(&original, retained));
+        assert_eq!(retained.health.load(Ordering::Relaxed), 1);
+        assert_eq!(retained.in_flight.load(Ordering::Relaxed), 1);
+        drop(request);
+        assert_eq!(retained.in_flight.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]

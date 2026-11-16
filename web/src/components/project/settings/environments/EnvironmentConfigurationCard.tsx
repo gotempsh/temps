@@ -143,7 +143,25 @@ const healthNumberDraft = (max: number) =>
         Number(value) <= max,
       `Enter a whole number from 1 to ${max}`
     )
+const probePathDraft = z
+  .string()
+  .refine(
+    (path) =>
+      path === '' ||
+      (path.startsWith('/') &&
+        !path.startsWith('//') &&
+        !path.includes('\\') &&
+        !path.includes('#') &&
+        new TextEncoder().encode(path).length <= 2048 &&
+        !Array.from(path).some(
+          (char) =>
+            char.charCodeAt(0) < 32 ||
+            (char.charCodeAt(0) >= 127 && char.charCodeAt(0) <= 159)
+        )),
+    'Use a path starting with /, without fragments or backslashes (maximum 2048 bytes)'
+  )
 const healthDraftSchema = z.object({
+  path: probePathDraft,
   maxInFlightPerReplica: z.union([
     z.literal(''),
     healthNumberDraft(4294967295),
@@ -158,6 +176,7 @@ type HealthDrafts = z.infer<typeof healthDraftSchema>
 function healthDraftValues(policy?: LoadBalancingConfig | null): HealthDrafts {
   const health = policy?.healthCheck
   return {
+    path: health?.path ?? '',
     maxInFlightPerReplica: policy?.maxInFlightPerReplica?.toString() ?? '',
     intervalSeconds: String(health?.intervalSeconds ?? 2),
     timeoutSeconds: String(health?.timeoutSeconds ?? 2),
@@ -437,6 +456,7 @@ export function EnvironmentConfigurationCard({
         healthCheck: {
           ...defaultLoadBalancing.healthCheck!,
           ...routing.healthCheck,
+          path: drafts.path || null,
           intervalSeconds: Number(drafts.intervalSeconds),
           timeoutSeconds: Number(drafts.timeoutSeconds),
           unhealthyThreshold: Number(drafts.unhealthyThreshold),
@@ -1698,6 +1718,8 @@ function LoadBalancingFields({
 }) {
   const policy = value ?? defaultLoadBalancing
   const health = policy.healthCheck ?? defaultLoadBalancing.healthCheck!
+  const invalidPath = !probePathDraft.safeParse(healthForm.watch('path'))
+    .success
   const limitDraft = healthForm.watch('maxInFlightPerReplica')
   const invalidLimit =
     !healthDraftSchema.shape.maxInFlightPerReplica.safeParse(limitDraft).success
@@ -1791,21 +1813,27 @@ function LoadBalancingFields({
             unhealthy, traffic fails open to all replicas.
           </p>
           {(health.enabled ||
+            invalidPath ||
             Object.keys(healthForm.formState.errors).length > 0) && (
             <div className="grid gap-4 sm:grid-cols-2">
               <div className="space-y-2">
                 <Label htmlFor={`lb-path-${id}`}>Probe path</Label>
                 <Input
                   id={`lb-path-${id}`}
-                  value={health.path ?? ''}
                   placeholder="Deployment health path"
-                  onChange={(e) =>
-                    onChange({
-                      ...policy,
-                      healthCheck: { ...health, path: e.target.value || null },
-                    })
-                  }
+                  {...healthForm.register('path')}
+                  aria-invalid={!!healthForm.formState.errors.path}
+                  aria-describedby={`lb-path-${id}-error`}
                 />
+                {healthForm.formState.errors.path && (
+                  <p
+                    id={`lb-path-${id}-error`}
+                    role="alert"
+                    className="text-sm text-destructive"
+                  >
+                    {healthForm.formState.errors.path.message}
+                  </p>
+                )}
               </div>
               {(
                 [

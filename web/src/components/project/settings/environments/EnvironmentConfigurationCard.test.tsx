@@ -483,3 +483,82 @@ for (const editDuringSave of [false, true]) {
     }
   })
 }
+
+test('invalid probe path stays reachable after disabling health checks', async () => {
+  const submissions: Array<{
+    load_balancing: {
+      healthCheck: { enabled: boolean; path: string | null }
+    }
+  }> = []
+  const environment = {
+    id: 1,
+    name: 'production',
+    slug: 'production',
+    branch: 'main',
+    deployment_config: {
+      loadBalancing: {
+        strategy: 'round_robin',
+        healthCheck: {
+          enabled: true,
+          intervalSeconds: 2,
+          timeoutSeconds: 2,
+          unhealthyThreshold: 3,
+          healthyThreshold: 2,
+        },
+      },
+    },
+  } as EnvironmentResponse
+  mockApi({
+    'GET /internal/nodes': () => jsonResponse({ nodes: [] }),
+    'PUT /projects/1/environments/1/settings': async (request) => {
+      submissions.push(await request.json())
+      return jsonResponse(environment)
+    },
+  })
+  const view = render(
+    <QueryClientProvider
+      client={
+        new QueryClient({
+          defaultOptions: {
+            queries: { retry: false },
+            mutations: { retry: false },
+          },
+        })
+      }
+    >
+      <MemoryRouter>
+        <EnvironmentConfigurationCard
+          project={
+            { id: 1, slug: 'app', source_type: 'manual' } as ProjectResponse
+          }
+          environment={environment}
+          onUpdate={() => {}}
+        />
+      </MemoryRouter>
+    </QueryClientProvider>
+  )
+  fireEvent.change(view.getByLabelText('Probe path'), {
+    target: { value: 'ready' },
+  })
+  fireEvent.click(view.getByLabelText('Active health checks'))
+  fireEvent.submit(
+    view.getByRole('button', { name: 'Save changes' }).closest('form')!
+  )
+  await waitFor(() =>
+    expect(
+      view.getByText(
+        'Use a path starting with /, without fragments or backslashes (maximum 2048 bytes)'
+      )
+    ).toBeTruthy()
+  )
+  expect(submissions).toHaveLength(0)
+  const interval = view.getByLabelText('Probe path')
+  expect(interval.getAttribute('aria-invalid')).toBe('true')
+  fireEvent.change(interval, { target: { value: '/ready?full=true' } })
+  fireEvent.submit(interval.closest('form')!)
+  await waitFor(() => expect(submissions).toHaveLength(1))
+  expect(submissions[0].load_balancing.healthCheck).toMatchObject({
+    enabled: false,
+    path: '/ready?full=true',
+  })
+})
