@@ -182,6 +182,8 @@ pub struct ApiKeyCreatedAudit {
     pub context: AuditContext,
     pub api_key_id: i32,
     pub api_key_name: String,
+    pub project_id: Option<i32>,
+    pub environment_id: Option<i32>,
     pub role_type: String,
     pub permissions: Option<Vec<String>>,
 }

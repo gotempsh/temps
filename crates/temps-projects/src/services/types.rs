@@ -458,6 +458,20 @@ pub(crate) fn describe_delivery_bindings(hostnames: &[String], binding_ids: &[i3
 
 #[derive(Error, Debug)]
 pub enum ProjectError {
+    #[error("Active environment {environment_id} in project {project_id} was not found")]
+    PipelineEnvironmentNotFound {
+        project_id: i32,
+        environment_id: i32,
+    },
+    #[error(
+        "Failed to load pipeline environment {environment_id} in project {project_id}: {source}"
+    )]
+    PipelineEnvironmentLookup {
+        project_id: i32,
+        environment_id: i32,
+        source: sea_orm::DbErr,
+    },
+
     #[error("Database connection error: {0}")]
     DatabaseConnectionError(String),
 

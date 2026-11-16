@@ -41,7 +41,6 @@ use crate::template_creation::{
     upgrade_needs_generated_app_url, validate_template_service_selection, TemplateEnvironmentError,
     TemplateRuntimeOverrides, TemplateServiceSelectionError,
 };
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
@@ -3117,6 +3116,29 @@ pub async fn update_service_template_runtime(
     Ok(Json(ProjectResponse::map_from_project(updated_project)))
 }
 
+/// Constrain the typed pipeline body before any lookup or audit event.
+fn authorize_pipeline_scope(
+    auth: &AuthContext,
+    project_id: i32,
+    environment_id: Option<i32>,
+) -> Result<(), Problem> {
+    if let Some(scope) = auth.api_key_scope() {
+        if scope.project_id != project_id
+            || (scope.environment_id.is_some()
+                && !environment_id.is_some_and(|id| scope.allows_environment(project_id, id)))
+        {
+            return Err(temps_core::error_builder::forbidden()
+                .title("API Key Scope Denied")
+                .detail(format!(
+                    "API key pipeline request is outside project {} environment {:?}",
+                    scope.project_id, scope.environment_id
+                ))
+                .build());
+        }
+    }
+    Ok(())
+}
+
 /// Trigger pipeline for a specific project
 #[utoipa::path(
     post,
@@ -3126,6 +3148,8 @@ pub async fn update_service_template_runtime(
     ),
     request_body = TriggerPipelinePayload,
     responses(
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Deployment permission or scope denied"),
         (status = 200, description = "Pipeline triggered successfully", body = TriggerPipelineResponse),
         (status = 404, description = "Project not found"),
         (status = 400, description = "Invalid request"),
@@ -3140,9 +3164,10 @@ pub async fn trigger_project_pipeline(
     Extension(metadata): Extension<RequestMetadata>,
     Json(payload): Json<super::types::TriggerPipelinePayload>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, ProjectsWrite);
+    permission_guard!(auth, DeploymentsCreate);
     project_scope_guard!(auth, id);
-    project_access_guard!(auth, id, state.project_access_checker);
+    authorize_pipeline_scope(&auth, id, payload.environment_id)?;
+    project_permission_guard!(auth, DeploymentsCreate, id, state.project_access_checker);
 
     info!("Triggering pipeline for project with id: {}", id);
 
@@ -3168,21 +3193,10 @@ pub async fn trigger_project_pipeline(
     };
 
     // Get the environment for audit logging (only active environments)
-    let environment = temps_entities::environments::Entity::find_by_id(environment_id)
-        .filter(temps_entities::environments::Column::ProjectId.eq(id))
-        .filter(temps_entities::environments::Column::DeletedAt.is_null())
-        .one(state.project_service.db.as_ref())
-        .await
-        .map_err(|e| {
-            temps_core::error_builder::internal_server_error()
-                .detail(e.to_string())
-                .build()
-        })?
-        .ok_or_else(|| {
-            temps_core::error_builder::not_found()
-                .detail("Environment not found or doesn't belong to project")
-                .build()
-        })?;
+    let environment = state
+        .project_service
+        .get_pipeline_environment(id, environment_id)
+        .await?;
 
     // Create audit context
     let audit_context = super::audit::AuditContext {
@@ -3951,6 +3965,23 @@ mod tests {
         };
 
         AuthContext::new_api_key(user, None, Some(permissions), "test-key".to_string(), 1)
+    }
+
+    #[test]
+    fn pipeline_scope_refuses_missing_or_sibling_environment() {
+        let auth = custom_api_key(vec![Permission::DeploymentsCreate]).with_api_key_scope(Some(
+            temps_auth::context::ApiKeyScope {
+                project_id: 7,
+                environment_id: Some(9),
+            },
+        ));
+        assert!(super::authorize_pipeline_scope(&auth, 7, Some(9)).is_ok());
+        for (project, env) in [(7, None), (7, Some(8)), (8, Some(9))] {
+            let error = super::authorize_pipeline_scope(&auth, project, env).unwrap_err();
+            assert_eq!(error.status_code, StatusCode::FORBIDDEN);
+        }
+        assert!(auth.has_permission(&Permission::DeploymentsCreate));
+        assert!(!auth.has_permission(&Permission::ProjectsWrite));
     }
 
     #[test]

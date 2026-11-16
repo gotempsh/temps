@@ -85,6 +85,12 @@ where
                     .with_title("Authentication Required")
                     .with_detail("You must be authenticated to access this resource")
             })?;
+        let path = parts
+            .extensions
+            .get::<axum::extract::OriginalUri>()
+            .map(|original| original.0.path())
+            .unwrap_or_else(|| parts.uri.path());
+        crate::enforce_api_key_path(&auth_context, path)?;
         Ok(RequireAuth(auth_context))
     }
 }

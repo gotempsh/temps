@@ -1331,6 +1331,11 @@ pub struct CreateEnvironmentRequest {
 impl From<ProjectError> for Problem {
     fn from(error: ProjectError) -> Self {
         match error {
+            ProjectError::PipelineEnvironmentNotFound { project_id, environment_id } => problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Environment Not Found").with_detail(format!("Active environment {environment_id} in project {project_id} was not found")),
+            ProjectError::PipelineEnvironmentLookup { project_id, environment_id, source } => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Environment Lookup Failed").with_detail(format!("Failed to load environment {environment_id} in project {project_id}: {source}")),
+
             ProjectError::DatabaseConnectionError(reason) => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Database Error")

@@ -48,6 +48,28 @@ async fn resolve_public_trigger_ref(
 }
 
 impl ProjectService {
+    /// Load an active environment under the project the caller authorized.
+    pub async fn get_pipeline_environment(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+    ) -> Result<temps_entities::environments::Model, ProjectError> {
+        temps_entities::environments::Entity::find_by_id(environment_id)
+            .filter(temps_entities::environments::Column::ProjectId.eq(project_id))
+            .filter(temps_entities::environments::Column::DeletedAt.is_null())
+            .one(self.db.as_ref())
+            .await
+            .map_err(|source| ProjectError::PipelineEnvironmentLookup {
+                project_id,
+                environment_id,
+                source,
+            })?
+            .ok_or(ProjectError::PipelineEnvironmentNotFound {
+                project_id,
+                environment_id,
+            })
+    }
+
     /// Trigger a pipeline for a specific project and environment
     pub async fn trigger_pipeline(
         &self,
@@ -309,6 +331,44 @@ impl ProjectService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn pipeline_environment_lookup_is_project_bound_and_contextual() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([Vec::<temps_entities::environments::Model>::new()])
+            .into_connection();
+        let service = super::super::tests::create_test_services(
+            Arc::new(db),
+            Arc::new(super::super::tests::MockJobQueue::new()),
+        )
+        .await;
+        let error = service.get_pipeline_environment(7, 9).await.unwrap_err();
+        assert!(matches!(
+            error,
+            ProjectError::PipelineEnvironmentNotFound {
+                project_id: 7,
+                environment_id: 9
+            }
+        ));
+        assert!(error.to_string().contains("project 7"));
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors([sea_orm::DbErr::Custom("database unavailable".into())])
+            .into_connection();
+        let service = super::super::tests::create_test_services(
+            Arc::new(db),
+            Arc::new(super::super::tests::MockJobQueue::new()),
+        )
+        .await;
+        assert!(matches!(
+            service.get_pipeline_environment(7, 9).await.unwrap_err(),
+            ProjectError::PipelineEnvironmentLookup {
+                project_id: 7,
+                environment_id: 9,
+                ..
+            }
+        ));
+    }
 
     // ------------------------------------------------------------------
     // Manual triggers resolve branches, tags and commits of public repos

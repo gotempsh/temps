@@ -4283,6 +4283,13 @@
             "format": "date-time",
             "type": "string"
           },
+          "environment_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "expires_at": {
             "example": "2024-12-31T23:59:59Z",
             "format": "date-time",
@@ -4318,6 +4325,14 @@
             },
             "type": [
               "array",
+              "null"
+            ]
+          },
+          "project_id": {
+            "description": "Immutable optional deployment resource scope.",
+            "format": "int32",
+            "type": [
+              "integer",
               "null"
             ]
           },
@@ -16277,6 +16292,13 @@
       },
       "CreateApiKeyRequest": {
         "properties": {
+          "environment_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "expires_at": {
             "example": "2024-12-31T23:59:59Z",
             "format": "date-time",
@@ -16301,6 +16323,14 @@
               "null"
             ]
           },
+          "project_id": {
+            "description": "Immutable optional deployment resource scope.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "role_type": {
             "example": "admin",
             "type": "string"
@@ -16321,6 +16351,13 @@
             "example": "2024-01-01T00:00:00Z",
             "format": "date-time",
             "type": "string"
+          },
+          "environment_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "expires_at": {
             "example": "2024-12-31T23:59:59Z",
@@ -16346,6 +16383,14 @@
             },
             "type": [
               "array",
+              "null"
+            ]
+          },
+          "project_id": {
+            "description": "Immutable optional deployment resource scope.",
+            "format": "int32",
+            "type": [
+              "integer",
               "null"
             ]
           },
@@ -140521,6 +140566,12 @@
           },
           "400": {
             "description": "Invalid request"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Deployment permission or scope denied"
           },
           "404": {
             "description": "Project not found"

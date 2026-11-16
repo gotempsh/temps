@@ -40,6 +40,8 @@ Create a new API key
 | `-r, --role <role>` | Role type (admin, platform_admin, user, reader, api_reader, custom, metrics_ingest) | - | No |
 | `-e, --expires-in <days>` | Expires in N days (7, 30, 90, 365) | - | No |
 | `-p, --permissions <permissions>` | Comma-separated list of permissions | - | No |
+| `--project-id <id>` | Confine to one project’s deployment and environment APIs | - | No |
+| `--environment-id <id>` | Confine to one environment (requires --project-id) | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `apikeys show`

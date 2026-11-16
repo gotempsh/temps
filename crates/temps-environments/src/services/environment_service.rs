@@ -1842,6 +1842,18 @@ impl EnvironmentService {
             });
         }
 
+        // Recreating this environment must not resurrect its old credentials.
+        // Creation takes a shared environment lock, so it cannot race past this
+        // transaction's exclusive lock and escape revocation.
+        temps_entities::api_keys::Entity::update_many()
+            .col_expr(
+                temps_entities::api_keys::Column::IsActive,
+                sea_orm::sea_query::Expr::value(false),
+            )
+            .filter(temps_entities::api_keys::Column::EnvironmentId.eq(env_id))
+            .exec(txn)
+            .await?;
+
         // Soft-delete: set deleted_at and clear current_deployment_id
         let environment_name = environment.name.clone();
         let mut active_env: environments::ActiveModel = environment.into();
@@ -2269,6 +2281,10 @@ mod tests {
             .append_query_results(vec![
                 Vec::<temps_entities::domain_delivery_bindings::Model>::new(),
             ])
+            .append_exec_results([MockExecResult {
+                rows_affected: 0,
+                last_insert_id: 0,
+            }])
             .append_query_results(vec![vec![fenced.clone()]])
             .append_query_results(vec![vec![fenced]])
             .into_connection();
@@ -3227,6 +3243,48 @@ mod tests {
             ingress_mode: Default::default(),
             workload_mode: Default::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn deleting_environment_deactivates_its_scoped_api_keys_before_fencing() {
+        use sea_orm::{MockExecResult, TransactionTrait};
+        let env = make_env_model(false, false);
+        let mut deleted = env.clone();
+        deleted.deleted_at = Some(chrono::Utc::now());
+        deleted.current_deployment_id = None;
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![env]])
+            .append_query_results([Vec::<temps_entities::domain_delivery_bindings::Model>::new()])
+            .append_exec_results([MockExecResult {
+                rows_affected: 2,
+                last_insert_id: 0,
+            }])
+            .append_query_results([vec![deleted]])
+            .into_connection();
+        let txn = db.begin().await.unwrap();
+        assert_eq!(
+            EnvironmentService::soft_delete_locked_environment(&txn, 10, 1)
+                .await
+                .unwrap(),
+            Some("staging".into())
+        );
+        txn.commit().await.unwrap();
+        let log = db.into_transaction_log();
+        let statements: Vec<_> = log
+            .iter()
+            .flat_map(|txn| txn.statements())
+            .map(|statement| statement.sql.as_str())
+            .collect();
+        let revoke = statements
+            .iter()
+            .position(|sql| sql.starts_with("UPDATE \"api_keys\""))
+            .unwrap();
+        let fence = statements
+            .iter()
+            .position(|sql| sql.starts_with("UPDATE \"environments\""))
+            .unwrap();
+        assert!(revoke < fence);
+        assert!(statements[revoke].contains("environment_id"));
     }
 
     #[tokio::test]

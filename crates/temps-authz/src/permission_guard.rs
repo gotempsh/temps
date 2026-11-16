@@ -78,7 +78,7 @@ macro_rules! project_scope_guard {
             .type_("https://temps.sh/probs/cross-project-access-denied")
             .title("Cross-Project Access Denied")
             .detail(
-                "This deployment token is scoped to a different project and \
+                "This credential is scoped to a different project and \
                  cannot access this resource",
             )
             .permission_denial(
