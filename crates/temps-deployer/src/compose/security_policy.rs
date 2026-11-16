@@ -1265,7 +1265,7 @@ impl ComposeExecutor {
                                 .and_then(YamlValue::as_str)
                             else {
                                 return Err(ComposeError::SecurityPolicyViolation {
-                                    check: Some(PolicyCheck::EnvFiles),
+                                    check: None,
                                     service: service_name.to_string(),
                                     field: "env_file".to_string(),
                                     reason:
@@ -1277,7 +1277,7 @@ impl ComposeExecutor {
                         }
                         _ => {
                             return Err(ComposeError::SecurityPolicyViolation {
-                                check: Some(PolicyCheck::EnvFiles),
+                                check: None,
                                 service: service_name.to_string(),
                                 field: "env_file".to_string(),
                                 reason: "env_file must be a path or a sequence of path entries"
@@ -1289,7 +1289,7 @@ impl ComposeExecutor {
                 Ok(())
             }
             _ => Err(ComposeError::SecurityPolicyViolation {
-                check: Some(PolicyCheck::EnvFiles),
+                check: None,
                 service: service_name.to_string(),
                 field: "env_file".to_string(),
                 reason: "env_file must be a literal path or sequence".to_string(),
@@ -1584,8 +1584,19 @@ impl ComposeExecutor {
             }
         }
 
+        // `service:` targets are rejected only when the service is missing or
+        // empty, which no setting allows, so they carry no policy check.
+        let check = if mode == "host" {
+            Some(PolicyCheck::HostNetwork)
+        } else if mode.starts_with("container:") {
+            Some(PolicyCheck::ContainerNamespace)
+        } else if mode.starts_with("service:") {
+            None
+        } else {
+            Some(PolicyCheck::NetworkMode)
+        };
         Err(ComposeError::SecurityPolicyViolation {
-            check: Some(if mode == "host" { PolicyCheck::HostNetwork } else if mode.starts_with("container:") { PolicyCheck::ContainerNamespace } else { PolicyCheck::NetworkMode }),
+            check,
             service: service_name.to_string(),
             field: "network_mode".to_string(),
             reason: "network_mode may not join host, default bridge, arbitrary container, or external namespaces; omit it for the project network, use 'none', or share a declared service namespace"
@@ -1748,7 +1759,9 @@ impl ComposeExecutor {
                     || !matches!(mount_type, "bind" | "volume")
                 {
                     return Err(ComposeError::SecurityPolicyViolation {
-                        check: None,
+                        // Disabling Tmpfs allows this mount (above); other
+                        // types are unsupported whatever the policy says.
+                        check: (mount_type == "tmpfs").then_some(PolicyCheck::Tmpfs),
                         service: service_name.to_string(),
                         field: "volumes.type".to_string(),
                         reason: format!(

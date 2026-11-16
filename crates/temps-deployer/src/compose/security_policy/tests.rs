@@ -1988,3 +1988,59 @@ fn inline_override_rejections_keep_the_actual_check() {
         )));
     }
 }
+
+#[test]
+fn structural_rejections_carry_no_policy_check() {
+    // Each of these is rejected even with its nearest check disabled, so
+    // telemetry must not name that check as the cause.
+    let executor =
+        executor_with_checks_disabled(&[PolicyCheck::EnvFiles, PolicyCheck::NetworkMode]);
+    for content in [
+        "services:\n  app:\n    image: nginx\n    env_file: true\n",
+        "services:\n  app:\n    image: nginx\n    env_file: [1]\n",
+        "services:\n  app:\n    image: nginx\n    env_file:\n      - required: true\n",
+        "services:\n  app:\n    image: nginx\n    network_mode: service:missing\n",
+        "services:\n  app:\n    image: nginx\n    network_mode: 'service:'\n",
+    ] {
+        let error = executor.preflight_validate(content, None).unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                ComposeError::SecurityPolicyViolation { check: None, .. }
+            ),
+            "{content}: {error}"
+        );
+        assert!(
+            error.to_string().contains("[check=unclassified]"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn configurable_volume_and_env_file_rejections_name_their_check() {
+    let executor = executor_with_checks_disabled(&[]);
+    for (content, expected) in [
+        (
+            "services:\n  app:\n    image: nginx\n    volumes:\n      - type: tmpfs\n        target: /cache\n",
+            PolicyCheck::Tmpfs,
+        ),
+        (
+            "services:\n  app:\n    image: nginx\n    env_file: ../outside.env\n",
+            PolicyCheck::EnvFiles,
+        ),
+    ] {
+        let error = executor.preflight_validate(content, None).unwrap_err();
+        assert!(
+            matches!(&error, ComposeError::SecurityPolicyViolation { check: Some(check), .. } if *check == expected),
+            "{content}: {error}"
+        );
+    }
+    // The same long-form tmpfs mount is allowed once its check is disabled.
+    executor_with_checks_disabled(&[PolicyCheck::Tmpfs])
+        .preflight_validate(
+            "services:\n  app:\n    image: nginx\n    volumes:\n      - type: tmpfs\n        target: /cache\n",
+            None,
+        )
+        .unwrap();
+}
