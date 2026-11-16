@@ -497,7 +497,7 @@ mockito = "1.5"
 moka = { version = "0.12", features = ["future"] }
 mongodb = { version = "3.7.0", default-features = false }
 netlink-packet-core = "0.9"
-netlink-packet-route = "0.33"
+netlink-packet-route = "0.34"
 nix = "0.31"
 num_cpus = "1.16"
 p256 = { version = "0.14", features = ["pkcs8", "pem"] }
