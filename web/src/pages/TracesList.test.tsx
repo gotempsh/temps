@@ -119,11 +119,23 @@ function renderWithTraces(entry: string) {
   )
 }
 
-test('a link to #traces-setup opens the setup even when traces exist', async () => {
-  const view = renderWithTraces('/traces#traces-setup')
-  await waitFor(() =>
-    expect(view.container.querySelector('#traces-setup')).not.toBeNull()
-  )
+test('a link to #traces-setup opens the setup and scrolls to it even when traces exist', async () => {
+  const scrolled: string[] = []
+  const original = HTMLElement.prototype.scrollIntoView
+  HTMLElement.prototype.scrollIntoView = function (this: HTMLElement) {
+    scrolled.push(this.id)
+  }
+  try {
+    const view = renderWithTraces('/traces#traces-setup')
+    await waitFor(() =>
+      expect(view.container.querySelector('#traces-setup')).not.toBeNull()
+    )
+    // The filter sync rewrites the URL without the hash on mount; the scroll
+    // still has to happen.
+    await waitFor(() => expect(scrolled).toContain('traces-setup'))
+  } finally {
+    HTMLElement.prototype.scrollIntoView = original
+  }
 })
 
 test('without the hash a service with traces keeps the setup closed', async () => {

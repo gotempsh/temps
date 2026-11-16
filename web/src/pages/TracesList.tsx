@@ -31,6 +31,7 @@ import {
 } from '@/components/project/setup/SetupWizardShell'
 import { Input } from '@/components/ui/input'
 import { useDebounce } from '@/hooks/useDebounce'
+import { preferredScrollBehavior } from '@/lib/scroll-behavior'
 import { useAttributeFilter } from '@/hooks/useAttributeFilter'
 import { attributesQueryValue } from '@/lib/attribute-facets'
 import {
@@ -778,21 +779,29 @@ export default function TracesList({ project }: TracesListProps) {
   // point at `#traces-setup`. A service that already has traces hides the
   // setup section, so arriving with that hash has to open it, not just try to
   // scroll to an element that is not there.
+  // The scroll waits on its own flag, not on the hash: the filter sync below
+  // rewrites the URL without it, and that must not cancel the scroll.
   const { hash } = useLocation()
   const [seenHash, setSeenHash] = useState<string | null>(null)
+  const [scrollToSetup, setScrollToSetup] = useState(false)
   if (hash !== seenHash) {
     setSeenHash(hash)
-    if (hash === '#traces-setup') setShowSetup(true)
+    if (hash === '#traces-setup') {
+      setShowSetup(true)
+      setScrollToSetup(true)
+    }
   }
   useEffect(() => {
-    if (!showSetup || hash !== '#traces-setup') return
+    if (!showSetup || !scrollToSetup) return
     const frame = requestAnimationFrame(() => {
-      document
-        .getElementById('traces-setup')
-        ?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+      document.getElementById('traces-setup')?.scrollIntoView({
+        behavior: preferredScrollBehavior(),
+        block: 'start',
+      })
+      setScrollToSetup(false)
     })
     return () => cancelAnimationFrame(frame)
-  }, [showSetup, hash])
+  }, [showSetup, scrollToSetup])
   // Bumped by Refresh so relative ranges recompute against "now". Without
   // this, start/end freeze at mount (or last range change) and newly ingested
   // traces that land after that frozen end_time stay invisible until a full
@@ -1066,9 +1075,10 @@ export default function TracesList({ project }: TracesListProps) {
               onClick={() => {
                 setShowSetup((v) => !v)
                 requestAnimationFrame(() => {
-                  document
-                    .getElementById('traces-setup')
-                    ?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+                  document.getElementById('traces-setup')?.scrollIntoView({
+                    behavior: preferredScrollBehavior(),
+                    block: 'start',
+                  })
                 })
               }}
             >
@@ -1226,9 +1236,10 @@ export default function TracesList({ project }: TracesListProps) {
                     size="sm"
                     className="gap-2"
                     onClick={() => {
-                      document
-                        .getElementById('traces-setup')
-                        ?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+                      document.getElementById('traces-setup')?.scrollIntoView({
+                        behavior: preferredScrollBehavior(),
+                        block: 'start',
+                      })
                     }}
                   >
                     <Settings2 className="h-3.5 w-3.5" />
