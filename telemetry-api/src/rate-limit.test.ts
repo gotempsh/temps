@@ -12,7 +12,7 @@ function clock(start = 1_000_000) {
 describe("createRateLimiter", () => {
   it("allows up to the limit per IP, then rejects", () => {
     const c = clock();
-    const limiter = createRateLimiter(3, c.now);
+    const limiter = createRateLimiter(3, { now: c.now });
     expect(limiter.isLimited("198.51.100.1")).toBe(false);
     expect(limiter.isLimited("198.51.100.1")).toBe(false);
     expect(limiter.isLimited("198.51.100.1")).toBe(false);
@@ -20,7 +20,7 @@ describe("createRateLimiter", () => {
   });
 
   it("keeps a separate budget per IP", () => {
-    const limiter = createRateLimiter(1, clock().now);
+    const limiter = createRateLimiter(1, { now: clock().now });
     expect(limiter.isLimited("198.51.100.1")).toBe(false);
     expect(limiter.isLimited("198.51.100.1")).toBe(true);
     expect(limiter.isLimited("198.51.100.2")).toBe(false);
@@ -28,7 +28,7 @@ describe("createRateLimiter", () => {
 
   it("frees the budget once the minute has passed", () => {
     const c = clock();
-    const limiter = createRateLimiter(1, c.now);
+    const limiter = createRateLimiter(1, { now: c.now });
     expect(limiter.isLimited("198.51.100.1")).toBe(false);
     c.advance(59_999);
     expect(limiter.isLimited("198.51.100.1")).toBe(true);
@@ -37,12 +37,48 @@ describe("createRateLimiter", () => {
   });
 
   it("charges a cost all at once and refuses one that would overrun", () => {
-    const limiter = createRateLimiter(10, clock().now);
+    const limiter = createRateLimiter(10, { now: clock().now });
     expect(limiter.isLimited("198.51.100.1", 8)).toBe(false);
     // 8 + 3 > 10: refused, and nothing is spent.
     expect(limiter.isLimited("198.51.100.1", 3)).toBe(true);
     expect(limiter.isLimited("198.51.100.1", 2)).toBe(false);
     expect(limiter.isLimited("198.51.100.1", 1)).toBe(true);
+  });
+
+  it("leaves no entry behind for an IP refused with nothing spent", () => {
+    const limiter = createRateLimiter(5, { now: clock().now });
+    // A cost above the whole limit, from addresses never seen before.
+    for (let i = 0; i < 50; i++) {
+      expect(limiter.isLimited(`198.51.100.${i}`, 6)).toBe(true);
+    }
+    expect(limiter.trackedIps()).toBe(0);
+  });
+
+  it("keeps the live window of an IP it refuses", () => {
+    const limiter = createRateLimiter(5, { now: clock().now });
+    expect(limiter.isLimited("198.51.100.1", 4)).toBe(false);
+    expect(limiter.isLimited("198.51.100.1", 6)).toBe(true);
+    expect(limiter.trackedIps()).toBe(1);
+    // The 4 units already spent still count.
+    expect(limiter.isLimited("198.51.100.1", 2)).toBe(true);
+    expect(limiter.isLimited("198.51.100.1", 1)).toBe(false);
+  });
+
+  it("sweeps expired IPs above the threshold, at most once per window", () => {
+    const c = clock(0);
+    const limiter = createRateLimiter(10, { now: c.now, sweepThreshold: 1 });
+    limiter.isLimited("a"); // t=0
+    c.advance(50_000);
+    limiter.isLimited("b"); // t=50s: 2 > 1, sweeps (nothing expired yet)
+    expect(limiter.trackedIps()).toBe(2);
+
+    c.advance(20_000);
+    limiter.isLimited("c"); // t=70s: "a" expired, but the last sweep was 20s ago
+    expect(limiter.trackedIps()).toBe(3);
+
+    c.advance(41_000);
+    limiter.isLimited("d"); // t=111s: a window since the last sweep; "a" and "b" go
+    expect(limiter.trackedIps()).toBe(2);
   });
 
   it("answers 429 with a Retry-After", async () => {

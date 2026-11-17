@@ -358,6 +358,36 @@ describe("ingest abuse limits", () => {
     expect((await postEvent(reqFrom(ip, event()))).status).toBe(429);
   });
 
+  it("charges malformed batch bodies one unit, until the IP is out of budget", async () => {
+    const pool = makePool();
+    const { postBatch } = routes(pool, 3);
+    const ip = "198.51.100.15";
+    const malformed = () =>
+      new Request("http://localhost/v1/events/batch", {
+        method: "POST",
+        headers: { "x-forwarded-for": ip },
+        body: "not json",
+      });
+
+    expect((await postBatch(malformed())).status).toBe(400);
+    expect((await postBatch(malformed())).status).toBe(400);
+    expect((await postBatch(malformed())).status).toBe(400);
+    expect((await postBatch(malformed())).status).toBe(429);
+    expect((pool.query as ReturnType<typeof mock>).mock.calls.length).toBe(0);
+  });
+
+  it("charges a valid batch its event count exactly once", async () => {
+    const pool = makePool();
+    const { postBatch } = routes(pool, 5);
+    const ip = "198.51.100.16";
+    const batch = (n: number) => reqFrom(ip, { events: Array.from({ length: n }, () => event()) }, "/v1/events/batch");
+
+    // 2 events cost 2, then 3 more fit exactly: charged once each, not twice.
+    expect((await postBatch(batch(2))).status).toBe(201);
+    expect((await postBatch(batch(3))).status).toBe(201);
+    expect((await postBatch(batch(1))).status).toBe(429);
+  });
+
   it("spends the budget on rejected payloads too", async () => {
     const pool = makePool();
     const { postEvent } = routes(pool, 1);

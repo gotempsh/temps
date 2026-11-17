@@ -7,23 +7,47 @@
 //
 // The client IP comes from X-Forwarded-For, which the Temps proxy overwrites
 // with the address it observed, so a caller cannot rotate it to escape the
-// limit. Memory is bounded: an IP holds at most `limit` timestamps, and IPs
-// whose window has fully expired are swept once the map grows large.
+// limit. Memory is bounded: an IP holds at most `limit` timestamps, a refused
+// call never leaves an empty entry behind, and IPs whose window has fully
+// expired are swept once the map grows large.
 
 const WINDOW_MS = 60_000;
-const SWEEP_THRESHOLD = 10_000;
+const DEFAULT_SWEEP_THRESHOLD = 10_000;
 
 export interface RateLimiter {
   // Spends `cost` units of `ip`'s budget. Returns true (and spends nothing)
   // when that would exceed the limit for the current window.
   isLimited(ip: string, cost?: number): boolean;
+  // How many IPs currently hold an entry (for tests and diagnostics).
+  trackedIps(): number;
+}
+
+export interface RateLimiterOptions {
+  now?: () => number;
+  // Map size above which expired IPs are swept, at most once per window.
+  sweepThreshold?: number;
 }
 
 export function createRateLimiter(
   limitPerMinute: number,
-  now: () => number = Date.now
+  options: RateLimiterOptions = {}
 ): RateLimiter {
+  const now = options.now ?? Date.now;
+  const sweepThreshold = options.sweepThreshold ?? DEFAULT_SWEEP_THRESHOLD;
   const requestLog = new Map<string, number[]>();
+  let lastSweep = Number.NEGATIVE_INFINITY;
+
+  // Drops every IP whose window has fully expired. A full scan, so it runs at
+  // most once per window: while more than `sweepThreshold` IPs are live, a
+  // sweep frees nothing, and repeating it on every request would make each
+  // request O(tracked IPs).
+  const sweep = (at: number, cutoff: number): void => {
+    if (requestLog.size <= sweepThreshold || at - lastSweep < WINDOW_MS) return;
+    lastSweep = at;
+    for (const [key, ts] of requestLog) {
+      if (ts.every((t) => t <= cutoff)) requestLog.delete(key);
+    }
+  };
 
   return {
     isLimited(ip: string, cost = 1): boolean {
@@ -32,22 +56,22 @@ export function createRateLimiter(
       const timestamps = (requestLog.get(ip) ?? []).filter((t) => t > cutoff);
 
       if (timestamps.length + cost > limitPerMinute) {
-        requestLog.set(ip, timestamps);
+        // Keep only the live window. An IP refused with nothing spent (a cost
+        // above the whole limit) holds no entry, so refusals alone can't grow
+        // the map.
+        if (timestamps.length > 0) requestLog.set(ip, timestamps);
+        else requestLog.delete(ip);
         return true;
       }
 
       for (let i = 0; i < cost; i++) timestamps.push(at);
       requestLog.set(ip, timestamps);
-
-      // Occasional sweep so long-running processes don't accumulate an
-      // ever-growing map of one-off callers.
-      if (requestLog.size > SWEEP_THRESHOLD) {
-        for (const [key, ts] of requestLog) {
-          if (ts.every((t) => t <= cutoff)) requestLog.delete(key);
-        }
-      }
-
+      sweep(at, cutoff);
       return false;
+    },
+
+    trackedIps(): number {
+      return requestLog.size;
     },
   };
 }

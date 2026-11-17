@@ -36,7 +36,8 @@ export function positiveIntFromEnv(
 
 export interface IngestLimits {
   // Largest request body accepted on any route (Bun answers 413 above it).
-  // Must fit a failure report: up to 200,000 chars of trace text, JSON-encoded.
+  // Must fit the largest failure report once JSON-encoded (see
+  // conflictingLimits for the worst case).
   maxRequestBodyBytes: number;
   // Largest `properties` object one event may carry, measured as UTF-8 JSON.
   eventPropertiesMaxBytes: number;
@@ -71,6 +72,19 @@ export function ingestLimitsFromEnv(
 // ids, job names, version), with room to spare.
 const FAILURE_REPORT_ENVELOPE_BYTES = 4 * KIB;
 
+// The most bytes one character of report_text can take in the JSON body.
+// report_text's length counts UTF-16 code units; the costliest unit is a
+// control character or lone surrogate, which JSON escapes as `\uXXXX` (6
+// bytes). Other units take fewer: a BMP character at most 3 bytes of UTF-8,
+// and an astral character 4 bytes for its 2 units.
+export const MAX_JSON_BYTES_PER_CHAR = 6;
+
+// Bytes the largest failure report allowed by `failureReportMaxChars` can
+// take, worst case.
+export function maxFailureReportBodyBytes(limits: IngestLimits): number {
+  return limits.failureReportMaxChars * MAX_JSON_BYTES_PER_CHAR + FAILURE_REPORT_ENVELOPE_BYTES;
+}
+
 // Combinations that are each valid but contradict one another, so a request
 // the other limits allow could never succeed. Logged at startup; the values
 // are still used as set, since the operator may intend them.
@@ -83,11 +97,12 @@ export function conflictingLimits(limits: IngestLimits): string[] {
         `the rate limit is always refused with 429`
     );
   }
-  if (limits.maxRequestBodyBytes < limits.failureReportMaxChars + FAILURE_REPORT_ENVELOPE_BYTES) {
+  const reportBytes = maxFailureReportBodyBytes(limits);
+  if (limits.maxRequestBodyBytes < reportBytes) {
     conflicts.push(
       `MAX_REQUEST_BODY_BYTES (${limits.maxRequestBodyBytes}) cannot fit a failure report of ` +
-        `FAILURE_REPORT_MAX_CHARS (${limits.failureReportMaxChars}): the largest reports ` +
-        `are refused with 413`
+        `FAILURE_REPORT_MAX_CHARS (${limits.failureReportMaxChars}) characters, which can take ` +
+        `up to ${reportBytes} bytes once JSON-encoded: such reports are refused with 413`
     );
   }
   return conflicts;

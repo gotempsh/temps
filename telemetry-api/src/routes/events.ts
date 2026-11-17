@@ -271,17 +271,19 @@ export function createEventsRoutes(pool: Pool, deps: EventsRoutesDeps) {
 
     // POST /v1/events/batch — up to 100 events in one request
     async postBatch(req: Request): Promise<Response> {
+      // Spend the budget before validating, so neither batching nor a stream
+      // of rejected requests gets more than the per-event budget: one unit
+      // per event, one for a body that isn't JSON or has no events array, the
+      // batch maximum for an oversized batch. Each request is charged once.
       let body: unknown;
       try {
         body = await req.json();
       } catch {
+        if (overBudget(req, 1)) return rateLimitedResponse();
         return Response.json({ error: "invalid JSON body" }, { status: 400 });
       }
 
       const b = body as BatchIngestBody;
-      // Spend one unit per event before validating, so neither batching nor a
-      // stream of rejected batches gets more than the per-event budget. A
-      // malformed body costs one, an oversized batch the maximum.
       const cost = Array.isArray(b?.events)
         ? Math.min(Math.max(b.events.length, 1), batchMax)
         : 1;

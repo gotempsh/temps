@@ -8,6 +8,7 @@ import { createFailureReportsRoutes } from "./routes/failure-reports.js";
 import { initGeo } from "./geo.js";
 import { CountryBackfiller } from "./backfill.js";
 import { gracefulShutdown } from "./shutdown.js";
+import { startServer } from "./server.js";
 import { errorFields, log } from "./log.js";
 import { conflictingLimits, ingestLimitsFromEnv } from "./limits.js";
 import { createRateLimiter } from "./rate-limit.js";
@@ -50,52 +51,10 @@ async function main() {
     maxTextChars: limits.failureReportMaxChars,
   });
 
-  const server = Bun.serve({
+  const server = startServer({
     port: PORT,
-    // Bun answers 413 above this before a handler reads the body. Its own
-    // default (128 MiB) would let one request write that much into Postgres.
-    maxRequestBodySize: limits.maxRequestBodyBytes,
-    async fetch(req) {
-      const url = new URL(req.url);
-      const method = req.method.toUpperCase();
-      const path = url.pathname;
-
-      // Health check — no auth required
-      if (method === "GET" && path === "/health") {
-        return Response.json({ ok: true });
-      }
-
-      // Ingest endpoints
-      if (method === "POST" && path === "/v1/events") {
-        return events.postEvent(req);
-      }
-      if (method === "POST" && path === "/v1/events/batch") {
-        return events.postBatch(req);
-      }
-      if (method === "POST" && path === "/v1/deploy-failure-reports") {
-        return failureReports.postReport(req);
-      }
-
-      // Stats endpoints (add auth in production via INGEST_API_KEY or network policy)
-      if (method === "GET" && path === "/v1/stats/overview") {
-        return stats.getOverview(req);
-      }
-      if (method === "GET" && path === "/v1/stats/active-instances") {
-        return stats.getActiveInstances(req);
-      }
-      if (method === "GET" && path === "/v1/stats/funnel") {
-        return stats.getFunnel(req);
-      }
-      if (method === "GET" && path === "/v1/stats/countries") {
-        return stats.getCountries(req);
-      }
-
-      return Response.json({ error: "not found" }, { status: 404 });
-    },
-    error(err) {
-      log("error", "server", "unhandled error", errorFields(err));
-      return Response.json({ error: "internal server error" }, { status: 500 });
-    },
+    maxRequestBodyBytes: limits.maxRequestBodyBytes,
+    routes: { events, failureReports, stats },
   });
 
   log("info", "server", "temps telemetry API listening", { port: server.port });
