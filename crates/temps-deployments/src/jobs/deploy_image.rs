@@ -1660,6 +1660,106 @@ impl DeployImageJob {
         }
     }
 
+    /// Pull a registry image again when the control plane no longer holds it,
+    /// before a replica is started from it here.
+    ///
+    /// The nightly image retention pass removes expired registry-pulled
+    /// images from the control plane, because unlike an uploaded tarball they
+    /// can be pulled again. This is where "again" happens: a rollback,
+    /// promotion or failover reuses the tag without a `PullExternalImageJob`,
+    /// and Docker's `create_container` never pulls, so without this a pruned
+    /// image would fail as a bare "No such image".
+    ///
+    /// Only registry-sourced images are pulled; a control-plane-local image
+    /// (an upload or a local build) has no registry to come from and keeps the
+    /// existing behaviour. When this deployment is bound to a recorded image
+    /// identity, the pulled image must match it: a registry tag is mutable,
+    /// and rolling back onto whatever the tag points at today would run a
+    /// different image than the one being restored.
+    async fn ensure_registry_image_local(
+        &self,
+        image_tag: &str,
+        context: &WorkflowContext,
+    ) -> Result<(), WorkflowError> {
+        if self.resolved_image_source(image_tag) != DeployImageSource::Registry {
+            return Ok(());
+        }
+        let Some(image_builder) = self.image_builder.as_ref() else {
+            return Ok(());
+        };
+        let absent_reason = match self.control_plane_image(image_tag).await {
+            ControlPlaneImage::Absent(reason) => reason,
+            // Present: nothing to do. No Docker or no builder: the deploy
+            // itself reports that, with its own remedy.
+            ControlPlaneImage::Present
+            | ControlPlaneImage::DockerUnavailable(_)
+            | ControlPlaneImage::NoImageBuilder => return Ok(()),
+        };
+
+        self.log(
+            context,
+            format!(
+                "Image '{}' is no longer on this server ({}); it may have been removed by \
+                 image retention. Pulling it again from its registry...",
+                image_tag, absent_reason
+            ),
+        )
+        .await?;
+
+        if let Err(pull_error) = image_builder
+            .fetch_registry_image(image_tag, image_tag, self.registry_credentials.clone())
+            .await
+        {
+            // A digest reference (`repo@sha256:...`) pulls but cannot be
+            // re-tagged as itself; what matters is whether it is here now.
+            if !matches!(
+                self.control_plane_image(image_tag).await,
+                ControlPlaneImage::Present
+            ) {
+                let msg = format!(
+                    "Image '{}' for deployment {} is no longer on this server and pulling it \
+                     again from its registry failed: {}. The registry may no longer serve this \
+                     tag, or its credentials may have changed. Deploy a tag the registry still \
+                     serves.",
+                    image_tag, context.deployment_id, pull_error
+                );
+                self.log_at(context, LogLevel::Error, format!("ERROR: {}", msg))
+                    .await?;
+                return Err(WorkflowError::JobExecutionFailed(msg));
+            }
+        }
+
+        if let Some(expected) = self.expected_image_identity(context) {
+            let mismatch = match image_builder.image_identity(image_tag).await {
+                Ok(local) if expected.matches(&local) => None,
+                Ok(local) => Some(format!(
+                    "the registry now serves a different image under this tag ({}; this \
+                     deployment is bound to {})",
+                    local.id, expected
+                )),
+                Err(error) => Some(format!(
+                    "the pulled image could not be inspected to verify it is {} ({})",
+                    expected, error
+                )),
+            };
+            if let Some(reason) = mismatch {
+                let msg = format!(
+                    "Refusing to start deployment {} from re-pulled image '{}': {}.",
+                    context.deployment_id, image_tag, reason
+                );
+                self.log_at(context, LogLevel::Error, format!("ERROR: {}", msg))
+                    .await?;
+                return Err(WorkflowError::JobExecutionFailed(msg));
+            }
+        }
+
+        self.log(
+            context,
+            format!("Image '{}' pulled again from its registry", image_tag),
+        )
+        .await
+    }
+
     pub fn with_config_service(mut self, service: Arc<temps_config::ConfigService>) -> Self {
         self.config_service = Some(service);
         self
@@ -3282,6 +3382,10 @@ impl DeployImageJob {
                         )
                         .await?;
                     }
+                    // A rollback/promotion of a registry image that image
+                    // retention removed from this server pulls it again.
+                    self.ensure_registry_image_local(&replica_image_tag, context)
+                        .await?;
                     // Remote replicas are checked before the image is
                     // transferred; local ones had no equivalent guard, so a
                     // mismatch here surfaced only as a container that won't
@@ -8396,6 +8500,228 @@ mod tests {
         );
         result.expect("registry pull should succeed");
         assert!(!save_image_called.load(Ordering::SeqCst));
+    }
+
+    /// An [`ImageBuilder`] whose image can be pruned and pulled back:
+    /// `inspect_image` answers from `present`, and `fetch_registry_image`
+    /// records the pull and (unless `pull_fails`) makes the image present
+    /// under `pulled_id`.
+    struct RepullImageBuilder {
+        present: AtomicBool,
+        pull_fails: bool,
+        pulled_id: &'static str,
+        fetches: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RepullImageBuilder {
+        fn new(present: bool, pull_fails: bool, pulled_id: &'static str) -> Self {
+            Self {
+                present: AtomicBool::new(present),
+                pull_fails,
+                pulled_id,
+                fetches: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn fetches(&self) -> Vec<String> {
+            self.fetches
+                .lock()
+                .expect("repull builder mutex poisoned")
+                .clone()
+        }
+    }
+
+    #[async_trait]
+    impl temps_deployer::ImageBuilder for RepullImageBuilder {
+        async fn build_image(
+            &self,
+            _request: temps_deployer::BuildRequest,
+        ) -> Result<temps_deployer::BuildResult, temps_deployer::BuilderError> {
+            unimplemented!("not used")
+        }
+
+        async fn build_image_with_callback(
+            &self,
+            _request: temps_deployer::BuildRequestWithCallback,
+        ) -> Result<temps_deployer::BuildResult, temps_deployer::BuilderError> {
+            unimplemented!("not used")
+        }
+
+        async fn fetch_registry_image(
+            &self,
+            reference: &str,
+            _tag: &str,
+            _credentials: Option<temps_deployer::remote::RemotePullCredentials>,
+        ) -> Result<(), temps_deployer::BuilderError> {
+            self.fetches
+                .lock()
+                .expect("repull builder mutex poisoned")
+                .push(reference.to_string());
+            if self.pull_fails {
+                return Err(temps_deployer::BuilderError::Other(format!(
+                    "manifest for {reference} not found"
+                )));
+            }
+            self.present.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn import_image(
+            &self,
+            _image_path: PathBuf,
+            _tag: &str,
+        ) -> Result<String, temps_deployer::BuilderError> {
+            unimplemented!("not used")
+        }
+
+        async fn save_image(
+            &self,
+            _image_name: &str,
+            _output_path: &std::path::Path,
+        ) -> Result<(), temps_deployer::BuilderError> {
+            unimplemented!("not used")
+        }
+
+        async fn extract_from_image(
+            &self,
+            _image_name: &str,
+            _source_path: &str,
+            _destination_path: &std::path::Path,
+        ) -> Result<(), temps_deployer::BuilderError> {
+            unimplemented!("not used")
+        }
+
+        async fn list_images(&self) -> Result<Vec<String>, temps_deployer::BuilderError> {
+            unimplemented!("not used")
+        }
+
+        async fn remove_image(
+            &self,
+            _image_name: &str,
+        ) -> Result<(), temps_deployer::BuilderError> {
+            unimplemented!("not used")
+        }
+
+        async fn inspect_image(
+            &self,
+            image_name: &str,
+        ) -> Result<temps_deployer::ImageInfo, temps_deployer::BuilderError> {
+            if !self.present.load(Ordering::SeqCst) {
+                return Err(temps_deployer::BuilderError::ImageNotFound(
+                    image_name.to_string(),
+                ));
+            }
+            Ok(temps_deployer::ImageInfo {
+                id: self.pulled_id.to_string(),
+                architecture: "amd64".to_string(),
+                os: "linux".to_string(),
+                platform: "linux/amd64".to_string(),
+                size_bytes: 0,
+                tags: vec![image_name.to_string()],
+                created: None,
+                working_dir: None,
+                config: None,
+            })
+        }
+
+        fn get_native_platform(&self) -> String {
+            "linux/amd64".to_string()
+        }
+    }
+
+    fn repull_job(
+        builder: Arc<RepullImageBuilder>,
+        source: DeployImageSource,
+    ) -> (DeployImageJob, WorkflowContext) {
+        let container_deployer: Arc<dyn ContainerDeployer> =
+            Arc::new(TrackingMockContainerDeployer::new());
+        let mut job = job_with_target(container_deployer)
+            .with_external_image_tag(REGISTRY_IMAGE.to_string())
+            .with_image_source(source);
+        job.image_builder = Some(builder);
+        let context = crate::test_utils::create_test_context("wf-repull".to_string(), 1, 1, 1);
+        (job, context)
+    }
+
+    /// Image retention now removes expired registry images from the control
+    /// plane. A rollback onto one must pull it again rather than fail at
+    /// container creation with "No such image".
+    #[tokio::test]
+    async fn local_rollback_repulls_a_registry_image_that_retention_removed() {
+        let builder = Arc::new(RepullImageBuilder::new(false, false, "sha256:pulled"));
+        let (job, context) = repull_job(builder.clone(), DeployImageSource::Registry);
+
+        job.ensure_registry_image_local(REGISTRY_IMAGE, &context)
+            .await
+            .expect("a pruned registry image must be pulled again");
+
+        assert_eq!(builder.fetches(), vec![REGISTRY_IMAGE.to_string()]);
+    }
+
+    /// An image that is still here is never pulled again: a pull would be a
+    /// needless registry round trip, and a mutable tag could move under it.
+    #[tokio::test]
+    async fn local_deploy_does_not_repull_a_registry_image_that_is_present() {
+        let builder = Arc::new(RepullImageBuilder::new(true, false, "sha256:local"));
+        let (job, context) = repull_job(builder.clone(), DeployImageSource::Registry);
+
+        job.ensure_registry_image_local(REGISTRY_IMAGE, &context)
+            .await
+            .expect("a present image needs nothing");
+
+        assert!(builder.fetches().is_empty());
+    }
+
+    /// An uploaded or locally built image has no registry to come from, so
+    /// its absence is never "fixed" by pulling a same-named public image.
+    #[tokio::test]
+    async fn local_deploy_never_pulls_a_control_plane_local_image() {
+        let builder = Arc::new(RepullImageBuilder::new(false, false, "sha256:pulled"));
+        let (job, context) = repull_job(builder.clone(), DeployImageSource::ControlPlaneLocal);
+
+        job.ensure_registry_image_local(REGISTRY_IMAGE, &context)
+            .await
+            .expect("control-plane-local images are left to the deploy path");
+
+        assert!(builder.fetches().is_empty());
+    }
+
+    /// A registry that no longer serves the tag fails the rollback with an
+    /// error that names the image, the deployment and the remedy.
+    #[tokio::test]
+    async fn failed_repull_explains_what_is_missing() {
+        let builder = Arc::new(RepullImageBuilder::new(false, true, "sha256:pulled"));
+        let (job, context) = repull_job(builder.clone(), DeployImageSource::Registry);
+
+        let error = job
+            .ensure_registry_image_local(REGISTRY_IMAGE, &context)
+            .await
+            .expect_err("a failed re-pull must fail the deploy");
+
+        let message = error.to_string();
+        assert!(message.contains(REGISTRY_IMAGE), "{message}");
+        assert!(message.contains("pulling it again"), "{message}");
+        assert!(message.contains("manifest for"), "{message}");
+    }
+
+    /// A deployment bound to a recorded image must not be rolled back onto a
+    /// different image the mutable tag points at today.
+    #[tokio::test]
+    async fn repulled_image_must_match_the_recorded_identity() {
+        let builder = Arc::new(RepullImageBuilder::new(false, false, "sha256:moved"));
+        let (job, context) = repull_job(builder.clone(), DeployImageSource::Registry);
+        let job = job.with_expected_image_identity(
+            ExpectedImageIdentity::image_id("sha256:original").expect("non-empty id"),
+        );
+
+        let error = job
+            .ensure_registry_image_local(REGISTRY_IMAGE, &context)
+            .await
+            .expect_err("a re-pulled image with another identity must be refused");
+
+        let message = error.to_string();
+        assert!(message.contains("different image"), "{message}");
+        assert!(message.contains("sha256:moved"), "{message}");
     }
 
     /// A registry-image job whose control plane holds a copy of the tag
