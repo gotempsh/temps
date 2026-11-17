@@ -486,20 +486,29 @@ async fn inline_ports_replace_inherited_and_source_ports_during_resolution() {
             let cleared: Value = yaml_serde::from_str(&cleared).unwrap();
             assert!(cleared["services"]["app"].get("ports").is_none());
 
+            // An override that publishes off loopback is narrowed like any
+            // other published port (it used to be rejected): the host address
+            // becomes loopback and the fixed host port goes, so the override
+            // can still choose which container port is published without
+            // choosing the interface.
             let public_inline = "services: {app: {ports: ['0.0.0.0:8194:8191']}}";
-            assert!(matches!(
-                executor
-                    .resolve_security_configuration(
-                        "temps-port-override-test",
-                        Some(root.path()),
-                        "compose.yml",
-                        source,
-                        Some(public_inline),
-                        &HashMap::new(),
-                    )
-                    .await,
-                Err(ComposeError::SecurityPolicyViolation { field, .. }) if field == "ports"
-            ));
+            let (narrowed, _) = executor
+                .resolve_security_configuration(
+                    "temps-port-override-test",
+                    Some(root.path()),
+                    "compose.yml",
+                    source,
+                    Some(public_inline),
+                    &HashMap::new(),
+                )
+                .await
+                .unwrap();
+            let narrowed: Value = yaml_serde::from_str(&narrowed).unwrap();
+            let ports = narrowed["services"]["app"]["ports"].as_sequence().unwrap();
+            assert_eq!(ports.len(), 1, "{narrowed:?}");
+            assert_eq!(ports[0]["host_ip"].as_str(), Some("127.0.0.1"));
+            assert_eq!(ports[0]["target"].as_u64(), Some(8191));
+            assert!(ports[0].get("published").is_none(), "{ports:?}");
         }
 }
 
@@ -1628,5 +1637,63 @@ async fn a_rewrite_report_does_not_echo_a_substituted_variable_value() {
         checked.content.contains("127.0.0.1::80"),
         "{}",
         checked.content
+    );
+}
+
+/// The same two rewrites reach a model that needed `docker compose config`
+/// to merge — a project override, `include`, `extends` or merge tags. The
+/// merged model is validated inside the resolution step, before
+/// `check_configuration` would narrow it, so the rewrites have to run there
+/// too or those files are rejected for a port Temps would have rewritten.
+#[tokio::test]
+async fn a_merged_model_is_narrowed_before_its_policy_check() {
+    if !std::process::Command::new("docker")
+        .args(["compose", "version"])
+        .output()
+        .is_ok_and(|result| result.status.success())
+    {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let environment = HashMap::new();
+    let content = "services:\n  web:\n    image: ghcr.io/example/web:1\n    container_name: example_web\n    ports:\n      - \"8080:80\"\n";
+    // A harmless override, enough to make the check merge with the CLI.
+    let override_content = "services:\n  web:\n    environment:\n      MODE: safe\n";
+    let checked = disabled_executor(root.path().join("data"))
+        .with_security_policy(Default::default())
+        .check_configuration(&ComposeCheckInput {
+            content,
+            allow_cli: true,
+            ..idiomatic_input(root.path(), &environment, Some(override_content))
+        })
+        .await
+        .unwrap();
+    assert!(
+        checked.resolution.command.is_some(),
+        "the CLI must have run"
+    );
+
+    let deployed: Value = yaml_serde::from_str(&checked.content).unwrap();
+    let web = &deployed["services"]["web"];
+    let port = &web["ports"][0];
+    // `docker compose config` emits the long form, whichever the file used.
+    assert_eq!(port["host_ip"].as_str(), Some("127.0.0.1"), "{:?}", port);
+    assert!(port.get("published").is_none(), "{port:?}");
+    assert_eq!(port["target"].as_u64(), Some(80));
+    assert!(web.get("container_name").is_none(), "{web:?}");
+    assert_eq!(
+        web["networks"]["default"]["aliases"][0].as_str(),
+        Some("example_web")
+    );
+    let checks: Vec<PolicyCheck> = checked
+        .rewrites
+        .iter()
+        .map(|rewrite| rewrite.check)
+        .collect();
+    assert_eq!(
+        checks,
+        [PolicyCheck::PublishedPorts, PolicyCheck::ContainerName],
+        "{:?}",
+        checked.rewrites
     );
 }

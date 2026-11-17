@@ -23,10 +23,16 @@
 //! A check an administrator disabled for the project is not rewritten —
 //! there is nothing to narrow in a file the policy already accepts.
 //!
-//! Only the project's own model is normalized. When a Compose CLI is present
-//! an inline project override has already been merged into that model
-//! ([`ComposeExecutor::resolve_configuration`]); without one the override is
-//! validated on its own and is not rewritten.
+//! A model that `docker compose config` had to merge (an inline project
+//! override, `include`, `extends`, merge tags) is narrowed inside that step
+//! instead, because it is validated there before `check_configuration` gets
+//! it; its reports travel out in
+//! [`super::ResolvedComposeConfiguration::rewrites`] and are reported with
+//! the rest. Normalizing is a fixed point, so the model passing through both
+//! places is only rewritten once.
+//!
+//! Without a Compose CLI to merge an inline project override, that override
+//! is validated on its own and is not rewritten.
 
 use std::collections::BTreeSet;
 

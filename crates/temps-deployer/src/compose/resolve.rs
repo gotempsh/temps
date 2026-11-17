@@ -19,7 +19,7 @@ use super::diagnostics::{
 };
 use super::exec::isolated_docker_command;
 use super::files::render_env_file;
-use super::normalize::ComposeRewrite;
+use super::normalize::{ComposeRewrite, NormalizedCompose};
 use super::support::{COMPOSE_CONFIG_FLAGS, COMPOSE_CONSISTENCY_FLAGS};
 use super::{
     ComposeCommandDiagnostics, ComposeError, ComposeExecutor, COMPOSE_CONFIG_TIMEOUT,
@@ -157,6 +157,13 @@ pub struct ResolvedComposeConfiguration {
     pub referenced_sources: Vec<String>,
     /// Values substituted into `content`, for redacting text derived from it.
     pub substituted_values: SubstitutedValues,
+    /// Narrowing rewrites already applied to `content`, which happens when
+    /// `docker compose config` merged the model: that step validates what it
+    /// produced, so it has to narrow it first. Empty otherwise, including
+    /// when the files were used directly —
+    /// [`ComposeExecutor::check_configuration`] narrows those itself and
+    /// reports both sets together.
+    pub rewrites: Vec<ComposeRewrite>,
     /// Caveats, e.g. resolution skipped because no Compose CLI is present.
     pub notes: Vec<String>,
 }
@@ -365,6 +372,7 @@ impl ComposeExecutor {
             deferred_required_variables,
             referenced_sources: Vec::new(),
             substituted_values,
+            rewrites: Vec::new(),
             notes: Vec::new(),
         };
         if resolved.resolution_reasons.is_empty() {
@@ -401,7 +409,8 @@ impl ComposeExecutor {
         resolved
             .substituted_values
             .extend(&snapshots_variables.loaded_values);
-        resolved.content = merged;
+        resolved.content = merged.content;
+        resolved.rewrites = merged.rewrites;
         resolved.override_content = None;
         resolved.command = Some(command);
         Ok(resolved)
@@ -540,12 +549,15 @@ impl ComposeExecutor {
             let mut resolution = self.resolve_configuration_inner(input, &variables).await?;
             // After interpolation, so a rewrite sees the values that will
             // deploy, and before validation, which then judges the rewritten
-            // model as defense in depth.
+            // model as defense in depth. A merged model was already narrowed
+            // inside the resolution step (see
+            // [`ResolvedComposeConfiguration::rewrites`]), which this second
+            // pass leaves alone: it is a fixed point.
             let normalized = self.normalize_for_policy(&resolution.content)?;
             resolution.content = normalized.content;
-            let rewrites = normalized
-                .rewrites
+            let rewrites = std::mem::take(&mut resolution.rewrites)
                 .into_iter()
+                .chain(normalized.rewrites)
                 // An excluded service does not deploy, so reporting a rewrite
                 // in it would describe work that never happens.
                 .filter(|rewrite| !input.excluded_services.contains(&rewrite.service))
@@ -784,7 +796,7 @@ impl ComposeExecutor {
         content: &str,
         override_content: Option<&str>,
         interpolation: &mut SnapshotInterpolation,
-    ) -> Result<(String, ComposeCommandDiagnostics), ComposeError> {
+    ) -> Result<(NormalizedCompose, ComposeCommandDiagnostics), ComposeError> {
         let project_name = input.project_name;
         let project_dir = input.project_dir;
         let compose_file = input.compose_file;
@@ -962,6 +974,14 @@ impl ComposeExecutor {
             .referenced
             .extend(reinterpolated.referenced_variables);
         let resolved = reinterpolated.content;
+        // The merged model is judged here, before the rewrites in
+        // [`Self::check_configuration`] would run, so narrow it first and
+        // carry the reports back: otherwise every file that needs this step —
+        // an inline project override, `include`, `extends`, merge tags — is
+        // still rejected for a port or a container name Temps would have
+        // rewritten, which is most of the files the rewrites exist for.
+        let normalized = self.normalize_for_policy(&resolved)?;
+        let resolved = normalized.content;
         self.validate_compose_security_policy("resolved Compose configuration", &resolved)?;
         if input.filesystem_checks || project_dir.is_none() {
             Self::validate_compose_filesystem_confinement_with_policy(
@@ -991,7 +1011,13 @@ impl ComposeExecutor {
                 let _ = snapshots.cache.keep();
             }
         }
-        Ok((resolved, diagnostics))
+        Ok((
+            NormalizedCompose {
+                content: resolved,
+                rewrites: normalized.rewrites,
+            },
+            diagnostics,
+        ))
     }
 
     /// Run one `docker compose config` invocation with a bounded timeout.
