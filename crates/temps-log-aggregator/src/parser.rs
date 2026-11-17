@@ -1295,11 +1295,12 @@ mod tests {
         assert_eq!(parse_duration_to_ms("500000ns"), Some(0.5));
     }
 
+    /// Micro-benchmark that doubles as a smoke test: cheap enough to run on
+    /// every `cargo test`; see the timing with `-- --nocapture`.
     #[test]
-    #[ignore = "micro-benchmark, run with --ignored to see ns/line"]
     fn bench_logfmt_extraction_ns_per_line() {
         let raw = "INFO GET /api/v1/users/42 200 137ms rid=7-31337 worker=3 cache=hit extra=1";
-        let iterations = 100_000u32;
+        let iterations = 10_000u32;
         let start = std::time::Instant::now();
         for _ in 0..iterations {
             let _ = std::hint::black_box(extract_logfmt_pairs(std::hint::black_box(raw)));

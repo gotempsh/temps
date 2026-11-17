@@ -140,6 +140,64 @@ pub struct HistogramBucket {
     pub count: i64,
 }
 
+/// Add the counts of lines the index does not hold yet to an indexed
+/// histogram.
+///
+/// The line index is written per sealed chunk, so the newest minutes of a
+/// window live only in the writer's head buffers until they seal; without
+/// this a live histogram drops to nothing at its right edge. `unindexed`
+/// uses the index's bucket alignment and group names. The indexed series
+/// keep their top-N shape: a group the index returned keeps its name, a new
+/// one takes a free slot up to `max_groups` (largest first) and anything
+/// beyond folds into `"other"`, exactly like the index's own overflow.
+pub fn merge_histogram(
+    indexed: Vec<HistogramBucket>,
+    unindexed: Vec<HistogramBucket>,
+    max_groups: u32,
+) -> Vec<HistogramBucket> {
+    if unindexed.is_empty() {
+        return indexed;
+    }
+    let mut named: std::collections::BTreeSet<String> = indexed
+        .iter()
+        .filter_map(|b| b.group.clone())
+        .filter(|g| g != "other")
+        .collect();
+    let mut new_totals: BTreeMap<String, i64> = BTreeMap::new();
+    for bucket in &unindexed {
+        if let Some(group) = bucket.group.as_ref().filter(|g| !named.contains(*g)) {
+            *new_totals.entry(group.clone()).or_default() += bucket.count;
+        }
+    }
+    let mut new_groups: Vec<(String, i64)> = new_totals.into_iter().collect();
+    new_groups.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    for (group, _) in new_groups {
+        if named.len() >= max_groups as usize {
+            break;
+        }
+        named.insert(group);
+    }
+
+    let mut counts: BTreeMap<(DateTime<Utc>, Option<String>), i64> = BTreeMap::new();
+    for bucket in indexed {
+        *counts.entry((bucket.ts, bucket.group)).or_default() += bucket.count;
+    }
+    for bucket in unindexed {
+        let group = bucket.group.map(|g| {
+            if g == "other" || named.contains(&g) {
+                g
+            } else {
+                "other".to_string()
+            }
+        });
+        *counts.entry((bucket.ts, group)).or_default() += bucket.count;
+    }
+    counts
+        .into_iter()
+        .map(|((ts, group), count)| HistogramBucket { ts, group, count })
+        .collect()
+}
+
 /// One row of an aggregation: the group values (in `group_by` order) and
 /// the metric.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
@@ -539,7 +597,8 @@ fn attr_exists_expr(key: &str, d: &Dialect) -> Result<String, LogAggregatorError
     })
 }
 
-fn level_name(l: LogLevel) -> &'static str {
+/// A level as the line index names it in group values (`info`, `warn`, …).
+pub(crate) fn level_name(l: LogLevel) -> &'static str {
     match l {
         LogLevel::Trace => "trace",
         LogLevel::Debug => "debug",
@@ -820,6 +879,57 @@ pub(crate) fn test_cloud_link(dir: &std::path::Path) -> Arc<temps_cloud_client::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bucket(minute: u32, group: Option<&str>, count: i64) -> HistogramBucket {
+        HistogramBucket {
+            ts: format!("2026-01-01T00:{minute:02}:00Z").parse().unwrap(),
+            group: group.map(str::to_string),
+            count,
+        }
+    }
+
+    #[test]
+    fn merge_histogram_adds_unindexed_minutes_to_the_indexed_series() {
+        let merged = merge_histogram(
+            vec![bucket(0, None, 10), bucket(1, None, 4)],
+            vec![bucket(1, None, 3), bucket(2, None, 7)],
+            8,
+        );
+        assert_eq!(
+            merged,
+            vec![bucket(0, None, 10), bucket(1, None, 7), bucket(2, None, 7)]
+        );
+    }
+
+    #[test]
+    fn merge_histogram_admits_new_groups_only_into_free_slots() {
+        let merged = merge_histogram(
+            vec![bucket(0, Some("info"), 10), bucket(0, Some("warn"), 2)],
+            vec![
+                bucket(1, Some("info"), 5),
+                bucket(1, Some("error"), 3),
+                bucket(1, Some("debug"), 1),
+            ],
+            3,
+        );
+        // `error` (the larger) takes the one free slot; `debug` folds.
+        assert_eq!(
+            merged,
+            vec![
+                bucket(0, Some("info"), 10),
+                bucket(0, Some("warn"), 2),
+                bucket(1, Some("error"), 3),
+                bucket(1, Some("info"), 5),
+                bucket(1, Some("other"), 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_histogram_without_unindexed_lines_is_the_indexed_answer() {
+        let indexed = vec![bucket(0, Some("a"), 1), bucket(0, Some("other"), 9)];
+        assert_eq!(merge_histogram(indexed.clone(), Vec::new(), 1), indexed);
+    }
 
     /// The dialect every pre-Cloud expectation in this file is written
     /// against; its SQL must not move.

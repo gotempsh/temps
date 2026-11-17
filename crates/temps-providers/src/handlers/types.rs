@@ -191,9 +191,16 @@ impl From<CreatableServiceTypeRoute> for crate::externalsvc::ServiceType {
     }
 }
 
+/// A route segment that names no service type.
+#[derive(Debug, thiserror::Error)]
+#[error("Invalid service type: {service_type}")]
+pub struct InvalidServiceTypeRoute {
+    pub service_type: String,
+}
+
 impl ServiceTypeRoute {
     #[allow(clippy::should_implement_trait)]
-    pub fn from_str(s: &str) -> anyhow::Result<Self> {
+    pub fn from_str(s: &str) -> Result<Self, InvalidServiceTypeRoute> {
         match s.to_lowercase().as_str() {
             "mariadb" => Ok(ServiceTypeRoute::Mariadb),
             "mongodb" => Ok(ServiceTypeRoute::Mongodb),
@@ -204,7 +211,9 @@ impl ServiceTypeRoute {
             "blob" => Ok(ServiceTypeRoute::Blob),
             "rustfs" => Ok(ServiceTypeRoute::Rustfs),
             "minio" => Ok(ServiceTypeRoute::Minio),
-            _ => Err(anyhow::anyhow!("Invalid service type: {}", s)),
+            _ => Err(InvalidServiceTypeRoute {
+                service_type: s.to_string(),
+            }),
         }
     }
 

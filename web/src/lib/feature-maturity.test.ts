@@ -21,9 +21,15 @@ describe('feature maturity route mapping', () => {
     expect(featureKeyForPath('/ai-gateway/activity')).toBe('ai-gateway')
   })
 
-  test('labels the AI workspace prototype as an experimental chat surface', () => {
-    expect(featureKeyForPath('/ai-first')).toBe('ai-chat')
-    expect(featureKeyForPath('/ai-first?application=app_1')).toBe('ai-chat')
+  test('labels the assistant and gateway pages, and nothing for retired AI routes', () => {
+    expect(featureKeyForPath('/chat')).toBe('ai-chat')
+    expect(featureKeyForPath('/ai-gateway/limits')).toBe('ai-gateway')
+    // Harnesses, the harness workspace and workflows were retired; their old
+    // URLs only redirect, so they carry no maturity of their own.
+    expect(featureKeyForPath('/ai-first')).toBeUndefined()
+    expect(featureKeyForPath('/ai-workflows')).toBeUndefined()
+    expect(featureKeyForPath('/agent-sandbox/providers')).toBeUndefined()
+    expect(featureKeyForPath('/projects/shop/agents')).toBeUndefined()
   })
 
   test('does not label stable or unresolved surfaces', () => {

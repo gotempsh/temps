@@ -6,7 +6,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{Json, Redirect},
     routing::{get, post},
-    Router,
+    Extension, Router,
 };
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -15,9 +15,13 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 use utoipa::ToSchema;
 
+use super::audit::{AuditContext, GithubAppCreatedAudit, GithubAppSetupStartedAudit};
 use super::types::GitAppState as AppState;
+use temps_auth::{permission_check, Permission, RequireAuth};
+use temps_core::error_builder::ErrorBuilder;
 use temps_core::problemdetails::{new as problem_new, Problem};
 use temps_core::telemetry::{OperationFailureCode, TelemetryEvent, TelemetryEventKind};
+use temps_core::RequestMetadata;
 // use crate::services::audit_service::{AuditContext, PipelineTriggeredAudit};
 // use crate::services::project::crud::ProjectCrud;
 // use crate::services::project::pipelines::ProjectPipelines;
@@ -32,6 +36,10 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
     Router::new()
         // GITHUB-SPECIFIC endpoints under /git-providers/{provider_id}/github/*
         // Standardized webhook/callback patterns using /webhook/git/{provider}/*
+        .route(
+            "/git-providers/github/manifest/start",
+            post(start_github_manifest_flow),
+        )
         .route("/webhook/git/github/auth", get(github_app_auth_callback)) // OAuth authorization callback
         .route(
             "/webhook/git/github/callback",
@@ -70,60 +78,126 @@ pub const GITHUB_REPO_WEBHOOK_PATH: &str = "/webhook/git/github/repo-events";
 
 // ===== Webhook Handlers =====
 
-#[derive(Deserialize)]
-#[allow(dead_code)] // Used for OAuth redirect query parsing
-struct RedirectQuery {
-    code: String,
-    state: String,
-    source: Option<String>,
+/// Response of [`start_github_manifest_flow`].
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct GithubManifestStartResponse {
+    /// Single-use token to send to GitHub with the manifest. GitHub returns it
+    /// to the callback, which accepts the manifest code only together with it.
+    pub state: String,
 }
 
-/// Handle GitHub App manifest conversion with source tracking
-/// This is when creating a new GitHub App from a manifest
+/// Start creating a GitHub App from a manifest.
+///
+/// Issues the `state` the console sends to GitHub along with the manifest. The
+/// callback GitHub redirects back to carries no session cookie (it is
+/// `SameSite=Strict`), so this state is what proves an operator started the
+/// flow. It works once and expires after 15 minutes.
+#[utoipa::path(
+    post,
+    path = "/git-providers/github/manifest/start",
+    responses(
+        (status = 200, description = "State issued", body = GithubManifestStartResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 500, description = "Internal server error")
+    ),
+    tag = "Git Providers",
+    security(("bearer_auth" = []))
+)]
+pub async fn start_github_manifest_flow(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+) -> Result<(HeaderMap, Json<GithubManifestStartResponse>), Problem> {
+    // The same permission as adding a provider by hand: the callback adds one.
+    permission_check!(auth, Permission::GitProvidersCreate);
+
+    let user = auth.require_user().map_err(|message| {
+        ErrorBuilder::new(StatusCode::FORBIDDEN)
+            .title("User Required")
+            .detail(message)
+            .build()
+    })?;
+
+    let manifest_state = state
+        .git_provider_manager
+        .issue_github_manifest_state(user.id)
+        .await?;
+
+    // The audit entry names the operator; the state is a credential and is
+    // never written to it.
+    let audit = GithubAppSetupStartedAudit {
+        context: AuditContext {
+            user_id: user.id,
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        error!(
+            user_id = user.id,
+            error = %e,
+            "Failed to create audit log for the start of a GitHub App setup"
+        );
+    }
+
+    // A credential minted by this request: returned once and never cached.
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "Cache-Control",
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    Ok((
+        headers,
+        Json(GithubManifestStartResponse {
+            state: manifest_state,
+        }),
+    ))
+}
+
+/// Require a server-issued `state` before a manifest code is redeemed.
+///
+/// Returns the operator who started the flow. A missing, unknown, expired or
+/// already used state is a 400, and nothing has been sent to GitHub yet.
+async fn require_manifest_state(
+    manager: &crate::services::git_provider_manager::GitProviderManager,
+    manifest_state: Option<&str>,
+) -> Result<i32, Problem> {
+    let Some(manifest_state) = manifest_state.filter(|value| !value.is_empty()) else {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Missing State")
+            .detail("Start the GitHub App setup again from the console.")
+            .build());
+    };
+    Ok(manager
+        .consume_github_manifest_state(manifest_state)
+        .await?)
+}
+
+/// Handle GitHub App manifest conversion.
+/// This is when creating a new GitHub App from a manifest. The `state` must be
+/// one the server issued; it is checked before the code is sent to GitHub.
 async fn handle_manifest_conversion_with_source(
     state: &Arc<AppState>,
     code: String,
-    source: Option<String>,
+    manifest_state: Option<String>,
+    metadata: Option<&RequestMetadata>,
 ) -> Result<(HeaderMap, Redirect), Problem> {
+    let user_id =
+        require_manifest_state(&state.git_provider_manager, manifest_state.as_deref()).await?;
+
+    // The code is a one-time credential: it is not logged.
     info!(
-        "Processing GitHub App manifest conversion with code: {} and source: {:?}",
-        code, source
+        user_id,
+        "Processing GitHub App manifest conversion for the operator who started it"
     );
 
-    let client = reqwest::Client::new();
-    let api_url = "https://api.github.com";
-    let conversions_url = format!("{}/app-manifests/{}/conversions", api_url, code);
-
-    let response = match client
-        .post(&conversions_url)
-        .header("Accept", "application/vnd.github+json")
-        .header("User-Agent", "Temps")
-        .send()
-        .await
-    {
-        Ok(resp) => resp,
-        Err(e) => {
-            error!("Failed to convert manifest: {}", e);
-            return Err(problem_new(StatusCode::BAD_GATEWAY)
-                .with_title("Manifest Conversion Failed")
-                .with_detail(format!("Failed to convert manifest: {}", e)));
-        }
-    };
-
-    let github_app_data = match response.json::<serde_json::Value>().await {
-        Ok(data) => data,
-        Err(e) => {
-            error!("Failed to parse GitHub App response: {}", e);
-            return Err(problem_new(StatusCode::BAD_GATEWAY)
-                .with_title("Response Parse Failed")
-                .with_detail(format!("Failed to parse GitHub App response: {}", e)));
-        }
-    };
+    let github_app_data = fetch_manifest_app(GITHUB_API_URL, &code).await?;
 
     // Create the GitHub App with source tracking (this creates both github_apps entry and git_provider)
     match state
         .github_service
-        .create_github_app(github_app_data, source)
+        .create_github_app(github_app_data, None)
         .await
     {
         Ok(app) => {
@@ -131,6 +205,7 @@ async fn handle_manifest_conversion_with_source(
                 "GitHub App created successfully: {} (provider_id: {})",
                 app.name, app.provider_id
             );
+            record_github_app_created(state, user_id, metadata, &app).await;
 
             // Use the operator-configured external URL — never reflect client headers.
             let external_url = state
@@ -158,17 +233,145 @@ async fn handle_manifest_conversion_with_source(
             );
 
             let mut response_headers = HeaderMap::new();
-            response_headers.insert("Cache-Control", "no-store".parse().unwrap());
+            response_headers.insert(
+                "Cache-Control",
+                axum::http::HeaderValue::from_static("no-store"),
+            );
 
             Ok((response_headers, Redirect::to(&redirect_url)))
         }
-        Err(e) => {
-            error!("Failed to create GitHub app: {:?}", e);
-            Err(problem_new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("GitHub App Creation Failed")
-                .with_detail(format!("Failed to create GitHub app: {}", e)))
+        Err(e) => Err(app_creation_problem(e)),
+    }
+}
+
+/// Audit a GitHub App the manifest callback registered as a git provider.
+///
+/// The operator is the user the setup state was issued to: the callback has no
+/// session of its own. Only identifiers are recorded, never the app's client
+/// secret, private key or webhook secret. A failed write is logged and does
+/// not fail the setup, which has already succeeded.
+async fn record_github_app_created(
+    state: &Arc<AppState>,
+    user_id: i32,
+    metadata: Option<&RequestMetadata>,
+    app: &crate::services::github::GitHubAppData,
+) {
+    let audit = GithubAppCreatedAudit {
+        context: AuditContext {
+            user_id,
+            ip_address: metadata.map(|metadata| metadata.ip_address.clone()),
+            user_agent: metadata
+                .map(|metadata| metadata.user_agent.clone())
+                .unwrap_or_default(),
+        },
+        provider_id: app.provider_id,
+        app_id: app.app_id,
+        app_name: app.name.clone(),
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        error!(
+            user_id,
+            provider_id = app.provider_id,
+            app_id = app.app_id,
+            error = %e,
+            "Failed to create audit log for a GitHub App created from a manifest"
+        );
+    }
+}
+
+/// The response for a failure to create the GitHub App from GitHub's reply.
+///
+/// Every variant is listed, so adding one forces a decision about its status.
+/// An unusable reply is GitHub's fault (502), an app that is already
+/// registered is a conflict (409), and everything else stays a 500.
+fn app_creation_problem(error: GithubAppServiceError) -> Problem {
+    match error {
+        GithubAppServiceError::Validation(message) => {
+            warn!(error = %message, "GitHub returned an unusable app");
+            ErrorBuilder::new(StatusCode::BAD_GATEWAY)
+                .title("Incomplete GitHub App")
+                .detail(message)
+                .build()
+        }
+        GithubAppServiceError::Conflict(message) => {
+            warn!(error = %message, "GitHub App already registered");
+            ErrorBuilder::new(StatusCode::CONFLICT)
+                .title("GitHub App Already Registered")
+                .detail(message)
+                .build()
+        }
+        error @ (GithubAppServiceError::DatabaseError(_)
+        | GithubAppServiceError::GithubApiError(_)
+        | GithubAppServiceError::NotFound(_)
+        | GithubAppServiceError::DecryptionFailed(_)
+        | GithubAppServiceError::EncryptionFailed(_)
+        | GithubAppServiceError::PrivateKeyCreationFailed(_)
+        | GithubAppServiceError::InstallationNotFound
+        | GithubAppServiceError::InvalidWebhookSignature
+        | GithubAppServiceError::Unauthorized(_)
+        | GithubAppServiceError::InvalidConfiguration(_)
+        | GithubAppServiceError::Other(_)) => {
+            error!(error = ?error, "Failed to create GitHub app");
+            ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .title("GitHub App Creation Failed")
+                .detail(format!("Failed to create GitHub app: {}", error))
+                .build()
         }
     }
+}
+
+const GITHUB_API_URL: &str = "https://api.github.com";
+
+/// Exchange a manifest `code` for the GitHub App it created.
+///
+/// Returns the JSON body only when GitHub answers with a success status. The
+/// code is percent-encoded into the request path, and reqwest errors are
+/// logged and returned without their URL, which would contain the code.
+async fn fetch_manifest_app(api_url: &str, code: &str) -> Result<serde_json::Value, Problem> {
+    let conversions_url = format!(
+        "{}/app-manifests/{}/conversions",
+        api_url,
+        urlencoding::encode(code)
+    );
+
+    let response = reqwest::Client::new()
+        .post(&conversions_url)
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "Temps")
+        .send()
+        .await
+        .map_err(|e| {
+            let e = e.without_url();
+            error!(error = %e, "Failed to convert manifest");
+            ErrorBuilder::new(StatusCode::BAD_GATEWAY)
+                .title("Manifest Conversion Failed")
+                .detail(format!("Failed to convert manifest: {}", e))
+                .build()
+        })?;
+
+    let status = response.status();
+    if !status.is_success() {
+        warn!(
+            github_status = status.as_u16(),
+            "GitHub rejected the manifest conversion"
+        );
+        return Err(ErrorBuilder::new(StatusCode::BAD_GATEWAY)
+            .title("Manifest Conversion Failed")
+            .detail(format!(
+                "GitHub answered the manifest conversion with HTTP {}",
+                status.as_u16()
+            ))
+            .build());
+    }
+
+    response.json::<serde_json::Value>().await.map_err(|e| {
+        let e = e.without_url();
+        error!(error = %e, "Failed to parse GitHub App response");
+        ErrorBuilder::new(StatusCode::BAD_GATEWAY)
+            .title("Response Parse Failed")
+            .detail(format!("Failed to parse GitHub App response: {}", e))
+            .build()
+    })
 }
 
 #[derive(ToSchema, Serialize, Deserialize)]
@@ -189,16 +392,16 @@ async fn github_webhook_events(
         .get("X-Hub-Signature-256")
         .and_then(|v| v.to_str().ok());
 
-    if let Err(e) = state
+    let signing = state
         .github_service
         .validate_webhook_signature(signature, &body)
         .await
-    {
-        error!("Invalid webhook signature: {:?}", e);
-        return Err(problem_new(StatusCode::UNAUTHORIZED)
-            .with_title("Invalid Webhook Signature")
-            .with_detail("The webhook signature validation failed"));
-    }
+        .map_err(|e| {
+            warn!(error = %e, "Invalid GitHub App webhook signature");
+            problem_new(StatusCode::UNAUTHORIZED)
+                .with_title("Invalid Webhook Signature")
+                .with_detail("The webhook signature validation failed")
+        })?;
 
     // Get the X-Github-Event header
     let event_type = headers
@@ -271,21 +474,39 @@ async fn github_webhook_events(
         }
     };
 
-    // Process the webhook event based on type
-    let installation_res = webhook_event.installation.clone();
-    let mut installation_id: i32 = 0;
+    let installation_id = match &webhook_event.installation {
+        Some(EventInstallation::Full(installation)) => Some(installation.id.into_inner()),
+        Some(EventInstallation::Minimal(installation)) => Some(installation.id.into_inner()),
+        None => None,
+    }
+    .map(i32::try_from)
+    .transpose()
+    .map_err(|_| {
+        problem_new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid Webhook Installation")
+            .with_detail("GitHub installation ID is out of range")
+    })?
+    .unwrap_or(0);
 
-    match installation_res {
-        Some(EventInstallation::Full(install)) => {
-            installation_id = install.id.into_inner() as i32;
-        }
-        Some(EventInstallation::Minimal(installation_)) => {
-            installation_id = installation_.id.into_inner() as i32;
-        }
-        None => {
-            warn!("No installation information in webhook event");
-        }
-    };
+    let mut sender = None;
+    if installation_id != 0 {
+        let app = state
+            .github_service
+            .authorize_webhook_installation(&signing, installation_id)
+            .await
+            .map_err(|e| {
+                warn!(installation_id, error = %e,
+                    "Ignoring GitHub App webhook: installation ownership not confirmed");
+                problem_new(StatusCode::UNAUTHORIZED)
+                    .with_title("Webhook Installation Not Authorized")
+                    .with_detail("The installation could not be bound to the signing App")
+            })?;
+        sender = Some(app.app_id);
+    } else if !matches!(webhook_event.specific, WebhookEventPayload::Ping(_)) {
+        return Err(problem_new(StatusCode::BAD_REQUEST)
+            .with_title("Missing Webhook Installation")
+            .with_detail("GitHub App webhook requires an installation"));
+    }
 
     // Handle specific webhook events
     let webhook_event_clone = webhook_event.clone();
@@ -294,16 +515,23 @@ async fn github_webhook_events(
             info!("Push event received");
             handle_push_event(&state, webhook_event_clone, push_event, installation_id).await;
         }
+        WebhookEventPayload::PullRequest(_) => {
+            handle_pull_request_event(&state, webhook_event_clone, &body, installation_id).await;
+        }
         WebhookEventPayload::InstallationRepositories(installation_repos) => {
             info!("Installation repositories event received");
             handle_installation_repositories(&state, installation_repos, installation_id).await;
         }
         WebhookEventPayload::Installation(installation_event) => {
             info!("Installation event received");
-            handle_installation_event(&state, installation_event, installation_id).await;
+            handle_installation_event(&state, installation_event, installation_id, sender).await;
         }
         WebhookEventPayload::Ping(ping_event) => {
-            if let Some(app_id) = ping_event.hook.and_then(|h| h.app_id) {
+            if let Some(app_id) = ping_event.hook.and_then(|h| h.app_id).filter(|id| {
+                signing
+                    .iter()
+                    .any(|app| id.into_inner() == app.app_id as u64)
+            }) {
                 info!("Ping event app_id: {:?}", app_id);
                 let _ = state
                     .github_service
@@ -342,16 +570,41 @@ async fn handle_push_event(
     let repo_name = repo.name;
 
     // Check if installation exists
-    if state
+    let Ok(installation) = state
         .github_service
         .get_installation_by_id(installation_id)
         .await
-        .is_err()
-    {
+    else {
         return;
-    }
+    };
 
     let (branch, tag) = push_target(&push_event.r#ref, push_event.base_ref.as_deref());
+
+    // A deleted branch retires previews only on the projects this
+    // installation connects, never on a same-named repository elsewhere.
+    if crate::services::git_provider_manager::GitProviderManager::is_ref_deletion(&push_event.after)
+    {
+        let result = match state
+            .git_provider_manager
+            .connection_projects(installation.connection_id, &repo_owner, &repo_name)
+            .await
+        {
+            Ok(projects) => {
+                state
+                    .git_provider_manager
+                    .handle_push_event_for_projects(branch, tag, push_event.after.clone(), projects)
+                    .await
+            }
+            Err(e) => Err(e),
+        };
+        if let Err(e) = result {
+            error!(
+                "Failed to handle branch deletion on {}/{}: {:?}",
+                repo_owner, repo_name, e
+            );
+        }
+        return;
+    }
 
     // A project that also has its own repository webhook (a non-App
     // connection on a repository where the App is installed) receives this
@@ -364,6 +617,57 @@ async fn handle_push_event(
         error!(
             "Failed to handle push event via git provider manager: {:?}",
             e
+        );
+    }
+}
+
+/// Retire the preview of a pull request's branch once the pull request is
+/// closed or merged.
+async fn handle_pull_request_event(
+    state: &Arc<AppState>,
+    webhook_event: WebhookEvent,
+    body: &[u8],
+    installation_id: i32,
+) {
+    let Some((branch, reason)) = super::pull_request::closed_pull_request(body) else {
+        return;
+    };
+    let Some(repo) = webhook_event.repository else {
+        error!("Pull request webhook event missing repository field, skipping");
+        return;
+    };
+    let Some(repo_owner) = repo.owner.map(|owner| owner.login) else {
+        error!("Pull request webhook event repository missing owner field, skipping");
+        return;
+    };
+
+    let Ok(installation) = state
+        .github_service
+        .get_installation_by_id(installation_id)
+        .await
+    else {
+        return;
+    };
+
+    // Only the projects this installation connects: a same-named repository
+    // on another connection is not the one whose pull request closed.
+    let result = match state
+        .git_provider_manager
+        .connection_projects(installation.connection_id, &repo_owner, &repo.name)
+        .await
+    {
+        Ok(projects) => {
+            state
+                .git_provider_manager
+                .handle_branch_closed_for_projects(branch, reason, projects)
+                .await
+        }
+        Err(e) => Err(e),
+    };
+    if let Err(e) = result {
+        error!(
+            "Failed to queue preview teardown for {}/{} ({}): {:?}",
+            repo_owner, repo.name, reason, e
         );
     }
 }
@@ -503,6 +807,34 @@ async fn github_repo_webhook_events(
 
     let project_ids: Vec<i32> = projects.iter().map(|p| p.id).collect();
 
+    if event_type == "pull_request" {
+        let queued = match super::pull_request::closed_pull_request(&body) {
+            Some((branch, reason)) => state
+                .git_provider_manager
+                .handle_branch_closed_for_projects(branch, reason, projects)
+                .await
+                .map_err(|e| {
+                    error!(
+                        delivery_id = delivery_id,
+                        "Failed to queue preview teardown for GitHub repository webhook on {}/{} (projects {:?}): {}",
+                        owner,
+                        repo,
+                        project_ids,
+                        e
+                    );
+                    problem_new(StatusCode::INTERNAL_SERVER_ERROR)
+                        .with_title("Webhook Processing Failed")
+                        .with_detail(format!(
+                            "Failed to queue preview teardown for GitHub pull request delivery {delivery_id} on {owner}/{repo}"
+                        ))
+                })?,
+            None => 0,
+        };
+        return Ok(Json(EventResponse {
+            message: format!("Queued preview teardown for {queued} project(s)"),
+        }));
+    }
+
     if event_type != "push" {
         info!(
             delivery_id = delivery_id,
@@ -602,6 +934,7 @@ async fn handle_installation_event(
     state: &Arc<AppState>,
     event: Box<octocrab::models::webhook_events::payload::InstallationWebhookEventPayload>,
     installation_id: i32,
+    signing_app_id: Option<i32>,
 ) {
     use octocrab::models::webhook_events::payload::InstallationWebhookEventAction;
 
@@ -627,7 +960,7 @@ async fn handle_installation_event(
 
             match state
                 .github_service
-                .process_installation(installation_id, None)
+                .process_installation(installation_id, signing_app_id)
                 .await
             {
                 Ok(result) => {
@@ -772,7 +1105,7 @@ fn installation_failure_code(error: &GithubAppServiceError) -> OperationFailureC
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
-#[allow(dead_code)] // Fields logged for debugging GitHub App installation webhooks
+#[allow(dead_code)] // query contract of the installation callback, documented in OpenAPI
 struct InstallWebhookParams {
     setup_action: String,
     source: Option<String>,
@@ -843,6 +1176,7 @@ async fn find_github_app_provider_for_installation(
 
 async fn github_app_auth_callback(
     State(state): State<Arc<AppState>>,
+    metadata: Option<Extension<RequestMetadata>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<(HeaderMap, Redirect), Problem> {
     let code = params.get("code").cloned().unwrap_or_default();
@@ -945,7 +1279,10 @@ async fn github_app_auth_callback(
         };
 
         let mut response_headers = HeaderMap::new();
-        response_headers.insert("Cache-Control", "no-store".parse().unwrap());
+        response_headers.insert(
+            "Cache-Control",
+            axum::http::HeaderValue::from_static("no-store"),
+        );
 
         return Ok((response_headers, Redirect::to(&redirect_url)));
     }
@@ -955,12 +1292,20 @@ async fn github_app_auth_callback(
         params.len() == 2 && params.contains_key("code") && params.contains_key("state");
 
     if is_manifest_flow {
+        // The state is a credential for this flow: record that one arrived,
+        // never its value.
         info!(
-            "Detected manifest conversion flow with state: {:?}",
-            state_param
+            has_state = state_param.is_some(),
+            "Detected manifest conversion flow"
         );
         // This is a manifest conversion - the code needs to be exchanged for a GitHub App
-        return handle_manifest_conversion_with_source(&state, code, state_param).await;
+        return handle_manifest_conversion_with_source(
+            &state,
+            code,
+            state_param,
+            metadata.as_ref().map(|Extension(metadata)| metadata),
+        )
+        .await;
     }
 
     // For auth-only flow (no installation_id yet), redirect and wait for webhook
@@ -969,7 +1314,10 @@ async fn github_app_auth_callback(
     let redirect_url = format!("{}/dashboard", external_url);
 
     let mut response_headers = HeaderMap::new();
-    response_headers.insert("Cache-Control", "no-store".parse().unwrap());
+    response_headers.insert(
+        "Cache-Control",
+        axum::http::HeaderValue::from_static("no-store"),
+    );
 
     Ok((response_headers, Redirect::to(&redirect_url)))
 }
@@ -1063,53 +1411,13 @@ async fn github_app_installation_callback(
     let redirect_url = format!("{}/dashboard", external_url);
 
     let mut response_headers = HeaderMap::new();
-    response_headers.insert("Cache-Control", "no-store".parse().unwrap());
+    response_headers.insert(
+        "Cache-Control",
+        axum::http::HeaderValue::from_static("no-store"),
+    );
 
     Ok((response_headers, Redirect::to(&redirect_url)))
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn installation_failures_map_to_fixed_codes() {
-        assert_eq!(
-            installation_failure_code(&GithubAppServiceError::InstallationNotFound),
-            OperationFailureCode::NotFound
-        );
-        assert_eq!(
-            installation_failure_code(&GithubAppServiceError::Unauthorized(
-                "bad credentials".to_string()
-            )),
-            OperationFailureCode::Authentication
-        );
-        assert_eq!(
-            installation_failure_code(&GithubAppServiceError::GithubApiError(
-                "operation timed out".to_string()
-            )),
-            OperationFailureCode::Timeout
-        );
-    }
-
-    #[test]
-    fn push_target_reads_branch_and_tag_refs() {
-        assert_eq!(
-            push_target("refs/heads/main", None),
-            (Some("main".to_string()), None)
-        );
-        assert_eq!(
-            push_target("refs/heads/feature/a-b", None),
-            (Some("feature/a-b".to_string()), None)
-        );
-        assert_eq!(
-            push_target("refs/tags/v1.2.0", Some("refs/heads/main")),
-            (Some("main".to_string()), Some("v1.2.0".to_string()))
-        );
-        assert_eq!(
-            push_target("refs/tags/v1.2.0", None),
-            (None, Some("v1.2.0".to_string()))
-        );
-        assert_eq!(push_target("", None), (None, None));
-    }
-}
+mod tests;

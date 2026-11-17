@@ -7,9 +7,12 @@ import { PageHeader } from '@/components/layout/PageContainer'
 
 import {
   deleteDomainMutation,
+  listDomainsQueryKey,
   listIngressHostnamesOptions,
+  listIngressHostnamesQueryKey,
   renewDomainMutation,
 } from '@/api/client/@tanstack/react-query.gen'
+import { ROUTE_FAILURE_IGNORE_REFUSAL } from '@/lib/route-query-failures'
 import { allTunnelsOptions } from '@/lib/tunnel-domains'
 import { DomainResponse } from '@/api/client/types.gen'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
@@ -25,6 +28,8 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { EmptyState } from '@/components/ui/empty-state'
+import { RefreshButton } from '@/components/ui/refresh-button'
+import { queryKeyPrefix } from '@/lib/refresh'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import {
   Collapsible,
@@ -65,8 +70,13 @@ import {
 } from './domain-rows'
 import { usePlatformCapabilities } from '@/hooks/usePlatformCapabilities'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
-import { Link, useNavigate } from 'react-router'
-import { DataTable, useUrlBoundText, type DataTableColumn } from '@temps-sdk/ds'
+import { useNavigate } from 'react-router'
+import {
+  DataTable,
+  RecordLink,
+  useUrlBoundText,
+  type DataTableColumn,
+} from '@temps-sdk/ds'
 import type { DomainSort } from './domain-sort'
 import { hasUrgentCertificate } from './domain-expiry'
 
@@ -183,11 +193,15 @@ export function DomainsManagement({
   const connectorsQuery = useQuery({
     ...allTunnelsOptions(),
     retry: false,
+    // Optional context: a role without settings access is refused and sees
+    // certificates only, which is not a failure of this page.
+    meta: { routeFailure: ROUTE_FAILURE_IGNORE_REFUSAL },
   })
   const hostnamesQuery = useQuery({
     ...listIngressHostnamesOptions(),
     refetchInterval: 15_000,
     retry: false,
+    meta: { routeFailure: ROUTE_FAILURE_IGNORE_REFUSAL },
   })
   const tunnels = tunnelRows(
     connectorsQuery.data ?? [],
@@ -241,12 +255,8 @@ export function DomainsManagement({
     {
       ...sortable('domain', 'Domain'),
       render: (row) => (
-        <Link
-          to={domainRowHref(row)}
-          className="font-medium hover:underline focus-visible:underline"
-        >
-          {row.name}
-        </Link>
+        // The row follows this link (RecordRow, DESIGN.md).
+        <RecordLink to={domainRowHref(row)}>{row.name}</RecordLink>
       ),
     },
     {
@@ -308,11 +318,17 @@ export function DomainsManagement({
         description="Every domain this install serves, and how each gets HTTPS: its own certificate or a tunnel"
         actions={
           <>
-            {' '}
+            <RefreshButton
+              queryKeys={[
+                queryKeyPrefix(listDomainsQueryKey),
+                allTunnelsOptions().queryKey,
+                queryKeyPrefix(listIngressHostnamesQueryKey),
+              ]}
+            />
             {canCreateDomains ? (
               <CreateActionButton
                 to="/domains/add"
-                label="Add Domain"
+                label="Add domain"
                 icon={<Globe className="h-4 w-4" />}
               />
             ) : (
@@ -343,7 +359,7 @@ export function DomainsManagement({
       </Collapsible>
 
       {isUsingCloudflare() && (
-        <Alert className="border-purple-200 bg-purple-50/50 dark:bg-purple-950/10">
+        <Alert className="border-purple-200 dark:border-purple-900 bg-purple-50/50 dark:bg-purple-950/10">
           <Info className="h-4 w-4 text-purple-600" />
           <AlertDescription>
             Domain and certificate management is handled automatically by
@@ -365,7 +381,7 @@ export function DomainsManagement({
       )}
 
       {pendingProvisioningCount > 0 && (
-        <Alert className="border-yellow-200 bg-yellow-50/50 dark:bg-yellow-950/10">
+        <Alert className="border-yellow-200 dark:border-yellow-900 bg-yellow-50/50 dark:bg-yellow-950/10">
           <AlertTriangle className="h-4 w-4 text-yellow-600" />
           <AlertTitle className="flex items-center gap-2">
             <span>TLS Certificates Pending</span>
@@ -443,7 +459,7 @@ export function DomainsManagement({
             action={
               <Button onClick={() => navigate('/domains/add')}>
                 <Plus className="mr-2 h-4 w-4" />
-                Add Domain
+                Add domain
               </Button>
             }
           />

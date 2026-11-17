@@ -54,6 +54,38 @@ pub struct GitPushEventJob {
     pub recovery_of_deployment_id: Option<i32>,
 }
 
+/// Why a branch's preview environment is no longer needed.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum PreviewBranchCloseReason {
+    /// The branch was deleted from the repository.
+    BranchDeleted,
+    /// A pull/merge request from the branch was closed without merging.
+    PullRequestClosed { number: i64 },
+    /// A pull/merge request from the branch was merged.
+    PullRequestMerged { number: i64 },
+}
+
+impl fmt::Display for PreviewBranchCloseReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BranchDeleted => write!(f, "branch deleted"),
+            Self::PullRequestClosed { number } => write!(f, "pull request #{number} closed"),
+            Self::PullRequestMerged { number } => write!(f, "pull request #{number} merged"),
+        }
+    }
+}
+
+/// A webhook reported that `branch` of `project_id`'s repository is done
+/// with (deleted, or its pull request closed). The consumer tears down the
+/// project's preview environment for that branch, if it has one.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct PreviewBranchClosedJob {
+    pub project_id: i32,
+    pub branch: String,
+    pub reason: PreviewBranchCloseReason,
+}
+
 /// Request to deploy a prebuilt Docker image to a project (no build step).
 ///
 /// Project-scoped like `GitPushEventJob` — the consumer resolves the target
@@ -488,6 +520,8 @@ pub enum Job {
     ProvisionCertificate(ProvisionCertificateJob),
     CalculateRepositoryPreset(CalculateRepositoryPresetJob),
     GitPushEvent(GitPushEventJob),
+    /// Tear down a branch's preview environment (see [`PreviewBranchClosedJob`]).
+    PreviewBranchClosed(PreviewBranchClosedJob),
     /// Deploy a prebuilt Docker image to a project (no build) — fired by the
     /// template one-click flow when a template carries a prebuilt image.
     DeployImageRequested(DeployImageRequestedJob),
@@ -567,6 +601,7 @@ impl fmt::Display for Job {
             Job::ProvisionCertificate(job) => write!(f, "ProvisionCertificate({})", job.domain),
             Job::CalculateRepositoryPreset(job) => write!(f, "CalculateRepositoryPreset(repository_id: {})", job.repository_id),
             Job::GitPushEvent(job) => write!(f, "GitPushEvent(project_id: {}, owner: {}, repo: {}, branch: {:?}, tag: {:?}, commit: {})", job.project_id, job.owner, job.repo, job.branch, job.tag, job.commit),
+            Job::PreviewBranchClosed(job) => write!(f, "PreviewBranchClosed(project_id: {}, branch: {}, reason: {})", job.project_id, job.branch, job.reason),
             Job::DeployImageRequested(job) => write!(f, "DeployImageRequested(project_id: {}, image_ref: {})", job.project_id, job.image_ref),
             Job::RedeploySourceBundleRequested(job) => write!(f, "RedeploySourceBundleRequested(project_id: {}, environment_id: {}, source_deployment_id: {})", job.project_id, job.environment_id, job.source_deployment_id),
             Job::CronInvocationError(job) => write!(f, "CronInvocationError(cron_id: {}, env: {}, error: {})", job.cron_job_id, job.environment_id, job.error_message),

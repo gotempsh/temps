@@ -169,9 +169,8 @@ impl AuditOperation for SandboxNodeEvictedAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize SandboxNodeEvictedAudit: {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -195,9 +194,8 @@ impl AuditOperation for SandboxPlacementUpdatedAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize SandboxPlacementUpdatedAudit: {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -342,6 +340,7 @@ pub async fn list_node_sandboxes(
                 SandboxResponse::with_template(entry.summary, template, &parts).sandbox;
             if entry.owner_user_id != Some(caller) {
                 sandbox.preview_password_hint = None;
+                sandbox.preview_allowed_cidrs = Vec::new();
                 sandbox.source_repo_url = None;
             }
             NodeSandboxEntry {
@@ -723,6 +722,7 @@ mod tests {
             reason: None,
             live_sandboxes: 1,
             dedicated: false,
+            backends: Vec::new(),
         }
     }
 

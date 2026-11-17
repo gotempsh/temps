@@ -420,20 +420,20 @@ export function ImprovedOnboardingDashboard() {
   if (allStepsComplete) {
     return (
       <div className="w-full space-y-6 px-4 py-6 sm:px-6 lg:px-8">
-        <Card className="border-green-200 bg-green-50/50 dark:bg-green-950/10">
+        <Card className="border-green-200 dark:border-green-900 bg-green-50/50 dark:bg-green-950/10">
           <CardContent className="pt-6">
             <div className="text-center space-y-4">
               <CheckCircle2 className="h-16 w-16 text-green-600 mx-auto" />
-              <h2 className="text-2xl font-bold">Setup Complete!</h2>
+              <h2 className="text-2xl font-bold">Setup complete</h2>
               <p className="text-muted-foreground">
                 You&apos;re all set to start deploying services with Temps
               </p>
               <div className="flex gap-3 justify-center pt-4">
                 <Button onClick={() => navigate('/projects')}>
-                  Go to Projects
+                  Go to projects
                 </Button>
                 <Button variant="outline" onClick={resetOnboarding}>
-                  Reset Onboarding
+                  Reset onboarding
                 </Button>
               </div>
             </div>

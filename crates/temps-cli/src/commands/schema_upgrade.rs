@@ -6,7 +6,7 @@
 //! migrations, also used by the console's "Update now").
 //!
 //! 1. **Schema guard** — classify the database. One that a newer release
-//!    migrated ([`temps_database::SchemaStatus::NewerThanBinary`], e.g. after
+//!    migrated ([`temps_schema::SchemaStatus::NewerThanBinary`], e.g. after
 //!    a binary-only rollback) is logged as a warning and startup continues;
 //!    only an unreadable migration ledger stops it.
 //! 2. **Pre-migration backup** — opt-in with `--pre-migration-backup`. When
@@ -29,7 +29,7 @@ use temps_backup::pre_migration::{
     remove_orphaned_pre_migration_backup_containers, PreMigrationBackup, PreMigrationBackupError,
     PreMigrationBackupRequest,
 };
-use temps_database::{SchemaGuardError, SchemaStatus};
+use temps_schema::{SchemaGuardError, SchemaStatus};
 use tracing::info;
 
 /// The CLI flag that opts in to the backup, as shown in errors and logs.
@@ -64,6 +64,12 @@ enum BackupDecision {
     NotRequested,
     /// Pending upgrade: take the backup before migrating.
     Take,
+}
+
+/// Whether [`prepare_schema_upgrade`] takes the pre-migration backup for this
+/// schema state, so a caller can check where it would go before asking.
+pub fn takes_backup(status: &SchemaStatus, policy: BackupPolicy) -> bool {
+    decide(status, policy) == BackupDecision::Take
 }
 
 fn decide(status: &SchemaStatus, policy: BackupPolicy) -> BackupDecision {
@@ -124,7 +130,7 @@ pub async fn prepare_schema_upgrade(
     data_dir: &Path,
     policy: BackupPolicy,
 ) -> Result<PreparedUpgrade, SchemaUpgradeError> {
-    let status = temps_database::check_schema_compatibility(db).await?;
+    let status = temps_schema::check_schema_compatibility(db).await?;
     let pending = status.pending().len();
     let backup = match decide(&status, policy) {
         BackupDecision::NotNeeded => None,

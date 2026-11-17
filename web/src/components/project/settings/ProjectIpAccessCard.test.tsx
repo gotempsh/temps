@@ -68,13 +68,17 @@ test('shows a skeleton while the list loads', () => {
   expect(markup).not.toContain('Save IP access list')
 })
 
-test('an unconfigured project explains the feature and offers presets', () => {
+test('an unconfigured project explains the modes, with nothing to edit while Off', () => {
   const markup = render({ data: unconfigured })
   expect(markup).toContain('Open to everyone')
   expect(markup).toContain('Only allow listed addresses')
   expect(markup).toContain('Block listed addresses')
-  expect(markup).toContain('Add Tailscale ranges')
-  expect(markup).toContain('Add my IP (203.0.113.9)')
+  // Off lets everyone through: no list, presets or address check until a
+  // list mode is chosen.
+  expect(markup).not.toContain('Addresses and ranges')
+  expect(markup).not.toContain('Add Tailscale ranges')
+  expect(markup).not.toContain('Add my IP')
+  expect(markup).not.toContain('Try an address')
   expect(markup).not.toContain('Remove list')
 })
 
@@ -109,5 +113,5 @@ test('an environment without its own list says it follows the project', () => {
 test('a load failure is reported with a retry', () => {
   const markup = render({ failed: true })
   expect(markup).toContain('Could not load the IP access list')
-  expect(markup).toContain('Try Again')
+  expect(markup).toContain('Try again')
 })

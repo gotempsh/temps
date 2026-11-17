@@ -880,9 +880,9 @@ enum Document {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
     use temps_shield::feeds::Format;
     use temps_shield::{Action, Index, ListVerdict};
+    use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const NOW: i64 = 1_800_000_000;

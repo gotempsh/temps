@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Deserializer, Serialize};
-use temps_core::external_plugin::channel::PluginHostPermission;
+use temps_plugin_protocol::channel::PluginHostPermission;
 use thiserror::Error;
 use tokio::sync::Mutex;
 use utoipa::ToSchema;

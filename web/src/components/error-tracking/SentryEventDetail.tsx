@@ -23,6 +23,7 @@ import { CheckCircle, Copy } from 'lucide-react'
 import { useState } from 'react'
 import { toast } from 'sonner'
 import { StackTrace } from './StackTrace'
+import { IpLink } from '@/components/data-display/IpLink'
 
 interface SentryEventDetailProps {
   event: SentryEvent
@@ -155,7 +156,7 @@ export function SentryEventDetail({
           {sentryData.logentry && exceptions.length === 0 && (
             <Card>
               <CardHeader>
-                <CardTitle>Log Message</CardTitle>
+                <CardTitle>Log message</CardTitle>
               </CardHeader>
               <CardContent>
                 <p className="font-mono text-sm bg-muted p-3 rounded">
@@ -209,7 +210,7 @@ export function SentryEventDetail({
                     {/* Exception Value */}
                     <div className="mb-4">
                       <div className="text-sm text-muted-foreground mb-1">
-                        Error Message
+                        Error message
                       </div>
                       <div className="font-mono text-sm bg-muted p-3 rounded">
                         {exception.value}
@@ -652,7 +653,7 @@ export function SentryEventDetail({
             <Card>
               <CardHeader>
                 <div className="flex items-center justify-between">
-                  <CardTitle>Raw Event Data</CardTitle>
+                  <CardTitle>Raw event data</CardTitle>
                   <Button
                     variant="ghost"
                     size="sm"
@@ -739,7 +740,7 @@ export function SentryEventDetail({
               {sentryData.type && (
                 <div className="text-sm">
                   <div className="text-muted-foreground text-xs">
-                    Event Type
+                    Event type
                   </div>
                   <Badge variant="outline">{sentryData.type}</Badge>
                 </div>
@@ -871,7 +872,7 @@ export function SentryEventDetail({
             <Card>
               <CardHeader className="pb-3">
                 <CardTitle className="text-sm font-medium">
-                  Operating System
+                  Operating system
                 </CardTitle>
               </CardHeader>
               <CardContent className="space-y-2">
@@ -973,7 +974,7 @@ export function SentryEventDetail({
                 {contexts.response.status_code && (
                   <div className="text-sm">
                     <div className="text-muted-foreground text-xs">
-                      Status Code
+                      Status code
                     </div>
                     <Badge
                       variant={
@@ -1022,10 +1023,10 @@ export function SentryEventDetail({
                 {sentryData.user.ip_address && (
                   <div className="text-sm">
                     <div className="text-muted-foreground text-xs">
-                      IP Address
+                      IP address
                     </div>
                     <div className="font-mono">
-                      {sentryData.user.ip_address}
+                      <IpLink ip={sentryData.user.ip_address} />
                     </div>
                   </div>
                 )}
@@ -1047,7 +1048,7 @@ export function SentryEventDetail({
                     {contexts.otel.resource['service.name'] && (
                       <div className="text-sm">
                         <div className="text-muted-foreground text-xs">
-                          Service Name
+                          Service name
                         </div>
                         <div className="font-mono">
                           {contexts.otel.resource['service.name']}
@@ -1057,7 +1058,7 @@ export function SentryEventDetail({
                     {contexts.otel.resource['service.version'] && (
                       <div className="text-sm">
                         <div className="text-muted-foreground text-xs">
-                          Service Version
+                          Service version
                         </div>
                         <div className="font-mono">
                           {contexts.otel.resource['service.version']}
@@ -1103,7 +1104,7 @@ export function SentryEventDetail({
                 {contexts.trace.parent_span_id && (
                   <div className="text-sm">
                     <div className="text-muted-foreground text-xs">
-                      Parent Span ID
+                      Parent span ID
                     </div>
                     <div className="font-mono text-xs">
                       {contexts.trace.parent_span_id}
@@ -1213,7 +1214,7 @@ export function SentryEventDetail({
             <Card>
               <CardHeader className="pb-3">
                 <CardTitle className="text-sm font-medium">
-                  Extra Data
+                  Extra data
                 </CardTitle>
                 <CardDescription>
                   Additional metadata ({Object.keys(sentryData.extra).length}{' '}
@@ -1260,7 +1261,7 @@ export function SentryEventDetail({
               <Card>
                 <CardHeader className="pb-3">
                   <CardTitle className="text-sm font-medium">
-                    Additional Context
+                    Additional context
                   </CardTitle>
                 </CardHeader>
                 <CardContent>

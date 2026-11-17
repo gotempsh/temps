@@ -206,20 +206,32 @@ export function TokenPermissionList({
 export function CloudflareTokenCheck({
   token,
   zone,
+  hostname,
   tunnel = 'required',
 }: {
   token: string
+  /** The zone the token is for, matched exactly. */
   zone?: string | null
+  /** A hostname the token is for, when the zone is not known: Temps
+   * checks the longest zone the token reaches that contains it. */
+  hostname?: string | null
   tunnel?: 'required' | 'optional'
 }) {
   const pasted = useDebounce(token.trim(), 400)
   const debouncedZone = useDebounce(zone?.trim() || null, 400)
+  const debouncedHostname = useDebounce(hostname?.trim() || null, 400)
   const check = useMutation(checkCloudflareTokenMutation())
   const { mutate } = check
   useEffect(() => {
     if (pasted.length >= 20)
-      mutate({ body: { token: pasted, zone: debouncedZone } })
-  }, [pasted, debouncedZone, mutate])
+      mutate({
+        body: {
+          token: pasted,
+          zone: debouncedZone,
+          hostname: debouncedZone ? null : debouncedHostname,
+        },
+      })
+  }, [pasted, debouncedZone, debouncedHostname, mutate])
   if (pasted.length < 20) return null
   if (check.isPending) return <Skeleton className="h-12 w-full" />
   if (check.isError)
@@ -251,7 +263,7 @@ export function CloudflareTokenGuide({
             target="_blank"
             rel="noreferrer"
           >
-            API Tokens
+            API tokens
             <ExternalLink className="h-3 w-3" />
           </a>{' '}
           in Cloudflare, then <strong>Create Token</strong> →{' '}

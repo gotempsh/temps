@@ -72,6 +72,66 @@ export function checksFor(
   )
 }
 
+/** How serious a check result is, least to most, for showing the worst one. */
+export const CHECK_STATUS_PRIORITY = {
+  healthy: 0,
+  pending: 1,
+  unknown: 2,
+  warning: 3,
+  error: 4,
+} as const
+
+export type CheckStatus = keyof typeof CHECK_STATUS_PRIORITY
+
+/** The check states a list of credentials can be narrowed to. */
+export const CHECK_FILTERS = [
+  { value: 'healthy', label: 'Healthy' },
+  { value: 'warning', label: 'Warning' },
+  { value: 'error', label: 'Not healthy' },
+  { value: 'unchecked', label: 'Not checked' },
+] as const
+
+export type CheckFilterBucket = (typeof CHECK_FILTERS)[number]['value']
+export type CheckFilter = 'all' | CheckFilterBucket
+
+/** The filter a URL asks for; anything unrecognised shows everything. */
+export function parseCheckFilter(
+  value: string | null | undefined
+): CheckFilter {
+  return CHECK_FILTERS.find((option) => option.value === value)?.value ?? 'all'
+}
+
+/**
+ * Where a credential's checks put it, judged by the worst result so it matches
+ * the icon on its row. A credential with no checks, or whose worst result is
+ * paused or still waiting, has not been verified, so it is not "healthy".
+ */
+export function checkFilterBucket(
+  checks: readonly { status: CheckStatus }[]
+): CheckFilterBucket {
+  let worst: CheckStatus | undefined
+  for (const { status } of checks) {
+    if (
+      worst === undefined ||
+      CHECK_STATUS_PRIORITY[status] > CHECK_STATUS_PRIORITY[worst]
+    ) {
+      worst = status
+    }
+  }
+  switch (worst) {
+    case 'healthy':
+      return 'healthy'
+    case 'warning':
+      return 'warning'
+    case 'error':
+      return 'error'
+    case 'pending':
+    case 'unknown':
+    case undefined:
+      return 'unchecked'
+  }
+}
+
 /** Request fields that bind a new check to its subject; a check has one source. */
 export function credentialSource(subject: CredentialSubject) {
   return {

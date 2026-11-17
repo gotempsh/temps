@@ -124,16 +124,20 @@ pub struct OutageEvent {
 #[derive(Debug, Error)]
 pub enum OutageError {
     #[error("Database error: {0}")]
-    Database(String),
+    Database(sea_orm::DbErr),
     #[error("Monitor not found: {0}")]
     MonitorNotFound(i32),
-    #[error("Notification error: {0}")]
-    Notification(String),
+    #[error("Failed to send the {kind} notification for monitor {monitor_id}: {reason}")]
+    Notification {
+        monitor_id: i32,
+        kind: &'static str,
+        reason: String,
+    },
 }
 
 impl From<sea_orm::DbErr> for OutageError {
     fn from(err: sea_orm::DbErr) -> Self {
-        OutageError::Database(err.to_string())
+        OutageError::Database(err)
     }
 }
 
@@ -807,7 +811,11 @@ impl OutageDetectionService {
         self.notification_service
             .send_notification(notification)
             .await
-            .map_err(|e| OutageError::Notification(e.to_string()))?;
+            .map_err(|e| OutageError::Notification {
+                monitor_id: event.monitor_id,
+                kind: "outage",
+                reason: e.to_string(),
+            })?;
 
         Ok(())
     }
@@ -842,7 +850,11 @@ impl OutageDetectionService {
         self.notification_service
             .send_notification(notification)
             .await
-            .map_err(|e| OutageError::Notification(e.to_string()))?;
+            .map_err(|e| OutageError::Notification {
+                monitor_id: event.monitor_id,
+                kind: "recovery",
+                reason: e.to_string(),
+            })?;
 
         Ok(())
     }
@@ -1080,7 +1092,6 @@ WHERE NOT EXISTS (
 
     /// Scan all monitors - this is now a fallback/diagnostic method
     /// The primary detection method is event-driven via start_monitoring()
-    #[allow(dead_code)]
     pub async fn start_monitoring_fallback(self: Arc<Self>, scan_interval_secs: u64) {
         info!(
             "Starting fallback outage detection with polling (interval: {}s)",
@@ -1427,14 +1438,25 @@ pub(crate) mod tests {
 
     #[test]
     fn test_outage_error_display() {
-        let db_err = OutageError::Database("connection refused".to_string());
-        assert_eq!(db_err.to_string(), "Database error: connection refused");
+        let db_err =
+            OutageError::Database(sea_orm::DbErr::Custom("connection refused".to_string()));
+        assert_eq!(
+            db_err.to_string(),
+            "Database error: Custom Error: connection refused"
+        );
 
         let not_found = OutageError::MonitorNotFound(42);
         assert_eq!(not_found.to_string(), "Monitor not found: 42");
 
-        let notif_err = OutageError::Notification("timeout".to_string());
-        assert_eq!(notif_err.to_string(), "Notification error: timeout");
+        let notif_err = OutageError::Notification {
+            monitor_id: 42,
+            kind: "recovery",
+            reason: "timeout".to_string(),
+        };
+        assert_eq!(
+            notif_err.to_string(),
+            "Failed to send the recovery notification for monitor 42: timeout"
+        );
     }
 
     // ── Alarm bridge tests ────────────────────────────────────────────
@@ -1525,6 +1547,8 @@ pub(crate) mod tests {
             shield_exempt_paths: Default::default(),
             force_https: None,
             last_activity_at: None,
+            ingress_mode: Default::default(),
+            workload_mode: Default::default(),
         }
     }
 
@@ -2093,6 +2117,7 @@ pub(crate) mod tests {
             environment_id: Some(1),
             monitor_id: Some(1),
             title: "API Health is down".to_string(),
+            public_title: None,
             description: Some("Connection refused".to_string()),
             severity: "critical".to_string(),
             status: "investigating".to_string(),

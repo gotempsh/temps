@@ -21,6 +21,11 @@
 //!
 //! Run: `cargo run --release -p temps-log-aggregator --example format_bench -- <logfile> [max_lines]`
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "example program: panicking on bad input is acceptable outside the library"
+)]
 use std::io::{BufRead, BufReader};
 use std::time::Instant;
 

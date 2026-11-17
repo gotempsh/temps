@@ -24,6 +24,14 @@
 //! Database tests skip gracefully when Docker/PostgreSQL is unavailable.
 
 // Shared with provider_integration_test.rs; this binary uses only part of it.
+
+// Test-only helpers outside `#[test]` fns (fixtures, mock servers, setup):
+// a panic there is the test failure, which is what we want.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test helpers: panicking is how a test fails"
+)]
 #[allow(dead_code)]
 mod mock_provider_servers;
 
@@ -41,8 +49,8 @@ use temps_ai_gateway::services::{
 };
 use temps_ai_gateway::types::*;
 use temps_core::EncryptionService;
-use temps_database::test_utils::TestDatabase;
 use temps_entities::ai_provider_keys;
+use temps_test_utils::TestDatabase;
 use tokio_stream::StreamExt;
 
 const SELF_HOSTED_MODEL: &str = "mlx-community/Some-Model-4bit";

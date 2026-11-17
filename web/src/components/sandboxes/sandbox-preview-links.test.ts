@@ -45,7 +45,6 @@ describe('toPreviewLinkBody', () => {
 describe('previewLinkBlockedReason', () => {
   const ok = {
     configured: true,
-    onWorkerNode: false,
     hasPassword: true,
     destroyed: false,
     running: true,
@@ -65,9 +64,6 @@ describe('previewLinkBlockedReason', () => {
     )
     expect(previewLinkBlockedReason({ ...ok, configured: false })).toContain(
       'not configured'
-    )
-    expect(previewLinkBlockedReason({ ...ok, onWorkerNode: true })).toContain(
-      'worker nodes'
     )
   })
 })

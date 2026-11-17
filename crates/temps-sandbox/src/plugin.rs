@@ -7,7 +7,7 @@
 //! `JobTracker`, and exposes HTTP routes under `/v1/sandbox/*`.
 //!
 //! Dependencies:
-//! - `temps-agents` plugin must run first to register the shared
+//! - `temps-ai-agents` plugin must run first to register the shared
 //!   `Arc<dyn SandboxProvider>` we consume here.
 //! - `temps-config` plugin for the `ConfigService` used to compute
 //!   preview URL parts.
@@ -17,12 +17,12 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use temps_agents::sandbox::SandboxProvider;
 use temps_config::ConfigService;
 use temps_core::plugin::{
     PluginContext, PluginError, PluginRoutes, ServiceRegistrationContext, TempsPlugin,
 };
 use temps_git::GitProviderManager;
+use temps_sandbox_providers::SandboxProvider;
 use tracing::{debug, info, warn};
 use utoipa::OpenApi;
 
@@ -33,7 +33,7 @@ use crate::services::placement::{NodeProbe, ResolverNodeProbe};
 use crate::services::registry::{SandboxNodeLookup, StandaloneSandboxRegistry};
 use crate::services::sandbox_service::SandboxService;
 use crate::services::snapshot_service::SnapshotService;
-use temps_agents::sandbox::node_routing::DbRemoteNodeResolver;
+use temps_sandbox_providers::node_routing::DbRemoteNodeResolver;
 
 pub struct SandboxPlugin;
 
@@ -50,8 +50,12 @@ impl Default for SandboxPlugin {
 }
 
 /// Root directory on the host where per-sandbox working directories live.
-/// Mirrors the `agent-sessions` pattern used by `temps-agents::executor`.
+/// Mirrors the `agent-sessions` pattern used by `temps-ai-agents::executor`.
 fn data_root() -> PathBuf {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "bootstrap: TEMPS_DATA_DIR (with host lookup of HOME as fallback) locates the data directory and is fixed before the database exists"
+    )]
     let root = std::env::var("TEMPS_DATA_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
@@ -200,7 +204,7 @@ impl TempsPlugin for SandboxPlugin {
             // them down. Say so while the operator is looking at the logs, in
             // the background: it shells out to `systemctl`.
             {
-                use temps_agents::sandbox::SandboxBackend;
+                use temps_sandbox_providers::SandboxBackend;
                 let provider = registry.provider();
                 if provider.supports_backend(SandboxBackend::Firecracker)
                     || provider.supports_backend(SandboxBackend::Microsandbox)
@@ -213,7 +217,7 @@ impl TempsPlugin for SandboxPlugin {
             // so agent runs (autofixer, workflow agents) create first-class
             // `sandboxes` rows instead of untracked containers.
             match (
-                context.get_service::<temps_agents::services::sandbox_registry::SandboxRegistry>(),
+                context.get_service::<temps_sandbox_providers::sandbox_registry::SandboxRegistry>(),
                 sandbox_service.clone(),
             ) {
                 (Some(agent_registry), Some(service)) => {
@@ -369,6 +373,22 @@ impl TempsPlugin for SandboxPlugin {
             tokio::spawn(async move {
                 sweeper.run().await;
             });
+
+            // Preview URLs of sandboxes on worker nodes: the proxy hands them
+            // to this relay, which reaches the sandbox through its worker.
+            let relay = Arc::new(
+                crate::services::worker_preview_relay::WorkerPreviewRelayServer::new(
+                    db.clone(),
+                    registry.clone(),
+                ),
+            );
+            if let Err(error) = relay.start().await {
+                tracing::error!(
+                    %error,
+                    "Could not start the worker sandbox preview relay; previews of sandboxes on \
+                     worker nodes will answer 502 until the server restarts"
+                );
+            }
 
             Ok(())
         })

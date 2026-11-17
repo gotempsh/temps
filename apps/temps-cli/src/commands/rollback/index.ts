@@ -25,6 +25,7 @@ async function rollback(projectArg: string | undefined, options: RollbackOptions
     project: resolved.slug,
     environment: options.environment ?? 'production',
     to: options.to,
+    yes: options.yes,
   })
 }
 

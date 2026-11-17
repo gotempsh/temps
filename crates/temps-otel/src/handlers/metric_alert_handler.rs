@@ -24,7 +24,7 @@ use crate::handlers::audit::{
 use crate::services::anomaly_preview::{compute_anomaly_preview, compute_static_preview};
 use crate::services::metric_alert_evaluator::SeriesStateEntry;
 use crate::OtelAppState;
-use temps_auth::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
+use temps_authz::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
 use temps_core::problemdetails::Problem;
 use temps_core::{AuditContext, ProblemDetails, RequestMetadata};
 use temps_entities::metric_alert_rules::Model;

@@ -20,6 +20,7 @@ import {
 } from 'lucide-react'
 import { useState } from 'react'
 import { Button } from '@/components/ui/button'
+import { DiscordHelpLink } from '@/components/support/DiscordHelpLink'
 import {
   Card,
   CardContent,
@@ -312,7 +313,11 @@ export const ProtectedLayout = ({
               </Button>
             </div>
 
-            <div className="flex flex-wrap items-center justify-between gap-2 border-t pt-4 text-xs text-muted-foreground">
+            <p className="border-t pt-4 text-sm text-muted-foreground">
+              Need help with Temps? <DiscordHelpLink />
+            </p>
+
+            <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
               <span>
                 Still not working? Check the{' '}
                 <a
@@ -327,7 +332,7 @@ export const ProtectedLayout = ({
                 .
               </span>
               <a
-                href="https://github.com/temps-sh/temps/issues"
+                href="https://github.com/gotempsh/temps/issues"
                 target="_blank"
                 rel="noreferrer"
                 className="inline-flex items-center gap-1 font-medium text-foreground underline-offset-4 hover:underline"

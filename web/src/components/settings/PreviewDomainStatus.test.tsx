@@ -30,8 +30,9 @@ function renderStatus(
   )
 }
 
-test('a local-only preview domain warns and points at the fixes', () => {
+test('a local-only preview domain states the fact and the fixes, without an alert', () => {
   const { container } = renderStatus('local_only')
+  expect(container.querySelector('[role="alert"]')).toBeNull()
   expect(container.textContent).toContain(
     'Only this machine can open these names'
   )
@@ -53,4 +54,19 @@ test('a tunnel publishing every environment makes the local domain no problem', 
     'Tunnel edge gives every environment an address'
   )
   expect(container.querySelector('[role="alert"]')).toBeNull()
+})
+
+test('a private address is a deliberate setup, not a warning', () => {
+  const { container } = renderStatus('no_way_in')
+  expect(container.textContent).toContain('Not reachable from the internet')
+  expect(container.querySelector('[role="alert"]')).toBeNull()
+  expect(container.querySelector('a')?.getAttribute('href')).toBe(
+    '/settings/nodes/ingress'
+  )
+})
+
+test('names that do not resolve at all still warn', () => {
+  const { container } = renderStatus('unresolved')
+  expect(container.querySelector('[role="alert"]')).not.toBeNull()
+  expect(container.textContent).toContain('These names do not resolve yet')
 })

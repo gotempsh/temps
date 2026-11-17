@@ -28,7 +28,7 @@ impl TimescaleBackend {
     /// Borrow the underlying connection. Kept `pub(crate)` so query methods
     /// added in subsequent commits can use it; handlers must go through the
     /// trait instead of touching this directly.
-    #[allow(dead_code)] // used by query methods migrating in Phase 1 task #3
+    #[allow(dead_code)] // for the query methods still to move onto this backend
     pub(crate) fn db(&self) -> &DatabaseConnection {
         self.db.as_ref()
     }

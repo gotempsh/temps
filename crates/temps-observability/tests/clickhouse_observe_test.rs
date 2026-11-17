@@ -22,6 +22,14 @@
 //! with empty result sets — they resolve to empty streams rather than erroring
 //! when a test enables all four kinds.
 
+// Test-only helpers outside `#[test]` fns (fixtures, mock servers, setup):
+// a panic there is the test failure, which is what we want.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test helpers: panicking is how a test fails"
+)]
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -84,11 +92,13 @@ async fn setup() -> Option<ChTestEnv> {
     };
     let url = format!("http://127.0.0.1:{host_port}");
 
-    let probe = ::clickhouse::Client::default()
-        .with_url(&url)
-        .with_database(CH_DB)
-        .with_user("default")
-        .with_password("test");
+    let probe = temps_clickhouse::build_client(
+        &url,
+        CH_DB,
+        "default",
+        "test",
+        temps_clickhouse::ClickHouseCompression::Lz4,
+    );
 
     let mut last_err = String::new();
     for _ in 0..30 {

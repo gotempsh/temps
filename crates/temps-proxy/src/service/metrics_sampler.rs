@@ -115,7 +115,7 @@ pub async fn build_metrics_store(
     config: &temps_config::ServerConfig,
     db: Arc<temps_database::DbConnection>,
 ) -> Arc<dyn MetricsStore> {
-    use temps_core::MetricsStoreKind;
+    use temps_config::MetricsStoreKind;
     use temps_metrics::{ClickHouseMetricsConfig, ClickhouseMetricsStore, TimescaleMetricsStore};
 
     let kind = match config_service.get_settings().await {
@@ -208,8 +208,8 @@ mod tests {
     /// per the repo's Docker-test convention.
     #[tokio::test]
     async fn test_sampler_pipeline_end_to_end_against_real_store() {
-        use temps_database::test_utils::TestDatabase;
         use temps_metrics::{LatestQuery, TimescaleMetricsStore};
+        use temps_test_utils::TestDatabase;
 
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,

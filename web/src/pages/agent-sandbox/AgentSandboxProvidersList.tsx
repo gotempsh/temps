@@ -2,9 +2,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { Link, useSearchParams } from 'react-router'
+import { PageContainer, PageHeader } from '@/components/layout/PageContainer'
 import { useQuery } from '@tanstack/react-query'
 import { ArrowRight } from 'lucide-react'
-import { RecordLink } from '@temps-sdk/ds'
+import { RecordLink, RecordRow } from '@temps-sdk/ds'
 import type { ProviderCatalogDto } from '@/api/client'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -20,54 +21,61 @@ import {
 import { AiHarnessLogo } from '@/components/ui/ai-harness-logo'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { aiProviderCatalogQueryOptions } from '@/lib/ai-provider-catalog-query'
+import { returnToFromSearch } from '@/lib/safe-return-to'
 import {
   harnessSetupHref,
   harnessSetupStatus,
   savedConnectionLabel,
-  workspaceReturnTo,
 } from './harness-onboarding'
 
+/**
+ * The accounts autofix's coding agent signs in with. Reached only from
+ * autofix's setup steps; the AI area's own providers are on /ai-gateway.
+ */
 export function AgentSandboxProvidersList() {
-  usePageTitle('Harnesses')
+  usePageTitle('Autofix agent credentials')
   const [params] = useSearchParams()
-  const returnTo = workspaceReturnTo(params.get('returnTo'))
+  const returnTo = returnToFromSearch(params)
   const { data, isPending, isError, refetch } = useQuery({
     ...aiProviderCatalogQueryOptions,
     staleTime: 60_000,
   })
 
   return (
-    <div className="space-y-4">
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <p className="text-sm text-muted-foreground">
-          Connect one harness to start. You can add the others later.
-        </p>
-        <Button asChild variant="outline" size="sm">
-          <Link to={returnTo}>
-            Back to workspace <ArrowRight className="size-4" />
-          </Link>
-        </Button>
-      </div>
+    <PageContainer>
+      <PageHeader
+        title="Autofix agent credentials"
+        description="Connect one account for autofix's coding agent to sign in with."
+        actions={
+          returnTo ? (
+            <Button asChild variant="outline" size="sm">
+              <Link to={returnTo}>
+                Back <ArrowRight className="size-4" />
+              </Link>
+            </Button>
+          ) : undefined
+        }
+      />
       <div className="rounded-lg border bg-card text-card-foreground">
         {isError && !data ? (
           <div
             role="alert"
             className="flex flex-wrap items-center gap-3 p-4 text-sm"
           >
-            Could not load harness configuration.
+            Could not load the agent credentials.
             <Button variant="outline" size="sm" onClick={() => void refetch()}>
               Retry
             </Button>
           </div>
         ) : data?.providers.length === 0 ? (
           <p role="status" className="p-4 text-sm text-muted-foreground">
-            This server offers no harnesses. Update Temps to add one.
+            This server offers no coding agents. Update Temps to add one.
           </p>
         ) : (
-          <Table aria-label="Harnesses" aria-busy={isPending}>
+          <Table aria-label="Autofix agent credentials" aria-busy={isPending}>
             <TableHeader>
               <TableRow>
-                <TableHead scope="col">Harness</TableHead>
+                <TableHead scope="col">Agent</TableHead>
                 {/* Secondary on phones: the harness page shows it too. */}
                 <TableHead scope="col" className="hidden sm:table-cell">
                   Sign-in method
@@ -101,7 +109,7 @@ export function AgentSandboxProvidersList() {
           </Table>
         )}
       </div>
-    </div>
+    </PageContainer>
   )
 }
 
@@ -110,14 +118,14 @@ export function HarnessSetupRow({
   returnTo,
 }: {
   provider: ProviderCatalogDto
-  returnTo: string
+  returnTo?: string | null
 }) {
   const needsAttention = provider.credential_saved && !provider.workspace_ready
   const method = provider.credential_saved
     ? savedConnectionLabel(provider)
     : undefined
   return (
-    <TableRow>
+    <RecordRow>
       <TableCell>
         <div className="flex min-w-0 items-center gap-3">
           <AiHarnessLogo providerId={provider.id} size={20} />
@@ -152,11 +160,11 @@ export function HarnessSetupRow({
           {needsAttention && (
             <p className="text-xs text-muted-foreground">
               {provider.workspace_readiness_hint ||
-                'Temps could not confirm a model response. Open the harness to verify it.'}
+                'Temps could not confirm a model response. Open the agent to verify it.'}
             </p>
           )}
         </div>
       </TableCell>
-    </TableRow>
+    </RecordRow>
   )
 }

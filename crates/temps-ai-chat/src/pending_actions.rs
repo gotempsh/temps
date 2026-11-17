@@ -247,6 +247,7 @@ impl PendingActionService {
             message_id: Set(None),
             project_id: Set(project_id),
             operation_id: Set(prepared.operation_id.clone()),
+            plugin_revision: Set(prepared.plugin_revision.clone()),
             method: Set(prepared.method.clone()),
             summary: Set(prepared.summary.clone()),
             params: Set(
@@ -347,6 +348,7 @@ impl PendingActionService {
                 plan_public_id: Set(Some(plan_public_id.clone())),
                 step_index: Set(idx as i32),
                 operation_id: Set(prepared.operation_id.clone()),
+                plugin_revision: Set(prepared.plugin_revision.clone()),
                 method: Set(prepared.method.clone()),
                 summary: Set(prepared.summary.clone()),
                 params: Set(encrypted_params),
@@ -526,6 +528,16 @@ impl PendingActionService {
         let user_id = auth.user_id();
         let action = self.get(project_id, user_id, public_id).await?;
 
+        if temps_core::ai_tool_call::requires_human_consent(&action.operation_id)
+            && confirmed_by != Some(user_id)
+        {
+            return Err(PendingActionError::PermissionDenied {
+                public_id: public_id.to_owned(),
+                permission: "explicit human confirmation".into(),
+                decision: "confirm",
+            });
+        }
+
         // 2. Status pre-check. Project-level feature toggles do not participate
         // in authorization: the native harness approval and the confirming
         // user's current RBAC/project scope are the authoritative controls.
@@ -614,7 +626,14 @@ impl PendingActionService {
             }),
         };
         let exec_result = caller
-            .execute_write(&action.operation_id, executable_params, &scope)
+            .execute_approved_write(
+                &action.operation_id,
+                executable_params,
+                &scope,
+                action.plugin_revision.as_deref(),
+                // The owner confirmed it here; the endpoint refuses assistants.
+                temps_ai_api_tools::WriteApproval::OwnerInApp,
+            )
             .await;
 
         // 8. Persist outcome regardless of success/failure.
@@ -883,6 +902,7 @@ mod tests {
 
     fn make_prepared() -> PreparedWrite {
         PreparedWrite {
+            plugin_revision: None,
             operation_id: "redeploy_deployment".to_string(),
             method: "POST".to_string(),
             path: "/projects/{project_id}/deployments/redeploy".to_string(),
@@ -896,6 +916,7 @@ mod tests {
     fn make_proposed(id: i64, public_id: &str, project_id: i32) -> ai_pending_actions::Model {
         let now = Utc::now();
         ai_pending_actions::Model {
+            plugin_revision: None,
             id,
             public_id: public_id.to_string(),
             conversation_id: 1,
@@ -1173,6 +1194,41 @@ mod tests {
         assert!(!log.contains("must-not-reach-the-database-in-plaintext"));
         assert!(log.contains("__temps_encrypted_v1"));
         assert!(log.contains("***"));
+    }
+
+    #[tokio::test]
+    async fn standalone_and_plan_inserts_bind_plugin_revision() {
+        for plan in [false, true] {
+            let row = make_proposed(1, "approval", 7);
+            let db = Arc::new(
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results([vec![row]])
+                    .into_connection(),
+            );
+            let svc = PendingActionService::new(db.clone(), noop_write_handle(), test_encryption());
+            let mut prepared = make_prepared();
+            let revision = "00000000-0000-4000-8000-000000000123";
+            prepared.plugin_revision = Some(revision.into());
+            if plan {
+                svc.create_plan(1, Some(7), &[(prepared, None)], 1)
+                    .await
+                    .unwrap();
+            } else {
+                svc.create(1, Some(7), &prepared, None, 1).await.unwrap();
+            }
+            drop(svc);
+            let transactions = Arc::try_unwrap(db).unwrap().into_transaction_log();
+            let insert = transactions
+                .iter()
+                .flat_map(|t| t.statements())
+                .find(|s| s.sql.starts_with("INSERT"))
+                .unwrap();
+            assert!(insert.sql.contains("plugin_revision"));
+            assert!(
+                format!("{:?}", insert.values).contains(revision),
+                "{insert:?}"
+            );
+        }
     }
 
     // get: not-found returns NotFound.
@@ -1619,5 +1675,61 @@ mod tests {
             matches!(err, PendingActionError::Unavailable),
             "unexpected: {err:?}"
         );
+    }
+
+    // A grant of internal access stays staged until its owner confirms that
+    // exact action: a confirmation not attributed to them (an automatic
+    // approval, an MCP client, anything the model produced) is refused before
+    // the row is claimed, so nothing executes.
+    #[tokio::test]
+    async fn an_internal_access_grant_runs_only_on_its_owners_confirmation() {
+        for operation in [
+            "create_internal_access_sandbox_grant",
+            "create_internal_access_grant",
+        ] {
+            for confirmed_by in [None, Some(2)] {
+                let mut action = make_proposed(1, "grant", 7);
+                action.operation_id = operation.to_string();
+                let db = MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results(vec![vec![action]])
+                    .into_connection();
+                let svc = make_svc(db);
+                let err = svc
+                    .confirm(Some(7), "grant", &make_auth(), confirmed_by, None)
+                    .await
+                    .expect_err("a grant without its owner's confirmation must not run");
+                assert!(
+                    matches!(
+                        err,
+                        PendingActionError::PermissionDenied { ref permission, .. }
+                            if permission == "explicit human confirmation"
+                    ),
+                    "{operation} {confirmed_by:?}: {err:?}"
+                );
+            }
+
+            // The owner's own confirmation goes on to claim and execute it
+            // (here the write handle is not wired, so it ends Unavailable).
+            let mut action = make_proposed(1, "grant", 7);
+            action.operation_id = operation.to_string();
+            let mut failed = action.clone();
+            failed.status = "failed".to_string();
+            let db = MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![action]])
+                .append_exec_results(vec![MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .append_query_results(vec![vec![failed]])
+                .into_connection();
+            let err = make_svc(db)
+                .confirm(Some(7), "grant", &make_auth(), Some(1), None)
+                .await
+                .expect_err("no write handle in this fixture");
+            assert!(
+                matches!(err, PendingActionError::Unavailable),
+                "{operation}: {err:?}"
+            );
+        }
     }
 }

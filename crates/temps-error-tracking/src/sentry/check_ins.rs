@@ -25,17 +25,20 @@ struct Trace {
 }
 pub fn decode(payload: &[u8]) -> Result<MonitorCheckIn, CronMonitorError> {
     if payload.len() > 16384 {
-        return Err(CronMonitorError::Invalid("check-in exceeds 16 KiB".into()));
+        return Err(CronMonitorError::Invalid {
+            reason: "check-in exceeds 16 KiB".into(),
+        });
     }
-    let wire: CheckIn = serde_json::from_slice(payload)
-        .map_err(|_| CronMonitorError::Invalid("invalid check-in JSON".into()))?;
+    let wire: CheckIn = serde_json::from_slice(payload).map_err(|_| CronMonitorError::Invalid {
+        reason: "invalid check-in JSON".into(),
+    })?;
     if wire.check_in_id.len() != 32
         || !wire.check_in_id.bytes().all(|c| c.is_ascii_hexdigit())
         || wire.check_in_id.bytes().all(|c| c == b'0')
     {
-        return Err(CronMonitorError::Invalid(
-            "invalid Sentry check-in ID".into(),
-        ));
+        return Err(CronMonitorError::Invalid {
+            reason: "invalid Sentry check-in ID".into(),
+        });
     }
     let trace = wire.contexts.and_then(|c| c.trace);
     let item = MonitorCheckIn {

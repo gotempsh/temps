@@ -30,6 +30,10 @@
 //! Build: `cargo build -p temps-preview-gateway --release`
 //! Docker image: see `Dockerfile` in this crate.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "standalone sidecar binary configured by the environment its launcher sets on the container; anyhow is fine at a binary's top level"
+)]
 use std::net::SocketAddr;
 use std::time::Duration;
 

@@ -142,6 +142,10 @@ impl TempsPlugin for LogAggregatorPlugin {
             // ── ADR-046 chunk read-through cache ─────────────────────────
             // Built before the chunk writer so the writer can write-through
             // into the same cache a sealing node reads from (ADR-046 §6a).
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "bootstrap: TEMPS_DATA_DIR locates the data directory and is fixed before the database exists"
+            )]
             let data_dir = std::env::var("TEMPS_DATA_DIR")
                 .map(std::path::PathBuf::from)
                 .ok();
@@ -152,7 +156,7 @@ impl TempsPlugin for LogAggregatorPlugin {
             // Opened at the default budget; the persisted setting is applied
             // as soon as the plugin starts (and re-applied every minute).
             let cache_bytes =
-                u64::from(temps_core::ContainerLogSettings::default().cache_mb) * 1024 * 1024;
+                u64::from(temps_config::ContainerLogSettings::default().cache_mb) * 1024 * 1024;
             let cache = ChunkCache::open(cache_dir, cache_bytes)
                 .await
                 .map_err(|e| PluginError::PluginRegistrationFailed {
@@ -268,7 +272,7 @@ impl TempsPlugin for LogAggregatorPlugin {
             // saved settings before any stream starts, and the budget sync
             // keeps them current.
             let ingest_budget = Arc::new(IngestBudget::new(IngestLimits::from_settings(
-                &temps_core::ContainerLogSettings::default(),
+                &temps_config::ContainerLogSettings::default(),
             )));
             context.register_service(ingest_budget.clone());
 

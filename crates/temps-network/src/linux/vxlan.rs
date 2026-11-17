@@ -197,13 +197,8 @@ async fn replace(
         });
     }
     if let Some(holder) = vxlan_holding(name, vni, port).await? {
-        return Err(NetworkError::Vxlan {
-            device: name.into(),
-            reason: format!(
-                "VXLAN device '{holder}' already holds vni={vni}, port={port}, so no \
-                 replacement on parent={underlay_dev} can be built; the existing device is kept"
-            ),
-        });
+        // The existing device is kept: nothing was changed yet.
+        return Err(id_in_use(name, holder, vni, port).await);
     }
     let request = Replacement {
         name: name.into(),
@@ -384,6 +379,19 @@ fn forget_refusal(request: &Replacement) {
     }
 }
 
+/// `holder` keeps `name` from being created on `vni`/`port`: say what it
+/// belongs to and what to do (ADR 062).
+async fn id_in_use(name: &str, holder: String, vni: u32, port: u16) -> NetworkError {
+    let diagnosis = crate::vxlan_holder::diagnose(&holder, name, vni, port).await;
+    NetworkError::VxlanIdInUse {
+        device: name.into(),
+        holder,
+        vni,
+        port,
+        diagnosis,
+    }
+}
+
 /// Another VXLAN device (not `name`) holding `vni` on `port`: the kernel
 /// refuses a second one, so a replacement could not be created.
 async fn vxlan_holding(name: &str, vni: u32, port: u16) -> crate::Result<Option<String>> {
@@ -416,21 +424,8 @@ async fn vxlan_holding(name: &str, vni: u32, port: u16) -> crate::Result<Option<
 /// From `ip -d -o link show type vxlan` output: the device other than `name`
 /// with `vni` on `port`.
 fn holder_of(output: &str, name: &str, vni: u32, port: u16) -> Option<String> {
-    let (vni, port) = (vni.to_string(), port.to_string());
-    output.lines().find_map(|line| {
-        let tokens: Vec<&str> = line.split_whitespace().collect();
-        // "11: vxlan-temps0: <...>" or "11: vx0@eth0: <...>".
-        let device = tokens.get(1)?.trim_end_matches(':');
-        let device = device.split('@').next().unwrap_or(device);
-        let topology = &tokens[tokens.iter().position(|token| *token == "vxlan")?..];
-        let has_pair = |key: &str, value: &str| {
-            topology
-                .windows(2)
-                .any(|pair| pair[0] == key && pair[1] == value)
-        };
-        (device != name && has_pair("id", &vni) && has_pair("dstport", &port))
-            .then(|| device.to_string())
-    })
+    let devices = crate::vxlan_holder::parse_devices(output);
+    crate::vxlan_holder::holder(&devices, name, vni, port).map(|device| device.name.clone())
 }
 
 /// A device about to be replaced, as needed to rebuild it.
@@ -578,16 +573,7 @@ async fn create(
     // this host under another name (ADR 059): name it, since every node of
     // a cluster must share the VNI and port and only the holder can move.
     if let Some(holder) = vxlan_holding(name, vni, port).await? {
-        return Err(NetworkError::Vxlan {
-            device: name.into(),
-            reason: format!(
-                "VXLAN device '{holder}' already holds vni={vni}, port={port} on this host, \
-                 so this cluster's overlay cannot use them. If '{holder}' belongs to an \
-                 overlay this host no longer serves, delete it (`ip link delete {holder}`): \
-                 its bridge and Docker network can stay, and their containers keep local \
-                 traffic. Two clusters' overlays cannot run on one host at once"
-            ),
-        });
+        return Err(id_in_use(name, holder, vni, port).await);
     }
 
     let builder = LinkVxlan::new(name, vni)

@@ -10,6 +10,7 @@ import {
   canSubmitBackup,
   confirmRestartParam,
   deriveRestartGate,
+  destinationToSubmit,
   restartGateAllowsSubmit,
   classifyDestinationError,
   deriveDestinationState,
@@ -48,6 +49,41 @@ function failedInitialRead(error: unknown) {
     isError: true,
   })
 }
+
+describe('refusals recognised from the status line', () => {
+  test('a 403 whose body carries no status or title is still a permission failure', () => {
+    const bare = Object.assign(new Error('denied'), { status: 403 })
+    expect(classifyDestinationError(bare).reason).toBe('permission')
+    expect(classifyDestinationError(bare).status).toBe(403)
+  })
+})
+
+describe('destinationToSubmit', () => {
+  test('a refused list submits no destination, whatever the form still holds', () => {
+    const restricted = deriveDestinationState<Destination>({
+      data: [],
+      error: forbidden,
+      isPending: false,
+      isError: true,
+    })
+    expect(restricted.kind).toBe('restricted')
+    // A destination chosen while the list was still readable.
+    expect(destinationToSubmit(restricted, 5)).toBeUndefined()
+    expect(
+      canSubmitBackup(restricted, destinationToSubmit(restricted, 5))
+    ).toBe(true)
+  })
+
+  test('a readable list keeps the chosen destination', () => {
+    const ready = deriveDestinationState<Destination>({
+      data: [primary],
+      error: null,
+      isPending: false,
+      isError: false,
+    })
+    expect(destinationToSubmit(ready, primary.id)).toBe(primary.id)
+  })
+})
 
 describe('classifyDestinationError', () => {
   test('403 problem is a permission failure carrying the server detail', () => {
@@ -153,11 +189,14 @@ describe('deriveDestinationState', () => {
     expect(canSubmitBackup(state, primary.id)).toBe(false)
   })
 
-  test('failed initial read with 403 is an error, not an empty list', () => {
+  test('a refused read is restricted: not an empty list, and a backup may use the default', () => {
     const state = failedInitialRead(forbidden)
-    expect(state.kind).toBe('error')
-    if (state.kind !== 'error') throw new Error('expected error state')
+    expect(state.kind).toBe('restricted')
+    if (state.kind !== 'restricted') throw new Error('expected restricted')
     expect(state.failure.reason).toBe('permission')
+    expect(knownDestinations(state)).toBeUndefined()
+    // No destination can be named, so none is: the server uses the default.
+    expect(canSubmitBackup(state, undefined)).toBe(true)
     expect(canSubmitBackup(state, primary.id)).toBe(false)
   })
 
@@ -195,15 +234,28 @@ describe('deriveDestinationState', () => {
     expect(canSubmitBackup(state, 99)).toBe(false)
   })
 
-  test('failed refresh over a cached empty list is an error, not onboarding', () => {
-    const state = deriveDestinationState<Destination>({
+  test('failed refresh over a cached empty list is never onboarding', () => {
+    const refused = deriveDestinationState<Destination>({
       data: [],
       error: forbidden,
       isPending: false,
       isError: true,
     })
-    expect(state.kind).toBe('error')
-    expect(canSubmitBackup(state, undefined)).toBe(false)
+    expect(refused.kind).toBe('restricted')
+    const down = deriveDestinationState<Destination>({
+      data: [],
+      error: unavailable,
+      isPending: false,
+      isError: true,
+    })
+    expect(down.kind).toBe('error')
+    expect(canSubmitBackup(down, undefined)).toBe(false)
+  })
+
+  test('a failed read that is not a refusal still blocks submission', () => {
+    for (const error of [unavailable, networkFailure]) {
+      expect(canSubmitBackup(failedInitialRead(error), undefined)).toBe(false)
+    }
   })
 
   test('successful empty list is the only empty state, and blocks submission', () => {
@@ -294,9 +346,9 @@ describe('deriveDestinationState with a real React Query observer', () => {
 
     expect(snapshot().kind).toBe('loading')
     await settled(observer)
-    expect(snapshot().kind).toBe('error')
+    expect(snapshot().kind).toBe('restricted')
 
-    // What the dialog's Retry button does.
+    // What a refresh does once the role gains access.
     await observer.refetch()
     const recovered = snapshot()
     expect(recovered).toEqual({ kind: 'ready', destinations: [primary] })

@@ -5,7 +5,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use temps_backup_core::BackupExecutorBuilder;
+use crate::execution::BackupExecutorBuilder;
 use temps_core::log_transitions::{FailureLatch, FailureLog, KeyedFailureLatch};
 use temps_core::plugin::{
     PluginContext, PluginError, PluginRoutes, ServiceRegistrationContext, TempsPlugin,
@@ -25,6 +25,8 @@ use crate::{
         postgres_walg::{PostgresWalgDeps, PostgresWalgEngine},
         redis::{RedisDeps, RedisEngine},
         s3_mirror::{S3MirrorDeps, S3MirrorEngine},
+        worker_agent::{WorkerAgentDeps, WorkerAgentEngine},
+        workload_job::{PostgresWorkloadJobDeps, PostgresWorkloadJobEngine},
     },
     handlers::{self, create_backup_app_state, BackupAppState},
     managed_schedule::ManagedScheduleProvisioner,
@@ -45,14 +47,9 @@ use temps_providers::postgres_upgrade_service::PostgresUpgradeService;
 /// Sourced from each engine's own `ENGINE_KEY` rather than re-spelled here, so
 /// a renamed engine cannot silently drop out of the unavailable set and start
 /// failing backups on a Dockerless control plane again.
-const DOCKER_BACKED_ENGINES: [&str; 8] = [
-    crate::engines::redis::ENGINE_KEY,
+const DOCKER_BACKED_ENGINES: [&str; 3] = [
     crate::engines::postgres_pgdump::ENGINE_KEY,
-    crate::engines::postgres_walg::ENGINE_KEY,
     crate::engines::postgres_cluster::ENGINE_KEY,
-    crate::engines::mongodb::ENGINE_KEY,
-    crate::engines::mariadb_physical::ENGINE_KEY,
-    crate::engines::mariadb_dump::ENGINE_KEY,
     crate::engines::s3_mirror::ENGINE_KEY,
 ];
 
@@ -93,6 +90,110 @@ impl Default for BackupPlugin {
     }
 }
 
+/// Deprecated environment variable replaced by `backup_executor.max_concurrent`.
+const BACKUP_EXECUTOR_MAX_CONCURRENT_ENV: &str = "TEMPS_BACKUP_EXECUTOR_MAX_CONCURRENT";
+const BACKUP_EXECUTOR_MAX_CONCURRENT_SETTING: &str = "backup_executor.max_concurrent";
+
+/// One-release shim: read the deprecated variable once at boot.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "one-release deprecation shim: read once at boot and persisted into \
+              backup_executor.max_concurrent; never read again at runtime"
+)]
+fn backup_executor_env_value() -> Option<String> {
+    std::env::var(BACKUP_EXECUTOR_MAX_CONCURRENT_ENV).ok()
+}
+
+/// What the deprecated variable means for the stored setting. Pure, so the
+/// shim's decision is testable without process environment.
+fn plan_backup_executor_env_migration(
+    env_value: Option<&str>,
+    stored: &temps_config::BackupExecutorSettings,
+) -> temps_config::EnvSettingMigration<u32> {
+    temps_config::decide_env_setting_migration(
+        env_value,
+        &stored.max_concurrent,
+        &temps_config::DEFAULT_BACKUP_EXECUTOR_MAX_CONCURRENT,
+        |raw| match raw.parse::<u32>() {
+            Ok(value)
+                if (1..=temps_config::MAX_BACKUP_EXECUTOR_MAX_CONCURRENT).contains(&value) =>
+            {
+                Ok(value)
+            }
+            _ => Err(format!(
+                "expected an integer between 1 and {}",
+                temps_config::MAX_BACKUP_EXECUTOR_MAX_CONCURRENT
+            )),
+        },
+    )
+}
+
+/// Resolve the backup executor settings, persisting a value from the
+/// deprecated `TEMPS_BACKUP_EXECUTOR_MAX_CONCURRENT` once when the setting has
+/// never been configured. A settings read or write failure never blocks
+/// startup: the defaults (or, if only the write failed, the environment
+/// value for this boot) apply and the failure is logged.
+async fn migrate_backup_executor_env(
+    config_service: &temps_config::ConfigService,
+    audit: &dyn temps_core::AuditLogger,
+) -> temps_config::BackupExecutorSettings {
+    let stored = match config_service.get_settings().await {
+        Ok(settings) => settings.backup_executor,
+        Err(e) => {
+            error!(
+                "Failed to read backup_executor settings; using the default concurrency of {}: {}",
+                temps_config::DEFAULT_BACKUP_EXECUTOR_MAX_CONCURRENT,
+                e
+            );
+            return temps_config::BackupExecutorSettings::default();
+        }
+    };
+
+    let env_value = backup_executor_env_value();
+    let ledger = config_service.env_migration_ledger_or_empty().await;
+    let plan = plan_backup_executor_env_migration(env_value.as_deref(), &stored)
+        .unless_handled(&ledger, BACKUP_EXECUTOR_MAX_CONCURRENT_ENV);
+    plan.log(
+        BACKUP_EXECUTOR_MAX_CONCURRENT_ENV,
+        BACKUP_EXECUTOR_MAX_CONCURRENT_SETTING,
+    );
+    if plan.is_settled_without_write() {
+        config_service
+            .mark_env_migrations_handled(&[BACKUP_EXECUTOR_MAX_CONCURRENT_ENV])
+            .await;
+    }
+    let Some(value) = plan.into_persist() else {
+        return stored;
+    };
+
+    match config_service
+        .update_backup_executor_settings(|settings| settings.max_concurrent = value)
+        .await
+    {
+        Ok(saved) => {
+            config_service
+                .mark_env_migrations_handled(&[BACKUP_EXECUTOR_MAX_CONCURRENT_ENV])
+                .await;
+            temps_config::record_env_setting_persisted(
+                Some(audit),
+                BACKUP_EXECUTOR_MAX_CONCURRENT_ENV,
+                BACKUP_EXECUTOR_MAX_CONCURRENT_SETTING,
+            )
+            .await;
+            saved
+        }
+        Err(e) => {
+            error!(
+                "Failed to persist {} into {}; honouring it for this boot only: {}",
+                BACKUP_EXECUTOR_MAX_CONCURRENT_ENV, BACKUP_EXECUTOR_MAX_CONCURRENT_SETTING, e
+            );
+            temps_config::BackupExecutorSettings {
+                max_concurrent: value,
+            }
+        }
+    }
+}
+
 impl TempsPlugin for BackupPlugin {
     fn name(&self) -> &'static str {
         "backup"
@@ -107,18 +208,34 @@ impl TempsPlugin for BackupPlugin {
             let external_service_manager =
                 context.require_service::<temps_providers::ExternalServiceManager>();
             let alarm_service =
-                context.require_service::<temps_monitoring::alarm_service::AlarmService>();
+                context.require_service::<temps_alarms::alarm_service::AlarmService>();
             let config_service = context.require_service::<temps_config::ConfigService>();
             let encryption_service = context.require_service::<temps_core::EncryptionService>();
+            // Shared workspace JobQueue. Producers (BackupService) publish
+            // Job::BackupRequested here; the BackupJobProcessor subscribes
+            // and dispatches to the executor. Required up front: a missing
+            // queue fails plugin registration at startup instead of
+            // panicking on the first backup trigger.
+            let job_queue = context.require_service::<dyn temps_core::JobQueue>();
+
+            let telemetry = context
+                .get_service::<dyn temps_core::telemetry::TelemetryReporter>()
+                .unwrap_or_else(|| {
+                    std::sync::Arc::new(temps_core::telemetry::NoopTelemetryReporter)
+                });
 
             // Create BackupService.
-            let backup_service = Arc::new(BackupService::new(
-                db.clone(),
-                external_service_manager.clone(),
-                alarm_service.clone(),
-                config_service.clone(),
-                encryption_service.clone(),
-            ));
+            let backup_service = Arc::new(
+                BackupService::new(
+                    db.clone(),
+                    external_service_manager.clone(),
+                    alarm_service.clone(),
+                    config_service.clone(),
+                    encryption_service.clone(),
+                    Arc::clone(&job_queue),
+                )
+                .with_telemetry(Arc::clone(&telemetry)),
+            );
             context.register_service(backup_service.clone());
             // The Cloud plugin creates and releases the managed destination's
             // nightly schedule through this seam (ADR-044).
@@ -128,11 +245,18 @@ impl TempsPlugin for BackupPlugin {
             ))
                 as Arc<dyn temps_core::ManagedBackupScheduleProvisioner>);
 
-            let telemetry = context
-                .get_service::<dyn temps_core::telemetry::TelemetryReporter>()
-                .unwrap_or_else(|| {
-                    std::sync::Arc::new(temps_core::telemetry::NoopTelemetryReporter)
-                });
+            // The workload plane, bound once `temps serve` starts it (the
+            // deployments plugin registers the slot). Backups and restores
+            // of databases on worker nodes run as jobs through it.
+            let plane_slot = context
+                .get_service::<temps_workload_plane::PlaneSlot>()
+                .unwrap_or_else(|| Arc::new(temps_workload_plane::PlaneSlot::new()));
+
+            // ADR-102: the one place a worker job's S3 credential is derived,
+            // registered by the providers plugin.
+            let worker_credentials = context
+                .require_service::<temps_providers::worker_s3_scope::WorkerCredentialScoper>(
+            );
 
             // Create RestoreService — orchestrates generic restore across all
             // engines via the ExternalService trait.
@@ -142,7 +266,9 @@ impl TempsPlugin for BackupPlugin {
                     external_service_manager.clone(),
                     encryption_service.clone(),
                 )
-                .with_telemetry(Arc::clone(&telemetry)),
+                .with_telemetry(Arc::clone(&telemetry))
+                .with_workload_plane(plane_slot.clone())
+                .with_worker_credentials(worker_credentials.clone()),
             );
             context.register_service(restore_service.clone());
 
@@ -155,7 +281,7 @@ impl TempsPlugin for BackupPlugin {
             // typed `DockerUnavailable` there instead of this registration
             // step panicking.
             let docker_handle = context.require_service::<temps_core::DockerHandle>();
-            let log_service = context.require_service::<temps_logs::LogService>();
+            let log_service = context.require_service::<temps_deployment_logs::LogService>();
             let backup_provider: Arc<dyn PreUpgradeBackupProvider> = backup_service.clone();
             let lifecycle: Arc<dyn PostgresContainerLifecycle> =
                 Arc::new(PostgresLifecycleAdapter::new(
@@ -173,20 +299,18 @@ impl TempsPlugin for BackupPlugin {
             ));
             context.register_service(pg_upgrade_service.clone());
 
-            // ── BackupExecutor: registers all 7 engines ──────────────────────
-            let executor_max_concurrent = std::env::var("TEMPS_BACKUP_EXECUTOR_MAX_CONCURRENT")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(4);
+            // ── BackupExecutor: registers every engine ───────────────────────
+            // Concurrency comes from the `backup_executor` setting; a value
+            // left in the deprecated environment variable is migrated into
+            // it once (see `migrate_backup_executor_env`).
+            let executor_max_concurrent =
+                migrate_backup_executor_env(&config_service, audit_service.as_ref())
+                    .await
+                    .effective_max_concurrent();
 
-            let executor_notifier: Arc<dyn temps_backup_core::BackupFailureNotifier> = Arc::new(
+            let executor_notifier: Arc<dyn crate::execution::BackupFailureNotifier> = Arc::new(
                 BackupNotificationAdapter::new(alarm_service.clone(), db.clone()),
             );
-
-            // Shared workspace JobQueue. Producers (BackupService) publish
-            // Job::BackupRequested here; the BackupJobProcessor subscribes
-            // and dispatches to the executor.
-            let job_queue = context.require_service::<dyn temps_core::JobQueue>();
 
             let mut executor_builder = BackupExecutorBuilder::new(db.clone())
                 .with_max_concurrent(executor_max_concurrent)
@@ -196,6 +320,75 @@ impl TempsPlugin for BackupPlugin {
                     db: db.clone(),
                     encryption_service: encryption_service.clone(),
                     config_service: config_service.clone(),
+                    // Without Docker the dump runs from this server's
+                    // PostgreSQL client instead (ADR-100).
+                    docker: docker_handle.cloned().map(|docker| docker.as_ref().clone()),
+                })))
+                // ADR-055 Phase 9: databases on worker nodes, backed up by a
+                // job on their node through the workload plane. Needs no
+                // local Docker; it is selected for every standalone
+                // PostgreSQL database on a worker (see
+                // `engines::workload_job`).
+                .register_engine(Arc::new(PostgresWorkloadJobEngine::new(
+                    PostgresWorkloadJobDeps {
+                        db: db.clone(),
+                        encryption_service: encryption_service.clone(),
+                        plane: plane_slot.clone(),
+                        worker_credentials: worker_credentials.clone(),
+                    },
+                )))
+                // Storage services on worker nodes, backed up by their
+                // node's agent. Needs no local
+                // Docker either (see `engines::worker_agent`).
+                .register_engine(Arc::new(WorkerAgentEngine::new(WorkerAgentDeps {
+                    db: db.clone(),
+                    encryption_service: encryption_service.clone(),
+                    manager: external_service_manager.clone(),
+                    worker_credentials: worker_credentials.clone(),
+                })))
+                // PostgreSQL WAL-G: here with this host's Docker, or on a
+                // worker through its agent (ADR-099). A server without
+                // Docker still backs up its workers' databases with it.
+                .register_engine(Arc::new(PostgresWalgEngine::new(PostgresWalgDeps {
+                    db: db.clone(),
+                    encryption_service: encryption_service.clone(),
+                    docker: docker_handle.cloned().map(|docker| docker.as_ref().clone()),
+                    manager: external_service_manager.clone(),
+                    worker_credentials: worker_credentials.clone(),
+                })))
+                // MongoDB: here with this host's Docker, or on a worker
+                // through its agent (ADR-099), like PostgreSQL WAL-G.
+                .register_engine(Arc::new(MongodbEngine::new(MongodbDeps {
+                    db: db.clone(),
+                    encryption_service: encryption_service.clone(),
+                    docker: docker_handle.cloned().map(|docker| docker.as_ref().clone()),
+                    manager: external_service_manager.clone(),
+                    worker_credentials: worker_credentials.clone(),
+                })))
+                // Redis: the same, here with this host's Docker or on a
+                // worker through its agent.
+                .register_engine(Arc::new(RedisEngine::new(RedisDeps {
+                    db: db.clone(),
+                    encryption_service: encryption_service.clone(),
+                    docker: docker_handle.cloned().map(|docker| docker.as_ref().clone()),
+                    manager: external_service_manager.clone(),
+                    worker_credentials: worker_credentials.clone(),
+                })))
+                // MariaDB physical (WAL-G) and dump: likewise here or on a
+                // worker through its agent (ADR-099).
+                .register_engine(Arc::new(MariadbPhysicalEngine::new(MariadbPhysicalDeps {
+                    db: db.clone(),
+                    encryption_service: encryption_service.clone(),
+                    docker: docker_handle.cloned().map(|docker| docker.as_ref().clone()),
+                    manager: external_service_manager.clone(),
+                    worker_credentials: worker_credentials.clone(),
+                })))
+                .register_engine(Arc::new(MariadbDumpEngine::new(MariadbDumpDeps {
+                    db: db.clone(),
+                    encryption_service: encryption_service.clone(),
+                    docker: docker_handle.cloned().map(|docker| docker.as_ref().clone()),
+                    manager: external_service_manager.clone(),
+                    worker_credentials: worker_credentials.clone(),
                 })));
 
             // Every other engine drives a local Docker container end to end
@@ -211,17 +404,7 @@ impl TempsPlugin for BackupPlugin {
             // rather than claiming the engine key is unknown.
             if let Some(docker) = docker_handle.cloned() {
                 executor_builder = executor_builder
-                    .register_engine(Arc::new(RedisEngine::new(RedisDeps {
-                        db: db.clone(),
-                        encryption_service: encryption_service.clone(),
-                        docker: docker.as_ref().clone(),
-                    })))
                     .register_engine(Arc::new(PostgresPgDumpEngine::new(PostgresPgDumpDeps {
-                        db: db.clone(),
-                        encryption_service: encryption_service.clone(),
-                        docker: docker.as_ref().clone(),
-                    })))
-                    .register_engine(Arc::new(PostgresWalgEngine::new(PostgresWalgDeps {
                         db: db.clone(),
                         encryption_service: encryption_service.clone(),
                         docker: docker.as_ref().clone(),
@@ -232,21 +415,6 @@ impl TempsPlugin for BackupPlugin {
                         encryption_service: encryption_service.clone(),
                         docker: docker.as_ref().clone(),
                     })))
-                    .register_engine(Arc::new(MongodbEngine::new(MongodbDeps {
-                        db: db.clone(),
-                        encryption_service: encryption_service.clone(),
-                        docker: docker.as_ref().clone(),
-                    })))
-                    .register_engine(Arc::new(MariadbPhysicalEngine::new(MariadbPhysicalDeps {
-                        db: db.clone(),
-                        encryption_service: encryption_service.clone(),
-                        docker: docker.as_ref().clone(),
-                    })))
-                    .register_engine(Arc::new(MariadbDumpEngine::new(MariadbDumpDeps {
-                        db: db.clone(),
-                        encryption_service: encryption_service.clone(),
-                        docker: docker.as_ref().clone(),
-                    })))
                     .register_engine(Arc::new(S3MirrorEngine::new(S3MirrorDeps {
                         db: db.clone(),
                         encryption_service: encryption_service.clone(),
@@ -254,35 +422,37 @@ impl TempsPlugin for BackupPlugin {
                     })));
 
                 info!(
-                    "BackupExecutor: registered 9 engines: control_plane, redis, \
-                     postgres_pgdump, postgres_walg, postgres_cluster, mongodb, \
-                     mariadb_physical, mariadb_dump, s3_mirror",
+                    "BackupExecutor: registered 11 engines: control_plane, \
+                     postgres_workload_job, worker_agent, postgres_walg, mongodb, redis, \
+                     mariadb_physical, mariadb_dump, postgres_pgdump, postgres_cluster, \
+                     s3_mirror",
                 );
             } else {
                 let reason = docker_engine_unavailable_reason(&docker_handle);
                 executor_builder = executor_builder
                     .with_unavailable_engines(DOCKER_BACKED_ENGINES, reason.clone());
 
+                // control_plane needs Docker or a local PostgreSQL client;
+                // say which this server has rather than that it needs
+                // neither.
+                let control_plane = crate::engines::control_plane::no_docker_summary().await;
                 warn!(
                     engines = %DOCKER_BACKED_ENGINES.join(", "),
-                    "BackupExecutor: registered only the control_plane engine — {}. Backups \
-                     requesting one of these engines fail immediately with that reason; \
-                     remote backup dispatch is not supported",
-                    reason,
+                    "BackupExecutor: no local Docker. {control_plane}. The worker engines \
+                     postgres_workload_job, worker_agent, postgres_walg, mongodb, redis, \
+                     mariadb_physical and mariadb_dump (for worker services) need no local \
+                     Docker. The other engines are unavailable — {reason}. Backups requesting \
+                     one of them fail immediately with that reason",
                 );
             }
 
             let executor = Arc::new(executor_builder.build());
 
-            // Wire the JobQueue into BackupService so trigger paths can
-            // publish Job::BackupRequested messages.
-            backup_service.set_queue(Arc::clone(&job_queue));
-
             // Spawn the consumer loop. It subscribes to the workspace
             // queue and dispatches every Job::BackupRequested to the
             // executor (which owns concurrency, cancel tokens, DB writes).
             {
-                let processor = temps_backup_core::BackupJobProcessor::new(Arc::clone(&executor));
+                let processor = crate::execution::BackupJobProcessor::new(Arc::clone(&executor));
                 let receiver = job_queue.subscribe();
                 tokio::spawn(async move {
                     if let Err(e) = processor.run(receiver).await {
@@ -389,26 +559,7 @@ impl TempsPlugin for BackupPlugin {
 
             // Anonymous backup_succeeded / backup_failed telemetry, derived from
             // the executor's lifecycle events so every run is covered.
-            if telemetry.is_enabled() {
-                let reporter = Arc::clone(&telemetry);
-                let mut receiver = job_queue.subscribe();
-                tokio::spawn(async move {
-                    let mut backup_telemetry = crate::telemetry::BackupTelemetry::new();
-                    loop {
-                        match receiver.recv().await {
-                            Ok(job) => {
-                                if let Some(event) = backup_telemetry.on_job(&job) {
-                                    reporter.report(event);
-                                }
-                            }
-                            Err(temps_core::QueueError::ChannelClosed) => break,
-                            // Lagged: some events were missed. Telemetry is
-                            // best-effort, so keep consuming.
-                            Err(_) => continue,
-                        }
-                    }
-                });
-            }
+            crate::telemetry::spawn_backup_telemetry(job_queue.as_ref(), Arc::clone(&telemetry));
 
             // Thread the telemetry reporter into the pg upgrade service so
             // orchestrators it spawns can emit PgMajorUpgradeCompleted.
@@ -466,12 +617,25 @@ impl TempsPlugin for BackupPlugin {
             // and are retried.
             match crate::services::active_restore_run_ids(db.as_ref()).await {
                 Ok(run_ids) if !run_ids.is_empty() => {
-                    let fence = crate::services::ManagerRestoreFence::new(
-                        context.require_service::<temps_providers::ExternalServiceManager>(),
+                    let manager =
+                        context.require_service::<temps_providers::ExternalServiceManager>();
+                    let fence = crate::services::ManagerRestoreFence::new(Arc::clone(&manager));
+                    // A worker restore keeps running on its node: it is
+                    // resumed from the node's outcome (or its job, through
+                    // the workload plane the deployments plugin binds once
+                    // `temps serve` starts it), not interrupted.
+                    let plane_slot = context
+                        .get_service::<temps_workload_plane::PlaneSlot>()
+                        .unwrap_or_else(|| Arc::new(temps_workload_plane::PlaneSlot::new()));
+                    let workers = crate::services::ManagerWorkerRestoreResume::new(
+                        db.clone(),
+                        Arc::clone(&encryption_service),
+                        manager,
+                        plane_slot,
                     );
                     let restore_db = db.clone();
                     tokio::spawn(async move {
-                        reconcile_restores_with_retry(restore_db, run_ids, fence).await;
+                        reconcile_restores_with_retry(restore_db, run_ids, fence, workers).await;
                     });
                 }
                 Ok(_) => {}
@@ -731,10 +895,25 @@ async fn reconcile_restores_with_retry(
     db: Arc<sea_orm::DatabaseConnection>,
     mut run_ids: Vec<i32>,
     fence: crate::services::ManagerRestoreFence,
+    workers: crate::services::ManagerWorkerRestoreResume,
 ) {
     for attempt in 1..=RESTORE_RECONCILE_MAX_ATTEMPTS {
-        match crate::services::reconcile_interrupted_restores(db.as_ref(), &run_ids, &fence).await {
+        match crate::services::reconcile_interrupted_restores(
+            db.as_ref(),
+            &run_ids,
+            &fence,
+            &workers,
+        )
+        .await
+        {
             Ok(report) => {
+                if !report.resumed.is_empty() {
+                    info!(
+                        resumed = ?report.resumed,
+                        "Worker restore runs left active by a restart are resumed from their \
+                         nodes' outcomes",
+                    );
+                }
                 if !report.interrupted.is_empty() {
                     info!(
                         interrupted = ?report.interrupted,
@@ -835,6 +1014,41 @@ fn report_lifecycle_reconcile_failure(
 
 #[cfg(test)]
 mod tests {
+    use temps_config::EnvSettingMigration;
+
+    #[test]
+    fn backup_executor_env_is_persisted_when_the_setting_is_unset() {
+        let stored = temps_config::BackupExecutorSettings::default();
+        assert_eq!(
+            super::plan_backup_executor_env_migration(Some("8"), &stored),
+            EnvSettingMigration::Persist(8)
+        );
+    }
+
+    #[test]
+    fn backup_executor_env_is_ignored_when_the_setting_is_set() {
+        let stored = temps_config::BackupExecutorSettings { max_concurrent: 2 };
+        assert_eq!(
+            super::plan_backup_executor_env_migration(Some("8"), &stored),
+            EnvSettingMigration::SettingAlreadySet
+        );
+        assert_eq!(
+            super::plan_backup_executor_env_migration(None, &stored),
+            EnvSettingMigration::EnvUnset
+        );
+    }
+
+    #[test]
+    fn backup_executor_env_rejects_zero_and_garbage() {
+        let stored = temps_config::BackupExecutorSettings::default();
+        for raw in ["0", "-1", "lots", "65"] {
+            assert!(matches!(
+                super::plan_backup_executor_env_migration(Some(raw), &stored),
+                EnvSettingMigration::Invalid { .. }
+            ));
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -884,6 +1098,29 @@ mod tests {
             !DOCKER_BACKED_ENGINES.contains(&crate::engines::control_plane::ENGINE_KEY),
             "the control-plane engine runs without a daemon and must stay available",
         );
+        // Registered without a daemon too: a worker's PostgreSQL is backed up
+        // with it through its agent (ADR-099).
+        assert!(
+            !DOCKER_BACKED_ENGINES.contains(&crate::engines::postgres_walg::ENGINE_KEY),
+            "the WAL-G engine backs up worker services without a local daemon",
+        );
+        assert!(
+            !DOCKER_BACKED_ENGINES.contains(&crate::engines::mongodb::ENGINE_KEY),
+            "the MongoDB engine backs up worker services without a local daemon",
+        );
+        assert!(
+            !DOCKER_BACKED_ENGINES.contains(&crate::engines::redis::ENGINE_KEY),
+            "the Redis engine backs up worker services without a local daemon",
+        );
+        for engine in [
+            crate::engines::mariadb_physical::ENGINE_KEY,
+            crate::engines::mariadb_dump::ENGINE_KEY,
+        ] {
+            assert!(
+                !DOCKER_BACKED_ENGINES.contains(&engine),
+                "{engine} backs up worker MariaDB services without a local daemon",
+            );
+        }
         assert_eq!(
             DOCKER_BACKED_ENGINES.len(),
             DOCKER_BACKED_ENGINES

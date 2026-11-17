@@ -4,7 +4,6 @@
 import { ProjectResponse } from '@/api/client'
 import {
   AlarmClock,
-  Bot,
   Boxes,
   ChevronRight,
   Flag,
@@ -12,12 +11,11 @@ import {
   Globe,
   HardDrive,
   KeyRound,
-  Server,
+  ListFilter,
   Settings2,
   Shield,
   SlidersHorizontal,
   Users,
-  Wand2,
   Webhook,
   type LucideIcon,
 } from 'lucide-react'
@@ -90,6 +88,13 @@ const settingsGroups: SettingsGroup[] = [
         icon: Shield,
       },
       {
+        title: 'Edge rules',
+        description:
+          'Block, allow, challenge or redirect requests before they reach your app.',
+        url: 'settings/edge-rules',
+        icon: ListFilter,
+      },
+      {
         title: 'Access',
         description: 'Control who can view and change this service.',
         url: 'settings/access',
@@ -146,7 +151,7 @@ const settingsGroups: SettingsGroup[] = [
     items: [
       {
         title: 'Cron jobs',
-        description: 'Run commands on a schedule.',
+        description: 'Call endpoints of your app on a schedule.',
         url: 'settings/cron-jobs',
         icon: AlarmClock,
       },
@@ -155,24 +160,6 @@ const settingsGroups: SettingsGroup[] = [
         description: 'Notify external systems about service events.',
         url: 'settings/webhooks',
         icon: Webhook,
-      },
-      {
-        title: 'AI workflows',
-        description: 'Automate service work with agents.',
-        url: 'agents',
-        icon: Bot,
-      },
-      {
-        title: 'Skills',
-        description: 'Give service agents reusable capabilities.',
-        url: 'settings/skills',
-        icon: Wand2,
-      },
-      {
-        title: 'MCP servers',
-        description: 'Connect service agents to external tools.',
-        url: 'settings/mcp-servers',
-        icon: Server,
       },
     ],
   },

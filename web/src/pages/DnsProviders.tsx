@@ -26,6 +26,7 @@ import { AdminOnlyNote } from '@/components/ui/admin-only-note'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { useCurrentUserRole } from '@/hooks/useCurrentUserRole'
 import { useIsInstanceAdmin } from '@/hooks/useIsInstanceAdmin'
+import { PageHeader } from '@/components/layout/PageContainer'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import {
   DNS_PROVIDERS_QUERY_KEY,
@@ -156,10 +157,10 @@ export function DnsProviders() {
   })
 
   useEffect(() => {
-    setBreadcrumbs([{ label: 'DNS Providers' }])
+    setBreadcrumbs([{ label: 'DNS providers' }])
   }, [setBreadcrumbs])
 
-  usePageTitle('DNS Providers')
+  usePageTitle('DNS providers')
 
   const handleDeleteProvider = () => {
     // The role can change under a cached list; never fire a refused write.
@@ -174,40 +175,38 @@ export function DnsProviders() {
   return (
     <div className="flex-1 overflow-auto">
       <div className="space-y-6 p-4 sm:p-6">
-        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-          <div className="min-w-0">
-            <h1 className="text-xl font-bold sm:text-2xl">DNS Providers</h1>
-            <p className="text-sm text-muted-foreground sm:text-base">
-              Manage your DNS providers for automatic DNS record configuration
-            </p>
-          </div>
-          <div className="flex flex-wrap items-center gap-2 self-start sm:self-auto">
-            <Button
-              variant="outline"
-              onClick={() => navigate('/delivery-profiles')}
-            >
-              Delivery profiles
-            </Button>
-            <Button
-              variant="outline"
-              size="icon"
-              onClick={() => refetch()}
-              aria-label="Refresh"
-              title="Refresh"
-            >
-              <RefreshCw className="h-4 w-4" />
-            </Button>
-            {!isLoading &&
-              canManageProviders &&
-              Boolean(dnsProviders?.length) && (
-                <CreateActionButton
-                  size="sm"
-                  onClick={() => navigate('/dns-providers/add')}
-                  label="Add DNS Provider"
-                />
-              )}
-          </div>
-        </div>
+        <PageHeader
+          title="DNS providers"
+          description="Manage your DNS providers for automatic DNS record configuration"
+          actions={
+            <>
+              <Button
+                variant="outline"
+                onClick={() => navigate('/delivery-profiles')}
+              >
+                Delivery profiles
+              </Button>
+              <Button
+                variant="outline"
+                size="icon"
+                onClick={() => refetch()}
+                aria-label="Refresh"
+                title="Refresh"
+              >
+                <RefreshCw className="h-4 w-4" />
+              </Button>
+              {!isLoading &&
+                canManageProviders &&
+                Boolean(dnsProviders?.length) && (
+                  <CreateActionButton
+                    size="sm"
+                    onClick={() => navigate('/dns-providers/add')}
+                    label="Add DNS provider"
+                  />
+                )}
+            </>
+          }
+        />
 
         {!canManageProviders && (
           <AdminOnlyNote
@@ -248,7 +247,7 @@ export function DnsProviders() {
               canManageProviders ? (
                 <Button onClick={() => navigate('/dns-providers/add')}>
                   <Plus className="mr-2 h-4 w-4" />
-                  Add DNS Provider
+                  Add DNS provider
                 </Button>
               ) : undefined
             }
@@ -351,7 +350,7 @@ export function DnsProviders() {
                             navigate(`/dns-providers/${provider.id}`)
                           }
                         >
-                          View Details
+                          View details
                         </DropdownMenuItem>
                         {canManageProviders && (
                           <>
@@ -359,7 +358,7 @@ export function DnsProviders() {
                               onClick={() => handleTestConnection(provider)}
                             >
                               <TestTube2 className="h-4 w-4 mr-2" />
-                              Test Connection
+                              Test connection
                             </DropdownMenuItem>
                             <DropdownMenuSeparator />
                             <DropdownMenuItem
@@ -370,7 +369,7 @@ export function DnsProviders() {
                               }}
                             >
                               <Trash2 className="h-4 w-4 mr-2" />
-                              Delete Provider
+                              Delete provider
                             </DropdownMenuItem>
                           </>
                         )}
@@ -398,7 +397,7 @@ export function DnsProviders() {
         }}
         resourceType="DNS provider"
         resourceName={providerToDelete?.name ?? ''}
-        confirmLabel="Delete Provider"
+        confirmLabel="Delete provider"
         consequences="All managed domains associated with this provider are removed, and DNS records for them will no longer be automatically managed."
         isPending={deleteProviderMut.isPending}
         onConfirm={handleDeleteProvider}

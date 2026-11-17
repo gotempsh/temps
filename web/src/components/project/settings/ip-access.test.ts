@@ -15,6 +15,7 @@ import {
   probeDraft,
   probeScope,
   showsEntries,
+  entriesToSave,
   policySummary,
   withPresets,
 } from './ip-access'
@@ -240,7 +241,40 @@ describe('scope modes', () => {
       ipAccessFormSchema.safeParse({ mode: 'inherit', cidrs: [] }).success
     ).toBe(true)
     expect(showsEntries('inherit')).toBe(false)
-    expect(showsEntries('disabled')).toBe(true)
+  })
+
+  test('only a list mode shows the entries; Off lets everyone through', () => {
+    expect(showsEntries('allow')).toBe(true)
+    expect(showsEntries('deny')).toBe(true)
+    expect(showsEntries('disabled')).toBe(false)
+  })
+
+  test('Off does not validate the hidden entries', () => {
+    expect(
+      ipAccessFormSchema.safeParse({
+        mode: 'disabled',
+        cidrs: [{ cidr: '' }, { cidr: '10.0.0.999' }],
+      }).success
+    ).toBe(true)
+  })
+})
+
+describe('entriesToSave', () => {
+  const draft = [
+    { cidr: '10.0.0.0/8', description: 'office' },
+    { cidr: '' },
+    { cidr: '10.0.0.999' },
+    { cidr: '10.0.0.0/8 ' },
+  ]
+
+  test('a list mode sends the entries as edited', () => {
+    expect(entriesToSave('allow', draft)).toEqual(draft)
+  })
+
+  test('Off keeps the valid list and drops blank, broken or repeated drafts', () => {
+    expect(entriesToSave('disabled', draft)).toEqual([
+      { cidr: '10.0.0.0/8', description: 'office' },
+    ])
   })
 })
 

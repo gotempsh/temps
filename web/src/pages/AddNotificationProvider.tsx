@@ -124,13 +124,13 @@ export function AddNotificationProvider() {
     headingRef.current?.focus()
   }, [currentStep])
 
-  usePageTitle('Add Notification Provider')
+  usePageTitle('Add notification provider')
 
   useEffect(() => {
     setBreadcrumbs([
       { label: 'Settings', href: '/settings' },
-      { label: 'Notification Providers', href: '/settings/notifications' },
-      { label: 'Add Provider' },
+      { label: 'Notification providers', href: '/settings/notifications' },
+      { label: 'Add provider' },
     ])
   }, [setBreadcrumbs])
 

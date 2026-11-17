@@ -52,7 +52,7 @@ function box(view: ReturnType<typeof render>, label: RegExp) {
 
 test('SMTP port stays empty after being changed and then cleared', () => {
   const view = render(<Harness type="email" />)
-  const port = box(view, /SMTP Port/i)
+  const port = box(view, /SMTP port/i)
   expect(port.value).toBe('587')
   fireEvent.change(port, { target: { value: '25' } })
   expect(port.value).toBe('25')
@@ -65,9 +65,9 @@ test('SMTP port stays empty after being changed and then cleared', () => {
 
 test('an emptied SMTP port fails validation rather than submitting the old default', async () => {
   const view = render(<Harness type="email" />)
-  fireEvent.change(box(view, /SMTP Port/i), { target: { value: '25' } })
-  fireEvent.change(box(view, /SMTP Port/i), { target: { value: '' } })
-  expect(box(view, /SMTP Port/i).value).toBe('')
+  fireEvent.change(box(view, /SMTP port/i), { target: { value: '25' } })
+  fireEvent.change(box(view, /SMTP port/i), { target: { value: '' } })
+  expect(box(view, /SMTP port/i).value).toBe('')
   let valid = true
   await act(async () => {
     valid = (await form?.trigger()) ?? true

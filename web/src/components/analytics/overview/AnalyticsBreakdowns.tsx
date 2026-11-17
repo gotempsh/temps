@@ -26,11 +26,11 @@ export function AnalyticsBreakdowns(
     <Tabs defaultValue="traffic" className="min-w-0">
       <ScrollableTabsList aria-label="Analytics breakdowns">
         {Object.keys(props).map((key) => (
-          <TabsTrigger key={key} value={key}>
-            {(() => {
-              const Icon = icons[key as keyof typeof icons]
-              return <Icon className="mr-1.5 h-4 w-4" aria-hidden="true" />
-            })()}
+          <TabsTrigger
+            key={key}
+            value={key}
+            icon={icons[key as keyof typeof icons]}
+          >
             {key[0].toUpperCase() + key.slice(1)}
           </TabsTrigger>
         ))}

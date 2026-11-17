@@ -5,14 +5,15 @@
 //!
 //! This implementation fetches files directly from GitHub API on-demand
 
-use anyhow::Result;
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use http_body_util::BodyExt;
 use octocrab::Octocrab;
 use std::sync::Arc;
-use temps_presets::source::ProjectSource;
+use temps_presets::source::{ProjectSource, ProjectSourceError, ProjectSourceResult};
 use tracing::debug;
+
+const LIST_FILES: &str = "list the repository tree";
 
 /// GitHub-backed ProjectSource
 ///
@@ -38,6 +39,66 @@ impl GitHubSource {
             owner,
             repo,
             reference,
+        }
+    }
+
+    fn location(&self) -> String {
+        format!(
+            "GitHub repository {}/{} at '{}'",
+            self.owner, self.repo, self.reference
+        )
+    }
+
+    /// Classify an answer GitHub refused. GitHub reports a primary rate limit
+    /// as a 403, so only the message tells it apart from missing access.
+    fn status_error(
+        &self,
+        operation: String,
+        path: Option<&str>,
+        status: u16,
+        message: &str,
+    ) -> ProjectSourceError {
+        if status == 403 && message.to_ascii_lowercase().contains("rate limit") {
+            return ProjectSourceError::RateLimited {
+                location: self.location(),
+                operation,
+                status,
+            };
+        }
+        ProjectSourceError::from_status(self.location(), operation, path, status)
+    }
+
+    fn invalid_content(
+        &self,
+        path: &str,
+        problem: &str,
+        error: impl std::fmt::Display,
+    ) -> ProjectSourceError {
+        ProjectSourceError::InvalidContent {
+            location: self.location(),
+            path: path.to_string(),
+            reason: format!("{problem}: {error}"),
+        }
+    }
+
+    fn api_error(
+        &self,
+        operation: String,
+        path: Option<&str>,
+        error: octocrab::Error,
+    ) -> ProjectSourceError {
+        match &error {
+            octocrab::Error::GitHub { source, .. } => self.status_error(
+                operation,
+                path,
+                source.status_code.as_u16(),
+                &source.message,
+            ),
+            _ => ProjectSourceError::Transport {
+                location: self.location(),
+                operation,
+                reason: error.to_string(),
+            },
         }
     }
 }
@@ -95,7 +156,7 @@ impl ProjectSource for GitHubSource {
         }
     }
 
-    async fn read_file(&self, path: &str) -> Result<String> {
+    async fn read_file(&self, path: &str) -> ProjectSourceResult<String> {
         debug!(
             "Reading file: {}/{}/{} @ {}",
             self.owner, self.repo, path, self.reference
@@ -109,30 +170,36 @@ impl ProjectSource for GitHubSource {
             .r#ref(&self.reference)
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to fetch file from GitHub: {}", e))?;
+            .map_err(|e| self.api_error(format!("fetch '{path}'"), Some(path), e))?;
 
         // Get the first item (file content)
         let file = content
             .items
             .first()
-            .ok_or_else(|| anyhow::anyhow!("File not found: {}", path))?;
+            .ok_or_else(|| ProjectSourceError::NotFound {
+                location: self.location(),
+                path: path.to_string(),
+            })?;
 
         // Decode base64 content
         if let Some(encoded_content) = &file.content {
             let decoded = STANDARD
                 .decode(encoded_content.replace('\n', ""))
-                .map_err(|e| anyhow::anyhow!("Failed to decode base64 content: {}", e))?;
+                .map_err(|e| self.invalid_content(path, "not valid base64", e))?;
 
             let content_str = String::from_utf8(decoded)
-                .map_err(|e| anyhow::anyhow!("File content is not valid UTF-8: {}", e))?;
+                .map_err(|e| self.invalid_content(path, "not valid UTF-8", e))?;
 
             Ok(content_str.replace("\r\n", "\n"))
         } else {
-            Err(anyhow::anyhow!("File has no content: {}", path))
+            Err(ProjectSourceError::MissingContent {
+                location: self.location(),
+                path: path.to_string(),
+            })
         }
     }
 
-    async fn list_files(&self) -> Result<Vec<String>> {
+    async fn list_files(&self) -> ProjectSourceResult<Vec<String>> {
         debug!(
             "Listing all files: {}/{} @ {}",
             self.owner, self.repo, self.reference
@@ -164,18 +231,36 @@ impl ProjectSource for GitHubSource {
             .client
             ._get(&url)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to fetch tree from GitHub: {}", e))?;
+            .map_err(|e| self.api_error(LIST_FILES.to_string(), None, e))?;
+        let status = response.status();
 
         // Read response body and parse JSON
         let body = response
             .into_body()
             .collect()
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to read response body: {}", e))?
+            .map_err(|e| ProjectSourceError::Transport {
+                location: self.location(),
+                operation: LIST_FILES.to_string(),
+                reason: e.to_string(),
+            })?
             .to_bytes();
 
-        let tree_response: TreeResponse = serde_json::from_slice(&body)
-            .map_err(|e| anyhow::anyhow!("Failed to parse tree response: {}", e))?;
+        if !status.is_success() {
+            return Err(self.status_error(
+                LIST_FILES.to_string(),
+                None,
+                status.as_u16(),
+                &String::from_utf8_lossy(&body),
+            ));
+        }
+
+        let tree_response: TreeResponse =
+            serde_json::from_slice(&body).map_err(|e| ProjectSourceError::InvalidResponse {
+                location: self.location(),
+                operation: LIST_FILES.to_string(),
+                reason: e.to_string(),
+            })?;
 
         // Filter only files (blobs)
         let files: Vec<String> = tree_response
@@ -189,7 +274,7 @@ impl ProjectSource for GitHubSource {
         Ok(files)
     }
 
-    async fn find_files(&self, pattern: &str) -> Result<Vec<String>> {
+    async fn find_files(&self, pattern: &str) -> ProjectSourceResult<Vec<String>> {
         debug!(
             "Finding files matching pattern '{}': {}/{} @ {}",
             pattern, self.owner, self.repo, self.reference
@@ -199,7 +284,8 @@ impl ProjectSource for GitHubSource {
 
         // Convert glob pattern to regex
         let regex_pattern = glob_to_regex(pattern);
-        let re = regex::Regex::new(&regex_pattern)?;
+        let re = regex::Regex::new(&regex_pattern)
+            .map_err(|e| ProjectSourceError::invalid_pattern(pattern, e))?;
 
         let matched_files: Vec<String> = all_files.into_iter().filter(|f| re.is_match(f)).collect();
 
@@ -251,6 +337,70 @@ fn glob_to_regex(pattern: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn source_over(url: &str) -> GitHubSource {
+        let client = Octocrab::builder()
+            .base_uri(url)
+            .expect("the mock server URL is valid")
+            .build()
+            .expect("the client builds");
+        GitHubSource::new(
+            Arc::new(client),
+            "owner".to_string(),
+            "repo".to_string(),
+            "main".to_string(),
+        )
+    }
+
+    async fn read_error(status: usize, body: &str) -> ProjectSourceError {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex("/repos/owner/repo/contents/.*".to_string()),
+            )
+            .with_status(status)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create_async()
+            .await;
+        source_over(&server.url())
+            .read_file("app.json")
+            .await
+            .expect_err("the provider refused the request")
+    }
+
+    #[tokio::test]
+    async fn read_file_tells_not_found_from_auth_and_rate_limits() {
+        let missing = read_error(404, r#"{"message":"Not Found"}"#).await;
+        assert!(
+            matches!(&missing, ProjectSourceError::NotFound { path, .. } if path == "app.json"),
+            "{missing:?}"
+        );
+        assert!(!missing.is_retryable());
+
+        let refused = read_error(401, r#"{"message":"Bad credentials"}"#).await;
+        assert!(
+            matches!(refused, ProjectSourceError::AuthFailed { status: 401, .. }),
+            "{refused:?}"
+        );
+
+        let limited = read_error(403, r#"{"message":"API rate limit exceeded"}"#).await;
+        assert!(
+            matches!(limited, ProjectSourceError::RateLimited { status: 403, .. }),
+            "{limited:?}"
+        );
+        assert!(limited.is_retryable());
+
+        let forbidden = read_error(403, r#"{"message":"Resource not accessible"}"#).await;
+        assert!(
+            matches!(
+                forbidden,
+                ProjectSourceError::AuthFailed { status: 403, .. }
+            ),
+            "{forbidden:?}"
+        );
+    }
 
     #[test]
     fn test_glob_to_regex() {

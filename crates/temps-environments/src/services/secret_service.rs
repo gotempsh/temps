@@ -1266,8 +1266,8 @@ mod integration_tests {
     use super::*;
     use chrono::Utc;
     use std::time::Duration;
-    use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
     use temps_entities::{preset::Preset, projects, upstream_config::UpstreamList};
+    use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 
     const ENCRYPTION_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 

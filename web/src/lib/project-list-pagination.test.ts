@@ -7,6 +7,7 @@ import {
   DEFAULT_PROJECT_PAGE_SIZE,
   projectPageCount,
   readProjectPagination,
+  showsProjectPagination,
   withProjectPagination,
   withProjectSearch,
 } from './project-list-pagination'
@@ -60,5 +61,20 @@ describe('project search view', () => {
     )
     expect(next.has('q')).toBe(false)
     expect(readProjectPagination(next)).toEqual({ page: 1, pageSize: 36 })
+  })
+})
+
+describe('showsProjectPagination', () => {
+  test('a list that fits on one page at the smallest size has no controls', () => {
+    expect(showsProjectPagination(1, 1)).toBe(false)
+    expect(showsProjectPagination(9, 1)).toBe(false)
+  })
+
+  test('a list longer than the smallest page size keeps them', () => {
+    expect(showsProjectPagination(10, 1)).toBe(true)
+  })
+
+  test('a later page always keeps them, so the reader can get back', () => {
+    expect(showsProjectPagination(3, 2)).toBe(true)
   })
 })

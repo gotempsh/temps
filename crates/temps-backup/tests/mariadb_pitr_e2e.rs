@@ -30,6 +30,15 @@
 //!
 //! Gated behind the `docker-tests` feature (mirrors `temps-providers`).
 #![cfg(feature = "docker-tests")]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "integration test: reads fixture configuration from the environment"
+)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration test: a failed setup step should abort the test with its message"
+)]
 
 use std::collections::HashMap;
 use std::sync::{Arc, Once};
@@ -39,7 +48,7 @@ use aws_sdk_s3::config::Region;
 use bollard::Docker;
 use sea_orm::{ActiveModelTrait, IntoActiveModel, Set};
 use sqlx::mysql::MySqlPoolOptions;
-use temps_backup_core::engine_v2::{BackupContext, BackupEngine};
+use temps_backup::execution::engine_v2::{BackupContext, BackupEngine};
 use temps_core::EncryptionService;
 use temps_providers::externalsvc::{
     ExternalService, MariaDbService, RecoveryTarget, RestoreContext, S3Credentials, ServiceConfig,
@@ -117,6 +126,31 @@ impl Drop for ContainerGuard {
             }
         }));
     }
+}
+
+/// The service manager the engines reach a worker's node through. These
+/// services run on this host, so it is never asked to; it only completes
+/// the engines' dependencies, as the plugin does.
+/// The per-job S3 credential deriver the engines are built with: the
+/// production one, with no Cloud minter. These services run on this host,
+/// so no worker credential is ever derived from it.
+fn worker_credentials(
+    encryption: &Arc<EncryptionService>,
+) -> Arc<temps_providers::worker_s3_scope::WorkerCredentialScoper> {
+    Arc::new(temps_providers::worker_s3_scope::WorkerCredentialScoper::new(Arc::clone(encryption)))
+}
+
+fn service_manager(
+    db: &Arc<temps_database::DbConnection>,
+    encryption: &Arc<EncryptionService>,
+    docker: &Docker,
+) -> Arc<temps_providers::ExternalServiceManager> {
+    Arc::new(temps_providers::ExternalServiceManager::new(
+        Arc::clone(db),
+        Arc::clone(encryption),
+        Arc::new(docker.clone()),
+        Arc::new(temps_providers::DnsRegistry::new(Arc::clone(db))),
+    ))
 }
 
 /// Connect to the local Docker daemon. Returns `None` (skip) when unreachable.
@@ -578,7 +612,7 @@ async fn mariadb_pitr_full_chain_e2e_inner() {
         return;
     }
 
-    let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+    let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
         Ok(db) => db,
         Err(e) => {
             eprintln!("Test database unavailable, skipping: {e}");
@@ -736,7 +770,9 @@ async fn run_pitr_flow(
         temps_backup::engines::mariadb_physical::MariadbPhysicalDeps {
             db: Arc::clone(&pool_arc),
             encryption_service: Arc::clone(&encryption),
-            docker: docker.clone(),
+            docker: Some(docker.clone()),
+            manager: service_manager(&pool_arc, &encryption, docker),
+            worker_credentials: worker_credentials(&encryption),
         },
     );
     let ctx = BackupContext {
@@ -1005,7 +1041,7 @@ async fn run_pitr_flow(
 /// `TestDatabase` tears down its schema).
 struct E2eEnv {
     docker: Docker,
-    _test_db: temps_database::test_utils::TestDatabase,
+    _test_db: temps_test_utils::TestDatabase,
     pool: Arc<temps_database::DbConnection>,
     s3_port: u16,
     _s3_guard: ContainerGuard,
@@ -1038,7 +1074,7 @@ async fn setup_e2e_env(name_prefix: &str, use_walg_image: bool) -> Option<E2eEnv
         }
     }
 
-    let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+    let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
         Ok(db) => db,
         Err(e) => {
             eprintln!("Test database unavailable, skipping: {e}");
@@ -1365,7 +1401,9 @@ async fn run_binlog_retention_flow(env: &E2eEnv) -> anyhow::Result<()> {
         temps_backup::engines::mariadb_physical::MariadbPhysicalDeps {
             db: Arc::clone(&env.pool),
             encryption_service: Arc::clone(&encryption),
-            docker: env.docker.clone(),
+            docker: Some(env.docker.clone()),
+            manager: service_manager(&env.pool, &encryption, &env.docker),
+            worker_credentials: worker_credentials(&encryption),
         },
     );
 
@@ -1765,7 +1803,9 @@ async fn run_logical_dump_restore_flow(env: &E2eEnv) -> anyhow::Result<()> {
         temps_backup::engines::mariadb_dump::MariadbDumpDeps {
             db: Arc::clone(&env.pool),
             encryption_service: Arc::clone(&encryption),
-            docker: env.docker.clone(),
+            docker: Some(env.docker.clone()),
+            manager: service_manager(&env.pool, &encryption, &env.docker),
+            worker_credentials: worker_credentials(&encryption),
         },
     );
     let (dump_location, backup_model) = run_engine_backup(

@@ -43,6 +43,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use super::access::{AccessApp, AccessPolicyAnswer};
+use super::edge_rules::{same_rule, EdgeRuleError, EdgeRulePurpose, EdgeRuleSeen, HttpPolicy};
 use super::model::{
     AccessBinding, AddressAudience, AddressReachability, Audience, Decision, DnsRecordState,
     Intent, JournalEntry, JournalState, LookupAuthority, PlanOptionKind, PlanStep, PlannedRecord,
@@ -303,7 +304,14 @@ pub trait RunOps: Send + Sync {
     async fn detach_domain(&self, id: i32) -> Result<(), String>;
     /// See `IngressConnectorService::hostname_choice`.
     async fn hostname_choice(&self, host: &str) -> Result<Option<Option<i32>>, String>;
-    async fn route_hostname(&self, host: &str, connector_id: i32) -> Result<(), String>;
+    /// Chooses the tunnel for `host` only while its choice is still
+    /// `expected`, the one the run read: a choice made meanwhile is kept.
+    async fn route_hostname(
+        &self,
+        host: &str,
+        connector_id: i32,
+        expected: Option<Option<i32>>,
+    ) -> Result<(), String>;
     /// Puts a hostname's choice back as it was before the run.
     async fn restore_hostname_choice(
         &self,
@@ -349,6 +357,12 @@ pub trait RunOps: Send + Sync {
         host: &str,
         audience: &AddressAudience,
     ) -> Result<(), String>;
+    /// The HTTPS-only choice `host` keeps (ADR 070 D1); `None` when it is
+    /// not attached to this run's environment, `Some(None)` when no choice
+    /// was ever recorded.
+    async fn http_policy(&self, host: &str) -> Result<Option<Option<HttpPolicy>>, String>;
+    /// Records the HTTPS-only choice of `host`; `None` forgets it.
+    async fn set_http_policy(&self, host: &str, policy: Option<HttpPolicy>) -> Result<(), String>;
     /// Access application `id` in `provider_id`'s account (ADR 065 D9);
     /// `None` when it no longer exists.
     async fn access_app(&self, provider_id: i32, id: &str) -> Result<Option<AccessApp>, String>;
@@ -431,7 +445,66 @@ pub trait RunOps: Send + Sync {
     async fn environment_hosts(&self, connector_id: i32) -> Result<bool, String>;
     /// Turns it on or off; off withdraws every host it generated.
     async fn set_environment_hosts(&self, connector_id: i32, on: bool) -> Result<(), String>;
+    /// Add `purpose`'s Cloudflare rule for `host` (ADR 070), with the token
+    /// of `connector_id`'s DNS provider (else the one managing the zone), or
+    /// find one doing the same already.
+    async fn create_edge_rule(
+        &self,
+        run_id: i32,
+        connector_id: Option<i32>,
+        host: &str,
+        purpose: EdgeRulePurpose,
+    ) -> Result<EdgeRuleMade, EdgeRuleError>;
+    /// The rule run `run_id` added for `host`, found by its reference.
+    async fn find_edge_rule(
+        &self,
+        run_id: i32,
+        connector_id: Option<i32>,
+        host: &str,
+        purpose: EdgeRulePurpose,
+    ) -> Result<Option<RunResource>, String>;
+    /// The rule `rule` names as Cloudflare has it now; `None` when gone.
+    async fn edge_rule(&self, rule: &EdgeRuleAt) -> Result<Option<EdgeRuleSeen>, String>;
+    async fn delete_edge_rule(&self, rule: &EdgeRuleAt) -> Result<(), String>;
     async fn sleep(&self, duration: Duration);
+}
+
+/// Where a rule a run added lives at Cloudflare (ADR 070).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EdgeRuleAt {
+    pub provider_id: i32,
+    pub zone_id: String,
+    pub ruleset_id: String,
+    pub rule_id: String,
+}
+
+impl EdgeRuleAt {
+    pub fn of(resource: &RunResource) -> Option<Self> {
+        match resource {
+            RunResource::EdgeRule {
+                provider_id,
+                zone_id,
+                ruleset_id,
+                rule_id,
+                ..
+            } => Some(Self {
+                provider_id: *provider_id,
+                zone_id: zone_id.clone(),
+                ruleset_id: ruleset_id.clone(),
+                rule_id: rule_id.clone(),
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// What adding a rule did (ADR 070 D1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EdgeRuleMade {
+    /// Added: a [`RunResource::EdgeRule`].
+    Created(Box<RunResource>),
+    /// A rule doing the same was there already; used as found.
+    AlreadyThere(String),
 }
 
 /// A write that failed.
@@ -556,6 +629,12 @@ pub struct RunInput {
     /// The user confirmed changing the hostname's tunnel choice.
     #[serde(default)]
     pub route_confirmed: bool,
+    /// The hostname's tunnel choice as the plan saw it, which apply checked
+    /// was still current: the choice `route_confirmed` agreed to change. A
+    /// different one found when routing was made after apply and is kept.
+    /// `None` for a run stored before this was recorded.
+    #[serde(default)]
+    pub planned_choice: Option<PreviousChoice>,
     /// In memory for the run only; never stored.
     #[serde(skip)]
     pub token: Option<String>,
@@ -583,6 +662,10 @@ pub struct RunInput {
     /// For a Tailscale Service: what the run defines (ADR 065 D4).
     #[serde(default)]
     pub tailscale_service: Option<ServicePlan>,
+    /// What the address answers besides HTTPS, as chosen in the plan
+    /// (ADR 070 D1); `None` when the option offered no choice.
+    #[serde(default)]
+    pub http_policy: Option<HttpPolicy>,
     /// A pasted Tailscale OAuth client, in memory for the run only; never
     /// stored.
     #[serde(skip)]
@@ -762,10 +845,50 @@ async fn look(ops: &dyn RunOps, run_id: i32, intent: &Intent) -> Result<Found, S
                 definition.comment
             )),
         }),
+        // Found by this run's reference at Cloudflare (ADR 070 D2).
+        Intent::EdgeRule {
+            hostname,
+            purpose,
+            connector_id,
+        } => Ok(
+            match ops
+                .find_edge_rule(run_id, *connector_id, hostname, *purpose)
+                .await?
+            {
+                Some(resource) => Found::Made(Box::new(resource)),
+                None => Found::Missing,
+            },
+        ),
+        // The address's own column (ADR 070 D1): set when it holds the
+        // choice, not set while it still holds what it held before.
+        Intent::HttpPolicy {
+            hostname,
+            before,
+            after,
+        } => Ok(match ops.http_policy(hostname).await? {
+            Some(current) if current == Some(*after) => {
+                Found::Made(Box::new(RunResource::HttpPolicy {
+                    hostname: hostname.clone(),
+                    before: *before,
+                    after: *after,
+                }))
+            }
+            Some(current) if current == *before => Found::Missing,
+            None => Found::Missing,
+            Some(current) => Found::Changed(policy_text(current)),
+        }),
         other => Ok(match ops.find(other).await? {
             Some(resource) => Found::Made(Box::new(resource)),
             None => Found::Missing,
         }),
+    }
+}
+
+/// A recorded HTTPS-only choice, in words.
+fn policy_text(policy: Option<HttpPolicy>) -> String {
+    match policy {
+        Some(policy) => policy.describe().to_string(),
+        None => "no recorded choice".to_string(),
     }
 }
 
@@ -1166,6 +1289,30 @@ fn conflict_message(entry: &JournalEntry) -> String {
     )
 }
 
+/// What a skipped edge rule step says (ADR 070 D3): what is missing,
+/// whose token, what stays exposed, and the fix.
+pub fn degraded_message(host: &str, purpose: EdgeRulePurpose, error: &EdgeRuleError) -> String {
+    let whose = error
+        .provider
+        .as_deref()
+        .map(|p| format!("The API token of DNS provider `{p}`"))
+        .unwrap_or_else(|| "The Cloudflare API token".to_string());
+    match error.missing_permission {
+        Some(permission) => format!(
+            "Not set up: {whose} lacks {permission}, so {}. {host} is published anyway. Add \
+             {permission} to the token in Cloudflare (My Profile → API Tokens), then make the \
+             address reachable again to add the rule.",
+            purpose.exposure(host)
+        ),
+        None => format!(
+            "Not set up: {} {host} is published anyway, but {}. Fix that in Cloudflare, then \
+             make the address reachable again to add the rule.",
+            error.message.trim_end_matches('.').to_string() + ".",
+            purpose.exposure(host)
+        ),
+    }
+}
+
 fn record_type(ip: IpAddr) -> &'static str {
     match ip {
         IpAddr::V4(_) => "A",
@@ -1403,6 +1550,167 @@ impl Runner<'_> {
                 Err(error) => {
                     self.finish_failed(&intent, error.maybe_applied).await;
                     Outcome::Failed(error.message)
+                }
+            },
+        }
+    }
+
+    /// Records on the address what it answers besides HTTPS (ADR 070 D1),
+    /// so making it reachable again offers the same choice. Nothing is
+    /// journaled when the address already keeps it.
+    async fn record_http_policy(&mut self, address: &str) -> Outcome {
+        let Some(after) = self.input.http_policy else {
+            return Outcome::Skipped("No choice to record.".into());
+        };
+        let done = format!(
+            "{address} keeps {}; making it reachable again offers the same.",
+            after.describe()
+        );
+        let key = Intent::HttpPolicy {
+            hostname: address.to_string(),
+            before: None,
+            after,
+        }
+        .key(self.input.run_id);
+        // An earlier attempt read what it held before; that stays the
+        // value undo puts back.
+        let journaled = self
+            .record
+            .journal
+            .iter()
+            .find(|e| e.key == key && e.state != JournalState::Absent)
+            .and_then(|e| match &e.intent {
+                Intent::HttpPolicy { before, .. } => Some(*before),
+                _ => None,
+            });
+        let before = match journaled {
+            Some(before) => before,
+            None => match self.ops.http_policy(address).await {
+                Ok(Some(current)) if current == Some(after) => {
+                    return Outcome::Skipped(format!(
+                        "{address} already keeps {}.",
+                        after.describe()
+                    ))
+                }
+                Ok(Some(current)) => current,
+                Ok(None) => {
+                    return Outcome::Failed(format!(
+                        "{address} is not attached to this environment any more, so its choice \
+                         ({}) was not recorded. Make it reachable again.",
+                        after.describe()
+                    ))
+                }
+                Err(error) => {
+                    return Outcome::Failed(format!(
+                        "Temps could not read what {address} answers, so it did not record \
+                         the choice ({}): {error} Retry the run.",
+                        after.describe()
+                    ))
+                }
+            },
+        };
+        let intent = Intent::HttpPolicy {
+            hostname: address.to_string(),
+            before,
+            after,
+        };
+        match self.begin(&intent).await {
+            Err(hold) => hold.into(),
+            Ok(Begin::Have(_)) => Outcome::Done(Some(done)),
+            Ok(Begin::Go) => match self.ops.set_http_policy(address, Some(after)).await {
+                Ok(()) => {
+                    self.finish(
+                        &intent.key(self.input.run_id),
+                        Some(RunResource::HttpPolicy {
+                            hostname: address.to_string(),
+                            before,
+                            after,
+                        }),
+                    )
+                    .await;
+                    Outcome::Done(Some(done))
+                }
+                Err(error) => {
+                    self.finish_failed(&intent, true).await;
+                    Outcome::Failed(format!(
+                        "Temps could not record what {address} answers ({}): {error} Retry the \
+                         run.",
+                        after.describe()
+                    ))
+                }
+            },
+        }
+    }
+
+    /// Add `purpose`'s Cloudflare rule for `host` (ADR 070 D1). A token
+    /// without the permission, or any refusal, publishes anyway: the step
+    /// is skipped and says what is missing and what stays exposed (D3).
+    async fn edge_rule(&mut self, host: &str, purpose: EdgeRulePurpose) -> Outcome {
+        let input = self.input;
+        let connector_id = input
+            .tunnel
+            .as_ref()
+            .map(|t| t.id)
+            .or(self.ctx.connector_id);
+        let intent = Intent::EdgeRule {
+            hostname: host.to_string(),
+            purpose,
+            connector_id,
+        };
+        match self.begin(&intent).await {
+            Err(hold) => hold.into(),
+            Ok(Begin::Have(resource)) => {
+                Outcome::Done(Some(format!("{} is in place.", resource.describe())))
+            }
+            Ok(Begin::Go) => match self
+                .ops
+                .create_edge_rule(input.run_id, connector_id, host, purpose)
+                .await
+            {
+                Ok(EdgeRuleMade::Created(resource)) => {
+                    let detail = format!("Added the {}.", resource.describe());
+                    self.finish(&intent.key(input.run_id), Some(*resource))
+                        .await;
+                    Outcome::Done(Some(detail))
+                }
+                Ok(EdgeRuleMade::AlreadyThere(found)) => {
+                    self.finish(&intent.key(input.run_id), None).await;
+                    Outcome::Skipped(format!(
+                        "The zone already has a rule doing this ({found}); used as it is, and \
+                         undo leaves it."
+                    ))
+                }
+                Err(error) if error.maybe_applied => {
+                    self.finish_failed(&intent, true).await;
+                    let key = intent.key(input.run_id);
+                    let entry = self.record.journal.iter().find(|e| e.key == key).cloned();
+                    match entry {
+                        Some(entry) if entry.state == JournalState::Done => Outcome::Done(
+                            entry
+                                .resource
+                                .map(|r| format!("Added the {}.", r.describe())),
+                        ),
+                        Some(entry) if entry.state == JournalState::Absent => {
+                            Outcome::Skipped(degraded_message(host, purpose, &error))
+                        }
+                        Some(entry) => Outcome::Stalled(format!(
+                            "{} {}",
+                            error.message,
+                            wait_message(&entry, chrono::Utc::now())
+                        )),
+                        None => Outcome::Failed(error.message),
+                    }
+                }
+                Err(error) => {
+                    self.finish(&intent.key(input.run_id), None).await;
+                    tracing::warn!(
+                        run = input.run_id,
+                        host,
+                        missing_permission = error.missing_permission,
+                        "could not add a Cloudflare edge rule; publishing without it: {}",
+                        error.message
+                    );
+                    Outcome::Skipped(degraded_message(host, purpose, &error))
                 }
             },
         }
@@ -2590,8 +2898,12 @@ impl Runner<'_> {
                             return Outcome::Skipped("Already chosen for this tunnel.".into());
                         }
                         // Another user's choice is changed only when the plan
-                        // said so and it was confirmed.
-                        if current.is_some() && !input.route_confirmed {
+                        // said so and it was confirmed, and only the one the
+                        // plan showed: a choice made after apply is kept.
+                        let moved = input
+                            .planned_choice
+                            .is_some_and(|planned| planned.as_choice() != current);
+                        if moved || (current.is_some() && !input.route_confirmed) {
                             return Outcome::Failed(format!(
                                 "{address} has a tunnel choice that this setup would change, and \
                                  that was not confirmed. Plan again and confirm the change, or \
@@ -2611,7 +2923,11 @@ impl Runner<'_> {
                 match self.begin(&intent).await {
                     Err(hold) => hold.into(),
                     Ok(Begin::Have(_)) => Outcome::Done(None),
-                    Ok(Begin::Go) => match self.ops.route_hostname(&address, connector_id).await {
+                    Ok(Begin::Go) => match self
+                        .ops
+                        .route_hostname(&address, connector_id, previous.as_choice())
+                        .await
+                    {
                         Ok(()) => {
                             self.finish(
                                 &intent.key(input.run_id),
@@ -2848,6 +3164,15 @@ impl Runner<'_> {
                 }
             }
             StepKind::AccessApp => self.access_app(&address).await,
+            StepKind::RedirectToHttps => {
+                self.edge_rule(&address, EdgeRulePurpose::HttpsRedirect)
+                    .await
+            }
+            StepKind::StandardPortsOnly => {
+                self.edge_rule(&address, EdgeRulePurpose::StandardPorts)
+                    .await
+            }
+            StepKind::SetHttpPolicy => self.record_http_policy(&address).await,
             StepKind::ConfigureTailscaleServe => {
                 let Some(target) = input.serve.clone() else {
                     return Outcome::Skipped("No worker serves it through Tailscale.".into());
@@ -3081,6 +3406,15 @@ fn undo_conflict_message(entry: &JournalEntry) -> String {
              app as it is now), or delete it anyway.",
             entry.conflict.as_deref().unwrap_or("its policies changed")
         ),
+        Intent::EdgeRule {
+            hostname, purpose, ..
+        } => format!(
+            "The {} was changed in Cloudflare after this run added it ({}). Temps did not \
+             touch it, nor anything this run did before it. Keep it (undo leaves the rule as it \
+             is now), or delete it anyway.",
+            purpose.describe(hostname),
+            entry.conflict.as_deref().unwrap_or("what it does changed")
+        ),
         Intent::DnsRecord { .. } => format!(
             "{} now holds {}, which this run did not write. Temps never deletes a record \
              without this run's marker, so it did not touch it, nor anything this run did \
@@ -3129,6 +3463,9 @@ fn journaled_hostnames(journal: &[JournalEntry]) -> std::collections::BTreeSet<S
             | Intent::AddressAudience { hostname, .. } => Some(hostname.clone()),
             Intent::Certificate { domain } => Some(domain.clone()),
             Intent::AccessApp { hostname, .. } => Some(hostname.clone()),
+            Intent::EdgeRule { hostname, .. } | Intent::HttpPolicy { hostname, .. } => {
+                Some(hostname.clone())
+            }
             Intent::TailscaleServe { hostname, .. } => Some(hostname.clone()),
             _ => None,
         })
@@ -3557,6 +3894,23 @@ pub async fn undo(
             continue;
         }
         match &resource {
+            // The choice goes with the address this undo removes.
+            RunResource::HttpPolicy {
+                hostname, after, ..
+            } if attached_here.contains(hostname) => {
+                entry.state = JournalState::Absent;
+                entry.at = now;
+                results.push(UndoResult {
+                    label: format!(
+                        "Left {hostname} at {} until it is removed",
+                        after.describe()
+                    ),
+                    resource: resource.clone(),
+                    ok: true,
+                    error: None,
+                });
+                continue;
+            }
             RunResource::AddressAudience {
                 hostname, after, ..
             } if attached_here.contains(hostname) => {
@@ -3648,6 +4002,50 @@ pub async fn undo(
                     )
                 }
             },
+            // A recorded choice goes back only while the address still
+            // holds the one this run recorded; a later choice is the
+            // user's and stays (ADR 070 D2).
+            RunResource::HttpPolicy {
+                hostname,
+                before,
+                after,
+            } if !checked => match ops.http_policy(hostname).await {
+                Ok(Some(current)) if current == Some(*after) => {}
+                Ok(Some(current)) if current == *before => {
+                    entry.state = JournalState::Absent;
+                    entry.at = now;
+                    continue;
+                }
+                Ok(None) => {
+                    entry.state = JournalState::Absent;
+                    entry.at = now;
+                    continue;
+                }
+                Ok(Some(current)) => {
+                    entry.state = JournalState::Absent;
+                    entry.at = now;
+                    results.push(UndoResult {
+                        label: format!(
+                            "Left {hostname} at {}: it was chosen again after this run",
+                            policy_text(current)
+                        ),
+                        resource: resource.clone(),
+                        ok: true,
+                        error: None,
+                    });
+                    continue;
+                }
+                Err(error) => {
+                    return stop(
+                        results,
+                        Stop::Failed(format!(
+                            "Temps could not read what {hostname} answers to check it still \
+                             holds the choice this run recorded, so it touched nothing from \
+                             there on: {error} Undo again to retry."
+                        )),
+                    )
+                }
+            },
             // An audience goes back only while the address, on this run's
             // environment, still holds exactly what the run set: a later
             // change, or the address moving elsewhere, is never reverted.
@@ -3734,6 +4132,42 @@ pub async fn undo(
                     )
                 }
             },
+            // A rule goes only while it still does what the run wrote
+            // (ADR 070 D2): its expression and action, and for the
+            // redirect its target, status and query string. Unless the
+            // user said to delete it anyway.
+            RunResource::EdgeRule {
+                hostname, purpose, ..
+            } => {
+                let Some(at) = EdgeRuleAt::of(&resource) else {
+                    continue;
+                };
+                match ops.edge_rule(&at).await {
+                    Ok(None) => {
+                        entry.state = JournalState::Absent;
+                        entry.at = now;
+                        continue;
+                    }
+                    Ok(Some(rule)) if !checked && !same_rule(&rule, *purpose, hostname) => {
+                        return stop(
+                            results,
+                            pause(entry, format!("it is now {}", rule.summary()), now),
+                        );
+                    }
+                    Ok(Some(_)) => {}
+                    Err(error) => {
+                        return stop(
+                            results,
+                            Stop::Failed(format!(
+                                "Temps could not read the {} to check it is still the one this \
+                                 run added, so it touched nothing from there on: {error} Undo \
+                                 again to retry.",
+                                purpose.describe(hostname)
+                            )),
+                        )
+                    }
+                }
+            }
             // A tunnel is checked for what else it serves, then marked
             // `deleting`, and that journaled, before any provider call:
             // sync then never brings it back, and an interrupted undo
@@ -3829,6 +4263,9 @@ pub async fn undo(
             RunResource::AddressAudience {
                 hostname, before, ..
             } => ops.set_address_audience(hostname, before).await,
+            RunResource::HttpPolicy {
+                hostname, before, ..
+            } => ops.set_http_policy(hostname, *before).await,
             RunResource::Certificate { domain } => ops.delete_certificate(domain).await,
             RunResource::AccessApp {
                 provider_id, id, ..
@@ -3840,6 +4277,10 @@ pub async fn undo(
             RunResource::EnvironmentHosts { connector_id, .. } => {
                 ops.set_environment_hosts(*connector_id, false).await
             }
+            RunResource::EdgeRule { .. } => match EdgeRuleAt::of(&resource) {
+                Some(at) => ops.delete_edge_rule(&at).await,
+                None => Ok(()),
+            },
         };
         let label = match &resource {
             RunResource::AutoManageEnabled { domain, .. } => {
@@ -3864,6 +4305,9 @@ pub async fn undo(
             RunResource::AddressAudience {
                 hostname, before, ..
             } => format!("Made {hostname} {} again", before.describe()),
+            RunResource::HttpPolicy {
+                hostname, before, ..
+            } => format!("Put {hostname} back to {}", policy_text(*before)),
             other => format!("Removed {}", other.describe()),
         };
         if outcome.is_ok() {
@@ -3946,6 +4390,8 @@ mod tests {
         zone: Option<ZoneState>,
         existing_domain: Option<(i32, i32)>,
         choice: Option<Option<i32>>,
+        /// The choice `route_hostname` was told to expect, once called.
+        route_expected: Mutex<Option<Option<Option<i32>>>>,
         published_after: usize,
         reachable: bool,
         resolves: bool,
@@ -3983,6 +4429,12 @@ mod tests {
         vanish_after: Option<usize>,
         /// Whether the tunnel publishes every environment's host.
         environment_hosts: Mutex<bool>,
+        /// The zone's Cloudflare rules (ADR 070), by purpose.
+        edge_rules: Mutex<Vec<(EdgeRulePurpose, EdgeRuleSeen)>>,
+        /// How adding a rule fails, by purpose.
+        edge_refusals: Vec<(EdgeRulePurpose, EdgeRuleError)>,
+        /// The address's recorded HTTPS-only choice (ADR 070 D1).
+        http_policy: Mutex<Option<HttpPolicy>>,
     }
 
     impl Fake {
@@ -4161,8 +4613,14 @@ mod tests {
             self.log("hostname_choice");
             Ok(self.choice)
         }
-        async fn route_hostname(&self, _host: &str, connector_id: i32) -> Result<(), String> {
+        async fn route_hostname(
+            &self,
+            _host: &str,
+            connector_id: i32,
+            expected: Option<Option<i32>>,
+        ) -> Result<(), String> {
             self.log(format!("route_hostname {connector_id}"));
+            *self.route_expected.lock().unwrap() = Some(expected);
             Ok(())
         }
         async fn restore_hostname_choice(
@@ -4263,6 +4721,7 @@ mod tests {
                 action: None,
                 network: None,
                 nothing_set_up: false,
+                findings: Vec::new(),
             }
         }
         async fn address_audience(&self, _host: &str) -> Result<Option<AddressAudience>, String> {
@@ -4275,6 +4734,21 @@ mod tests {
         ) -> Result<(), String> {
             self.log(format!("set_address_audience {}", audience.describe()));
             *self.audience.lock().expect("lock") = Some(audience.clone());
+            Ok(())
+        }
+        async fn http_policy(&self, _host: &str) -> Result<Option<Option<HttpPolicy>>, String> {
+            Ok(Some(*self.http_policy.lock().expect("lock")))
+        }
+        async fn set_http_policy(
+            &self,
+            _host: &str,
+            policy: Option<HttpPolicy>,
+        ) -> Result<(), String> {
+            self.log(format!(
+                "set_http_policy {}",
+                policy.map_or("none", HttpPolicy::as_str)
+            ));
+            *self.http_policy.lock().expect("lock") = policy;
             Ok(())
         }
         async fn access_app(
@@ -4456,6 +4930,77 @@ mod tests {
             self.result("set_environment_hosts")?;
             self.log(format!("set_environment_hosts {connector_id} {on}"));
             *self.environment_hosts.lock().expect("lock") = on;
+            Ok(())
+        }
+        async fn create_edge_rule(
+            &self,
+            run_id: i32,
+            connector_id: Option<i32>,
+            host: &str,
+            purpose: EdgeRulePurpose,
+        ) -> Result<EdgeRuleMade, EdgeRuleError> {
+            self.log(format!(
+                "create_edge_rule {host} {purpose:?} via {connector_id:?}"
+            ));
+            if let Some((_, error)) = self.edge_refusals.iter().find(|(p, _)| *p == purpose) {
+                return Err(error.clone());
+            }
+            let mut rules = self.edge_rules.lock().expect("lock");
+            if let Some((_, rule)) = rules
+                .iter()
+                .find(|(p, r)| *p == purpose && same_rule(r, purpose, host))
+            {
+                return Ok(EdgeRuleMade::AlreadyThere(
+                    rule.description.clone().unwrap_or_default(),
+                ));
+            }
+            let reference = super::super::edge_rules::rule_ref("abcd", run_id, purpose);
+            // The rule as Cloudflare would return it: Temps' body, with an id.
+            let mut body = super::super::edge_rules::rule_body(purpose, host, &reference);
+            body["id"] = serde_json::json!(format!("rule-{}", rules.len() + 1));
+            let rule = super::super::edge_rules::parse_rule(&body).expect("rule");
+            rules.push((purpose, rule.clone()));
+            Ok(EdgeRuleMade::Created(Box::new(RunResource::EdgeRule {
+                hostname: host.to_string(),
+                purpose,
+                provider_id: 30,
+                zone: "example.com".into(),
+                zone_id: "zone-1".into(),
+                ruleset_id: format!("rs-{}", purpose.phase()),
+                rule_id: rule.id,
+                expression: rule.expression,
+            })))
+        }
+        async fn find_edge_rule(
+            &self,
+            _run_id: i32,
+            connector_id: Option<i32>,
+            host: &str,
+            purpose: EdgeRulePurpose,
+        ) -> Result<Option<RunResource>, String> {
+            self.find(&Intent::EdgeRule {
+                hostname: host.to_string(),
+                purpose,
+                connector_id,
+            })
+            .await
+        }
+        async fn edge_rule(&self, rule: &EdgeRuleAt) -> Result<Option<EdgeRuleSeen>, String> {
+            self.result("edge_rule")?;
+            Ok(self
+                .edge_rules
+                .lock()
+                .expect("lock")
+                .iter()
+                .find(|(_, r)| r.id == rule.rule_id)
+                .map(|(_, r)| r.clone()))
+        }
+        async fn delete_edge_rule(&self, rule: &EdgeRuleAt) -> Result<(), String> {
+            self.log(format!("delete_edge_rule {}", rule.rule_id));
+            self.edge_rules
+                .lock()
+                .expect("lock")
+                .retain(|(_, r)| r.id != rule.rule_id);
             Ok(())
         }
         async fn sleep(&self, _duration: Duration) {}
@@ -4867,6 +5412,7 @@ mod tests {
         RunInput {
             run_id: 0,
             route_confirmed: false,
+            planned_choice: None,
             project_id: 1,
             environment_id: 7,
             environment_name: "production".into(),
@@ -4905,6 +5451,7 @@ mod tests {
             serve: None,
             tailscale_service: None,
             tailscale_credential: None,
+            http_policy: None,
         }
     }
 
@@ -6146,6 +6693,9 @@ mod tests {
             connector_id: 41,
             previous: PreviousChoice::Off,
         }));
+        // The write is conditional on the choice the run read, so one made
+        // meanwhile is never replaced unseen.
+        assert_eq!(*ops.route_expected.lock().unwrap(), Some(Some(None)));
         let results = undo(&mut record.journal, &ops, 0, &Journaled::default())
             .await
             .results;
@@ -6172,6 +6722,544 @@ mod tests {
         .await;
         assert_eq!(record.state, RunState::Failed);
         assert!(!ops.calls().iter().any(|c| c.starts_with("route_hostname")));
+    }
+
+    /// The confirmation covers the choice the plan showed. A different one
+    /// made after apply (here: another tunnel, where the plan saw "no
+    /// tunnel") is kept, never replaced under that confirmation.
+    #[tokio::test]
+    async fn a_confirmed_route_keeps_a_choice_made_after_apply() {
+        let input = RunInput {
+            option: PlanOptionKind::ExistingTunnel,
+            steps: steps(&[StepKind::AttachDomain, StepKind::RouteHostname]),
+            tunnel: Some(NamedId {
+                id: 41,
+                name: "homelab".into(),
+            }),
+            new_tunnel: None,
+            token: None,
+            route_confirmed: true,
+            planned_choice: Some(PreviousChoice::Off),
+            ..token_input()
+        };
+        let ops = Fake {
+            choice: Some(Some(7)),
+            ..Default::default()
+        };
+        let record = execute(&input, &ops, &Saved::default(), timing()).await;
+        assert_eq!(record.state, RunState::Failed);
+        assert!(!ops.calls().iter().any(|c| c.starts_with("route_hostname")));
+
+        // Still the choice the plan showed: the confirmed change goes ahead.
+        let ops = Fake {
+            choice: Some(None),
+            ..Default::default()
+        };
+        execute(&input, &ops, &Saved::default(), timing()).await;
+        assert!(ops.calls().contains(&"route_hostname 41".to_string()));
+
+        // Nothing was chosen when planned, and someone chose since.
+        let ops = Fake {
+            choice: Some(Some(7)),
+            ..Default::default()
+        };
+        let record = execute(
+            &RunInput {
+                route_confirmed: false,
+                planned_choice: Some(PreviousChoice::Automatic),
+                ..input
+            },
+            &ops,
+            &Saved::default(),
+            timing(),
+        )
+        .await;
+        assert_eq!(record.state, RunState::Failed);
+        assert!(!ops.calls().iter().any(|c| c.starts_with("route_hostname")));
+    }
+
+    fn edge_input() -> RunInput {
+        RunInput {
+            option: PlanOptionKind::ExistingTunnel,
+            steps: steps(&[
+                StepKind::RedirectToHttps,
+                StepKind::StandardPortsOnly,
+                StepKind::AttachDomain,
+                StepKind::SetHttpPolicy,
+                StepKind::WaitForPublication,
+                StepKind::CheckReachability,
+            ]),
+            tunnel: Some(NamedId {
+                id: 41,
+                name: "homelab".into(),
+            }),
+            new_tunnel: None,
+            token: None,
+            http_policy: Some(HttpPolicy::HttpsOnly),
+            ..token_input()
+        }
+    }
+
+    /// `edge_input` for `policy`, with the steps the plan gives it.
+    fn policy_input(policy: HttpPolicy) -> RunInput {
+        let mut input = RunInput {
+            steps: steps(&[
+                StepKind::AttachDomain,
+                StepKind::WaitForPublication,
+                StepKind::CheckReachability,
+            ]),
+            http_policy: Some(policy),
+            ..edge_input()
+        };
+        super::super::plan::place_http_policy_steps(&mut input.steps, "myapp.example.com", policy);
+        input
+    }
+
+    fn rule_calls(ops: &Fake) -> Vec<String> {
+        ops.calls()
+            .into_iter()
+            .filter(|c| c.starts_with("create_edge_rule"))
+            .collect()
+    }
+
+    /// ADR 070 D1: with HTTPS only off, no rule is created or journaled;
+    /// the choice is recorded on the address.
+    #[tokio::test]
+    async fn turning_https_only_off_creates_no_rule_and_records_the_choice() {
+        let ops = Fake {
+            reachable: true,
+            ..Default::default()
+        };
+        let record = execute(
+            &policy_input(HttpPolicy::AllowAll),
+            &ops,
+            &Saved::default(),
+            timing(),
+        )
+        .await;
+        assert_eq!(record.state, RunState::Succeeded);
+        assert!(rule_calls(&ops).is_empty(), "{:?}", ops.calls());
+        assert!(!record
+            .journal
+            .iter()
+            .any(|e| matches!(e.intent, Intent::EdgeRule { .. })));
+        assert!(record.created().contains(&RunResource::HttpPolicy {
+            hostname: "myapp.example.com".into(),
+            before: None,
+            after: HttpPolicy::AllowAll,
+        }));
+        assert_eq!(
+            *ops.http_policy.lock().expect("lock"),
+            Some(HttpPolicy::AllowAll)
+        );
+
+        // Plain HTTP on 80 only: the port rule, and no redirect.
+        let ops = Fake {
+            reachable: true,
+            ..Default::default()
+        };
+        let record = execute(
+            &policy_input(HttpPolicy::AllowHttp),
+            &ops,
+            &Saved::default(),
+            timing(),
+        )
+        .await;
+        assert_eq!(record.state, RunState::Succeeded);
+        assert_eq!(
+            rule_calls(&ops),
+            vec!["create_edge_rule myapp.example.com StandardPorts via Some(41)".to_string()]
+        );
+        assert_eq!(
+            edge_created(&record),
+            vec![(EdgeRulePurpose::StandardPorts, "rule-1".to_string())]
+        );
+    }
+
+    /// ADR 070 D1: HTTPS only creates both rules and records the choice.
+    #[tokio::test]
+    async fn https_only_creates_both_rules_and_records_the_choice() {
+        let ops = Fake {
+            reachable: true,
+            ..Default::default()
+        };
+        let record = execute(
+            &policy_input(HttpPolicy::HttpsOnly),
+            &ops,
+            &Saved::default(),
+            timing(),
+        )
+        .await;
+        assert_eq!(record.state, RunState::Succeeded);
+        assert_eq!(rule_calls(&ops).len(), 2);
+        assert!(ops
+            .calls()
+            .contains(&"set_http_policy https_only".to_string()));
+        let record_step = record
+            .steps
+            .iter()
+            .find(|s| s.kind == StepKind::SetHttpPolicy)
+            .expect("the record step");
+        assert_eq!(record_step.status, RunStepStatus::Done);
+    }
+
+    /// ADR 070 D1: a re-run that keeps the recorded choice records
+    /// nothing new.
+    #[tokio::test]
+    async fn a_re_run_keeping_the_choice_records_nothing_new() {
+        let ops = Fake {
+            reachable: true,
+            http_policy: Mutex::new(Some(HttpPolicy::AllowHttp)),
+            ..Default::default()
+        };
+        let record = execute(
+            &policy_input(HttpPolicy::AllowHttp),
+            &ops,
+            &Saved::default(),
+            timing(),
+        )
+        .await;
+        assert_eq!(record.state, RunState::Succeeded);
+        let record_step = record
+            .steps
+            .iter()
+            .find(|s| s.kind == StepKind::SetHttpPolicy)
+            .expect("the record step");
+        assert_eq!(record_step.status, RunStepStatus::Skipped);
+        assert!(!record
+            .journal
+            .iter()
+            .any(|e| matches!(e.intent, Intent::HttpPolicy { .. })));
+        assert!(!ops.calls().iter().any(|c| c.starts_with("set_http_policy")));
+        assert_eq!(
+            *ops.http_policy.lock().expect("lock"),
+            Some(HttpPolicy::AllowHttp)
+        );
+    }
+
+    /// ADR 070 D2: undo puts the earlier choice back on an address the
+    /// run did not attach, unless it was chosen again since.
+    #[tokio::test]
+    async fn undo_puts_the_earlier_choice_back_while_the_address_holds_this_one() {
+        let input = RunInput {
+            steps: steps(&[StepKind::SetHttpPolicy]),
+            ..edge_input()
+        };
+        let ops = Fake {
+            reachable: true,
+            http_policy: Mutex::new(Some(HttpPolicy::AllowAll)),
+            ..Default::default()
+        };
+        let mut record = execute(&input, &ops, &Saved::default(), timing()).await;
+        assert!(record.created().contains(&RunResource::HttpPolicy {
+            hostname: "myapp.example.com".into(),
+            before: Some(HttpPolicy::AllowAll),
+            after: HttpPolicy::HttpsOnly,
+        }));
+        let mut journal = record.journal.clone();
+        let outcome = undo(&mut record.journal, &ops, 0, &Journaled::default()).await;
+        assert!(outcome.stopped.is_none(), "{outcome:?}");
+        assert_eq!(
+            *ops.http_policy.lock().expect("lock"),
+            Some(HttpPolicy::AllowAll)
+        );
+        assert!(outcome.results.iter().any(|r| r.label
+            == "Put myapp.example.com back to HTTPS, plain HTTP and \
+                                Cloudflare's other ports"));
+
+        // Chosen again by a later run: left as it is.
+        *ops.http_policy.lock().expect("lock") = Some(HttpPolicy::AllowHttp);
+        let outcome = undo(&mut journal, &ops, 0, &Journaled::default()).await;
+        assert!(outcome.stopped.is_none(), "{outcome:?}");
+        assert_eq!(
+            *ops.http_policy.lock().expect("lock"),
+            Some(HttpPolicy::AllowHttp)
+        );
+        assert!(outcome
+            .results
+            .iter()
+            .any(|r| r.label.contains("chosen again after this run")));
+    }
+
+    fn edge_created(record: &RunRecord) -> Vec<(EdgeRulePurpose, String)> {
+        record
+            .created()
+            .into_iter()
+            .filter_map(|r| match r {
+                RunResource::EdgeRule {
+                    purpose, rule_id, ..
+                } => Some((purpose, rule_id)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// ADR 070 D1/D2: both rules are journaled before the address is
+    /// attached, and undo removes exactly them, newest first.
+    #[tokio::test]
+    async fn a_tunnel_run_adds_both_edge_rules_and_undo_removes_exactly_them() {
+        let ops = Fake {
+            reachable: true,
+            ..Default::default()
+        };
+        // A rule of the user's own for another hostname in the zone.
+        ops.edge_rules.lock().expect("lock").push((
+            EdgeRulePurpose::HttpsRedirect,
+            EdgeRuleSeen {
+                id: "user-rule".into(),
+                reference: None,
+                description: Some("the blog".into()),
+                expression: "(http.host eq \"blog.example.com\")".into(),
+                action: "redirect".into(),
+                action_parameters: None,
+                enabled: true,
+            },
+        ));
+        let mut record = execute(&edge_input(), &ops, &Saved::default(), timing()).await;
+        assert_eq!(record.state, RunState::Succeeded);
+        assert_eq!(
+            edge_created(&record),
+            vec![
+                (EdgeRulePurpose::HttpsRedirect, "rule-2".to_string()),
+                (EdgeRulePurpose::StandardPorts, "rule-3".to_string()),
+            ]
+        );
+        let calls = ops.calls();
+        let first_rule = calls
+            .iter()
+            .position(|c| c.starts_with("create_edge_rule"))
+            .expect("a rule");
+        let attach = calls
+            .iter()
+            .position(|c| c.starts_with("attach_domain"))
+            .expect("attached");
+        assert!(first_rule < attach, "{calls:?}");
+        // The tunnel's DNS provider's token is the one used.
+        assert!(calls.contains(
+            &"create_edge_rule myapp.example.com HttpsRedirect via Some(41)".to_string()
+        ));
+        assert_eq!(record.steps[0].status, RunStepStatus::Done);
+
+        let outcome = undo(&mut record.journal, &ops, 0, &Journaled::default()).await;
+        assert!(outcome.stopped.is_none(), "{outcome:?}");
+        let deletes: Vec<String> = ops
+            .calls()
+            .into_iter()
+            .filter(|c| c.starts_with("delete_edge_rule"))
+            .collect();
+        assert_eq!(
+            deletes,
+            vec![
+                "delete_edge_rule rule-3".to_string(),
+                "delete_edge_rule rule-2".to_string()
+            ]
+        );
+        // The user's rule is untouched.
+        let left = ops.edge_rules.lock().expect("lock").clone();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].1.id, "user-rule");
+    }
+
+    /// ADR 070 D3: a token without the permission still publishes, and the
+    /// step says exactly which permission is missing and whose token.
+    #[tokio::test]
+    async fn a_token_without_the_rule_permissions_publishes_and_says_which_is_missing() {
+        let denied = |purpose: EdgeRulePurpose| EdgeRuleError {
+            message: "Cloudflare refused to add the rule: Authentication error".into(),
+            missing_permission: Some(purpose.permission()),
+            provider: Some("Cloudflare example.com".into()),
+            maybe_applied: false,
+        };
+        let ops = Fake {
+            reachable: true,
+            edge_refusals: vec![
+                (
+                    EdgeRulePurpose::HttpsRedirect,
+                    denied(EdgeRulePurpose::HttpsRedirect),
+                ),
+                (
+                    EdgeRulePurpose::StandardPorts,
+                    denied(EdgeRulePurpose::StandardPorts),
+                ),
+            ],
+            ..Default::default()
+        };
+        let record = execute(&edge_input(), &ops, &Saved::default(), timing()).await;
+        assert_eq!(record.state, RunState::Succeeded);
+        assert_eq!(
+            record.live_url.as_deref(),
+            Some("https://myapp.example.com")
+        );
+        assert!(edge_created(&record).is_empty());
+        assert!(record
+            .created()
+            .iter()
+            .any(|r| matches!(r, RunResource::CustomDomain { .. })));
+        let redirect = &record.steps[0];
+        assert_eq!(redirect.status, RunStepStatus::Skipped);
+        let detail = redirect.detail.as_deref().unwrap_or_default();
+        assert!(
+            detail.starts_with(
+                "Not set up: The API token of DNS provider `Cloudflare example.com` lacks \
+                 Zone · Single Redirect · Edit"
+            ),
+            "{detail}"
+        );
+        assert!(detail.contains("http://myapp.example.com still answers without encryption"));
+        assert!(detail.contains("myapp.example.com is published anyway"));
+        let ports = &record.steps[1];
+        assert_eq!(ports.status, RunStepStatus::Skipped);
+        assert!(ports
+            .detail
+            .as_deref()
+            .is_some_and(|d| d.contains("lacks Zone · Zone WAF · Edit")));
+        // Nothing for undo to remove at Cloudflare.
+        assert!(record
+            .journal
+            .iter()
+            .filter(|e| matches!(e.intent, Intent::EdgeRule { .. }))
+            .all(|e| e.state == JournalState::Absent));
+    }
+
+    /// ADR 070 D1: a rule doing the same already there is used as found,
+    /// never journaled, and never removed by undo.
+    #[tokio::test]
+    async fn an_identical_rule_already_there_is_left_alone_by_the_run_and_its_undo() {
+        let ops = Fake {
+            reachable: true,
+            ..Default::default()
+        };
+        ops.edge_rules.lock().expect("lock").push((
+            EdgeRulePurpose::HttpsRedirect,
+            EdgeRuleSeen {
+                id: "user-https".into(),
+                reference: None,
+                description: Some("mine".into()),
+                expression: super::super::edge_rules::expression(
+                    EdgeRulePurpose::HttpsRedirect,
+                    "myapp.example.com",
+                ),
+                action: "redirect".into(),
+                action_parameters: super::super::edge_rules::action_parameters(
+                    EdgeRulePurpose::HttpsRedirect,
+                ),
+                enabled: true,
+            },
+        ));
+        let mut record = execute(&edge_input(), &ops, &Saved::default(), timing()).await;
+        assert_eq!(record.steps[0].status, RunStepStatus::Skipped);
+        assert!(record.steps[0]
+            .detail
+            .as_deref()
+            .is_some_and(|d| d.contains("(mine)")));
+        assert_eq!(
+            edge_created(&record),
+            vec![(EdgeRulePurpose::StandardPorts, "rule-2".to_string())]
+        );
+        undo(&mut record.journal, &ops, 0, &Journaled::default()).await;
+        assert!(!ops
+            .calls()
+            .contains(&"delete_edge_rule user-https".to_string()));
+        assert!(ops
+            .edge_rules
+            .lock()
+            .expect("lock")
+            .iter()
+            .any(|(_, r)| r.id == "user-https"));
+    }
+
+    /// ADR 070 D1/D2: a redirect with Temps' expression that sends
+    /// elsewhere is not taken for Temps' rule. The run adds its own beside
+    /// it, and undo pauses on the run's redirect once someone points it
+    /// elsewhere, rather than deleting it.
+    #[tokio::test]
+    async fn a_redirect_pointed_elsewhere_is_neither_reused_nor_deleted_by_undo() {
+        let ops = Fake {
+            reachable: true,
+            ..Default::default()
+        };
+        let mut elsewhere =
+            super::super::edge_rules::action_parameters(EdgeRulePurpose::HttpsRedirect)
+                .expect("redirect");
+        elsewhere["from_value"]["target_url"]["expression"] =
+            serde_json::json!("concat(\"http://elsewhere.example.net\", http.request.uri.path)");
+        ops.edge_rules.lock().expect("lock").push((
+            EdgeRulePurpose::HttpsRedirect,
+            EdgeRuleSeen {
+                id: "user-elsewhere".into(),
+                reference: None,
+                description: Some("mine".into()),
+                expression: super::super::edge_rules::expression(
+                    EdgeRulePurpose::HttpsRedirect,
+                    "myapp.example.com",
+                ),
+                action: "redirect".into(),
+                action_parameters: Some(elsewhere.clone()),
+                enabled: true,
+            },
+        ));
+        let mut record = execute(&edge_input(), &ops, &Saved::default(), timing()).await;
+        assert_eq!(record.state, RunState::Succeeded);
+        assert_eq!(
+            edge_created(&record),
+            vec![
+                (EdgeRulePurpose::HttpsRedirect, "rule-2".to_string()),
+                (EdgeRulePurpose::StandardPorts, "rule-3".to_string()),
+            ]
+        );
+        for (_, rule) in ops.edge_rules.lock().expect("lock").iter_mut() {
+            if rule.id == "rule-2" {
+                rule.action_parameters = Some(elsewhere.clone());
+            }
+        }
+        let outcome = undo(&mut record.journal, &ops, 0, &Journaled::default()).await;
+        assert!(
+            matches!(&outcome.stopped, Some(Stop::Conflict(why)) if why.contains("elsewhere.example.net")),
+            "{outcome:?}"
+        );
+        let calls = ops.calls();
+        assert!(!calls.contains(&"delete_edge_rule rule-2".to_string()));
+        assert!(!calls.contains(&"delete_edge_rule user-elsewhere".to_string()));
+    }
+
+    /// ADR 070 D2: a rule edited after the run pauses undo; keep leaves it,
+    /// delete anyway removes it.
+    #[tokio::test]
+    async fn undo_pauses_on_an_edge_rule_someone_edited() {
+        let ops = Fake {
+            reachable: true,
+            ..Default::default()
+        };
+        let mut record = execute(&edge_input(), &ops, &Saved::default(), timing()).await;
+        for (_, rule) in ops.edge_rules.lock().expect("lock").iter_mut() {
+            if rule.id == "rule-2" {
+                rule.expression =
+                    "(http.host eq \"myapp.example.com\" and ip.src.country eq \"FR\")".into();
+            }
+        }
+        let outcome = undo(&mut record.journal, &ops, 0, &Journaled::default()).await;
+        assert!(
+            matches!(&outcome.stopped, Some(Stop::Conflict(why)) if why.contains("was changed in Cloudflare")),
+            "{outcome:?}"
+        );
+        assert!(!ops.calls().contains(&"delete_edge_rule rule-2".to_string()));
+        let key = record
+            .journal
+            .iter()
+            .find(|e| e.state == JournalState::Conflict)
+            .map(|e| e.key.clone())
+            .expect("a conflict");
+
+        let mut kept = record.journal.clone();
+        decide(&mut kept, &key, Decision::Keep, true).expect("decide");
+        let outcome = undo(&mut kept, &ops, 0, &Journaled::default()).await;
+        assert!(outcome.stopped.is_none(), "{outcome:?}");
+        assert!(!ops.calls().contains(&"delete_edge_rule rule-2".to_string()));
+
+        decide(&mut record.journal, &key, Decision::Overwrite, true).expect("decide");
+        let outcome = undo(&mut record.journal, &ops, 0, &Journaled::default()).await;
+        assert!(outcome.stopped.is_none(), "{outcome:?}");
+        assert!(ops.calls().contains(&"delete_edge_rule rule-2".to_string()));
     }
 
     /// ADR 068 D5's tunnel fix: one run turns the tunnel's environment

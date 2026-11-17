@@ -8,7 +8,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use temps_auth::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
+use temps_authz::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
 use temps_core::{problemdetails::Problem, ProblemDetails};
 use utoipa::{IntoParams, ToSchema};
 
@@ -110,7 +110,7 @@ fn window(p: &GlobalTraceParams) -> Result<(DateTime<Utc>, DateTime<Utc>), Probl
         .transpose()?
         .unwrap_or_else(|| {
             if p.trace_id.is_some() {
-                DateTime::from_timestamp_millis(0).unwrap()
+                DateTime::UNIX_EPOCH
             } else {
                 to - chrono::Duration::days(1)
             }

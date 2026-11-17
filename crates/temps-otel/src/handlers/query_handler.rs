@@ -23,7 +23,7 @@ use crate::services::cross_project::is_valid_trace_id;
 use crate::services::{CrossProjectTraceError, SiblingRef, UnifiedTrace};
 use crate::types::*;
 use crate::OtelAppState;
-use temps_auth::{
+use temps_authz::{
     deny_deployment_token, permission_guard, project_access_guard, project_scope_guard, RequireAuth,
 };
 use temps_core::problemdetails::{self, Problem};
@@ -1912,13 +1912,13 @@ pub struct CrossProjectSiblingsParams {
 /// team model in OSS to scope against. Infrastructure errors from the checker
 /// drop the project (fail closed) rather than disclosing its spans.
 async fn readable_project_ids(
-    auth: &temps_auth::AuthContext,
+    auth: &temps_authz::AuthContext,
     state: &OtelAppState,
     project_ids: impl IntoIterator<Item = i32>,
 ) -> std::collections::HashSet<i32> {
     let project_ids: std::collections::HashSet<i32> = project_ids.into_iter().collect();
 
-    if auth.is_admin() || auth.has_role(&temps_auth::Role::PlatformAdmin) {
+    if auth.is_admin() || auth.has_role(&temps_authz::Role::PlatformAdmin) {
         return project_ids;
     }
     let Some(checker) = state.project_access_checker.as_deref() else {

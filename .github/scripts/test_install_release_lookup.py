@@ -1,18 +1,24 @@
 # SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 # SPDX-License-Identifier: MIT OR Apache-2.0
 
-"""Exercise installer release lookup without network access or installation.
+"""Exercise installer release lookup without network access.
 
 A fake `curl` serves canned GitHub API responses and refuses every download,
 so each run stops right after the installer has decided what to fetch; the
 download URL in the failure message tells us which release it picked. A fake
-`uname` pins the platform to linux-amd64.
+`uname` pins the platform (linux-amd64 unless a test says otherwise).
+
+`CompletedInstallTests` instead hands the fake `curl` a local archive, so the
+installer runs to the end inside a temporary directory and its final output
+can be checked.
 """
 
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
+import tarfile
 import tempfile
 import unittest
 
@@ -27,8 +33,18 @@ url = sys.argv[-1]
 with open(os.environ["FAKE_CALLS"], "a") as calls:
     calls.write(url + "\n")
 if "api.github.com" not in url:
-    sys.stderr.write("download refused by test\n")
-    sys.exit(22)
+    archive = os.environ.get("FAKE_ARCHIVE")
+    if not archive:
+        sys.stderr.write("download refused by test\n")
+        sys.exit(22)
+    output = sys.argv[sys.argv.index("--output") + 1]
+    if url.endswith(".sha256"):
+        import hashlib
+        digest = hashlib.sha256(open(archive, "rb").read()).hexdigest()
+        open(output, "w").write(digest + "  archive.tar.gz\n")
+    else:
+        open(output, "wb").write(open(archive, "rb").read())
+    sys.exit(0)
 routes = json.load(open(os.environ["FAKE_ROUTES"]))
 status, body = routes.get(url.split("/repos/gotempsh/temps/", 1)[1], routes["default"])
 sys.stdout.write(body + "\n" + status)
@@ -79,7 +95,7 @@ class InstallerRun:
 
 
 class ReleaseLookupTests(unittest.TestCase):
-    def install(self, *arguments, routes=None, status="404"):
+    def install(self, *arguments, routes=None, status="404", platform="Linux x86_64"):
         """Run the installer against canned API routes (path -> (status, body))."""
         table = {"default": [status, "{}"]}
         for path, (route_status, body) in (routes or {}).items():
@@ -89,7 +105,7 @@ class ReleaseLookupTests(unittest.TestCase):
             bin_dir = root / "bin"
             bin_dir.mkdir()
             (bin_dir / "curl").write_text(FAKE_CURL)
-            (bin_dir / "uname").write_text('#!/bin/sh\necho "Linux x86_64"\n')
+            (bin_dir / "uname").write_text(f'#!/bin/sh\necho "{platform}"\n')
             for tool in ("curl", "uname"):
                 (bin_dir / tool).chmod(0o755)
             (root / "routes.json").write_text(json.dumps(table))
@@ -280,6 +296,13 @@ echo stable-install-continues
                 self.assert_picked(run, tag)
                 self.assertEqual(run.api_calls, [])
 
+    def test_arm64_linux_picks_the_arm64_archive(self):
+        for platform in ("Linux aarch64", "Linux arm64"):
+            with self.subTest(platform=platform):
+                run = self.install("v0.1.0", platform=platform)
+                self.assertEqual(run.downloads,
+                                 [f"{DOWNLOAD}v0.1.0/temps-linux-arm64.tar.gz"], run.output)
+
     def test_malformed_pinned_version_is_rejected(self):
         for argument in ["latest", "v1.2", "1.2.3.4", "v1.2.3-", "v1.2.3-rc..1",
                          "1.2.3/../../other", "test-v0.1.0", "vv1.2.3", ""]:
@@ -314,6 +337,76 @@ echo stable-install-continues
                                         capture_output=True, text=True)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout.strip(), expected)
+
+
+CAPABILITIES_URL = "https://temps.sh/docs/capabilities"
+
+
+class CompletedInstallTests(unittest.TestCase):
+    """Run a pinned install to the end against a local archive."""
+
+    def install(self, temps_already_on_path):
+        with tempfile.TemporaryDirectory(prefix="temps-install-complete-") as temporary:
+            root = Path(temporary)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            (bin_dir / "curl").write_text(FAKE_CURL)
+            (bin_dir / "uname").write_text('#!/bin/sh\necho "Linux x86_64"\n')
+            tools = ["curl", "uname"]
+            if temps_already_on_path:
+                (bin_dir / "temps").write_text("#!/bin/sh\n")
+                tools.append("temps")
+            for tool in tools:
+                (bin_dir / tool).chmod(0o755)
+
+            payload = root / "payload"
+            payload.mkdir()
+            (payload / "temps").write_text("#!/bin/sh\necho fake temps\n")
+            archive = root / "temps-linux-amd64.tar.gz"
+            with tarfile.open(archive, "w:gz") as bundle:
+                bundle.add(payload / "temps", arcname="temps")
+
+            # Only system directories besides the fakes, so a `temps` the
+            # host machine has installed cannot change which branch runs.
+            search_path = os.pathsep.join([str(bin_dir), "/usr/bin", "/bin"])
+            if not temps_already_on_path and shutil.which("temps", path=search_path):
+                self.skipTest("a temps binary in /usr/bin or /bin is already on PATH")
+            home = root / "home"
+            home.mkdir()
+            calls = root / "calls"
+            calls.touch()
+            environment = dict(
+                os.environ,
+                PATH=search_path,
+                HOME=str(home),
+                SHELL="/bin/bash",
+                TEMPS_INSTALL=str(root / "install"),
+                FAKE_ROUTES=str(root / "routes.json"),
+                FAKE_CALLS=str(calls),
+                FAKE_ARCHIVE=str(archive),
+            )
+            environment.pop("XDG_CONFIG_HOME", None)
+            result = subprocess.run(
+                ["bash", str(INSTALLER), "v0.1.0"],
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            output = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 0, output)
+            self.assertTrue((root / "install" / "bin" / "temps").is_file(), output)
+            return output
+
+    def test_fresh_install_links_to_capabilities_page(self):
+        output = self.install(temps_already_on_path=False)
+        self.assertIn("temps --help", output)
+        self.assertIn(CAPABILITIES_URL, output)
+
+    def test_reinstall_with_temps_on_path_links_to_capabilities_page(self):
+        output = self.install(temps_already_on_path=True)
+        self.assertIn("Run 'temps --help' to get started", output)
+        self.assertIn(CAPABILITIES_URL, output)
 
 
 if __name__ == "__main__":

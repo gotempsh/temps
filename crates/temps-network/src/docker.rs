@@ -114,18 +114,18 @@ fn routed_overlap(routed: &[Ipv4Net], existing: &Ipv4Net) -> Option<Ipv4Net> {
         .find(|subnet| cidrs_overlap(subnet, existing))
 }
 
-/// Every Docker network's IPv4 subnets except `owned_network`'s, as occupied
-/// ranges (ADR 056).
+/// Every Docker network's IPv4 subnets except those of `owned_networks` (the
+/// overlays this node runs), as occupied ranges (ADR 056).
 pub async fn occupied_docker_subnets(
     docker: &Docker,
-    owned_network: &str,
+    owned_networks: &[&str],
 ) -> crate::Result<Vec<crate::occupied::OccupiedRange>> {
     let networks = docker
         .list_networks(None::<ListNetworksOptions>)
         .await
         .map_err(|error| NetworkError::Docker {
             op: "list_networks",
-            network: owned_network.to_owned(),
+            network: owned_networks.join(","),
             reason: error.to_string(),
         })?;
     let mut ranges = Vec::new();
@@ -133,7 +133,7 @@ pub async fn occupied_docker_subnets(
         let Some(name) = network.name else {
             continue;
         };
-        if name == owned_network {
+        if owned_networks.contains(&name.as_str()) {
             continue;
         }
         let subnets = network

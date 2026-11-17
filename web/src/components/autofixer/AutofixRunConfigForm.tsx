@@ -21,6 +21,7 @@ import { AlertTriangle, ArrowRight, Loader2, Wand2 } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { Link } from 'react-router'
 import { aiProviderCatalogQueryOptions } from '@/lib/ai-provider-catalog-query'
+import { harnessSetupHref } from '@/pages/agent-sandbox/harness-onboarding'
 
 // Sentinel for the "use provider default" model option — Radix Select
 // rejects empty-string item values.
@@ -136,7 +137,7 @@ export function AutofixRunConfigForm({
                 </p>
               </div>
               <Button asChild variant="outline" size="sm" className="shrink-0">
-                <Link to={`/agent-sandbox/providers/${p.id}`}>
+                <Link to={harnessSetupHref(p.id)}>
                   Configure
                   <ArrowRight className="h-3.5 w-3.5 ml-1.5" />
                 </Link>
@@ -196,7 +197,7 @@ export function AutofixRunConfigForm({
     <div className="space-y-4">
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
         <div className="space-y-1.5">
-          <Label>Harness</Label>
+          <Label>Agent</Label>
           <Select
             value={effectiveProvider}
             onValueChange={(v) => {

@@ -6,7 +6,7 @@
 mod tests {
     use std::sync::Arc;
 
-    use temps_database::test_utils::TestDatabase;
+    use temps_test_utils::TestDatabase;
 
     use crate::test_utils::*;
     use crate::traits::*;

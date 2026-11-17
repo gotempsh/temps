@@ -42,7 +42,7 @@ test('observability starter submits its pinned image and exposes collapsed valid
     '/projects/new?source=templates&template=observability-starter'
   )
   const create = page.getByRole('button', {
-    name: 'Create Service from Template',
+    name: 'Create service from template',
     exact: true,
   })
   await expect(create).toBeEnabled()

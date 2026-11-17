@@ -1390,9 +1390,9 @@ mod tests {
     use crate::service::shield_console_service::{ShieldConsoleService, ShieldProposalStatus};
     use crate::shield::ShieldSources;
     use sea_orm::{EntityTrait, QueryOrder};
-    use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
     use temps_entities::shield_snapshots;
     use temps_shield::{Action, Index, ShieldSnapshot};
+    use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 
     const BROWSER_LIKE_JA4: &str = "t13d1715h2_5b57614c22b0_3d5424432f57";
 

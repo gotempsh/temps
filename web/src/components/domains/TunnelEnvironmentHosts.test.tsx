@@ -22,6 +22,7 @@ const off: EnvironmentHostsResponse = {
   connector_id: 2,
   connector_name: 'edge',
   domain: 'apps.example.com',
+  host_suffix: null,
   enabled: false,
   hosts: [
     {
@@ -113,6 +114,32 @@ test('another tunnel already publishing environments blocks this one and says wh
   }) as HTMLButtonElement
   expect(button.disabled).toBe(true)
   expect(screen.getByText(/Tunnel homelab already does this/)).toBeTruthy()
+})
+
+test('a tunnel with a hostname suffix names the pattern one level deep', () => {
+  render(
+    <TunnelEnvironmentHostsView
+      data={{ ...off, domain: 'example.com', host_suffix: 'lab' }}
+      pending={false}
+      onConfirm={() => {}}
+    />
+  )
+  expect(
+    screen.getByText(/published as <environment>-lab\.example\.com\./)
+  ).toBeTruthy()
+})
+
+test('a tunnel without a suffix names the pattern under its domain', () => {
+  render(
+    <TunnelEnvironmentHostsView
+      data={off}
+      pending={false}
+      onConfirm={() => {}}
+    />
+  )
+  expect(
+    screen.getByText(/published as <environment>\.apps\.example\.com\./)
+  ).toBeTruthy()
 })
 
 function connector(environment_hosts: boolean): ConnectorView {

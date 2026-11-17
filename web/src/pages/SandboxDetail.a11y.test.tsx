@@ -28,6 +28,9 @@ const sandbox = {
     name: 'example-sandbox',
     node_name: 'control-plane',
     preview_url_template: 'https://{port}-example.test',
+    preview_access: 'temps_login',
+    preview_allowed_cidrs: [],
+    egress_policy: { mode: 'internet', rules: [] },
     region: 'local',
     requestedAt: 1_767_225_600_000,
     runtime: 'node22',
@@ -77,6 +80,20 @@ test('the command runner fields are named, not just titled', async () => {
   })
   expect(cwd.getAttribute('placeholder')).toBe('/workspace')
   view.getByRole('textbox', { name: 'Command to run in the sandbox' })
+  expect(view.getAllByRole('tab').map((tab) => tab.textContent)).toEqual([
+    'Terminal',
+    'Files',
+    'Services',
+    'Network',
+    'Access',
+    'Activity',
+  ])
+  expect(view.getAllByRole('tabpanel')).toHaveLength(1)
+  view.getByRole('button', { name: 'Sandbox actions' })
+  expect(view.queryByRole('button', { name: /^Stop/ })).toBeNull()
+  expect(view.queryByRole('button', { name: /^Restart/ })).toBeNull()
+  expect(view.queryByRole('button', { name: /^Delete/ })).toBeNull()
+  expect(view.container.querySelector('aside')).toBeNull()
 
   const result = await axe.run(view.container, {
     runOnly: { type: 'rule', values: ['label', 'label-title-only'] },

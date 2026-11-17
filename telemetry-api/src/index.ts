@@ -8,7 +8,10 @@ import { createFailureReportsRoutes } from "./routes/failure-reports.js";
 import { initGeo } from "./geo.js";
 import { CountryBackfiller } from "./backfill.js";
 import { gracefulShutdown } from "./shutdown.js";
+import { startServer } from "./server.js";
 import { errorFields, log } from "./log.js";
+import { conflictingLimits, ingestLimitsFromEnv } from "./limits.js";
+import { createRateLimiter } from "./rate-limit.js";
 
 const PORT = parseInt(process.env.PORT ?? "4200", 10);
 
@@ -29,53 +32,29 @@ async function main() {
   const backfill = new CountryBackfiller(pool);
   backfill.start();
 
-  const events = createEventsRoutes(pool, { backfill });
+  // Abuse limits for the public ingest routes; see limits.ts for each
+  // variable and its default.
+  const limits = ingestLimitsFromEnv();
+  log("info", "server", "ingest limits", { ...limits });
+  for (const conflict of conflictingLimits(limits)) {
+    log("warn", "config", "ingest limits contradict each other", { conflict });
+  }
+
+  const events = createEventsRoutes(pool, {
+    backfill,
+    rateLimiter: createRateLimiter(limits.eventsPerMinute),
+    limits,
+  });
   const stats = createStatsRoutes(pool);
-  const failureReports = createFailureReportsRoutes(pool);
+  const failureReports = createFailureReportsRoutes(pool, {
+    rateLimiter: createRateLimiter(limits.failureReportsPerMinute),
+    maxTextChars: limits.failureReportMaxChars,
+  });
 
-  const server = Bun.serve({
+  const server = startServer({
     port: PORT,
-    async fetch(req) {
-      const url = new URL(req.url);
-      const method = req.method.toUpperCase();
-      const path = url.pathname;
-
-      // Health check — no auth required
-      if (method === "GET" && path === "/health") {
-        return Response.json({ ok: true });
-      }
-
-      // Ingest endpoints
-      if (method === "POST" && path === "/v1/events") {
-        return events.postEvent(req);
-      }
-      if (method === "POST" && path === "/v1/events/batch") {
-        return events.postBatch(req);
-      }
-      if (method === "POST" && path === "/v1/deploy-failure-reports") {
-        return failureReports.postReport(req);
-      }
-
-      // Stats endpoints (add auth in production via INGEST_API_KEY or network policy)
-      if (method === "GET" && path === "/v1/stats/overview") {
-        return stats.getOverview(req);
-      }
-      if (method === "GET" && path === "/v1/stats/active-instances") {
-        return stats.getActiveInstances(req);
-      }
-      if (method === "GET" && path === "/v1/stats/funnel") {
-        return stats.getFunnel(req);
-      }
-      if (method === "GET" && path === "/v1/stats/countries") {
-        return stats.getCountries(req);
-      }
-
-      return Response.json({ error: "not found" }, { status: 404 });
-    },
-    error(err) {
-      log("error", "server", "unhandled error", errorFields(err));
-      return Response.json({ error: "internal server error" }, { status: 500 });
-    },
+    maxRequestBodyBytes: limits.maxRequestBodyBytes,
+    routes: { events, failureReports, stats },
   });
 
   log("info", "server", "temps telemetry API listening", { port: server.port });

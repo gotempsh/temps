@@ -4241,7 +4241,7 @@ mod tests {
 
     #[tokio::test]
     async fn zone_operation_lock_admits_one_operation_per_zone() {
-        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error) => {
                 eprintln!(
@@ -4445,7 +4445,7 @@ mod tests {
     /// Applying again finishes the work.
     #[tokio::test]
     async fn hostname_mode_apply_stopped_while_writing_keeps_the_mode_and_saves_written_states() {
-        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error) => {
                 eprintln!(
@@ -4511,7 +4511,7 @@ mod tests {
     /// certificate for it.
     #[tokio::test]
     async fn hostname_mode_apply_saves_states_for_adopted_hostnames_but_not_skipped_ones() {
-        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error) => {
                 eprintln!(
@@ -4593,7 +4593,7 @@ mod tests {
     /// applying again removes the rest.
     #[tokio::test]
     async fn hostname_mode_apply_stopped_while_removing_keeps_the_saved_mode() {
-        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error) => {
                 eprintln!(
@@ -4644,7 +4644,7 @@ mod tests {
     /// resolves as before, and its record state is kept.
     #[tokio::test]
     async fn hostname_mode_apply_writes_back_a_record_whose_replacement_failed() {
-        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error) => {
                 eprintln!(

@@ -390,8 +390,8 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use sea_orm::{ActiveModelTrait, Set};
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::{git_providers, repositories, users};
+    use temps_test_utils::TestDatabase;
 
     /// `provider_id` is a shared, platform-level resource — many users can
     /// each hold their own `git_provider_connections` row against the same

@@ -59,9 +59,8 @@ impl AuditOperation for IngressAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation: {e}"))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -291,6 +290,7 @@ async fn create_ingress_connector(
             "domain": view.domain,
             "node_ids": view.nodes.iter().map(|n| n.node_id).collect::<Vec<_>>(),
             "auto_publish": view.auto_publish,
+            "host_suffix": view.host_suffix,
             "outcome": "created",
         }))
         .record(&state)

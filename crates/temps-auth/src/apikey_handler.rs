@@ -177,6 +177,8 @@ pub async fn create_api_key(
         },
         api_key_id: api_key.id,
         api_key_name: api_key.name.clone(),
+        project_id: api_key.project_id,
+        environment_id: api_key.environment_id,
         role_type,
         permissions,
     };
@@ -268,7 +270,7 @@ pub async fn get_api_key(
 }
 
 #[utoipa::path(
-    put,
+    patch,
     path = "/api-keys/{id}",
     params(
         ("id" = i32, Path, description = "API key ID")
@@ -565,7 +567,7 @@ mod tests {
         async fn create_audit_log(
             &self,
             _operation: &dyn temps_core::AuditOperation,
-        ) -> temps_core::anyhow::Result<()> {
+        ) -> temps_core::AuditResult<()> {
             Ok(())
         }
     }
@@ -674,6 +676,8 @@ mod tests {
 
     fn custom_request(permissions: Vec<&str>) -> CreateApiKeyRequest {
         CreateApiKeyRequest {
+            project_id: None,
+            environment_id: None,
             name: "test-key".to_string(),
             role_type: "custom".to_string(),
             permissions: Some(permissions.into_iter().map(String::from).collect()),
@@ -712,6 +716,8 @@ mod tests {
 
     fn predefined_request(role_type: &str) -> CreateApiKeyRequest {
         CreateApiKeyRequest {
+            project_id: None,
+            environment_id: None,
             name: "test-key".to_string(),
             role_type: role_type.to_string(),
             permissions: None,
@@ -800,6 +806,8 @@ mod tests {
         permissions: Vec<&str>,
     ) -> CreateApiKeyRequest {
         CreateApiKeyRequest {
+            project_id: None,
+            environment_id: None,
             permissions: Some(permissions.into_iter().map(String::from).collect()),
             ..predefined_request(role_type)
         }

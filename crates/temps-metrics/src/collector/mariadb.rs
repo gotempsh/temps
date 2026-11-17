@@ -991,7 +991,7 @@ fn push_buffer_pool_ratios(out: &mut Points<'_>, status: &impl Fn(&str) -> Optio
         // Lifetime read requests behind the ratio: alert rules on it are only
         // evaluated once there is enough volume to mean something. A gauge
         // (not a `_total` counter) because the evaluator needs the absolute
-        // value, like `pg.cache_blocks_accessed`.
+        // value, like `redis.keyspace_lookups`.
         out.gauge("mariadb.buffer_pool_read_requests", requests);
     }
 

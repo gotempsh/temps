@@ -17,7 +17,7 @@ const providerKey = getGitProviderOptions({ path: { provider_id: 3 } }).queryKey
 const connectionsKey = getProviderConnectionsOptions({
   path: { provider_id: 3 },
 }).queryKey
-const NOT_FOUND = 'Git Provider Not Found'
+const NOT_FOUND = 'Git provider not found'
 
 function createClient() {
   return new QueryClient({

@@ -11,6 +11,7 @@ import {
 import {
   getAiProviderStatusOptions,
   getChatSandboxOptions,
+  getProjectsOptions,
   getAiProviderStatusQueryKey,
   listProviderKeysQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
@@ -52,6 +53,7 @@ import { useFocusComposerShortcut } from './useFocusComposerShortcut'
 import {
   ASSISTANT_CONTEXT_TYPE,
   ASSISTANT_EXAMPLE_PROMPTS,
+  assistantExamplePrompts,
   assistantReadiness,
   setupPathFromProblem,
 } from './assistant-state'
@@ -427,6 +429,16 @@ export function AssistantStart({
     newChatModel.keyId
   )
   const [project, setProject] = useState<ProjectChoice | null>(null)
+  // One project is enough to know the suggestions can be about the user's
+  // own services instead of a demo app.
+  const anyProject = useQuery({
+    ...getProjectsOptions({ query: { page: 1, per_page: 1 } }),
+    staleTime: 60_000,
+  })
+  const examplePrompts = assistantExamplePrompts({
+    hasProjects: (anyProject.data?.total ?? 0) > 0,
+    projectName: project?.name,
+  })
   // The workspace the created chat already joined, so a retry after a failed
   // upload does not join it twice.
   const joined = useRef<string | null>(null)
@@ -747,7 +759,7 @@ export function AssistantStart({
         role="group"
         aria-label="Suggestions"
       >
-        {ASSISTANT_EXAMPLE_PROMPTS.map((prompt) => (
+        {examplePrompts.map((prompt) => (
           <button
             key={prompt}
             type="button"
@@ -836,7 +848,10 @@ export function AssistantThread({
   readOnly,
   syncUrl = false,
 }: {
-  conversation: Pick<ConversationResponse, 'public_id' | 'context_id'>
+  conversation: Pick<ConversationResponse, 'public_id' | 'context_id'> & {
+    /** What kind of chat this is; a new chat is an assistant chat. */
+    context_type?: string
+  }
   firstMessage?: string
   /** Files already uploaded to this chat, sent with `firstMessage`. */
   firstAttachments?: OpeningAttachment[]
@@ -1061,7 +1076,9 @@ export function AssistantThread({
                 key={conversation.public_id}
                 conversationPublicId={conversation.public_id}
                 userScoped
-                contextType={ASSISTANT_CONTEXT_TYPE}
+                contextType={
+                  conversation.context_type ?? ASSISTANT_CONTEXT_TYPE
+                }
                 contextId={conversation.context_id}
                 detailLevel="simple"
                 initialMessage={firstMessage}

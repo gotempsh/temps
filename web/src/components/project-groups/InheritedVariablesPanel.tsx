@@ -61,6 +61,22 @@ export function InheritedVariablesPanel({
   const variables = inherited.data?.variables ?? []
   const manageHref = `${groupHref(group.slug)}?tab=variables`
 
+  // Nothing is inherited, so this is only a way in, not a section of the page.
+  if (variables.length === 0) {
+    return (
+      <p className="flex flex-wrap items-center gap-x-1 gap-y-2 text-sm text-muted-foreground">
+        <Boxes className="mr-1 size-4" aria-hidden="true" />
+        <span>Setting the same value on every service in {group.name}?</span>
+        <Link
+          to={manageHref}
+          className="font-medium text-foreground hover:underline"
+        >
+          Add a shared variable
+        </Link>
+      </p>
+    )
+  }
+
   return (
     <div className="rounded-lg border">
       <div className="flex flex-wrap items-center gap-2 border-b px-4 py-2.5">
@@ -78,56 +94,41 @@ export function InheritedVariablesPanel({
           <Link to={manageHref}>Manage shared variables</Link>
         </Button>
       </div>
-      {variables.length === 0 ? (
-        <p className="px-4 py-3 text-sm text-muted-foreground">
-          {group.name} has no shared variables yet.{' '}
-          <Link
-            to={manageHref}
-            className="font-medium text-foreground underline"
+      <ul className="divide-y">
+        {variables.map((v) => (
+          <li
+            key={`${v.key}-${v.environment_slug ?? 'all'}`}
+            className="flex flex-wrap items-center gap-2 px-4 py-2"
           >
-            Add one
-          </Link>{' '}
-          to give every service in it the same value.
-        </p>
-      ) : (
-        <>
-          <ul className="divide-y">
-            {variables.map((v) => (
-              <li
-                key={`${v.key}-${v.environment_slug ?? 'all'}`}
-                className="flex flex-wrap items-center gap-2 px-4 py-2"
-              >
-                <span
-                  className={
-                    v.defined_on_project
-                      ? 'font-mono text-sm text-muted-foreground line-through'
-                      : 'font-mono text-sm'
-                  }
-                >
-                  {v.key}
-                </span>
-                <Badge variant="secondary" className="font-normal">
-                  {v.environment_slug ?? 'All environments'}
-                </Badge>
-                {v.is_secret && (
-                  <Badge variant="outline" className="font-normal">
-                    Secret
-                  </Badge>
-                )}
-                {v.defined_on_project && (
-                  <span className="text-xs text-muted-foreground">
-                    Overridden by this service&apos;s own {v.key}
-                  </span>
-                )}
-              </li>
-            ))}
-          </ul>
-          <p className="border-t px-4 py-2 text-xs text-muted-foreground">
-            This service&apos;s own variables below win when names match.
-            Changes to shared variables apply on the next deployment.
-          </p>
-        </>
-      )}
+            <span
+              className={
+                v.defined_on_project
+                  ? 'font-mono text-sm text-muted-foreground line-through'
+                  : 'font-mono text-sm'
+              }
+            >
+              {v.key}
+            </span>
+            <Badge variant="secondary" className="font-normal">
+              {v.environment_slug ?? 'All environments'}
+            </Badge>
+            {v.is_secret && (
+              <Badge variant="outline" className="font-normal">
+                Secret
+              </Badge>
+            )}
+            {v.defined_on_project && (
+              <span className="text-xs text-muted-foreground">
+                Overridden by this service&apos;s own {v.key}
+              </span>
+            )}
+          </li>
+        ))}
+      </ul>
+      <p className="border-t px-4 py-2 text-xs text-muted-foreground">
+        This service&apos;s own variables below win when names match. Changes to
+        shared variables apply on the next deployment.
+      </p>
     </div>
   )
 }

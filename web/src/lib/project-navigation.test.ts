@@ -1,149 +1,190 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
-import { describe, expect, test } from 'bun:test'
-import {
-  PROJECT_PRIMARY_ROUTES,
-  PROJECT_SECTION_LINKS,
-  resolveProjectPrimaryRoute,
-  resolveProjectSectionLink,
-} from './project-navigation'
-import {
-  flattenProjectTools,
-  projectToolGroups,
-} from '@/components/project/project-tools'
 
-describe('flat project navigation', () => {
-  test('has direct observability sections and gives security its own home', () => {
-    expect(PROJECT_PRIMARY_ROUTES).toEqual([
-      'project',
-      'deployments',
-      'domains',
-      'environments',
-      'environment-variables',
-      'logs',
-      'errors',
-      'traces',
-      'analytics',
-      'monitoring',
-      'storage',
-      'security',
-      'settings',
-    ])
-    for (const path of [
-      'security',
-      'security/scans/1',
-      'security/scans/1/vulnerabilities/2',
-      'settings/security',
-      'settings/access',
-    ])
-      expect(resolveProjectPrimaryRoute(path)).toBe('security')
-  })
-  test('puts Domains in the main navigation and keeps its old URL', () => {
-    expect(resolveProjectPrimaryRoute('domains')).toBe('domains')
-    expect(resolveProjectPrimaryRoute('settings/domains')).toBe('domains')
-    expect(resolveProjectSectionLink('domains', 'settings/domains', '')).toBe(
-      'domains'
-    )
-    expect(
-      PROJECT_SECTION_LINKS.settings?.some((link) => link.url === 'domains')
-    ).toBe(false)
-  })
-  test('keeps deep links in their owning section', () => {
-    for (const [path, section] of Object.entries({
-      'analytics/pages': 'analytics',
-      'analytics/visitors/42': 'analytics',
-      'errors/12': 'errors',
-      releases: 'errors',
-      'client-outcomes': 'errors',
-      'errors/alert-rules/new': 'monitoring',
-      'traces/abc': 'traces',
-      'ai-gateway?tab=activity': 'traces',
-      runtime: 'logs',
-      'request-logs/42': 'logs',
-      'telemetry-logs': 'logs',
-      'dashboards/custom': 'monitoring',
-      'cron-jobs/12': 'monitoring',
-      'cron-jobs/new': 'monitoring',
-      observe: 'project',
-    } as const))
-      expect(resolveProjectPrimaryRoute(path)).toBe(section)
-    expect(resolveProjectPrimaryRoute('deployments/99')).toBe('deployments')
-    expect(resolveProjectPrimaryRoute('environments/1')).toBe('environments')
-    expect(resolveProjectPrimaryRoute('services/blob')).toBe('storage')
-    expect(resolveProjectPrimaryRoute('')).toBe('project')
-    expect(resolveProjectPrimaryRoute('agents/detail/example')).toBe('settings')
-  })
-  test('selects the most specific sibling and respects legacy build query links', () => {
-    expect(
-      resolveProjectSectionLink('monitoring', 'errors/alert-rules/new', '')
-    ).toBe('errors/alert-rules')
-    expect(
-      resolveProjectSectionLink('analytics', 'analytics/visitors/42', '')
-    ).toBe('analytics/visitors')
-    for (const route of ['build', 'settings/build']) {
-      for (const tab of ['source', 'build', 'deploy', 'previews'])
-        expect(
-          resolveProjectSectionLink('settings', route, `?tab=${tab}`)
-        ).toBe('settings/delivery')
-      expect(resolveProjectSectionLink('settings', route, '?tab=invalid')).toBe(
-        'settings/delivery'
+import { describe, expect, test } from 'bun:test'
+
+import {
+  PROJECT_NAV_GROUPS,
+  PROJECT_NAV_SECTIONS,
+  projectPageWidth,
+  projectTabNamesPage,
+  projectNavGroupsFor,
+  resolveProjectLocation,
+} from './project-navigation'
+
+describe('resolveProjectLocation', () => {
+  test('maps each section landing page to that section', () => {
+    for (const section of PROJECT_NAV_SECTIONS) {
+      expect(resolveProjectLocation(section.tabs[0].url).section.id).toBe(
+        section.id
       )
     }
-    expect(resolveProjectSectionLink('security', 'settings/security', '')).toBe(
-      'settings/security'
+  })
+
+  test('prefers the longest prefix across sections', () => {
+    expect(resolveProjectLocation('errors/alert-rules/new').tab.title).toBe(
+      'Alerts'
+    )
+    expect(resolveProjectLocation('metrics/dashboards/3').tab.title).toBe(
+      'Dashboards'
+    )
+    expect(resolveProjectLocation('metrics').tab.title).toBe('Metrics')
+    expect(resolveProjectLocation('metrics/alerts/new').tab.title).toBe(
+      'Alerts'
+    )
+    const feedback = resolveProjectLocation('errors/feedback/12')
+    expect(feedback.section.id).toBe('errors')
+    expect(feedback.tab.title).toBe('Feedback')
+    expect(resolveProjectLocation('errors/42').tab.title).toBe('Issues')
+  })
+
+  test('keeps detail pages inside their tab', () => {
+    expect(resolveProjectLocation('deployments/9').section.id).toBe(
+      'deployments'
     )
     expect(
-      resolveProjectSectionLink(
-        'environment-variables',
-        'settings/environment-variables',
-        ''
-      )
-    ).toBe('environment-variables')
+      resolveProjectLocation('environment-variables/3/checks').section.id
+    ).toBe('variables')
+    expect(resolveProjectLocation('security/scans/1').tab.title).toBe('Scans')
   })
-  test('environment variables has a direct home while other variable settings stay in Settings', () => {
+
+  test('folds the old build, git and delivery settings into Build & deploy', () => {
     for (const route of [
-      'environment-variables',
-      'environment-variables?environment=1',
-      'settings/environment-variables',
+      'settings/delivery',
+      'connect-repository/connections/1',
     ]) {
-      expect(resolveProjectPrimaryRoute(route)).toBe('environment-variables')
+      expect(resolveProjectLocation(route).section.id).toBe('build')
     }
-    for (const route of [
+  })
+
+  test('does not match a sibling that only shares a string prefix', () => {
+    expect(resolveProjectLocation('settings/securityx').section.id).toBe(
+      'general'
+    )
+  })
+
+  test('falls back to the overview for an unknown path', () => {
+    expect(resolveProjectLocation('nope').section.id).toBe('overview')
+    expect(resolveProjectLocation('').section.id).toBe('overview')
+  })
+})
+
+describe('projectNavGroupsFor', () => {
+  const titles = (sourceType: string) =>
+    projectNavGroupsFor({ source_type: sourceType }).flatMap((group) =>
+      group.sections.map(
+        (section) =>
+          `${section.title}: ${section.tabs.map((tab) => tab.title).join(', ')}`
+      )
+    )
+
+  test('a hosted service gets the whole menu', () => {
+    expect(projectNavGroupsFor({ source_type: 'git' })).toBe(PROJECT_NAV_GROUPS)
+  })
+
+  test('a monitoring-only project keeps only the pages it registers', () => {
+    const menu = titles('external')
+    expect(menu).toContain('Overview: Overview')
+    expect(menu).toContain('General: General')
+    // Hosting sections disappear entirely, not as empty headings.
+    expect(menu.some((entry) => entry.startsWith('Deployments'))).toBe(false)
+    expect(menu.some((entry) => entry.startsWith('Build & deploy'))).toBe(false)
+    // A section keeps the tabs a monitoring project has.
+    const monitoring = menu.find((entry) => entry.startsWith('Monitoring'))
+    expect(monitoring).toContain('Uptime')
+    expect(monitoring).toContain('Check-ins')
+    // An external project runs no jobs of its own; it only reports check-ins.
+    expect(monitoring).not.toContain('Cron jobs')
+  })
+
+  test("a monitoring-only project's integrations page highlights Overview", () => {
+    expect(resolveProjectLocation('integrations').section.id).toBe('overview')
+  })
+})
+
+describe('projectTabNamesPage', () => {
+  const names = (route: string) =>
+    projectTabNamesPage(route, resolveProjectLocation(route))
+
+  test("a tab's own page is named by the tab strip", () => {
+    expect(names('metrics/explore')).toBe(true)
+    expect(names('metrics')).toBe(true)
+    expect(names('errors')).toBe(true)
+    expect(names('analytics/visitors')).toBe(true)
+  })
+
+  test('a record below a tab keeps its own title', () => {
+    expect(names('errors/42')).toBe(false)
+    expect(names('metrics/dashboards/3')).toBe(false)
+    expect(names('security/scans/1')).toBe(false)
+  })
+
+  test('a section without a tab strip keeps its title', () => {
+    expect(names('deployments')).toBe(false)
+    expect(names('domains')).toBe(false)
+    expect(names('settings/general')).toBe(false)
+  })
+})
+
+describe('projectPageWidth', () => {
+  const widthOf = (route: string, search = '') =>
+    projectPageWidth(resolveProjectLocation(route), search)
+
+  test('Configure forms are narrow, its tables use the full width', () => {
+    const configure = PROJECT_NAV_GROUPS.find((g) => g.label === 'Configure')
+    expect(configure).toBeDefined()
+    const tables = new Set([
+      'environment-variables',
       'settings/variables',
-      'settings/secrets',
       'settings/deployment-tokens',
-    ]) {
-      expect(resolveProjectPrimaryRoute(route)).toBe('settings')
-    }
-  })
-  test('monitoring lists metrics, uptime, cron jobs, status pages and alert rules', () => {
-    expect(PROJECT_SECTION_LINKS.monitoring?.map((link) => link.url)).toEqual([
-      'metrics',
-      'monitors',
-      'cron-jobs',
-      'status-pages',
-      'errors/alert-rules',
+      'settings/edge-rules',
+      'security',
     ])
-    for (const route of ['status-pages', 'status-pages/7']) {
-      expect(resolveProjectPrimaryRoute(route)).toBe('monitoring')
-      expect(resolveProjectSectionLink('monitoring', route, '')).toBe(
-        'status-pages'
-      )
+    for (const section of configure?.sections ?? []) {
+      for (const tab of section.tabs) {
+        expect([tab.url, widthOf(tab.url)]).toEqual([
+          tab.url,
+          tables.has(tab.url) ? 'full' : 'form',
+        ])
+      }
     }
   })
-  test('settings has only six destinations', () => {
-    expect(PROJECT_SECTION_LINKS.settings).toHaveLength(6)
+
+  test('logs, traces and session replays use the full width', () => {
+    expect(widthOf('runtime')).toBe('full')
+    expect(widthOf('request-logs')).toBe('full')
+    expect(widthOf('traces')).toBe('full')
+    expect(widthOf('analytics/replays')).toBe('full')
+    expect(widthOf('analytics/replays/abc')).toBe('full')
   })
-  test('every existing tool has a direct contextual destination', () => {
-    for (const tool of flattenProjectTools(projectToolGroups)) {
-      const [route, search] = tool.url.split('?')
-      const section = resolveProjectPrimaryRoute(route)
-      expect(
-        resolveProjectSectionLink(section, route, search ?? '')
-      ).toBeDefined()
+
+  test('lists and dashboards use the full width', () => {
+    expect(widthOf('deployments')).toBe('full')
+    expect(widthOf('project')).toBe('full')
+    expect(widthOf('analytics')).toBe('full')
+    expect(widthOf('errors')).toBe('full')
+  })
+
+  test("an environment's settings view is a form, its dashboard is not", () => {
+    expect(widthOf('environments', '?view=settings&env=production')).toBe(
+      'form'
+    )
+    expect(widthOf('environments', '?view=containers')).toBe('full')
+    expect(widthOf('environments')).toBe('full')
+  })
+})
+
+describe('tab icons', () => {
+  test('a section and its landing tab share an icon, so the menu and the tabs read as one', () => {
+    for (const section of PROJECT_NAV_SECTIONS) {
+      expect(section.tabs[0].icon).toBe(section.icon)
     }
-    for (const [section, links] of Object.entries(PROJECT_SECTION_LINKS))
-      for (const link of links ?? [])
-        expect(String(resolveProjectPrimaryRoute(link.url))).toEqual(section)
+  })
+
+  test('no two tabs of a section share an icon', () => {
+    for (const section of PROJECT_NAV_SECTIONS) {
+      const icons = section.tabs.map((tab) => tab.icon)
+      expect(new Set(icons).size).toBe(icons.length)
+    }
   })
 })

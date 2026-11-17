@@ -15,12 +15,16 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
-import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
-import { ChevronLeft, Globe } from 'lucide-react'
+import { ChevronLeft, Globe, ShieldOff } from 'lucide-react'
 import * as React from 'react'
 import { useNavigate, useSearchParams } from 'react-router'
 import { buildAnalyticsDimensionUrl } from './viewAllUrl'
+import {
+  ExcludeTrafficDialog,
+  type ExcludeTrafficTarget,
+} from '../ExcludeTrafficDialog'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 interface ReferrersChartProps {
   project: ProjectResponse
@@ -40,8 +44,10 @@ export function ReferrersChart({
   const [selectedReferrer, setSelectedReferrer] = React.useState<string | null>(
     null
   )
+  const [excludeTarget, setExcludeTarget] =
+    React.useState<ExcludeTrafficTarget | null>(null)
 
-  const { data, isLoading, error } = useQuery({
+  const { data, isLoading, error } = useWindowQuery({
     ...getPropertyBreakdownOptions({
       path: {
         project_id: project.id,
@@ -59,7 +65,7 @@ export function ReferrersChart({
   })
 
   // When a referrer is selected, show top pages filtered by that referrer
-  const { data: pagesData } = useQuery({
+  const { data: pagesData } = useWindowQuery({
     ...getPropertyBreakdownOptions({
       path: {
         project_id: project.id,
@@ -131,7 +137,7 @@ export function ReferrersChart({
               <p className="text-sm font-mono">{selectedReferrer}</p>
             </div>
             {selectedReferrer !== 'Direct' && (
-              <div>
+              <div className="flex flex-wrap items-center gap-2">
                 <Badge variant="outline" className="text-xs">
                   <a
                     href={`https://${selectedReferrer}`}
@@ -143,12 +149,26 @@ export function ReferrersChart({
                     <Globe className="h-3 w-3" />
                   </a>
                 </Badge>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-7 text-xs"
+                  onClick={() =>
+                    setExcludeTarget({
+                      kind: 'referrer',
+                      value: selectedReferrer,
+                    })
+                  }
+                >
+                  <ShieldOff className="mr-1.5 h-3 w-3" />
+                  Exclude from analytics
+                </Button>
               </div>
             )}
             {pagesData && pagesData.items.length > 0 && (
               <div>
                 <p className="text-sm font-medium mb-2 text-muted-foreground">
-                  Top Pages
+                  Top pages
                 </p>
                 <div className="space-y-2">
                   {pagesData.items.slice(0, 5).map((page) => (
@@ -169,6 +189,12 @@ export function ReferrersChart({
             )}
           </div>
         </CardContent>
+        <ExcludeTrafficDialog
+          projectId={project.id}
+          projectSlug={project.slug}
+          target={excludeTarget}
+          onClose={() => setExcludeTarget(null)}
+        />
       </Card>
     )
   }

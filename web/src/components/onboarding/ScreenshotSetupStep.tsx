@@ -93,7 +93,7 @@ export function ScreenshotSetupStep({
             <Camera className="h-8 w-8 text-primary" />
           </div>
         </div>
-        <h2 className="text-2xl font-bold">Screenshot Generation</h2>
+        <h2 className="text-2xl font-bold">Screenshot generation</h2>
         <p className="text-muted-foreground">
           Automatically capture preview images of your deployments
         </p>
@@ -118,7 +118,7 @@ export function ScreenshotSetupStep({
       <div className="flex items-center justify-between p-6 border-2 rounded-lg bg-accent/50">
         <div className="space-y-1">
           <Label htmlFor="screenshot-toggle" className="text-base font-medium">
-            Enable Screenshot Generation
+            Enable screenshot generation
           </Label>
           <p className="text-sm text-muted-foreground">
             Use local browser to capture deployment previews
@@ -132,7 +132,7 @@ export function ScreenshotSetupStep({
       </div>
 
       {enabled && (
-        <Alert className="border-blue-200 bg-blue-50/50 dark:bg-blue-950/20">
+        <Alert className="border-blue-200 dark:border-blue-900 bg-blue-50/50 dark:bg-blue-950/20">
           <CheckCircle2 className="h-4 w-4 text-blue-600" />
           <AlertDescription>
             <p className="text-sm">
@@ -145,7 +145,7 @@ export function ScreenshotSetupStep({
 
       <div className="flex justify-between">
         <Button variant="outline" onClick={handleSkip}>
-          Skip for Now
+          Skip for now
         </Button>
         <Button onClick={handleSave} disabled={updateSettings.isPending}>
           {updateSettings.isPending ? (

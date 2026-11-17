@@ -99,6 +99,8 @@ fi
 echo -e "${GREEN}Installing git hooks using $HOOK_TOOL...${NC}"
 "$HOOK_TOOL" install
 "$HOOK_TOOL" install --hook-type commit-msg
+# The full-workspace clippy hook runs at push time.
+"$HOOK_TOOL" install --hook-type pre-push
 
 echo ""
 echo -e "${GREEN}✅ Git hooks installed using $HOOK_TOOL!${NC}"

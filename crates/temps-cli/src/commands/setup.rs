@@ -21,7 +21,8 @@ use std::io::{self, Write};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use temps_auth::UserService;
-use temps_core::{url_validation::validate_ipv4, AppSettings, EncryptionService};
+use temps_config::AppSettings;
+use temps_core::{url_validation::validate_ipv4, EncryptionService};
 use temps_dns::providers::credentials::{
     AzureCredentials, CloudflareCredentials, DigitalOceanCredentials, GcpCredentials,
     ProviderCredentials, Route53Credentials,
@@ -84,7 +85,7 @@ pub enum TlsMode {
 pub struct SetupCommand {
     /// Database connection URL. Prefer TEMPS_DATABASE_URL (or TEMPS_DATABASE_URL_FILE / the systemd credential temps_database_url): the flag form puts the password in the process command line
     #[arg(long, env = "TEMPS_DATABASE_URL", hide_env_values = true)]
-    pub database_url: String,
+    pub database_url: Option<String>,
 
     /// Data directory for storing configuration and runtime files
     #[arg(long, env = "TEMPS_DATA_DIR")]
@@ -502,7 +503,6 @@ async fn create_dns_provider(
 
 /// Result of git provider creation
 pub struct GitProviderCreationResult {
-    #[allow(dead_code)] // Provider is available for future use (e.g., repository sync)
     pub provider: git_providers::Model,
     pub connection: git_provider_connections::Model,
 }
@@ -613,7 +613,7 @@ async fn create_git_provider(
 }
 
 async fn verify_cloudflare_token(token: &str) -> anyhow::Result<bool> {
-    let provider = CloudflareDnsProvider::new(token.to_string());
+    let provider = CloudflareDnsProvider::new(token.to_string())?;
     match provider.test_api_access().await {
         Ok(true) => Ok(true),
         Ok(false) => Err(anyhow::anyhow!(
@@ -867,7 +867,6 @@ fn print_warning(message: &str) {
     println!("{} {}", "⚠️ ".bright_yellow(), message.bright_yellow());
 }
 
-#[allow(dead_code)]
 fn print_error(message: &str) {
     println!("{} {}", "❌".bright_red(), message.bright_red());
 }
@@ -1090,7 +1089,7 @@ fn show_geolite2_missing_warning(data_dir: &Path) {
     println!(
         "   {} {}",
         "📍".bright_yellow(),
-        "GeoLite2-City.mmdb is required to run the application".bright_white()
+        "GeoLite2-City.mmdb is needed for geolocation".bright_white()
     );
     println!(
         "{}",
@@ -1131,7 +1130,7 @@ fn show_geolite2_missing_warning(data_dir: &Path) {
     );
     println!();
     println!(
-        "   {} Setup can continue, but {} will fail without this file.",
+        "   {} Setup can continue; {} runs without geolocation until this file is provided.",
         "ℹ️ ".bright_blue(),
         "temps serve".bright_cyan()
     );
@@ -1688,6 +1687,12 @@ impl SetupCommand {
     }
 
     pub fn execute(mut self) -> anyhow::Result<()> {
+        // Setup provisions the database it is given, never a discovered one.
+        let database_url = crate::database_url_source::resolve_database_url(
+            self.database_url.as_deref(),
+            crate::database_url_source::UrlDiscovery::ThisProcess,
+        )?
+        .into_url();
         self.resolve_installation_inputs()?;
         print_header();
 
@@ -1774,7 +1779,7 @@ impl SetupCommand {
         print_section("Database Setup");
         print_substep("Checking database connectivity...");
 
-        let db = match rt.block_on(temps_database::establish_connection(&self.database_url)) {
+        let db = match rt.block_on(temps_schema::establish_connection(&database_url)) {
             Ok(db) => {
                 print_substep(&format!("{} Database reachable", "✓".bright_green()));
                 print_substep("Running migrations...");
@@ -2226,7 +2231,7 @@ impl SetupCommand {
 
                 let cf_provider = CloudflareDnsProvider::new(cloudflare_token_for_dns.clone().ok_or_else(|| {
                     anyhow::anyhow!("DNS A record creation requires Cloudflare provider. Use --skip-dns-records to skip.")
-                })?);
+                })?)?;
 
                 print_section("DNS A Record Setup");
                 let wildcard_record_name = if subdomain_prefix.is_empty() {
@@ -2353,7 +2358,7 @@ impl SetupCommand {
 
                 let cf_provider = CloudflareDnsProvider::new(cloudflare_token_for_dns.clone().ok_or_else(|| {
                     anyhow::anyhow!("DNS A record creation requires Cloudflare provider. Use --skip-dns-records to skip.")
-                })?);
+                })?)?;
 
                 print_section("DNS A Record Setup");
                 let wildcard_record_name = if subdomain_prefix.is_empty() {
@@ -2446,7 +2451,7 @@ impl SetupCommand {
         print_step(1, 8, "Verifying Cloudflare zone and detecting server IP");
         let cf_provider = CloudflareDnsProvider::new(cloudflare_token_for_dns.clone().ok_or_else(|| {
                     anyhow::anyhow!("DNS A record creation requires Cloudflare provider. Use --skip-dns-records to skip.")
-                })?);
+                })?)?;
 
         // Extract base domain from wildcard (e.g., "*.app.example.com" -> "example.com")
         let base_domain = wildcard_domain
@@ -2549,7 +2554,6 @@ impl SetupCommand {
 
         // Set Let's Encrypt environment based on --letsencrypt-staging flag
         if self.letsencrypt_staging {
-            std::env::set_var("LETSENCRYPT_MODE", "staging");
             print_substep(&format!(
                 "{} Using Let's Encrypt staging environment",
                 "ℹ".bright_blue()
@@ -2563,7 +2567,15 @@ impl SetupCommand {
                 encryption_service_arc.clone(),
             ));
         let cert_provider: std::sync::Arc<dyn temps_domains::tls::CertificateProvider> =
-            std::sync::Arc::new(LetsEncryptProvider::new(repository.clone()));
+            std::sync::Arc::new(
+                LetsEncryptProvider::new(repository.clone()).with_environment(
+                    if self.letsencrypt_staging {
+                        "staging"
+                    } else {
+                        "production"
+                    },
+                ),
+            );
         let domain_service = DomainService::new(
             db.clone(),
             cert_provider,

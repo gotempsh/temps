@@ -79,7 +79,7 @@ test('verified empty provider list explains the page and offers Add Provider', (
   const html = render(client)
   expect(html).toContain('No notification providers configured')
   expect(html).toContain('Add your first notification provider')
-  expect(html).toContain('Add Provider')
+  expect(html).toContain('Add provider')
   expect(html).not.toContain('Only administrators can')
   // The compact variant: no 400px legacy panel.
   expect(html).toContain('min-h-60')
@@ -92,7 +92,7 @@ test('empty provider list offers no Add Provider to a non-administrator', () => 
   client.setQueryData(listKey, [] as NotificationProviderResponse[])
   const html = render(client, 'reader')
   expect(html).toContain('No notification providers configured')
-  expect(html).not.toContain('Add Provider')
+  expect(html).not.toContain('Add provider')
   expect(html).toContain('Only administrators can add or change providers')
   client.clear()
 })
@@ -105,7 +105,7 @@ for (const error of [serverError, new TypeError('Failed to fetch')]) {
     expect(html).toContain('Notification providers unavailable')
     expect(html).toContain('Retry')
     expect(html).not.toContain('No notification providers configured')
-    expect(html).not.toContain('Add Provider')
+    expect(html).not.toContain('Add provider')
     client.clear()
   })
 }

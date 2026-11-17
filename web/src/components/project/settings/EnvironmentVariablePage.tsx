@@ -36,7 +36,7 @@ export function EnvironmentVariablePage({
   const [backPath] = useState(() =>
     detailReturnPath(location.state, project.slug, listPath)
   )
-  const backLabel = backPath === listPath ? 'Environment Variables' : 'Back'
+  const backLabel = backPath === listPath ? 'Environment variables' : 'Back'
   return (
     <div className="w-full min-w-0 space-y-5">
       <Link
@@ -62,7 +62,7 @@ export function EnvironmentVariablePage({
             This variable may have been deleted or is not part of this service.
           </p>
           <Button asChild variant="outline">
-            <Link to={backPath}>Back to Environment Variables</Link>
+            <Link to={backPath}>Back to environment variables</Link>
           </Button>
         </div>
       ) : configure ? (

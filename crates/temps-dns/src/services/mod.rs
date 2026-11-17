@@ -20,6 +20,7 @@ pub mod dns_registry;
 pub mod domain_delivery;
 pub mod hostname_sync;
 pub mod managed_records;
+pub mod observability;
 pub mod provider_service;
 pub mod record_service;
 

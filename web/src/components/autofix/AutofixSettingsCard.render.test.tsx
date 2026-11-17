@@ -13,6 +13,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router'
 import { getAutofixCapabilityOptions } from '@/api/client/@tanstack/react-query.gen'
 import { client } from '@/api/client/client.gen'
+import { restoreApiClient } from '@/test/api-client'
 import type {
   AutofixCapabilityResponse,
   AutofixSettingsResponse,
@@ -26,7 +27,7 @@ const originalConfig = client.getConfig()
 
 afterEach(() => {
   cleanup()
-  client.setConfig(originalConfig)
+  restoreApiClient(originalConfig)
 })
 
 const PROJECT = 7
@@ -139,6 +140,17 @@ test('pausing autofix keeps the policy edits that are not saved yet', async () =
   ])
   expect(command.value).toBe('bun test')
   expect(paths.value).toBe('migrations/**')
+})
+
+test('the modes stack in one column, at every width, so their details stay readable', async () => {
+  serve()
+  renderCard()
+
+  const modes = await screen.findByRole('radiogroup')
+
+  expect(screen.getAllByRole('radio')).toHaveLength(3)
+  expect(modes.className).toContain('grid-cols-1')
+  expect(modes.className).not.toMatch(/grid-cols-[2-9]/)
 })
 
 test('saving makes the saved values the form baseline', async () => {

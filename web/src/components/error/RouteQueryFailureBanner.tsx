@@ -15,7 +15,12 @@ import { useCallback, useRef, useSyncExternalStore } from 'react'
 function sameFailures(a: RouteQueryFailure[], b: RouteQueryFailure[]): boolean {
   return (
     a.length === b.length &&
-    a.every((f, i) => f.queryHash === b[i].queryHash && f.error === b[i].error)
+    a.every(
+      (f, i) =>
+        f.queryHash === b[i].queryHash &&
+        f.error === b[i].error &&
+        f.retained === b[i].retained
+    )
   )
 }
 
@@ -66,6 +71,8 @@ export function RouteQueryFailureBanner({
 
   const failure = representativeFailure(failures)
   if (!failure) return null
+  // A moved window that did not load leaves the earlier window on screen.
+  const retained = failures.every((f) => f.retained)
 
   return (
     <div
@@ -74,9 +81,14 @@ export function RouteQueryFailureBanner({
     >
       <ReadFailure
         resource={
-          failures.length > 1 ? 'Some data on this page' : 'Data on this page'
+          retained
+            ? 'Latest data on this page'
+            : failures.length > 1
+              ? 'Some data on this page'
+              : 'Data on this page'
         }
         error={failure.error}
+        cached={retained}
         onRetry={retry}
         retrying={retrying}
         routeLevel

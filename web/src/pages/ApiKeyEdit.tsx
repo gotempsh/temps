@@ -12,6 +12,7 @@ import {
   CardTitle,
 } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
+import { PageHeader } from '@/components/layout/PageContainer'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
@@ -38,9 +39,14 @@ import {
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { isVerifiedNotFound } from '@/lib/read-failure'
 import { listApiKeysQueryKey } from '@/api/client/@tanstack/react-query.gen'
+import {
+  earliestExpiryDate,
+  expiryDateInput,
+  expiryForUpdate,
+} from './api-key-expiry'
 
 export default function ApiKeyEdit() {
-  usePageTitle('Edit API Key')
+  usePageTitle('Edit API key')
   const navigate = useNavigate()
   const { id } = useParams<{ id: string }>()
   const queryClient = useQueryClient()
@@ -68,16 +74,18 @@ export default function ApiKeyEdit() {
       setFormData({
         name: apiKey.name,
         is_active: apiKey.is_active,
-        expires_at: apiKey.expires_at
-          ? new Date(apiKey.expires_at).toISOString().split('T')[0]
-          : '',
+        expires_at: expiryDateInput(apiKey.expires_at),
       })
     }
   }
 
   const updateMutation = useMutation({
     mutationFn: (data: UpdateApiKeyRequest) =>
-      updateApiKey({ path: { id: parseInt(id!) }, body: data }),
+      updateApiKey({
+        path: { id: parseInt(id!) },
+        body: data,
+        throwOnError: true,
+      }),
     meta: {
       errorTitle: 'Failed to update API key',
     },
@@ -93,12 +101,23 @@ export default function ApiKeyEdit() {
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
+    // The server keeps the stored expiry when none is sent, so an emptied
+    // date would report success and change nothing.
+    if (formData.expires_at === '' && loadedApiKey?.expires_at) {
+      toast.error('The expiration date cannot be removed', {
+        description:
+          'Pick a new date, or create a new key that never expires and revoke this one.',
+      })
+      return
+    }
     const data: UpdateApiKeyRequest = {
       name: formData.name,
       is_active: formData.is_active,
-      expires_at: formData.expires_at
-        ? new Date(formData.expires_at).toISOString()
-        : null,
+      // An untouched date keeps the stored expiry, time of day included.
+      expires_at: expiryForUpdate(
+        formData.expires_at,
+        loadedApiKey?.expires_at
+      ),
     }
     updateMutation.mutate(data)
   }
@@ -139,7 +158,7 @@ export default function ApiKeyEdit() {
         />
         <Button variant="ghost" onClick={() => navigate('/settings/keys')}>
           <ArrowLeft className="mr-2 h-4 w-4" />
-          Back to API Keys
+          Back to API keys
         </Button>
       </div>
     )
@@ -151,13 +170,13 @@ export default function ApiKeyEdit() {
         <Card>
           <CardContent className="py-12 text-center">
             <AlertCircle className="h-12 w-12 text-muted-foreground mx-auto mb-4" />
-            <h3 className="text-lg font-medium">API Key not found</h3>
+            <h3 className="text-lg font-medium">API key not found</h3>
             <p className="text-muted-foreground mt-2">
               The API key you&apos;re looking for doesn&apos;t exist or has been
               deleted.
             </p>
             <Button className="mt-4" onClick={() => navigate('/settings/keys')}>
-              Back to API Keys
+              Back to API keys
             </Button>
           </CardContent>
         </Card>
@@ -165,30 +184,29 @@ export default function ApiKeyEdit() {
     )
   }
 
+  const expiryChanged =
+    formData.expires_at !== '' &&
+    formData.expires_at !== expiryDateInput(apiKey.expires_at)
   const isExpired =
     apiKey.expires_at && new Date(apiKey.expires_at) < new Date()
+  const hasStoredExpiry = Boolean(apiKey.expires_at)
 
   return (
     <div className="w-full min-w-0 space-y-6">
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-4">
-          <Button
-            aria-label="Back"
-            variant="ghost"
-            size="icon"
-            onClick={() => navigate('/settings/keys')}
-          >
-            <ArrowLeft className="h-4 w-4" />
-          </Button>
-          <div>
-            <h1 className="text-2xl font-semibold tracking-tight">
-              Edit API Key
-            </h1>
-            <p className="text-muted-foreground mt-1">
-              Update settings for your API key
-            </p>
-          </div>
-        </div>
+      <div className="flex items-start gap-4">
+        <Button
+          aria-label="Back"
+          variant="ghost"
+          size="icon"
+          onClick={() => navigate('/settings/keys')}
+        >
+          <ArrowLeft className="h-4 w-4" />
+        </Button>
+        <PageHeader
+          className="min-w-0 flex-1"
+          title="Edit API key"
+          description="Update settings for your API key"
+        />
       </div>
 
       {/* Editing stale settings would save over changes made since, so a
@@ -207,7 +225,7 @@ export default function ApiKeyEdit() {
         {/* Key Information Card */}
         <Card>
           <CardHeader>
-            <CardTitle>Key Information</CardTitle>
+            <CardTitle>Key information</CardTitle>
             <CardDescription>
               View and manage your API key details
             </CardDescription>
@@ -218,7 +236,7 @@ export default function ApiKeyEdit() {
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                 <div>
                   <Label className="text-muted-foreground text-xs">
-                    Key Prefix
+                    Key prefix
                   </Label>
                   <p className="font-mono text-sm mt-1">
                     {apiKey.key_prefix}...
@@ -234,7 +252,7 @@ export default function ApiKeyEdit() {
                 </div>
                 <div>
                   <Label className="text-muted-foreground text-xs">
-                    Last Used
+                    Last used
                   </Label>
                   <p className="text-sm mt-1">
                     {apiKey.last_used_at
@@ -277,7 +295,7 @@ export default function ApiKeyEdit() {
                     className="flex items-center gap-2"
                   >
                     <Activity className="h-4 w-4" />
-                    Active Status
+                    Active status
                   </Label>
                   <p className="text-sm text-muted-foreground">
                     Disable this key to temporarily revoke access
@@ -295,7 +313,7 @@ export default function ApiKeyEdit() {
               <div className="space-y-2">
                 <Label htmlFor="expires_at" className="flex items-center gap-2">
                   <Calendar className="h-4 w-4" />
-                  Expiration Date
+                  Expiration date
                 </Label>
                 <Input
                   id="expires_at"
@@ -304,11 +322,19 @@ export default function ApiKeyEdit() {
                   onChange={(e) =>
                     setFormData({ ...formData, expires_at: e.target.value })
                   }
-                  min={new Date().toISOString().split('T')[0]}
+                  // Only a newly picked date must be in the future: an
+                  // already-expired key can still be renamed or deactivated.
+                  min={expiryChanged ? earliestExpiryDate() : undefined}
+                  required={hasStoredExpiry}
+                  aria-describedby="expires_at_hint"
                 />
-                <p className="text-sm text-muted-foreground">
-                  Leave empty for no expiration. Current keys expire on the set
-                  date.
+                <p
+                  id="expires_at_hint"
+                  className="text-sm text-muted-foreground"
+                >
+                  {hasStoredExpiry
+                    ? 'The key stops working on this date. Pick a new date to change it; an expiration date cannot be removed.'
+                    : 'Leave empty for no expiration, or pick the date the key stops working.'}
                 </p>
                 {isExpired && (
                   <Alert variant="destructive">
@@ -349,7 +375,7 @@ export default function ApiKeyEdit() {
                   </div>
                 ) : (
                   <div className="p-4 bg-muted/50 rounded-lg">
-                    <p className="text-sm font-medium">Custom Permissions</p>
+                    <p className="text-sm font-medium">Custom permissions</p>
                     <p className="text-xs text-muted-foreground">
                       This key has custom permissions configured
                     </p>
@@ -378,7 +404,7 @@ export default function ApiKeyEdit() {
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
               <Clock className="h-5 w-5" />
-              Usage Information
+              Usage information
             </CardTitle>
             <CardDescription>
               Track when and how this API key is being used
@@ -406,7 +432,7 @@ export default function ApiKeyEdit() {
                 </div>
                 <div className="space-y-1">
                   <Label className="text-muted-foreground text-xs">
-                    Last Activity
+                    Last activity
                   </Label>
                   <p className="text-sm">
                     {apiKey.last_used_at
@@ -429,7 +455,7 @@ export default function ApiKeyEdit() {
             Cancel
           </Button>
           <Button type="submit" disabled={updateMutation.isPending}>
-            {updateMutation.isPending ? 'Saving...' : 'Save Changes'}
+            {updateMutation.isPending ? 'Saving...' : 'Save'}
           </Button>
         </div>
       </form>

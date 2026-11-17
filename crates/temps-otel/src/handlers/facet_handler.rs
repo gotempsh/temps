@@ -48,7 +48,7 @@ use crate::handlers::audit::{FacetBackfillRetriedAudit, FacetCreatedAudit, Facet
 use crate::services::facet_service::FacetError;
 use crate::services::FacetInfo;
 use crate::OtelAppState;
-use temps_auth::{permission_guard, RequireAuth};
+use temps_authz::{permission_guard, RequireAuth};
 use temps_core::problemdetails::{self, Problem};
 use temps_core::{AuditContext, ProblemDetails, RequestMetadata};
 
@@ -61,10 +61,10 @@ use temps_core::{AuditContext, ProblemDetails, RequestMetadata};
 /// shared spans table even if `OtelWrite` were later added to the
 /// deployment-token permission mapping in `AuthContext::has_permission`.
 fn require_instance_admin(
-    auth: &temps_auth::context::AuthContext,
+    auth: &temps_authz::context::AuthContext,
     operation: &str,
 ) -> Result<(), Problem> {
-    if auth.is_admin() || auth.has_role(&temps_auth::Role::PlatformAdmin) {
+    if auth.is_admin() || auth.has_role(&temps_authz::Role::PlatformAdmin) {
         return Ok(());
     }
     Err(
@@ -339,8 +339,8 @@ pub async fn retry_facet_backfill(
 mod tests {
     use super::require_instance_admin;
     use axum::response::IntoResponse;
-    use temps_auth::permissions::Permission;
-    use temps_auth::{AuthContext, Role};
+    use temps_authz::permissions::Permission;
+    use temps_authz::{AuthContext, Role};
     use temps_entities::deployment_tokens::DeploymentTokenPermission;
 
     fn user(role: Role) -> AuthContext {

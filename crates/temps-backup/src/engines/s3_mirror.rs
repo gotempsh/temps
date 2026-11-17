@@ -67,7 +67,7 @@ use tracing::{info, warn};
 
 use super::oneshot::{run_one_shot, OneShotError, OneShotSpec};
 use super::v2_common;
-use temps_backup_core::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
+use crate::execution::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
 use temps_providers::externalsvc::SensitiveValues;
 
 pub(crate) const ENGINE_KEY: &str = "s3_mirror";
@@ -511,7 +511,11 @@ fn build_mirror_script(source_path: &str, dest_path: &str, dest_session_token: b
     )
 }
 
-fn build_dest_prefix(bucket_path: &str, service_name: &str, backup_uuid: &str) -> String {
+pub(crate) fn build_dest_prefix(
+    bucket_path: &str,
+    service_name: &str,
+    backup_uuid: &str,
+) -> String {
     let base = bucket_path.trim_matches('/');
     if base.is_empty() {
         format!("external_services/s3/{}/{}", service_name, backup_uuid)
@@ -579,7 +583,7 @@ async fn list_source_buckets(
     Ok(bucket_names)
 }
 
-async fn list_total_s3_size(
+pub(crate) async fn list_total_s3_size(
     client: &S3Client,
     bucket: &str,
     prefix: &str,

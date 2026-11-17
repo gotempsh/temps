@@ -153,7 +153,10 @@ http {
       # Authorization header into the Temps application.
       proxy_http_version 1.1;
       proxy_set_header Authorization "";
-      proxy_set_header Host \$host;
+      # \$http_host keeps the port the browser used. \$host strips it, and
+      # validate_websocket_origin then rejects every console WebSocket on a
+      # non-default port (Origin localhost:9001 vs Host localhost).
+      proxy_set_header Host \$http_host;
       proxy_set_header X-Forwarded-For \$proxy_protocol_addr;
       proxy_set_header X-Forwarded-Proto \$scheme;
       proxy_set_header Upgrade \$http_upgrade;

@@ -29,13 +29,13 @@ service on the control-plane host. PostgreSQL, MariaDB/MySQL, MongoDB, and
 Redis are supported; check before assuming:
 
 ```bash
-bunx @temps-sdk/cli@0.1.38 --target-context production services import-data-availability --id <service-id>
+bunx @temps-sdk/cli@latest --target-context production services import-data-availability --id <service-id>
 ```
 
 It reports whether the engine supports imports, whether one can start now
 (and why not), the accepted source schemes and options, whether a failed
 import is all-or-nothing, and the target-name limit. If the command is
-unknown, the pinned CLI predates this feature: say so instead of falling back
+unknown, the current CLI predates this feature: say so instead of falling back
 to raw API calls.
 
 1. **Pick the target.** A project environment reads the database it is linked
@@ -53,7 +53,7 @@ to raw API calls.
 4. **Run and wait for the result:**
 
    ```bash
-   bunx @temps-sdk/cli@0.1.38 --target-context production services import-data \
+   bunx @temps-sdk/cli@latest --target-context production services import-data \
      --id <service-id> --target <database> --source-url-env SOURCE_DATABASE_URL --yes
    ```
 
@@ -67,7 +67,7 @@ to raw API calls.
 5. **Report from the run, not from assumptions:**
 
    ```bash
-   bunx @temps-sdk/cli@0.1.38 --target-context production services import-data-run --id <service-id> --run <run-id>
+   bunx @temps-sdk/cli@latest --target-context production services import-data-run --id <service-id> --run <run-id>
    ```
 
    A succeeded run reports the tables/collections/keys and size it measured

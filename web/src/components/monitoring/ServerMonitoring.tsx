@@ -581,7 +581,10 @@ export function ServerMonitoring({
   // hold. Other roles get one explanation below and send no metric requests.
   const canReadNodeMetrics = useIsInstanceAdmin()
   // ADR 061: one node, or all of them. Hidden with only the control plane.
-  const nodes = useMetricNodeScope(canReadNodeMetrics)
+  const nodes = useMetricNodeScope(
+    canReadNodeMetrics,
+    nodeId == null ? 'first' : 'all'
+  )
   const pinned = nodeId != null
   const scope: NodeScope = useMemo(
     () => (nodeId != null ? { kind: 'node', id: nodeId } : nodes.scope),
@@ -634,7 +637,7 @@ export function ServerMonitoring({
     'node.disk_used_bytes',
     '7d',
     refetchInterval,
-    metricsEnabled,
+    metricsEnabled && scope.kind === 'node',
     scope
   )
   const rx = useNodeSeries(
@@ -683,7 +686,12 @@ export function ServerMonitoring({
 
   const cpuPeak = peakOf(cpu.data)
   const memPeak = peakOf(memory.data)
-  const projection = projectDisk(diskHistory.data, diskTotal)
+  const projection = projectDisk(
+    diskHistory.data,
+    diskTotal,
+    undefined,
+    scope.kind === 'node'
+  )
 
   const rxRate = toRatePerSecond(rx.data, step)
   const txRate = toRatePerSecond(tx.data, step)

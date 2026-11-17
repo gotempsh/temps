@@ -155,3 +155,29 @@ test("a project's log view lists only that project's containers", () => {
   )
   expect(quiet).toBe('')
 })
+
+test('a service-scoped notice links to that service’s own log settings', () => {
+  const html = renderToStaticMarkup(
+    <MemoryRouter>
+      <LogIngestBudgetNotice
+        budget={{
+          ...budget,
+          throttled: [
+            { ...noisy, project_id: undefined, external_service_id: 9 },
+          ],
+        }}
+        scope={{ externalServiceId: 9 }}
+      />
+    </MemoryRouter>
+  )
+  expect(html).toContain('href="/storage/9/logs?settings=log-ingestion"')
+  expect(html).toContain('change this service&#x27;s ingestion budget')
+  expect(html).not.toContain(budget.setup_path)
+})
+
+test('an unscoped notice still links to the platform budget', () => {
+  const html = render({ ...budget, throttled: [noisy] })
+  expect(html).toContain(
+    'href="/settings/metrics-monitoring#container-log-ingest-budget"'
+  )
+})

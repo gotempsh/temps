@@ -13,7 +13,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use temps_auth::{deny_deployment_token, permission_guard, RequireAuth};
+use temps_authz::{deny_deployment_token, permission_guard, RequireAuth};
 use temps_core::{
     error_builder::{bad_request, forbidden, internal_server_error, not_found},
     problemdetails::Problem,
@@ -213,7 +213,7 @@ pub struct GlobalEventsQuery {
 /// `EmailsRead` is held by the ordinary user role, so on its own it would hand
 /// every low-privilege user that instance-wide PII.
 fn require_instance_admin_for_global_tracking(
-    auth: &temps_auth::AuthContext,
+    auth: &temps_authz::AuthContext,
     operation: &str,
 ) -> Result<(), Problem> {
     if auth.is_instance_admin() {
@@ -591,7 +591,7 @@ pub struct EventsQuery {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use temps_auth::{AuthContext, Permission, Role};
+    use temps_authz::{AuthContext, Permission, Role};
     use temps_entities::users;
 
     fn test_user(id: i32) -> users::Model {

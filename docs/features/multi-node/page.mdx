@@ -16,6 +16,7 @@ export const sections = [
   { title: 'Adding a worker node (WireGuard mode)', id: 'wireguard-mode' },
   { title: 'Running the agent directly', id: 'agent-command' },
   { title: 'Verifying nodes', id: 'verifying-nodes' },
+  { title: 'How variables and secrets reach a worker', id: 'encrypted-values' },
   { title: 'How scheduling works', id: 'scheduling' },
   { title: 'Sandboxes on worker nodes', id: 'sandboxes' },
   { title: 'A control plane that runs no workloads', id: 'control-plane-profile' },
@@ -144,7 +145,7 @@ temps join <url> <token> --private-address 10.0.0.5 \
 ```
 
 - `--name` — A friendly name for this node (defaults to the hostname)
-- `--labels` — Key-value pairs for scheduling hints (e.g., `region=us-east,tier=production`). The `temps.sh/role` key is reserved: `temps.sh/role=builder` makes a [build-only node](#control-plane-builds) and `temps.sh/role=dedicated` makes a [dedicated node](#dedicated-nodes)
+- `--labels` — Key-value pairs for scheduling hints (e.g., `region=us-east,tier=production`). The `temps.sh/role` key is reserved: `temps.sh/role=builder` makes a [build-only node](#control-plane-builds) and `temps.sh/role=dedicated` makes a [dedicated node](#dedicated-nodes). An invalid label stops the join before anything is registered. Change labels later with [`temps agent labels`](#dedicated-nodes)
 - `--agent-address` — The address the agent server listens on (default: `0.0.0.0:3100`)
 
 After joining, the node is registered and the agent config is saved to `~/.temps/agent.json`. Start the agent separately:
@@ -419,6 +420,27 @@ To fix it yourself, either move the network on the node, or change the pool in t
 
 ---
 
+## How variables and secrets reach a worker {{ anchor: true, id: 'encrypted-values' }}
+
+Environment variables, secrets, build arguments, registry credentials, database credentials, commands run in a container, and files written into a sandbox are encrypted with that worker's own public key, on top of TLS. Someone who can read the traffic between the control plane and the worker sees ciphertext: only the worker's private key opens it, and an encrypted request can't be moved to another route or split from the image it was sent with.
+
+The worker generates this key when it joins, or when an upgraded agent starts without one, and registers the public half with the control plane. The private key stays on the worker, in `agent.json` or `public-ingress.key` in its data directory.
+
+Temps refuses to send values it can't protect, and the deployment fails with an error naming the node:
+
+| The node | What to do |
+|---|---|
+| Has no key on record | Upgrade `temps` on the node and restart `temps agent`, or re-run `temps join` |
+| Has a plain `http://` agent address | Re-run `temps join` to give it an `https://` (mutual TLS) address. On plain HTTP the node's token can be read on the wire and used to read a container's environment, so encrypting the values alone wouldn't protect them |
+| Runs an agent too old to decrypt | Upgrade `temps` on the node and restart `temps agent` |
+| Can't open the request (it lost or changed its key) | Re-run `temps join` on the node |
+
+Containers that are already running keep running: this applies when something is sent, such as a new deployment, a restart that recreates a container, or a command run in a container. While you upgrade a cluster, those operations on a worker still on an older agent fail with the upgrade message until that worker is upgraded.
+
+This protects values on the way to the worker. It doesn't protect them from someone with root on the worker, which has to decrypt them to run the container. Some things are protected by TLS only: values sent in a response, such as a database's connection string a worker returns to the control plane, or ingress connector secrets and S3 credentials a worker fetches from it; live connections to a sandbox, meaning terminal sessions, its agent runtime and its preview ports, so a secret sent through one of them can be read; and source code and image layers sent for a build or a transfer, so a secret committed to a repository isn't covered. A sandbox upload larger than about 72 MiB is refused, because encrypting it would use too much of a small worker's memory.
+
+---
+
 ## How scheduling works {{ anchor: true, id: 'scheduling' }}
 
 When you deploy an application with multiple replicas, the **node scheduler** decides which node each replica lands on:
@@ -471,7 +493,16 @@ No eligible node for this deployment: node 7 (gpu-1) is dedicated (temps.sh/role
 
 If the control plane can run the workload, unpinned deployments simply stay on it, and the deploy log notes `Skipping node 'gpu-1' is dedicated ...`. A dedicated node is not counted when anti-affinity decides whether there are enough nodes: marking a node dedicated never makes an unpinned multi-replica deployment fail where it previously wrapped around.
 
-**Changing an existing node's role.** The agent reports its labels on every heartbeat, from the `labels` object in the `~/.temps/agent.json` that `temps join` wrote. To make an existing node dedicated, add `"temps.sh/role": "dedicated"` there and restart `temps agent`; the control plane picks it up on the next heartbeat (within 30 seconds), and the scheduler reads it at every placement decision. Workloads already running on a node when it becomes dedicated are **not moved or stopped** — they keep running until their next deployment, which is then placed under the new rules (so an unpinned environment moves off the node on its next deploy). Sandboxes already on the node keep running too. To stop using the node for something now, redeploy that environment or drain the node.
+**Changing an existing node's role or labels.** Run `temps agent labels` on the worker, as the user the agent runs as (`sudo` on Linux, where the service runs as root; never `sudo` on a Mac, where it runs as the user who joined):
+
+```bash
+temps agent labels list                          # labels, role, and what the control plane last accepted
+temps agent labels set temps.sh/role=dedicated   # make this node dedicated
+temps agent labels set gpu=true zone=b           # add or change labels
+temps agent labels unset temps.sh/role           # back to an ordinary worker
+```
+
+`set` and `unset` rewrite only the `labels` object of `~/.temps/agent.json` (owner-only, replaced atomically) and check every label the way `temps join --labels` does: a key is `name` or `prefix/name` (letters, digits, `-`, `_`, `.`), a value has no commas or control characters, and `temps.sh/role` is only `builder` or `dedicated`. The running agent picks the change up within about 5 seconds, without a restart, and reports it to the control plane at once; the command waits up to 15 seconds for the control plane to accept it and says so. If that takes longer (the control plane is unreachable, say), the command says the change is **pending**: it is saved, the agent reports it on its next successful heartbeat, and `temps agent labels list` shows whether it has been accepted. A running agent is never restarted for a label change. An agent older than this release reads its labels only at start, so the command restarts the Temps-managed service (`temps-agent.service`, or the `sh.temps.agent` LaunchAgent on a Mac) instead; pass `--no-restart` to leave that to you. If the agent is started with `--labels` or `TEMPS_NODE_LABELS`, those override `agent.json`: the command finds them in the installed service and refuses rather than saving a change the agent would ignore. In the console, the node's labels are under **Settings > Nodes > (node) > Scheduling**, and a dedicated node carries a *Dedicated* badge. The scheduler reads labels at every placement decision. Workloads already running on a node when it becomes dedicated are **not moved or stopped** — they keep running until their next deployment, which is then placed under the new rules (so an unpinned environment moves off the node on its next deploy). Sandboxes already on the node keep running too. To stop using the node for something now, redeploy that environment or drain the node. Labels are set on the worker only: the control plane cannot change them.
 
 A node has one role: `builder` and `dedicated` are mutually exclusive values of the same `temps.sh/role` label. A build-only node never hosts replicas, pinned or not.
 
@@ -500,7 +531,7 @@ Over the API, pass the optional `node` field to `POST /api/v1/sandboxes` (`"node
 
 ### Choosing which nodes run sandboxes
 
-By default every node may run sandboxes, including nodes added later. Administrators can restrict this to an allow-list in the console under **AI runtime settings > Sandbox > Sandbox nodes**, or from the CLI:
+By default every node may run sandboxes, including nodes added later. Administrators can restrict this to an allow-list in the console under **Sandboxes > Settings > Runtime > Sandbox nodes**, or from the CLI:
 
 ```bash
 bunx @temps-sdk/cli sandbox nodes                     # every node, whether it is allowed, and why not
@@ -519,13 +550,15 @@ Changing the list only affects new sandboxes; existing ones keep running where t
 - **An `https://` agent address.** The control plane talks to the worker over the mutual-TLS connection set up when the node joined. A node registered with a plain `http://` address is listed as not eligible, with the reason.
 - **An active node.** Offline nodes, and nodes whose sandboxes are being destroyed, don't take new sandboxes. `sandbox nodes` and the console show why.
 
+### Terminal, agent runtime and preview URLs
+
+A sandbox on a worker works like one on the control plane for the interactive terminal, the agent runtime (Temps Fleet) and preview URLs. The control plane carries each one over the mutual-TLS connection to the worker's agent. Preview URLs keep the `ws-<id>-<port>.<preview domain>` form and the same password protection. Each preview connection is relayed into the sandbox's own port, so nothing is published on the worker's network.
+
 ### Not available on worker nodes yet
 
 These features only work for sandboxes on the control plane for now. On a worker sandbox they fail with a message naming the node (`422`) instead of doing something different:
 
-- the interactive terminal and the agent runtime (Temps Fleet)
 - snapshots, both taking and restoring them
-- preview URLs (the sandbox page explains why there is none)
 - disk resize and workspace volumes
 - the Firecracker and microsandbox backends, and the git, model and harness relays
 
@@ -835,7 +868,7 @@ node's native architecture automatically.
 Multi-node is functional but still evolving. Known limitations:
 
 - **No bin-packing** — placement is least-loaded plus anti-affinity, not full bin-packing across resource dimensions.
-- **Worker sandboxes are a subset** — sandboxes on worker nodes have no terminal, agent runtime (Fleet), snapshots, preview URLs, disk resize, workspace volumes or Firecracker/microsandbox backends yet. See [Sandboxes on worker nodes](#sandboxes).
+- **Worker sandboxes are a subset** — sandboxes on worker nodes have no snapshots, disk resize, workspace volumes or Firecracker/microsandbox backends yet; their terminal, agent runtime and preview URLs work as on the control plane. See [Sandboxes on worker nodes](#sandboxes).
 - **Sandboxes don't move** — a sandbox stays on the node it was created on. Draining a node does not move its sandboxes; [evict them](#sandboxes) before removing the node.
 - **Drain rebuilds what it moves** — a deployment whose only replicas are on the draining node is rebuilt elsewhere from its source: the Git ref it was built from, the same image for image deployments, or the retained ZIP for uploaded-source deployments. If any such deployment has nothing to rebuild from (for example its uploaded archive is gone), the drain is refused with a `409` that names it (the first 50 individually, the rest counted), and the node is left unchanged; redeploy or delete that workload first.
 - **Removing a node cleans up what Temps left on it** — before a drained node is removed, Temps removes the containers it placed there that no deployment needs but that may still exist, such as a failed deployment's container, or one a drain's redeploy replaced while the node was unreachable. With the agent running, Temps asks the node about each of those containers individually: one that is still there is removed after its labels confirm the owning project, and only Docker reporting it not found counts as already gone, so nothing it placed there is forgotten. Containers that earlier releases recorded as removed on a worker without confirming it are checked the same way after upgrading. Containers of a current or still-running deployment block removal until the drain has moved them, and so do those of the deployment a rollout in progress would fall back to if its new deployment fails its checks; retry once the rollout finishes. If the node's agent cannot confirm that a container is gone, removal is refused with a `409` listing each container (the first 50 are described individually and the rest are counted). Start `temps agent` on the node, or remove them on that host with `docker rm -f`, then retry. If the host is gone for good, remove it with `?force=true` (**Remove Anyway** in the console's remove dialog, or `temps node remove <id> --yes --force`): the containers are recorded as orphaned on that node, listed in the response, and later project deletion skips them instead of failing. Because removal deletes containers on the host, it asks an administrator with MFA enrolled to verify again in the console, as draining does; API keys and CLI tokens are not prompted.
@@ -848,3 +881,40 @@ Multi-node is functional but still evolving. Known limitations:
 <Button href="/docs/scaling">Scaling strategies</Button>
 <Button href="/docs/resources">Resource allocation</Button>
 <Button href="/docs/docker-containers">Docker container management</Button>
+
+
+### Preferred-node request routing
+
+Environment **Settings → Scaling → Request routing** controls where the
+control-plane HTTP proxy sends traffic, independently of replica placement.
+Select **Preferred nodes** and enter node IDs in priority order (0 denotes the
+control plane). Replicas on each preferred node form a tier; unlisted nodes
+form the last tier. Requests rotate within the first healthy tier with spare
+capacity. An optional in-flight threshold spills traffic to the next tier;
+when all tiers are full, the least-loaded healthy replica receives the request.
+Long-lived streams count until their requests end. Counters are local to each
+proxy process, not a cluster-wide concurrency quota.
+
+Active HTTP health checks work with either routing strategy. Only 2xx responses
+pass; redirects are not followed. Timeouts and consecutive-failure/success
+thresholds remove and restore replicas. With no healthy replicas, selection
+fails open to all replicas. The default probe path is the deployment's health path (including source
+configuration), or `/` if none was recorded.
+
+Policies inherit from project deployment config to environment deployment
+config. Existing deployments retain round robin and no active checks. Clearing
+an environment override restores project inheritance. Settings apply on route
+refresh without redeploying. The policy applies at control-plane ingress;
+worker internal service routing remains round robin, and routes requiring this
+policy are excluded from direct worker public and private ingress.
+
+The CLI accepts the same camelCase policy object:
+
+```sh
+temps environments scale -p my-app -e production --load-balancing '{"strategy":"preferred_nodes","preferredNodeIds":[3,5],"maxInFlightPerReplica":100,"healthCheck":{"enabled":true,"path":"/health","intervalSeconds":2,"timeoutSeconds":2,"unhealthyThreshold":3,"healthyThreshold":2}}'
+```
+
+Use `--load-balancing null` to inherit the project policy again. Probes use at
+most 16 simultaneous requests per proxy; under saturation, probe intervals may
+be delayed. Routing state is O(active replicas), retained across reloads and
+released when replicas leave the route table.

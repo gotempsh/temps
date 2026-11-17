@@ -4,7 +4,7 @@
 
 Accepted — 2026-10-23
 
-Related: ADR 048 (multi-node overlay), ADR 055 (workers join outbound only),
+Related: ADR 080 (multi-node overlay), ADR 088 (workers join outbound only),
 ADR 056 (a compute pool that avoids collisions).
 
 ## Context

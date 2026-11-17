@@ -3,8 +3,8 @@
 
 """Protocol types matching the Rust plugin SDK.
 
-Mirrors: crates/temps-core/src/external_plugin/manifest.rs
-         crates/temps-core/src/external_plugin/channel.rs
+Mirrors: crates/temps-plugin-protocol/src/manifest.rs
+         crates/temps-plugin-protocol/src/channel.rs
 """
 
 from __future__ import annotations

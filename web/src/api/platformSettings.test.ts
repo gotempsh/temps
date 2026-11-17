@@ -6,12 +6,35 @@ import { buildPlatformSettingsUpdateBody } from './platformSettings'
 import type { PlatformSettings } from './platformSettings'
 
 describe('buildPlatformSettingsUpdateBody', () => {
+  test('round-trips both platform identity choices', () => {
+    for (const expose_platform_identity of [true, false]) {
+      const body = buildPlatformSettingsUpdateBody({
+        expose_platform_identity,
+      } as PlatformSettings)
+      expect(body.expose_platform_identity).toBe(expose_platform_identity)
+    }
+  })
+
   test('round-trips the admin proxy trust setting on unrelated saves', () => {
     const body = buildPlatformSettingsUpdateBody({
       trust_loopback_forwarded_ip: true,
     } as PlatformSettings)
 
     expect(body.trust_loopback_forwarded_ip).toBe(true)
+  })
+
+  test('only sends proxy CIDRs when explicitly changed, including clearing', () => {
+    const stored = { trusted_proxy_cidrs: ['10.20.0.0/16'] } as PlatformSettings
+    expect(
+      buildPlatformSettingsUpdateBody(stored, {}).trusted_proxy_cidrs
+    ).toBeUndefined()
+    expect(
+      buildPlatformSettingsUpdateBody(stored, { trusted_proxy_cidrs: [] })
+        .trusted_proxy_cidrs
+    ).toEqual([])
+    expect(buildPlatformSettingsUpdateBody(stored).trusted_proxy_cidrs).toEqual(
+      ['10.20.0.0/16']
+    )
   })
 
   test('round-trips the loopback JA4 header on unrelated saves', () => {

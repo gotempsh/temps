@@ -16,6 +16,7 @@ pub mod protocol;
 pub mod pty;
 pub mod relay;
 pub mod server;
+pub mod service_proxy;
 
 pub const DEFAULT_SOCKET_PATH: &str = "/run/temps-pty/agent.sock";
 

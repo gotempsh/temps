@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use anyhow::Result;
 use serde::Serialize;
 use temps_core::AuditOperation;
 
@@ -42,9 +41,8 @@ impl AuditOperation for PipelineTriggeredAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -75,9 +73,8 @@ impl AuditOperation for GitRepositoryCreatedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -110,9 +107,8 @@ impl AuditOperation for GitFilesCommittedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -144,8 +140,102 @@ impl AuditOperation for GitPullRequestOpenedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
+    }
+}
+
+#[derive(Serialize)]
+pub(super) struct GitConnectionReauthorizationAudit {
+    pub context: AuditContext,
+    pub connection_id: i32,
+    pub provider_id: i32,
+    pub completed: bool,
+}
+
+impl AuditOperation for GitConnectionReauthorizationAudit {
+    fn operation_type(&self) -> String {
+        if self.completed {
+            "GIT_CONNECTION_REAUTHORIZED"
+        } else {
+            "GIT_CONNECTION_REAUTHORIZATION_STARTED"
+        }
+        .to_string()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
+    }
+}
+
+/// An operator started creating a GitHub App from a manifest, which is what
+/// lets the callback accept the resulting code. Records who and from where,
+/// never the state that was issued.
+#[derive(Debug, Clone, Serialize)]
+pub struct GithubAppSetupStartedAudit {
+    pub context: AuditContext,
+}
+
+impl AuditOperation for GithubAppSetupStartedAudit {
+    fn operation_type(&self) -> String {
+        "GITHUB_APP_SETUP_STARTED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
+    }
+}
+
+/// A GitHub App was created from a manifest and registered as a git provider.
+/// The callback carries no session, so the operator is the one the
+/// server-issued setup state was issued to. Records the provider and the app,
+/// never the app's credentials.
+#[derive(Debug, Clone, Serialize)]
+pub struct GithubAppCreatedAudit {
+    pub context: AuditContext,
+    pub provider_id: i32,
+    pub app_id: i32,
+    pub app_name: String,
+}
+
+impl AuditOperation for GithubAppCreatedAudit {
+    fn operation_type(&self) -> String {
+        "GITHUB_APP_CREATED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }

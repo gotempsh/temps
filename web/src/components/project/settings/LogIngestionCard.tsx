@@ -45,14 +45,16 @@ export function LogIngestionCard({
   }
 
   return (
-    <LogIngestionBudgetCard
-      scope="project"
-      value={{
-        lines: project.log_ingest_lines_per_sec,
-        kib: project.log_ingest_kib_per_sec,
-      }}
-      onSave={handleSave}
-      isSaving={updateProjectSettings.isPending}
-    />
+    <div id="setting-log-ingestion" className="scroll-mt-4">
+      <LogIngestionBudgetCard
+        scope="project"
+        value={{
+          lines: project.log_ingest_lines_per_sec,
+          kib: project.log_ingest_kib_per_sec,
+        }}
+        onSave={handleSave}
+        isSaving={updateProjectSettings.isPending}
+      />
+    </div>
   )
 }

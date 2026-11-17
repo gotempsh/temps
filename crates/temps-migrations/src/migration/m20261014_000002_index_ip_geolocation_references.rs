@@ -12,7 +12,7 @@
 //! lock that stops writes (analytics ingestion, audit logs, proxy logs) for as
 //! long as the build scans the table, which on a large history is minutes.
 //! They are built after the server has bound by
-//! `temps_database::run_post_migration_indexes`, with `CREATE INDEX
+//! `temps_schema::run_post_migration_indexes`, with `CREATE INDEX
 //! CONCURRENTLY` on plain tables and TimescaleDB's per-chunk build on the
 //! `proxy_logs` hypertable (which does not support `CONCURRENTLY`). Both are
 //! idempotent, and an index that already exists (a database that ran the

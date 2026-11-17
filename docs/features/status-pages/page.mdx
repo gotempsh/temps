@@ -9,7 +9,7 @@ export const metadata = {
 
 # Status Pages
 
-A status page shows your users whether your services are up, without giving them access to Temps. You pick which uptime monitors appear and what they are called; Temps publishes their current state, 90 days of daily uptime and the incident updates you mark as public, at an unguessable link. {{ className: 'lead' }}
+A status page shows your users whether your services are up, without giving them access to Temps. You pick which uptime monitors appear — from any of your projects — what they are called and how they are grouped; Temps publishes their current state, 90 days of daily uptime and the incident updates you mark as public, at an unguessable link. {{ className: 'lead' }}
 
 Status pages are **Beta**. See [feature maturity](/docs/feature-maturity).
 
@@ -18,7 +18,7 @@ Status pages are **Beta**. See [feature maturity](/docs/feature-maturity).
 ## What a visitor sees
 
 - A banner with the overall state: all operational, degraded, or down.
-- One row per selected monitor, under the **public name** you gave it, with its current state, uptime over 90 days and a bar per day.
+- One row per selected monitor, under the **public name** you gave it, with its current state, uptime over 90 days and a bar per day. Components that share a **group** (for example `Cloud` → API, Dashboard, Billing) are shown together under one collapsible row with the group's worst state; it opens by itself when something in it is not operational.
 - Active and recently resolved (last 14 days) incidents, showing only the updates you made public.
 
 The page is plain HTML with no JavaScript and refreshes itself every minute. The same data is available as JSON at `…/summary.json` for widgets and scripts.
@@ -39,19 +39,26 @@ A status page is built from an allowlist, not by hiding fields from the internal
 
 ## Create and publish a page
 
-1. Open the project and go to **Observe → Status Pages** (also linked from the **Uptime** page).
-2. Click **Create status page** and give it a public title. The page starts as a **draft**: its link returns "not found".
-3. Under **Monitors**, tick each monitor to show and type its **public name**, for example `API` or `Dashboard`. Internal names are never pre-filled as public names. Click **Save changes**.
-4. Click **Publish**. The **Public link** is now live; copy it and share it.
+1. Open **Status pages** in the sidebar (under **Observability**). A project's **Status Pages** tab lists the pages that show it and starts a new page from that project.
+2. Click **Create status page** and give it a public title.
+3. Add components: choose a **project** and one of its **environments**, then **Add**. Repeat for every service the page should show, from as many projects as you like. Give each a **public name** (for example `API` or `Dashboard`) and, optionally, a **group**.
+4. Leave **Publish right away** on, or turn it off to create a **draft** whose link returns "not found" until you publish it.
 
-Publishing needs at least one selected monitor.
+A page is created with at least one component and cannot be published without one. You can change a component's project or environment later in its **Components** tab.
+
+### Who can manage a page
+
+A page is authorized against every project it draws components from: reading it needs `status_page:read` on each of them, and changing it needs the matching permission on each. Editing the components is checked against the projects before *and* after the change, so a page cannot be taken over by removing the components you have no access to, and you cannot add another team's monitor to your page. Instance administrators can manage every page. Deployment tokens cannot use the status page API.
 
 ### From the CLI
 
 ```bash
 # Create a draft showing monitor 12 as "API" and monitor 15 as "Dashboard"
-temps status-pages create --project-id 3 --title "Acme status" \
-  --monitor 12=API --monitor 15=Dashboard
+# (they may belong to different projects), grouped under "Cloud"
+temps status-pages create --title "Acme status" \
+  --monitor 12=API --monitor 15=Dashboard --group "Cloud=12,15"
+
+temps status-pages list --project-id 3   # only pages showing project 3
 
 temps status-pages publish --id 1
 temps status-pages show --id 1        # prints the public URL
@@ -61,8 +68,8 @@ temps status-pages show --id 1        # prints the public URL
 
 | Action | Endpoint |
 |---|---|
-| List a project's pages | `GET /api/projects/{project_id}/status-pages` |
-| Create a draft | `POST /api/projects/{project_id}/status-pages` |
+| List pages | `GET /api/status-pages` (optional `?project_id=` for the pages showing a project) |
+| Create a draft | `POST /api/status-pages` |
 | Read one | `GET /api/status-pages/{id}` |
 | Change title, description or monitors | `PATCH /api/status-pages/{id}` |
 | Publish / unpublish | `POST /api/status-pages/{id}/publish`, `POST /api/status-pages/{id}/unpublish` |
@@ -79,7 +86,9 @@ Each of these makes the old link return "not found" **immediately**, before the 
 
 - **Unpublish** keeps the page and its settings as a draft.
 - **Replace public link** issues a new link and retires the old one, for when a link was shared too widely.
-- **Delete** removes the page. Deleting the project takes all its pages down; deleting a selected monitor removes it from the page.
+- **Delete** removes the page.
+
+Deleting a project or a selected monitor does not retire a page: it only removes those components. A page that still shows another project's components stays public with what is left. A page left with no components answers "not found" but keeps its link, hostnames and settings until you delete it, and it cannot be published again until you add a component. To retire a page, unpublish or delete it.
 
 Public responses are sent with `Cache-Control: no-store`, so browsers and proxies do not keep a copy after you take the page down.
 
@@ -136,9 +145,9 @@ A hostname cannot be attached if anything else on this instance uses it: an appl
 
 **Until a hostname is verified**, it serves nothing and no certificate is issued or presented for it. On-demand TLS never mints certificates for status-page hostnames.
 
-**Taking it down.** Removing a hostname, unpublishing the page, or deleting the page or its project makes the hostname answer "not found" immediately:
+**Taking it down.** Removing a hostname, unpublishing the page, or deleting the page makes the hostname answer "not found" immediately:
 
-- Removing a hostname, or deleting the page or project, deletes its certificate (including the stored copy), which stops serving and renewal. The hostname keeps answering "not found" until it is attached again or used by an application.
+- Removing a hostname, or deleting the page, deletes its certificate (including the stored copy), which stops serving and renewal. The hostname keeps answering "not found" until it is attached again or used by an application.
 - Unpublishing also releases the certificates. After publishing again, click **Verify** on each hostname.
 
 Status-page hostnames are served by the control plane's proxy (single node, or `temps proxy` in a split control plane started with `--console-ingress-address`). Point them at the control plane, not at a worker node.
@@ -162,6 +171,7 @@ Adding, verifying, renewing and removing custom domains needs `status_page:write
 
 ## Limits
 
-- 10 status pages per project, 50 monitors per page.
-- Titles up to 120 characters, descriptions up to 1,000, public names up to 80, incident update messages up to 5,000.
+- 100 status pages per instance, 50 monitors per page.
+- Titles up to 120 characters, descriptions up to 1,000, public names and group names up to 80, incident update messages up to 5,000.
+- 30 custom-domain verifications or renewals per page per hour, and 60 across the instance.
 - Up to 5 custom domains per page.

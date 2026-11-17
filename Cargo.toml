@@ -4,6 +4,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/patches/libsqlite3-sys-compat",
     # Application crates
     "crates/temps-cli",
     "crates/temps-vm-agent",
@@ -17,34 +18,55 @@ members = [
     "crates/temps-entities",
     "crates/temps-migrations",
     "crates/temps-database",
+    "crates/temps-schema",
+    "crates/temps-test-utils",
+    "crates/temps-docker-util",
     "crates/temps-queue",
     "crates/temps-auth",
+    "crates/temps-authz",
     "crates/temps-git",
     "crates/temps-presets",
-    "crates/temps-logs",
+    "crates/temps-deployment-logs",
     "crates/temps-deployer",
+    "crates/temps-docker-capture",
+    "crates/temps-workload",
+    "crates/temps-workload-env",
+    "crates/temps-workload-netpol",
+    "crates/temps-netpol-ebpf-common",
+    "crates/temps-workload-ingress",
+    "crates/temps-workload-volumes",
+    "crates/temps-workload-docker",
+    "crates/temps-workload-plane",
+    "crates/temps-workload-node",
+    "crates/temps-workload-activator",
     "crates/temps-projects",
     "crates/temps-domains",
     "crates/temps-proxy",
     "crates/temps-shield",
     "crates/temps-signatures",
     "crates/temps-providers",
-    "crates/temps-query",
-    "crates/temps-query-postgres",
-    "crates/temps-query-s3",
-    "crates/temps-query-redis",
-    "crates/temps-query-mongodb",
+    "crates/temps-providers-core",
+    "crates/temps-providers-postgres",
+    "crates/temps-providers-s3",
+    "crates/temps-providers-mariadb",
+    "crates/temps-providers-mongodb",
+    "crates/temps-providers-redis",
     "crates/temps-deployments",
+    "crates/temps-nodes",
+    "crates/temps-docker-housekeeping",
+    "crates/temps-ci-tokens",
+    "crates/temps-traefik-discovery",
     "crates/temps-backup",
-    "crates/temps-backup-core",
     "crates/temps-notifications",
     "crates/temps-monitoring",
+    "crates/temps-alarms",
     "crates/temps-runtime-health",
     "crates/temps-credential-checks",
     "crates/temps-network",
     "crates/temps-analytics",
     "crates/temps-audit",
     "crates/temps-config",
+    "crates/temps-config-handlers",
     "crates/temps-geo",
     "crates/temps-analytics-backend",
     "crates/temps-analytics-events",
@@ -55,7 +77,6 @@ members = [
     "crates/temps-error-tracking",
     "crates/temps-analytics-performance",
     "crates/temps-status-page",
-    "crates/temps-static-files",
     "crates/temps-file-store",
     "crates/temps-import-types",
     "crates/temps-import",
@@ -73,30 +94,39 @@ members = [
     "crates/temps-email",
     "crates/temps-email-tracking",
     "crates/temps-dns",
-    "crates/temps-dns-resolver",
+    "crates/temps-node-dns",
     "crates/temps-vulnerability-scanner",
     "crates/temps-kv",
     "crates/temps-flags",
+    "crates/temps-workflows",
+    "crates/temps-workflows-sdk",
+    "crates/temps-service-access",
+    "crates/temps-service-access-runtime",
     "crates/temps-ingress",
+    "crates/temps-edge-rules",
     "crates/temps-blob",
     "crates/temps-log-aggregator",
     "crates/temps-clickhouse",
     "crates/temps-otel",
-    "crates/temps-telemetry",
+    "crates/temps-product-telemetry",
     "crates/temps-environments",
     "crates/temps-screenshots",
-    "crates/temps-embeddings",
     "crates/temps-plugin-sdk",
+    "crates/temps-plugin-protocol",
     "crates/temps-wireguard",
     "crates/temps-ai-agent-cli",
     "crates/temps-ai-gateway",
-    "crates/temps-agents",
+    "crates/temps-agent-core",
+    "crates/temps-ai-agents",
+    "crates/temps-ai-cli",
     "crates/temps-agents-mcp-proxy",
     "crates/temps-memory",
     "crates/temps-sandbox",
+    "crates/temps-service-protocol",
+    "crates/temps-sandbox-providers",
     "crates/temps-pty-agent",
     "crates/temps-git-credential",
-    "crates/temps-agent",
+    "crates/temps-node-agent",
     "crates/temps-edge",
     "crates/temps-preview-gateway",
     "crates/temps-external-plugins",
@@ -109,22 +139,39 @@ members = [
     "examples/lighthouse-plugin",
     "examples/indexnow-plugin",
     "examples/google-indexing-plugin",
+    "crates/temps-netpol-probe",
+    "crates/temps-network-policy",
 ]
 
 [workspace.package]
-version = "0.1.0-beta.57"
+version = "0.1.0-beta.62"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Temps Contributors"]
 repository = "https://github.com/gotempsh/temps"
 homepage = "https://github.com/gotempsh/temps"
 
+[workspace.lints.clippy]
+# CLAUDE.md rules enforced by the compiler. Production code may not panic on
+# a Result/Option; tests may (see allow-*-in-tests in clippy.toml). For a
+# truly infallible call, prefer restructuring; otherwise use
+# `#[allow(clippy::unwrap_used, reason = "...")]` on the narrowest item.
+unwrap_used = "deny"
+expect_used = "deny"
+dbg_macro = "deny"
+todo = "deny"
+
 [workspace.dependencies]
 arc-swap = "1.7"
 # ============================================================================
 # Async Runtime & Concurrency
 # ============================================================================
-tokio = { version = "1.47.1", features = ["full"] }
+# Below 1.54: tokio 1.54 panics on a zero-capacity `BufStream` and pingora-core
+# 0.9.0 builds one in `From<TcpStream> for Stream`, so every proxied connection
+# would panic. Lift this once a pingora release no longer does that;
+# `shield::ja4_hook::tests::the_hello_is_fingerprinted_and_handed_back_whole`
+# in temps-proxy fails if the two are combined.
+tokio = { version = ">=1.47.1, <1.54", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 futures = "0.3.31"
 futures-util = "0.3.31"
@@ -205,6 +252,7 @@ rusqlite = { version = "0.32.0", features = ["bundled", "trace"] }
 # HTTP Framework & Web Server
 # ============================================================================
 axum = { version = "0.8", features = ["multipart", "form", "ws"] }
+matchit = "0.9.2"
 axum-extra = { version = "0.12", features = ["query"] }
 axum-macros = "0.5.0-alpha.1"
 tower = { version = "0.5", features = ["util"] }
@@ -226,7 +274,7 @@ reqwest = { version = "0.12.15", features = ["json", "stream", "multipart", "rus
 utoipa = { version = "6.0.0", features = ["axum_extras", "debug"] }
 utoipa-swagger-ui = { version = "10.0.2", features = ["axum", "vendored"], default-features = false }
 schemars = { version = "1.2", features = ["preserve_order"] }
-jsonschema = { version = "0.58.4", default-features = false }
+jsonschema = { version = "0.61.2", default-features = false }
 
 # ============================================================================
 # Cryptography & Security
@@ -328,7 +376,10 @@ octocrab = "0.54.1"
 # ============================================================================
 # Container Management (Docker)
 # ============================================================================
-bollard = { version = "0.20.1", features = ["buildkit", "buildkit_providerless", "chrono", "json_data_content"] }
+# `time` decides the type of bollard's timestamps, which temps-deployer reads as
+# `time::OffsetDateTime`. It has to be named here: testcontainers enables it too,
+# but only in test builds, so a release build would otherwise not compile.
+bollard = { version = "0.21.1", features = ["buildkit", "buildkit_providerless", "chrono", "json_data_content", "time"] }
 
 # ============================================================================
 # Scheduling & Background Jobs
@@ -370,7 +421,7 @@ libc = "0.2"
 tikv-jemallocator = { version = "0.7", features = ["profiling", "stats"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 rand = "0.10"
-sysinfo = "0.39.6"
+sysinfo = "0.40.0"
 tempfile = "3.12.0"
 once_cell = "1.20"
 notify = "8.2"
@@ -385,9 +436,116 @@ woothee = "0.13.0"
 # ============================================================================
 # Using git version for security fixes:
 # - Uses astral-tokio-tar instead of vulnerable tokio-tar (RUSTSEC-2025-0111)
-# - Compatible with bollard 0.19.x
-testcontainers =  "0.27.2"
+# - 0.28 is the first release compatible with bollard 0.21.x
+testcontainers =  "0.28.0"
 
+# Centralised from per-crate pins (P1.7). Keep them here, not in member crates.
+autopack-core = { git = "https://github.com/gotempsh/autopack", tag = "v0.1.6" }
+autopack-dockerfile = { git = "https://github.com/gotempsh/autopack", tag = "v0.1.6" }
+autopack-providers = { git = "https://github.com/gotempsh/autopack", tag = "v0.1.6" }
+aws-credential-types = "1.2"
+aws-sdk-sesv2 = { version = "1", default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
+aws-sdk-sns = { version = "1.101", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-smithy-http-client = { version = "1.1", default-features = false, features = ["rustls-aws-lc"] }
+aws-smithy-runtime-api = { version = "1", features = ["client"] }
+axum-test = "21.0.0"
+aya = "0.16"
+base32 = "0.5.1"
+bson = "3.1"
+chrono-tz = "0.10"
+colored = "3.1"
+crc32fast = "1.4"
+croner = "=4.0.3"
+crossbeam-queue = "0.3"
+csv = "1.3"
+dashmap = "6"
+defguard_wireguard_rs = "0.12"
+directories = "6.0"
+dirs = "7.0"
+downcast-rs = "2.0"
+env_logger = "0.11"
+gethostname = "1.1"
+git2 = { version = "0.21.0", features = ["https", "ssh"] }
+glob = "0.3"
+globset = "0.4"
+headless_chrome = { version = "1.0.18", features = ["offline"] }
+hickory-proto = { version = "0.26", default-features = false }
+hickory-resolver = "0.26"
+hickory-server = { version = "0.26", default-features = false }
+hmac = "0.13"
+htmd = "0.5"
+httparse = "1.10"
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "tls12", "ring"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+if-addrs = "0.15"
+image = { version = "0.25.6", default-features = false }
+indicatif = "0.18"
+ipnet = "2.10"
+ipnetwork = "0.21"
+js-sys = "0.3"
+jsonwebtoken = { version = "11.0.0", features = ["rust_crypto"] }
+lol_html = "3"
+lopdf = { version = "0.47", default-features = false }
+maplit = "1.0"
+maxminddb = { version = "0.33.0", features = ["mmap"] }
+md5 = "0.8"
+memchr = "2.7"
+microsandbox = { version = "=0.7.15", default-features = false, features = ["local", "net"] }
+mime_guess = "2.0"
+mockall = "0.15"
+mockito = "1.5"
+moka = { version = "0.12", features = ["future"] }
+mongodb = { version = "3.7.0", default-features = false }
+netlink-packet-core = "0.9"
+netlink-packet-route = "0.34"
+nix = "0.31"
+num_cpus = "1.16"
+p256 = { version = "0.14", features = ["pkcs8", "pem"] }
+parking_lot = "0.13"
+pem = "4"
+picomatch-rs = "=0.1.0"
+pingora-http = "0.9.0"
+pingora-openssl = "0.9.0"
+postcard = { version = "1", default-features = false, features = ["alloc"] }
+prost = "0.14"
+prost-build = "0.14"
+pulldown-cmark = "0.13"
+qrcode = "0.14.1"
+quick-xml = { version = "0.42", features = ["serialize"] }
+relay-event-schema = { git = "https://github.com/getsentry/relay", rev = "ca7e20d" }
+relay-protocol = { git = "https://github.com/getsentry/relay", rev = "ca7e20d" }
+reqwest-otlp = { package = "reqwest", version = "0.13", default-features = false, features = ["blocking", "rustls"] }
+rsa = "0.9"
+rtnetlink = "0.24"
+russh = "0.65"
+rustix = { version = "1.1.4", features = ["fs"] }
+rustls-native-certs = "0.8"
+rustls-pki-types = "1.12.0"
+scraper = "0.29"
+serial_test = "4.0"
+sha1_smol = "1.0.1"
+sha2-rsa = { package = "sha2", version = "0.10", features = ["oid"] }
+sha2_010 = { package = "sha2", version = "0.10.9" }
+shlex = "2.0"
+sourcemap = "9"
+subtle = "2.6.1"
+temp-dir = "0.2"
+temps-agent-runtime = { git = "https://github.com/gotempsh/agent-runtime-sdk.git", rev = "ac661d29974eb020f3bd7bd1a286445d5cb820cd" }
+time = "0.3.47"
+tokio-postgres = "0.7"
+tokio-postgres-rustls = "0.14"
+tokio-socks = "0.5"
+tokio-stream = "0.1.17"
+tokio-test = "0.4"
+toml = "1.1"
+unicode-casefold = "0.2"
+unicode-normalization = "0.1"
+wasm-bindgen = "0.2"
+webpki-root-certs = "1.0"
+wiremock = "0.6"
+x509-parser = "0.18.0"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+zeroize = "1"
 
 [profile.release]
 codegen-units = 1
@@ -506,20 +664,12 @@ debug = false
 #      fix the dependency or establish safety for other consumers/features;
 #      re-review the key type and operations on every aws-sdk-s3 upgrade.
 #
-# 6. RUSTSEC-2026-0367 / -0368 / -0369: zip 8.6.0 (extract() SUID/SGID + symlink handling)
-#    - Fix: zip >= 9.0.0. The workspace `zip` dependency is already 9.x; the 8.6.0
-#      entry in Cargo.lock comes only from headless_chrome 1.0.22 (temps-screenshots,
-#      `fetch` feature), whose latest release still requires `zip ^8` (checked
-#      2026-10-27). utoipa-swagger-ui moved to zip 9 in 10.0.2, the minimum required
-#      above. A [patch.crates-io] to 9.x is semver-incompatible and rejected.
-#    - Reachability: headless_chrome calls neither `ZipArchive::extract()` nor
-#      `ZipStreamReader::extract()`; it unpacks via `by_index()` + its own file
-#      writes (Chromium builds it downloads itself; `unzip` on macOS).
-#    - Ignored in .github/workflows/dependency-scan.yml; remove once headless_chrome
-#      releases against zip 9. This copy also locks zstd 0.13.3 (see the zstd entry
-#      in that workflow).
-#
 # Previously resolved:
+# - zip 8.6.0 (RUSTSEC-2026-0367/-0368/-0369, GHSA-m665-v7pm-7grj): RESOLVED by
+#     dropping headless_chrome's `fetch` feature, the only thing that locked it
+#     (headless_chrome 1.0.22 still requires `zip ^8`). temps-screenshots
+#     downloads the same Chromium build itself (chromium_installer.rs) with the
+#     workspace's zip 9.
 # - atty 0.2.14: RESOLVED in Pingora 0.7.0 (upgraded to clap 4.5)
 # - idna 0.2.3: RESOLVED by upgrading check-if-email-exists 0.9 → 0.11
 # - lru 0.12.5: RESOLVED by upgrading aws-sdk-s3 (new version dropped lru 0.12)
@@ -604,3 +754,6 @@ debug = false
 # crate drags in opentelemetry_sdk 0.30 (GHSA-w9wp-h8wv-79jx). See item 2b above
 # and crates/patches/opentelemetry-proto-unused/Cargo.toml.
 opentelemetry-proto = { path = "crates/patches/opentelemetry-proto-unused" }
+
+# SQLx compatibility layer; the native library is libsqlite3-sys 0.39.1.
+libsqlite3-sys = { path = "crates/patches/libsqlite3-sys-compat" }

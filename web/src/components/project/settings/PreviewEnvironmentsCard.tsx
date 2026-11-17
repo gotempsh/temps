@@ -19,12 +19,14 @@ import {
   FormField,
   FormItem,
   FormLabel,
+  FormMessage,
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation } from '@tanstack/react-query'
-import { useForm, useWatch } from 'react-hook-form'
+import { Loader2 } from 'lucide-react'
+import { useForm, useFormState, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
 import { z } from 'zod'
 
@@ -93,11 +95,15 @@ export function PreviewEnvironmentsCard({
     name: 'previewEnvsOnDemand',
   })
 
+  const { isDirty } = useFormState({ control: form.control })
+
+  // `toast.promise` returns a toast handle, not the request: await the
+  // mutation itself so the refetch sees the saved settings.
   const handleSave = async (values: FormValues) => {
     if (!project?.id) return
-    await toast.promise(
-      updateProjectSettings.mutateAsync({
-        path: { project_id: project.id! },
+    try {
+      await updateProjectSettings.mutateAsync({
+        path: { project_id: project.id },
         body: {
           enable_preview_environments: values.enablePreviewEnvironments,
           preview_envs_on_demand: values.previewEnvsOnDemand,
@@ -110,79 +116,74 @@ export function PreviewEnvironmentsCard({
             10
           ),
         },
-      }),
-      {
-        loading: 'Updating preview environment settings...',
-        success: 'Preview environment settings updated successfully',
-      }
-    )
+      })
+    } catch {
+      // The mutation's errorTitle already explains the failure.
+      return
+    }
+    form.reset(values)
+    toast.success('Preview environments saved')
     refetch()
   }
 
   return (
     <Form {...form}>
       <form onSubmit={form.handleSubmit(handleSave)}>
-        <Card className="bg-background text-foreground">
+        <Card id="setting-preview-environments" className="scroll-mt-4">
           <CardHeader>
-            <CardTitle>Preview Environments</CardTitle>
+            <CardTitle>Preview environments</CardTitle>
             <CardDescription>
-              Automatically create preview environments for each branch. When
-              enabled, deployments to branches that don&apos;t match any
-              existing environment will create temporary preview environments.
-              When disabled, pushes to those branches are not deployed.
+              A temporary environment for each branch or pull request that
+              matches no other environment.
             </CardDescription>
           </CardHeader>
-          <CardContent className="space-y-6">
-            <FormField
-              control={form.control}
-              name="enablePreviewEnvironments"
-              render={({ field }) => (
-                <FormItem className="flex flex-row items-center justify-between rounded-lg border p-4">
-                  <div className="space-y-0.5">
-                    <FormLabel className="text-base">
-                      Enable Preview Environments
-                    </FormLabel>
-                    <FormDescription>
-                      Automatically create environments for feature branches,
-                      pull requests, and other non-production branches
-                    </FormDescription>
-                  </div>
-                  <FormControl>
-                    <Switch
-                      checked={field.value}
-                      onCheckedChange={field.onChange}
-                    />
-                  </FormControl>
-                </FormItem>
-              )}
-            />
-
-            <FormField
-              control={form.control}
-              name="previewEnvsOnDemand"
-              render={({ field }) => (
-                <FormItem className="flex flex-row items-center justify-between rounded-lg border p-4">
-                  <div className="space-y-0.5">
-                    <FormLabel className="text-base">
-                      On-Demand Preview Environments
-                    </FormLabel>
-                    <FormDescription>
-                      Save resources by sleeping preview environments when idle.
-                      Containers stop after the idle timeout and start again on
-                      the next request. Applies only to previews created after
-                      this is enabled.
-                    </FormDescription>
-                  </div>
-                  <FormControl>
-                    <Switch
-                      checked={field.value}
-                      onCheckedChange={field.onChange}
-                      disabled={!previewEnabled}
-                    />
-                  </FormControl>
-                </FormItem>
-              )}
-            />
+          <CardContent className="space-y-4">
+            <div className="divide-y rounded-md border">
+              <FormField
+                control={form.control}
+                name="enablePreviewEnvironments"
+                render={({ field }) => (
+                  <FormItem className="flex flex-row items-start justify-between gap-4 space-y-0 px-4 py-3">
+                    <div className="space-y-0.5">
+                      <FormLabel>Create previews</FormLabel>
+                      <FormDescription>
+                        Deploy feature branches and pull requests to their own
+                        environment.
+                      </FormDescription>
+                    </div>
+                    <FormControl>
+                      <Switch
+                        checked={field.value}
+                        onCheckedChange={field.onChange}
+                      />
+                    </FormControl>
+                  </FormItem>
+                )}
+              />
+              <FormField
+                control={form.control}
+                name="previewEnvsOnDemand"
+                render={({ field }) => (
+                  <FormItem className="flex flex-row items-start justify-between gap-4 space-y-0 px-4 py-3">
+                    <div className="space-y-0.5">
+                      <FormLabel>Sleep when idle</FormLabel>
+                      <FormDescription>
+                        Stop a preview&apos;s containers after the idle timeout
+                        and start them again on the next request. Applies to
+                        previews created after it is turned on.
+                      </FormDescription>
+                    </div>
+                    <FormControl>
+                      <Switch
+                        checked={field.value}
+                        onCheckedChange={field.onChange}
+                        disabled={!previewEnabled}
+                      />
+                    </FormControl>
+                  </FormItem>
+                )}
+              />
+            </div>
 
             {onDemandEnabled && previewEnabled && (
               <div className="grid gap-4 sm:grid-cols-2">
@@ -196,9 +197,10 @@ export function PreviewEnvironmentsCard({
                         <Input type="number" min={60} max={86400} {...field} />
                       </FormControl>
                       <FormDescription>
-                        Seconds of inactivity before containers are stopped. Min
-                        60, max 86400 (24h). Default 300 (5 min).
+                        Inactivity before containers stop. 60 to 86400; default
+                        300.
                       </FormDescription>
+                      <FormMessage />
                     </FormItem>
                   )}
                 />
@@ -212,9 +214,10 @@ export function PreviewEnvironmentsCard({
                         <Input type="number" min={5} max={120} {...field} />
                       </FormControl>
                       <FormDescription>
-                        Max time to wait for containers to start on wake. Min 5,
-                        max 120. Default 30.
+                        Longest wait for containers to start on wake. 5 to 120;
+                        default 30.
                       </FormDescription>
+                      <FormMessage />
                     </FormItem>
                   )}
                 />
@@ -222,8 +225,19 @@ export function PreviewEnvironmentsCard({
             )}
           </CardContent>
           <CardFooter>
-            <Button type="submit" disabled={updateProjectSettings.isPending}>
-              Save Settings
+            <p>
+              {!previewEnabled &&
+                'With previews off, pushes to other branches do not deploy.'}
+            </p>
+            <Button
+              type="submit"
+              size="sm"
+              disabled={!isDirty || updateProjectSettings.isPending}
+            >
+              {updateProjectSettings.isPending && (
+                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+              )}
+              Save
             </Button>
           </CardFooter>
         </Card>

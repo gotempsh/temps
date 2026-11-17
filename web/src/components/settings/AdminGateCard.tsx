@@ -3,13 +3,7 @@
 
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from '@/components/ui/card'
+import { Card, CardContent } from '@/components/ui/card'
 import { Label } from '@/components/ui/label'
 import { ReadFailure } from '@/components/ui/read-failure'
 import { isForbiddenRead } from '@/lib/read-failure'
@@ -21,7 +15,7 @@ import {
   patchAdminGateMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Loader2, Lock, Save, Shield } from 'lucide-react'
+import { Loader2, Lock, Save } from 'lucide-react'
 import { useState } from 'react'
 import { toast } from 'sonner'
 
@@ -76,15 +70,6 @@ export function AdminGateCard() {
   if (isLoading) {
     return (
       <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Shield className="h-5 w-5" />
-            Admin Access Gate
-          </CardTitle>
-          <CardDescription>
-            Restrict which IPs and hostnames can reach the admin console.
-          </CardDescription>
-        </CardHeader>
         <CardContent className="space-y-4">
           <Skeleton className="h-24 w-full" />
           <Skeleton className="h-24 w-full" />
@@ -97,12 +82,6 @@ export function AdminGateCard() {
   if (error || !data) {
     return (
       <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Shield className="h-5 w-5" />
-            Admin Access Gate
-          </CardTitle>
-        </CardHeader>
         <CardContent>
           <ReadFailure
             resource="Admin access gate"
@@ -137,21 +116,6 @@ export function AdminGateCard() {
 
   return (
     <Card>
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2">
-          <Shield className="h-5 w-5" />
-          Admin Access Gate
-        </CardTitle>
-        <CardDescription>
-          Restrict which hostnames and source IPs can reach the management
-          surface (dashboard, <code>/api/projects</code>, etc.) through the
-          public load balancer. Hosts that don&apos;t match are served as normal
-          LB traffic — if they resolve to a deployed app it serves; otherwise
-          they 404. Public ingest (<code>/api/_temps/*</code>) is always
-          reachable from any host. Empty lists = no restriction. Bare IPs are
-          accepted as /32 (or /128 for IPv6). CIDR allowed for ranges.
-        </CardDescription>
-      </CardHeader>
       <CardContent className="space-y-4">
         {envOverride && (
           <Alert>
@@ -186,7 +150,7 @@ export function AdminGateCard() {
         </div>
 
         <div className="space-y-2">
-          <Label htmlFor="admin-gate-hosts">Allowed Host headers</Label>
+          <Label htmlFor="admin-gate-hosts">Allowed host headers</Label>
           <Textarea
             id="admin-gate-hosts"
             placeholder={'admin.example.com\nconsole.internal'}

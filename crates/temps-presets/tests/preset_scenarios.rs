@@ -6,6 +6,14 @@
 //! what a deployment needs. No Docker required; the image builds live in
 //! `deployment_regressions.rs`.
 
+// Test-only helpers outside `#[test]` fns (docker/fixture wrappers): a panic
+// there is the test failure, which is what we want.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test helpers: panicking is how a test fails"
+)]
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use temps_presets::{

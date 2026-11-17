@@ -18,7 +18,6 @@ const READY = {
   running: true,
   destroyed: false,
   configured: true,
-  onWorkerNode: false,
 }
 
 function renderCard(props: Partial<typeof READY> = {}) {
@@ -78,7 +77,7 @@ test('without a preview password it explains and links to the fix', () => {
   api.restore()
 })
 
-test('says when preview URLs are not configured or the sandbox is on a worker', () => {
+test('says when preview URLs are not configured', () => {
   const api = mockApi({})
   const unconfigured = renderCard({ configured: false })
   expect(unconfigured.getByText(/not configured on this install/)).toBeTruthy()
@@ -87,9 +86,6 @@ test('says when preview URLs are not configured or the sandbox is on a worker', 
     name: 'Open platform settings',
   })
   expect(fix.getAttribute('href')).toBe('/settings')
-  cleanup()
-  const worker = renderCard({ onWorkerNode: true })
-  expect(worker.getByText(/worker nodes/)).toBeTruthy()
   api.restore()
 })
 

@@ -1,9 +1,13 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { type CreateApiKeyRequest } from '@/api/client'
+import {
+  type CreateApiKeyRequest,
+  type CreateApiKeyResponse,
+} from '@/api/client'
 import { createApiKeyMutation } from '@/api/client/@tanstack/react-query.gen'
 import { useApiKeyPermissions } from '@/components/api-keys/useApiKeyPermissions'
+import { PageHeader } from '@/components/layout/PageContainer'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -25,7 +29,16 @@ import {
   CollapsibleTrigger,
 } from '@/components/ui/collapsible'
 import { cn } from '@/lib/utils'
-import { useMutation } from '@tanstack/react-query'
+import { ProjectSelect } from '@/components/project/ProjectSelect'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
+import { getEnvironmentsOptions } from '@/api/client/@tanstack/react-query.gen'
+import { useMutation, useQuery } from '@tanstack/react-query'
 import {
   AlertCircle,
   ArrowLeft,
@@ -40,11 +53,18 @@ import { useEffect, useRef, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router'
 import { toast } from 'sonner'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { useCurrentUserRole } from '@/hooks/useCurrentUserRole'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import { sensitiveActionErrorMessage } from '@/lib/sensitiveActionProblem'
+import {
+  canGrantPermission,
+  canGrantRole,
+  permissionCeiling,
+} from './api-key-ceiling'
+import { earliestExpiryDate, expiryFromDateInput } from './api-key-expiry'
 
 export default function ApiKeyCreate() {
-  usePageTitle('Create API Key')
+  usePageTitle('Create API key')
   const navigate = useNavigate()
   const [searchParams] = useSearchParams()
   const requestedReturnTo = searchParams.get('returnTo')
@@ -55,17 +75,28 @@ export default function ApiKeyCreate() {
   const isHarnessSetup = returnTo === '/setup/ai'
   const [step, setStep] = useState(1)
   const [keyName, setKeyName] = useState(searchParams.get('name') ?? '')
+  const [projectId, setProjectId] = useState<number | null>(null)
+  const [environmentId, setEnvironmentId] = useState<number | null>(null)
+  const environments = useQuery({
+    ...getEnvironmentsOptions({ path: { project_id: projectId ?? 0 } }),
+    enabled: projectId !== null,
+  })
   const [expiresAt, setExpiresAt] = useState('')
-  const [selectedRole, setSelectedRole] = useState<string>(
+  const [requestedRole, setSelectedRole] = useState<string>(
     searchParams.get('role') ?? ''
   )
   const [selectedPermissions, setSelectedPermissions] = useState<Set<string>>(
     new Set()
   )
   const [useCustomPermissions, setUseCustomPermissions] = useState(false)
-  const [newKeySecret, setNewKeySecret] = useState<string | null>(null)
+  // The created key as the server stored it. The success summary reads from
+  // this, never from the form: the form stays editable while the request is in
+  // flight, so it may no longer describe the key that was created.
+  const [createdKey, setCreatedKey] = useState<CreateApiKeyResponse | null>(
+    null
+  )
+  const newKeySecret = createdKey?.api_key ?? null
   const [openCategories, setOpenCategories] = useState<Set<string>>(new Set())
-  const [createdKeyId, setCreatedKeyId] = useState<number | null>(null)
   const isSubmittingRef = useRef(false)
   const resultHeadingRef = useRef<HTMLDivElement | null>(null)
 
@@ -80,6 +111,18 @@ export default function ApiKeyCreate() {
     useApiKeyPermissions()
   const { handleSensitiveActionError, verificationDialog } =
     useSensitiveActionVerification()
+  const userRole = useCurrentUserRole()
+  const ceiling = permissionCeiling(permissionsData?.roles, userRole)
+
+  // A `?role=` link can preselect a role this user may not grant; treat it as
+  // unselected instead of letting the wizard run to a refusal on the last step.
+  const requestedRoleInfo = permissionsData?.roles.find(
+    (r) => r.name === requestedRole
+  )
+  const selectedRole =
+    requestedRoleInfo && !canGrantRole(requestedRoleInfo, ceiling)
+      ? ''
+      : requestedRole
 
   const createMutation = useMutation({
     ...createApiKeyMutation(),
@@ -87,8 +130,7 @@ export default function ApiKeyCreate() {
       errorTitle: 'Failed to create API key',
     },
     onSuccess: (response) => {
-      setNewKeySecret(response.api_key)
-      setCreatedKeyId(response.id)
+      setCreatedKey(response)
       setStep(4) // Show success step
       toast.success('API key created successfully')
     },
@@ -107,6 +149,8 @@ export default function ApiKeyCreate() {
   })
 
   const handleRoleSelect = (role: string) => {
+    const info = permissionsData?.roles.find((r) => r.name === role)
+    if (info && !canGrantRole(info, ceiling)) return
     setSelectedRole(role)
     setUseCustomPermissions(false)
     const selectedRoleInfo = permissionsData?.roles.find((r) => r.name === role)
@@ -163,15 +207,30 @@ export default function ApiKeyCreate() {
     if (!trimmedName || isSubmittingRef.current || createMutation.isPending) {
       return
     }
+    if (expiresAt && expiresAt < earliestExpiryDate()) {
+      toast.error('Choose an expiration date after today', {
+        description:
+          'A key expires at the start of its expiration date (UTC), so today would create a key that is already expired.',
+      })
+      return
+    }
+    // A role chosen before the catalogue arrived can turn out to be one this
+    // user may not grant. Go back to choosing instead of sending an empty role.
+    if (!useCustomPermissions && !selectedRole) {
+      setStep(2)
+      return
+    }
     isSubmittingRef.current = true
 
     const data: CreateApiKeyRequest = {
       name: trimmedName,
+      project_id: projectId,
+      environment_id: projectId === null ? null : environmentId,
       role_type: useCustomPermissions ? 'custom' : selectedRole,
       permissions: useCustomPermissions
         ? Array.from(selectedPermissions)
         : undefined,
-      expires_at: expiresAt ? new Date(expiresAt).toISOString() : undefined,
+      expires_at: expiryFromDateInput(expiresAt) ?? undefined,
     }
     createMutation.mutate(
       {
@@ -188,8 +247,11 @@ export default function ApiKeyCreate() {
   const canProceed = () => {
     if (step === 1) return keyName.trim().length > 0
     if (step === 2)
+      // Not before the catalogue is known: a role preselected from the link is
+      // only checked against the user's own permissions once it has loaded.
       return (
-        selectedRole || (useCustomPermissions && selectedPermissions.size > 0)
+        !isLoadingPermissions &&
+        (selectedRole || (useCustomPermissions && selectedPermissions.size > 0))
       )
     return true
   }
@@ -197,6 +259,7 @@ export default function ApiKeyCreate() {
   // Group permissions by category
   const permissionsByCategory = permissionsData?.permissions.reduce(
     (acc, perm) => {
+      if (!canGrantPermission(perm.name, ceiling)) return acc
       if (!acc[perm.category]) {
         acc[perm.category] = []
       }
@@ -218,7 +281,7 @@ export default function ApiKeyCreate() {
                   tabIndex={-1}
                   className="text-2xl focus-visible:outline-none"
                 >
-                  API Key Created Successfully
+                  API key created
                 </CardTitle>
                 <CardDescription>
                   Your API key has been created. Copy it now as it won&apos;t be
@@ -240,10 +303,10 @@ export default function ApiKeyCreate() {
             </Alert>
 
             <div className="space-y-2">
-              <Label>Your API Key</Label>
+              <Label>Your API key</Label>
               <div className="flex gap-2">
                 <Input
-                  aria-label="Your API Key"
+                  aria-label="Your API key"
                   value={newKeySecret}
                   readOnly
                   className="font-mono text-sm"
@@ -259,34 +322,41 @@ export default function ApiKeyCreate() {
 
             <div className="space-y-4 p-4 bg-muted rounded-lg">
               <div className="text-sm">
-                <strong>Name:</strong> {keyName.trim()}
+                <strong>Name:</strong> {createdKey?.name}
               </div>
               <div className="text-sm">
-                <strong>Access Level:</strong>{' '}
-                {useCustomPermissions
-                  ? `Custom (${selectedPermissions.size} permissions)`
-                  : selectedRole}
+                <strong>Scope:</strong>{' '}
+                {apiKeyScopeLabel(
+                  createdKey?.project_id ?? null,
+                  createdKey?.environment_id ?? null
+                )}
               </div>
-              {expiresAt && (
+              <div className="text-sm">
+                <strong>Access level:</strong>{' '}
+                {createdKey?.role_type === 'custom'
+                  ? `Custom (${createdKey.permissions?.length ?? 0} permissions)`
+                  : createdKey?.role_type}
+              </div>
+              {createdKey?.expires_at && (
                 <div className="text-sm">
                   <strong>Expires:</strong>{' '}
-                  {new Date(expiresAt).toLocaleDateString()}
+                  {new Date(createdKey.expires_at).toLocaleDateString()}
                 </div>
               )}
             </div>
 
             <div className="flex justify-end gap-3">
-              {createdKeyId && (
+              {createdKey && (
                 <Button
                   variant="outline"
-                  onClick={() => navigate(`/settings/keys/${createdKeyId}`)}
+                  onClick={() => navigate(`/settings/keys/${createdKey.id}`)}
                 >
                   <Edit className="mr-2 h-4 w-4" />
-                  Edit Permissions
+                  Edit permissions
                 </Button>
               )}
               <Button onClick={() => navigate(returnTo)}>
-                {isHarnessSetup ? 'Continue harness setup' : 'Go to API Keys'}
+                {isHarnessSetup ? 'Continue harness setup' : 'Go to API keys'}
               </Button>
             </div>
           </CardContent>
@@ -298,25 +368,20 @@ export default function ApiKeyCreate() {
   return (
     <div className="w-full min-w-0 space-y-6">
       {verificationDialog}
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-4">
-          <Button
-            aria-label="Back"
-            variant="ghost"
-            size="icon"
-            onClick={() => navigate(returnTo)}
-          >
-            <ArrowLeft className="h-4 w-4" />
-          </Button>
-          <div>
-            <h1 className="text-2xl font-semibold tracking-tight">
-              Create API Key
-            </h1>
-            <p className="text-muted-foreground mt-1">
-              Generate a new API key for programmatic access
-            </p>
-          </div>
-        </div>
+      <div className="flex items-start gap-4">
+        <Button
+          aria-label="Back"
+          variant="ghost"
+          size="icon"
+          onClick={() => navigate(returnTo)}
+        >
+          <ArrowLeft className="h-4 w-4" />
+        </Button>
+        <PageHeader
+          className="min-w-0 flex-1"
+          title="Create API key"
+          description="Generate a new API key for programmatic access"
+        />
       </div>
 
       {isHarnessSetup && (
@@ -333,7 +398,7 @@ export default function ApiKeyCreate() {
       {/* Progress Steps */}
       <div className="flex items-center justify-center mb-8">
         {[
-          { number: 1, name: 'Basic Info' },
+          { number: 1, name: 'Basic info' },
           { number: 2, name: 'Permissions' },
           { number: 3, name: 'Review' },
         ].map((s, index) => (
@@ -374,7 +439,7 @@ export default function ApiKeyCreate() {
       {step === 1 && (
         <Card>
           <CardHeader>
-            <CardTitle>Basic Information</CardTitle>
+            <CardTitle>Basic information</CardTitle>
             <CardDescription>
               Give your API key a descriptive name and set an optional
               expiration date
@@ -389,7 +454,7 @@ export default function ApiKeyCreate() {
               className="space-y-6"
             >
               <div className="space-y-2">
-                <Label htmlFor="name">API Key Name *</Label>
+                <Label htmlFor="name">API key name *</Label>
                 <Input
                   id="name"
                   placeholder="e.g., Production Server Key"
@@ -405,16 +470,77 @@ export default function ApiKeyCreate() {
               </div>
 
               <div className="space-y-2">
+                <Label>Deployment scope</Label>
+                <ProjectSelect
+                  ariaLabel="API key project scope"
+                  value={projectId}
+                  allLabel="Account-wide access"
+                  onValueChange={(id) => {
+                    setProjectId(id)
+                    setEnvironmentId(null)
+                  }}
+                />
+                <p className="text-xs text-muted-foreground">
+                  Project keys are confined to deployment and environment APIs.
+                  Scope cannot be changed after creation.
+                </p>
+              </div>
+              {projectId !== null && (
+                <div className="space-y-2">
+                  <Label htmlFor="environment-scope">Environment scope</Label>
+                  <Select
+                    value={
+                      environmentId === null ? 'all' : String(environmentId)
+                    }
+                    onValueChange={(value) =>
+                      setEnvironmentId(value === 'all' ? null : Number(value))
+                    }
+                  >
+                    <SelectTrigger id="environment-scope">
+                      <SelectValue placeholder="All environments" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="all">
+                        All environments in this project
+                      </SelectItem>
+                      {environments.data?.map((env) => (
+                        <SelectItem key={env.id} value={String(env.id)}>
+                          {env.name}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  {environments.isError && (
+                    <div role="alert" className="text-sm text-destructive">
+                      Could not load environments.
+                      <Button
+                        type="button"
+                        variant="link"
+                        aria-disabled={environments.isFetching}
+                        onClick={() => {
+                          if (!environments.isFetching)
+                            void environments.refetch()
+                        }}
+                      >
+                        Retry
+                      </Button>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              <div className="space-y-2">
                 <Label htmlFor="expires">
                   <Calendar className="inline h-4 w-4 mr-2" />
-                  Expiration Date (Optional)
+                  Expiration date (optional)
                 </Label>
                 <Input
                   id="expires"
                   type="date"
                   value={expiresAt}
                   onChange={(e) => setExpiresAt(e.target.value)}
-                  min={new Date().toISOString().split('T')[0]}
+                  // Today would mean 00:00 UTC today: a key already expired.
+                  min={earliestExpiryDate()}
                   className="max-w-md"
                 />
                 <p className="text-sm text-muted-foreground">
@@ -448,7 +574,7 @@ export default function ApiKeyCreate() {
             <CardHeader>
               <CardTitle>
                 <Shield className="inline h-5 w-5 mr-2" />
-                Choose Access Level
+                Choose access level
               </CardTitle>
               <CardDescription>
                 Select a predefined role or customize permissions
@@ -461,57 +587,72 @@ export default function ApiKeyCreate() {
                 </div>
               ) : (
                 <div className="grid gap-4">
-                  {permissionsData?.roles.map((role) => (
-                    <div
-                      key={role.name}
-                      className={cn(
-                        'p-4 rounded-lg border-2 cursor-pointer transition-colors',
-                        selectedRole === role.name
-                          ? 'border-primary bg-primary/5'
-                          : 'border-border hover:border-primary/50'
-                      )}
-                      onClick={() => handleRoleSelect(role.name)}
-                    >
-                      <div className="flex items-start justify-between">
-                        <div className="space-y-1">
-                          <div className="font-medium">{role.name}</div>
-                          <div className="text-sm text-muted-foreground">
-                            {role.description}
+                  {permissionsData?.roles.map((role) => {
+                    const grantable = canGrantRole(role, ceiling)
+                    return (
+                      <div
+                        key={role.name}
+                        aria-disabled={grantable ? undefined : true}
+                        className={cn(
+                          'p-4 rounded-lg border-2 transition-colors',
+                          !grantable && 'cursor-not-allowed opacity-60',
+                          grantable && 'cursor-pointer',
+                          selectedRole === role.name
+                            ? 'border-primary bg-primary/5'
+                            : grantable
+                              ? 'border-border hover:border-primary/50'
+                              : 'border-border'
+                        )}
+                        onClick={() => handleRoleSelect(role.name)}
+                      >
+                        <div className="flex items-start justify-between">
+                          <div className="space-y-1">
+                            <div className="font-medium">{role.name}</div>
+                            <div className="text-sm text-muted-foreground">
+                              {role.description}
+                            </div>
+                            {!grantable && (
+                              <div className="text-sm text-muted-foreground">
+                                Not available: it includes permissions your own
+                                role{userRole ? ` (${userRole})` : ''} does not
+                                have, and a key cannot grant more than you hold.
+                              </div>
+                            )}
+                            <div className="flex flex-wrap gap-1 mt-2">
+                              {role.permissions.slice(0, 5).map((p) => (
+                                <Badge
+                                  key={p}
+                                  variant="secondary"
+                                  className="text-xs"
+                                >
+                                  {p}
+                                </Badge>
+                              ))}
+                              {role.permissions.length > 5 && (
+                                <Badge variant="outline" className="text-xs">
+                                  +{role.permissions.length - 5} more
+                                </Badge>
+                              )}
+                            </div>
                           </div>
-                          <div className="flex flex-wrap gap-1 mt-2">
-                            {role.permissions.slice(0, 5).map((p) => (
-                              <Badge
-                                key={p}
-                                variant="secondary"
-                                className="text-xs"
-                              >
-                                {p}
-                              </Badge>
-                            ))}
-                            {role.permissions.length > 5 && (
-                              <Badge variant="outline" className="text-xs">
-                                +{role.permissions.length - 5} more
-                              </Badge>
-                            )}
-                          </div>
-                        </div>
-                        <div className="mt-1">
-                          <div
-                            className={cn(
-                              'w-5 h-5 rounded-full border-2',
-                              selectedRole === role.name
-                                ? 'border-primary bg-primary'
-                                : 'border-muted-foreground'
-                            )}
-                          >
-                            {selectedRole === role.name && (
-                              <Check className="h-3 w-3 text-primary-foreground m-auto" />
-                            )}
+                          <div className="mt-1">
+                            <div
+                              className={cn(
+                                'w-5 h-5 rounded-full border-2',
+                                selectedRole === role.name
+                                  ? 'border-primary bg-primary'
+                                  : 'border-muted-foreground'
+                              )}
+                            >
+                              {selectedRole === role.name && (
+                                <Check className="h-3 w-3 text-primary-foreground m-auto" />
+                              )}
+                            </div>
                           </div>
                         </div>
                       </div>
-                    </div>
-                  ))}
+                    )
+                  })}
                 </div>
               )}
             </CardContent>
@@ -522,7 +663,7 @@ export default function ApiKeyCreate() {
             <CardHeader>
               <CardTitle>
                 <Key className="inline h-5 w-5 mr-2" />
-                Custom Permissions
+                Custom permissions
               </CardTitle>
               <CardDescription>
                 Select specific permissions for fine-grained access control
@@ -651,7 +792,7 @@ export default function ApiKeyCreate() {
       {step === 3 && (
         <Card>
           <CardHeader>
-            <CardTitle>Review and Create</CardTitle>
+            <CardTitle>Review and create</CardTitle>
             <CardDescription>
               Review your API key configuration before creating
             </CardDescription>
@@ -666,9 +807,13 @@ export default function ApiKeyCreate() {
               <Separator />
 
               <div>
-                <Label className="text-muted-foreground">Access Level</Label>
+                <Label className="text-muted-foreground">Scope</Label>
+                <p>{apiKeyScopeLabel(projectId, environmentId)}</p>
+              </div>
+              <div className="space-y-2">
+                <Label className="text-muted-foreground">Access level</Label>
                 <p className="font-medium">
-                  {useCustomPermissions ? 'Custom Permissions' : selectedRole}
+                  {useCustomPermissions ? 'Custom permissions' : selectedRole}
                 </p>
               </div>
 
@@ -730,7 +875,7 @@ export default function ApiKeyCreate() {
                   onClick={handleSubmit}
                   disabled={createMutation.isPending}
                 >
-                  {createMutation.isPending ? 'Creating...' : 'Create API Key'}
+                  {createMutation.isPending ? 'Creating...' : 'Create API key'}
                 </Button>
               </div>
             </div>
@@ -739,4 +884,16 @@ export default function ApiKeyCreate() {
       )}
     </div>
   )
+}
+
+function apiKeyScopeLabel(
+  projectId: number | null,
+  environmentId: number | null
+): string {
+  if (projectId === null) return 'Account-wide'
+  const environment =
+    environmentId === null
+      ? 'All environments'
+      : `Environment #${environmentId}`
+  return `Project #${projectId} · ${environment}`
 }

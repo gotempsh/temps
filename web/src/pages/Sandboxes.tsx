@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { useComposedSearchParams } from '@temps-sdk/ds'
 import { Checkbox } from '@/components/ui/checkbox'
 import { useEffect, useMemo, useState } from 'react'
 import { Link, useNavigate } from 'react-router'
@@ -26,6 +27,7 @@ import {
   HardDrive,
   Cpu,
   Plus,
+  Settings,
 } from 'lucide-react'
 import { toast } from 'sonner'
 
@@ -94,6 +96,7 @@ function statusVariant(
     case 'sleeping':
       return 'warning'
     case 'recovering':
+    case 'starting':
       return 'secondary'
     case 'failed':
     case 'destroyed':
@@ -113,7 +116,7 @@ const DEFAULT_PORTS: { port: number; label: string }[] = [
   { port: 8000, label: 'Django · FastAPI' },
   { port: 4000, label: 'Phoenix · Keystone' },
   { port: 4200, label: 'Angular' },
-  { port: 3001, label: 'Alt Node' },
+  { port: 3001, label: 'Alt node' },
 ]
 
 function formatCountdown(iso: string, now: number): string {
@@ -166,19 +169,27 @@ const PAGE_SIZE = 20
 
 type StatusFilter = 'active' | 'expired' | 'all'
 
-export default function Sandboxes({
-  workspacesOnly = false,
-}: {
-  workspacesOnly?: boolean
-}) {
-  usePageTitle(workspacesOnly ? 'Workspaces' : 'Sandboxes')
+export default function Sandboxes() {
+  usePageTitle('Sandboxes')
   const platformFeatures = usePlatformFeatures()
   const [includeWorkspaceCompute, setIncludeWorkspaceCompute] = useState(false)
-  const loadWorkspaces = workspacesOnly || includeWorkspaceCompute
+  const loadWorkspaces = includeWorkspaceCompute
   const [page, setPage] = useState(1)
   const [filter, setFilter] = useState<StatusFilter>('active')
   const [stopTarget, setStopTarget] = useState<SandboxView | null>(null)
-  const [createOpen, setCreateOpen] = useState(false)
+  const [searchParams, updateSearchParams] = useComposedSearchParams()
+  const createOpen = searchParams.get('new') === 'sandbox'
+  const setCreateOpen = (open: boolean) => {
+    updateSearchParams(
+      (current) => {
+        const next = new URLSearchParams(current)
+        if (open) next.set('new', 'sandbox')
+        else next.delete('new')
+        return next
+      },
+      { replace: !open }
+    )
+  }
   const queryClient = useQueryClient()
 
   const listQuery = listSandboxesOptions({
@@ -186,7 +197,6 @@ export default function Sandboxes({
   })
   const { data, isLoading, isError, error, refetch, isFetching } = useQuery({
     ...listQuery,
-    enabled: !workspacesOnly,
     refetchInterval: 15_000,
   })
 
@@ -242,7 +252,7 @@ export default function Sandboxes({
     globalWorkspaceQuery.isFetching
 
   const refreshAll = () => {
-    if (!workspacesOnly) void refetch()
+    void refetch()
     if (loadWorkspaces) {
       void applicationsQuery.refetch()
       void globalWorkspaceQuery.refetch()
@@ -299,18 +309,14 @@ export default function Sandboxes({
   return (
     <PageContainer>
       <PageHeader
-        title={workspacesOnly ? 'Workspaces' : 'Sandboxes'}
-        description={
-          workspacesOnly
-            ? 'Persistent services and working context, with compute when you need it.'
-            : 'Standalone compute environments managed through the CLI, API, or SDK.'
-        }
+        title="Sandboxes"
+        description="Standalone compute environments managed through the CLI, API, or SDK."
         actions={
           <div className="flex flex-wrap items-center gap-2">
             {/* Segmented filter — defaults to Active so expired/destroyed rows
               don't clutter the everyday view, but stay one click away for
               cleanup or audit. Counts are computed from the current page. */}
-            {!workspacesOnly && items.length > 0 && (
+            {items.length > 0 && (
               <div className="inline-flex rounded-md border bg-background p-0.5">
                 {(
                   [
@@ -341,12 +347,16 @@ export default function Sandboxes({
                 })}
               </div>
             )}
-            {!workspacesOnly && (
-              <Button size="sm" onClick={() => setCreateOpen(true)}>
-                <Plus className="mr-1.5 h-4 w-4" />
-                <span className="max-sm:sr-only">New sandbox</span>
-              </Button>
-            )}
+            <Button size="sm" onClick={() => setCreateOpen(true)}>
+              <Plus className="mr-1.5 h-4 w-4" />
+              <span className="max-sm:sr-only">New sandbox</span>
+            </Button>
+            <Button variant="outline" size="sm" asChild>
+              <Link to="/sandboxes/settings">
+                <Settings className="mr-1.5 h-4 w-4" />
+                <span className="max-sm:sr-only">Settings</span>
+              </Link>
+            </Button>
             <Button
               variant="outline"
               size="sm"
@@ -365,22 +375,20 @@ export default function Sandboxes({
       {platformFeatures.data && (
         <PlatformFeatureNotice
           available={platformFeatures.data.sandboxes}
-          label={workspacesOnly ? 'Workspaces' : 'Sandboxes'}
+          label="Sandboxes"
         />
       )}
 
-      {!workspacesOnly && (
-        <label className="flex items-center gap-2 text-sm">
-          <Checkbox
-            name="includeWorkspaceCompute"
-            checked={includeWorkspaceCompute}
-            onCheckedChange={(checked) =>
-              setIncludeWorkspaceCompute(checked === true)
-            }
-          />
-          Include workspace-owned sandboxes (operator view)
-        </label>
-      )}
+      <label className="flex items-center gap-2 text-sm">
+        <Checkbox
+          name="includeWorkspaceCompute"
+          checked={includeWorkspaceCompute}
+          onCheckedChange={(checked) =>
+            setIncludeWorkspaceCompute(checked === true)
+          }
+        />
+        Include workspace-owned sandboxes (operator view)
+      </label>
 
       {loadWorkspaces && (
         <ManagedApplicationWorkspaces
@@ -388,166 +396,164 @@ export default function Sandboxes({
           error={managedWorkspacesError}
           globalWorkspace={globalWorkspaceQuery.data ?? null}
           loading={managedWorkspacesLoading}
-          computeOnly={!workspacesOnly}
+          computeOnly
           activity={activityQuery.data?.workspaces}
           activityLoading={activityQuery.isLoading}
           activityError={activityQuery.isError}
         />
       )}
 
-      {!workspacesOnly && (
-        <>
-          <div className="space-y-1 border-t pt-6">
-            <h2 className="text-base font-semibold tracking-tight">
-              Standalone sandboxes
-            </h2>
-            <p className="text-sm text-muted-foreground">
-              Sandboxes you create and control directly through the CLI, API, or
-              SDK.
-            </p>
-          </div>
+      <>
+        <div className="space-y-1 border-t pt-6">
+          <h2 className="text-base font-semibold tracking-tight">
+            Standalone sandboxes
+          </h2>
+          <p className="text-sm text-muted-foreground">
+            Sandboxes you create and control directly through the CLI, API, or
+            SDK.
+          </p>
+        </div>
 
-          {isLoading ? (
-            <div className="space-y-3">
-              {Array.from({ length: 4 }).map((_, i) => (
-                <Card key={i}>
-                  <CardContent className="py-4 space-y-3">
-                    <div className="flex items-center justify-between gap-3">
-                      <div className="flex-1 space-y-2">
-                        <div className="h-5 w-48 rounded bg-muted animate-pulse" />
-                        <div className="h-3 w-32 rounded bg-muted animate-pulse" />
-                      </div>
-                      <div className="flex gap-2">
-                        <div className="h-8 w-20 rounded bg-muted animate-pulse" />
-                        <div className="h-8 w-20 rounded bg-muted animate-pulse" />
-                      </div>
+        {isLoading ? (
+          <div className="space-y-3">
+            {Array.from({ length: 4 }).map((_, i) => (
+              <Card key={i}>
+                <CardContent className="py-4 space-y-3">
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="flex-1 space-y-2">
+                      <div className="h-5 w-48 rounded bg-muted animate-pulse" />
+                      <div className="h-3 w-32 rounded bg-muted animate-pulse" />
                     </div>
-                  </CardContent>
-                </Card>
-              ))}
-            </div>
-          ) : isError ? (
+                    <div className="flex gap-2">
+                      <div className="h-8 w-20 rounded bg-muted animate-pulse" />
+                      <div className="h-8 w-20 rounded bg-muted animate-pulse" />
+                    </div>
+                  </div>
+                </CardContent>
+              </Card>
+            ))}
+          </div>
+        ) : isError ? (
+          <Card>
+            <CardContent className="py-12 text-center space-y-2">
+              <Box className="mx-auto h-8 w-8 text-destructive" />
+              <p className="text-sm font-medium">Failed to load sandboxes</p>
+              <p className="text-xs text-muted-foreground">
+                {(error as Error)?.message ?? 'Unknown error'}
+              </p>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => refetch()}
+                className="mt-2"
+              >
+                <RefreshCw className="mr-1.5 h-4 w-4" />
+                Try again
+              </Button>
+            </CardContent>
+          </Card>
+        ) : items.length === 0 ? (
+          // Empty state: the primary action first, then the three other ways
+          // to create one (CLI / REST / SDK) so nobody has to hunt for docs.
+          <div className="space-y-4">
             <Card>
-              <CardContent className="py-12 text-center space-y-2">
-                <Box className="mx-auto h-8 w-8 text-destructive" />
-                <p className="text-sm font-medium">Failed to load sandboxes</p>
-                <p className="text-xs text-muted-foreground">
-                  {(error as Error)?.message ?? 'Unknown error'}
+              <CardContent className="space-y-3 py-10 text-center">
+                <Box className="mx-auto h-8 w-8 text-muted-foreground" />
+                <p className="text-sm font-medium">No sandboxes yet</p>
+                <p className="mx-auto max-w-md text-xs text-muted-foreground">
+                  A sandbox is an isolated environment you can run commands in,
+                  open a terminal on, edit files in and share a preview of.
+                  Create one here or from the CLI, API or SDK.
                 </p>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => refetch()}
-                  className="mt-2"
-                >
-                  <RefreshCw className="mr-1.5 h-4 w-4" />
-                  Try again
+                <Button size="sm" onClick={() => setCreateOpen(true)}>
+                  <Plus className="mr-1.5 h-4 w-4" />
+                  New sandbox
                 </Button>
               </CardContent>
             </Card>
-          ) : items.length === 0 ? (
-            // Empty state: the primary action first, then the three other ways
-            // to create one (CLI / REST / SDK) so nobody has to hunt for docs.
-            <div className="space-y-4">
+            <CreateSandboxDocs variant="full" />
+          </div>
+        ) : (
+          <div className="space-y-3">
+            {/* Collapsible docs banner: the CLI, API and SDK equivalents of
+              "New sandbox", one click away even when sandboxes already exist. */}
+            <CreateSandboxDocs variant="compact" />
+            {visible.length === 0 ? (
               <Card>
-                <CardContent className="space-y-3 py-10 text-center">
-                  <Box className="mx-auto h-8 w-8 text-muted-foreground" />
-                  <p className="text-sm font-medium">No sandboxes yet</p>
-                  <p className="mx-auto max-w-md text-xs text-muted-foreground">
-                    A sandbox is an isolated environment you can run commands
-                    in, open a terminal on, edit files in and share a preview
-                    of. Create one here or from the CLI, API or SDK.
+                <CardContent className="py-10 text-center space-y-2">
+                  <Box className="mx-auto h-6 w-6 text-muted-foreground" />
+                  <p className="text-sm font-medium">No {filter} sandboxes</p>
+                  <p className="text-xs text-muted-foreground">
+                    {filter === 'active'
+                      ? 'All sandboxes on this page have expired.'
+                      : 'Nothing to show in this view.'}
                   </p>
-                  <Button size="sm" onClick={() => setCreateOpen(true)}>
-                    <Plus className="mr-1.5 h-4 w-4" />
-                    New sandbox
-                  </Button>
+                  {filter !== 'all' && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => setFilter('all')}
+                      className="mt-2"
+                    >
+                      Show all
+                    </Button>
+                  )}
                 </CardContent>
               </Card>
-              <CreateSandboxDocs variant="full" />
-            </div>
-          ) : (
-            <div className="space-y-3">
-              {/* Collapsible docs banner: the CLI, API and SDK equivalents of
-              "New sandbox", one click away even when sandboxes already exist. */}
-              <CreateSandboxDocs variant="compact" />
-              {visible.length === 0 ? (
-                <Card>
-                  <CardContent className="py-10 text-center space-y-2">
-                    <Box className="mx-auto h-6 w-6 text-muted-foreground" />
-                    <p className="text-sm font-medium">No {filter} sandboxes</p>
-                    <p className="text-xs text-muted-foreground">
-                      {filter === 'active'
-                        ? 'All sandboxes on this page have expired.'
-                        : 'Nothing to show in this view.'}
-                    </p>
-                    {filter !== 'all' && (
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        onClick={() => setFilter('all')}
-                        className="mt-2"
-                      >
-                        Show all
-                      </Button>
-                    )}
-                  </CardContent>
-                </Card>
-              ) : (
-                visible.map((sbx) => (
-                  <SandboxRow
-                    key={sbx.id}
-                    sandbox={sbx}
-                    now={now}
-                    onDeleteRequest={setStopTarget}
-                  />
-                ))
-              )}
-            </div>
-          )}
+            ) : (
+              visible.map((sbx) => (
+                <SandboxRow
+                  key={sbx.id}
+                  sandbox={sbx}
+                  now={now}
+                  onDeleteRequest={setStopTarget}
+                />
+              ))
+            )}
+          </div>
+        )}
 
-          {(hasNext || hasPrev) && (
-            <div className="flex flex-col gap-2 border-t pt-4 sm:flex-row sm:items-center sm:justify-between">
-              <p className="text-xs text-muted-foreground tabular-nums">
-                Page {page}
-              </p>
-              <div className="flex items-center gap-2">
-                <Button
-                  variant="outline"
-                  size="sm"
-                  disabled={!hasPrev}
-                  onClick={() => setPage((p) => Math.max(1, p - 1))}
-                >
-                  Previous
-                </Button>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  disabled={!hasNext}
-                  onClick={() => setPage((p) => p + 1)}
-                >
-                  Next
-                </Button>
-              </div>
+        {(hasNext || hasPrev) && (
+          <div className="flex flex-col gap-2 border-t pt-4 sm:flex-row sm:items-center sm:justify-between">
+            <p className="text-xs text-muted-foreground tabular-nums">
+              Page {page}
+            </p>
+            <div className="flex items-center gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={!hasPrev}
+                onClick={() => setPage((p) => Math.max(1, p - 1))}
+              >
+                Previous
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={!hasNext}
+                onClick={() => setPage((p) => p + 1)}
+              >
+                Next
+              </Button>
             </div>
-          )}
+          </div>
+        )}
 
-          <ConfirmDeleteDialog
-            open={stopTarget !== null}
-            onOpenChange={(open) => {
-              if (!open) setStopTarget(null)
-            }}
-            resourceType="sandbox"
-            resourceName={stopTarget?.name || stopTarget?.id || ''}
-            consequences={`This tears down the container for ${stopTarget?.id ?? ''}. The row is kept for audit but cannot be restarted.`}
-            isPending={deleteMutation.isPending}
-            onConfirm={() => {
-              if (stopTarget)
-                deleteMutation.mutate({ path: { id: stopTarget.id } })
-            }}
-          />
-        </>
-      )}
+        <ConfirmDeleteDialog
+          open={stopTarget !== null}
+          onOpenChange={(open) => {
+            if (!open) setStopTarget(null)
+          }}
+          resourceType="sandbox"
+          resourceName={stopTarget?.name || stopTarget?.id || ''}
+          consequences={`This tears down the container for ${stopTarget?.id ?? ''}. The row is kept for audit but cannot be restarted.`}
+          isPending={deleteMutation.isPending}
+          onConfirm={() => {
+            if (stopTarget)
+              deleteMutation.mutate({ path: { id: stopTarget.id } })
+          }}
+        />
+      </>
       <CreateSandboxSheet
         open={createOpen}
         onOpenChange={setCreateOpen}

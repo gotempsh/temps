@@ -20,6 +20,14 @@ ARG TEMPS_ARTIFACTS=artifacts-source
 # Keep the patch version aligned with the committed CAPTCHA WASM producer.
 FROM rust:1.98.1-alpine AS toolchain
 
+# The repository's rust-toolchain.toml pins the compiler developers and CI
+# lint with. This image deliberately stays on its own version until the
+# committed CAPTCHA WASM is regenerated with the pinned one; without this,
+# rustup would honour the toolchain file inside /build and silently swap the
+# compiler (and the WASM bytes). .github/scripts/check-toolchain-pin.py
+# enforces that the two are either equal or explicitly overridden here.
+ENV RUSTUP_TOOLCHAIN=1.98.1
+
 # Install required build dependencies.
 #
 # python3 is required by crates/temps-captcha-wasm's `build`/`build:dev` npm
@@ -130,15 +138,19 @@ RUN test -f /app/temps || { \
 FROM scratch AS artifacts-source
 COPY --from=builder /app/temps /temps
 COPY --from=builder /build/crates/temps-cli/GeoLite2-City.mmdb /GeoLite2-City.mmdb
+COPY --from=builder /build/crates/temps-cli/GeoLite2-ASN.mmdb /GeoLite2-ASN.mmdb
 
 FROM scratch AS artifacts-prebuilt
 COPY ci-prebuilt/temps /temps
 COPY crates/temps-cli/GeoLite2-City.mmdb /GeoLite2-City.mmdb
+COPY crates/temps-cli/GeoLite2-ASN.mmdb /GeoLite2-ASN.mmdb
 
 FROM ${TEMPS_ARTIFACTS} AS artifacts
 
 # Stage 3: Runtime
-FROM alpine:3.22
+# Alpine 3.23 is the first release with PostgreSQL 18 client packages; see the
+# postgresql18-client note below.
+FROM alpine:3.23
 
 # `apk add` only installs the packages listed below -- it does not touch
 # packages already present in the base image (busybox, musl, ssl_client),
@@ -152,13 +164,21 @@ RUN apk update && apk upgrade --no-cache
 # git is how plugin installs fetch their source from GitHub. libstdc++ and
 # libgcc are what a Bun-compiled musl plugin binary links against; without
 # them an installed plugin dies at load.
+# postgresql18-client: without a local Docker daemon the control-plane backup
+# runs this image's own pg_dump and pg_dumpall, and refuses when they are
+# older than the database's major version (ADR-100). Name the major
+# explicitly (the unversioned postgresql-client is 17 on Alpine 3.22) and fail
+# the build if the tools report another one.
+ARG PG_CLIENT_MAJOR=18
 RUN apk add --no-cache \
     ca-certificates \
     git \
     libgcc \
     libssl3 \
     libstdc++ \
-    postgresql-client
+    "postgresql${PG_CLIENT_MAJOR}-client" && \
+    pg_dump --version | grep -Eq "^pg_dump \(PostgreSQL\) ${PG_CLIENT_MAJOR}\." && \
+    pg_dumpall --version | grep -Eq "^pg_dumpall \(PostgreSQL\) ${PG_CLIENT_MAJOR}\."
 
 # Create app user
 RUN addgroup -g 1001 -S appgroup && \
@@ -175,9 +195,11 @@ COPY --from=artifacts /temps /app/temps
 COPY LICENSE LICENSE-MIT NOTICE /usr/share/licenses/temps/
 
 # The city database is tracked in the repository and required by the proxy.
-# Keep it outside /app/data so an existing persistent volume cannot mask it
-# during an upgrade.
+# The ASN database is tracked alongside it and powers hosting/datacenter
+# detection. Keep both outside /app/data so an existing persistent volume
+# cannot mask them during an upgrade.
 COPY --from=artifacts /GeoLite2-City.mmdb /usr/share/temps/GeoLite2-City.mmdb
+COPY --from=artifacts /GeoLite2-ASN.mmdb /usr/share/temps/GeoLite2-ASN.mmdb
 
 # Create data directory structure
 RUN mkdir -p /app/data/logs && \
@@ -186,8 +208,9 @@ RUN mkdir -p /app/data/logs && \
 # Set permissions
 RUN chown -R appuser:appgroup /app/data && \
     chmod -R 755 /app/data && \
-    chmod 644 /usr/share/temps/GeoLite2-City.mmdb && \
-    ln -s /usr/share/temps/GeoLite2-City.mmdb /app/GeoLite2-City.mmdb
+    chmod 644 /usr/share/temps/GeoLite2-City.mmdb /usr/share/temps/GeoLite2-ASN.mmdb && \
+    ln -s /usr/share/temps/GeoLite2-City.mmdb /app/GeoLite2-City.mmdb && \
+    ln -s /usr/share/temps/GeoLite2-ASN.mmdb /app/GeoLite2-ASN.mmdb
 
 # Switch to non-root user
 USER appuser:appgroup
@@ -256,7 +279,7 @@ CMD ["/app/temps", "serve"]
 # - The tracked crates/temps-cli/GeoLite2-City.mmdb is copied to the immutable
 #   /usr/share/temps directory. It remains available when /app/data is an existing
 #   persistent volume.
-# - GeoLite2-ASN.mmdb is optional and may be mounted under /app/data. It powers
-#   hosting/VPS-provider detection used to keep scraper/bot traffic out of the
-#   live-visitors view. Without it, that detection is disabled (non-fatal), while
+# - The tracked crates/temps-cli/GeoLite2-ASN.mmdb is copied the same way. It
+#   powers hosting/VPS-provider detection used to keep scraper/bot traffic out
+#   of analytics. If it is missing, that detection is disabled (non-fatal), while
 #   city/country geolocation continues to use the bundled city database.

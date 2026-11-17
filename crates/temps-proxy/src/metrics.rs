@@ -4,7 +4,7 @@
 //! Hot-path proxy metrics.
 //!
 //! The counters themselves live in [`temps_metrics::proxy`], shared with the
-//! worker edge proxy in `temps-agent` so both count traffic the same way
+//! worker edge proxy in `temps-node-agent` so both count traffic the same way
 //! (ADR 061). This module re-exports them under the path the proxy has always
 //! used.
 

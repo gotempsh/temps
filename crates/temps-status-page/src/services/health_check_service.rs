@@ -69,10 +69,32 @@ enum ProbeSendError {
     Timeout { attempts: u32 },
 }
 
+fn authenticated_probe_request(
+    client: &reqwest::Client,
+    url: &str,
+    key: Option<&str>,
+) -> reqwest::RequestBuilder {
+    let request = client.get(url);
+    let Some((key, host)) = key.zip(
+        reqwest::Url::parse(url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_owned)),
+    ) else {
+        return request;
+    };
+    request
+        .header(
+            temps_core::probe_auth::HEADER,
+            temps_core::probe_auth::sign(key, &host, temps_core::probe_auth::now()),
+        )
+        .header("cache-control", "no-cache, no-store")
+}
+
 async fn send_with_timeout_retries(
     client: &reqwest::Client,
     url: &str,
     request_timeout: Duration,
+    probe_key: Option<&str>,
 ) -> Result<(reqwest::Response, u32), ProbeSendError> {
     for attempt in 0..=MAX_RETRIES {
         if attempt > 0 {
@@ -80,7 +102,12 @@ async fn send_with_timeout_retries(
             sleep(Duration::from_millis(delay)).await;
         }
 
-        match timeout(request_timeout, client.get(url).send()).await {
+        match timeout(
+            request_timeout,
+            authenticated_probe_request(client, url, probe_key).send(),
+        )
+        .await
+        {
             Ok(Ok(response)) => return Ok((response, attempt + 1)),
             Ok(Err(source)) if source.is_timeout() && attempt < MAX_RETRIES => continue,
             Ok(Err(source)) => {
@@ -609,6 +636,13 @@ fn primary_probe_url(address: Option<&EnvironmentAddress>) -> Option<String> {
     }
 }
 
+/// Only a settled absence of ingress permits substituting runtime health.
+/// A broken configured route or an unavailable reachability provider keeps
+/// the external check authoritative. Local installations keep proxy checks.
+fn use_worker_health(no_address: bool, has_worker: bool) -> bool {
+    no_address && has_worker
+}
+
 impl HealthCheckService {
     /// Match deployment-readiness semantics: a redirect is a valid public
     /// application response (login/setup redirects are common), while 4xx/5xx
@@ -991,6 +1025,59 @@ impl HealthCheckService {
             );
             return Ok(());
         }
+        let probe = MonitorProbeSnapshot {
+            monitor_id: monitor.id,
+            deployment_id: current_deployment_id,
+            monitor_updated_at: monitor.updated_at,
+        };
+
+        // ADR-096: without configured ingress, remote workloads use their
+        // existing worker runtime observations. Local installations retain
+        // proxy checks. A broken configured route or uncertain address lookup
+        // still uses the external monitor, so runtime success cannot hide it.
+        let address = match &addresses {
+            Some(addresses) => match addresses.address(environment.project_id, env_id).await {
+                Ok(address) => Some(address),
+                Err(error) => {
+                    warn!(
+                        monitor_id = monitor.id,
+                        environment_id = env_id,
+                        %error,
+                        "Could not tell the primary address; probing the generated URL"
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+        let no_address = address
+            .as_ref()
+            .is_some_and(EnvironmentAddress::has_no_address);
+        let has_worker = if no_address {
+            deployment_containers::Entity::find()
+                .filter(deployment_containers::Column::DeploymentId.eq(current_deployment_id))
+                .filter(deployment_containers::Column::DeletedAt.is_null())
+                .filter(deployment_containers::Column::NodeId.is_not_null())
+                .one(db.as_ref())
+                .await?
+                .is_some()
+        } else {
+            false
+        };
+        if use_worker_health(no_address, has_worker) {
+            // Runtime probes already run on the owning worker (ADR-053).
+            // Keep external uptime neutral; readers use fresh runtime state,
+            // never copy a worker observation into external uptime history.
+            return Self::record_check(
+                &db,
+                probe,
+                NO_ADDRESS_STATUS.to_string(),
+                None,
+                Some(NO_ADDRESS_MESSAGE.to_string()),
+                &job_queue,
+            )
+            .await;
+        }
         if deployment.static_dir_location.is_none()
             && Self::is_portless_deployment(db.as_ref(), current_deployment_id).await?
         {
@@ -1031,35 +1118,6 @@ impl HealthCheckService {
                 })?;
             return Ok(());
         }
-        let probe = MonitorProbeSnapshot {
-            monitor_id: monitor.id,
-            deployment_id: current_deployment_id,
-            monitor_updated_at: monitor.updated_at,
-        };
-
-        // ADR 068 D4: probe the environment's primary address when it has a
-        // reachable one; otherwise probe exactly as before. `no_address` only
-        // replaces the one failure that means nothing was ever set up: the
-        // target hostname does not resolve and the environment has no
-        // address at all. Without an answer, probe as before.
-        let address = match &addresses {
-            Some(addresses) => match addresses.address(environment.project_id, env_id).await {
-                Ok(address) => Some(address),
-                Err(error) => {
-                    warn!(
-                        monitor_id = monitor.id,
-                        environment_id = env_id,
-                        %error,
-                        "Could not tell the primary address; probing the generated URL"
-                    );
-                    None
-                }
-            },
-            None => None,
-        };
-        let no_address = address
-            .as_ref()
-            .is_some_and(EnvironmentAddress::has_no_address);
         let primary_url = primary_probe_url(address.as_ref());
 
         // IMPORTANT: Always use the public URL for health checks
@@ -1256,7 +1314,13 @@ impl HealthCheckService {
 
             let check_result = timeout(
                 Duration::from_secs(10),
-                probe_client.get(&health_url).send(),
+                authenticated_probe_request(
+                    &probe_client,
+                    &health_url,
+                    is_local_probe
+                        .then_some(config_service.get_server_config().encryption_key.as_str()),
+                )
+                .send(),
             )
             .await;
 
@@ -1348,6 +1412,7 @@ impl HealthCheckService {
                             &tls_client,
                             &https_url,
                             Duration::from_secs(10),
+                            Some(&config_service.get_server_config().encryption_key),
                         )
                         .await;
                         total_response_time_ms = start_time.elapsed().as_millis() as i32;
@@ -2475,7 +2540,7 @@ mod tests {
             .expect("build pinned TLS client with test root");
 
         let (response, attempts) =
-            send_with_timeout_retries(&client, &logical_url, Duration::from_secs(1))
+            send_with_timeout_retries(&client, &logical_url, Duration::from_secs(1), None)
                 .await
                 .expect("HTTPS follow-up succeeds");
         assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
@@ -2499,7 +2564,7 @@ mod tests {
             .expect("build pinned TLS client with test root");
 
         let (response, _) =
-            send_with_timeout_retries(&client, &logical_url, Duration::from_secs(1))
+            send_with_timeout_retries(&client, &logical_url, Duration::from_secs(1), None)
                 .await
                 .expect("HTTPS follow-up succeeds");
         assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
@@ -2508,7 +2573,7 @@ mod tests {
 
     #[tokio::test]
     async fn managed_redirect_tls_certificate_failure_records_outage() {
-        let Ok(test_db) = temps_database::test_utils::TestDatabase::with_migrations().await else {
+        let Ok(test_db) = temps_test_utils::TestDatabase::with_migrations().await else {
             println!("Docker not available, skipping");
             return;
         };
@@ -2673,9 +2738,10 @@ mod tests {
         let client = local_proxy_client(logical_url, &destination.to_string())
             .expect("build pinned timeout client");
 
-        let error = send_with_timeout_retries(&client, logical_url, Duration::from_millis(20))
-            .await
-            .expect_err("all attempts should time out");
+        let error =
+            send_with_timeout_retries(&client, logical_url, Duration::from_millis(20), None)
+                .await
+                .expect_err("all attempts should time out");
         assert!(matches!(
             error,
             ProbeSendError::Timeout { attempts } if attempts == MAX_RETRIES + 1
@@ -2752,6 +2818,8 @@ mod tests {
             shield_exempt_paths: Default::default(),
             force_https: None,
             last_activity_at: None,
+            ingress_mode: Default::default(),
+            workload_mode: Default::default(),
         }
     }
 
@@ -3145,7 +3213,7 @@ mod tests {
         }
     }
 
-    fn settings_row(settings: temps_core::AppSettings) -> temps_entities::settings::Model {
+    fn settings_row(settings: temps_config::AppSettings) -> temps_entities::settings::Model {
         let now = Utc::now();
         temps_entities::settings::Model {
             id: 1,
@@ -3226,11 +3294,12 @@ mod tests {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results([vec![make_env(1, false)]])
             .append_query_results([vec![health_probe_deployment()]])
+            .append_query_results([Vec::<deployment_containers::Model>::new()])
             .append_query_results([vec![health_probe_counts(1, 1)]])
-            .append_query_results([vec![settings_row(temps_core::AppSettings {
+            .append_query_results([vec![settings_row(temps_config::AppSettings {
                 preview_domain: "localho.st".into(),
                 external_url: None,
-                ..temps_core::AppSettings::default()
+                ..temps_config::AppSettings::default()
             })]]);
         let db = Arc::new(persisted_check(db, &monitor, "operational").into_connection());
         let config = temps_config::ServerConfig::new(
@@ -3291,11 +3360,12 @@ mod tests {
             let db = MockDatabase::new(DatabaseBackend::Postgres)
                 .append_query_results([vec![make_env(1, false)]])
                 .append_query_results([vec![health_probe_deployment()]])
+                .append_query_results([Vec::<deployment_containers::Model>::new()])
                 .append_query_results([vec![health_probe_counts(1, 1)]])
-                .append_query_results([vec![settings_row(temps_core::AppSettings {
+                .append_query_results([vec![settings_row(temps_config::AppSettings {
                     preview_domain: "apps.example.invalid".into(),
                     external_url,
-                    ..temps_core::AppSettings::default()
+                    ..temps_config::AppSettings::default()
                 })]]);
             let db = Arc::new(persisted_check(db, &monitor, NO_ADDRESS_STATUS).into_connection());
             let addresses: Arc<dyn EnvironmentAddresses> = Arc::new(FixedAddress(settled(
@@ -3351,9 +3421,9 @@ mod tests {
         // reaching any network.
         let settings = temps_entities::settings::Model {
             id: 1,
-            data: temps_core::AppSettings {
+            data: temps_config::AppSettings {
                 preview_domain: "apps.example.invalid".into(),
-                ..temps_core::AppSettings::default()
+                ..temps_config::AppSettings::default()
             }
             .to_json(),
             created_at: now,
@@ -3446,7 +3516,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_environment_recheck_selects_monitor_and_skips_paused_deployment() {
-        let Ok(test_db) = temps_database::test_utils::TestDatabase::with_migrations().await else {
+        let Ok(test_db) = temps_test_utils::TestDatabase::with_migrations().await else {
             println!("Docker not available, skipping");
             return;
         };
@@ -3557,7 +3627,7 @@ mod tests {
     /// *late* guard inside `record_check` itself is the one doing the work.
     #[tokio::test]
     async fn test_record_check_skips_paused_deployment_mid_check() {
-        let Ok(test_db) = temps_database::test_utils::TestDatabase::with_migrations().await else {
+        let Ok(test_db) = temps_test_utils::TestDatabase::with_migrations().await else {
             println!("Docker not available, skipping");
             return;
         };
@@ -3669,7 +3739,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_record_check_discards_result_from_replaced_deployment() {
-        let Ok(test_db) = temps_database::test_utils::TestDatabase::with_migrations().await else {
+        let Ok(test_db) = temps_test_utils::TestDatabase::with_migrations().await else {
             println!("Docker not available, skipping");
             return;
         };
@@ -3861,7 +3931,7 @@ mod tests {
     /// query for ten minutes instead of being re-selected by the next sweep.
     #[tokio::test]
     async fn claiming_a_monitor_stamps_its_own_interval_and_clears_the_due_query() {
-        let Ok(test_db) = temps_database::test_utils::TestDatabase::with_migrations().await else {
+        let Ok(test_db) = temps_test_utils::TestDatabase::with_migrations().await else {
             println!("Docker not available, skipping");
             return;
         };
@@ -3934,7 +4004,7 @@ mod tests {
     /// under load, not a pathology). Exactly one may probe it.
     #[tokio::test]
     async fn overlapping_sweeps_claim_a_due_monitor_exactly_once() {
-        let Ok(test_db) = temps_database::test_utils::TestDatabase::with_migrations().await else {
+        let Ok(test_db) = temps_test_utils::TestDatabase::with_migrations().await else {
             println!("Docker not available, skipping");
             return;
         };
@@ -3991,7 +4061,7 @@ mod tests {
     /// on-demand set four times a minute forever.
     #[tokio::test]
     async fn run_all_checks_stamps_on_demand_monitors_instead_of_refetching_them() {
-        let Ok(test_db) = temps_database::test_utils::TestDatabase::with_migrations().await else {
+        let Ok(test_db) = temps_test_utils::TestDatabase::with_migrations().await else {
             println!("Docker not available, skipping");
             return;
         };
@@ -4056,5 +4126,59 @@ mod tests {
             !due_ids.contains(&monitor.id),
             "the on-demand monitor must drop out of the next sweep's result set"
         );
+    }
+}
+
+#[cfg(test)]
+mod probe_auth_tests {
+    use super::*;
+    #[test]
+    fn only_local_probe_requests_carry_host_bound_credentials() {
+        let client = reqwest::Client::new();
+        let url = "http://app.example.test/health";
+        let public = authenticated_probe_request(&client, url, None)
+            .build()
+            .unwrap();
+        assert!(!public
+            .headers()
+            .contains_key(temps_core::probe_auth::HEADER));
+        let local = authenticated_probe_request(&client, url, Some("test-key"))
+            .build()
+            .unwrap();
+        let token = local
+            .headers()
+            .get(temps_core::probe_auth::HEADER)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(temps_core::probe_auth::verify(
+            "test-key",
+            "app.example.test",
+            token,
+            temps_core::probe_auth::now()
+        ));
+        assert!(!temps_core::probe_auth::verify(
+            "test-key",
+            "other.example.test",
+            token,
+            temps_core::probe_auth::now()
+        ));
+        assert_eq!(
+            local.headers().get("cache-control").unwrap(),
+            "no-cache, no-store"
+        );
+    }
+}
+
+#[cfg(test)]
+mod worker_selection_tests {
+    use super::use_worker_health;
+
+    #[test]
+    fn worker_checks_only_replace_an_absent_address_on_remote_placements() {
+        assert!(use_worker_health(true, true));
+        assert!(!use_worker_health(false, true)); // public, broken, or unknown
+        assert!(!use_worker_health(true, false)); // combined local install
+        assert!(!use_worker_health(false, false));
     }
 }

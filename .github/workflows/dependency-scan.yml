@@ -10,6 +10,9 @@ name: Dependency & Container Scan
 #
 # - `cargo-audit` scans the Rust workspace's Cargo.lock against the RustSec
 #   Advisory Database.
+# - `cargo-deny` enforces deny.toml: the licence allow-list, allowed
+#   registries and git sources, bans, and the same advisory ignores as
+#   cargo-audit. Duplicate crate versions are reported, not failed.
 # - `web-audit` scans web/ (bun) dependencies against the same class of
 #   advisory data via `bun audit`.
 # - `container-scan` (schedule/dispatch only) scans the latest
@@ -26,6 +29,7 @@ on:
       - "**/Cargo.lock"
       - "web/package.json"
       - "web/bun.lock"
+      - "deny.toml"
       - ".github/workflows/dependency-scan.yml"
   schedule:
     # Every Monday at 06:00 UTC.
@@ -44,6 +48,8 @@ env:
 jobs:
   cargo-audit:
     name: Rust Dependency Audit (cargo-audit)
+    env:
+      AUDIT_IGNORE: RUSTSEC-2025-0134,RUSTSEC-2023-0071,RUSTSEC-2026-0235,RUSTSEC-2024-0436,RUSTSEC-2026-0173,RUSTSEC-2024-0388,RUSTSEC-2026-0253,RUSTSEC-2024-0449,RUSTSEC-2025-0141,RUSTSEC-2026-0381,RUSTSEC-2026-0387,RUSTSEC-2026-0459,RUSTSEC-2026-0440
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -62,24 +68,14 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch; version pinned below
         with:
-          toolchain: stable
+          # Keep in sync with rust-toolchain.toml.
+          toolchain: 1.99.1
 
-      - name: Cache dependencies
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          key: dependency-scan-cargo-audit
-          # Save from `main` only -- writes are scoped to the producing ref,
-          # so without this every open PR held its own ~340MB copy under this
-          # key (9 simultaneous copies measured = ~2.9GB, more than a quarter
-          # of the repo's 10GB cache pool). That's what was evicting
-          # `temps-musl-fast-*` -- the much larger, much more valuable shared
-          # musl build cache in rust-tests.yml -- turning its restore-keys
-          # fallback into a full ~80min cold compile on every workflow run.
-          # See the matching `save-if` note on the `test-build`/
-          # `nextest-archive` caches in rust-tests.yml for the same lesson.
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # No rust-cache step: nothing in this job compiles (cargo-audit is a
+      # prebuilt binary and reads Cargo.lock), so the cache only ever stored
+      # an empty ~/.cargo and cost a restore on every run.
 
       # Runs `cargo audit` against Cargo.lock and fails the job if any
       # RUSTSEC advisory matches a resolved dependency (all advisories, not
@@ -98,10 +94,6 @@ jobs:
       #     (direct `image` dep, and via qrcode for MFA QR codes). This is
       #     the only path in the default build -- temps-auth is depended on
       #     by nearly every service crate.
-      #   * tokenizers (and macro_rules_attribute <- tokenizers) <-
-      #     temps-embeddings, only behind its optional `huggingface`/`all`
-      #     feature, which no workspace crate enables (in Cargo.lock but not
-      #     compiled by default).
       # - RUSTSEC-2026-0173 (proc-macro-error2): proc-macro only. Paths:
       #   * sea-orm -> sea-orm-macros -> sea-bae -> proc-macro-error2
       #     (default build); sea-orm 1.1.20 is the pinned major, 2.0 is a
@@ -123,7 +115,7 @@ jobs:
       #   `Opt::default()`, so the parser is linked but never fed input.
       # - RUSTSEC-2025-0141 (bincode 2.0.1): no workspace crate uses bincode.
       #   Its only dependents are microsandbox-filesystem, msb_krun_devices
-      #   and msb_krun_vmm, all under temps-agents' exact-pinned microsandbox
+      #   and msb_krun_vmm, all under temps-sandbox-providers' exact-pinned microsandbox
       #   SDK (ADR-050), which is not linked on musl (the container image) or
       #   Intel macOS. They encode/decode VM and filesystem state blobs the
       #   microsandbox runtime writes itself. The latest releases checked on
@@ -131,12 +123,36 @@ jobs:
       #   `bincode ^2.0.1` non-optionally, so no upgrade drops it. No
       #   vulnerability is reported against bincode 2.0.1. A temps-core
       #   Cargo.lock guard test fails if anything else starts depending on it.
+      # - RUSTSEC-2026-0440 (astral-tokio-tar): Astral ended maintenance on
+      #   2026-11-03; no patched version exists. No workspace crate uses it.
+      #   Dependents:
+      #   * microsandbox-image (and microsandbox's `local` feature, enabled by
+      #     temps-sandbox-providers): parses OCI image layer tarballs pulled
+      #     from registries when a microsandbox sandbox boots, so
+      #     registry-supplied archives do reach this parser. Not linked on musl
+      #     (the container image) or Intel macOS, same as bincode above.
+      #   * testcontainers: writes tar archives for copy-to-container and
+      #     reads copy-from-container output, against containers the tests
+      #     start themselves. Test-only: it is a dependency of the dev-only
+      #     temps-test-utils crate and of dev-dependencies, and no crate
+      #     depends on temps-test-utils outside dev-dependencies.
+      #   Checked 2026-11-09: the latest releases (microsandbox and
+      #   microsandbox-image 0.7.14, testcontainers 0.28.0) still require
+      #   `astral-tokio-tar ^0.6`, so no upgrade drops it. Cargo.lock is held
+      #   at 0.6.4, the last 0.6 release, which carries 0.6.3's parser
+      #   hardening (rejects ambiguous PAX/GNU metadata, truncated payloads and
+      #   partial sparse maps). A temps-core guard test fails if anything else
+      #   starts depending on it or if the lock drops below 0.6.4. Replace once
+      #   microsandbox and testcontainers move to a maintained tar crate.
       #
-      # The three below are vulnerability/unsoundness advisories (not "unmaintained"
-      # notices), blocked on upstream fixes with no non-forking workaround.
-      # Full reachability analysis for each lives in the root Cargo.toml
-      # under "Dependency Overrides - Security Fixes" -- re-verify that
-      # analysis before removing/renewing these on advisory-db updates:
+      # The six below are vulnerability/unsoundness advisories (not "unmaintained"
+      # notices). A version bump here cannot clear any of them: either no fix is
+      # released, or an upstream crate still requires the affected copy.
+      # Reachability analysis for RUSTSEC-2023-0071, RUSTSEC-2026-0235 and
+      # RUSTSEC-2026-0253 lives in the root Cargo.toml under "Dependency
+      # Overrides - Security Fixes"; for RUSTSEC-2026-0381, RUSTSEC-2026-0387
+      # and RUSTSEC-2026-0459 it is the note on the entry itself. Re-verify that analysis before
+      # removing/renewing these on advisory-db updates:
       # - RUSTSEC-2023-0071 (rsa, Marvin Attack). Locked paths and how each
       #   uses RSA:
       #   rsa 0.9.10:
@@ -155,11 +171,11 @@ jobs:
       #     `mysql` feature): caching_sha2/sha256_password auth on non-TLS
       #     connections RSA-OAEP *encrypts* the password to the server's
       #     public key -- encryption, never decryption.
-      #   * dev-dependency only: temps-deployments (cert_validator.rs test
+      #   * dev-dependency only: temps-traefik-discovery (cert_validator.rs test
       #     module generates throwaway RSA keys) and the
       #     examples/google-indexing-plugin test module (keygen); that
       #     example also signs RS256 JWTs via jsonwebtoken 11.
-      #   rsa 0.10.0-rc.18: russh/ssh-key <- temps-deployments for SSH node
+      #   rsa 0.10.0-rc.18: russh/ssh-key <- temps-nodes for SSH node
       #   enrollment, where RSA is only used for host-key/user-key signatures
       #   and verification -- no RSA decryption path exists in SSH2.
       #   Marvin Attack is a chosen-ciphertext *decryption* oracle attack;
@@ -193,20 +209,6 @@ jobs:
       #   consumer uses CacheKey(String), without a custom Drop, and calls
       #   get_or_insert_mut rather than pop. The advisory's panicking-key-Drop
       #   prerequisite is absent there. Re-review when the SDK changes.
-      # - RUSTSEC-2026-0367, RUSTSEC-2026-0368, RUSTSEC-2026-0369 (zip 8.6.0:
-      #   SUID/SGID bits and symlink targets honoured by `ZipArchive::extract()`
-      #   / `ZipStreamReader::extract()`; fixed in zip >= 9.0.0). The workspace's
-      #   own `zip` dependency is already 9.x, and utoipa-swagger-ui moved to
-      #   zip 9 in 10.0.2. The 8.6.0 copy is locked only by headless_chrome,
-      #   whose latest release (checked 2026-10-27: 1.0.22) still requires
-      #   `zip ^8`, so a version bump or [patch] cannot reach it.
-      #   headless_chrome (temps-screenshots, `fetch` feature) unpacks the
-      #   Chromium build it downloads. It does not call `extract()`; it
-      #   iterates `by_index()`, takes `mangled_name()` for the output path and
-      #   sets modes itself (on macOS it shells out to `unzip` instead). It
-      #   calls no advisory-affected function and handles no
-      #   attacker-controlled archive. Re-check and drop these three once
-      #   headless_chrome releases with zip 9.
       # - RUSTSEC-2026-0381 (webpki-roots: bundled `emSign ECC Root CA - G3`
       #   lets paths through distrusted emSign intermediates; fixed in
       #   webpki-roots >= 1.0.10). Cargo.lock has webpki-roots 1.0.10. The
@@ -226,55 +228,95 @@ jobs:
       #   this repository makes are signed with plain SigV4 (HMAC-SHA256),
       #   which does not touch it. Drop this entry once aws-sigv4 moves to
       #   crypto-bigint >= 0.7.6.
-      # - RUSTSEC-2026-0391, RUSTSEC-2026-0398, RUSTSEC-2026-0403 (zstd 0.13.3
-      #   / zstd-safe 7.2.4: data from an abandoned stream leaking into the
-      #   next one on a reused context; `Seekable::decompress` past the end;
-      #   uninitialized memory after a failed legacy-frame streaming decode;
-      #   fixed in zstd >= 0.14.3 / zstd-safe >= 8.2.0). The workspace's own
-      #   zstd is already 0.14.3. The 0.13.3 copy is locked by three upstream
-      #   crates whose latest releases (checked 2026-10-27) still require
-      #   `zstd ^0.13`, or `zip ^8`, which does:
-      #   * pingora-header-serde 0.9.0 <- pingora-cache <- pingora-proxy
-      #     (temps-proxy, temps-edge): compresses cached response headers.
-      #     Temps never enables Pingora's HTTP cache (no `session.cache` use in
-      #     the workspace), so this code is linked but never runs.
-      #   * msb_krun_vmm 0.1.41 (0.1.42 is the same) <- microsandbox
-      #     (temps-agents), a dependency only on x86_64 and, per the bincode
-      #     entry above, not linked on musl. Its one call is
-      #     `zstd::stream::copy_decode` on an external guest kernel file
-      #     (builder.rs, `KernelFormat::ImageZstd`): a fresh decoder per call,
-      #     so no context is reused (0391); the `seekable` feature is not
-      #     enabled, so 0398's code is not compiled; and 0403 needs a malformed
-      #     legacy frame in a kernel file on the host, which only someone who
-      #     can already write the host's files could plant.
-      #   * zip 8.6.0 <- headless_chrome 1.0.22 (temps-screenshots), the copy
-      #     the zip entry above covers. zip decodes with zstd only an archive
-      #     entry stored with the zstd method, through a fresh
-      #     `zstd::Decoder::with_buffer` per entry (0391 needs a reused one;
-      #     0398's code is not compiled). The only archive it opens is the
-      #     Chromium build headless_chrome downloads itself, so 0403 would need
-      #     a malformed legacy zstd frame inside that download.
-      #     (utoipa-swagger-ui 10.0.2 builds against zip 9 and no longer locks
-      #     this copy.)
-      #   Drop these three only once every path above resolves zstd >= 0.14.3:
-      #   pingora-header-serde and msb_krun_vmm moving to zstd 0.14, and
-      #   headless_chrome to zip 9.
+      # - RUSTSEC-2026-0459 (libsqlite3-sys: bundled SQLite < 3.54.0 can
+      #   return uninitialized page-cache memory when it opens a database
+      #   together with a crafted sibling `-wal` file of a different page
+      #   size; fixed in >= 0.39.0). Cargo.lock has one copy, 0.30.1, shared
+      #   by sqlx-sqlite 0.8 (sea-orm 1.1's `sqlx-sqlite` feature; sqlx 0.8
+      #   requires libsqlite3-sys 0.30, which has no patched release) and
+      #   sqlx-sqlite 0.9 (microsandbox-db in the exactly pinned microsandbox
+      #   SDK; capped at libsqlite3-sys < 0.38). The crate is
+      #   `links = "sqlite3"`, so no second, patched copy can coexist.
+      #   It is reachable. Two code paths open an on-disk database in WAL
+      #   mode:
+      #   * `temps edge` opens `<cache_dir>/analytics.db` through sea-orm and
+      #     sets `journal_mode = WAL` (temps-edge analytics.rs
+      #     AnalyticsStore::open). The cache dir defaults to
+      #     `~/.temps/edge-cache` and is created with the default umask.
+      #   * the experimental microsandbox backend (not linked on musl or
+      #     Intel macOS) opens the SDK's catalog under
+      #     `<data_dir>/microsandbox/db/` in WAL mode in the server process;
+      #     the `msb` VMM process writes the same catalog. The SDK home is
+      #     0700 and Temps-owned.
+      #   The main server database is never SQLite: temps-database only
+      #   accepts postgres:// URLs, and the other SQLite uses are
+      #   `sqlite::memory:` connections and mocks in tests.
+      #   Planting a crafted `-wal` next to either file takes write access to
+      #   a directory the Temps user owns: the Temps user itself (or root), an
+      #   operator who pointed `--cache-dir` at a shared writable path, or,
+      #   for the catalog, a guest that has already escaped into the VMM,
+      #   which ADR-050 treats as holding whatever the VMM can reach. That
+      #   residual risk is accepted until a patched copy is reachable.
+      #   Drop this entry once both sea-orm's sqlx and microsandbox-db allow
+      #   libsqlite3-sys >= 0.39.
       # Remove an entry once its upstream is fixed/replaced.
       # Install a checksum-verified release binary before audit-check runs.
       # audit-check otherwise compiles cargo-audit from a newly-resolved
       # dependency graph, which can fail independently of this repository's
       # Cargo.lock (for example, when an upstream build-only crate is broken).
       - name: Install cargo-audit
-        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
         with:
           tool: cargo-audit@0.22.2
           fallback: none
 
+      # PRs use the job status directly: audit-check's additional Check API
+      # reporting can fail even after a successful scan. Keep scheduled issue
+      # reporting, and preserve the same advisory policy on both paths.
+      - name: Audit pull request dependencies
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          IFS=',' read -r -a advisories <<< "$AUDIT_IGNORE"
+          args=()
+          for advisory in "${advisories[@]}"; do
+            args+=(--ignore "$advisory")
+          done
+          cargo audit --file Cargo.lock "${args[@]}"
+
       - name: Run cargo-audit
+        if: github.event_name != 'pull_request'
         uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          ignore: RUSTSEC-2025-0134,RUSTSEC-2023-0071,RUSTSEC-2026-0235,RUSTSEC-2024-0436,RUSTSEC-2026-0173,RUSTSEC-2024-0388,RUSTSEC-2026-0253,RUSTSEC-2024-0449,RUSTSEC-2025-0141,RUSTSEC-2026-0367,RUSTSEC-2026-0368,RUSTSEC-2026-0369,RUSTSEC-2026-0381,RUSTSEC-2026-0387,RUSTSEC-2026-0391,RUSTSEC-2026-0398,RUSTSEC-2026-0403
+          ignore: ${{ env.AUDIT_IGNORE }}
+
+  cargo-deny:
+    name: Rust Licences, Sources & Bans (cargo-deny)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # cargo-deny reads `cargo metadata`, which needs the pinned toolchain
+      # (rust-toolchain.toml) but compiles nothing, so no rust-cache step.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch; version pinned below
+        with:
+          # Keep in sync with rust-toolchain.toml.
+          toolchain: 1.99.1
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
+        with:
+          tool: cargo-deny@0.20.2
+          fallback: none
+
+      # Configuration and the reasoning behind every exception: deny.toml.
+      - name: Run cargo-deny
+        run: cargo deny --locked check licenses bans sources advisories
 
   web-audit:
     name: Web Dependency Audit (bun audit)
@@ -370,7 +412,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -409,7 +451,7 @@ jobs:
       - name: Upload Trivy results to GitHub code scanning
         if: ${{ !cancelled() && hashFiles('trivy-results.sarif') != '' }}
         continue-on-error: true
-        uses: github/codeql-action/upload-sarif@adfda868f108ac4222129de456ea554034a27db7 # v4
+        uses: github/codeql-action/upload-sarif@3ea37a44b6e4e6847c46edae209410d258d548d1 # v4
         with:
           sarif_file: trivy-results.sarif
           category: ${{ matrix.sarif-category }}

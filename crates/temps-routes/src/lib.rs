@@ -1,12 +1,22 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        reason = "tests read fixture configuration (database/service URLs) from the environment"
+    )
+)]
 pub mod access_keys;
 pub mod gate;
 pub mod gate_sync;
+pub mod ingress;
+pub mod internal_access_grants;
 pub mod project_change_listener;
 pub mod public_ingress_store;
 pub mod public_ingress_sync;
+pub mod replica_policy;
 pub mod route_reload_subscriber;
 pub mod route_sync;
 pub mod route_table;

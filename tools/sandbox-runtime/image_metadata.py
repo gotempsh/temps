@@ -55,6 +55,6 @@ def metadata(environment, version):
 
 
 if __name__ == "__main__":
-    source = (ROOT / "crates/temps-sandbox/src/services/sandbox_service.rs").read_text()
+    source = (ROOT / "crates/temps-sandbox/src/services/sandbox_service/application_workspace.rs").read_text()
     for key, value in metadata(os.environ, image_version(source)).items():
         print(f"{key}={value}")

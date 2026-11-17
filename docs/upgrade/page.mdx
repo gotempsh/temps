@@ -13,6 +13,21 @@ An upgrade replaces the `temps` binary and then applies the new release's databa
 
 ---
 
+## Response branding is now opt-in
+
+After upgrading, Temps no longer adds identifying headers or branding to its
+proxy responses by default, including on existing installations. To restore
+branded responses, enable **Settings → Security → Show Temps branding in
+responses** (`expose_platform_identity: true`). The switch defaults to off.
+The branding setting does not otherwise remove application headers: existing
+proxy policies can still replace security headers and `X-Request-ID`, and
+reserved proxy marker headers are removed from upstream responses. A request ID
+remains available for troubleshooting in either mode.
+
+Challenge solver assets use neutral paths and module names, but retain required
+copyright and license notices. The setting removes routine response branding;
+it does not guarantee that the platform cannot be identified.
+
 ## Before you upgrade
 
 Check what you are running:

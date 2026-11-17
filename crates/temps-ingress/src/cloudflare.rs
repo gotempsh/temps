@@ -700,6 +700,7 @@ impl crate::registry::ProviderFactory for CloudflareTunnelFactory {
                 "A domain on Cloudflare (the free plan works)".to_string(),
                 "That domain added in Temps under a Cloudflare DNS provider".to_string(),
                 "Its API token with only 'Zone · Zone · Read', 'Zone · DNS · Edit' and 'Account · Cloudflare Tunnel · Edit', limited to that account and zone".to_string(),
+                "Optional, so addresses answer only HTTPS on standard ports: 'Zone · Single Redirect · Edit' and 'Zone · Zone WAF · Edit' on the same token".to_string(),
             ],
             needs_public_ip: false,
             works_behind_cgnat: true,

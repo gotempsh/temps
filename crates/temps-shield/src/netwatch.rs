@@ -127,6 +127,10 @@ impl NetwatchConfig {
     /// `TEMPS_NETWATCH` is `1` or `true`: temps never assumes netwatch is
     /// there. `TEMPS_NETWATCH_URL`, `TEMPS_NETWATCH_TOKEN` and
     /// `TEMPS_NETWATCH_SOCKET` override the defaults.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "legacy runtime env config; follow-up: move to a DB-backed setting (P0.7 follow-up). TEMPS_NETWATCH, TEMPS_NETWATCH_URL, TEMPS_NETWATCH_TOKEN, TEMPS_NETWATCH_SOCKET"
+    )]
     pub fn from_env() -> Self {
         Self::from_vars(|name| std::env::var(name).ok())
     }

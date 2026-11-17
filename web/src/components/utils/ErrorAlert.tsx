@@ -4,6 +4,7 @@
 import { AlertCircle } from 'lucide-react'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
+import { DiscordHelpLink } from '@/components/support/DiscordHelpLink'
 
 interface ErrorAlertProps {
   title?: string
@@ -34,10 +35,13 @@ export function ErrorAlert({
               if (!retrying) retry()
             }}
           >
-            {retrying ? 'Retrying…' : 'Try Again'}
+            {retrying ? 'Retrying…' : 'Try again'}
           </Button>
         )}
       </div>
+      <p className="mt-3 text-sm text-muted-foreground">
+        Need help with Temps? <DiscordHelpLink />
+      </p>
     </Alert>
   )
 }

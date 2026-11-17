@@ -1,0 +1,64 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "temps-ai-agents"
+version.workspace = true
+edition.workspace = true
+description = "AI agent runs: agent definitions, workflows and triggers, AI CLI provider logins, the autofixer, and the sandbox providers they run in"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+temps-docker-util = { path = "../temps-docker-util" }
+temps-core = { path = "../temps-core" }
+temps-agent-core = { path = "../temps-agent-core" }
+temps-ai-cli = { path = "../temps-ai-cli" }
+temps-sandbox-providers = { path = "../temps-sandbox-providers" }
+temps-ai = { path = "../temps-ai" }
+temps-entities = { path = "../temps-entities" }
+# ADR-055 §6: sandbox backends are runtime drivers (`SandboxExt`).
+temps-workload = { path = "../temps-workload", features = ["openapi"] }
+temps-git = { path = "../temps-git" }
+temps-config = { path = "../temps-config" }
+temps-memory = { path = "../temps-memory" }
+temps-deployments = { path = "../temps-deployments" }
+temps-docker-housekeeping = { path = "../temps-docker-housekeeping" }
+temps-notifications = { path = "../temps-notifications" }
+temps-authz = { path = "../temps-authz" }
+sea-orm = { workspace = true }
+tokio = { workspace = true, features = ["process", "fs"] }
+async-trait = { workspace = true }
+futures = { workspace = true }
+async-stream = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+yaml_serde = { workspace = true }
+tracing = { workspace = true }
+utoipa = { workspace = true }
+chrono = { workspace = true }
+axum = { workspace = true }
+http = { workspace = true }
+cron = { workspace = true }
+temps-error-tracking = { path = "../temps-error-tracking" }
+temps-agents-mcp-proxy = { path = "../temps-agents-mcp-proxy" }
+anyhow = { workspace = true }
+bollard = { workspace = true }
+tar = { workspace = true }
+flate2 = { workspace = true }
+pulldown-cmark = { workspace = true }
+libc = { workspace = true }
+rand = { workspace = true }
+regex = { workspace = true }
+hex = { workspace = true }
+tempfile = { workspace = true }
+
+[dev-dependencies]
+temps-sandbox-providers = { path = "../temps-sandbox-providers", features = ["test-support"] }
+temps-test-utils = { path = "../temps-test-utils" }
+
+[lints]
+workspace = true

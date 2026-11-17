@@ -14,8 +14,8 @@ use std::sync::Arc;
 use axum::body::Body;
 use hyper::Request;
 use hyper_util::rt::TokioIo;
-use temps_core::external_plugin::{PluginEvent, PluginManifest, PLUGIN_EVENTS_PATH};
 use temps_core::{Job, JobQueue};
+use temps_plugin_protocol::{PluginEvent, PluginManifest, PLUGIN_EVENTS_PATH};
 use tokio::net::UnixStream;
 use tokio::sync::{watch, RwLock};
 use tokio::task::JoinHandle;
@@ -385,10 +385,7 @@ impl PluginEventListener {
             .uri(PLUGIN_EVENTS_PATH)
             .header(hyper::header::CONTENT_TYPE, "application/json")
             .header(hyper::header::HOST, "localhost")
-            .header(
-                temps_core::external_plugin::headers::AUTH_SIGNATURE,
-                auth_secret,
-            )
+            .header(temps_plugin_protocol::headers::AUTH_SIGNATURE, auth_secret)
             .header("x-temps-request-id", uuid::Uuid::new_v4().to_string())
             .body(Body::from(body))
             .map_err(|e| format!("Failed to build request: {}", e))?;
@@ -430,7 +427,7 @@ impl Drop for PluginEventListener {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use temps_core::external_plugin::PluginManifest;
+    use temps_plugin_protocol::PluginManifest;
 
     #[test]
     fn test_manifest_subscribes_to_exact_match() {

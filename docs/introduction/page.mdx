@@ -220,10 +220,11 @@ sudo systemctl enable --now temps
 If Temps hangs during startup, it's likely waiting for the screenshot provider to initialize. Disable it with:
 
 ```bash
-export TEMPS_SCREENSHOT_PROVIDER=noop
 export TEMPS_DATABASE_URL="..."
-temps serve --address 0.0.0.0:80
+temps serve --address 0.0.0.0:80 --screenshot-provider noop
 ```
+
+The flag is saved into the `screenshots.provider` setting the first time it is used (while that setting is still at its default); after that, change the provider in **Settings > Screenshots**.
 
 ### Database connection issues
 
@@ -261,6 +262,8 @@ Temps supports **any application that can run in a container**:
 | **Databases**     | PostgreSQL, Redis, MySQL             | Managed services    |
 | **Custom Apps**   | Anything with a Dockerfile           | Full Docker support |
 
+For the platforms Temps runs on, multi-node setups, upgrades and backups, see [What Temps supports](/docs/capabilities).
+
 ---
 
 ## Why Temps?
@@ -296,6 +299,9 @@ Running 5 apps with analytics, error tracking, and monitoring:
   </Button>
   <Button href="/docs/installation" variant="text" arrow="right">
     Detailed installation guide
+  </Button>
+  <Button href="/docs/capabilities" variant="text" arrow="right">
+    What Temps supports
   </Button>
   <Button href="/docs/cli" variant="text" arrow="right">
     CLI reference

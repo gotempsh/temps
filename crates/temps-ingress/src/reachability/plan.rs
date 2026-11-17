@@ -9,7 +9,7 @@
 //! | What the cluster has | Option | Actions |
 //! |---|---|---|
 //! | A tunnel that would publish the hostname | `existing_tunnel` | 1 |
-//! | A tunnel that covers it but would not publish it | `existing_tunnel`, confirmed | 2 |
+//! | A tunnel that covers it but would not publish it | `existing_tunnel` (confirmed when it changes a choice) | 2 |
 //! | A direct ingress on port 80 and a zone Temps manages | `direct_managed_dns` | 1 |
 //! | A Cloudflare account, no covering tunnel | `new_tunnel` | 2 |
 //! | Nothing | `new_tunnel_with_token` | 3 |
@@ -54,18 +54,20 @@ use std::collections::{HashMap, HashSet};
 use sha2::{Digest, Sha256};
 use temps_core::tailnet::{messages as tailnet_messages, TailscaleReport};
 use temps_core::ways_in::{private_allow_list_message, PrivateAllowList};
+use temps_core::worker_ingress::{address_scope, AddressScope};
 
 use temps_auth::permissions::Permission;
 use temps_core::gate::GateKind;
 
 use super::access::{AccessApp, AccessPolicyAnswer};
 use super::compute::{
-    is_local_only, tailnet_worker_problem, DirectIngress, INGRESS_SETUP_PATH, PRIVATE_COMMAND,
-    TAILNET_REPORT_STALE_MINUTES,
+    is_local_only, tailnet_worker_problem, ControlPlaneHost, DirectIngress, INGRESS_SETUP_PATH,
+    PRIVATE_COMMAND, TAILNET_REPORT_STALE_MINUTES,
 };
+use super::edge_rules::{below_free_certificate, EdgeRulePurpose, HttpPolicy};
 use super::model::{
-    ActionKind, AddressAudience, Audience, PlanBlocked, PlanOption, PlanOptionKind, PlanStep,
-    PlannedRecord, ReachAction, ReachabilityPlan, StepKind,
+    ActionKind, AddressAudience, Audience, AudienceChoice, PlanBlocked, PlanOption, PlanOptionKind,
+    PlanStep, PlannedRecord, ReachAction, ReachabilityPlan, StepKind, WayInChoice,
 };
 use crate::registry::{FieldChoice, FieldKind, SetupField};
 use crate::service::{covers, normalize_host, record_label, PublicationIntent, TunnelFact};
@@ -75,6 +77,9 @@ use crate::tailscale::{self, Ownership, ServiceDefinition, TailscaleFactory};
 pub const FIELD_ADDRESS: &str = "address";
 pub const FIELD_DNS_PROVIDER: &str = "dns_provider_id";
 pub const FIELD_TOKEN: &str = "cloudflare_api_token";
+/// What a tunnel address answers besides HTTPS (ADR 070): an
+/// [`HttpPolicy`] value.
+pub const FIELD_HTTP_POLICY: &str = "http_policy";
 /// The teams that may sign in to a signed-in address (ADR 065 D7).
 pub const FIELD_GATE_TEAMS: &str = "gate_teams";
 /// The users that may sign in to a signed-in address (ADR 065 D7).
@@ -86,6 +91,8 @@ pub const FIELD_ACCESS_EMAILS: &str = "access_emails";
 pub const FIELD_ACCESS_EMAIL_DOMAINS: &str = "access_email_domains";
 /// Where a Cloudflare Access token is added.
 pub const ACCESS_SETUP_PATH: &str = "/dns-providers#cloudflare-access";
+/// Where the control plane's public address is set.
+pub const EDGE_TARGET_SETTINGS_PATH: &str = "/settings#edge-target";
 
 /// A saved Cloudflare Access token, and the apps in its account that
 /// protect the planned address (ADR 065 D9).
@@ -235,6 +242,10 @@ pub struct PlanFacts {
     /// Active Cloudflare DNS providers.
     pub cloudflare_accounts: Vec<NamedId>,
     pub directs: Vec<DirectIngress>,
+    /// When the environment runs on the control plane alone and the control
+    /// plane is no direct ingress: the hosts it is reached at and what they
+    /// resolve to, none of it public. Empty when it has no such host.
+    pub control_plane_hosts: Option<Vec<ControlPlaneHost>>,
     /// Active workers that let Temps run a tunnel on them.
     pub tunnel_workers: Vec<NamedId>,
     /// Active workers whose owner keeps Temps from exposing them.
@@ -296,6 +307,9 @@ pub struct PlanFacts {
     /// Workers whose agent reports `tailnet_identity.v1`: the only ones a
     /// `tailnet_users` address is sent to.
     pub identity_workers: Vec<String>,
+    /// The recorded HTTPS-only choice of each attached address that has
+    /// one (ADR 070).
+    pub http_policies: HashMap<String, HttpPolicy>,
 }
 
 /// The worker a private plan serves through: the first whose private
@@ -581,11 +595,16 @@ pub fn tunnel_route<'a>(facts: &'a PlanFacts, host: &str) -> Option<TunnelRoute<
             ),
             None => "the tunnel that would publish it is gone".to_string(),
         },
+        // Nothing is chosen for the hostname yet: recording the choice is
+        // what asking for this address under the tunnel means, and it
+        // changes nobody's choice, so it needs no confirmation. The run
+        // still refuses to override a choice that appears before it routes.
         Some(PublicationIntent::OnlyChosen { .. }) | Some(PublicationIntent::NoTunnel) | None => {
-            format!(
-                "tunnel `{}` publishes only hostnames chosen for it",
-                tunnel.name
-            )
+            return Some(TunnelRoute {
+                tunnel,
+                route: true,
+                confirmation: None,
+            });
         }
     };
     Some(TunnelRoute {
@@ -777,8 +796,10 @@ pub const ENVIRONMENT_HOSTS_WARNING: &str = "Every environment, including previe
      become public, and each name's certificate appears in Certificate Transparency logs.";
 
 /// The tunnel whose environment hosts would give this environment `host`
-/// (ADR 068 D3): `host` is `<its label>.<tunnel domain>`, the tunnel can
-/// publish, its environment hosts are off, and no other tunnel's are on.
+/// (ADR 068 D3): `host` is `<its label>.<tunnel domain>` (or
+/// `<its label>-<suffix>.<tunnel domain>` for a tunnel with a host suffix),
+/// the tunnel can publish, its environment hosts are off, and no other
+/// tunnel's are on.
 pub fn environment_hosts_tunnel<'a>(facts: &'a PlanFacts, host: &str) -> Option<&'a TunnelFact> {
     let label = facts.environment_host_label.as_deref()?;
     if facts.tunnels.iter().any(|t| t.environment_hosts) {
@@ -796,11 +817,21 @@ pub fn environment_hosts_tunnel<'a>(facts: &'a PlanFacts, host: &str) -> Option<
         usable(t)
             && t.zone.is_some()
             && host
-                == format!(
-                    "{label}.{}",
-                    t.domain.trim_end_matches('.').to_ascii_lowercase()
+                == super::environment_hosts::natural_host(
+                    &super::environment_hosts::tunnel_label(label, t.host_suffix.as_deref()),
+                    &t.domain,
                 )
     })
+}
+
+/// How `tunnel` names environment hosts: `<environment>.<domain>`, or
+/// `<environment>-<suffix>.<domain>` with a host suffix.
+fn environment_host_pattern(tunnel: &TunnelFact) -> String {
+    let domain = tunnel.domain.trim_end_matches('.').to_ascii_lowercase();
+    match tunnel.host_suffix.as_deref().filter(|s| !s.is_empty()) {
+        Some(suffix) => format!("<environment>-{suffix}.{domain}"),
+        None => format!("<environment>.{domain}"),
+    }
 }
 
 fn address_field(suggested: Option<&str>) -> SetupField {
@@ -832,9 +863,12 @@ fn token_field() -> SetupField {
         help: Some(format!(
             "Create one at {} with Zone · Zone · Read and Zone · DNS · Edit filled in; add \
              Account · Cloudflare Tunnel · Edit yourself, and limit Zone Resources to this \
-             address's zone only. Temps checks it before creating anything and stores it \
-             encrypted.",
-            cloudflare_token_url()
+             address's zone only. For HTTPS only on standard ports, also add {} and {} \
+             (optional: without them the address is still published). Temps checks it before \
+             creating anything and stores it encrypted.",
+            cloudflare_token_url(),
+            EdgeRulePurpose::HttpsRedirect.permission(),
+            EdgeRulePurpose::StandardPorts.permission(),
         )),
         kind: FieldKind::Secret,
         required: true,
@@ -894,6 +928,165 @@ pub fn http01_direct(facts: &PlanFacts) -> Option<&DirectIngress> {
         .directs
         .iter()
         .find(|d| d.takes_port_80 && d.check_failed.is_none() && !d.ips.is_empty())
+}
+
+/// Why no tunnel can carry the environment: it is deployed and its workers
+/// serve none of it, so it runs on the control plane.
+fn tunnel_unserved(facts: &PlanFacts) -> Option<PlanBlocked> {
+    (facts.deployed && !facts.served_by_workers).then(|| PlanBlocked {
+        reason: format!(
+            "{} runs on the control plane, and a tunnel only carries what workers serve. \
+             Deploy it to a worker to put it behind a tunnel.",
+            facts.environment_name
+        ),
+        action: None,
+    })
+}
+
+/// Why nothing can serve the environment: it runs on the control plane, a
+/// tunnel only carries what workers serve, and the control plane has no
+/// public address DNS could point at. Says what its hosts resolve to, so a
+/// console reached over a tailnet or a LAN reads as the cause.
+fn control_plane_unaddressed(facts: &PlanFacts) -> Option<PlanBlocked> {
+    let hosts = facts.control_plane_hosts.as_ref()?;
+    let found = if hosts.is_empty() {
+        "it has no edge target, and no external URL to look up".to_string()
+    } else {
+        hosts
+            .iter()
+            .map(describe_control_plane_host)
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    Some(PlanBlocked {
+        reason: format!(
+            "{env} runs on the control plane, which has no public address to point DNS at: \
+             {found}. A tunnel only carries what workers serve, so set the edge target to \
+             the control plane's public address, or deploy {env} to a worker.",
+            env = facts.environment_name
+        ),
+        action: Some(
+            ReachAction::new(ActionKind::OpenIngress, "Set the edge target")
+                .with_href(EDGE_TARGET_SETTINGS_PATH),
+        ),
+    })
+}
+
+/// `console.example.com resolves to 100.64.0.7, a carrier-grade NAT
+/// address`, or `10.0.0.5 is a private network address`.
+fn describe_control_plane_host(host: &ControlPlaneHost) -> String {
+    if let Ok(ip) = host.host.parse::<std::net::IpAddr>() {
+        return format!("{ip} is {}", describe_scope(address_scope(ip)));
+    }
+    if host.ips.is_empty() {
+        return format!("{} does not resolve", host.host);
+    }
+    let ips = host
+        .ips
+        .iter()
+        .map(|ip| format!("{ip}, {}", describe_scope(address_scope(*ip))))
+        .collect::<Vec<_>>()
+        .join(" and ");
+    format!("{} resolves to {ips}", host.host)
+}
+
+fn describe_scope(scope: AddressScope) -> &'static str {
+    match scope {
+        AddressScope::Public => "a public address",
+        AddressScope::Private => "a private network address",
+        AddressScope::Cgnat => "a carrier-grade NAT address, such as Tailscale's",
+        AddressScope::Local => "a local address",
+    }
+}
+
+/// Why no tunnel can carry the environment although workers serve it: an IP
+/// allow list of only private ranges governs it, which no visitor through a
+/// tunnel can match (ADR 064 D9). `address` names the tunnel when one would
+/// carry it.
+fn tunnel_into_private_rule(
+    facts: &PlanFacts,
+    address: Option<&str>,
+    shown: &str,
+) -> Option<String> {
+    let rule = facts.private_rule.as_ref()?;
+    let tunnels_served = !facts.deployed || facts.served_by_workers;
+    if !tunnels_served {
+        return None;
+    }
+    let through = address
+        .and_then(|host| {
+            tunnel_route(facts, host).or_else(|| {
+                covering_tunnel(facts, host).map(|tunnel| TunnelRoute {
+                    tunnel,
+                    route: false,
+                    confirmation: None,
+                })
+            })
+        })
+        .map(|r| format!("tunnel `{}`", r.tunnel.name))
+        .unwrap_or_else(|| "a tunnel".to_string());
+    Some(format!(
+        "No tunnel is offered: {} The rule is {}.",
+        private_allow_list_message(&through, &rule.cidr, shown),
+        rule.rule
+    ))
+}
+
+/// Whether `facts.audience` can work for the environment before the user
+/// asks for an address (ADR 069 D3): the plan with no address, reduced to
+/// the ways in it offers. Stores nothing. A `tailnet_users` audience is
+/// judged before anyone is listed: on whether any way in can tell who a
+/// visitor is.
+pub fn choice(facts: &PlanFacts) -> AudienceChoice {
+    let unasked = PlanFacts {
+        requested: None,
+        ..facts.clone()
+    };
+    let planned = if unasked.audience == Audience::TailnetUsers && unasked.principals.is_empty() {
+        tailnet_users_ways(&unasked)
+    } else {
+        plan(&unasked)
+    };
+    let available = !planned.options.is_empty();
+    // A way in left out while another still fits, said where the user
+    // chooses rather than after they typed an address.
+    let not_offered = if available && !unasked.audience.is_private() {
+        let tunnel_offered = planned
+            .options
+            .iter()
+            .any(|o| o.way_in.starts_with("tunnel:"));
+        let shown = planned.address.as_deref().unwrap_or("the address");
+        let private_rule = tunnel_into_private_rule(&unasked, planned.address.as_deref(), shown)
+            .map(|reason| PlanBlocked {
+                reason,
+                action: None,
+            });
+        tunnel_unserved(&unasked)
+            .into_iter()
+            .chain(private_rule)
+            .filter(|_| !tunnel_offered)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    AudienceChoice {
+        audience: unasked.audience,
+        gate: (unasked.audience == Audience::SignedIn).then_some(unasked.gate),
+        available,
+        blocked: if available { None } else { planned.blocked },
+        suggested_address: planned.address,
+        ways_in: planned
+            .options
+            .into_iter()
+            .map(|o| WayInChoice {
+                kind: o.kind,
+                title: o.title,
+                way_in: o.way_in,
+                recommended: o.recommended,
+            })
+            .collect(),
+        not_offered,
+    }
 }
 
 /// The plan for `facts`.
@@ -992,41 +1185,15 @@ pub fn plan(facts: &PlanFacts) -> ReachabilityPlan {
     // list its visitors cannot match (D9).
     let tunnels_served = !facts.deployed || facts.served_by_workers;
     let tunnels_possible = tunnels_served && facts.private_rule.is_none();
-    let mut d9_note: Option<String> = None;
-    if let (Some(rule), true) = (&facts.private_rule, tunnels_served) {
-        let through = address
-            .as_deref()
-            .and_then(|host| {
-                tunnel_route(facts, host).or_else(|| {
-                    covering_tunnel(facts, host).map(|tunnel| TunnelRoute {
-                        tunnel,
-                        route: false,
-                        confirmation: None,
-                    })
-                })
-            })
-            .map(|r| format!("tunnel `{}`", r.tunnel.name))
-            .unwrap_or_else(|| "a tunnel".to_string());
-        let reason = format!(
-            "No tunnel is offered: {} The rule is {}.",
-            private_allow_list_message(&through, &rule.cidr, &shown),
-            rule.rule
-        );
-        d9_note = Some(reason.clone());
+    let d9_note = tunnel_into_private_rule(facts, address.as_deref(), &shown);
+    if let Some(reason) = &d9_note {
         blocked_reasons.push(PlanBlocked {
-            reason,
+            reason: reason.clone(),
             action: None,
         });
     }
-    if !tunnels_served {
-        blocked_reasons.push(PlanBlocked {
-            reason: format!(
-                "{} runs on the control plane, and a tunnel only carries what workers serve. \
-                 Deploy it to a worker to put it behind a tunnel.",
-                facts.environment_name
-            ),
-            action: None,
-        });
+    if let Some(unserved) = control_plane_unaddressed(facts).or_else(|| tunnel_unserved(facts)) {
+        blocked_reasons.push(unserved);
     }
     let not_deployed_warning = (!facts.deployed).then(|| {
         format!(
@@ -1045,10 +1212,11 @@ pub fn plan(facts: &PlanFacts) -> ReachabilityPlan {
                 kind: PlanOptionKind::TunnelEnvironmentHosts,
                 title: format!("Give every environment an address under {}", tunnel.domain),
                 description: format!(
-                    "Tunnel {} publishes each environment as <environment>.{}, and keeps \
+                    "Tunnel {} publishes each environment as {}, and keeps \
                      them as environments come, go and are renamed; {host} is this one's. \
                      Cloudflare serves HTTPS.",
-                    tunnel.name, tunnel.domain
+                    tunnel.name,
+                    environment_host_pattern(tunnel)
                 ),
                 actions: 1,
                 way_in: format!("tunnel:{}", tunnel.name),
@@ -1389,6 +1557,11 @@ pub fn plan(facts: &PlanFacts) -> ReachabilityPlan {
             draft.warnings.insert(0, warning.clone());
         }
     }
+    if let Some(host) = address.as_deref() {
+        for draft in &mut drafts {
+            add_edge_rule_steps(facts, host, draft);
+        }
+    }
     if facts.audience == Audience::SignedIn {
         if facts.gate == GateKind::CloudflareAccess {
             if let Err(blocked) = access_drafts(facts, &shown, &mut drafts) {
@@ -1450,6 +1623,226 @@ pub fn plan(facts: &PlanFacts) -> ReachabilityPlan {
         options,
         blocked,
         principals: Vec::new(),
+    }
+}
+
+/// Said on every option that adds the Cloudflare edge rules (ADR 070 D3).
+pub fn edge_rules_warning(host: &str) -> String {
+    format!(
+        "Temps adds two Cloudflare rules for {host} only: a redirect from http:// to https:// \
+         (the token needs {}) and a WAF rule refusing Cloudflare's other ports such as 8080 \
+         and 8443 (the token needs {}; it can change every WAF custom rule in the zone). \
+         Without a permission Temps still publishes {host} and says which one is missing.",
+        EdgeRulePurpose::HttpsRedirect.permission(),
+        EdgeRulePurpose::StandardPorts.permission(),
+    )
+}
+
+/// What a tunnel address may answer besides HTTPS, as offered for `host`
+/// (ADR 070 D1): the choices, and the one taken when the user does not
+/// answer, which is the address's recorded choice, else HTTPS only. A
+/// hostname below the free certificate's reach cannot be HTTPS only:
+/// redirecting it to an HTTPS address without a certificate would take it
+/// down.
+pub fn http_policy_choices(facts: &PlanFacts, host: &str) -> (Vec<HttpPolicy>, HttpPolicy) {
+    // Only a zone Temps knows: a managed one, else the covering tunnel's.
+    // A guess (the last two labels) is wrong for `example.co.uk` and would
+    // refuse HTTPS only to every address in it; with no known zone the run
+    // checks the zone Cloudflare names before adding the redirect.
+    let zone = zone_for(host, &facts.zones)
+        .map(|z| z.domain.clone())
+        .or_else(|| covering_tunnel(facts, host).and_then(|t| t.zone.clone()))
+        .map(|z| z.trim_end_matches('.').to_ascii_lowercase());
+    let allowed: Vec<HttpPolicy> = if zone
+        .as_deref()
+        .is_some_and(|zone| below_free_certificate(host, zone))
+    {
+        vec![HttpPolicy::AllowHttp, HttpPolicy::AllowAll]
+    } else {
+        HttpPolicy::ALL.to_vec()
+    };
+    let default = facts
+        .http_policies
+        .get(host)
+        .copied()
+        .filter(|p| allowed.contains(p))
+        .unwrap_or(allowed[0]);
+    (allowed, default)
+}
+
+/// Whether an option publishes its address through a Cloudflare tunnel,
+/// and so offers the HTTPS-only choice (ADR 070).
+pub fn offers_http_policy(kind: PlanOptionKind) -> bool {
+    matches!(
+        kind,
+        PlanOptionKind::ExistingTunnel
+            | PlanOptionKind::NewTunnel
+            | PlanOptionKind::NewTunnelWithToken
+    )
+}
+
+fn http_policy_field(host: &str, allowed: &[HttpPolicy], default: HttpPolicy) -> SetupField {
+    let label = |policy: HttpPolicy| match policy {
+        HttpPolicy::HttpsOnly => "HTTPS only (recommended)".to_string(),
+        HttpPolicy::AllowHttp => "Also plain HTTP on port 80".to_string(),
+        HttpPolicy::AllowAll => "Also plain HTTP, and Cloudflare's other ports".to_string(),
+    };
+    let help = |policy: HttpPolicy| match policy {
+        HttpPolicy::HttpsOnly => format!(
+            "http://{host} redirects to HTTPS and Cloudflare's other ports (8080, 8443, …) \
+             are refused, with two Cloudflare rules for this hostname only."
+        ),
+        HttpPolicy::AllowHttp => format!(
+            "http://{host} serves the app unencrypted; only Cloudflare's other ports are \
+             refused."
+        ),
+        HttpPolicy::AllowAll => format!(
+            "No Cloudflare rule: {host} answers plain HTTP and on every port Cloudflare \
+             proxies."
+        ),
+    };
+    SetupField {
+        key: FIELD_HTTP_POLICY.to_string(),
+        label: "What it answers".to_string(),
+        help: Some(format!(
+            "Left unanswered: {}. Temps keeps the choice on the address, so making it \
+             reachable again offers the same. Choosing less than before leaves the rules an \
+             earlier run added; undo that run to remove them.",
+            label(default)
+        )),
+        kind: FieldKind::Choice {
+            choices: allowed
+                .iter()
+                .map(|p| FieldChoice {
+                    value: p.as_str().to_string(),
+                    label: label(*p),
+                    help: Some(help(*p)),
+                })
+                .collect(),
+        },
+        required: false,
+        placeholder: Some(default.as_str().to_string()),
+    }
+}
+
+/// The steps an option publishing `host` through a tunnel takes for
+/// `policy` (ADR 070 D1): the rules it wants, before the address is
+/// attached, and recording the choice right after.
+pub fn http_policy_steps(host: &str, policy: HttpPolicy) -> (Vec<PlanStep>, PlanStep) {
+    let mut rules = Vec::new();
+    if policy.wants(EdgeRulePurpose::HttpsRedirect) {
+        rules.push(step(
+            StepKind::RedirectToHttps,
+            format!(
+                "Redirect http://{host} to HTTPS, with a Cloudflare redirect rule for this \
+                 hostname only"
+            ),
+        ));
+    }
+    if policy.wants(EdgeRulePurpose::StandardPorts) {
+        rules.push(step(
+            StepKind::StandardPortsOnly,
+            format!(
+                "Refuse {host} on Cloudflare's other ports (8080, 8443, …), with a Cloudflare \
+                 WAF rule for this hostname only"
+            ),
+        ));
+    }
+    let record = step(
+        StepKind::SetHttpPolicy,
+        format!("Keep {host} at {}", policy.describe()),
+    );
+    (rules, record)
+}
+
+/// Put `policy`'s steps into `steps`: rules before attaching, the record
+/// right after. Any earlier policy steps are replaced, in the places `plan`
+/// gives them: the rules ahead of an Access app made just before attaching,
+/// the record after an audience set just after it, so applying a choice
+/// keeps the order the plan showed.
+pub fn place_http_policy_steps(steps: &mut Vec<PlanStep>, host: &str, policy: HttpPolicy) {
+    steps.retain(|s| {
+        !matches!(
+            s.kind,
+            StepKind::RedirectToHttps | StepKind::StandardPortsOnly | StepKind::SetHttpPolicy
+        )
+    });
+    let (rules, record) = http_policy_steps(host, policy);
+    let attach = steps.iter().position(|s| s.kind == StepKind::AttachDomain);
+    let mut at = attach.unwrap_or(0);
+    if at > 0 && steps[at - 1].kind == StepKind::AccessApp {
+        at -= 1;
+    }
+    let count = rules.len();
+    for (offset, added) in rules.into_iter().enumerate() {
+        steps.insert(at + offset, added);
+    }
+    let after = match attach.map(|i| i + count) {
+        Some(attach) if steps.get(attach + 1).map(|s| s.kind) == Some(StepKind::SetAudience) => {
+            attach + 2
+        }
+        Some(attach) => attach + 1,
+        None => at + count,
+    };
+    steps.insert(after.min(steps.len()), record);
+}
+
+/// The HTTPS-only choice an applied `option` takes (ADR 070 D1): the
+/// answer, else the default the plan showed. `None` for an option that
+/// offers no choice; `Err` for an answer the option does not offer.
+pub fn chosen_http_policy(
+    option: &PlanOption,
+    answer: Option<&str>,
+) -> Result<Option<HttpPolicy>, String> {
+    let Some(field) = option.fields.iter().find(|f| f.key == FIELD_HTTP_POLICY) else {
+        return Ok(None);
+    };
+    let FieldKind::Choice { choices } = &field.kind else {
+        return Ok(None);
+    };
+    let offered: Vec<HttpPolicy> = choices
+        .iter()
+        .filter_map(|c| HttpPolicy::parse(&c.value))
+        .collect();
+    let value = answer.or(field.placeholder.as_deref()).unwrap_or_default();
+    match HttpPolicy::parse(value).filter(|p| offered.contains(p)) {
+        Some(policy) => Ok(Some(policy)),
+        None => Err(format!(
+            "`{value}` is not one of the choices for what the address answers: {}.",
+            offered
+                .iter()
+                .map(|p| format!("`{}`", p.as_str()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
+/// ADR 070 D1: an option that publishes `host` through a Cloudflare tunnel
+/// asks what the address answers besides HTTPS, HTTPS only by default, and
+/// shows the steps of the default.
+fn add_edge_rule_steps(facts: &PlanFacts, host: &str, draft: &mut OptionDraft) {
+    if !offers_http_policy(draft.kind) {
+        return;
+    }
+    let (allowed, default) = http_policy_choices(facts, host);
+    place_http_policy_steps(&mut draft.steps, host, default);
+    draft
+        .fields
+        .push(http_policy_field(host, &allowed, default));
+    if !allowed.contains(&HttpPolicy::HttpsOnly) {
+        draft.warnings.push(format!(
+            "HTTPS only is not offered for {host}: Cloudflare's free certificate covers one \
+             level below the zone only, and a redirect to an HTTPS address without a \
+             certificate would take {host} down. Once HTTPS works on it, add a redirect rule \
+             in Cloudflare (Rules → Redirect Rules)."
+        ));
+    }
+    if let Some(exposure) = default.exposure(host) {
+        draft.warnings.push(exposure);
+    }
+    if default.wants(EdgeRulePurpose::StandardPorts) {
+        draft.warnings.push(edge_rules_warning(host));
     }
 }
 
@@ -2133,19 +2526,37 @@ fn plan_private(facts: &PlanFacts) -> ReachabilityPlan {
 /// The plan for `tailnet_users` (ADR 065 D6): a private plan, kept to the
 /// ways in that can tell who a visitor is, on agents that check it.
 fn plan_tailnet_users(facts: &PlanFacts) -> ReachabilityPlan {
-    let blocked = |address: Option<String>, reason: String, action: Option<ReachAction>| {
-        let mut plan = private_blocked(address, None, PlanBlocked { reason, action });
-        plan.audience = Audience::TailnetUsers;
-        plan.principals = facts.principals.clone();
-        plan
-    };
     if facts.principals.is_empty() {
-        return blocked(
+        return tailnet_users_blocked(
+            facts,
             facts.requested.clone(),
             tailnet_messages::NO_PRINCIPALS.to_string(),
             None,
         );
     }
+    tailnet_users_ways(facts)
+}
+
+fn tailnet_users_blocked(
+    facts: &PlanFacts,
+    address: Option<String>,
+    reason: String,
+    action: Option<ReachAction>,
+) -> ReachabilityPlan {
+    let mut plan = private_blocked(address, None, PlanBlocked { reason, action });
+    plan.audience = Audience::TailnetUsers;
+    plan.principals = facts.principals.clone();
+    plan
+}
+
+/// The ways in a `tailnet_users` plan keeps, whoever is listed: those that
+/// can tell who a visitor is, on agents that check it. [`choice`] calls it
+/// before anyone is listed; a plan to apply goes through
+/// [`plan_tailnet_users`], which refuses an empty list.
+fn tailnet_users_ways(facts: &PlanFacts) -> ReachabilityPlan {
+    let blocked = |address: Option<String>, reason: String, action: Option<ReachAction>| {
+        tailnet_users_blocked(facts, address, reason, action)
+    };
     let mut planned = plan_private(facts);
     planned.audience = Audience::TailnetUsers;
     planned.principals = facts.principals.clone();
@@ -2847,6 +3258,7 @@ mod tests {
             has_nodes: true,
             auto_publish: true,
             environment_hosts: false,
+            host_suffix: None,
         }
     }
 
@@ -3112,6 +3524,315 @@ mod tests {
         assert_eq!(first.fields[0].key, FIELD_ADDRESS);
     }
 
+    /// ADR 070 D1/D2: a tunnel option shows the HTTPS redirect and the
+    /// port rule, for this hostname only, before the address is attached,
+    /// and says which token permissions they need. Direct options do not.
+    #[test]
+    fn a_tunnel_plan_shows_the_https_redirect_and_the_port_rule() {
+        let facts = PlanFacts {
+            tunnels: vec![tunnel("homelab", "example.com", "example.com")],
+            zones: vec![zone("example.com", "cloudflare")],
+            directs: vec![direct(true)],
+            ..base()
+        };
+        let plan = plan(&facts);
+        let tunneled = &plan.options[0];
+        assert_eq!(tunneled.kind, PlanOptionKind::ExistingTunnel);
+        assert_eq!(
+            tunneled.steps.iter().map(|s| s.kind).collect::<Vec<_>>(),
+            vec![
+                StepKind::RedirectToHttps,
+                StepKind::StandardPortsOnly,
+                StepKind::AttachDomain,
+                StepKind::SetHttpPolicy,
+                StepKind::WaitForPublication,
+                StepKind::CheckReachability,
+            ]
+        );
+        // HTTPS only is the default, offered with the two ways off it.
+        let field = tunneled
+            .fields
+            .iter()
+            .find(|f| f.key == FIELD_HTTP_POLICY)
+            .expect("the choice");
+        assert!(!field.required);
+        assert_eq!(field.placeholder.as_deref(), Some("https_only"));
+        let FieldKind::Choice { choices } = &field.kind else {
+            panic!("a choice field");
+        };
+        assert_eq!(
+            choices.iter().map(|c| c.value.as_str()).collect::<Vec<_>>(),
+            vec!["https_only", "allow_http", "allow_all"]
+        );
+        assert_eq!(choices[0].label, "HTTPS only (recommended)");
+        assert!(!tunneled
+            .warnings
+            .iter()
+            .any(|w| w.contains("unencrypted HTTP")));
+        assert_eq!(
+            tunneled.steps[0].label,
+            "Redirect http://myapp.example.com to HTTPS, with a Cloudflare redirect rule for \
+             this hostname only"
+        );
+        assert!(tunneled.steps[1]
+            .label
+            .starts_with("Refuse myapp.example.com on Cloudflare's other ports (8080, 8443"));
+        assert!(tunneled.warnings.iter().any(|w| w
+            .contains("the token needs Zone · Single Redirect · Edit")
+            && w.contains("Zone · Zone WAF · Edit")
+            && w.contains("still publishes")));
+        let direct = &plan.options[1];
+        assert_eq!(direct.kind, PlanOptionKind::DirectManagedDns);
+        assert!(!direct.steps.iter().any(|s| matches!(
+            s.kind,
+            StepKind::RedirectToHttps | StepKind::StandardPortsOnly
+        )));
+    }
+
+    /// ADR 070 D1: a new tunnel adds the rules once it exists, right
+    /// before the address is attached.
+    #[test]
+    fn a_new_tunnel_plan_adds_the_rules_before_attaching() {
+        let facts = PlanFacts {
+            requested: Some("myapp.example.com".into()),
+            tunnel_workers: vec![worker()],
+            ..base()
+        };
+        let plan = plan(&facts);
+        assert_eq!(kinds(&plan), vec![PlanOptionKind::NewTunnelWithToken]);
+        let kinds: Vec<StepKind> = plan.options[0].steps.iter().map(|s| s.kind).collect();
+        let at = kinds
+            .iter()
+            .position(|k| *k == StepKind::RedirectToHttps)
+            .expect("redirect");
+        assert_eq!(
+            &kinds[at - 1..at + 3],
+            &[
+                StepKind::WaitForTunnel,
+                StepKind::RedirectToHttps,
+                StepKind::StandardPortsOnly,
+                StepKind::AttachDomain
+            ]
+        );
+        // The token help names the optional permissions.
+        let token = plan.options[0]
+            .fields
+            .iter()
+            .find(|f| f.key == FIELD_TOKEN)
+            .expect("token field");
+        assert!(token
+            .help
+            .as_deref()
+            .is_some_and(|h| h.contains("Zone · Single Redirect · Edit")));
+    }
+
+    /// ADR 070 D1: no redirect for a hostname the free certificate does
+    /// not cover; the port rule stays, and the plan says why.
+    #[test]
+    fn a_hostname_below_the_free_certificate_gets_no_redirect() {
+        let facts = PlanFacts {
+            requested: Some("myapp.lab.example.com".into()),
+            tunnels: vec![tunnel("homelab", "lab.example.com", "example.com")],
+            zones: vec![zone("example.com", "cloudflare")],
+            ..base()
+        };
+        let plan = plan(&facts);
+        let option = &plan.options[0];
+        assert_eq!(option.kind, PlanOptionKind::ExistingTunnel);
+        let kinds: Vec<StepKind> = option.steps.iter().map(|s| s.kind).collect();
+        assert!(!kinds.contains(&StepKind::RedirectToHttps));
+        assert_eq!(kinds[0], StepKind::StandardPortsOnly);
+        assert!(option
+            .warnings
+            .iter()
+            .any(|w| w.starts_with("HTTPS only is not offered for myapp.lab.example.com")));
+        let (allowed, default) = http_policy_choices(&facts, "myapp.lab.example.com");
+        assert_eq!(allowed, vec![HttpPolicy::AllowHttp, HttpPolicy::AllowAll]);
+        assert_eq!(default, HttpPolicy::AllowHttp);
+    }
+
+    fn policy_steps(policy: HttpPolicy) -> Vec<StepKind> {
+        let mut steps = vec![
+            step(StepKind::AttachDomain, "attach"),
+            step(StepKind::WaitForPublication, "wait"),
+            step(StepKind::CheckReachability, "check"),
+        ];
+        place_http_policy_steps(&mut steps, "myapp.example.com", policy);
+        steps.iter().map(|s| s.kind).collect()
+    }
+
+    /// ADR 070 D1: each choice runs only the rules it wants, and always
+    /// records itself right after the address is attached.
+    #[test]
+    fn each_choice_runs_only_its_rules() {
+        assert_eq!(
+            policy_steps(HttpPolicy::HttpsOnly),
+            vec![
+                StepKind::RedirectToHttps,
+                StepKind::StandardPortsOnly,
+                StepKind::AttachDomain,
+                StepKind::SetHttpPolicy,
+                StepKind::WaitForPublication,
+                StepKind::CheckReachability,
+            ]
+        );
+        assert_eq!(
+            policy_steps(HttpPolicy::AllowHttp),
+            vec![
+                StepKind::StandardPortsOnly,
+                StepKind::AttachDomain,
+                StepKind::SetHttpPolicy,
+                StepKind::WaitForPublication,
+                StepKind::CheckReachability,
+            ]
+        );
+        assert_eq!(
+            policy_steps(HttpPolicy::AllowAll),
+            vec![
+                StepKind::AttachDomain,
+                StepKind::SetHttpPolicy,
+                StepKind::WaitForPublication,
+                StepKind::CheckReachability,
+            ]
+        );
+        // Placing again replaces, never duplicates.
+        let mut steps = vec![step(StepKind::AttachDomain, "attach")];
+        place_http_policy_steps(&mut steps, "myapp.example.com", HttpPolicy::HttpsOnly);
+        place_http_policy_steps(&mut steps, "myapp.example.com", HttpPolicy::AllowAll);
+        assert_eq!(
+            steps.iter().map(|s| s.kind).collect::<Vec<_>>(),
+            vec![StepKind::AttachDomain, StepKind::SetHttpPolicy]
+        );
+    }
+
+    /// Applying a choice puts the policy steps where the plan showed them:
+    /// the rules ahead of the Access app, the record after the audience.
+    #[test]
+    fn placing_a_choice_keeps_the_access_app_and_audience_where_the_plan_put_them() {
+        let mut steps = vec![
+            step(StepKind::AccessApp, "app"),
+            step(StepKind::AttachDomain, "attach"),
+            step(StepKind::SetAudience, "gate"),
+            step(StepKind::CheckReachability, "check"),
+        ];
+        place_http_policy_steps(&mut steps, "myapp.example.com", HttpPolicy::HttpsOnly);
+        let expected = vec![
+            StepKind::RedirectToHttps,
+            StepKind::StandardPortsOnly,
+            StepKind::AccessApp,
+            StepKind::AttachDomain,
+            StepKind::SetAudience,
+            StepKind::SetHttpPolicy,
+            StepKind::CheckReachability,
+        ];
+        assert_eq!(steps.iter().map(|s| s.kind).collect::<Vec<_>>(), expected);
+        place_http_policy_steps(&mut steps, "myapp.example.com", HttpPolicy::HttpsOnly);
+        assert_eq!(steps.iter().map(|s| s.kind).collect::<Vec<_>>(), expected);
+
+        // Every option of a signed-in Access plan keeps its steps as shown
+        // when its default choice is applied.
+        let plan = plan(&access_facts(vec![provider(4, Ok(vec![]))]));
+        assert!(!plan.options.is_empty());
+        for option in &plan.options {
+            let policy = chosen_http_policy(option, None)
+                .expect("a valid default")
+                .expect("a tunnel option offers the choice");
+            let mut applied = option.steps.clone();
+            place_http_policy_steps(&mut applied, "myapp.example.com", policy);
+            assert_eq!(
+                applied.iter().map(|s| s.kind).collect::<Vec<_>>(),
+                option.steps.iter().map(|s| s.kind).collect::<Vec<_>>(),
+                "{}",
+                option.way_in
+            );
+        }
+    }
+
+    /// A zone Temps only guesses never takes HTTPS only away: the last two
+    /// labels of `myapp.example.co.uk` are `co.uk`, not its zone.
+    #[test]
+    fn a_guessed_zone_does_not_refuse_https_only() {
+        let (allowed, default) = http_policy_choices(&base(), "myapp.example.co.uk");
+        assert_eq!(allowed, HttpPolicy::ALL.to_vec());
+        assert_eq!(default, HttpPolicy::HttpsOnly);
+        // A zone Temps knows still decides.
+        let facts = PlanFacts {
+            zones: vec![zone("example.co.uk", "cloudflare")],
+            ..base()
+        };
+        let (allowed, _) = http_policy_choices(&facts, "myapp.lab.example.co.uk");
+        assert!(!allowed.contains(&HttpPolicy::HttpsOnly));
+        let (allowed, _) = http_policy_choices(&facts, "myapp.example.co.uk");
+        assert!(allowed.contains(&HttpPolicy::HttpsOnly));
+    }
+
+    /// ADR 070 D1: a re-run offers the choice the address keeps, and the
+    /// plan says plainly what it will also answer.
+    #[test]
+    fn a_re_run_keeps_the_recorded_choice_and_states_the_exposure() {
+        let facts = PlanFacts {
+            tunnels: vec![tunnel("homelab", "example.com", "example.com")],
+            zones: vec![zone("example.com", "cloudflare")],
+            http_policies: [("myapp.example.com".to_string(), HttpPolicy::AllowAll)]
+                .into_iter()
+                .collect(),
+            ..base()
+        };
+        let plan = plan(&facts);
+        let option = &plan.options[0];
+        assert_eq!(option.kind, PlanOptionKind::ExistingTunnel);
+        let kinds: Vec<StepKind> = option.steps.iter().map(|s| s.kind).collect();
+        assert!(!kinds.contains(&StepKind::RedirectToHttps));
+        assert!(!kinds.contains(&StepKind::StandardPortsOnly));
+        assert!(kinds.contains(&StepKind::SetHttpPolicy));
+        let field = option
+            .fields
+            .iter()
+            .find(|f| f.key == FIELD_HTTP_POLICY)
+            .expect("the choice");
+        assert_eq!(field.placeholder.as_deref(), Some("allow_all"));
+        assert!(option.warnings.iter().any(|w| w.contains(
+            "myapp.example.com will also answer over unencrypted HTTP (http://myapp.example.com) \
+             and on Cloudflare's other ports"
+        )));
+        // No rule, so no word about the permissions rules need.
+        assert!(!option
+            .warnings
+            .iter()
+            .any(|w| w.contains("Zone · Zone WAF · Edit")));
+    }
+
+    /// ADR 070 D1: applying takes the answer, else the default shown;
+    /// a value the option does not offer is refused.
+    #[test]
+    fn applying_takes_the_answer_or_the_default_shown() {
+        let facts = PlanFacts {
+            tunnels: vec![tunnel("homelab", "example.com", "example.com")],
+            zones: vec![zone("example.com", "cloudflare")],
+            directs: vec![direct(true)],
+            ..base()
+        };
+        let plan = plan(&facts);
+        let tunneled = &plan.options[0];
+        assert_eq!(
+            chosen_http_policy(tunneled, None),
+            Ok(Some(HttpPolicy::HttpsOnly))
+        );
+        assert_eq!(
+            chosen_http_policy(tunneled, Some("allow_http")),
+            Ok(Some(HttpPolicy::AllowHttp))
+        );
+        let refused = chosen_http_policy(tunneled, Some("sometimes")).expect_err("refused");
+        assert!(
+            refused.contains("`https_only`, `allow_http`, `allow_all`"),
+            "{refused}"
+        );
+        // A direct way in offers no choice and creates no rule.
+        let direct = &plan.options[1];
+        assert_eq!(direct.kind, PlanOptionKind::DirectManagedDns);
+        assert_eq!(chosen_http_policy(direct, Some("allow_all")), Ok(None));
+    }
+
     /// ADR 068 D5's tunnel fix: the environment's own host under a tunnel
     /// is offered first as "every environment gets one", behind the
     /// public-names warning; the single-host option stays as the alternative.
@@ -3149,6 +3870,48 @@ mod tests {
             permissions_for(PlanOptionKind::TunnelEnvironmentHosts),
             vec![Permission::SettingsWrite]
         );
+    }
+
+    /// A tunnel with a host suffix names the environment's host one level
+    /// under its zone (`<label>-<suffix>.<zone>`), and offers environment
+    /// hosts for that name, not for `<label>.<zone>`.
+    #[test]
+    fn a_tunnel_with_a_host_suffix_offers_the_suffixed_environment_host() {
+        let lab = || TunnelFact {
+            host_suffix: Some("lab".into()),
+            ..tunnel("homelab", "example.com", "example.com")
+        };
+        let facts = |requested: &str| PlanFacts {
+            tunnels: vec![lab()],
+            requested: Some(requested.into()),
+            environment_host_label: Some("myapp-production".into()),
+            ..base()
+        };
+        let suffixed = facts("myapp-production-lab.example.com");
+        assert_eq!(
+            environment_hosts_tunnel(&suffixed, "myapp-production-lab.example.com")
+                .map(|t| t.name.as_str()),
+            Some("homelab")
+        );
+        assert!(kinds(&plan(&suffixed)).contains(&PlanOptionKind::TunnelEnvironmentHosts));
+        // It names the pattern the tunnel uses, with the suffix.
+        let planned = plan(&suffixed);
+        let option = planned
+            .options
+            .iter()
+            .find(|o| o.kind == PlanOptionKind::TunnelEnvironmentHosts)
+            .expect("the environment hosts option");
+        assert!(
+            option
+                .description
+                .contains("publishes each environment as <environment>-lab.example.com,"),
+            "{}",
+            option.description
+        );
+        // The unsuffixed name is not this tunnel's environment host.
+        let plain = facts("myapp-production.example.com");
+        assert!(environment_hosts_tunnel(&plain, "myapp-production.example.com").is_none());
+        assert!(!kinds(&plan(&plain)).contains(&PlanOptionKind::TunnelEnvironmentHosts));
     }
 
     #[test]
@@ -3222,8 +3985,16 @@ mod tests {
             .steps
             .iter()
             .any(|s| s.kind == StepKind::RouteHostname));
-        // The address was given, so it is not asked again.
-        assert!(plan.options[0].fields.is_empty());
+        // The address was given, so it is not asked again; only what it
+        // answers is (ADR 070).
+        assert!(plan.options[0]
+            .fields
+            .iter()
+            .all(|f| f.key == FIELD_HTTP_POLICY));
+        // No choice exists for it yet, so recording one changes nobody's:
+        // one click applies it, without a confirmation.
+        assert_eq!(plan.options[0].confirmation, None);
+        assert!(plan.options[0].recommended);
     }
 
     #[test]
@@ -3257,8 +4028,9 @@ mod tests {
         assert_eq!(kinds(&plan), vec![PlanOptionKind::NewTunnelWithToken]);
         let option = &plan.options[0];
         assert_eq!(option.actions, 3);
-        assert_eq!(option.fields.len(), 1);
+        assert_eq!(option.fields.len(), 2);
         assert_eq!(option.fields[0].key, FIELD_TOKEN);
+        assert_eq!(option.fields[1].key, FIELD_HTTP_POLICY);
         assert!(matches!(option.fields[0].kind, FieldKind::Secret));
         assert_eq!(option.steps[0].kind, StepKind::CheckToken);
     }
@@ -3337,6 +4109,100 @@ mod tests {
             .expect("blocked")
             .reason
             .contains("runs on the control plane"));
+    }
+
+    fn control_plane_host(host: &str, ips: &[&str]) -> ControlPlaneHost {
+        ControlPlaneHost {
+            host: host.into(),
+            ips: ips.iter().map(|ip| ip.parse().expect("ip")).collect(),
+        }
+    }
+
+    /// A console reached over a tailnet: the control plane's only host
+    /// resolves to a CGNAT address, so nothing can serve an environment
+    /// that runs there, and the plan says why and where to fix it.
+    #[test]
+    fn a_control_plane_without_a_public_address_says_what_its_host_resolves_to() {
+        let facts = PlanFacts {
+            tunnels: vec![tunnel("homelab", "example.com", "example.com")],
+            served_by_workers: false,
+            control_plane_hosts: Some(vec![control_plane_host(
+                "console.example.ts.net",
+                &["100.101.102.103"],
+            )]),
+            ..base()
+        };
+        let plan = plan(&facts);
+        assert!(plan.options.is_empty());
+        let blocked = plan.blocked.expect("blocked");
+        assert!(
+            blocked.reason.starts_with(
+                "production runs on the control plane, which has no public address to point \
+                 DNS at: console.example.ts.net resolves to 100.101.102.103, a carrier-grade \
+                 NAT address, such as Tailscale's."
+            ),
+            "{}",
+            blocked.reason
+        );
+        assert!(
+            blocked.reason.contains("deploy production to a worker"),
+            "{}",
+            blocked.reason
+        );
+        let action = blocked.action.expect("action");
+        assert_eq!(action.href.as_deref(), Some(EDGE_TARGET_SETTINGS_PATH));
+    }
+
+    #[test]
+    fn a_control_plane_address_names_each_host_and_why_it_is_not_public() {
+        let facts = PlanFacts {
+            served_by_workers: false,
+            control_plane_hosts: Some(vec![
+                control_plane_host("10.0.0.5", &["10.0.0.5"]),
+                control_plane_host("console.example.com", &[]),
+            ]),
+            ..base()
+        };
+        let reason = plan(&facts).blocked.expect("blocked").reason;
+        assert!(
+            reason.contains(
+                "10.0.0.5 is a private network address; console.example.com does not resolve."
+            ),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn a_control_plane_with_no_host_to_look_up_says_so() {
+        let facts = PlanFacts {
+            served_by_workers: false,
+            control_plane_hosts: Some(Vec::new()),
+            ..base()
+        };
+        let reason = plan(&facts).blocked.expect("blocked").reason;
+        assert!(
+            reason.contains("it has no edge target, and no external URL to look up."),
+            "{reason}"
+        );
+    }
+
+    /// The fact also reaches the choice the user is offered first.
+    #[test]
+    fn a_choice_on_an_unaddressed_control_plane_carries_the_same_reason() {
+        let facts = PlanFacts {
+            served_by_workers: false,
+            control_plane_hosts: Some(vec![control_plane_host(
+                "console.example.ts.net",
+                &["100.101.102.103"],
+            )]),
+            ..base()
+        };
+        let choice = choice(&facts);
+        assert!(!choice.available);
+        assert_eq!(
+            choice.blocked.expect("blocked").reason,
+            plan(&facts).blocked.expect("blocked").reason
+        );
     }
 
     #[test]
@@ -4508,5 +5374,160 @@ mod tests {
             plan.blocked.expect("blocked").reason,
             tailnet_messages::users_need_tailnet("192.168.1.20")
         );
+    }
+
+    // ----- ADR 069 D3: what is possible before an address is asked for ---
+
+    /// The user's example: production runs on the control plane. A public
+    /// address is still possible through a direct ingress, and the choice
+    /// says up front why no tunnel is offered.
+    #[test]
+    fn a_choice_says_why_no_tunnel_is_offered_on_the_control_plane() {
+        let facts = PlanFacts {
+            tunnels: vec![tunnel("homelab", "example.com", "example.com")],
+            directs: vec![direct(true)],
+            served_by_workers: false,
+            ..base()
+        };
+        let choice = choice(&facts);
+        assert!(choice.available);
+        assert!(choice.blocked.is_none());
+        assert!(!choice.ways_in.is_empty());
+        assert!(choice
+            .ways_in
+            .iter()
+            .all(|w| !w.way_in.starts_with("tunnel:")));
+        assert!(choice.ways_in[0].recommended);
+        assert_eq!(choice.not_offered.len(), 1);
+        assert!(
+            choice.not_offered[0]
+                .reason
+                .contains("runs on the control plane"),
+            "{:?}",
+            choice.not_offered
+        );
+    }
+
+    /// A private-only allow list keeps tunnels out while direct ingress still
+    /// fits: the choice is offered and says why no tunnel is.
+    #[test]
+    fn a_choice_says_why_a_private_allow_list_leaves_out_the_tunnel() {
+        let facts = PlanFacts {
+            tunnels: vec![tunnel("homelab", "example.com", "example.com")],
+            tunnel_workers: vec![worker()],
+            directs: vec![direct(true)],
+            zones: vec![zone("example.com", "cloudflare")],
+            private_rule: Some(PrivateAllowList {
+                rule: "the IP access allow list of environment `production`".into(),
+                cidr: "100.64.0.0/10".into(),
+            }),
+            ..base()
+        };
+        let choice = choice(&facts);
+        assert!(choice.available);
+        assert!(choice
+            .ways_in
+            .iter()
+            .all(|w| !w.way_in.starts_with("tunnel:")));
+        assert_eq!(choice.not_offered.len(), 1, "{:?}", choice.not_offered);
+        let reason = &choice.not_offered[0].reason;
+        assert!(
+            reason.contains("100.64.0.0/10") && reason.contains("environment `production`"),
+            "{reason}"
+        );
+        // Without the rule a tunnel is offered and nothing is left out.
+        let choice = super::choice(&PlanFacts {
+            private_rule: None,
+            ..facts
+        });
+        assert!(choice
+            .ways_in
+            .iter()
+            .any(|w| w.way_in.starts_with("tunnel:")));
+        assert!(choice.not_offered.is_empty());
+    }
+
+    /// With nothing but a tunnel, the same environment cannot be public at
+    /// all, and the reason is the planner's.
+    #[test]
+    fn a_choice_is_unavailable_with_the_planners_reason() {
+        let facts = PlanFacts {
+            tunnels: vec![tunnel("homelab", "example.com", "example.com")],
+            served_by_workers: false,
+            ..base()
+        };
+        let choice = choice(&facts);
+        assert!(!choice.available);
+        assert!(choice.ways_in.is_empty());
+        assert!(choice.not_offered.is_empty());
+        let blocked = choice.blocked.expect("blocked");
+        assert!(
+            blocked.reason.contains("runs on the control plane"),
+            "{}",
+            blocked.reason
+        );
+        // The plan the user would get says the same.
+        assert_eq!(
+            plan(&facts).blocked.expect("blocked").reason,
+            blocked.reason
+        );
+    }
+
+    /// A choice is for the environment, not for whatever address the facts
+    /// were gathered with.
+    #[test]
+    fn a_choice_ignores_the_address_asked_for() {
+        let facts = PlanFacts {
+            requested: Some("localhost".into()),
+            directs: vec![direct(true)],
+            ..base()
+        };
+        assert!(plan(&facts).options.is_empty());
+        assert!(choice(&facts).available);
+    }
+
+    /// ADR 065 D6: before anyone is listed, `tailnet_users` is available
+    /// when a way in can tell who a visitor is, and the plan to apply still
+    /// refuses an empty list.
+    #[test]
+    fn a_tailnet_users_choice_is_judged_before_anyone_is_listed() {
+        let unlisted = PlanFacts {
+            principals: Vec::new(),
+            ..users_facts()
+        };
+        let choice = choice(&unlisted);
+        assert!(choice.available, "{:?}", choice.blocked);
+        assert_eq!(choice.audience, Audience::TailnetUsers);
+        assert_eq!(
+            choice.ways_in.iter().map(|w| w.kind).collect::<Vec<_>>(),
+            vec![PlanOptionKind::TailscaleServe]
+        );
+        assert!(plan_of(&unlisted).options.is_empty());
+
+        // An agent that cannot check identities leaves nothing to offer.
+        let unchecked = PlanFacts {
+            identity_workers: Vec::new(),
+            ..unlisted
+        };
+        let choice = super::choice(&unchecked);
+        assert!(!choice.available);
+        assert!(choice.blocked.is_some());
+    }
+
+    /// Only `signed_in` names a gate.
+    #[test]
+    fn a_choice_names_the_gate_only_for_signed_in() {
+        let public = choice(&PlanFacts {
+            directs: vec![direct(true)],
+            ..base()
+        });
+        assert_eq!(public.gate, None);
+        let signed_in = choice(&PlanFacts {
+            audience: Audience::SignedIn,
+            gate: GateKind::Temps,
+            directs: vec![direct(true)],
+            ..base()
+        });
+        assert_eq!(signed_in.gate, Some(GateKind::Temps));
     }
 }

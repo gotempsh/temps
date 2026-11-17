@@ -158,7 +158,7 @@ impl IngestLimits {
     };
 
     /// Limits from the `container_logs` settings, which store bytes in KiB.
-    pub fn from_settings(logs: &temps_core::ContainerLogSettings) -> Self {
+    pub fn from_settings(logs: &temps_config::ContainerLogSettings) -> Self {
         Self {
             lines_per_sec: logs.ingest_lines_per_sec,
             bytes_per_sec: u64::from(logs.ingest_kib_per_sec) * 1024,
@@ -1392,7 +1392,7 @@ mod tests {
 
     #[test]
     fn limits_from_settings_convert_kib_to_bytes() {
-        let logs = temps_core::ContainerLogSettings {
+        let logs = temps_config::ContainerLogSettings {
             ingest_lines_per_sec: 300,
             ingest_kib_per_sec: 128,
             ..Default::default()
@@ -1568,7 +1568,7 @@ mod tests {
         use sea_orm::{ActiveModelTrait, Set};
         use temps_entities::external_services;
 
-        let db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(_) => {
                 println!("Docker/DB not available, skipping test");
@@ -1599,6 +1599,11 @@ mod tests {
             metrics_enabled: Set(true),
             default_backup_provisioned: Set(false),
             log_ingest_kib_per_sec: Set(Some(0)),
+            healthcheck_interval_secs: Set(None),
+            healthcheck_start_interval_secs: Set(None),
+            healthcheck_start_period_secs: Set(None),
+            healthcheck_timeout_secs: Set(None),
+            healthcheck_retries: Set(None),
             ..Default::default()
         }
         .insert(conn.as_ref())

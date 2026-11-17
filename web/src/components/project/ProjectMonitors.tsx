@@ -1,15 +1,23 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { PageHeader } from '@/components/layout/PageContainer'
 import {
   listMonitorsOptions,
+  listMonitorsQueryKey,
   getProjectRuntimeHealthOptions,
+  getProjectRuntimeHealthQueryKey,
   createMonitorMutation,
   deleteMonitorMutation,
   getBucketedStatusOptions,
+  getBucketedStatusQueryKey,
   getEnvironmentsOptions,
   getCurrentMonitorStatusOptions,
+  getCurrentMonitorStatusQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
+import { RefreshButton } from '@/components/ui/refresh-button'
+import { queryKeyPrefix } from '@/lib/refresh'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 import {
   ProjectResponse,
   MonitorResponse,
@@ -32,7 +40,7 @@ import {
   Globe,
   MoreVertical,
 } from 'lucide-react'
-import { useMemo, useState } from 'react'
+import { useMemo, useReducer, useState } from 'react'
 import { Link } from 'react-router'
 import { useForm } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
@@ -104,6 +112,8 @@ interface MonitorCardProps {
   projectSlug: string
   onDelete: () => void
   environment?: EnvironmentResponse
+  /** End of the card's last-24-hours window; Refresh moves it to now. */
+  windowEnd: number
 }
 
 function MonitorCard({
@@ -111,17 +121,18 @@ function MonitorCard({
   projectSlug,
   onDelete,
   environment,
+  windowEnd,
 }: MonitorCardProps) {
   const isOnDemand = environment?.deployment_config?.onDemand === true
   const { startDate, endDate } = useMemo(() => {
-    const now = new Date()
+    const end = new Date(windowEnd)
     return {
-      startDate: subDays(now, 1),
-      endDate: now,
+      startDate: subDays(end, 1),
+      endDate: end,
     }
-  }, [])
+  }, [windowEnd])
   // Fetch status timeline for the monitor
-  const { data: statusData } = useQuery({
+  const { data: statusData } = useWindowQuery({
     ...getBucketedStatusOptions({
       path: {
         monitor_id: monitor.id,
@@ -135,7 +146,7 @@ function MonitorCard({
     refetchInterval: 30000, // Refresh every 30 seconds
   })
 
-  const { data: currentMonitorStatus } = useQuery({
+  const { data: currentMonitorStatus } = useWindowQuery({
     ...getCurrentMonitorStatusOptions({
       path: {
         monitor_id: monitor.id,
@@ -307,7 +318,7 @@ function MonitorCard({
               <DropdownMenuItem asChild>
                 <Link to={`/projects/${projectSlug}/monitors/${monitor.id}`}>
                   <ExternalLink className="mr-2 h-4 w-4" />
-                  View Details
+                  View details
                 </Link>
               </DropdownMenuItem>
               <DropdownMenuItem
@@ -333,6 +344,13 @@ export function ProjectMonitors({ project }: ProjectMonitorsProps) {
   const [isCreateDialogOpen, setIsCreateDialogOpen] = useState(false)
   const [monitorToDelete, setMonitorToDelete] =
     useState<MonitorResponse | null>(null)
+  // The cards' last-24-hours window ends here; Refresh moves it to now so
+  // new samples come into view.
+  const [windowEnd, moveWindowToNow] = useReducer(
+    () => Date.now(),
+    undefined,
+    () => Date.now()
+  )
 
   // Form with validation
   const form = useForm<CreateMonitorFormData>({
@@ -435,7 +453,7 @@ export function ProjectMonitors({ project }: ProjectMonitorsProps) {
 
   if (error) {
     return (
-      <div className="p-6">
+      <div>
         <ErrorAlert
           title="Failed to load monitors"
           description={
@@ -451,163 +469,167 @@ export function ProjectMonitors({ project }: ProjectMonitorsProps) {
 
   return (
     <div className="space-y-6">
-      {/* Header */}
-      <div className="flex items-center justify-between">
-        <div>
-          <h2 className="text-2xl font-bold tracking-tight">
-            {runtimeEnabled ? 'Uptime and health' : 'Monitors'}
-          </h2>
-          <p className="text-muted-foreground">
-            Monitor your service&apos;s uptime and performance
-          </p>
-        </div>
-        <div className="flex items-center gap-2">
-          <Button variant="outline" asChild>
-            <Link to={`/projects/${project.slug}/status-pages`}>
-              <Globe className="size-4 sm:mr-2" />
-              <span className="max-sm:sr-only">Status pages</span>
-            </Link>
-          </Button>
-          {externalMonitors.length > 0 && (
-            <CreateActionButton
-              onClick={() => setIsCreateDialogOpen(true)}
-              label="Create Monitor"
+      <PageHeader
+        title={runtimeEnabled ? 'Uptime and health' : 'Monitors'}
+        description="Whether this service is up, and how fast it answers."
+        actions={
+          <>
+            <RefreshButton
+              queryKeys={[
+                queryKeyPrefix(listMonitorsQueryKey, {
+                  path: { project_id: project.id },
+                }),
+                getProjectRuntimeHealthQueryKey({
+                  path: { project_id: project.id },
+                }),
+                queryKeyPrefix(getBucketedStatusQueryKey),
+                queryKeyPrefix(getCurrentMonitorStatusQueryKey),
+              ]}
+              onRefresh={moveWindowToNow}
             />
-          )}
-        </div>
-        <Dialog open={isCreateDialogOpen} onOpenChange={setIsCreateDialogOpen}>
-          <DialogContent>
-            <DialogHeader>
-              <DialogTitle>Create Monitor</DialogTitle>
-              <DialogDescription>
-                Set up a new monitor to track your service&apos;s uptime and
-                performance.
-              </DialogDescription>
-            </DialogHeader>
-            <Form {...form}>
-              <form
-                onSubmit={form.handleSubmit(handleCreateMonitor)}
-                className="space-y-4"
-              >
-                <FormField
-                  control={form.control}
-                  name="name"
-                  render={({ field }) => (
-                    <FormItem>
-                      <FormLabel>Monitor Name</FormLabel>
+            <Button variant="outline" asChild>
+              <Link to="/status-pages">
+                <Globe className="size-4 sm:mr-2" />
+                <span className="max-sm:sr-only">Status pages</span>
+              </Link>
+            </Button>
+            {externalMonitors.length > 0 && (
+              <CreateActionButton
+                onClick={() => setIsCreateDialogOpen(true)}
+                label="Create monitor"
+              />
+            )}
+          </>
+        }
+      />
+      <Dialog open={isCreateDialogOpen} onOpenChange={setIsCreateDialogOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Create monitor</DialogTitle>
+            <DialogDescription>
+              Set up a new monitor to track your service&apos;s uptime and
+              performance.
+            </DialogDescription>
+          </DialogHeader>
+          <Form {...form}>
+            <form
+              onSubmit={form.handleSubmit(handleCreateMonitor)}
+              className="space-y-4"
+            >
+              <FormField
+                control={form.control}
+                name="name"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Monitor name</FormLabel>
+                    <FormControl>
+                      <Input placeholder="Production API" {...field} />
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+
+              <FormField
+                control={form.control}
+                name="monitor_type"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Monitor type</FormLabel>
+                    <Select
+                      onValueChange={field.onChange}
+                      defaultValue={field.value}
+                    >
                       <FormControl>
-                        <Input placeholder="Production API" {...field} />
+                        <SelectTrigger>
+                          <SelectValue />
+                        </SelectTrigger>
                       </FormControl>
-                      <FormMessage />
-                    </FormItem>
-                  )}
-                />
+                      <SelectContent>
+                        <SelectItem value="http">HTTP</SelectItem>
+                        <SelectItem value="https">HTTPS</SelectItem>
+                        <SelectItem value="tcp">TCP</SelectItem>
+                        <SelectItem value="ping">Ping</SelectItem>
+                      </SelectContent>
+                    </Select>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
 
-                <FormField
-                  control={form.control}
-                  name="monitor_type"
-                  render={({ field }) => (
-                    <FormItem>
-                      <FormLabel>Monitor Type</FormLabel>
-                      <Select
-                        onValueChange={field.onChange}
-                        defaultValue={field.value}
-                      >
-                        <FormControl>
-                          <SelectTrigger>
-                            <SelectValue />
-                          </SelectTrigger>
-                        </FormControl>
-                        <SelectContent>
-                          <SelectItem value="http">HTTP</SelectItem>
-                          <SelectItem value="https">HTTPS</SelectItem>
-                          <SelectItem value="tcp">TCP</SelectItem>
-                          <SelectItem value="ping">Ping</SelectItem>
-                        </SelectContent>
-                      </Select>
-                      <FormMessage />
-                    </FormItem>
-                  )}
-                />
+              <FormField
+                control={form.control}
+                name="environment_id"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Environment</FormLabel>
+                    <Select
+                      onValueChange={(value) => field.onChange(parseInt(value))}
+                      value={field.value?.toString()}
+                    >
+                      <FormControl>
+                        <SelectTrigger>
+                          <SelectValue
+                            placeholder={
+                              isLoadingEnvironments
+                                ? 'Loading...'
+                                : 'Select environment'
+                            }
+                          />
+                        </SelectTrigger>
+                      </FormControl>
+                      <SelectContent>
+                        {environments?.map((env) => (
+                          <SelectItem key={env.id} value={env.id.toString()}>
+                            {env.name}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
 
-                <FormField
-                  control={form.control}
-                  name="environment_id"
-                  render={({ field }) => (
-                    <FormItem>
-                      <FormLabel>Environment</FormLabel>
-                      <Select
+              <FormField
+                control={form.control}
+                name="check_interval_seconds"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Check Interval (seconds)</FormLabel>
+                    <FormControl>
+                      <NumberInput
+                        min={30}
+                        name={field.name}
+                        ref={field.ref}
+                        onBlur={field.onBlur}
+                        value={field.value}
                         onValueChange={(value) =>
-                          field.onChange(parseInt(value))
+                          field.onChange(value ?? Number.NaN)
                         }
-                        value={field.value?.toString()}
-                      >
-                        <FormControl>
-                          <SelectTrigger>
-                            <SelectValue
-                              placeholder={
-                                isLoadingEnvironments
-                                  ? 'Loading...'
-                                  : 'Select environment'
-                              }
-                            />
-                          </SelectTrigger>
-                        </FormControl>
-                        <SelectContent>
-                          {environments?.map((env) => (
-                            <SelectItem key={env.id} value={env.id.toString()}>
-                              {env.name}
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-                      <FormMessage />
-                    </FormItem>
-                  )}
-                />
+                      />
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
 
-                <FormField
-                  control={form.control}
-                  name="check_interval_seconds"
-                  render={({ field }) => (
-                    <FormItem>
-                      <FormLabel>Check Interval (seconds)</FormLabel>
-                      <FormControl>
-                        <NumberInput
-                          min={30}
-                          name={field.name}
-                          ref={field.ref}
-                          onBlur={field.onBlur}
-                          value={field.value}
-                          onValueChange={(value) =>
-                            field.onChange(value ?? Number.NaN)
-                          }
-                        />
-                      </FormControl>
-                      <FormMessage />
-                    </FormItem>
-                  )}
-                />
-
-                <DialogFooter>
-                  <Button
-                    variant="outline"
-                    type="button"
-                    onClick={() => setIsCreateDialogOpen(false)}
-                  >
-                    Cancel
-                  </Button>
-                  <Button type="submit" disabled={createMutation.isPending}>
-                    {createMutation.isPending
-                      ? 'Creating...'
-                      : 'Create Monitor'}
-                  </Button>
-                </DialogFooter>
-              </form>
-            </Form>
-          </DialogContent>
-        </Dialog>
-      </div>
+              <DialogFooter>
+                <Button
+                  variant="outline"
+                  type="button"
+                  onClick={() => setIsCreateDialogOpen(false)}
+                >
+                  Cancel
+                </Button>
+                <Button type="submit" disabled={createMutation.isPending}>
+                  {createMutation.isPending ? 'Creating...' : 'Create Monitor'}
+                </Button>
+              </DialogFooter>
+            </form>
+          </Form>
+        </DialogContent>
+      </Dialog>
 
       {/* Monitors List */}
       {runtimeEnabled && runtimeEnvironment && (
@@ -676,6 +698,7 @@ export function ProjectMonitors({ project }: ProjectMonitorsProps) {
               monitor={monitor}
               projectSlug={project.slug}
               onDelete={() => setMonitorToDelete(monitor)}
+              windowEnd={windowEnd}
               environment={environments?.find(
                 (env) => env.id === monitor.environment_id
               )}

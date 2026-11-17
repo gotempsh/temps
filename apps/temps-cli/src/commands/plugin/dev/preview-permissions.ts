@@ -151,7 +151,16 @@ export const previewPermissions = {
     "stacks:create",
     "sandboxes:read",
     "sandboxes:write",
-    "sandboxes:exec"
+    "sandboxes:exec",
+    "edge_rules:read",
+    "edge_rules:write",
+    "workflows:read",
+    "workflows:write",
+    "workflow_runs:create",
+    "workflow_runs:write",
+    "workflow_runs:delete",
+    "workflow_events:create",
+    "workflow_payloads:read"
   ],
   "reader": [
     "projects:read",
@@ -192,6 +201,8 @@ export const previewPermissions = {
     "otel:read",
     "ai_gateway:read",
     "stacks:read",
-    "sandboxes:read"
+    "sandboxes:read",
+    "edge_rules:read",
+    "workflows:read"
   ]
 } as const;

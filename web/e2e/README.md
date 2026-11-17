@@ -92,7 +92,7 @@ catalog.
 | Observability | — | — |
 | Data & Storage | `navigation` (databases page only) | — |
 | AI | `ai-chat-layout` | — |
-| Security & Auth | `auth`, `user-creation`, `api-key-create` | `cli-scenario` (apikeys read paths) |
+| Security & Auth | `auth`, `user-creation`, `api-key-create`, `edge-rules` | `cli-scenario` (apikeys read paths), `edge-rules-scenario` |
 | Platform & Commerce | `command-palette`, `preview-share-link`, `email-provider-mailpit` | `email-scenario` |
 
 Rows with only a dash are not covered end-to-end yet — tracked gaps, not

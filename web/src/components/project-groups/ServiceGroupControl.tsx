@@ -12,6 +12,12 @@ import {
 import type { ProjectResponse } from '@/api/client'
 import { Button } from '@/components/ui/button'
 import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
+import {
   Popover,
   PopoverContent,
   PopoverTrigger,
@@ -50,12 +56,6 @@ export function ServiceGroupControl({
   const membership = useServiceGroup(project.id)
   const [open, setOpen] = useState(false)
   const [creating, setCreating] = useState(false)
-  const { groups } = useProjectGroups()
-  const invalidate = useInvalidateGroups()
-  const add = useMutation({
-    ...addProjectToGroupMutation(),
-    meta: { errorTitle: 'Could not add the service to the project' },
-  })
 
   if (membership.isLoading) return null
   if (membership.isError) {
@@ -103,19 +103,6 @@ export function ServiceGroupControl({
     )
   }
 
-  const addTo = async (groupId: number, groupName: string) => {
-    try {
-      await add.mutateAsync({
-        path: { group_id: groupId, project_id: project.id },
-      })
-      await invalidate()
-      toast.success(`${project.name} is now part of ${groupName}`)
-      setOpen(false)
-    } catch {
-      // The app-wide mutation handler already toasts this failure.
-    }
-  }
-
   return (
     <>
       <Popover open={open} onOpenChange={setOpen}>
@@ -137,45 +124,130 @@ export function ServiceGroupControl({
           </Button>
         </PopoverTrigger>
         <PopoverContent align="start" className="w-72 p-2">
-          <p className="px-2 pb-2 text-xs text-muted-foreground">
-            Group {project.name} with the services it ships with to share
-            variables and get one overview.
-          </p>
-          {groups.length > 0 && (
-            <div className="max-h-56 overflow-y-auto border-y py-1">
-              {groups.map((g) => (
-                <button
-                  key={g.id}
-                  type="button"
-                  disabled={add.isPending}
-                  onClick={() => void addTo(g.id, g.name)}
-                  className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-sm hover:bg-muted disabled:opacity-50"
-                >
-                  <Boxes
-                    className="size-4 text-muted-foreground"
-                    aria-hidden="true"
-                  />
-                  <span className="min-w-0 flex-1 truncate">{g.name}</span>
-                  <span className="text-xs text-muted-foreground">
-                    {serviceCount(g.projects.length)}
-                  </span>
-                </button>
-              ))}
-            </div>
-          )}
-          <button
-            type="button"
-            onClick={() => {
+          <GroupChoices
+            project={project}
+            onAdded={() => setOpen(false)}
+            onCreate={() => {
               setOpen(false)
               setCreating(true)
             }}
-            className="mt-1 flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-sm hover:bg-muted"
-          >
-            <Plus className="size-4 text-muted-foreground" aria-hidden="true" />
-            New project with {project.name}…
-          </button>
+          />
         </PopoverContent>
       </Popover>
+      <CreateProjectGroupDialog
+        open={creating}
+        onOpenChange={setCreating}
+        initialServices={[{ id: project.id, name: project.name }]}
+      />
+    </>
+  )
+}
+
+/**
+ * The projects a service can join, and "New project with …": the content of
+ * the header's "Add to project" choice, whether it opens as a popover or from
+ * the project bar's menu as a dialog.
+ */
+function GroupChoices({
+  project,
+  onAdded,
+  onCreate,
+}: {
+  project: ProjectResponse
+  onAdded: () => void
+  onCreate: () => void
+}) {
+  const { groups } = useProjectGroups()
+  const invalidate = useInvalidateGroups()
+  const add = useMutation({
+    ...addProjectToGroupMutation(),
+    meta: { errorTitle: 'Could not add the service to the project' },
+  })
+
+  const addTo = async (groupId: number, groupName: string) => {
+    try {
+      await add.mutateAsync({
+        path: { group_id: groupId, project_id: project.id },
+      })
+      await invalidate()
+      toast.success(`${project.name} is now part of ${groupName}`)
+      onAdded()
+    } catch {
+      // The app-wide mutation handler already toasts this failure.
+    }
+  }
+
+  return (
+    <>
+      <p className="px-2 pb-2 text-xs text-muted-foreground">
+        Group {project.name} with the services it ships with to share variables
+        and get one overview.
+      </p>
+      {groups.length > 0 && (
+        <div className="max-h-56 overflow-y-auto border-y py-1">
+          {groups.map((g) => (
+            <button
+              key={g.id}
+              type="button"
+              disabled={add.isPending}
+              onClick={() => void addTo(g.id, g.name)}
+              className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-sm hover:bg-muted disabled:opacity-50"
+            >
+              <Boxes
+                className="size-4 text-muted-foreground"
+                aria-hidden="true"
+              />
+              <span className="min-w-0 flex-1 truncate">{g.name}</span>
+              <span className="text-xs text-muted-foreground">
+                {serviceCount(g.projects.length)}
+              </span>
+            </button>
+          ))}
+        </div>
+      )}
+      <button
+        type="button"
+        onClick={onCreate}
+        className="mt-1 flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-sm hover:bg-muted"
+      >
+        <Plus className="size-4 text-muted-foreground" aria-hidden="true" />
+        New project with {project.name}…
+      </button>
+    </>
+  )
+}
+
+/**
+ * "Add to project" opened from a menu: the same choices as the header
+ * popover, in a dialog, since a menu item cannot anchor a popover.
+ */
+export function AddToProjectDialog({
+  project,
+  open,
+  onOpenChange,
+}: {
+  project: ProjectResponse
+  open: boolean
+  onOpenChange: (open: boolean) => void
+}) {
+  const [creating, setCreating] = useState(false)
+  return (
+    <>
+      <Dialog open={open} onOpenChange={onOpenChange}>
+        <DialogContent className="max-w-sm">
+          <DialogHeader>
+            <DialogTitle>Add {project.name} to a project</DialogTitle>
+          </DialogHeader>
+          <GroupChoices
+            project={project}
+            onAdded={() => onOpenChange(false)}
+            onCreate={() => {
+              onOpenChange(false)
+              setCreating(true)
+            }}
+          />
+        </DialogContent>
+      </Dialog>
       <CreateProjectGroupDialog
         open={creating}
         onOpenChange={setCreating}

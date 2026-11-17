@@ -3,12 +3,10 @@
 
 use crate::externalsvc::{
     garage::{
-        generate_access_key as generate_garage_access_key,
-        generate_admin_token as generate_garage_admin_token,
-        generate_rpc_secret as generate_garage_rpc_secret,
-        generate_secret_key as generate_garage_secret_key, DEFAULT_GARAGE_IMAGE, GARAGE_ADMIN_PORT,
-        GARAGE_S3_PORT,
+        fill_missing_parameters as fill_missing_garage_parameters, DEFAULT_GARAGE_IMAGE,
+        GARAGE_ADMIN_PORT, GARAGE_S3_PORT,
     },
+    is_empty_parameter_value as is_empty_value,
     managed_s3::{parse_bucket_parameter, ManagedS3BackendKind},
     mariadb::{validate_immutable_mariadb_image, MariaDbSizeProfile, MARIADB_DEFAULT_IMAGE},
     rustfs::DEFAULT_RUSTFS_IMAGE,
@@ -130,7 +128,9 @@ fn is_valid_mariadb_identifier(s: &str) -> bool {
         return false;
     }
     let mut chars = s.chars();
-    let first = chars.next().expect("non-empty checked above");
+    let Some(first) = chars.next() else {
+        return false;
+    };
     if !first.is_ascii_alphabetic() && first != '_' {
         return false;
     }
@@ -374,7 +374,12 @@ pub struct PostgresParameterStrategy;
 
 impl ParameterStrategy for PostgresParameterStrategy {
     fn validate_for_creation(&self, params: &HashMap<String, JsonValue>) -> Result<(), String> {
-        reject_internal_only_keys(params, &["container_name"])?;
+        // `server_tls_*` are injected by the control plane from the TLS record
+        // (ADR 093) and never stored with the parameters.
+        reject_internal_only_keys(
+            params,
+            &["container_name", "server_tls_mode", "server_tls_material"],
+        )?;
         reject_non_loopback_host(params)?;
         if !params.contains_key("database") || is_empty_value(params.get("database")) {
             return Err("'database' is required for PostgreSQL".to_string());
@@ -510,11 +515,10 @@ impl ParameterStrategy for MariaDbParameterStrategy {
         reject_internal_only_keys(params, &["container_name"])?;
         reject_non_loopback_host(params)?;
         // Absent/empty is fine here -- `auto_generate_missing` (which runs
-        // after this) fills it with `MARIADB_DEFAULT_IMAGE`, same as every
-        // other optional field on this strategy. Only a caller-supplied
-        // image is held to the immutable-digest bar: our own default is a
-        // known-safe, logical-backup-only image we control, not something
-        // that needs pinning against drift.
+        // after this) fills it with `MARIADB_DEFAULT_IMAGE`, the pinned
+        // managed WAL-G image, same as every other optional field on this
+        // strategy. A caller-supplied image, including that default sent
+        // back from the schema, is held to the immutable-digest bar.
         if let Some(image) = params
             .get("docker_image")
             .and_then(JsonValue::as_str)
@@ -674,7 +678,7 @@ impl ParameterStrategy for MariaDbParameterStrategy {
                 },
                 "docker_image": {
                     "type": "string",
-                    "description": "MariaDB image (updateable). Defaults to a plain upstream tag; set an immutable repository@sha256:<64-hex-digest> reference to enable continuous archiving (mariadb_physical backups).",
+                    "description": "MariaDB image (updateable), an immutable repository@sha256:<64-hex-digest> reference. Defaults to the managed MariaDB 11.4 image with WAL-G, which supports logical and physical backups and continuous archiving.",
                     "default": MARIADB_DEFAULT_IMAGE
                 },
                 "size_profile": {
@@ -717,7 +721,7 @@ impl ParameterStrategy for RedisParameterStrategy {
         if is_empty_value(params.get("docker_image")) {
             params.insert(
                 "docker_image".to_string(),
-                JsonValue::String("gotempsh/redis-walg:8-bookworm".to_string()),
+                JsonValue::String(crate::externalsvc::redis::DEFAULT_REDIS_IMAGE.to_string()),
             );
         }
 
@@ -776,8 +780,11 @@ impl ParameterStrategy for RedisParameterStrategy {
                 },
                 "docker_image": {
                     "type": "string",
-                    "description": "Docker image (updateable, e.g., gotempsh/redis-walg:8-bookworm)",
-                    "default": "gotempsh/redis-walg:8-bookworm"
+                    "description": format!(
+                        "Docker image (updateable, e.g., {})",
+                        crate::externalsvc::redis::DEFAULT_REDIS_IMAGE
+                    ),
+                    "default": crate::externalsvc::redis::DEFAULT_REDIS_IMAGE
                 }
             },
             "readonly": ["password"]
@@ -1343,40 +1350,7 @@ impl ParameterStrategy for GarageParameterStrategy {
     }
 
     fn auto_generate_missing(&self, params: &mut HashMap<String, JsonValue>) -> Result<(), String> {
-        if is_empty_value(params.get("port")) {
-            if let Some(port) = find_available_port(GARAGE_S3_PORT) {
-                params.insert("port".to_string(), JsonValue::String(port.to_string()));
-            }
-        }
-        // Search after the S3 port so the two never collide.
-        if is_empty_value(params.get("admin_port")) {
-            let s3_port: u16 = params
-                .get("port")
-                .and_then(JsonValue::as_str)
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(GARAGE_S3_PORT);
-            let start = std::cmp::max(s3_port.saturating_add(1), GARAGE_ADMIN_PORT);
-            if let Some(port) = find_available_port(start) {
-                params.insert(
-                    "admin_port".to_string(),
-                    JsonValue::String(port.to_string()),
-                );
-            }
-        }
-        let defaults: [(&str, String); 7] = [
-            ("docker_image", DEFAULT_GARAGE_IMAGE.to_string()),
-            ("host", "localhost".to_string()),
-            ("region", "us-east-1".to_string()),
-            ("access_key", generate_garage_access_key()),
-            ("secret_key", generate_garage_secret_key()),
-            ("admin_token", generate_garage_admin_token()),
-            ("rpc_secret", generate_garage_rpc_secret()),
-        ];
-        for (key, value) in defaults {
-            if is_empty_value(params.get(key)) {
-                params.insert(key.to_string(), JsonValue::String(value));
-            }
-        }
+        fill_missing_garage_parameters(params);
         Ok(())
     }
 
@@ -1663,15 +1637,6 @@ fn validate_s3_server_kind(params: &HashMap<String, JsonValue>) -> Result<(), St
     }
 }
 
-fn is_empty_value(value: Option<&JsonValue>) -> bool {
-    match value {
-        None => true,
-        Some(JsonValue::Null) => true,
-        Some(JsonValue::String(s)) => s.is_empty(),
-        _ => false,
-    }
-}
-
 use crate::externalsvc::port_util::find_available_port;
 
 fn generate_secure_password() -> String {
@@ -1729,6 +1694,25 @@ mod tests {
         assert!(strategy.updateable_keys().contains(&"port"));
         assert!(strategy.updateable_keys().contains(&"max_connections"));
         assert!(strategy.updateable_keys().contains(&"ssl_mode"));
+    }
+
+    /// ADR 093: the TLS mode and certificate are injected by the control
+    /// plane; a client can neither create nor update them as parameters, so
+    /// they can never land in the stored parameter blob.
+    #[test]
+    fn test_postgres_rejects_client_supplied_server_tls_parameters() {
+        let strategy = PostgresParameterStrategy;
+        for key in ["server_tls_mode", "server_tls_material"] {
+            let params = HashMap::from([
+                ("database".to_string(), JsonValue::String("app".into())),
+                ("username".to_string(), JsonValue::String("app".into())),
+                (key.to_string(), JsonValue::String("available".into())),
+            ]);
+            let err = strategy.validate_for_creation(&params).unwrap_err();
+            assert!(err.contains(key), "{err}");
+            let updates = HashMap::from([(key.to_string(), JsonValue::String("off".into()))]);
+            assert!(strategy.validate_for_update(&updates).is_err());
+        }
     }
 
     #[test]
@@ -1839,7 +1823,7 @@ mod tests {
 
     #[test]
     fn test_mariadb_missing_image_defaults_instead_of_failing() {
-        // A caller who names no image at all gets the safe, mutable
+        // A caller who names no image at all gets the pinned
         // MARIADB_DEFAULT_IMAGE from auto_generate_missing -- creation must
         // not require every caller to already know about WAL-G pinning.
         let strategy = MariaDbParameterStrategy;
@@ -1854,6 +1838,23 @@ mod tests {
             params.get("docker_image"),
             Some(&JsonValue::String(MARIADB_DEFAULT_IMAGE.to_string()))
         );
+    }
+
+    /// A client that fills in the schema's advertised default and sends it
+    /// back, as the console and CLI do, is accepted: the default is pinned.
+    #[test]
+    fn test_mariadb_accepts_the_advertised_default_image() {
+        let strategy = MariaDbParameterStrategy;
+        let schema = strategy.get_schema().expect("a MariaDB schema");
+        let advertised = schema["properties"]["docker_image"]["default"]
+            .as_str()
+            .expect("an advertised default image")
+            .to_string();
+        assert_eq!(advertised, MARIADB_DEFAULT_IMAGE);
+        let params = HashMap::from([("docker_image".to_string(), JsonValue::String(advertised))]);
+        strategy
+            .validate_for_creation(&params)
+            .expect("the advertised default must be accepted");
     }
 
     #[test]
@@ -2805,6 +2806,74 @@ mod tests {
         assert_eq!(
             strategy.service_name(),
             GarageParameterStrategy.service_name()
+        );
+    }
+
+    /// Regression guard for the cross-tenant IDOR: a client-supplied
+    /// `container_name` in a create request would make every subsequent Docker
+    /// operation (start, exec, backup, restore) target that named container
+    /// instead of creating a new one. Because Docker names are global and
+    /// predictable (`mariadb-{slug}`), this lets a tenant redirect operations
+    /// to a different tenant's live database container.
+    ///
+    /// The schema-level `#[schemars(skip)]` only hides the field from the UI
+    /// form — it does NOT stop `serde_json::from_value` from deserialising a
+    /// client-supplied value. `validate_for_creation` must reject it explicitly.
+    #[test]
+    fn test_mariadb_container_name_rejected_by_validate_for_creation() {
+        let strategy = MariaDbParameterStrategy;
+        let mut params = std::collections::HashMap::new();
+        params.insert(
+            "container_name".to_string(),
+            serde_json::Value::String("mariadb-victim-slug".to_string()),
+        );
+        let result = ParameterStrategy::validate_for_creation(&strategy, &params);
+        assert!(
+            result.is_err(),
+            "validate_for_creation must reject a client-supplied container_name"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("container_name"),
+            "error message should mention 'container_name', got: {err}"
+        );
+    }
+
+    /// Regression guard for the cross-tenant IDOR: a client-supplied
+    /// `container_name` in a create request would make every subsequent Docker
+    /// operation (start, exec, backup, restore) target that named container
+    /// instead of creating a new one. Because Docker names are global and
+    /// predictable (`postgres-{slug}`), this lets a tenant redirect operations
+    /// to a different tenant's live database container.
+    ///
+    /// The schema-level `#[schemars(skip)]` only hides the field from the UI
+    /// form — it does NOT stop `serde_json::from_value` from deserialising a
+    /// client-supplied value. `validate_for_creation` must reject it explicitly.
+    #[test]
+    fn test_postgres_container_name_rejected_by_validate_for_creation() {
+        let strategy = PostgresParameterStrategy;
+        let mut params = std::collections::HashMap::new();
+        params.insert(
+            "database".to_string(),
+            serde_json::Value::String("mydb".to_string()),
+        );
+        params.insert(
+            "username".to_string(),
+            serde_json::Value::String("myuser".to_string()),
+        );
+        params.insert(
+            "container_name".to_string(),
+            serde_json::Value::String("postgres-victim-slug".to_string()),
+        );
+        let result = ParameterStrategy::validate_for_creation(&strategy, &params);
+        assert!(
+            result.is_err(),
+            "validate_for_creation must reject a client-supplied container_name"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("container_name"),
+            "error message should mention 'container_name', got: {err}"
         );
     }
 }

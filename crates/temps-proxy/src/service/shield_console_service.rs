@@ -1717,7 +1717,7 @@ mod tests {
     // checked against the real schema. They skip without Docker.
 
     use sea_orm::Value;
-    use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+    use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 
     async fn database() -> Option<TestDatabase> {
         match TestDatabase::with_migrations().await {

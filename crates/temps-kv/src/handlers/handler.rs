@@ -13,7 +13,7 @@ use axum::{
     Json, Router,
 };
 use std::collections::HashMap;
-use temps_auth::{permission_guard, project_scope_guard, RequireAuth};
+use temps_authz::{permission_guard, project_scope_guard, RequireAuth};
 use temps_core::problemdetails::Problem;
 use temps_core::RequestMetadata;
 use temps_providers::externalsvc::{ExternalService, ServiceType};
@@ -361,7 +361,7 @@ pub async fn kv_keys(
 /// 1. Deployment tokens: Use project_id from token (request body ignored for security)
 /// 2. API keys/sessions: Use project_id from request body (required)
 async fn extract_project_id(
-    auth: &temps_auth::AuthContext,
+    auth: &temps_authz::AuthContext,
     request_project_id: Option<i32>,
     project_access_checker: &Option<Arc<dyn temps_core::ProjectAccessChecker>>,
 ) -> Result<i32, Problem> {
@@ -383,7 +383,7 @@ async fn extract_project_id(
     // the client-supplied project_id was trusted verbatim, allowing cross-tenant
     // reads/writes of another project's KV entries. No-op in plain OSS (no
     // checker registered); enforced when a team-access plugin is present.
-    temps_auth::project_access_guard!(auth, project_id, project_access_checker);
+    temps_authz::project_access_guard!(auth, project_id, project_access_checker);
 
     Ok(project_id)
 }
@@ -459,7 +459,7 @@ pub async fn kv_status(
                 .and_then(|p| p.get("docker_image").cloned())
                 .and_then(|v| v.as_str().map(String::from));
 
-            // Extract version from docker_image tag (e.g., "gotempsh/redis-walg:8-bookworm" -> "8-bookworm")
+            // Extract version from docker_image tag (e.g., "ghcr.io/gotempsh/redis-walg:8-trixie" -> "8-trixie")
             // This ensures the version always matches the actual docker image being used
             let version = docker_image
                 .as_ref()
@@ -602,7 +602,7 @@ pub async fn kv_enable(
             serde_json::json!(request.persistence),
         );
 
-        // Extract version from docker_image (e.g., "gotempsh/redis-walg:8-bookworm" -> "8-bookworm")
+        // Extract version from docker_image (e.g., "ghcr.io/gotempsh/redis-walg:8-trixie" -> "8-trixie")
         let version = parameters
             .get("docker_image")
             .and_then(|v| v.as_str())
@@ -1001,7 +1001,7 @@ mod idor_tests {
     use super::extract_project_id;
     use async_trait::async_trait;
     use std::sync::Arc;
-    use temps_auth::{AuthContext, Role};
+    use temps_authz::{AuthContext, Role};
     use temps_core::ProjectAccessChecker;
 
     struct MockChecker {

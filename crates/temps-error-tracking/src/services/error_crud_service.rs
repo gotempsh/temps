@@ -333,7 +333,9 @@ impl ErrorCRUDService {
                 rows
             }
         } else {
-            paginator.fetch_page(page.saturating_sub(1)).await?
+            paginator
+                .fetch_page(temps_core::config::page_index(page))
+                .await?
         };
 
         let mut domain_groups: Vec<ErrorGroupDomain> = groups
@@ -665,6 +667,8 @@ impl ErrorCRUDService {
         status: String,
         assigned_to: Option<String>,
     ) -> Result<(), ErrorTrackingError> {
+        validate_group_status(&status)?;
+
         let group = error_groups::Entity::find_by_id(group_id)
             .filter(error_groups::Column::ProjectId.eq(project_id))
             .one(self.db.as_ref())
@@ -755,7 +759,9 @@ impl ErrorCRUDService {
         }
         let paginator = query.paginate(self.db.as_ref(), page_size);
         let total = paginator.num_items().await?;
-        let events = paginator.fetch_page(page - 1).await?;
+        let events = paginator
+            .fetch_page(temps_core::config::page_index(page))
+            .await?;
 
         let domain_events = events.into_iter().map(Self::to_domain).collect();
 
@@ -790,11 +796,56 @@ impl ErrorCRUDService {
     }
 }
 
+/// The statuses a group can hold. Anything else would drop the group out of every
+/// status filter and stats bucket.
+const ERROR_GROUP_STATUSES: [&str; 4] = ["unresolved", "resolved", "ignored", "assigned"];
+
+fn validate_group_status(status: &str) -> Result<(), ErrorTrackingError> {
+    if ERROR_GROUP_STATUSES.contains(&status) {
+        return Ok(());
+    }
+    Err(ErrorTrackingError::Validation(format!(
+        "unknown error group status '{status}'; expected one of {}",
+        ERROR_GROUP_STATUSES.join(", ")
+    )))
+}
+
+#[cfg(test)]
+mod group_status_tests {
+    use super::*;
+
+    #[test]
+    fn every_known_status_is_accepted() {
+        for status in ERROR_GROUP_STATUSES {
+            assert!(validate_group_status(status).is_ok(), "{status}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_status_is_refused_by_name() {
+        for status in ["definitely-not-a-status", "", "RESOLVED", " resolved"] {
+            let err = validate_group_status(status).unwrap_err();
+            assert!(matches!(err, ErrorTrackingError::Validation(_)));
+            assert!(err.to_string().contains(&format!("'{status}'")), "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unknown_status_is_refused_before_any_query() {
+        // An empty mock fails on any query, so a pass proves nothing was read.
+        let db = sea_orm::MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let result = ErrorCRUDService::new(Arc::new(db))
+            .update_error_group_status(1, 1, "definitely-not-a-status".to_string(), None)
+            .await;
+        assert!(matches!(result, Err(ErrorTrackingError::Validation(_))));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::{error_groups, projects};
+    use temps_test_utils::TestDatabase;
 
     /// Test: Manual error resolution workflow
     ///
@@ -805,12 +856,6 @@ mod tests {
     /// 3. Ignore errors with "ignored" status
     /// 4. Proper error handling for non-existent groups
     /// 5. Project isolation - can't update groups from other projects
-    async fn setup_test_db() -> TestDatabase {
-        TestDatabase::with_migrations()
-            .await
-            .expect("Failed to create test database")
-    }
-
     async fn create_test_project(db: &Arc<DatabaseConnection>) -> i32 {
         use temps_entities::preset::Preset;
         use uuid::Uuid;
@@ -873,9 +918,7 @@ mod tests {
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping global errors database test: {error}");
                 return;
@@ -980,7 +1023,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_update_error_group_status_to_resolved() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorCRUDService::new(db.clone());
 
@@ -1007,7 +1050,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_update_error_group_with_assignment() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorCRUDService::new(db.clone());
 
@@ -1040,7 +1083,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_update_error_group_to_ignored() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorCRUDService::new(db.clone());
 
@@ -1067,7 +1110,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_update_error_group_not_found() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorCRUDService::new(db);
 
@@ -1086,7 +1129,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_update_error_group_wrong_project() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorCRUDService::new(db.clone());
 
@@ -1108,7 +1151,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_list_error_groups_with_pagination() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorCRUDService::new(db.clone());
 
@@ -1142,7 +1185,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_list_error_groups_with_status_filter() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorCRUDService::new(db.clone());
 
@@ -1182,9 +1225,7 @@ mod tests {
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping range sort database test: {error}");
                 return;
@@ -1255,7 +1296,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_get_error_group_by_id() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorCRUDService::new(db.clone());
 
@@ -1274,7 +1315,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_has_error_groups() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorCRUDService::new(db.clone());
 
@@ -1351,7 +1392,7 @@ impl ErrorCRUDService {
         let total: i64 = count.try_get("", "total")?;
         values.push(page_size.into());
         let limit = values.len();
-        values.push(((page - 1) * page_size).into());
+        values.push(temps_core::config::page_offset(page, page_size).into());
         let offset = values.len();
         let sql = format!(
             r#"

@@ -55,6 +55,9 @@ pub enum SensitiveAction {
     /// Change the cluster compute pool (ADR 056): every never-applied
     /// overlay allocation is re-assigned from the new pool.
     ChangeClusterComputePool,
+    /// Give the cluster a new VXLAN network ID (ADR 062): every overlay is
+    /// rebuilt on it, and cross-node traffic pauses until each node follows.
+    ChangeClusterNetworkId,
     /// Destroy every sandbox on a worker node, from all owners, including
     /// their files (ADR-048). `node` is the name or id the caller gave.
     EvictNodeSandboxes {
@@ -109,6 +112,8 @@ pub enum SensitiveAction {
     DeleteGitProvider {
         provider_id: i32,
     },
+    /// Replace the upstream credentials used by an existing git connection.
+    ReauthorizeGitConnection,
     DeleteGitConnection {
         connection_id: i32,
     },
@@ -190,6 +195,7 @@ impl SensitiveAction {
             Self::AddNodeOverSsh => "add_node_over_ssh",
             Self::SetWireguardMeshHub => "set_wireguard_mesh_hub",
             Self::ChangeClusterComputePool => "change_cluster_compute_pool",
+            Self::ChangeClusterNetworkId => "change_cluster_network_id",
             Self::EvictNodeSandboxes { .. } => "evict_node_sandboxes",
             Self::CreateOidcProvider => "create_oidc_provider",
             Self::UpdateOidcProvider { .. } => "update_oidc_provider",
@@ -207,6 +213,7 @@ impl SensitiveAction {
             Self::DeleteTeam { .. } => "delete_team",
             Self::DeleteDomain { .. } => "delete_domain",
             Self::DeleteGitProvider { .. } => "delete_git_provider",
+            Self::ReauthorizeGitConnection => "reauthorize_git_connection",
             Self::DeleteGitConnection { .. } => "delete_git_connection",
             Self::RotateDeploymentToken { .. } => "rotate_deployment_token",
             Self::DeleteDeploymentToken { .. } => "delete_deployment_token",
