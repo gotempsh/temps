@@ -1747,6 +1747,11 @@ impl DeployImageJob {
     /// identity, the pulled image must match it: a registry tag is mutable,
     /// and rolling back onto whatever the tag points at today would run a
     /// different image than the one being restored.
+    ///
+    /// An image that is already here is not pulled, but a rollback or
+    /// promotion bound to a recorded identity still checks it: a refused
+    /// re-pull leaves the moved tag on disk, and a retry must refuse it again
+    /// rather than start it because the tag now resolves locally.
     async fn ensure_registry_image_local(
         &self,
         image_tag: &str,
@@ -1760,11 +1765,26 @@ impl DeployImageJob {
         };
         let absent_reason = match self.control_plane_image(image_tag).await {
             ControlPlaneImage::Absent(reason) => reason,
-            // Present: nothing to do. No Docker or no builder: the deploy
-            // itself reports that, with its own remedy.
-            ControlPlaneImage::Present
-            | ControlPlaneImage::DockerUnavailable(_)
-            | ControlPlaneImage::NoImageBuilder => return Ok(()),
+            ControlPlaneImage::Present => {
+                // Only a bound (rollback/promotion) identity: a fresh deploy's
+                // image was resolved by this workflow's own pull.
+                if let Some(expected) = self.expected_image_identity.clone() {
+                    self.verify_local_image_identity(
+                        image_builder.as_ref(),
+                        image_tag,
+                        &expected,
+                        "image",
+                        context,
+                    )
+                    .await?;
+                }
+                return Ok(());
+            }
+            // No Docker or no builder: the deploy itself reports that, with
+            // its own remedy.
+            ControlPlaneImage::DockerUnavailable(_) | ControlPlaneImage::NoImageBuilder => {
+                return Ok(())
+            }
         };
 
         self.log(
@@ -1801,27 +1821,14 @@ impl DeployImageJob {
         }
 
         if let Some(expected) = self.expected_image_identity(context) {
-            let mismatch = match image_builder.image_identity(image_tag).await {
-                Ok(local) if expected.matches(&local) => None,
-                Ok(local) => Some(format!(
-                    "the registry now serves a different image under this tag ({}; this \
-                     deployment is bound to {})",
-                    local.id, expected
-                )),
-                Err(error) => Some(format!(
-                    "the pulled image could not be inspected to verify it is {} ({})",
-                    expected, error
-                )),
-            };
-            if let Some(reason) = mismatch {
-                let msg = format!(
-                    "Refusing to start deployment {} from re-pulled image '{}': {}.",
-                    context.deployment_id, image_tag, reason
-                );
-                self.log_at(context, LogLevel::Error, format!("ERROR: {}", msg))
-                    .await?;
-                return Err(WorkflowError::JobExecutionFailed(msg));
-            }
+            self.verify_local_image_identity(
+                image_builder.as_ref(),
+                image_tag,
+                &expected,
+                "re-pulled image",
+                context,
+            )
+            .await?;
         }
 
         self.log(
@@ -1829,6 +1836,37 @@ impl DeployImageJob {
             format!("Image '{}' pulled again from its registry", image_tag),
         )
         .await
+    }
+
+    /// Refuse to start `image_tag` unless this server's copy is `expected`.
+    /// `what` names the image in the error ("image", "re-pulled image").
+    async fn verify_local_image_identity(
+        &self,
+        image_builder: &dyn ImageBuilder,
+        image_tag: &str,
+        expected: &ExpectedImageIdentity,
+        what: &str,
+        context: &WorkflowContext,
+    ) -> Result<(), WorkflowError> {
+        let reason = match image_builder.image_identity(image_tag).await {
+            Ok(local) if expected.matches(&local) => return Ok(()),
+            Ok(local) => format!(
+                "the tag now names a different image on this server ({}; this deployment is \
+                 bound to {}), most likely because the registry moved it",
+                local.id, expected
+            ),
+            Err(error) => format!(
+                "the image could not be inspected to verify it is {} ({})",
+                expected, error
+            ),
+        };
+        let msg = format!(
+            "Refusing to start deployment {} from {} '{}': {}.",
+            context.deployment_id, what, image_tag, reason
+        );
+        self.log_at(context, LogLevel::Error, format!("ERROR: {}", msg))
+            .await?;
+        Err(WorkflowError::JobExecutionFailed(msg))
     }
 
     pub fn with_config_service(mut self, service: Arc<temps_config::ConfigService>) -> Self {
@@ -9121,6 +9159,36 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("different image"), "{message}");
         assert!(message.contains("sha256:moved"), "{message}");
+
+        // The refused pull left the moved tag here. A retry finds it present
+        // and must refuse it again instead of starting it.
+        let retry = job
+            .ensure_registry_image_local(REGISTRY_IMAGE, &context)
+            .await
+            .expect_err("a retry must not start the image the first attempt refused");
+        let message = retry.to_string();
+        assert!(message.contains("different image"), "{message}");
+        assert!(message.contains("sha256:moved"), "{message}");
+        assert_eq!(
+            builder.fetches().len(),
+            1,
+            "the retry checks the image already here instead of pulling again"
+        );
+    }
+
+    /// A rollback whose recorded image is still here starts it without a pull.
+    #[tokio::test]
+    async fn present_image_matching_the_recorded_identity_is_used_as_is() {
+        let builder = Arc::new(RepullImageBuilder::new(true, false, "sha256:original"));
+        let (job, context) = repull_job(builder.clone(), DeployImageSource::Registry);
+        let job = job.with_expected_image_identity(
+            ExpectedImageIdentity::image_id("sha256:original").expect("non-empty id"),
+        );
+
+        job.ensure_registry_image_local(REGISTRY_IMAGE, &context)
+            .await
+            .expect("the recorded image is here");
+        assert!(builder.fetches().is_empty());
     }
 
     /// #1892: an arm64 worker pulls the arm64 variant of a multi-platform
