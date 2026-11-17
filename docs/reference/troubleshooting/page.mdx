@@ -256,7 +256,11 @@ Jobs that run after this one (cron configuration, screenshots, vulnerability sca
 
 Temps raises a **Disk Space Alert** when a mounted volume passes 80% (configurable under **Settings → Disk Monitoring**). A build that runs out of disk fails with Docker's `no space left on device` error in the job log.
 
-To free space, Temps runs a cleanup every night at 02:00 UTC. It removes dangling images older than 7 days, build cache unused for 7 days, and deployment images older than the image retention period (14 days by default, always keeping the 5 most recent). You can also run `docker system df` to see what is using space, and remove unused images. Do not remove images or volumes that belong to running deployments or managed services.
+To free space, Temps runs a cleanup every night at 02:00 UTC. It removes dangling images older than 7 days, build cache unused for 7 days, and deployment images older than the image retention period (14 days by default, always keeping the 5 most recent per environment). That includes images pulled from a registry by `temps deploy:image`, which are pulled again automatically if you roll back to one; uploaded images are never removed. It also removes previous versions of Temps' own sandbox and preview gateway images once no container uses them.
+
+Worker nodes have no database to read the retention settings from, so they apply a local rule instead: in each repository a Temps deployment on that node uses, they keep the 5 newest images and remove older ones that were pulled from a registry. Images transferred from the control plane or built on the node are kept. No image any container (running or stopped) uses is ever removed, on any node.
+
+You can also run `docker system df` to see what is using space, and remove unused images. Do not remove images or volumes that belong to running deployments or managed services.
 
 When debugging a build, `TEMPS_DEPLOYMENT_KEEP_TEMP_FILES` keeps the working directories under `/tmp/temps-deployments/` after each deployment. Unset it afterwards: with it set, nothing in that directory is ever cleaned up.
 

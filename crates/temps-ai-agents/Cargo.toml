@@ -25,6 +25,7 @@ temps-git = { path = "../temps-git" }
 temps-config = { path = "../temps-config" }
 temps-memory = { path = "../temps-memory" }
 temps-deployments = { path = "../temps-deployments" }
+temps-docker-housekeeping = { path = "../temps-docker-housekeeping" }
 temps-notifications = { path = "../temps-notifications" }
 temps-authz = { path = "../temps-authz" }
 sea-orm = { workspace = true }
