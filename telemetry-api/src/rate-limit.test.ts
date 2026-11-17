@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { describe, it, expect } from "bun:test";
-import { createRateLimiter, rateLimitedResponse } from "./rate-limit.js";
+import { createRateLimiter, rateLimitAddress, rateLimitedResponse } from "./rate-limit.js";
 
 function clock(start = 1_000_000) {
   let t = start;
@@ -86,5 +86,21 @@ describe("createRateLimiter", () => {
     expect(res.status).toBe(429);
     expect(res.headers.get("Retry-After")).toBe("60");
     expect((await res.json()).error).toContain("rate limit");
+  });
+});
+
+describe("rateLimitAddress", () => {
+  const req = (headers: Record<string, string>) => new Request("http://localhost/", { headers });
+
+  it("uses the address the edge proxy wrote: the rightmost forwarded entry", () => {
+    expect(rateLimitAddress(req({ "x-forwarded-for": "198.51.100.7" }), "10.0.0.2")).toBe("198.51.100.7");
+    // Earlier entries are whatever the caller sent.
+    expect(rateLimitAddress(req({ "x-forwarded-for": "1.2.3.4, 5.6.7.8,198.51.100.7 " }), null)).toBe("198.51.100.7");
+  });
+
+  it("never trusts X-Real-IP, falling back to the TCP peer", () => {
+    expect(rateLimitAddress(req({ "x-real-ip": "203.0.113.9" }), "10.0.0.2")).toBe("10.0.0.2");
+    expect(rateLimitAddress(req({ "x-forwarded-for": " , " }), "10.0.0.2")).toBe("10.0.0.2");
+    expect(rateLimitAddress(req({}), null)).toBeNull();
   });
 });

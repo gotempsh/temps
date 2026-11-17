@@ -2,10 +2,15 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import type { Pool } from "pg";
-import { countryForRequest, clientIpFromHeaders } from "../geo.js";
+import { countryForRequest } from "../geo.js";
 import { errorFields, log } from "../log.js";
 import { ingestLimitsFromEnv } from "../limits.js";
-import { createRateLimiter, rateLimitedResponse, type RateLimiter } from "../rate-limit.js";
+import {
+  createRateLimiter,
+  rateLimitAddress,
+  rateLimitedResponse,
+  type RateLimiter,
+} from "../rate-limit.js";
 
 
 // This endpoint is deliberately unauthenticated (any self-hosted instance in
@@ -88,10 +93,11 @@ export function createFailureReportsRoutes(pool: Pool, deps: FailureReportsRoute
 
   return {
     // POST /v1/deploy-failure-reports
-    async postReport(req: Request): Promise<Response> {
-      const ip = clientIpFromHeaders(req);
-      // No resolvable IP (e.g. direct connection with no proxy headers) fails
-      // open rather than blocking every request behind a misconfigured proxy
+    // `peer` is the TCP peer address, from the server.
+    async postReport(req: Request, peer: string | null = null): Promise<Response> {
+      const ip = rateLimitAddress(req, peer);
+      // No resolvable address (neither a forwarded header nor a peer, which
+      // only happens when a handler is called outside the server) fails open
       // -- the per-payload size cap is still in force either way.
       if (ip && rateLimiter.isLimited(ip)) {
         return rateLimitedResponse();

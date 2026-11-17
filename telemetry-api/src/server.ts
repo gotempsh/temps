@@ -32,8 +32,10 @@ export function startServer({ port, maxRequestBodyBytes, routes }: ServerOptions
   return Bun.serve({
     port,
     maxRequestBodySize: maxRequestBodyBytes,
-    async fetch(req) {
+    async fetch(req, server) {
       const url = new URL(req.url);
+      // The TCP peer: the rate-limit key when no proxy forwarded an address.
+      const peer = server.requestIP(req)?.address ?? null;
       const method = req.method.toUpperCase();
       const path = url.pathname;
 
@@ -44,13 +46,13 @@ export function startServer({ port, maxRequestBodyBytes, routes }: ServerOptions
 
       // Ingest endpoints
       if (method === "POST" && path === "/v1/events") {
-        return events.postEvent(req);
+        return events.postEvent(req, peer);
       }
       if (method === "POST" && path === "/v1/events/batch") {
-        return events.postBatch(req);
+        return events.postBatch(req, peer);
       }
       if (method === "POST" && path === "/v1/deploy-failure-reports") {
-        return failureReports.postReport(req);
+        return failureReports.postReport(req, peer);
       }
 
       // Stats endpoints (add auth in production via INGEST_API_KEY or network policy)

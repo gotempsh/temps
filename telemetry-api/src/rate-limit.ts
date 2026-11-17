@@ -5,9 +5,9 @@
 // single-process service (this one is): no shared state is needed, and a
 // restart merely resets everyone's window rather than under- or over-counting.
 //
-// The client IP comes from X-Forwarded-For, which the Temps proxy overwrites
-// with the address it observed, so a caller cannot rotate it to escape the
-// limit. Memory is bounded: an IP holds at most `limit` timestamps, a refused
+// Requests are keyed by rateLimitAddress (below), never by a header only the
+// caller sets, so a caller cannot rotate it to escape the limit. Memory is
+// bounded: an IP holds at most `limit` timestamps, a refused
 // call never leaves an empty entry behind, and IPs whose window has fully
 // expired are swept once the map grows large.
 
@@ -74,6 +74,25 @@ export function createRateLimiter(
       return requestLog.size;
     },
   };
+}
+
+// The address to rate-limit a request by.
+//
+// This service is deployed behind the Temps proxy, which overwrites
+// X-Forwarded-For with the single address it observed. A proxy that appends
+// instead puts the address it observed last, so earlier entries are whatever
+// the caller sent: only the rightmost entry is used. Without the header (a
+// direct connection), the TCP peer is used. X-Real-IP is never used: the Temps
+// proxy strips it, so only a caller could have set it. Expose the service only
+// through that proxy; a port published past it would let a caller pick their
+// own key.
+export function rateLimitAddress(req: Request, peer: string | null): string | null {
+  const forwarded = req.headers.get("x-forwarded-for");
+  if (forwarded) {
+    const last = forwarded.split(",").at(-1)?.trim();
+    if (last) return last;
+  }
+  return peer;
 }
 
 export function rateLimitedResponse(): Response {

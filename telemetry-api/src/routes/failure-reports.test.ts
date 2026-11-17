@@ -208,3 +208,18 @@ describe("POST /v1/deploy-failure-reports report size", () => {
     expect((await tooLong.json()).error).toBe("report_text exceeds 10 chars");
   });
 });
+
+describe("POST /v1/deploy-failure-reports rate-limit key", () => {
+  it("ignores X-Real-IP and keys on the TCP peer", async () => {
+    const pool = makePool();
+    const { postReport } = createFailureReportsRoutes(pool, { rateLimiter: createRateLimiter(1) });
+    const req = (realIp: string) =>
+      new Request("http://localhost/v1/deploy-failure-reports", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-real-ip": realIp },
+        body: JSON.stringify({ report_text: "trace", failed_job_id: "x", failed_job_type: "y" }),
+      });
+    expect((await postReport(req("192.0.2.1"), "10.0.0.7")).status).toBe(201);
+    expect((await postReport(req("192.0.2.2"), "10.0.0.7")).status).toBe(429);
+  });
+});

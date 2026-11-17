@@ -2,12 +2,17 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import type { Pool } from "pg";
-import { clientIpFromHeaders, countryForRequest } from "../geo.js";
+import { countryForRequest } from "../geo.js";
 import { backfillTargets, insertEvent, type IngestBody } from "../db/events.js";
 import type { CountryBackfillQueue } from "../backfill.js";
 import { errorFields, log } from "../log.js";
 import { ingestLimitsFromEnv, type IngestLimits } from "../limits.js";
-import { createRateLimiter, rateLimitedResponse, type RateLimiter } from "../rate-limit.js";
+import {
+  createRateLimiter,
+  rateLimitAddress,
+  rateLimitedResponse,
+  type RateLimiter,
+} from "../rate-limit.js";
 
 // The limits the event routes enforce (see limits.ts for each variable).
 // temps_version is capped as well as properties, or it could carry what the
@@ -217,31 +222,33 @@ export interface EventsRoutesDeps {
   resolveCountry?: (req: Request) => string | null;
   // Per-IP event budget shared by both routes; a batch spends one per event.
   rateLimiter?: RateLimiter;
-  resolveClientIp?: (req: Request) => string | null;
+  // Rate-limit key for a request and its TCP peer; see rateLimitAddress.
+  resolveClientIp?: (req: Request, peer: string | null) => string | null;
   limits?: EventLimits;
 }
 
 export function createEventsRoutes(pool: Pool, deps: EventsRoutesDeps) {
   const resolveCountry = deps.resolveCountry ?? countryForRequest;
-  const resolveClientIp = deps.resolveClientIp ?? clientIpFromHeaders;
+  const resolveClientIp = deps.resolveClientIp ?? rateLimitAddress;
   const rateLimiter =
     deps.rateLimiter ?? createRateLimiter(ingestLimitsFromEnv().eventsPerMinute);
   const limits: EventLimits = deps.limits ?? ingestLimitsFromEnv();
   const batchMax = limits.eventsBatchMaxEvents;
 
-  // No resolvable IP (a direct connection with no proxy headers) fails open
-  // rather than blocking every request behind a misconfigured proxy; the body
+  // No resolvable address (neither a forwarded header nor a peer, which only
+  // happens when a handler is called outside the server) fails open; the body
   // and properties caps still apply either way.
-  const overBudget = (req: Request, cost: number): boolean => {
-    const ip = resolveClientIp(req);
+  const overBudget = (req: Request, peer: string | null, cost: number): boolean => {
+    const ip = resolveClientIp(req, peer);
     return ip !== null && rateLimiter.isLimited(ip, cost);
   };
 
   return {
     // POST /v1/events — single event
-    async postEvent(req: Request): Promise<Response> {
+    // `peer` is the TCP peer address, from the server.
+    async postEvent(req: Request, peer: string | null = null): Promise<Response> {
       // Budget first, so rejected payloads spend it too.
-      if (overBudget(req, 1)) return rateLimitedResponse();
+      if (overBudget(req, peer, 1)) return rateLimitedResponse();
 
       let body: unknown;
       try {
@@ -270,7 +277,7 @@ export function createEventsRoutes(pool: Pool, deps: EventsRoutesDeps) {
     },
 
     // POST /v1/events/batch — up to 100 events in one request
-    async postBatch(req: Request): Promise<Response> {
+    async postBatch(req: Request, peer: string | null = null): Promise<Response> {
       // Spend the budget before validating, so neither batching nor a stream
       // of rejected requests gets more than the per-event budget: one unit
       // per event, one for a body that isn't JSON or has no events array, the
@@ -279,7 +286,7 @@ export function createEventsRoutes(pool: Pool, deps: EventsRoutesDeps) {
       try {
         body = await req.json();
       } catch {
-        if (overBudget(req, 1)) return rateLimitedResponse();
+        if (overBudget(req, peer, 1)) return rateLimitedResponse();
         return Response.json({ error: "invalid JSON body" }, { status: 400 });
       }
 
@@ -287,7 +294,7 @@ export function createEventsRoutes(pool: Pool, deps: EventsRoutesDeps) {
       const cost = Array.isArray(b?.events)
         ? Math.min(Math.max(b.events.length, 1), batchMax)
         : 1;
-      if (overBudget(req, cost)) return rateLimitedResponse();
+      if (overBudget(req, peer, cost)) return rateLimitedResponse();
 
       if (!Array.isArray(b?.events)) {
         return Response.json({ error: "body must have an 'events' array" }, { status: 422 });

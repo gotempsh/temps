@@ -397,6 +397,31 @@ describe("ingest abuse limits", () => {
     expect((await postEvent(reqFrom(ip, event()))).status).toBe(429);
   });
 
+  it("can't be escaped by rotating caller-controlled forwarding headers", async () => {
+    const pool = makePool();
+    const { postEvent } = routes(pool, 2);
+    const spoofed = (i: number) =>
+      new Request("http://localhost/v1/events", {
+        method: "POST",
+        headers: {
+          "x-forwarded-for": `203.0.113.${i}, 198.51.100.30`,
+          "x-real-ip": `192.0.2.${i}`,
+        },
+        body: JSON.stringify(event()),
+      });
+    expect((await postEvent(spoofed(1))).status).toBe(201);
+    expect((await postEvent(spoofed(2))).status).toBe(201);
+    expect((await postEvent(spoofed(3))).status).toBe(429);
+  });
+
+  it("keys a request without a forwarded address on its TCP peer", async () => {
+    const pool = makePool();
+    const { postEvent } = routes(pool, 1);
+    expect((await postEvent(makeReq(event()), "10.0.0.5")).status).toBe(201);
+    expect((await postEvent(makeReq(event()), "10.0.0.5")).status).toBe(429);
+    expect((await postEvent(makeReq(event()), "10.0.0.6")).status).toBe(201);
+  });
+
   it("fails open when no client IP is resolvable", async () => {
     const pool = makePool();
     const { postEvent } = routes(pool, 1);

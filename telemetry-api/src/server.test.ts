@@ -20,7 +20,7 @@ afterEach(() => {
 });
 
 // A real Bun server on an ephemeral port, wired to routes over a mock pool.
-function start() {
+function start(eventsPerMinute = 1000) {
   const query = mock(() => ({ rows: [] }));
   const pool = { query } as unknown as Pool;
   server = startServer({
@@ -29,7 +29,7 @@ function start() {
     routes: {
       events: createEventsRoutes(pool, {
         backfill: { enqueue: () => {} },
-        rateLimiter: createRateLimiter(1000),
+        rateLimiter: createRateLimiter(eventsPerMinute),
         limits: { eventPropertiesMaxBytes: 1_000_000, eventsBatchMaxEvents: 100, tempsVersionMaxChars: 64 },
       }),
       failureReports: createFailureReportsRoutes(pool, {
@@ -87,5 +87,20 @@ describe("startServer request body cap", () => {
     const { url } = start();
     expect((await fetch(`${url}/health`)).status).toBe(200);
     expect((await fetch(`${url}/nope`)).status).toBe(404);
+  });
+});
+
+describe("startServer rate-limit key", () => {
+  it("limits a caller with no forwarded address by its TCP peer", async () => {
+    const { url } = start(2);
+    expect((await post(`${url}/v1/events`, event())).status).toBe(201);
+    expect((await post(`${url}/v1/events`, event())).status).toBe(201);
+    // Same socket address; X-Real-IP from the caller changes nothing.
+    const third = await fetch(`${url}/v1/events`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-real-ip": "192.0.2.50" },
+      body: JSON.stringify(event()),
+    });
+    expect(third.status).toBe(429);
   });
 });
