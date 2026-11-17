@@ -62,6 +62,45 @@ fn rebinding_brackets_ipv6_and_keeps_non_loopback_bindings() {
     );
 }
 
+/// A worker node rebinds what the rewrite produced, not what the author
+/// wrote: `normalize_for_policy` runs first, so the entries reaching this
+/// step are the loopback ones, in both forms.
+#[test]
+fn rewritten_published_ports_are_rebound_on_a_worker_node() {
+    let normalized = crate::compose::test_support::executor_with_checks_disabled(&[])
+        .normalize_for_policy(
+            "services:\n  web:\n    image: app\n    ports:\n      - \"8080:80\"\n      - \"0.0.0.0:5353:53/udp\"\n      - 9000\n      - target: 7000\n        published: 7001\n        host_ip: 0.0.0.0\n",
+        )
+        .unwrap();
+    assert_eq!(normalized.rewrites.len(), 4);
+    let private: std::net::IpAddr = "10.20.0.5".parse().unwrap();
+    let rebound = ComposeExecutor::rebind_loopback_published_ports(
+        &normalized.content,
+        private,
+        "compose file",
+    )
+    .unwrap();
+    let root: YamlValue = yaml_serde::from_str(&rebound).unwrap();
+    let ports = root["services"]["web"]["ports"].as_sequence().unwrap();
+    assert_eq!(ports[0].as_str(), Some("10.20.0.5::80"));
+    assert_eq!(ports[1].as_str(), Some("10.20.0.5::53/udp"));
+    assert_eq!(ports[2].as_str(), Some("10.20.0.5::9000"));
+    assert_eq!(ports[3]["host_ip"].as_str(), Some("10.20.0.5"));
+    assert!(ports[3].get("published").is_none(), "{rebound}");
+    assert!(!rebound.contains("127.0.0.1"), "{rebound}");
+
+    // The control plane keeps the rewritten file as it is.
+    assert_eq!(
+        ComposeExecutor::rebind_loopback_published_ports(
+            &normalized.content,
+            LOOPBACK,
+            "compose file"
+        )
+        .unwrap(),
+        normalized.content
+    );
+}
+
 #[test]
 fn test_strip_excluded_services_removes_service_and_sequence_depends_on() {
     let docker = Docker::connect_with_defaults();

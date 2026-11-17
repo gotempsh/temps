@@ -486,20 +486,29 @@ async fn inline_ports_replace_inherited_and_source_ports_during_resolution() {
             let cleared: Value = yaml_serde::from_str(&cleared).unwrap();
             assert!(cleared["services"]["app"].get("ports").is_none());
 
+            // An override that publishes off loopback is narrowed like any
+            // other published port (it used to be rejected): the host address
+            // becomes loopback and the fixed host port goes, so the override
+            // can still choose which container port is published without
+            // choosing the interface.
             let public_inline = "services: {app: {ports: ['0.0.0.0:8194:8191']}}";
-            assert!(matches!(
-                executor
-                    .resolve_security_configuration(
-                        "temps-port-override-test",
-                        Some(root.path()),
-                        "compose.yml",
-                        source,
-                        Some(public_inline),
-                        &HashMap::new(),
-                    )
-                    .await,
-                Err(ComposeError::SecurityPolicyViolation { field, .. }) if field == "ports"
-            ));
+            let (narrowed, _) = executor
+                .resolve_security_configuration(
+                    "temps-port-override-test",
+                    Some(root.path()),
+                    "compose.yml",
+                    source,
+                    Some(public_inline),
+                    &HashMap::new(),
+                )
+                .await
+                .unwrap();
+            let narrowed: Value = yaml_serde::from_str(&narrowed).unwrap();
+            let ports = narrowed["services"]["app"]["ports"].as_sequence().unwrap();
+            assert_eq!(ports.len(), 1, "{narrowed:?}");
+            assert_eq!(ports[0]["host_ip"].as_str(), Some("127.0.0.1"));
+            assert_eq!(ports[0]["target"].as_u64(), Some(8191));
+            assert!(ports[0].get("published").is_none(), "{ports:?}");
         }
 }
 
@@ -1492,4 +1501,226 @@ async fn override_lists_repeating_the_repository_file_are_not_duplicated() {
         yaml_serde::from_str::<Value>("[cache:/cache]").unwrap()
     );
     assert_eq!(resolved.notes.len(), 1);
+}
+
+/// A file whose only violations are the two rules Temps rewrites deploys:
+/// the check passes, the model that comes out is loopback-only and carries
+/// the container name as an in-stack alias, and every change is reported.
+#[tokio::test]
+async fn ports_and_container_names_are_narrowed_instead_of_rejected() {
+    let root = tempfile::tempdir().unwrap();
+    let environment = HashMap::new();
+    let content = "services:\n  web:\n    image: ghcr.io/example/web:1\n    container_name: example_web\n    ports:\n      - \"8080:80\"\n  db:\n    image: ghcr.io/example/db:16\n    ports:\n      - target: 5432\n        published: 5432\n        host_ip: 0.0.0.0\n";
+    let executor =
+        disabled_executor(root.path().join("data")).with_security_policy(Default::default());
+
+    let checked = executor
+        .check_configuration(&ComposeCheckInput {
+            content,
+            allow_cli: false,
+            ..idiomatic_input(root.path(), &environment, None)
+        })
+        .await
+        .unwrap();
+
+    let deployed: Value = yaml_serde::from_str(&checked.content).unwrap();
+    assert_eq!(
+        deployed["services"]["web"]["ports"][0].as_str(),
+        Some("127.0.0.1::80")
+    );
+    assert!(deployed["services"]["web"].get("container_name").is_none());
+    assert_eq!(
+        deployed["services"]["web"]["networks"]["default"]["aliases"][0].as_str(),
+        Some("example_web")
+    );
+    assert_eq!(
+        deployed["services"]["db"]["ports"][0]["host_ip"].as_str(),
+        Some("127.0.0.1")
+    );
+    assert!(deployed["services"]["db"]["ports"][0]
+        .get("published")
+        .is_none());
+    // The settings page lists services from the same rewritten model.
+    assert_eq!(checked.resolved_content, checked.content);
+
+    let checks: Vec<PolicyCheck> = checked
+        .rewrites
+        .iter()
+        .map(|rewrite| rewrite.check)
+        .collect();
+    assert_eq!(
+        checks,
+        [
+            PolicyCheck::PublishedPorts,
+            PolicyCheck::ContainerName,
+            PolicyCheck::PublishedPorts
+        ]
+    );
+
+    // The preview runs the same step, so it reports the same rewrites
+    // before the first deploy.
+    let report = executor
+        .check_report(ComposeCheckRequest {
+            project_name: "temps-idiom-test".to_string(),
+            compose_file: "docker-compose.yml".to_string(),
+            content: content.to_string(),
+            ..Default::default()
+        })
+        .await;
+    assert!(report.passed, "{report:?}");
+    assert_eq!(report.notes.len(), 3, "{:?}", report.notes);
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|note| note.contains("\"8080:80\"") && note.contains("\"127.0.0.1::80\"")),
+        "{:?}",
+        report.notes
+    );
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|note| note.contains("example_web") && note.contains("network alias")),
+        "{:?}",
+        report.notes
+    );
+}
+
+/// A rewrite in a service the deployment excludes is not reported: it
+/// describes work that never happens.
+#[tokio::test]
+async fn rewrites_in_excluded_services_are_not_reported() {
+    let root = tempfile::tempdir().unwrap();
+    let environment = HashMap::new();
+    let content = "services:\n  web:\n    image: ghcr.io/example/web:1\n    ports:\n      - \"8080:80\"\n  db:\n    image: ghcr.io/example/db:16\n    container_name: example_db\n";
+    let excluded = vec!["db".to_string()];
+    let checked = disabled_executor(root.path().join("data"))
+        .with_security_policy(Default::default())
+        .check_configuration(&ComposeCheckInput {
+            content,
+            excluded_services: &excluded,
+            allow_cli: false,
+            ..idiomatic_input(root.path(), &environment, None)
+        })
+        .await
+        .unwrap();
+    let services: Vec<String> = checked
+        .rewrites
+        .iter()
+        .map(|rewrite| rewrite.service.clone())
+        .collect();
+    assert_eq!(services, ["web"]);
+}
+
+/// A port built from a project variable keeps that value out of the
+/// deployment log, like every other message derived from the model.
+#[tokio::test]
+async fn a_rewrite_report_does_not_echo_a_substituted_variable_value() {
+    let root = tempfile::tempdir().unwrap();
+    let environment = HashMap::from([("HOST_PORT".to_string(), "18080".to_string())]);
+    let checked = disabled_executor(root.path().join("data"))
+        .with_security_policy(Default::default())
+        .check_configuration(&ComposeCheckInput {
+            content: "services:\n  web:\n    image: ghcr.io/example/web:1\n    ports:\n      - \"${HOST_PORT}:80\"\n",
+            allow_cli: false,
+            ..idiomatic_input(root.path(), &environment, None)
+        })
+        .await
+        .unwrap();
+    let [rewrite] = checked.rewrites.as_slice() else {
+        panic!("expected one rewrite, got {:?}", checked.rewrites);
+    };
+    assert!(!rewrite.before.contains("18080"), "{rewrite:?}");
+    assert!(rewrite.after.contains("127.0.0.1::80"), "{rewrite:?}");
+    assert!(
+        checked.content.contains("127.0.0.1::80"),
+        "{}",
+        checked.content
+    );
+}
+
+/// The same two rewrites reach a model that needed `docker compose config`
+/// to merge — a project override, `include`, `extends` or merge tags. The
+/// merged model is validated inside the resolution step, before
+/// `check_configuration` would narrow it, so the rewrites have to run there
+/// too or those files are rejected for a port Temps would have rewritten.
+#[tokio::test]
+async fn a_merged_model_is_narrowed_before_its_policy_check() {
+    if !std::process::Command::new("docker")
+        .args(["compose", "version"])
+        .output()
+        .is_ok_and(|result| result.status.success())
+    {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let environment = HashMap::new();
+    let content = "services:\n  web:\n    image: ghcr.io/example/web:1\n    container_name: example_web\n    ports:\n      - \"8080:80\"\n";
+    // A harmless override, enough to make the check merge with the CLI.
+    let override_content = "services:\n  web:\n    environment:\n      MODE: safe\n";
+    let checked = disabled_executor(root.path().join("data"))
+        .with_security_policy(Default::default())
+        .check_configuration(&ComposeCheckInput {
+            content,
+            allow_cli: true,
+            ..idiomatic_input(root.path(), &environment, Some(override_content))
+        })
+        .await
+        .unwrap();
+    assert!(
+        checked.resolution.command.is_some(),
+        "the CLI must have run"
+    );
+
+    let deployed: Value = yaml_serde::from_str(&checked.content).unwrap();
+    let web = &deployed["services"]["web"];
+    let port = &web["ports"][0];
+    // `docker compose config` emits the long form, whichever the file used.
+    assert_eq!(port["host_ip"].as_str(), Some("127.0.0.1"), "{:?}", port);
+    assert!(port.get("published").is_none(), "{port:?}");
+    assert_eq!(port["target"].as_u64(), Some(80));
+    assert!(web.get("container_name").is_none(), "{web:?}");
+    assert_eq!(
+        web["networks"]["default"]["aliases"][0].as_str(),
+        Some("example_web")
+    );
+    let checks: Vec<PolicyCheck> = checked
+        .rewrites
+        .iter()
+        .map(|rewrite| rewrite.check)
+        .collect();
+    assert_eq!(
+        checks,
+        [PolicyCheck::PublishedPorts, PolicyCheck::ContainerName],
+        "{:?}",
+        checked.rewrites
+    );
+}
+
+/// Interpolation escapes a substituted value's dollar signs into the model
+/// (`a$b` is written `a$$b`), so a rewrite report quoting the model must be
+/// masked in that form too — otherwise the value is recoverable from the
+/// deployment log.
+#[tokio::test]
+async fn a_rewrite_report_masks_a_substituted_value_with_a_dollar_sign() {
+    let root = tempfile::tempdir().unwrap();
+    let environment = HashMap::from([("NAME".to_string(), "alpha$bravo".to_string())]);
+    let checked = disabled_executor(root.path().join("data"))
+        .with_security_policy(Default::default())
+        .check_configuration(&ComposeCheckInput {
+            content: "services:\n  web:\n    image: ghcr.io/example/web:1\n    container_name: ${NAME}\n",
+            allow_cli: false,
+            ..idiomatic_input(root.path(), &environment, None)
+        })
+        .await
+        .unwrap();
+    let [rewrite] = checked.rewrites.as_slice() else {
+        panic!("expected one rewrite, got {:?}", checked.rewrites);
+    };
+    let message = rewrite.message();
+    for leak in ["alpha", "bravo", "alpha$bravo", "alpha$$bravo"] {
+        assert!(!message.contains(leak), "{leak} leaked: {message}");
+    }
+    assert!(message.contains("<redacted>"), "{message}");
 }

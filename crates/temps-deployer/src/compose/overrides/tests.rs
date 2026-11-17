@@ -282,6 +282,41 @@ services:
     }
 }
 
+/// The network override repeats the aliases the model declares on the
+/// default network, so the name a `container_name` became survives however
+/// Compose merges the per-service `networks:` across `-f` files — and never
+/// appears on the shared Temps network, which other projects can reach.
+#[test]
+fn network_override_repeats_default_network_aliases_but_never_shares_them() {
+    let executor = executor_with_checks_disabled(&[]);
+    let normalized = executor
+        .normalize_for_policy(
+            "services:\n  db:\n    image: db:16\n    container_name: app_db\n  web:\n    image: web:1\n",
+        )
+        .unwrap();
+    let parsed: yaml_serde::Value =
+        yaml_serde::from_str(&executor.generate_network_override(&normalized.content)).unwrap();
+    let network_name = temps_core::NETWORK_NAME.as_str();
+
+    let db = &parsed["services"]["db"]["networks"];
+    assert_eq!(db["default"]["aliases"][0].as_str(), Some("app_db"));
+    assert!(
+        db[network_name].get("aliases").is_none(),
+        "the shared network must not carry the alias: {db:?}"
+    );
+    assert!(db.get(network_name).is_some(), "{db:?}");
+
+    // A service with no alias keeps the plain list form.
+    let web = &parsed["services"]["web"]["networks"];
+    let names: Vec<&str> = web
+        .as_sequence()
+        .expect("a networks list")
+        .iter()
+        .filter_map(yaml_serde::Value::as_str)
+        .collect();
+    assert_eq!(names, ["default", network_name]);
+}
+
 #[test]
 fn test_generate_network_override_empty_for_no_services() {
     let docker = Docker::connect_with_defaults();
