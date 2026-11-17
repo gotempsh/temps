@@ -7,7 +7,7 @@
 //! Runs as a background task scheduled at 2 AM UTC daily.
 
 use chrono::Timelike as _;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
@@ -28,13 +28,17 @@ pub trait DockerClient: Send + Sync {
     /// policy's size cap.
     async fn prune_builder_cache(&self, policy: BuildCachePolicy) -> Result<String, String>;
 
-    /// Remove the named images (a `repo:tag` or an image ID), returning a
-    /// per-image outcome in the same order. Removal is never forced, so
-    /// Docker itself refuses an image any container (running or stopped)
-    /// still uses. Takes the whole batch (rather than one image per call) so
-    /// the implementation opens a single Docker connection for the entire
-    /// nightly pass instead of one per image.
-    async fn remove_images(&self, image_names: &[String]) -> Vec<ImageRemovalOutcome>;
+    /// Remove each selected image by its reference (a `repo:tag`, a digest
+    /// reference or an image ID), returning a per-image outcome in the same
+    /// order. A reference is removed only while it still names the image
+    /// ID the pass selected: a pull between the pass's inventory and the
+    /// removal can repoint a tag at a newer image, which is then
+    /// [`ImageDeleteStatus::Retained`] rather than deleted. Removal is never
+    /// forced, so Docker itself refuses an image any container (running or
+    /// stopped) still uses. Takes the whole batch (rather than one image per
+    /// call) so the implementation opens a single Docker connection for the
+    /// entire nightly pass instead of one per image.
+    async fn remove_images(&self, removals: &[ImageRemoval]) -> Vec<ImageRemovalOutcome>;
 
     /// Every top-level image on the local daemon (`all=false`, so not the
     /// intermediate layers of a build). The retention pass only considers
@@ -187,6 +191,46 @@ impl ImageRemovalOutcome {
             image_name: image_name.to_string(),
             status,
         }
+    }
+}
+
+/// One image a pass selected for removal: the reference to remove it by,
+/// and the local image ID that reference named when the pass decided.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageRemoval {
+    pub reference: String,
+    pub image_id: String,
+}
+
+impl ImageRemoval {
+    /// Remove `image_id` by the ID itself.
+    pub fn by_id(image_id: &str) -> Self {
+        Self {
+            reference: image_id.to_string(),
+            image_id: image_id.to_string(),
+        }
+    }
+
+    /// Whether the reference has to be checked against the selected ID
+    /// before removal. An image ID always names the same image; a tag can
+    /// be moved to another one.
+    pub fn needs_identity_check(&self) -> bool {
+        self.reference != self.image_id
+    }
+
+    /// The outcome to report instead of removing, when the reference now
+    /// names `current_id` rather than the selected image. `None` when it
+    /// still names the selected image.
+    pub fn moved_outcome(&self, current_id: &str) -> Option<ImageRemovalOutcome> {
+        (current_id != self.image_id).then(|| ImageRemovalOutcome {
+            image_name: self.reference.clone(),
+            status: ImageDeleteStatus::Retained {
+                reason: format!(
+                    "'{}' now names image {} instead of {}, the image selected for removal",
+                    self.reference, current_id, self.image_id
+                ),
+            },
+        })
     }
 }
 
@@ -399,7 +443,7 @@ impl DockerClient for DefaultDockerClient {
         }
     }
 
-    async fn remove_images(&self, image_names: &[String]) -> Vec<ImageRemovalOutcome> {
+    async fn remove_images(&self, removals: &[ImageRemoval]) -> Vec<ImageRemovalOutcome> {
         use bollard::Docker;
 
         // One connection for the whole batch.
@@ -407,10 +451,10 @@ impl DockerClient for DefaultDockerClient {
             Ok(docker) => docker,
             Err(e) => {
                 let reason = format!("Failed to connect to Docker daemon: {}", e);
-                return image_names
+                return removals
                     .iter()
-                    .map(|name| ImageRemovalOutcome {
-                        image_name: name.clone(),
+                    .map(|removal| ImageRemovalOutcome {
+                        image_name: removal.reference.clone(),
                         status: ImageDeleteStatus::Failed {
                             reason: reason.clone(),
                         },
@@ -419,8 +463,29 @@ impl DockerClient for DefaultDockerClient {
             }
         };
 
-        let mut outcomes = Vec::with_capacity(image_names.len());
-        for image_name in image_names {
+        let mut outcomes = Vec::with_capacity(removals.len());
+        for removal in removals {
+            let image_name = removal.reference.as_str();
+            // The pass chose this reference from an earlier inventory. If a
+            // pull has since moved it to another image, removing it by name
+            // would delete that newer image instead.
+            if removal.needs_identity_check() {
+                match docker.inspect_image(image_name).await {
+                    Ok(current) => {
+                        if let Some(moved) =
+                            removal.moved_outcome(current.id.as_deref().unwrap_or_default())
+                        {
+                            outcomes.push(moved);
+                            continue;
+                        }
+                    }
+                    Err(error) => {
+                        outcomes.push(ImageRemovalOutcome::from_docker(image_name, Err(error)));
+                        continue;
+                    }
+                }
+            }
+
             // Non-forced: Docker refuses while any container (running or
             // stopped) still references the image. That is deliberate — it is
             // the last line of defence behind the passes' own in-use checks.
@@ -854,13 +919,35 @@ fn sql_registry_pull() -> String {
 /// candidate recorded under another.
 ///
 /// A reference that names a registry host (its first component has a `.` or
-/// `:`, or is `localhost`) and a bare image ID are returned unchanged.
+/// `:`, or is `localhost`) keeps its registry, and a bare image ID is
+/// returned unchanged.
+///
+/// A reference with neither a tag nor a digest gets `:latest`, the tag
+/// Docker pulls and stores it under: `nginx` gives
+/// `docker.io/library/nginx:latest`, so a deployment that recorded `nginx`
+/// matches the local `nginx:latest` tag.
+///
 /// [`sql_canonical_image_reference`] is the same rule in SQL; keep them in
 /// step.
 pub fn canonical_image_reference(reference: &str) -> String {
     if reference.is_empty() || reference.starts_with("sha256:") {
         return reference.to_string();
     }
+    let canonical = canonical_repository_spelling(reference);
+    let has_tag = canonical
+        .rsplit('/')
+        .next()
+        .is_some_and(|last| last.contains(':'));
+    if canonical.contains('@') || has_tag {
+        canonical
+    } else {
+        format!("{canonical}:latest")
+    }
+}
+
+/// [`canonical_image_reference`] before the default tag: the registry and
+/// repository spelled one way, tag or digest kept as written.
+fn canonical_repository_spelling(reference: &str) -> String {
     let reference = match reference.strip_prefix("index.docker.io/") {
         Some(rest) => format!("docker.io/{rest}"),
         None => reference.to_string(),
@@ -884,6 +971,19 @@ pub fn canonical_image_reference(reference: &str) -> String {
 /// SQL expression giving [`canonical_image_reference`] of `expr`, a column
 /// expression (never user input). NULL stays NULL.
 fn sql_canonical_image_reference(expr: &str) -> String {
+    let c = sql_canonical_repository_spelling(expr);
+    // A colon after the last `/` is a tag; `@` is a digest.
+    format!(
+        r"(CASE
+            WHEN {c} = '' OR {c} LIKE 'sha256:%'
+              OR strpos({c}, '@') > 0 OR {c} ~ ':[^/]*$' THEN {c}
+            ELSE {c} || ':latest'
+        END)"
+    )
+}
+
+/// SQL expression giving `canonical_repository_spelling` of `expr`.
+fn sql_canonical_repository_spelling(expr: &str) -> String {
     let n = format!(r"regexp_replace({expr}, '^index\.docker\.io/', 'docker.io/')");
     format!(
         r"(CASE
@@ -1021,8 +1121,7 @@ impl LocalImageIndex {
         let Some(image) = self.images.get(image_id) else {
             return Vec::new();
         };
-        let named: std::collections::HashSet<&str> =
-            named_keys.iter().map(String::as_str).collect();
+        let named: HashSet<&str> = named_keys.iter().map(String::as_str).collect();
         if !image.repo_tags.is_empty() {
             return image
                 .repo_tags
@@ -1031,7 +1130,7 @@ impl LocalImageIndex {
                 .cloned()
                 .collect();
         }
-        let repositories: std::collections::HashSet<String> = named_keys
+        let repositories: HashSet<String> = named_keys
             .iter()
             .filter_map(|key| image_repository(key))
             .collect();
@@ -1272,28 +1371,127 @@ impl DockerCleanupService {
         }
     }
 
+    /// Local image IDs retention must keep whatever their age: the rollback
+    /// floor, images that cannot be obtained again, what each environment
+    /// serves, and built images worker nodes roll back from. `None` when any
+    /// of them cannot be read: the pass is then skipped rather than run
+    /// without that protection.
+    async fn protected_image_ids(&self, index: &LocalImageIndex) -> Option<HashSet<String>> {
+        let mut protected = HashSet::new();
+
+        // Preserve main's rollback floor from #645: regardless of the age
+        // policy, keep the newest N deployment images for every
+        // project+environment. Computed via a window function so the result
+        // is bounded by (project, environment) pairs × N, not by total
+        // deployment history.
+        match self
+            .recently_protected_image_names(self.keep_recent_deployment_images)
+            .await
+        {
+            Ok(names) => {
+                for name in &names {
+                    Self::protect_image(&mut protected, index, name);
+                }
+            }
+            Err(e) => {
+                error!(
+                    error = %e,
+                    "Could not determine recently-deployed images; skipping image \
+                     retention this run to avoid removing a rollback target"
+                );
+                return None;
+            }
+        }
+
+        // Protect images that can be neither rebuilt nor pulled again.
+        match self.unrecoverable_image_names().await {
+            Ok(names) => {
+                for name in &names {
+                    Self::protect_image(&mut protected, index, name);
+                }
+                debug!(
+                    protected = names.len(),
+                    "Protected unrecoverable deployment images from retention"
+                );
+            }
+            Err(e) => {
+                // Failing open here would delete uploaded images. Abort the
+                // whole pass instead and say so — a skipped night costs disk,
+                // a wrong deletion costs the user their deployment.
+                error!(
+                    error = %e,
+                    "Could not determine which deployment images are recoverable; \
+                     skipping image retention this run to avoid deleting an \
+                     unrecoverable image"
+                );
+                return None;
+            }
+        }
+
+        // Protect whatever each environment is currently serving. Bounded by
+        // environment count via a direct join rather than a scan of
+        // deployment history.
+        match self.actively_served_image_names().await {
+            Ok(names) => {
+                for name in &names {
+                    Self::protect_image(&mut protected, index, name);
+                }
+            }
+            Err(e) => {
+                error!(
+                    error = %e,
+                    "Could not determine active deployments; skipping image \
+                     retention this run to avoid removing a live image"
+                );
+                return None;
+            }
+        }
+
+        // Protect built images whose containers live on a worker node: the
+        // control plane's copy is what a rollback there streams from. A
+        // registry image is exempt, since the worker pulls it itself.
+        match self.remote_node_image_names().await {
+            Ok(names) => {
+                for name in &names {
+                    Self::protect_image(&mut protected, index, name);
+                }
+                if !names.is_empty() {
+                    debug!(
+                        remote = names.len(),
+                        "Skipping deployment images owned by worker nodes"
+                    );
+                }
+            }
+            Err(e) => {
+                error!(
+                    error = %e,
+                    "Could not determine which deployment images are node-local; \
+                     skipping image retention this run"
+                );
+                return None;
+            }
+        }
+
+        Some(protected)
+    }
+
     /// Mark an image as permanently protected, whatever its age.
     ///
     /// Used for images we cannot recover (uploaded tarballs, claimed local
-    /// images, non-git builds) and for the image each environment is
-    /// currently serving. `insert` rather than `and_modify` so protection wins
-    /// regardless of the order references are visited in. No name filter:
-    /// which images are candidates at all is decided by
+    /// images, non-git builds), the image each environment is currently
+    /// serving, the rollback floor and worker-node rollback sources. No name
+    /// filter: which images are candidates at all is decided by
     /// `expired_image_candidates` from the builder's own records, so a
-    /// protection entry for any other name is simply never consulted.
+    /// protection for any other image is simply never consulted.
     ///
-    /// `candidates` is keyed by local image ID, and `image_name` (a reference
-    /// in any spelling, or an image ID) is resolved through `index`: protecting
+    /// `protected` holds local image IDs, and `image_name` (a reference in
+    /// any spelling, or an image ID) is resolved through `index`: protecting
     /// `nginx:1` protects the image a candidate recorded as
     /// `docker.io/library/nginx:1`, or as its digest. A name not on this
     /// daemon protects nothing, because there is nothing to remove.
-    fn protect_image(
-        candidates: &mut HashMap<String, bool>,
-        index: &LocalImageIndex,
-        image_name: &str,
-    ) {
+    fn protect_image(protected: &mut HashSet<String>, index: &LocalImageIndex, image_name: &str) {
         if let Some(image_id) = index.image_id_for(image_name) {
-            candidates.insert(image_id.to_string(), false);
+            protected.insert(image_id.to_string());
         }
     }
 
@@ -1387,14 +1585,24 @@ impl DockerCleanupService {
             return;
         }
 
+        // Every protection is read before the candidate query and handed to
+        // it, so a protected image is dropped before its `LIMIT` and never
+        // takes one of the run's slots. Otherwise a project whose only
+        // expired deployment is also its rollback floor (or what it serves)
+        // could hold the oldest slots every night, and no other project's
+        // expired images would ever be reached.
+        let Some(protected) = self.protected_image_ids(&index).await else {
+            return;
+        };
+
         // Eligibility (and the oldest reference per image, used to order
         // removal) is computed inside Postgres via GROUP BY/HAVING rather
         // than by pulling every deployment row into the process, and capped
         // at `max_deployment_images_per_run` — see the doc comment on
         // `expired_image_candidates` for why this table's row count doesn't
         // shrink to "how many images exist".
-        let (mut candidates, oldest_and_names_by_image) = match self
-            .expired_image_candidates(default_image_retention_hours, &index)
+        let oldest_and_names_by_image = match self
+            .expired_image_candidates(default_image_retention_hours, &index, &protected)
             .await
         {
             Ok(result) => result,
@@ -1408,114 +1616,17 @@ impl DockerCleanupService {
             }
         };
 
-        if candidates.is_empty() {
+        if oldest_and_names_by_image.is_empty() {
             debug!("No expired deployment images to consider");
             return;
         }
 
-        // Preserve main's rollback floor from #645: regardless of the age
-        // policy, keep the newest N deployment images for every
-        // project+environment. Computed via a window function so the result
-        // is bounded by (project, environment) pairs × N, not by total
-        // deployment history.
-        match self
-            .recently_protected_image_names(self.keep_recent_deployment_images)
-            .await
-        {
-            Ok(names) => {
-                for name in &names {
-                    Self::protect_image(&mut candidates, &index, name);
-                }
-            }
-            Err(e) => {
-                error!(
-                    error = %e,
-                    "Could not determine recently-deployed images; skipping image \
-                     retention this run to avoid removing a rollback target"
-                );
-                return;
-            }
-        }
-
-        // Protect images that can be neither rebuilt nor pulled again.
-        match self.unrecoverable_image_names().await {
-            Ok(names) => {
-                for name in &names {
-                    Self::protect_image(&mut candidates, &index, name);
-                }
-                debug!(
-                    protected = names.len(),
-                    "Protected unrecoverable deployment images from retention"
-                );
-            }
-            Err(e) => {
-                // Failing open here would delete uploaded images. Abort the
-                // whole pass instead and say so — a skipped night costs disk,
-                // a wrong deletion costs the user their deployment.
-                error!(
-                    error = %e,
-                    "Could not determine which deployment images are recoverable; \
-                     skipping image retention this run to avoid deleting an \
-                     unrecoverable image"
-                );
-                return;
-            }
-        }
-
-        // Protect whatever each environment is currently serving. Bounded by
-        // environment count via a direct join rather than a scan of
-        // deployment history.
-        match self.actively_served_image_names().await {
-            Ok(names) => {
-                for name in &names {
-                    Self::protect_image(&mut candidates, &index, name);
-                }
-            }
-            Err(e) => {
-                error!(
-                    error = %e,
-                    "Could not determine active deployments; skipping image \
-                     retention this run to avoid removing a live image"
-                );
-                return;
-            }
-        }
-
-        // Protect built images whose containers live on a worker node: the
-        // control plane's copy is what a rollback there streams from. A
-        // registry image is exempt, since the worker pulls it itself.
-        match self.remote_node_image_names().await {
-            Ok(names) => {
-                for name in &names {
-                    Self::protect_image(&mut candidates, &index, name);
-                }
-                if !names.is_empty() {
-                    debug!(
-                        remote = names.len(),
-                        "Skipping deployment images owned by worker nodes"
-                    );
-                }
-            }
-            Err(e) => {
-                error!(
-                    error = %e,
-                    "Could not determine which deployment images are node-local; \
-                     skipping image retention this run"
-                );
-                return;
-            }
-        }
-
-        // An image a protection added that the query never returned is not
-        // a candidate.
-        let mut expired: Vec<(String, chrono::DateTime<chrono::Utc>)> = candidates
-            .into_iter()
-            .filter(|(_, eligible)| *eligible)
-            .filter_map(|(image_id, _)| {
-                oldest_and_names_by_image
-                    .get(&image_id)
-                    .map(|(oldest, _)| (image_id, *oldest))
-            })
+        // The query already excluded `protected`; checking again here keeps
+        // a protected image safe even if the two ever disagree.
+        let mut expired: Vec<(String, chrono::DateTime<chrono::Utc>)> = oldest_and_names_by_image
+            .iter()
+            .filter(|(image_id, _)| !protected.contains(*image_id))
+            .map(|(image_id, (oldest, _))| (image_id.clone(), *oldest))
             .collect();
 
         // Preserve main's bounded nightly work from #645. Oldest candidates
@@ -1524,7 +1635,7 @@ impl DockerCleanupService {
         expired.truncate(self.max_deployment_images_per_run.min(usize::MAX as u64) as usize);
 
         let mut image_sizes: HashMap<String, u64> = HashMap::new();
-        let mut removals: Vec<String> = Vec::new();
+        let mut removals: Vec<ImageRemoval> = Vec::new();
         for (image_id, _) in &expired {
             let named_keys = oldest_and_names_by_image
                 .get(image_id)
@@ -1540,7 +1651,10 @@ impl DockerCleanupService {
             }
             for name in names {
                 image_sizes.insert(name.clone(), index.size_of(image_id));
-                removals.push(name);
+                removals.push(ImageRemoval {
+                    reference: name,
+                    image_id: image_id.clone(),
+                });
             }
         }
         let expired = removals;
@@ -1644,37 +1758,40 @@ impl DockerCleanupService {
     /// Each protective flag is `COALESCE`d to `TRUE`, so a NULL column
     /// protects the image rather than releasing it.
     ///
-    /// The permanent protections are applied here, before `LIMIT`, and not
-    /// only downstream via `protect_image`. An install with
-    /// `max_deployment_images_per_run` or more old, permanently protected
-    /// images would otherwise fill the whole `ORDER BY MIN(created_at) ASC
-    /// LIMIT` window with rows that `protect_image` then throws away, and
-    /// every run would reclaim nothing instead of picking up the remainder
-    /// on the next run. Recency-based protections (keep-recent-N,
-    /// actively-served) don't need this: they cover the *newest*
-    /// deployments, so they never compete for the oldest-first slots.
-    /// For the same reason an image no recorded name would remove
-    /// (`removable_images`, mirroring [`LocalImageIndex::removal_names`]),
-    /// such as a pulled image that now carries only an operator's own tag,
-    /// is dropped before `LIMIT` rather than skipped after it.
+    /// **Nothing protected takes a slot.** Every protection is applied here,
+    /// before `LIMIT`, not after it. An install with
+    /// `max_deployment_images_per_run` or more old, protected images would
+    /// otherwise fill the whole `ORDER BY MIN(created_at) ASC LIMIT` window
+    /// with rows the pass then keeps, and every run would reclaim nothing
+    /// instead of picking up the remainder on the next run. The protections
+    /// above are evaluated in the query; the rest (the keep-recent-N rollback
+    /// floor, what each environment serves, worker-node rollback sources)
+    /// are read first and passed in as `protected`, local image IDs. Being a
+    /// project's newest deployment does not make an image newer than another
+    /// project's expired ones, so those compete for the oldest-first slots
+    /// too. An image no recorded name would remove (`removable_images`,
+    /// mirroring [`LocalImageIndex::removal_names`]), such as a pulled image
+    /// that now carries only an operator's own tag, is dropped the same way.
+    ///
     /// `HAVING` drops non-expired groups before they leave Postgres, and
     /// `LIMIT` gives the candidate scan the same bound as the removal batch.
     async fn expired_image_candidates(
         &self,
         default_hours: i64,
         index: &LocalImageIndex,
-    ) -> Result<
-        (
-            HashMap<String, bool>,
-            HashMap<String, (chrono::DateTime<chrono::Utc>, Vec<String>)>,
-        ),
-        sea_orm::DbErr,
-    > {
+        protected: &HashSet<String>,
+    ) -> Result<HashMap<String, (chrono::DateTime<chrono::Utc>, Vec<String>)>, sea_orm::DbErr> {
         use sea_orm::{ActiveEnum, ConnectionTrait, Statement};
 
         let limit = i64::try_from(self.max_deployment_images_per_run).unwrap_or(i64::MAX);
         let build_succeeded = temps_entities::types::JobStatus::Success.to_value();
         let local_references = index.query_input();
+        let protected_ids = serde_json::Value::Array(
+            protected
+                .iter()
+                .map(|id| serde_json::Value::String(id.clone()))
+                .collect(),
+        );
         // Only fixed predicates are interpolated; every value is a bind
         // parameter.
         let sql = format!(
@@ -1827,6 +1944,9 @@ impl DockerCleanupService {
                     string_agg(DISTINCT name_key, E'\n') AS named_keys
                 FROM ref_rows
                 WHERE image_id IN (SELECT image_id FROM removable_images)
+                  AND image_id NOT IN (
+                      SELECT jsonb_array_elements_text($5::jsonb)
+                  )
                 GROUP BY image_id
                 HAVING BOOL_AND(expired)
                    AND NOT BOOL_OR(in_flight)
@@ -1860,11 +1980,11 @@ impl DockerCleanupService {
                     limit.into(),
                     build_succeeded.into(),
                     local_references.into(),
+                    protected_ids.into(),
                 ],
             ))
             .await?;
 
-        let mut candidates = HashMap::new();
         let mut oldest_and_names_by_image = HashMap::new();
         for row in rows {
             let image_id: String = row.try_get("", "image_id")?;
@@ -1877,15 +1997,10 @@ impl DockerCleanupService {
                 .lines()
                 .map(str::to_string)
                 .collect();
-            oldest_and_names_by_image.insert(image_id.clone(), (oldest_reference, named_keys));
-            // Every row that survives the query's HAVING clause is, by
-            // definition, fully expired — `protect_image` (called for the
-            // recent/unrebuildable/active/remote-node sets below) is what
-            // flips an entry back to `false`.
-            candidates.insert(image_id, true);
+            oldest_and_names_by_image.insert(image_id, (oldest_reference, named_keys));
         }
 
-        Ok((candidates, oldest_and_names_by_image))
+        Ok(oldest_and_names_by_image)
     }
 
     /// Image names among the newest `keep_recent` deployments for each
@@ -2155,7 +2270,7 @@ impl DockerCleanupService {
             return;
         }
 
-        let stale_hashes: std::collections::HashSet<String> =
+        let stale_hashes: HashSet<String> =
             stale_rows.iter().map(|r| r.content_hash.clone()).collect();
         let stale_count = stale_rows.len();
 

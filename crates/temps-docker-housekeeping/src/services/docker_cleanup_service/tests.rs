@@ -22,11 +22,11 @@ impl DockerClient for MockDockerClient {
         self.prune_cache_result.clone()
     }
 
-    async fn remove_images(&self, image_names: &[String]) -> Vec<ImageRemovalOutcome> {
-        image_names
+    async fn remove_images(&self, removals: &[ImageRemoval]) -> Vec<ImageRemovalOutcome> {
+        removals
             .iter()
-            .map(|name| ImageRemovalOutcome {
-                image_name: name.clone(),
+            .map(|removal| ImageRemovalOutcome {
+                image_name: removal.reference.clone(),
                 status: ImageDeleteStatus::Deleted,
             })
             .collect()
@@ -98,7 +98,11 @@ impl DockerClient for RecordingDockerClient {
         Ok(String::new())
     }
 
-    async fn remove_images(&self, image_names: &[String]) -> Vec<ImageRemovalOutcome> {
+    async fn remove_images(&self, removals: &[ImageRemoval]) -> Vec<ImageRemovalOutcome> {
+        let image_names: Vec<String> = removals
+            .iter()
+            .map(|removal| removal.reference.clone())
+            .collect();
         self.removed
             .lock()
             .expect("recording mock mutex poisoned")
@@ -160,11 +164,11 @@ impl DockerClient for UnlistableDockerClient {
         Ok(String::new())
     }
 
-    async fn remove_images(&self, image_names: &[String]) -> Vec<ImageRemovalOutcome> {
+    async fn remove_images(&self, removals: &[ImageRemoval]) -> Vec<ImageRemovalOutcome> {
         self.removed
             .lock()
             .expect("unlistable mock mutex poisoned")
-            .extend(image_names.iter().cloned());
+            .extend(removals.iter().map(|removal| removal.reference.clone()));
         Vec::new()
     }
 
@@ -450,44 +454,15 @@ fn test_out_of_range_operator_setting_is_clamped() {
     assert_eq!(huge.effective_default_hours(), 8760);
 }
 
-/// An uploaded image has no source to rebuild from. Pruning it is data
-/// loss: rollback and promotion both hard-fail with "image no longer
-/// exists locally" and there is no way to get it back.
-///
-/// Eligibility itself (newer-reference-preserves-reused-image, the
-/// build-provenance filter) is now computed inside Postgres by
-/// `expired_image_candidates` and exercised end-to-end in
-/// `test_prune_old_deployment_images_end_to_end` below; this test only
-/// covers `protect_image`'s order-independence against an
-/// already-recorded entry, which is still pure Rust.
+/// A protection resolves its name through the local index to the image it
+/// names: an uploaded tag protects that image's ID.
 #[test]
-fn test_protection_beats_expiry_regardless_of_order() {
+fn test_protection_records_the_image_id() {
     let uploaded = "temps-demo-prod:upload-1750000000";
     let index = LocalImageIndex::new(vec![local_image("sha256:up", 1, &[uploaded], &[])]);
-
-    // Protect first, then simulate an already-recorded expired entry.
-    let mut protect_first = HashMap::new();
-    DockerCleanupService::protect_image(&mut protect_first, &index, uploaded);
-    protect_first
-        .entry("sha256:up".to_string())
-        .and_modify(|eligible| *eligible &= true)
-        .or_insert(true);
-    assert_eq!(protect_first.get("sha256:up"), Some(&false));
-
-    // Simulate an already-recorded expired entry first, then protect.
-    let mut record_first = HashMap::new();
-    record_first.insert("sha256:up".to_string(), true);
-    assert_eq!(
-        record_first.get("sha256:up"),
-        Some(&true),
-        "precondition: an old upload looks eligible on age alone"
-    );
-    DockerCleanupService::protect_image(&mut record_first, &index, uploaded);
-    assert_eq!(
-        record_first.get("sha256:up"),
-        Some(&false),
-        "protection must win over an already-recorded expiry"
-    );
+    let mut protected = HashSet::new();
+    DockerCleanupService::protect_image(&mut protected, &index, uploaded);
+    assert_eq!(protected, HashSet::from(["sha256:up".to_string()]));
 }
 
 /// Protection used to skip any name without a `temps-` prefix, which
@@ -496,21 +471,27 @@ fn test_protection_beats_expiry_regardless_of_order() {
 #[test]
 fn test_protect_applies_to_builder_tags_without_temps_prefix() {
     let index = LocalImageIndex::new(vec![local_image("sha256:b", 1, &["my-app-12:latest"], &[])]);
-    let mut candidates = HashMap::new();
-    candidates.insert("sha256:b".to_string(), true);
-    DockerCleanupService::protect_image(&mut candidates, &index, "my-app-12:latest");
-    assert_eq!(candidates.get("sha256:b"), Some(&false));
+    let mut protected = HashSet::new();
+    DockerCleanupService::protect_image(&mut protected, &index, "my-app-12:latest");
+    assert!(protected.contains("sha256:b"));
 }
 
 /// A protection recorded under one spelling of a Docker Hub name covers a
 /// candidate recorded under another: Docker resolves both to one image.
+/// So does a recorded name with no tag, which Docker pulls as `:latest`.
 #[test]
 fn test_protection_matches_every_docker_hub_spelling() {
-    let index = LocalImageIndex::new(vec![local_image("sha256:n", 1, &["nginx:1"], &[])]);
-    let mut candidates = HashMap::new();
-    candidates.insert("sha256:n".to_string(), true);
-    DockerCleanupService::protect_image(&mut candidates, &index, "index.docker.io/nginx:1");
-    assert_eq!(candidates.get("sha256:n"), Some(&false));
+    let index = LocalImageIndex::new(vec![
+        local_image("sha256:n", 1, &["nginx:1"], &[]),
+        local_image("sha256:l", 1, &["redis:latest"], &[]),
+    ]);
+    let mut protected = HashSet::new();
+    DockerCleanupService::protect_image(&mut protected, &index, "index.docker.io/nginx:1");
+    DockerCleanupService::protect_image(&mut protected, &index, "docker.io/library/redis");
+    assert_eq!(
+        protected,
+        HashSet::from(["sha256:n".to_string(), "sha256:l".to_string()])
+    );
 }
 
 /// `app:v1` and `app@sha256:...` are one image: removing its last tag also
@@ -529,15 +510,41 @@ fn test_protection_covers_every_reference_of_an_image() {
         "ghcr.io/example-org/app@sha256:d1",
         "sha256:app",
     ] {
-        let mut candidates = HashMap::new();
-        candidates.insert("sha256:app".to_string(), true);
-        DockerCleanupService::protect_image(&mut candidates, &index, protected_as);
-        assert_eq!(candidates.get("sha256:app"), Some(&false), "{protected_as}");
+        let mut protected = HashSet::new();
+        DockerCleanupService::protect_image(&mut protected, &index, protected_as);
+        assert!(protected.contains("sha256:app"), "{protected_as}");
     }
     // A name that is not on this daemon protects nothing.
-    let mut candidates = HashMap::new();
-    DockerCleanupService::protect_image(&mut candidates, &index, "ghcr.io/other/app:v1");
-    assert!(candidates.is_empty());
+    let mut protected = HashSet::new();
+    DockerCleanupService::protect_image(&mut protected, &index, "ghcr.io/other/app:v1");
+    assert!(protected.is_empty());
+}
+
+/// A tag a pull moved to a newer image after the pass chose it is kept,
+/// not removed: removing it by name would delete the newer image. An image
+/// ID always names the same image, so removing by ID needs no check.
+#[test]
+fn test_a_moved_reference_is_retained() {
+    let removal = ImageRemoval {
+        reference: "registry.example.com/team/app:latest".to_string(),
+        image_id: "sha256:old".to_string(),
+    };
+    assert!(removal.needs_identity_check());
+    assert_eq!(removal.moved_outcome("sha256:old"), None);
+    let moved = removal.moved_outcome("sha256:new");
+    assert!(
+        matches!(
+            moved,
+            Some(ImageRemovalOutcome {
+                ref image_name,
+                status: ImageDeleteStatus::Retained { ref reason },
+            }) if image_name == "registry.example.com/team/app:latest"
+                && reason.contains("sha256:new")
+                && reason.contains("sha256:old")
+        ),
+        "{moved:?}"
+    );
+    assert!(!ImageRemoval::by_id("sha256:old").needs_identity_check());
 }
 
 /// An expired image is removed only by the names deployments recorded:
@@ -664,6 +671,21 @@ fn test_canonical_image_reference() {
         canonical_image_reference("nginx@sha256:abc"),
         "docker.io/library/nginx@sha256:abc"
     );
+    // No tag and no digest means `:latest`, as Docker stores the pull.
+    for (untagged, expected) in [
+        ("nginx", "docker.io/library/nginx:latest"),
+        ("docker.io/library/nginx", "docker.io/library/nginx:latest"),
+        ("org/app", "docker.io/org/app:latest"),
+        ("ghcr.io/org/app", "ghcr.io/org/app:latest"),
+        ("localhost:5000/app", "localhost:5000/app:latest"),
+    ] {
+        assert_eq!(canonical_image_reference(untagged), expected, "{untagged}");
+        assert_eq!(
+            canonical_image_reference(untagged),
+            canonical_image_reference(&format!("{untagged}:latest")),
+            "{untagged}"
+        );
+    }
     // Registry-qualified references and image IDs are left alone.
     for unchanged in [
         "ghcr.io/org/app:1",
@@ -732,7 +754,10 @@ async fn test_refused_removals_are_counted_separately() {
     });
 
     let outcomes = docker
-        .remove_images(&["temps-a:1".to_string(), "temps-b:1".to_string()])
+        .remove_images(&[
+            ImageRemoval::by_id("temps-a:1"),
+            ImageRemoval::by_id("temps-b:1"),
+        ])
         .await;
 
     let summary = summarize_removals(
@@ -877,20 +902,43 @@ async fn test_real_docker_removes_unused_and_retains_in_use_image() {
         }
     };
 
+    let image_id = |name: &'static str| {
+        let docker = docker.clone();
+        async move {
+            docker
+                .inspect_image(name)
+                .await
+                .ok()
+                .and_then(|image| image.id)
+                .unwrap_or_default()
+        }
+    };
+    let unused_id = image_id(unused).await;
+    let in_use_id = image_id(in_use).await;
+
+    // The first removal was selected when `unused` named another image, as
+    // after a pull moved the tag: it must leave the image alone.
     let outcomes = DefaultDockerClient
-        .remove_images(&[unused.to_string(), in_use.to_string()])
+        .remove_images(&[
+            ImageRemoval {
+                reference: unused.to_string(),
+                image_id: in_use_id.clone(),
+            },
+            ImageRemoval {
+                reference: unused.to_string(),
+                image_id: unused_id,
+            },
+            ImageRemoval {
+                reference: in_use.to_string(),
+                image_id: in_use_id,
+            },
+        ])
         .await;
 
-    let unused_outcome = outcomes
-        .iter()
-        .find(|o| o.image_name == unused)
-        .expect("outcome reported for the unused image")
-        .clone();
-    let in_use_outcome = outcomes
-        .iter()
-        .find(|o| o.image_name == in_use)
-        .expect("outcome reported for the in-use image")
-        .clone();
+    assert_eq!(outcomes.len(), 3, "one outcome per removal: {outcomes:?}");
+    let moved_outcome = outcomes[0].clone();
+    let unused_outcome = outcomes[1].clone();
+    let in_use_outcome = outcomes[2].clone();
     let unused_still_present = docker.inspect_image(unused).await.is_ok();
 
     // Clean up before asserting so a failing assert cannot leak state.
@@ -914,6 +962,11 @@ async fn test_real_docker_removes_unused_and_retains_in_use_image() {
         )
         .await;
 
+    assert!(
+        matches!(moved_outcome.status, ImageDeleteStatus::Retained { .. }),
+        "a reference that no longer names the selected image must be kept: {:?}",
+        moved_outcome.status
+    );
     assert_eq!(
         unused_outcome.status,
         ImageDeleteStatus::Deleted,
@@ -2005,6 +2058,92 @@ async fn test_superseded_mutable_tag_images_expire_by_recorded_identity(
         docker.removed_sorted(),
         vec![digest(1)],
         "image 1 is past the window and the floor of two; images 2 and 3 are the floor"
+    );
+    Ok(())
+}
+
+/// Project A's only deployment is old, so its image is the oldest
+/// expired one, but it is also A's rollback floor. It must not take the
+/// run's only slot: project B's expired image behind it is removed.
+#[tokio::test]
+async fn test_rollback_floor_images_do_not_fill_the_run_window(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use chrono::{Duration, Utc};
+    use sea_orm::ActiveModelTrait;
+
+    if !cleanup_integration_tests_available().await {
+        eprintln!("Docker/Postgres unavailable; skipping rollback floor window test");
+        return Ok(());
+    }
+
+    let test_db = temps_test_utils::TestDatabase::with_migrations().await?;
+    let db = test_db.connection_arc();
+    let now = Utc::now();
+    let (project_a, environment_a) = registry_fixture(db.as_ref(), "floor-a").await?;
+    let (project_b, environment_b) = registry_fixture(db.as_ref(), "floor-b").await?;
+    let image = |project: &str, tag: &str| format!("registry.example.com/{project}/app:{tag}");
+
+    for (project, environment, slug, reference, age) in [
+        (
+            &project_a,
+            &environment_a,
+            "floor-a-1",
+            image("a", "v1"),
+            200,
+        ),
+        (
+            &project_b,
+            &environment_b,
+            "floor-b-1",
+            image("b", "v1"),
+            150,
+        ),
+        (
+            &project_b,
+            &environment_b,
+            "floor-b-2",
+            image("b", "v2"),
+            100,
+        ),
+    ] {
+        registry_deployment(
+            project.id,
+            environment.id,
+            slug,
+            &reference,
+            now - Duration::hours(age),
+        )
+        .insert(db.as_ref())
+        .await?;
+    }
+
+    let inventory = [("a", "v1", 1), ("b", "v1", 2), ("b", "v2", 3)]
+        .into_iter()
+        .map(|(project, tag, n)| LocalImage {
+            id: format!("sha256:image{n}"),
+            repo_tags: vec![image(project, tag)],
+            repo_digests: vec![format!(
+                "registry.example.com/{project}/app@sha256:{n:064x}"
+            )],
+            created: i64::from(n),
+            size_bytes: 1024,
+        })
+        .collect();
+    let docker = Arc::new(RecordingDockerClient::with_inventory(inventory, Vec::new()));
+    let service = DockerCleanupService::new(docker.clone(), db.clone(), mock_file_store())
+        .with_keep_recent_deployment_images(1)
+        .with_max_deployment_images_per_run(1)
+        .with_image_retention(&temps_config::ImageRetentionSettings {
+            enabled: true,
+            default_hours: 1,
+        });
+
+    service.prune_old_deployment_images().await;
+
+    assert_eq!(
+        docker.removed_sorted(),
+        vec![image("b", "v1")],
+        "A's floor image is kept without using the run's only slot"
     );
     Ok(())
 }

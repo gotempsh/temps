@@ -22,7 +22,8 @@ use std::sync::Arc;
 use tracing::{debug, error};
 
 use super::docker_cleanup_service::{
-    summarize_removals, DockerClient, LocalContainer, LocalImage, RESERVED_LOCAL_IMAGE_PREFIX,
+    summarize_removals, DockerClient, ImageRemoval, LocalContainer, LocalImage,
+    RESERVED_LOCAL_IMAGE_PREFIX,
 };
 
 /// Repository part of an image reference: `ghcr.io/org/app:v1` and
@@ -51,10 +52,25 @@ pub fn image_repository(reference: &str) -> Option<String> {
     (!repository.is_empty()).then(|| repository.to_string())
 }
 
-/// Repository prefix of the sandbox and workspace-daemon images Temps pulls.
-const TEMPS_SANDBOX_REPOSITORY_PREFIX: &str = "ghcr.io/gotempsh/temps-sandbox-";
 /// Repository of the preview routing gateway image Temps pulls.
 pub const TEMPS_PREVIEW_GATEWAY_REPOSITORY: &str = "ghcr.io/gotempsh/temps-preview-gateway";
+
+/// Every repository of infrastructure images Temps pulls and runs itself:
+/// the workspace daemons and sandbox runtimes a release pins (the same set
+/// as the release manifest), and the preview gateway. Listed one by one so
+/// a repository Temps does not publish never enters the deletion boundary,
+/// whatever its name looks like.
+const TEMPS_MANAGED_INFRA_REPOSITORIES: [&str; 9] = [
+    "ghcr.io/gotempsh/temps-sandbox-nodejs",
+    "ghcr.io/gotempsh/temps-sandbox-python",
+    "ghcr.io/gotempsh/temps-sandbox-all",
+    "ghcr.io/gotempsh/temps-sandbox-node",
+    "ghcr.io/gotempsh/temps-sandbox-bun",
+    "ghcr.io/gotempsh/temps-sandbox-rust",
+    "ghcr.io/gotempsh/temps-sandbox-go",
+    "ghcr.io/gotempsh/temps-sandbox-full",
+    TEMPS_PREVIEW_GATEWAY_REPOSITORY,
+];
 
 /// Whether `repository` holds infrastructure images Temps itself pulls and
 /// runs (sandbox runtimes, workspace daemons, the preview gateway), as
@@ -66,15 +82,7 @@ pub const TEMPS_PREVIEW_GATEWAY_REPOSITORY: &str = "ghcr.io/gotempsh/temps-previ
 /// back to), and managed-database images whose older versions a restore can
 /// still need. Neither is ours to remove.
 pub fn is_temps_managed_infra_repository(repository: &str) -> bool {
-    repository == TEMPS_PREVIEW_GATEWAY_REPOSITORY
-        || repository
-            .strip_prefix(TEMPS_SANDBOX_REPOSITORY_PREFIX)
-            .is_some_and(|flavor| {
-                !flavor.is_empty()
-                    && flavor
-                        .bytes()
-                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-            })
+    TEMPS_MANAGED_INFRA_REPOSITORIES.contains(&repository)
 }
 
 /// The infrastructure images this build pins (embedded at compile time by
@@ -392,16 +400,32 @@ pub(crate) async fn prune_local_images_without_database(
         if tags.is_empty() {
             debug!("No superseded registry-pulled deployment images on this node");
         } else {
-            let sizes: HashMap<String, u64> = images
+            // Each reference with the image it named in this inventory, so
+            // a tag a pull moves in the meantime is not removed.
+            let selected: HashMap<&str, &LocalImage> = images
                 .iter()
                 .flat_map(|image| {
                     image
                         .removable_references()
                         .iter()
-                        .map(move |reference| (reference.clone(), image.size_bytes))
+                        .map(move |reference| (reference.as_str(), image))
                 })
                 .collect();
-            let outcomes = docker_client.remove_images(&tags).await;
+            let sizes: HashMap<String, u64> = selected
+                .iter()
+                .map(|(reference, image)| (reference.to_string(), image.size_bytes))
+                .collect();
+            let removals: Vec<ImageRemoval> = tags
+                .into_iter()
+                .filter_map(|reference| {
+                    let image_id = selected.get(reference.as_str())?.id.clone();
+                    Some(ImageRemoval {
+                        reference,
+                        image_id,
+                    })
+                })
+                .collect();
+            let outcomes = docker_client.remove_images(&removals).await;
             summarize_removals("node_deployment_images", &outcomes, &sizes);
         }
     }
@@ -416,7 +440,8 @@ pub(crate) async fn prune_local_images_without_database(
         .iter()
         .map(|image| (image.id.clone(), image.size_bytes))
         .collect();
-    let outcomes = docker_client.remove_images(&ids).await;
+    let removals: Vec<ImageRemoval> = ids.iter().map(|id| ImageRemoval::by_id(id)).collect();
+    let outcomes = docker_client.remove_images(&removals).await;
     summarize_removals("superseded_infra_images", &outcomes, &sizes);
 }
 

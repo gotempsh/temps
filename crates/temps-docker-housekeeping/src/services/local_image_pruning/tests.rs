@@ -110,6 +110,13 @@ fn infra_repositories_are_an_exact_allowlist() {
     assert!(!is_temps_managed_infra_repository(
         "ghcr.io/someone/temps-sandbox-nodejs"
     ));
+    // Shaped like a sandbox repository, but not one Temps publishes.
+    assert!(!is_temps_managed_infra_repository(
+        "ghcr.io/gotempsh/temps-sandbox-nodejs-fork"
+    ));
+    assert!(!is_temps_managed_infra_repository(
+        "ghcr.io/gotempsh/temps-sandbox-custom"
+    ));
 }
 
 /// Fix 2: a worker running image deployments keeps the newest N images
