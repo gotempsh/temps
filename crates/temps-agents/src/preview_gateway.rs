@@ -653,6 +653,9 @@ pub async fn reconcile(
             );
             remove_gateway_pair(&docker, &spec.container_name).await?;
             create_and_start(&docker, &spec, &ingress_image, &legacy_owned_networks).await?;
+            // Only once the new gateway runs: a failed switch keeps the old
+            // image around to recreate from.
+            remove_superseded_gateway_image(&docker, &existing, &desired_image_id).await;
         }
         None => {
             info!("preview gateway not present — creating");
@@ -1039,6 +1042,78 @@ async fn ensure_image_present(docker: &Docker, image: &str) -> Result<()> {
             format!("failed to inspect supporting preview image {image}"),
             error,
         )),
+    }
+}
+
+/// The image a gateway update replaced, when it may be removed: only a
+/// different image than the one now running, and only one from Temps'
+/// own gateway repository (never a locally built `:dev` tag, a bare image ID
+/// the operator configured, or anything else they pointed the gateway at).
+fn superseded_gateway_image<'a>(
+    previous_image: &str,
+    previous_image_id: &'a str,
+    desired_image_id: &str,
+) -> Option<&'a str> {
+    if previous_image_id.is_empty() || previous_image_id == desired_image_id {
+        return None;
+    }
+    let ours =
+        temps_deployments::services::image_repository(previous_image).is_some_and(|repository| {
+            repository == temps_deployments::services::TEMPS_PREVIEW_GATEWAY_REPOSITORY
+        });
+    ours.then_some(previous_image_id)
+}
+
+/// Remove the gateway image an update just replaced, so every Temps update
+/// stops leaving the previous (digest-pinned, so never "dangling") version
+/// on disk. Removal is by image ID and never forced: Docker refuses while
+/// any container, running or stopped, still uses it, and that refusal is
+/// expected rather than an error. Failures never fail the reconcile; the
+/// nightly cleanup retries superseded infrastructure images.
+async fn remove_superseded_gateway_image(
+    docker: &Docker,
+    previous: &ExistingContainer,
+    desired_image_id: &str,
+) {
+    use temps_deployments::services::{ImageRemovalOutcome, ImageRemovalStatus};
+
+    let Some(image_id) =
+        superseded_gateway_image(&previous.image, &previous.image_id, desired_image_id)
+    else {
+        return;
+    };
+    let result = docker
+        .remove_image(
+            image_id,
+            Some(bollard::query_parameters::RemoveImageOptions {
+                force: false,
+                ..Default::default()
+            }),
+            None,
+        )
+        .await;
+    match ImageRemovalOutcome::from_docker(image_id, result).status {
+        ImageRemovalStatus::Deleted | ImageRemovalStatus::Untagged => info!(
+            image = %previous.image,
+            image_id = %image_id,
+            "removed the preview gateway image this update replaced"
+        ),
+        ImageRemovalStatus::Retained { reason } => debug!(
+            image = %previous.image,
+            image_id = %image_id,
+            reason = %reason,
+            "kept the replaced preview gateway image: still in use"
+        ),
+        ImageRemovalStatus::NotFound => debug!(
+            image_id = %image_id,
+            "replaced preview gateway image already removed"
+        ),
+        ImageRemovalStatus::Failed { reason } => warn!(
+            image = %previous.image,
+            image_id = %image_id,
+            error = %reason,
+            "could not remove the replaced preview gateway image; the nightly cleanup will retry"
+        ),
     }
 }
 
@@ -2019,6 +2094,39 @@ pub async fn tail_logs(docker: &Docker, container: &str, tail: usize) -> Result<
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_a_replaced_temps_gateway_image_is_removed() {
+        use super::superseded_gateway_image;
+        let old = "ghcr.io/gotempsh/temps-preview-gateway@sha256:aaaa";
+        assert_eq!(
+            superseded_gateway_image(old, "sha256:old", "sha256:new"),
+            Some("sha256:old")
+        );
+        // Same image: a restart or config drift, nothing was replaced.
+        assert_eq!(
+            superseded_gateway_image(old, "sha256:new", "sha256:new"),
+            None
+        );
+        assert_eq!(superseded_gateway_image(old, "", "sha256:new"), None);
+        // Images the operator pointed the gateway at are theirs.
+        assert_eq!(
+            superseded_gateway_image("temps-preview-gateway:dev", "sha256:old", "sha256:new"),
+            None
+        );
+        assert_eq!(
+            superseded_gateway_image("sha256:old", "sha256:old", "sha256:new"),
+            None
+        );
+        assert_eq!(
+            superseded_gateway_image(
+                "registry.internal/mirror/temps-preview-gateway:1",
+                "sha256:old",
+                "sha256:new"
+            ),
+            None
+        );
+    }
+
     use super::*;
     use tempfile::TempDir;
 
