@@ -5,7 +5,9 @@ pub mod docker_cleanup_service;
 pub mod docker_disk_usage;
 pub mod image_ownership;
 pub mod image_references;
+pub mod local_image_pruning;
 pub mod orphaned_images;
 
 pub use docker_cleanup_service::*;
 pub use docker_disk_usage::*;
+pub use local_image_pruning::*;
