@@ -1012,12 +1012,18 @@ fn sql_canonical_key_repository(expr: &str) -> String {
 /// SQL expression normalising an image ID column expression to the
 /// `sha256:<hex>` form Docker lists, so a row that recorded the bare hex
 /// matches too. Empty and NULL give NULL.
+///
+/// `expr` is parenthesised before use: `||` and `->>` share one precedence
+/// level and associate left, so `'sha256:' || d.metadata ->> 'id'` would
+/// parse as `('sha256:' || d.metadata) ->> 'id'` and fail with
+/// `operator does not exist: text ->> unknown`.
 fn sql_normalized_image_id(expr: &str) -> String {
+    let e = format!("({expr})");
     format!(
         r"(CASE
-            WHEN NULLIF({expr}, '') IS NULL THEN NULL
-            WHEN {expr} LIKE 'sha256:%' THEN {expr}
-            ELSE 'sha256:' || {expr}
+            WHEN NULLIF({e}, '') IS NULL THEN NULL
+            WHEN {e} LIKE 'sha256:%' THEN {e}
+            ELSE 'sha256:' || {e}
         END)"
     )
 }
