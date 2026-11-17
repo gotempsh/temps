@@ -941,6 +941,10 @@ pub fn plan_node_deployment_image_removals(
 /// - **every** reference of the image (tags and digests) is in one Temps
 ///   infrastructure repository ([`is_temps_managed_infra_repository`]), so an
 ///   image a user also tagged into their own repository is never touched;
+/// - it can be pulled again: it carries a registry digest and no `:dev` tag.
+///   A local build (no digest, or a `:dev` tag, which Temps never pulls) may
+///   be the only copy of that image, even under the official repository
+///   name, so it is the operator's to remove;
 /// - no container, running or stopped, uses it;
 /// - it is not one this release pins ([`pinned_infra_image_references`]);
 /// - and it is not among the newest `keep_newest_infra_images` of its
@@ -985,6 +989,11 @@ pub fn plan_superseded_infra_image_removals(
             .into_iter()
             .skip(policy.keep_newest_infra_images)
         {
+            let re_pullable = !image.repo_digests.is_empty()
+                && !image.repo_tags.iter().any(|tag| tag.ends_with(":dev"));
+            if !re_pullable {
+                continue;
+            }
             let pinned_here = image
                 .repo_tags
                 .iter()
@@ -4241,6 +4250,55 @@ mod tests {
         );
 
         assert!(removals.is_empty(), "{removals:?}");
+    }
+
+    /// A local build under the official repository name may be the only copy:
+    /// one with no registry digest, or a `:dev` tag (never pulled), is kept
+    /// even when newer versions exist and no container uses it.
+    #[test]
+    fn infra_pruning_keeps_local_builds_it_cannot_pull_again() {
+        let images = vec![
+            local_image(
+                "sha256:devbuild",
+                1,
+                &[&format!("{TEMPS_PREVIEW_GATEWAY_REPOSITORY}:dev")],
+                &[],
+            ),
+            // Pushed somewhere, so it has a digest, but tagged `:dev`.
+            local_image(
+                "sha256:devpushed",
+                2,
+                &[&format!("{TEMPS_PREVIEW_GATEWAY_REPOSITORY}:dev")],
+                &[&format!("{TEMPS_PREVIEW_GATEWAY_REPOSITORY}@sha256:dev")],
+            ),
+            local_image(
+                "sha256:nodelocal",
+                1,
+                &["ghcr.io/gotempsh/temps-sandbox-nodejs:local"],
+                &[],
+            ),
+            local_image(
+                "sha256:node035",
+                5,
+                &["ghcr.io/gotempsh/temps-sandbox-nodejs:0.3.5"],
+                &["ghcr.io/gotempsh/temps-sandbox-nodejs@sha256:n035"],
+            ),
+            gateway_image(3),
+            gateway_image(4),
+        ];
+
+        let removals = plan_superseded_infra_image_removals(
+            &images,
+            &[],
+            &[],
+            &LocalImagePrunePolicy::default(),
+        );
+
+        assert_eq!(
+            removals,
+            vec!["sha256:gw3".to_string()],
+            "only the superseded registry gateway image may go"
+        );
     }
 
     /// Only images whose every reference is in a Temps infrastructure
