@@ -1204,6 +1204,15 @@ fn superseded_gateway_image<'a>(
     ours.then_some(previous_image_id)
 }
 
+/// Whether the image's *current* references let it go: it must be pullable
+/// again (a registry digest) and carry no tag the gateway never pulls. The
+/// container recorded only the reference it was created from; since then a
+/// `:dev` tag may have been put on the same image, and a removal by ID drops
+/// every reference in the repository, that tag included.
+fn replaced_gateway_image_is_disposable(repo_tags: &[String], repo_digests: &[String]) -> bool {
+    !repo_digests.is_empty() && repo_tags.iter().all(|tag| should_pull_gateway_image(tag))
+}
+
 /// Remove the gateway image an update just replaced, so every Temps update
 /// stops leaving the previous (digest-pinned, so never "dangling") version
 /// on disk. Removal is by image ID and never forced: Docker refuses while
@@ -1222,6 +1231,36 @@ async fn remove_superseded_gateway_image(
     else {
         return;
     };
+    match docker.inspect_image(image_id).await {
+        Ok(inspected) => {
+            let tags = inspected.repo_tags.unwrap_or_default();
+            let digests = inspected.repo_digests.unwrap_or_default();
+            if !replaced_gateway_image_is_disposable(&tags, &digests) {
+                debug!(
+                    image_id = %image_id,
+                    tags = ?tags,
+                    "kept the replaced preview gateway image: it cannot be pulled again"
+                );
+                return;
+            }
+        }
+        Err(bollard::errors::Error::DockerResponseServerError {
+            status_code: 404, ..
+        }) => {
+            debug!(image_id = %image_id, "replaced preview gateway image already removed");
+            return;
+        }
+        Err(error) => {
+            // Without its current tags, removing it could drop one nothing
+            // can bring back; the nightly cleanup decides with a full listing.
+            warn!(
+                image_id = %image_id,
+                error = %error,
+                "could not inspect the replaced preview gateway image; leaving it in place"
+            );
+            return;
+        }
+    }
     let result = docker
         .remove_image(
             image_id,
@@ -2442,6 +2481,25 @@ pub async fn tail_logs(docker: &Docker, container: &str, tail: usize) -> Result<
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_replaced_gateway_image_that_gained_a_dev_tag_is_kept() {
+        use super::replaced_gateway_image_is_disposable;
+        let digest = || vec!["ghcr.io/gotempsh/temps-preview-gateway@sha256:a".to_string()];
+        assert!(replaced_gateway_image_is_disposable(&[], &digest()));
+        assert!(replaced_gateway_image_is_disposable(
+            &["ghcr.io/gotempsh/temps-preview-gateway:0.4.1".to_string()],
+            &digest()
+        ));
+        // Removing it by ID would also drop the `:dev` tag, which is never
+        // pulled back.
+        assert!(!replaced_gateway_image_is_disposable(
+            &["ghcr.io/gotempsh/temps-preview-gateway:dev".to_string()],
+            &digest()
+        ));
+        // No digest: a local build, possibly the only copy.
+        assert!(!replaced_gateway_image_is_disposable(&[], &[]));
+    }
+
     #[test]
     fn only_a_replaced_temps_gateway_image_is_removed() {
         use super::superseded_gateway_image;
