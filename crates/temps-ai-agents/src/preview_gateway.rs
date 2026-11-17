@@ -1191,6 +1191,11 @@ fn superseded_gateway_image<'a>(
     if previous_image_id.is_empty() || previous_image_id == desired_image_id {
         return None;
     }
+    // A tag the gateway never pulls (a local `:dev` build, a bare ID) could
+    // not be restored by switching back, whatever repository it names.
+    if !should_pull_gateway_image(previous_image) {
+        return None;
+    }
     let ours = temps_docker_housekeeping::services::image_repository(previous_image).is_some_and(
         |repository| {
             repository == temps_docker_housekeeping::services::TEMPS_PREVIEW_GATEWAY_REPOSITORY
@@ -2454,6 +2459,16 @@ mod tests {
         // Images the operator pointed the gateway at are theirs.
         assert_eq!(
             superseded_gateway_image("temps-preview-gateway:dev", "sha256:old", "sha256:new"),
+            None
+        );
+        // A local dev build under the official repository name is never
+        // pulled, so it could not come back either.
+        assert_eq!(
+            superseded_gateway_image(
+                "ghcr.io/gotempsh/temps-preview-gateway:dev",
+                "sha256:old",
+                "sha256:new"
+            ),
             None
         );
         assert_eq!(
