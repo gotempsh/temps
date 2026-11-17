@@ -99,12 +99,14 @@ export function ImageRetentionCard({
       <form onSubmit={form.handleSubmit(handleSave)}>
         <Card className="bg-background text-foreground">
           <CardHeader>
-            <CardTitle>Built Image Retention</CardTitle>
+            <CardTitle>Image Retention</CardTitle>
             <CardDescription>
-              How long this service&apos;s built Docker images are kept before
-              the nightly cleanup removes them. Rolling back or promoting a
-              deployment requires its image, so this is effectively the
-              service&apos;s rollback window.
+              How long this service&apos;s deployment images, built from source
+              or pulled from a registry, are kept before the nightly cleanup
+              removes them. Rolling back or promoting a deployment requires its
+              image, so for built images this is effectively the
+              service&apos;s rollback window; a registry image that was removed
+              is pulled again on rollback. Uploaded images are never removed.
             </CardDescription>
           </CardHeader>
           <CardContent>
