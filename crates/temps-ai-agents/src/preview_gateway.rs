@@ -1224,7 +1224,7 @@ async fn remove_superseded_gateway_image(
     previous: &ExistingContainer,
     desired_image_id: &str,
 ) {
-    use temps_docker_housekeeping::services::{ImageRemovalOutcome, ImageRemovalStatus};
+    use temps_docker_housekeeping::services::{ImageDeleteStatus, ImageRemovalOutcome};
 
     let Some(image_id) =
         superseded_gateway_image(&previous.image, &previous.image_id, desired_image_id)
@@ -1272,22 +1272,22 @@ async fn remove_superseded_gateway_image(
         )
         .await;
     match ImageRemovalOutcome::from_docker(image_id, result).status {
-        ImageRemovalStatus::Deleted | ImageRemovalStatus::Untagged => info!(
+        ImageDeleteStatus::Deleted | ImageDeleteStatus::Untagged => info!(
             image = %previous.image,
             image_id = %image_id,
             "removed the preview gateway image this update replaced"
         ),
-        ImageRemovalStatus::Retained { reason } => debug!(
+        ImageDeleteStatus::Retained { reason } => debug!(
             image = %previous.image,
             image_id = %image_id,
             reason = %reason,
             "kept the replaced preview gateway image: still in use"
         ),
-        ImageRemovalStatus::NotFound => debug!(
+        ImageDeleteStatus::NotFound => debug!(
             image_id = %image_id,
             "replaced preview gateway image already removed"
         ),
-        ImageRemovalStatus::Failed { reason } => warn!(
+        ImageDeleteStatus::Failed { reason } => warn!(
             image = %previous.image,
             image_id = %image_id,
             error = %reason,

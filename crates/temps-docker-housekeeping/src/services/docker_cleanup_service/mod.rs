@@ -128,9 +128,17 @@ pub const DEPLOYMENT_CONTAINER_LABEL: &str = "sh.temps.deploy_id";
 /// this crate cannot depend on; a test there keeps the two equal.
 pub const RESERVED_LOCAL_IMAGE_PREFIX: &str = "temps.internal/";
 
-/// What happened when one image was asked to be removed.
+/// What happened when one image was asked to be removed by name, with a
+/// plain non-forced `docker image rm`.
+///
+/// Distinct from `temps_docker_util::image_removal::ImageRemovalStatus`,
+/// which reports the guarded removal used for deleted projects' images: that
+/// one removes by a verified image ID and refuses an image carrying other
+/// tags, so it never reports "untagged only". Here removing one of several
+/// names is a normal outcome ([`ImageDeleteStatus::Untagged`]) that frees no
+/// space, and the bytes-reclaimed summary depends on telling it apart.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ImageRemovalStatus {
+pub enum ImageDeleteStatus {
     /// Docker deleted the image.
     Deleted,
     /// Docker only removed this reference; another tag or digest still holds
@@ -150,7 +158,7 @@ pub enum ImageRemovalStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageRemovalOutcome {
     pub image_name: String,
-    pub status: ImageRemovalStatus,
+    pub status: ImageDeleteStatus,
 }
 
 impl ImageRemovalOutcome {
@@ -161,17 +169,17 @@ impl ImageRemovalOutcome {
     ) -> Self {
         let status = match result {
             Ok(items) if items.iter().any(|item| item.deleted.is_some()) => {
-                ImageRemovalStatus::Deleted
+                ImageDeleteStatus::Deleted
             }
-            Ok(_) => ImageRemovalStatus::Untagged,
+            Ok(_) => ImageDeleteStatus::Untagged,
             Err(bollard::errors::Error::DockerResponseServerError {
                 status_code: 409,
                 message,
-            }) => ImageRemovalStatus::Retained { reason: message },
+            }) => ImageDeleteStatus::Retained { reason: message },
             Err(bollard::errors::Error::DockerResponseServerError {
                 status_code: 404, ..
-            }) => ImageRemovalStatus::NotFound,
-            Err(error) => ImageRemovalStatus::Failed {
+            }) => ImageDeleteStatus::NotFound,
+            Err(error) => ImageDeleteStatus::Failed {
                 reason: format!("Failed to remove image '{}': {}", image_name, error),
             },
         };
@@ -210,14 +218,14 @@ pub(crate) fn summarize_removals(
     let mut summary = ImageRemovalSummary::default();
     for outcome in outcomes {
         match &outcome.status {
-            ImageRemovalStatus::Deleted => {
+            ImageDeleteStatus::Deleted => {
                 summary.deleted += 1;
                 summary.bytes_reclaimed = summary
                     .bytes_reclaimed
                     .saturating_add(sizes.get(&outcome.image_name).copied().unwrap_or(0));
                 debug!(pass, image_name = %outcome.image_name, "Removed image");
             }
-            ImageRemovalStatus::Untagged => {
+            ImageDeleteStatus::Untagged => {
                 summary.untagged += 1;
                 debug!(
                     pass,
@@ -225,7 +233,7 @@ pub(crate) fn summarize_removals(
                     "Removed image reference; another tag still holds the image"
                 );
             }
-            ImageRemovalStatus::Retained { reason } => {
+            ImageDeleteStatus::Retained { reason } => {
                 summary.retained += 1;
                 debug!(
                     pass,
@@ -234,11 +242,11 @@ pub(crate) fn summarize_removals(
                     "Image retained: Docker reports it is still in use"
                 );
             }
-            ImageRemovalStatus::NotFound => {
+            ImageDeleteStatus::NotFound => {
                 summary.not_found += 1;
                 debug!(pass, image_name = %outcome.image_name, "Image already removed");
             }
-            ImageRemovalStatus::Failed { reason } => {
+            ImageDeleteStatus::Failed { reason } => {
                 summary.failed += 1;
                 warn!(
                     pass,
@@ -403,7 +411,7 @@ impl DockerClient for DefaultDockerClient {
                     .iter()
                     .map(|name| ImageRemovalOutcome {
                         image_name: name.clone(),
-                        status: ImageRemovalStatus::Failed {
+                        status: ImageDeleteStatus::Failed {
                             reason: reason.clone(),
                         },
                     })

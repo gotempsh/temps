@@ -27,7 +27,7 @@ impl DockerClient for MockDockerClient {
             .iter()
             .map(|name| ImageRemovalOutcome {
                 image_name: name.clone(),
-                status: ImageRemovalStatus::Deleted,
+                status: ImageDeleteStatus::Deleted,
             })
             .collect()
     }
@@ -108,11 +108,11 @@ impl DockerClient for RecordingDockerClient {
             .map(|name| ImageRemovalOutcome {
                 image_name: name.clone(),
                 status: if self.refuse.contains(name) {
-                    ImageRemovalStatus::Retained {
+                    ImageDeleteStatus::Retained {
                         reason: format!("conflict: image {} is being used", name),
                     }
                 } else {
-                    ImageRemovalStatus::Deleted
+                    ImageDeleteStatus::Deleted
                 },
             })
             .collect()
@@ -859,7 +859,7 @@ async fn test_real_docker_removes_unused_and_retains_in_use_image() {
 
     assert_eq!(
         unused_outcome.status,
-        ImageRemovalStatus::Deleted,
+        ImageDeleteStatus::Deleted,
         "an unreferenced expired image must actually be removed"
     );
     assert!(
@@ -867,7 +867,7 @@ async fn test_real_docker_removes_unused_and_retains_in_use_image() {
         "the unused image must be gone from the daemon after removal"
     );
     assert!(
-        matches!(in_use_outcome.status, ImageRemovalStatus::Retained { .. }),
+        matches!(in_use_outcome.status, ImageDeleteStatus::Retained { .. }),
         "an image still referenced by a container must be retained (a 409 \
          conflict), not untagged underneath the service running it: {:?}",
         in_use_outcome.status
@@ -1551,7 +1551,7 @@ fn removal_outcomes_classify_docker_responses() {
     );
     assert!(matches!(
         conflict.status,
-        ImageRemovalStatus::Retained { .. }
+        ImageDeleteStatus::Retained { .. }
     ));
 
     let gone = ImageRemovalOutcome::from_docker(
@@ -1561,7 +1561,7 @@ fn removal_outcomes_classify_docker_responses() {
             message: "No such image".to_string(),
         }),
     );
-    assert_eq!(gone.status, ImageRemovalStatus::NotFound);
+    assert_eq!(gone.status, ImageDeleteStatus::NotFound);
 
     let failed = ImageRemovalOutcome::from_docker(
         "a:1",
@@ -1571,7 +1571,7 @@ fn removal_outcomes_classify_docker_responses() {
         }),
     );
     assert!(
-        matches!(&failed.status, ImageRemovalStatus::Failed { reason } if reason.contains("a:1"))
+        matches!(&failed.status, ImageDeleteStatus::Failed { reason } if reason.contains("a:1"))
     );
 
     let untagged = ImageRemovalOutcome::from_docker(
@@ -1581,7 +1581,7 @@ fn removal_outcomes_classify_docker_responses() {
             deleted: None,
         }]),
     );
-    assert_eq!(untagged.status, ImageRemovalStatus::Untagged);
+    assert_eq!(untagged.status, ImageDeleteStatus::Untagged);
 }
 
 // ------------------------------------------------------------------
