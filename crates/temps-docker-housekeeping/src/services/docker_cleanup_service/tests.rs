@@ -580,6 +580,63 @@ fn test_removal_names_only_cover_what_deployments_recorded() {
     assert!(index.removal_names("sha256:missing", &named).is_empty());
 }
 
+/// The candidate query sees each reference with how `removal_names` could
+/// remove the image by it, so it can drop an unremovable image before its
+/// `LIMIT`: tags of a tagged image, digests only of an untagged one.
+#[test]
+fn test_query_input_marks_how_each_reference_removes_its_image() {
+    let index = LocalImageIndex::new(vec![
+        local_image(
+            "sha256:tagged",
+            1,
+            &["ghcr.io/example-org/app:v1"],
+            &["ghcr.io/example-org/app@sha256:t"],
+        ),
+        local_image(
+            "sha256:untagged",
+            1,
+            &[],
+            &["ghcr.io/example-org/app@sha256:u"],
+        ),
+    ]);
+
+    let mut rows: Vec<(String, String, Option<String>)> = index
+        .query_input()
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|row| {
+            (
+                row[0].as_str().unwrap_or_default().to_string(),
+                row[1].as_str().unwrap_or_default().to_string(),
+                row[2].as_str().map(str::to_string),
+            )
+        })
+        .collect();
+    rows.sort();
+
+    let row = |id: &str, reference: &str, removable_as: Option<&str>| {
+        (
+            id.to_string(),
+            reference.to_string(),
+            removable_as.map(str::to_string),
+        )
+    };
+    assert_eq!(
+        rows,
+        vec![
+            row("sha256:tagged", "ghcr.io/example-org/app:v1", Some("tag")),
+            row("sha256:tagged", "ghcr.io/example-org/app@sha256:t", None),
+            row(
+                "sha256:untagged",
+                "ghcr.io/example-org/app@sha256:u",
+                Some("digest")
+            ),
+        ]
+    );
+}
+
 #[test]
 fn test_canonical_image_reference() {
     for spelling in [
@@ -1948,6 +2005,77 @@ async fn test_superseded_mutable_tag_images_expire_by_recorded_identity(
         docker.removed_sorted(),
         vec![digest(1)],
         "image 1 is past the window and the floor of two; images 2 and 3 are the floor"
+    );
+    Ok(())
+}
+
+/// Expired images linked only by their recorded pull ID, that now carry
+/// only a tag someone else added, are kept: no recorded name removes them.
+/// They must not fill the `LIMIT` window either, or every run would select
+/// the same kept images and never reach a removable one behind them.
+#[tokio::test]
+async fn test_unremovable_pulled_images_do_not_fill_the_run_window(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use chrono::{Duration, Utc};
+    use sea_orm::ActiveModelTrait;
+
+    if !cleanup_integration_tests_available().await {
+        eprintln!("Docker/Postgres unavailable; skipping retention window test");
+        return Ok(());
+    }
+
+    let test_db = temps_test_utils::TestDatabase::with_migrations().await?;
+    let db = test_db.connection_arc();
+    let (project, environment) = registry_fixture(db.as_ref(), "window-app").await?;
+    let now = Utc::now();
+    let latest = "registry.example.com/team/app:latest";
+    let digest = |n: u32| format!("registry.example.com/team/app@sha256:{n:064x}");
+
+    for n in 1..=5u32 {
+        let deployment = registry_deployment(
+            project.id,
+            environment.id,
+            &format!("window-app-{n}"),
+            latest,
+            now - Duration::hours(i64::from(200 - n * 10)),
+        )
+        .insert(db.as_ref())
+        .await?;
+        record_pull(db.as_ref(), deployment.id, &format!("sha256:image{n}")).await?;
+    }
+
+    // Images 1-3 (the oldest) were retagged by hand after `latest` moved on;
+    // image 4 is a plain superseded pull; image 5 still carries `latest`.
+    let inventory = (1..=5u32)
+        .map(|n| LocalImage {
+            id: format!("sha256:image{n}"),
+            repo_tags: match n {
+                1..=3 => vec![format!("registry.example.com/team/app:kept-{n}")],
+                5 => vec![latest.to_string()],
+                _ => Vec::new(),
+            },
+            repo_digests: vec![digest(n)],
+            created: i64::from(n),
+            size_bytes: 1024,
+        })
+        .collect();
+    let docker = Arc::new(RecordingDockerClient::with_inventory(inventory, Vec::new()));
+    let service = DockerCleanupService::new(docker.clone(), db.clone(), mock_file_store())
+        .with_keep_recent_deployment_images(1)
+        // Fewer slots than kept images: if they were selected, image 4
+        // would never be reached.
+        .with_max_deployment_images_per_run(1)
+        .with_image_retention(&temps_config::ImageRetentionSettings {
+            enabled: true,
+            default_hours: 1,
+        });
+
+    service.prune_old_deployment_images().await;
+
+    assert_eq!(
+        docker.removed_sorted(),
+        vec![digest(4)],
+        "the hand-tagged images are kept without using the run's only slot"
     );
     Ok(())
 }

@@ -901,6 +901,14 @@ fn sql_canonical_image_reference(expr: &str) -> String {
     )
 }
 
+/// SQL expression giving the repository of a canonical image key
+/// ([`sql_canonical_image_reference`]): the key without its `@digest` or
+/// `:tag`. On two canonical keys, equality agrees with comparing their
+/// [`image_repository`] in Rust.
+fn sql_canonical_key_repository(expr: &str) -> String {
+    format!(r"regexp_replace(regexp_replace({expr}, '@.*$', ''), ':[^:/]*$', '')")
+}
+
 /// SQL expression normalising an image ID column expression to the
 /// `sha256:<hex>` form Docker lists, so a row that recorded the bare hex
 /// matches too. Empty and NULL give NULL.
@@ -962,18 +970,30 @@ impl LocalImageIndex {
         self.ids_by_key.is_empty()
     }
 
-    /// `[[image_id, reference], ...]` for every tag and digest reference,
-    /// the candidate query's view of this daemon.
+    /// `[[image_id, reference, removable_as], ...]` for every tag and digest
+    /// reference, the candidate query's view of this daemon.
+    ///
+    /// `removable_as` says how [`Self::removal_names`] may remove the image
+    /// by that reference: `"tag"` when its key matches a recorded name,
+    /// `"digest"` when its repository matches one (only for an untagged
+    /// image), `null` when never. The query uses it to drop, before its
+    /// `LIMIT`, an image no recorded name would remove, so such images
+    /// cannot fill every run's window.
     fn query_input(&self) -> serde_json::Value {
         serde_json::Value::Array(
             self.images
                 .values()
                 .flat_map(|image| {
-                    image
+                    let untagged = image.repo_tags.is_empty();
+                    let tags = image
                         .repo_tags
                         .iter()
-                        .chain(image.repo_digests.iter())
-                        .map(move |reference| serde_json::json!([image.id, reference]))
+                        .map(|reference| serde_json::json!([image.id, reference, "tag"]));
+                    let digests = image.repo_digests.iter().map(move |reference| {
+                        let removable_as = untagged.then_some("digest");
+                        serde_json::json!([image.id, reference, removable_as])
+                    });
+                    tags.chain(digests)
                 })
                 .collect(),
         )
@@ -1633,6 +1653,10 @@ impl DockerCleanupService {
     /// on the next run. Recency-based protections (keep-recent-N,
     /// actively-served) don't need this: they cover the *newest*
     /// deployments, so they never compete for the oldest-first slots.
+    /// For the same reason an image no recorded name would remove
+    /// (`removable_images`, mirroring [`LocalImageIndex::removal_names`]),
+    /// such as a pulled image that now carries only an operator's own tag,
+    /// is dropped before `LIMIT` rather than skipped after it.
     /// `HAVING` drops non-expired groups before they leave Postgres, and
     /// `LIMIT` gives the candidate scan the same bound as the removal batch.
     async fn expired_image_candidates(
@@ -1656,7 +1680,10 @@ impl DockerCleanupService {
         let sql = format!(
             r#"
                 WITH local_refs AS (
-                    SELECT DISTINCT e ->> 0 AS image_id, {key_e} AS image_key
+                    SELECT DISTINCT
+                        e ->> 0 AS image_id,
+                        {key_e} AS image_key,
+                        e ->> 2 AS removable_as
                     FROM jsonb_array_elements($4::jsonb) AS e
                 ),
                 local_ids AS (
@@ -1721,6 +1748,16 @@ impl DockerCleanupService {
                     SELECT ci.image_id, d.id, NULL
                     FROM deployments d
                     JOIN candidate_ids ci ON ci.image_id = {uploaded_id}
+                ),
+                -- Mirrors `LocalImageIndex::removal_names`: an image whose
+                -- removable references match no recorded name is kept, so
+                -- it must not take a slot in the LIMIT window either.
+                removable_images AS (
+                    SELECT DISTINCT r.image_id
+                    FROM refs r
+                    JOIN local_refs lr ON lr.image_id = r.image_id
+                    WHERE (lr.removable_as = 'tag' AND lr.image_key = r.name_key)
+                       OR (lr.removable_as = 'digest' AND {repo_lr} = {repo_r})
                 ),
                 built_keys AS (
                     SELECT DISTINCT {key_b} AS image_key FROM built b
@@ -1789,6 +1826,7 @@ impl DockerCleanupService {
                     MIN(created_at) AS oldest_reference,
                     string_agg(DISTINCT name_key, E'\n') AS named_keys
                 FROM ref_rows
+                WHERE image_id IN (SELECT image_id FROM removable_images)
                 GROUP BY image_id
                 HAVING BOOL_AND(expired)
                    AND NOT BOOL_OR(in_flight)
@@ -1808,6 +1846,8 @@ impl DockerCleanupService {
             key_dci = sql_canonical_image_reference("dci.image_name"),
             pulled_id = sql_normalized_image_id("dj.outputs ->> 'image_id'"),
             uploaded_id = sql_normalized_image_id("d.metadata ->> 'uploadedImageId'"),
+            repo_lr = sql_canonical_key_repository("lr.image_key"),
+            repo_r = sql_canonical_key_repository("r.name_key"),
         );
         let rows = self
             .db
