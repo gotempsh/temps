@@ -49,7 +49,7 @@ jobs:
   cargo-audit:
     name: Rust Dependency Audit (cargo-audit)
     env:
-      AUDIT_IGNORE: RUSTSEC-2025-0134,RUSTSEC-2023-0071,RUSTSEC-2026-0235,RUSTSEC-2024-0436,RUSTSEC-2026-0173,RUSTSEC-2024-0388,RUSTSEC-2026-0253,RUSTSEC-2024-0449,RUSTSEC-2025-0141,RUSTSEC-2026-0381,RUSTSEC-2026-0387,RUSTSEC-2026-0459,RUSTSEC-2026-0440
+      AUDIT_IGNORE: RUSTSEC-2025-0134,RUSTSEC-2023-0071,RUSTSEC-2026-0235,RUSTSEC-2024-0436,RUSTSEC-2026-0173,RUSTSEC-2024-0388,RUSTSEC-2026-0253,RUSTSEC-2024-0449,RUSTSEC-2025-0141,RUSTSEC-2026-0381,RUSTSEC-2026-0387,RUSTSEC-2026-0459,RUSTSEC-2026-0440,RUSTSEC-2026-0543,RUSTSEC-2026-0555
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -144,6 +144,11 @@ jobs:
       #   partial sparse maps). A temps-core guard test fails if anything else
       #   starts depending on it or if the lock drops below 0.6.4. Replace once
       #   microsandbox and testcontainers move to a maintained tar crate.
+      # - RUSTSEC-2026-0543 (chrono) and RUSTSEC-2026-0555 (chrono-tz):
+      #   informational "unmaintained" notices, no vulnerability reported.
+      #   chrono is the workspace-wide date type and is required by sea-orm;
+      #   chrono-tz comes with it for timezone handling. Neither has a
+      #   maintained drop-in replacement yet. Drop both once one exists.
       #
       # The six below are vulnerability/unsoundness advisories (not "unmaintained"
       # notices). A version bump here cannot clear any of them: either no fix is
