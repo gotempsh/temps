@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { describe, it, expect, mock } from "bun:test";
-import { createEventsRoutes, KNOWN_EVENT_TYPES } from "./events.js";
+import { createEventsRoutes, KNOWN_EVENT_TYPES, type EventLimits } from "./events.js";
+import { createRateLimiter } from "../rate-limit.js";
 import type { Pool } from "pg";
 
 describe("KNOWN_EVENT_TYPES", () => {
@@ -299,5 +300,204 @@ describe("country backfill (request path)", () => {
     );
     expect(res.status).toBe(500);
     expect(queue.queued.length).toBe(0);
+  });
+});
+
+describe("ingest abuse limits", () => {
+  const event = (properties: Record<string, unknown> = {}) => ({
+    anonymous_id: "instance-abcdef12",
+    event_type: "deploy_attempted",
+    properties,
+  });
+
+  function reqFrom(ip: string, body: unknown, path = "/v1/events"): Request {
+    return new Request(`http://localhost${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-forwarded-for": ip },
+      body: JSON.stringify(body),
+    });
+  }
+
+  function routes(pool: Pool, eventsPerMinute: number, overrides: Partial<EventLimits> = {}) {
+    return createEventsRoutes(pool, {
+      backfill: noBackfill,
+      rateLimiter: createRateLimiter(eventsPerMinute),
+      limits: {
+        eventPropertiesMaxBytes: 8192,
+        eventsBatchMaxEvents: 100,
+        tempsVersionMaxChars: 64,
+        ...overrides,
+      },
+    });
+  }
+
+  it("429s single events past the per-IP budget without touching the database", async () => {
+    const pool = makePool();
+    const { postEvent } = routes(pool, 2);
+    expect((await postEvent(reqFrom("198.51.100.10", event()))).status).toBe(201);
+    expect((await postEvent(reqFrom("198.51.100.10", event()))).status).toBe(201);
+    const calls = (pool.query as ReturnType<typeof mock>).mock.calls.length;
+
+    const limited = await postEvent(reqFrom("198.51.100.10", event()));
+    expect(limited.status).toBe(429);
+    expect((pool.query as ReturnType<typeof mock>).mock.calls.length).toBe(calls);
+    // Another IP is unaffected.
+    expect((await postEvent(reqFrom("198.51.100.11", event()))).status).toBe(201);
+  });
+
+  it("charges a batch one unit per event, shared with the single-event route", async () => {
+    const pool = makePool();
+    const { postEvent, postBatch } = routes(pool, 5);
+    const ip = "198.51.100.12";
+    const batch = (n: number) => reqFrom(ip, { events: Array.from({ length: n }, () => event()) }, "/v1/events/batch");
+
+    expect((await postBatch(batch(4))).status).toBe(201);
+    // 4 + 2 > 5: the whole batch is refused.
+    expect((await postBatch(batch(2))).status).toBe(429);
+    expect((await postEvent(reqFrom(ip, event()))).status).toBe(201);
+    expect((await postEvent(reqFrom(ip, event()))).status).toBe(429);
+  });
+
+  it("charges malformed batch bodies one unit, until the IP is out of budget", async () => {
+    const pool = makePool();
+    const { postBatch } = routes(pool, 3);
+    const ip = "198.51.100.15";
+    const malformed = () =>
+      new Request("http://localhost/v1/events/batch", {
+        method: "POST",
+        headers: { "x-forwarded-for": ip },
+        body: "not json",
+      });
+
+    expect((await postBatch(malformed())).status).toBe(400);
+    expect((await postBatch(malformed())).status).toBe(400);
+    expect((await postBatch(malformed())).status).toBe(400);
+    expect((await postBatch(malformed())).status).toBe(429);
+    expect((pool.query as ReturnType<typeof mock>).mock.calls.length).toBe(0);
+  });
+
+  it("charges a valid batch its event count exactly once", async () => {
+    const pool = makePool();
+    const { postBatch } = routes(pool, 5);
+    const ip = "198.51.100.16";
+    const batch = (n: number) => reqFrom(ip, { events: Array.from({ length: n }, () => event()) }, "/v1/events/batch");
+
+    // 2 events cost 2, then 3 more fit exactly: charged once each, not twice.
+    expect((await postBatch(batch(2))).status).toBe(201);
+    expect((await postBatch(batch(3))).status).toBe(201);
+    expect((await postBatch(batch(1))).status).toBe(429);
+  });
+
+  it("spends the budget on rejected payloads too", async () => {
+    const pool = makePool();
+    const { postEvent } = routes(pool, 1);
+    const ip = "198.51.100.13";
+    const invalid = await postEvent(reqFrom(ip, { anonymous_id: "instance-abcdef12", event_type: "nope" }));
+    expect(invalid.status).toBe(422);
+    expect((await postEvent(reqFrom(ip, event()))).status).toBe(429);
+  });
+
+  it("can't be escaped by rotating caller-controlled forwarding headers", async () => {
+    const pool = makePool();
+    const { postEvent } = routes(pool, 2);
+    const spoofed = (i: number) =>
+      new Request("http://localhost/v1/events", {
+        method: "POST",
+        headers: {
+          "x-forwarded-for": `203.0.113.${i}, 198.51.100.30`,
+          "x-real-ip": `192.0.2.${i}`,
+        },
+        body: JSON.stringify(event()),
+      });
+    expect((await postEvent(spoofed(1))).status).toBe(201);
+    expect((await postEvent(spoofed(2))).status).toBe(201);
+    expect((await postEvent(spoofed(3))).status).toBe(429);
+  });
+
+  it("keys a request without a forwarded address on its TCP peer", async () => {
+    const pool = makePool();
+    const { postEvent } = routes(pool, 1);
+    expect((await postEvent(makeReq(event()), "10.0.0.5")).status).toBe(201);
+    expect((await postEvent(makeReq(event()), "10.0.0.5")).status).toBe(429);
+    expect((await postEvent(makeReq(event()), "10.0.0.6")).status).toBe(201);
+  });
+
+  it("fails open when no client IP is resolvable", async () => {
+    const pool = makePool();
+    const { postEvent } = routes(pool, 1);
+    for (let i = 0; i < 3; i++) {
+      expect((await postEvent(makeReq(event()))).status).toBe(201);
+    }
+  });
+
+  it("rejects properties over the byte cap, in single events and batches", async () => {
+    const pool = makePool();
+    const { postEvent, postBatch } = routes(pool, 1000, { eventPropertiesMaxBytes: 100 });
+    const big = event({ blob: "x".repeat(200) });
+
+    const single = await postEvent(makeReq(big));
+    expect(single.status).toBe(422);
+    expect((await single.json()).error).toContain("properties exceeds 100 bytes");
+
+    const batch = await postBatch(
+      new Request("http://localhost/v1/events/batch", {
+        method: "POST",
+        body: JSON.stringify({ events: [event(), big] }),
+      })
+    );
+    expect(batch.status).toBe(422);
+    expect((pool.query as ReturnType<typeof mock>).mock.calls.length).toBe(0);
+
+    expect((await postEvent(makeReq(event({ blob: "x".repeat(50) })))).status).toBe(201);
+  });
+
+  it("measures the cap in UTF-8 bytes, not characters", async () => {
+    const pool = makePool();
+    const { postEvent } = routes(pool, 1000, { eventPropertiesMaxBytes: 100 });
+    // 40 chars of a 3-byte character: under 100 chars, over 100 bytes.
+    const res = await postEvent(makeReq(event({ note: "€".repeat(40) })));
+    expect(res.status).toBe(422);
+  });
+
+  it("rejects an oversized temps_version", async () => {
+    const pool = makePool();
+    const { postEvent } = routes(pool, 1000);
+    const res = await postEvent(makeReq({ ...event(), temps_version: "1".repeat(65) }));
+    expect(res.status).toBe(422);
+    expect((await postEvent(makeReq({ ...event(), temps_version: "0.1.36" }))).status).toBe(201);
+  });
+
+  it("uses the configured temps_version cap", async () => {
+    const pool = makePool();
+    const { postEvent } = routes(pool, 1000, { tempsVersionMaxChars: 5 });
+    const res = await postEvent(makeReq({ ...event(), temps_version: "0.1.36" }));
+    expect(res.status).toBe(422);
+    expect((await res.json()).error).toContain("temps_version exceeds 5 chars");
+    expect((await postEvent(makeReq({ ...event(), temps_version: "0.1.9" }))).status).toBe(201);
+  });
+
+  it("uses the configured batch size cap", async () => {
+    const pool = makePool();
+    const { postBatch } = routes(pool, 1000, { eventsBatchMaxEvents: 3 });
+    const batch = (n: number) =>
+      new Request("http://localhost/v1/events/batch", {
+        method: "POST",
+        body: JSON.stringify({ events: Array.from({ length: n }, () => event()) }),
+      });
+    expect((await postBatch(batch(3))).status).toBe(201);
+    const tooMany = await postBatch(batch(4));
+    expect(tooMany.status).toBe(422);
+    expect((await tooMany.json()).error).toBe("max 3 events per batch");
+  });
+
+  it("charges an oversized batch the batch cap, not its full length", async () => {
+    const pool = makePool();
+    const { postBatch } = routes(pool, 5, { eventsBatchMaxEvents: 3 });
+    const ip = "198.51.100.14";
+    const batch = (n: number) => reqFrom(ip, { events: Array.from({ length: n }, () => event()) }, "/v1/events/batch");
+    // 50 events, rejected as too many, but charged 3, leaving 2.
+    expect((await postBatch(batch(50))).status).toBe(422);
+    expect((await postBatch(batch(2))).status).toBe(201);
+    expect((await postBatch(batch(1))).status).toBe(429);
   });
 });
