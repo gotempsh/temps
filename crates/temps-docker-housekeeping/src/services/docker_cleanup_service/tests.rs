@@ -2170,13 +2170,23 @@ async fn test_unremovable_pulled_images_do_not_fill_the_run_window(
     let latest = "registry.example.com/team/app:latest";
     let digest = |n: u32| format!("registry.example.com/team/app@sha256:{n:064x}");
 
+    // Every deployment recorded `latest`, so image 5 (which carries it) is
+    // referenced by all of them. Deployment 5 is inside the retention
+    // window, which keeps image 5 out of the candidates on expiry alone,
+    // with no rollback floor involved: only the hand-tagged images can
+    // compete with image 4 for the slot.
     for n in 1..=5u32 {
+        let created_at = if n == 5 {
+            now - Duration::minutes(10)
+        } else {
+            now - Duration::hours(i64::from(200 - n * 10))
+        };
         let deployment = registry_deployment(
             project.id,
             environment.id,
             &format!("window-app-{n}"),
             latest,
-            now - Duration::hours(i64::from(200 - n * 10)),
+            created_at,
         )
         .insert(db.as_ref())
         .await?;
@@ -2200,7 +2210,7 @@ async fn test_unremovable_pulled_images_do_not_fill_the_run_window(
         .collect();
     let docker = Arc::new(RecordingDockerClient::with_inventory(inventory, Vec::new()));
     let service = DockerCleanupService::new(docker.clone(), db.clone(), mock_file_store())
-        .with_keep_recent_deployment_images(1)
+        .with_keep_recent_deployment_images(0)
         // Fewer slots than kept images: if they were selected, image 4
         // would never be reached.
         .with_max_deployment_images_per_run(1)
