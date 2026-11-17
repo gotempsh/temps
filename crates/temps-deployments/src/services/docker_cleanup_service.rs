@@ -24,45 +24,216 @@ pub trait DockerClient: Send + Sync {
     /// policy's size cap.
     async fn prune_builder_cache(&self, policy: BuildCachePolicy) -> Result<String, String>;
 
-    /// Remove the named images, returning a per-image outcome in the same
-    /// order. Takes the whole batch (rather than one image per call) so the
-    /// implementation opens a single Docker connection for the entire nightly
-    /// pass instead of one per image.
+    /// Remove the named images (a `repo:tag` or an image ID), returning a
+    /// per-image outcome in the same order. Removal is never forced, so
+    /// Docker itself refuses an image any container (running or stopped)
+    /// still uses. Takes the whole batch (rather than one image per call) so
+    /// the implementation opens a single Docker connection for the entire
+    /// nightly pass instead of one per image.
     async fn remove_images(&self, image_names: &[String]) -> Vec<ImageRemovalOutcome>;
 
-    /// Every `repo:tag` currently present on the local daemon. The retention
-    /// pass only considers images that still exist here: once an image is
-    /// removed its deployment rows keep naming it, so without this filter the
-    /// oldest-first candidate window would refill with already-removed tags
-    /// every night and never reach newer ones.
-    async fn list_image_tags(&self) -> Result<Vec<String>, DockerImageListError>;
+    /// Every top-level image on the local daemon (`all=false`, so not the
+    /// intermediate layers of a build). The retention pass only considers
+    /// images that still exist here: once an image is removed its deployment
+    /// rows keep naming it, so without this filter the oldest-first candidate
+    /// window would refill with already-removed tags every night and never
+    /// reach newer ones.
+    async fn list_images(&self) -> Result<Vec<LocalImage>, DockerInventoryError>;
+
+    /// Every container on the local daemon, running or stopped. An image any
+    /// of them uses is never a removal candidate.
+    async fn list_containers(&self) -> Result<Vec<LocalContainer>, DockerInventoryError>;
 }
 
-/// Why the local image listing used by the retention pass failed. Keeps the
+/// Why listing the local daemon's images or containers failed. Keeps the
 /// underlying Docker error as its source instead of flattening it to text.
 #[derive(Debug, thiserror::Error)]
-pub enum DockerImageListError {
-    #[error("Failed to connect to Docker daemon to list local images: {source}")]
+pub enum DockerInventoryError {
+    #[error("Failed to connect to Docker daemon to list local images and containers: {source}")]
     Connect {
         #[source]
         source: bollard::errors::Error,
     },
 
     #[error("Failed to list local Docker images (all=false): {source}")]
-    List {
+    ListImages {
+        #[source]
+        source: bollard::errors::Error,
+    },
+
+    #[error("Failed to list local Docker containers (all=true): {source}")]
+    ListContainers {
         #[source]
         source: bollard::errors::Error,
     },
 }
 
-/// Result of attempting to remove one image during the retention pass.
+/// One image on the local daemon, as the image-pruning passes see it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalImage {
+    /// Image ID (`sha256:...`).
+    pub id: String,
+    /// `repo:tag` references, without Docker's `<none>:<none>` placeholder.
+    pub repo_tags: Vec<String>,
+    /// `repo@sha256:...` references. Non-empty only for an image that came
+    /// from (or was pushed to) a registry; an image pinned by digest and never
+    /// tagged has only these, and shows up as `<none>` in `docker images`.
+    pub repo_digests: Vec<String>,
+    /// Image build time (Unix seconds), as recorded in the image config.
+    pub created: i64,
+    /// Size Docker reports for the image, shared layers included.
+    pub size_bytes: u64,
+}
+
+/// One container on the local daemon, running or stopped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalContainer {
+    /// The reference the container was created from (`repo:tag`,
+    /// `repo@sha256:...`, or a bare image ID).
+    pub image: String,
+    /// The image ID the container runs, whatever its reference now points at.
+    pub image_id: String,
+    /// Whether Temps created it for a deployment (it carries the
+    /// `sh.temps.deploy_id` label every deployment container gets).
+    pub is_temps_deployment: bool,
+}
+
+/// Label every container Temps starts for a deployment carries.
+pub const DEPLOYMENT_CONTAINER_LABEL: &str = "sh.temps.deploy_id";
+
+/// What happened when one image was asked to be removed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImageRemovalStatus {
+    /// Docker deleted the image.
+    Deleted,
+    /// Docker only removed this reference; another tag or digest still holds
+    /// the image, so no space was freed.
+    Untagged,
+    /// Docker refused with a conflict (HTTP 409): a container still uses the
+    /// image, or another repository references it. This is the intended
+    /// safety net behind the passes' own in-use checks, not a failure.
+    Retained { reason: String },
+    /// The image was already gone (HTTP 404).
+    NotFound,
+    /// Any other failure (daemon unreachable, server error, ...).
+    Failed { reason: String },
+}
+
+/// Result of attempting to remove one image during a pruning pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageRemovalOutcome {
     pub image_name: String,
-    /// `None` on success, `Some(reason)` when Docker refused (most commonly
-    /// because a container still references the image, which is the intended
-    /// safety net rather than a real failure).
-    pub error: Option<String>,
+    pub status: ImageRemovalStatus,
+}
+
+impl ImageRemovalOutcome {
+    /// Classify a Docker `remove_image` result.
+    pub fn from_docker(
+        image_name: &str,
+        result: Result<Vec<bollard::models::ImageDeleteResponseItem>, bollard::errors::Error>,
+    ) -> Self {
+        let status = match result {
+            Ok(items) if items.iter().any(|item| item.deleted.is_some()) => {
+                ImageRemovalStatus::Deleted
+            }
+            Ok(_) => ImageRemovalStatus::Untagged,
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 409,
+                message,
+            }) => ImageRemovalStatus::Retained { reason: message },
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => ImageRemovalStatus::NotFound,
+            Err(error) => ImageRemovalStatus::Failed {
+                reason: format!("Failed to remove image '{}': {}", image_name, error),
+            },
+        };
+        Self {
+            image_name: image_name.to_string(),
+            status,
+        }
+    }
+}
+
+/// Totals of one pruning pass, logged once at the end of it.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ImageRemovalSummary {
+    pub deleted: usize,
+    pub untagged: usize,
+    pub retained: usize,
+    pub not_found: usize,
+    pub failed: usize,
+    /// Sum of Docker's reported size for each deleted image. Layers shared
+    /// with images that remain are not actually freed, so this is an upper
+    /// bound on the disk space reclaimed.
+    pub bytes_reclaimed: u64,
+}
+
+/// Log every outcome of a removal batch and the pass's totals.
+///
+/// A refusal because the image is still in use (or already gone) is the
+/// expected safety net and is logged at `debug`; any other failure is a
+/// `warn` naming the image and the reason. Neither aborts the rest of the
+/// batch: by the time this runs every removal has already been attempted.
+fn summarize_removals(
+    pass: &'static str,
+    outcomes: &[ImageRemovalOutcome],
+    sizes: &HashMap<String, u64>,
+) -> ImageRemovalSummary {
+    let mut summary = ImageRemovalSummary::default();
+    for outcome in outcomes {
+        match &outcome.status {
+            ImageRemovalStatus::Deleted => {
+                summary.deleted += 1;
+                summary.bytes_reclaimed = summary
+                    .bytes_reclaimed
+                    .saturating_add(sizes.get(&outcome.image_name).copied().unwrap_or(0));
+                debug!(pass, image_name = %outcome.image_name, "Removed image");
+            }
+            ImageRemovalStatus::Untagged => {
+                summary.untagged += 1;
+                debug!(
+                    pass,
+                    image_name = %outcome.image_name,
+                    "Removed image reference; another tag still holds the image"
+                );
+            }
+            ImageRemovalStatus::Retained { reason } => {
+                summary.retained += 1;
+                debug!(
+                    pass,
+                    image_name = %outcome.image_name,
+                    reason = %reason,
+                    "Image retained: Docker reports it is still in use"
+                );
+            }
+            ImageRemovalStatus::NotFound => {
+                summary.not_found += 1;
+                debug!(pass, image_name = %outcome.image_name, "Image already removed");
+            }
+            ImageRemovalStatus::Failed { reason } => {
+                summary.failed += 1;
+                warn!(
+                    pass,
+                    image_name = %outcome.image_name,
+                    error = %reason,
+                    "Could not remove image"
+                );
+            }
+        }
+    }
+    info!(
+        pass,
+        deleted = summary.deleted,
+        untagged = summary.untagged,
+        retained_in_use = summary.retained,
+        already_gone = summary.not_found,
+        failed = summary.failed,
+        bytes_reclaimed = summary.bytes_reclaimed,
+        mb_reclaimed = summary.bytes_reclaimed / (1024 * 1024),
+        "Image pruning pass finished"
+    );
+    summary
 }
 
 /// What the nightly build cache prune keeps.
@@ -205,7 +376,9 @@ impl DockerClient for DefaultDockerClient {
                     .iter()
                     .map(|name| ImageRemovalOutcome {
                         image_name: name.clone(),
-                        error: Some(reason.clone()),
+                        status: ImageRemovalStatus::Failed {
+                            reason: reason.clone(),
+                        },
                     })
                     .collect();
             }
@@ -215,7 +388,7 @@ impl DockerClient for DefaultDockerClient {
         for image_name in image_names {
             // Non-forced: Docker refuses while any container (running or
             // stopped) still references the image. That is deliberate — it is
-            // the last line of defence behind the active-deployment guard.
+            // the last line of defence behind the passes' own in-use checks.
             let result = docker
                 .remove_image(
                     image_name,
@@ -227,34 +400,68 @@ impl DockerClient for DefaultDockerClient {
                 )
                 .await;
 
-            outcomes.push(ImageRemovalOutcome {
-                image_name: image_name.clone(),
-                error: result
-                    .err()
-                    .map(|e| format!("Failed to remove image '{}': {}", image_name, e)),
-            });
+            outcomes.push(ImageRemovalOutcome::from_docker(image_name, result));
         }
 
         outcomes
     }
 
-    async fn list_image_tags(&self) -> Result<Vec<String>, DockerImageListError> {
+    async fn list_images(&self) -> Result<Vec<LocalImage>, DockerInventoryError> {
         use bollard::Docker;
 
         let docker = Docker::connect_with_unix_defaults()
-            .map_err(|source| DockerImageListError::Connect { source })?;
+            .map_err(|source| DockerInventoryError::Connect { source })?;
         let images = docker
             .list_images(Some(bollard::query_parameters::ListImagesOptions {
                 all: false,
                 ..Default::default()
             }))
             .await
-            .map_err(|source| DockerImageListError::List { source })?;
+            .map_err(|source| DockerInventoryError::ListImages { source })?;
 
         Ok(images
             .into_iter()
-            .flat_map(|image| image.repo_tags)
-            .filter(|tag| tag != "<none>:<none>")
+            .map(|image| LocalImage {
+                id: image.id,
+                repo_tags: image
+                    .repo_tags
+                    .into_iter()
+                    .filter(|tag| tag != "<none>:<none>")
+                    .collect(),
+                repo_digests: image
+                    .repo_digests
+                    .into_iter()
+                    .filter(|digest| digest != "<none>@<none>")
+                    .collect(),
+                created: image.created,
+                size_bytes: u64::try_from(image.size).unwrap_or(0),
+            })
+            .collect())
+    }
+
+    async fn list_containers(&self) -> Result<Vec<LocalContainer>, DockerInventoryError> {
+        use bollard::Docker;
+
+        let docker = Docker::connect_with_unix_defaults()
+            .map_err(|source| DockerInventoryError::Connect { source })?;
+        let containers = docker
+            .list_containers(Some(bollard::query_parameters::ListContainersOptions {
+                all: true,
+                ..Default::default()
+            }))
+            .await
+            .map_err(|source| DockerInventoryError::ListContainers { source })?;
+
+        Ok(containers
+            .into_iter()
+            .map(|container| LocalContainer {
+                image: container.image.unwrap_or_default(),
+                image_id: container.image_id.unwrap_or_default(),
+                is_temps_deployment: container
+                    .labels
+                    .as_ref()
+                    .is_some_and(|labels| labels.contains_key(DEPLOYMENT_CONTAINER_LABEL)),
+            })
             .collect())
     }
 
@@ -450,6 +657,416 @@ async fn perform_docker_prune(
     }
 }
 
+/// Repository part of an image reference: `ghcr.io/org/app:v1` and
+/// `ghcr.io/org/app@sha256:...` both give `ghcr.io/org/app`, and a registry
+/// port (`registry:5000/app:v1`) is not mistaken for a tag. `None` for a bare
+/// image ID. Docker Hub references are normalised to the short form Docker
+/// itself lists (`nginx`, `org/app`), so a container created from
+/// `docker.io/library/nginx:1` matches the image listed as `nginx:1`.
+pub fn image_repository(reference: &str) -> Option<String> {
+    let reference = reference.trim();
+    if reference.is_empty() || reference.starts_with("sha256:") {
+        return None;
+    }
+    let without_digest = reference
+        .split_once('@')
+        .map_or(reference, |(repository, _)| repository);
+    let repository = match without_digest.rsplit_once(':') {
+        Some((repository, tag)) if !tag.contains('/') => repository,
+        _ => without_digest,
+    };
+    let repository = ["docker.io/library/", "index.docker.io/library/"]
+        .iter()
+        .chain(["docker.io/", "index.docker.io/"].iter())
+        .find_map(|prefix| repository.strip_prefix(prefix))
+        .unwrap_or(repository);
+    (!repository.is_empty()).then(|| repository.to_string())
+}
+
+/// `tag` plus the fully qualified forms Docker resolves it from when it is a
+/// Docker Hub short name: `nginx:1` is also `docker.io/library/nginx:1`, and
+/// `org/app:1` is also `docker.io/org/app:1`. A reference that names a
+/// registry host (its first component has a `.` or `:`, or is `localhost`)
+/// has no aliases.
+fn docker_hub_aliases(tag: &str) -> Vec<String> {
+    let mut aliases = vec![tag.to_string()];
+    let first_component = tag.split('/').next().unwrap_or_default();
+    let names_a_registry = tag.contains('/')
+        && (first_component.contains('.')
+            || first_component.contains(':')
+            || first_component == "localhost");
+    if names_a_registry {
+        return aliases;
+    }
+    if !tag.contains('/') {
+        aliases.push(format!("docker.io/library/{tag}"));
+    }
+    aliases.push(format!("docker.io/{tag}"));
+    aliases
+}
+
+/// Repository prefix of the sandbox and workspace-daemon images Temps pulls.
+const TEMPS_SANDBOX_REPOSITORY_PREFIX: &str = "ghcr.io/gotempsh/temps-sandbox-";
+/// Repository of the preview routing gateway image Temps pulls.
+pub const TEMPS_PREVIEW_GATEWAY_REPOSITORY: &str = "ghcr.io/gotempsh/temps-preview-gateway";
+
+/// Whether `repository` holds infrastructure images Temps itself pulls and
+/// runs (sandbox runtimes, workspace daemons, the preview gateway), as
+/// opposed to anything a user deploys.
+///
+/// Deliberately an exact allowlist inside Temps' own registry namespace
+/// rather than "anything under `ghcr.io/gotempsh/`": that namespace also
+/// holds the Temps server image an operator may run themselves (and roll
+/// back to), and managed-database images whose older versions a restore can
+/// still need. Neither is ours to remove.
+pub fn is_temps_managed_infra_repository(repository: &str) -> bool {
+    repository == TEMPS_PREVIEW_GATEWAY_REPOSITORY
+        || repository
+            .strip_prefix(TEMPS_SANDBOX_REPOSITORY_PREFIX)
+            .is_some_and(|flavor| {
+                !flavor.is_empty()
+                    && flavor
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            })
+}
+
+/// The infrastructure images this build pins (embedded at compile time by
+/// official releases). Always kept, even when no container runs them yet,
+/// so the next sandbox or gateway start does not have to pull them again.
+fn pinned_infra_image_references() -> Vec<&'static str> {
+    use temps_core::release_images as pinned;
+    [
+        pinned::PREVIEW_GATEWAY,
+        pinned::DAEMON_NODEJS,
+        pinned::DAEMON_PYTHON,
+        pinned::DAEMON_ALL,
+        pinned::SANDBOX_NODE,
+        pinned::SANDBOX_BUN,
+        pinned::SANDBOX_PYTHON,
+        pinned::SANDBOX_RUST,
+        pinned::SANDBOX_GO,
+        pinned::SANDBOX_FULL,
+    ]
+    .into_iter()
+    .flatten()
+    .chain(std::iter::once(pinned::LOCAL_PREVIEW_GATEWAY_IMAGE))
+    .collect()
+}
+
+/// Limits of the database-free image pruning a host applies to its own
+/// Docker daemon (worker agents, and the infrastructure-image sweep on the
+/// console).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalImagePrunePolicy {
+    /// Newest distinct images kept in each deployment repository on a worker
+    /// node, whatever their age. Mirrors the console's
+    /// `keep_recent_deployment_images` rollback floor.
+    pub keep_newest_deployment_images: usize,
+    /// Newest images kept in each Temps infrastructure repository, on top of
+    /// the ones a container uses and the ones this release pins.
+    pub keep_newest_infra_images: usize,
+    /// Most images a single pass removes in one run; the rest are picked up
+    /// on the following nights.
+    pub max_removals_per_run: usize,
+}
+
+impl Default for LocalImagePrunePolicy {
+    fn default() -> Self {
+        Self {
+            keep_newest_deployment_images: 5,
+            keep_newest_infra_images: 1,
+            max_removals_per_run: 500,
+        }
+    }
+}
+
+/// Image IDs and references that some container on this daemon (running or
+/// stopped) uses. Built once per run and consulted by every local pass.
+struct ImagesInUse<'a> {
+    ids: std::collections::HashSet<&'a str>,
+    references: std::collections::HashSet<&'a str>,
+}
+
+impl<'a> ImagesInUse<'a> {
+    fn new(containers: &'a [LocalContainer]) -> Self {
+        Self {
+            ids: containers
+                .iter()
+                .map(|c| c.image_id.as_str())
+                .filter(|id| !id.is_empty())
+                .collect(),
+            references: containers
+                .iter()
+                .map(|c| c.image.as_str())
+                .filter(|image| !image.is_empty())
+                .collect(),
+        }
+    }
+
+    fn contains(&self, image: &LocalImage, reference: &str) -> bool {
+        self.ids.contains(image.id.as_str()) || self.references.contains(reference)
+    }
+}
+
+/// Which registry-pulled deployment images a worker node may remove, oldest
+/// first, as `repo:tag` references.
+///
+/// A worker has no database, so it cannot apply the console's retention
+/// policy. It applies a stricter local rule instead, and only to images it
+/// can prove are both Temps deployment images and re-pullable:
+///
+/// - **Temps deployment repository.** A tag is considered only when its
+///   repository is one a Temps deployment container on this node (one with
+///   the `sh.temps.deploy_id` label, running or stopped) was created from.
+///   Images in any other repository — a user's own, a managed service's, or
+///   Temps infrastructure — are never touched by this rule.
+/// - **Re-pullable.** The image must carry a registry digest for that same
+///   repository, i.e. it was pulled from a registry that can serve it again
+///   (a rollback on a worker pulls a missing registry image itself). Images
+///   transferred from the control plane or built on this node have no such
+///   digest and are always kept: for those this node may be the only copy.
+/// - **Rollback floor.** The newest `keep_newest_deployment_images` distinct
+///   images of each repository are kept regardless of age.
+/// - **Never in use.** An image any container uses (by ID or by the
+///   reference it was created from) is kept, and removal is non-forced so
+///   Docker refuses one that became in use meanwhile.
+///
+/// The result is capped at `max_removals_per_run`.
+pub fn plan_node_deployment_image_removals(
+    images: &[LocalImage],
+    containers: &[LocalContainer],
+    policy: &LocalImagePrunePolicy,
+) -> Vec<String> {
+    let in_use = ImagesInUse::new(containers);
+    let deployment_repositories: std::collections::HashSet<String> = containers
+        .iter()
+        .filter(|c| c.is_temps_deployment)
+        .filter(|c| {
+            !c.image
+                .starts_with(crate::jobs::image_source::RESERVED_LOCAL_IMAGE_PREFIX)
+        })
+        .filter_map(|c| image_repository(&c.image))
+        .filter(|repository| !is_temps_managed_infra_repository(repository))
+        .collect();
+    if deployment_repositories.is_empty() {
+        return Vec::new();
+    }
+
+    let mut by_repository: std::collections::BTreeMap<String, Vec<(&LocalImage, &str)>> =
+        std::collections::BTreeMap::new();
+    for image in images {
+        for tag in &image.repo_tags {
+            if let Some(repository) = image_repository(tag) {
+                if deployment_repositories.contains(&repository) {
+                    by_repository
+                        .entry(repository)
+                        .or_default()
+                        .push((image, tag.as_str()));
+                }
+            }
+        }
+    }
+
+    let mut removable: Vec<(&LocalImage, &str)> = Vec::new();
+    for (repository, mut tags) in by_repository {
+        // Newest first; ties broken deterministically.
+        tags.sort_by(|(a, a_tag), (b, b_tag)| {
+            b.created
+                .cmp(&a.created)
+                .then_with(|| a.id.cmp(&b.id))
+                .then_with(|| a_tag.cmp(b_tag))
+        });
+        let mut kept_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for (image, tag) in tags {
+            if kept_ids.contains(image.id.as_str())
+                || kept_ids.len() < policy.keep_newest_deployment_images
+            {
+                kept_ids.insert(image.id.as_str());
+                continue;
+            }
+            if in_use.contains(image, tag) {
+                continue;
+            }
+            let re_pullable = image
+                .repo_digests
+                .iter()
+                .any(|digest| image_repository(digest).as_deref() == Some(repository.as_str()));
+            if !re_pullable {
+                continue;
+            }
+            removable.push((image, tag));
+        }
+    }
+
+    removable
+        .sort_by(|(a, a_tag), (b, b_tag)| a.created.cmp(&b.created).then_with(|| a_tag.cmp(b_tag)));
+    removable
+        .into_iter()
+        .take(policy.max_removals_per_run)
+        .map(|(_, tag)| tag.to_string())
+        .collect()
+}
+
+/// Which superseded Temps infrastructure images may be removed, oldest
+/// first, as image IDs.
+///
+/// Sandbox and gateway images are pinned by digest, so an old version is
+/// left with no tag (`<none>` in `docker images`) but still holds a digest
+/// reference. Docker's `dangling=true` prune never matches such an image,
+/// which is why every Temps update used to leave the previous versions
+/// behind for good. This rule removes them, but only when:
+///
+/// - **every** reference of the image (tags and digests) is in one Temps
+///   infrastructure repository ([`is_temps_managed_infra_repository`]), so an
+///   image a user also tagged into their own repository is never touched;
+/// - no container, running or stopped, uses it;
+/// - it is not one this release pins ([`pinned_infra_image_references`]);
+/// - and it is not among the newest `keep_newest_infra_images` of its
+///   repository.
+///
+/// Removal is by image ID and non-forced, so Docker still refuses one that is
+/// referenced from another repository or became in use meanwhile.
+pub fn plan_superseded_infra_image_removals(
+    images: &[LocalImage],
+    containers: &[LocalContainer],
+    pinned: &[&str],
+    policy: &LocalImagePrunePolicy,
+) -> Vec<String> {
+    let in_use = ImagesInUse::new(containers);
+    let mut by_repository: std::collections::BTreeMap<String, Vec<&LocalImage>> =
+        std::collections::BTreeMap::new();
+    for image in images {
+        let references: Vec<&String> = image
+            .repo_tags
+            .iter()
+            .chain(image.repo_digests.iter())
+            .collect();
+        let repositories: std::collections::BTreeSet<Option<String>> = references
+            .iter()
+            .map(|reference| image_repository(reference))
+            .collect();
+        let mut repositories = repositories.into_iter();
+        let (Some(Some(repository)), None) = (repositories.next(), repositories.next()) else {
+            // No reference, an unparseable one, or more than one repository.
+            continue;
+        };
+        if !is_temps_managed_infra_repository(&repository) {
+            continue;
+        }
+        by_repository.entry(repository).or_default().push(image);
+    }
+
+    let mut removable: Vec<&LocalImage> = Vec::new();
+    for (_, mut repository_images) in by_repository {
+        repository_images.sort_by(|a, b| b.created.cmp(&a.created).then_with(|| a.id.cmp(&b.id)));
+        for image in repository_images
+            .into_iter()
+            .skip(policy.keep_newest_infra_images)
+        {
+            let pinned_here = image
+                .repo_tags
+                .iter()
+                .chain(image.repo_digests.iter())
+                .any(|reference| pinned.contains(&reference.as_str()));
+            let used = in_use.ids.contains(image.id.as_str())
+                || image
+                    .repo_tags
+                    .iter()
+                    .chain(image.repo_digests.iter())
+                    .any(|reference| in_use.references.contains(reference.as_str()));
+            if pinned_here || used {
+                continue;
+            }
+            removable.push(image);
+        }
+    }
+
+    removable.sort_by(|a, b| a.created.cmp(&b.created).then_with(|| a.id.cmp(&b.id)));
+    removable
+        .into_iter()
+        .take(policy.max_removals_per_run)
+        .map(|image| image.id.clone())
+        .collect()
+}
+
+/// Which database-free pruning passes a host runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalPrunePasses {
+    /// Superseded infrastructure images only. The console prunes its
+    /// deployment images with the database-backed retention policy instead.
+    InfraOnly,
+    /// A worker node: deployment images by the local rule, then superseded
+    /// infrastructure images.
+    WorkerNode,
+}
+
+/// List this daemon's containers and images once, then run the requested
+/// database-free passes against them.
+///
+/// Fails closed: if either listing fails nothing is removed, because the
+/// in-use check would be guessing.
+async fn prune_local_images_without_database(
+    docker_client: &Arc<dyn DockerClient>,
+    policy: LocalImagePrunePolicy,
+    passes: LocalPrunePasses,
+) {
+    // Containers first: one created after this listing makes its image "in
+    // use" at removal time, and non-forced removal then refuses it.
+    let containers = match docker_client.list_containers().await {
+        Ok(containers) => containers,
+        Err(e) => {
+            error!(
+                error = %e,
+                "Could not list local containers; skipping local image pruning this run"
+            );
+            return;
+        }
+    };
+    let images = match docker_client.list_images().await {
+        Ok(images) => images,
+        Err(e) => {
+            error!(
+                error = %e,
+                "Could not list local images; skipping local image pruning this run"
+            );
+            return;
+        }
+    };
+
+    if passes == LocalPrunePasses::WorkerNode {
+        let tags = plan_node_deployment_image_removals(&images, &containers, &policy);
+        if tags.is_empty() {
+            debug!("No superseded registry-pulled deployment images on this node");
+        } else {
+            let sizes: HashMap<String, u64> = images
+                .iter()
+                .flat_map(|image| {
+                    image
+                        .repo_tags
+                        .iter()
+                        .map(move |tag| (tag.clone(), image.size_bytes))
+                })
+                .collect();
+            let outcomes = docker_client.remove_images(&tags).await;
+            summarize_removals("node_deployment_images", &outcomes, &sizes);
+        }
+    }
+
+    let pinned = pinned_infra_image_references();
+    let ids = plan_superseded_infra_image_removals(&images, &containers, &pinned, &policy);
+    if ids.is_empty() {
+        debug!("No superseded Temps infrastructure images to remove");
+        return;
+    }
+    let sizes: HashMap<String, u64> = images
+        .iter()
+        .map(|image| (image.id.clone(), image.size_bytes))
+        .collect();
+    let outcomes = docker_client.remove_images(&ids).await;
+    summarize_removals("superseded_infra_images", &outcomes, &sizes);
+}
+
 /// Lightweight Docker-only cleanup scheduler for hosts without a database
 /// connection — namely worker agent nodes (`temps agent`), which are a
 /// separate process from the console and never register the plugin system
@@ -457,6 +1074,11 @@ async fn perform_docker_prune(
 /// and accumulate build cache locally, so they need the same nightly
 /// image + build-cache prune; they just skip the DB-backed static asset
 /// cache and chunk cleanup steps, which are console-only concerns.
+///
+/// Without a database a worker cannot apply the console's image retention
+/// policy, so it prunes old deployment images by a stricter local rule
+/// ([`plan_node_deployment_image_removals`]) and superseded Temps
+/// infrastructure images ([`plan_superseded_infra_image_removals`]).
 pub struct DockerOnlyCleanupScheduler {
     docker_client: Arc<dyn DockerClient>,
     /// Hour of day (UTC) to run cleanup (default: 2 AM)
@@ -465,6 +1087,8 @@ pub struct DockerOnlyCleanupScheduler {
     /// read the operator's `build_limits` from, so they apply the defaults
     /// (7 days unused, 10 GB).
     build_cache_policy: BuildCachePolicy,
+    /// Rollback floor and per-run cap of the local image pruning.
+    local_image_policy: LocalImagePrunePolicy,
 }
 
 impl DockerOnlyCleanupScheduler {
@@ -473,6 +1097,7 @@ impl DockerOnlyCleanupScheduler {
             docker_client,
             cleanup_hour: 2, // 2 AM UTC
             build_cache_policy: BuildCachePolicy::default(),
+            local_image_policy: LocalImagePrunePolicy::default(),
         }
     }
 
@@ -489,6 +1114,25 @@ impl DockerOnlyCleanupScheduler {
     pub fn with_build_cache_policy(mut self, policy: BuildCachePolicy) -> Self {
         self.build_cache_policy = policy;
         self
+    }
+
+    pub fn with_local_image_policy(mut self, policy: LocalImagePrunePolicy) -> Self {
+        self.local_image_policy = policy;
+        self
+    }
+
+    /// One nightly pass: dangling images and build cache, then old
+    /// deployment images and superseded infrastructure images.
+    async fn perform_cleanup(&self) {
+        info!("🧹 Starting nightly Docker cleanup (agent node)");
+        perform_docker_prune(&self.docker_client, self.build_cache_policy).await;
+        prune_local_images_without_database(
+            &self.docker_client,
+            self.local_image_policy,
+            LocalPrunePasses::WorkerNode,
+        )
+        .await;
+        info!("Nightly Docker cleanup completed (agent node)");
     }
 
     /// Start the cleanup scheduler (blocking, should be spawned in a tokio task).
@@ -510,14 +1154,69 @@ impl DockerOnlyCleanupScheduler {
 
             sleep(Duration::from_secs(seconds_until_cleanup)).await;
 
-            info!("🧹 Starting nightly Docker cleanup (agent node)");
-            perform_docker_prune(&self.docker_client, self.build_cache_policy).await;
-            info!("Nightly Docker cleanup completed (agent node)");
+            self.perform_cleanup().await;
 
             // Sleep for 1 minute to avoid running cleanup multiple times in the same minute
             sleep(Duration::from_secs(60)).await;
         }
     }
+}
+
+/// SQL predicate over a `deployments d` row: its image was handed to this
+/// server rather than built or pulled by it, so nothing can produce it again.
+///
+/// - an upload (`POST .../deployments/upload`, trigger `image_upload`, or
+///   `imageUploadedLocally`/`uploadedImageId` in the metadata);
+/// - a claimed local image (a reserved `temps.internal/` reference);
+/// - an external-image ID with no registry reference recorded next to it:
+///   the image is known only by a local ID, with nothing to pull it from.
+///
+/// Every field is read through `COALESCE`/`NULLIF` so a NULL or empty value
+/// never reads as "not an upload". No user input is interpolated.
+const SQL_HANDED_OVER_IMAGE: &str = r#"(
+       COALESCE(d.context_vars ->> 'trigger', '') = 'image_upload'
+    OR COALESCE(d.metadata ->> 'imageUploadedLocally', 'false') <> 'false'
+    OR NULLIF(d.metadata ->> 'uploadedImageId', '') IS NOT NULL
+    OR COALESCE(d.metadata ->> 'externalImageRef', '') LIKE 'temps.internal/%'
+    OR (d.metadata ->> 'externalImageId' IS NOT NULL
+        AND NULLIF(d.metadata ->> 'externalImageRef', '') IS NULL)
+)"#;
+
+/// SQL predicate over `deployments d` joined to `projects p`: this deployment
+/// row makes its image unrecoverable, so it must never be pruned.
+///
+/// Either the image was handed over ([`SQL_HANDED_OVER_IMAGE`]), or it
+/// belongs to a non-git project and is not a registry pull. The second arm is
+/// deliberately broader than strictly necessary: a `Manual`-source project
+/// can deploy a rebuildable git-built image, but its row doesn't say so.
+///
+/// Rollback and promotion rows record no image metadata of their own (their
+/// provenance is that of the deployment they reuse), so they are neutral
+/// here rather than protecting every image they ever reused. That is safe
+/// because the original deployment always takes part in the same decision:
+/// a candidate exists only because a build record or a registry deployment
+/// names it, and that row is one of its references.
+fn sql_unrecoverable_deployment() -> String {
+    format!(
+        r#"COALESCE(
+            {SQL_HANDED_OVER_IMAGE}
+            OR (
+                p.source_type <> 'git'
+                AND NULLIF(d.metadata ->> 'externalImageRef', '') IS NULL
+                AND COALESCE(d.context_vars ->> 'trigger', '') NOT IN ('rollback', 'promotion')
+            ),
+            TRUE
+        )"#
+    )
+}
+
+/// SQL predicate over a `deployments d` row: a registry image deployment whose
+/// image can be pulled again from the reference it recorded.
+fn sql_registry_pull() -> String {
+    format!(
+        r#"(NULLIF(d.metadata ->> 'externalImageRef', '') IS NOT NULL
+            AND NOT {SQL_HANDED_OVER_IMAGE})"#
+    )
 }
 
 /// Docker cleanup service that runs nightly
@@ -721,9 +1420,9 @@ impl DockerCleanupService {
 
     /// Mark an image as permanently protected, whatever its age.
     ///
-    /// Used for images we cannot rebuild (uploaded tarballs, external
-    /// registry pulls) and for the image each environment is currently
-    /// serving. `insert` rather than `and_modify` so protection wins
+    /// Used for images we cannot recover (uploaded tarballs, claimed local
+    /// images, non-git builds) and for the image each environment is
+    /// currently serving. `insert` rather than `and_modify` so protection wins
     /// regardless of the order references are visited in. No name filter:
     /// which images are candidates at all is decided by
     /// `expired_image_candidates` from the builder's own records, so a
@@ -766,28 +1465,35 @@ impl DockerCleanupService {
 
     /// Remove deployment images that are older than their project's retention period.
     ///
+    /// Two kinds of image are candidates: tags the Temps image builder
+    /// recorded producing, and images pulled from a registry for an image
+    /// deployment (`temps deploy:image`). Both can be obtained again — the
+    /// first by redeploying from source, the second by pulling the same
+    /// reference, which a rollback onto it does automatically.
+    ///
     /// An image is eligible only when **every** deployment row that references it is
     /// older than its owning project's retention period, so an image reused by a newer
-    /// rollback or promotion survives. On top of that expiry rule three categories are
+    /// rollback or promotion survives. On top of that expiry rule these are
     /// protected unconditionally, whatever their age:
     ///
-    /// 1. **Images we cannot rebuild** — uploaded tarballs (`POST .../deployments/upload`)
-    ///    and external registry pulls. There is no source to build them from again, so
-    ///    removing one is data loss, not disk reclamation.
+    /// 1. **Images we cannot recover** — uploaded tarballs (`POST .../deployments/upload`),
+    ///    claimed local images, images recorded only by an external-image ID with no
+    ///    registry reference, and builds of non-git projects. There is no source to get
+    ///    them from again, so removing one is data loss, not disk reclamation.
     /// 2. **The image each environment is currently serving**
     ///    (`environments.current_deployment_id`), so a live service can never lose the
     ///    image it is running even if it has not been redeployed in months.
-    /// 3. **Images belonging to deployments on other nodes** — this pass only talks to
-    ///    the local Docker daemon, so it only considers deployments whose containers
-    ///    live on the control plane.
+    /// 3. **Images a container on this host still uses**, according to
+    ///    `deployment_containers` (and, as the final safety net, Docker itself: removal
+    ///    is non-forced, so an image any container references is refused).
+    /// 4. **Built images belonging to deployments on other nodes** — the control plane's
+    ///    copy of a built image is what a worker rollback streams from. A registry image
+    ///    is not protected this way: a worker pulls it from the registry itself.
     ///
     /// The newest `keep_recent_deployment_images` deployment rows in each
     /// project+environment are retained as a rollback floor, and each pass removes at
-    /// most `max_deployment_images_per_run` candidates, oldest first. Only tags the
-    /// Temps image builder recorded producing, and which still exist on the local
-    /// daemon, are considered; registry and uploaded images are left alone. Docker
-    /// removal is non-forced, so an image still referenced by any container is
-    /// retained as a final safety net.
+    /// most `max_deployment_images_per_run` candidates, oldest first. Only images that
+    /// still exist on the local daemon are considered.
     async fn prune_old_deployment_images(&self) {
         let (image_retention_enabled, default_image_retention_hours) =
             self.current_image_retention().await;
@@ -796,8 +1502,8 @@ impl DockerCleanupService {
             return;
         }
 
-        let local_image_tags = match self.docker_client.list_image_tags().await {
-            Ok(tags) => tags,
+        let local_images = match self.docker_client.list_images().await {
+            Ok(images) => images,
             Err(e) => {
                 error!(
                     error = %e,
@@ -806,6 +1512,22 @@ impl DockerCleanupService {
                 return;
             }
         };
+        // Docker lists Docker Hub images by their short name (`nginx:1`),
+        // while a deployment may have recorded the fully qualified reference
+        // (`docker.io/library/nginx:1`); Docker resolves either form on
+        // removal, so both are matched.
+        let image_sizes: HashMap<String, u64> = local_images
+            .iter()
+            .flat_map(|image| {
+                image.repo_tags.iter().flat_map(move |tag| {
+                    docker_hub_aliases(tag)
+                        .into_iter()
+                        .map(move |alias| (alias, image.size_bytes))
+                })
+            })
+            .collect();
+        let local_image_tags: Vec<String> = image_sizes.keys().cloned().collect();
+        drop(local_images);
         if local_image_tags.is_empty() {
             debug!("No tagged local Docker images; skipping image retention");
             return;
@@ -833,7 +1555,7 @@ impl DockerCleanupService {
         };
 
         if candidates.is_empty() {
-            debug!("No expired Temps-built deployment images to consider");
+            debug!("No expired deployment images to consider");
             return;
         }
 
@@ -861,15 +1583,15 @@ impl DockerCleanupService {
             }
         }
 
-        // Protect images that cannot be rebuilt from source.
-        match self.unrebuildable_image_names().await {
+        // Protect images that can be neither rebuilt nor pulled again.
+        match self.unrecoverable_image_names().await {
             Ok(names) => {
                 for name in &names {
                     Self::protect_image(&mut candidates, name);
                 }
                 debug!(
                     protected = names.len(),
-                    "Protected non-rebuildable deployment images from retention"
+                    "Protected unrecoverable deployment images from retention"
                 );
             }
             Err(e) => {
@@ -878,7 +1600,7 @@ impl DockerCleanupService {
                 // a wrong deletion costs the user their deployment.
                 error!(
                     error = %e,
-                    "Could not determine which deployment images are rebuildable; \
+                    "Could not determine which deployment images are recoverable; \
                      skipping image retention this run to avoid deleting an \
                      unrecoverable image"
                 );
@@ -905,9 +1627,9 @@ impl DockerCleanupService {
             }
         }
 
-        // Protect images whose containers live on a worker node — this pass
-        // only speaks to the local Docker daemon, so a remote image is not
-        // ours to remove and a failed removal here would be pure log noise.
+        // Protect built images whose containers live on a worker node: the
+        // control plane's copy is what a rollback there streams from. A
+        // registry image is exempt, since the worker pulls it itself.
         match self.remote_node_image_names().await {
             Ok(names) => {
                 for name in &names {
@@ -954,64 +1676,59 @@ impl DockerCleanupService {
             return;
         }
 
+        // Every outcome is logged individually and the totals reported
+        // explicitly: reporting only successes made a run where every removal
+        // was refused look identical to a run with nothing to do.
         let outcomes = self.docker_client.remove_images(&expired).await;
-        let removed = outcomes.iter().filter(|o| o.error.is_none()).count();
-        let failed = outcomes.len() - removed;
-
-        for outcome in outcomes.iter().filter(|o| o.error.is_some()) {
-            // Most commonly "image is being used by container" — the intended
-            // safety net rather than a real failure. Logged individually so an
-            // operator debugging disk usage can see exactly what was retained.
-            warn!(
-                image_name = %outcome.image_name,
-                error = %outcome.error.as_deref().unwrap_or_default(),
-                "Could not remove expired deployment image"
-            );
-        }
-
-        // Report retained-vs-removed explicitly. Reporting only successes made
-        // a run where every removal failed look identical to a run with
-        // nothing to do.
-        if failed > 0 {
-            info!(
-                "🧹 Deployment image retention: removed {}, retained {} (still referenced or already gone)",
-                removed, failed
-            );
-        } else {
-            info!("✅ Removed {} expired deployment images", removed);
-        }
+        summarize_removals("deployment_image_retention", &outcomes, &image_sizes);
     }
 
     /// Per-image eligibility and oldest reference, computed inside Postgres.
     ///
-    /// **What is a candidate.** Only a tag the Temps image builder recorded
-    /// producing: the `image_tag` output a successful `BuildImageJob`
-    /// persists to `deployment_jobs.outputs`. Eligibility is never inferred
-    /// from the tag text. The builder tags `<deployment slug>:latest`, so an
-    /// earlier `image_name LIKE 'temps-%'` filter matched only projects whose
-    /// slug happened to start with `temps-` and left every other project's
-    /// images on disk forever. Provenance from the build job also covers a
-    /// build that succeeded ahead of a deploy that failed: the image is on
-    /// disk, but `deployments.image_name` is only written on completion and
-    /// stays NULL. External pulls and uploads never run a `BuildImageJob`,
-    /// so they can't become candidates this way. Candidates are further
-    /// restricted to `local_image_tags`, the tags that still exist on this
-    /// daemon, so an image removed on an earlier night (whose deployment rows
-    /// still name it) does not take up a slot in the `LIMIT` window again.
+    /// **What is a candidate.** Only an image Temps itself produced or
+    /// fetched for a deployment, by recorded provenance — eligibility is
+    /// never inferred from the tag text:
     ///
-    /// **When it is eligible.** A built image's references are the
-    /// deployment whose build produced it plus every deployment that records
-    /// it in `image_name` (rollbacks and promotions reuse the tag). The image
-    /// is eligible only when **every** reference is older than its owning
-    /// project's retention window (`BOOL_AND`, with the per-project override
-    /// applied via `COALESCE`), so an image reused by a newer rollback
-    /// survives, and only when **no** reference is
+    /// - a tag the Temps image builder recorded producing: the `image_tag`
+    ///   output a successful `BuildImageJob` persists to
+    ///   `deployment_jobs.outputs`. The builder tags `<deployment slug>:latest`,
+    ///   so an earlier `image_name LIKE 'temps-%'` filter matched only projects
+    ///   whose slug happened to start with `temps-` and left every other
+    ///   project's images on disk forever. Provenance from the build job also
+    ///   covers a build that succeeded ahead of a deploy that failed: the
+    ///   image is on disk, but `deployments.image_name` is only written on
+    ///   completion and stays NULL;
+    /// - a registry reference an image deployment pulled
+    ///   (`metadata.externalImageRef`, [`sql_registry_pull`]). Unlike an
+    ///   upload it can be pulled again from that registry, and a rollback
+    ///   onto it does so. A deployment that only names an external-image ID
+    ///   with no registry reference, or any kind of upload, never makes its
+    ///   image a candidate.
+    ///
+    /// Candidates are further restricted to `local_image_tags`, the tags that
+    /// still exist on this daemon, so an image removed on an earlier night
+    /// (whose deployment rows still name it) does not take up a slot in the
+    /// `LIMIT` window again.
+    ///
+    /// **When it is eligible.** An image's references are every deployment
+    /// that built it, recorded it in `image_name` (rollbacks and promotions
+    /// reuse the tag), or recorded it as its external image reference
+    /// (uploads included). The image is eligible only when **every**
+    /// reference is older than its owning project's retention window
+    /// (`BOOL_AND`, with the per-project override applied via `COALESCE`),
+    /// so an image reused by a newer rollback survives, and only when **no**
+    /// reference is
     ///
     /// - still in flight (a deployment that built its image and is still
     ///   rolling out has no `image_name` yet, and nothing else protects it),
-    /// - unrebuildable (upload trigger, external image metadata, or a
-    ///   non-git project, the same predicate as `unrebuildable_image_names`),
-    /// - or running containers on a worker node (`remote_node_image_names`).
+    /// - unrecoverable ([`sql_unrecoverable_deployment`], the same predicate
+    ///   as `unrecoverable_image_names`) — so a tag that was ever an upload
+    ///   stays protected even if a registry deployment later used the name,
+    /// - running a container on this host that has not been removed
+    ///   (`deployment_containers` with no `deleted_at`),
+    /// - or, for a built image, running containers on a worker node
+    ///   (`remote_node_image_names`). A registry-only image is exempt: the
+    ///   worker pulls it from the registry, never from this copy.
     ///
     /// Each protective flag is `COALESCE`d to `TRUE`, so a NULL column
     /// protects the image rather than releasing it.
@@ -1043,12 +1760,10 @@ impl DockerCleanupService {
         let limit = i64::try_from(self.max_deployment_images_per_run).unwrap_or(i64::MAX);
         let build_succeeded = temps_entities::types::JobStatus::Success.to_value();
         let local_image_tags = serde_json::Value::from(local_image_tags.to_vec());
-        let rows = self
-            .db
-            .as_ref()
-            .query_all(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                r#"
+        // Only fixed predicates are interpolated; every value is a bind
+        // parameter.
+        let sql = format!(
+            r#"
                 WITH built AS (
                     SELECT DISTINCT
                         dj.deployment_id,
@@ -1058,14 +1773,27 @@ impl DockerCleanupService {
                       AND dj.status = $3
                       AND dj.outputs ->> 'image_tag' IS NOT NULL
                 ),
+                pulled AS (
+                    SELECT d.id AS deployment_id,
+                           d.metadata ->> 'externalImageRef' AS image_name
+                    FROM deployments d
+                    WHERE {registry_pull}
+                ),
                 local_images AS (
                     SELECT jsonb_array_elements_text($4::jsonb) AS image_name
                 ),
                 candidate_images AS (
-                    SELECT DISTINCT b.image_name
-                    FROM built b
-                    JOIN local_images li ON li.image_name = b.image_name
-                    WHERE b.image_name NOT LIKE '%/%'
+                    SELECT DISTINCT
+                        s.image_name,
+                        NOT EXISTS (
+                            SELECT 1 FROM built b WHERE b.image_name = s.image_name
+                        ) AS registry_only
+                    FROM (
+                        SELECT image_name FROM built WHERE image_name NOT LIKE '%/%'
+                        UNION
+                        SELECT image_name FROM pulled
+                    ) s
+                    JOIN local_images li ON li.image_name = s.image_name
                 ),
                 refs AS (
                     SELECT b.image_name, b.deployment_id
@@ -1075,10 +1803,16 @@ impl DockerCleanupService {
                     SELECT ci.image_name, d.id AS deployment_id
                     FROM candidate_images ci
                     JOIN deployments d ON d.image_name = ci.image_name
+                    UNION
+                    SELECT ci.image_name, d.id AS deployment_id
+                    FROM candidate_images ci
+                    JOIN deployments d
+                      ON d.metadata ->> 'externalImageRef' = ci.image_name
                 ),
                 ref_rows AS (
                     SELECT
                         r.image_name,
+                        ci.registry_only,
                         d.created_at,
                         d.created_at < NOW() - (
                             COALESCE(p.image_retention_hours, $1) * INTERVAL '1 hour'
@@ -1090,13 +1824,14 @@ impl DockerCleanupService {
                             ),
                             TRUE
                         ) AS in_flight,
-                        COALESCE(
-                            COALESCE(d.context_vars ->> 'trigger', '') = 'image_upload'
-                         OR d.metadata ->> 'externalImageRef' IS NOT NULL
-                         OR d.metadata ->> 'externalImageId' IS NOT NULL
-                         OR p.source_type <> 'git',
-                            TRUE
-                        ) AS unrebuildable,
+                        {unrecoverable} AS unrecoverable,
+                        EXISTS (
+                            SELECT 1
+                            FROM deployment_containers dcl
+                            WHERE dcl.deployment_id = d.id
+                              AND dcl.node_id IS NULL
+                              AND dcl.deleted_at IS NULL
+                        ) AS has_live_local_container,
                         EXISTS (
                             SELECT 1
                             FROM deployment_containers dcr
@@ -1104,6 +1839,7 @@ impl DockerCleanupService {
                               AND dcr.node_id IS NOT NULL
                         ) AS on_remote_node
                     FROM refs r
+                    JOIN candidate_images ci ON ci.image_name = r.image_name
                     JOIN deployments d ON d.id = r.deployment_id
                     JOIN projects p ON p.id = d.project_id
                 )
@@ -1114,11 +1850,28 @@ impl DockerCleanupService {
                 GROUP BY image_name
                 HAVING BOOL_AND(expired)
                    AND NOT BOOL_OR(in_flight)
-                   AND NOT BOOL_OR(unrebuildable)
-                   AND NOT BOOL_OR(on_remote_node)
+                   AND NOT BOOL_OR(unrecoverable)
+                   AND NOT BOOL_OR(has_live_local_container)
+                   AND (BOOL_AND(registry_only) OR NOT BOOL_OR(on_remote_node))
+                   AND NOT EXISTS (
+                       SELECT 1
+                       FROM deployment_containers dci
+                       WHERE dci.image_name = ref_rows.image_name
+                         AND dci.node_id IS NULL
+                         AND dci.deleted_at IS NULL
+                   )
                 ORDER BY MIN(created_at) ASC
                 LIMIT $2
                 "#,
+            registry_pull = sql_registry_pull(),
+            unrecoverable = sql_unrecoverable_deployment(),
+        );
+        let rows = self
+            .db
+            .as_ref()
+            .query_all(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                sql,
                 vec![
                     default_hours.into(),
                     limit.into(),
@@ -1214,44 +1967,54 @@ impl DockerCleanupService {
             .collect()
     }
 
-    /// Image names that must never be pruned because Temps cannot rebuild them:
-    /// tarballs uploaded via the image-upload API and external registry images.
+    /// Image names that must never be pruned because nothing can produce them
+    /// again ([`sql_unrecoverable_deployment`]): uploads, claimed local
+    /// images, external images known only by ID, and builds of non-git
+    /// projects. A registry image deployment is *not* listed: it can be
+    /// pulled again.
     ///
     /// Matched on the deployment's own provenance rather than on the tag text,
     /// because the upload endpoint lets the caller supply an arbitrary `tag`.
+    /// Both the recorded `image_name` and the external image reference are
+    /// listed, since a failed upload deployment never writes `image_name`
+    /// while its image is still on disk.
     ///
     /// `source_type <> 'git'` is deliberately broader than strictly necessary:
     /// a `Manual`-source project (`SourceType::Manual`, "accepts any
     /// deployment method") *can* deploy from a rebuildable git-built image,
     /// but the project row doesn't distinguish that case from a genuinely
-    /// unrebuildable one, so every image from a non-`Git` project is
-    /// protected. This costs disk on `Manual` projects that happen to be
-    /// rebuildable; the alternative — trying to infer rebuildability from
-    /// something other than the source_type column — risks a false negative
-    /// that permanently deletes an image with no way back. Over-retention is
-    /// the safe direction here; under-retention is not.
-    async fn unrebuildable_image_names(&self) -> Result<Vec<String>, sea_orm::DbErr> {
+    /// unrebuildable one, so every non-registry image from a non-`Git`
+    /// project is protected. This costs disk on `Manual` projects that happen
+    /// to be rebuildable; the alternative — trying to infer rebuildability
+    /// from something other than the source_type column — risks a false
+    /// negative that permanently deletes an image with no way back.
+    /// Over-retention is the safe direction here; under-retention is not.
+    async fn unrecoverable_image_names(&self) -> Result<Vec<String>, sea_orm::DbErr> {
         use sea_orm::{ConnectionTrait, Statement};
 
         // No user input is interpolated — this is a fixed predicate over JSON
         // columns that Sea-ORM's query builder cannot express directly.
+        let sql = format!(
+            r#"
+                SELECT DISTINCT n.image_name
+                FROM deployments d
+                JOIN projects p ON p.id = d.project_id
+                CROSS JOIN LATERAL (
+                    VALUES
+                        (d.image_name),
+                        (NULLIF(d.metadata ->> 'externalImageRef', ''))
+                ) AS n(image_name)
+                WHERE n.image_name IS NOT NULL
+                  AND {unrecoverable}
+                "#,
+            unrecoverable = sql_unrecoverable_deployment(),
+        );
         let rows = self
             .db
             .as_ref()
             .query_all(Statement::from_string(
                 sea_orm::DatabaseBackend::Postgres,
-                r#"
-                SELECT DISTINCT d.image_name
-                FROM deployments d
-                JOIN projects p ON p.id = d.project_id
-                WHERE d.image_name IS NOT NULL
-                  AND (
-                        d.context_vars ->> 'trigger' = 'image_upload'
-                     OR d.metadata ->> 'externalImageRef' IS NOT NULL
-                     OR d.metadata ->> 'externalImageId' IS NOT NULL
-                     OR p.source_type <> 'git'
-                  )
-                "#,
+                sql,
             ))
             .await?;
 
@@ -1261,22 +2024,44 @@ impl DockerCleanupService {
     }
 
     /// Image names whose deployment containers are recorded against a worker
-    /// node rather than the control plane.
+    /// node rather than the control plane, unless the image is purely a
+    /// registry pull: the control plane's copy of a built image is what a
+    /// rollback on that worker streams from, while a registry image is pulled
+    /// by the worker itself. A name any build recorded stays protected, even
+    /// if a registry deployment also used it.
     async fn remote_node_image_names(&self) -> Result<Vec<String>, sea_orm::DbErr> {
         use sea_orm::{ConnectionTrait, Statement};
 
+        let sql = format!(
+            r#"
+                SELECT DISTINCT od.image_name
+                FROM deployments od
+                JOIN deployment_containers dc ON dc.deployment_id = od.id
+                WHERE od.image_name IS NOT NULL
+                  AND dc.node_id IS NOT NULL
+                  AND (
+                      EXISTS (
+                          SELECT 1
+                          FROM deployment_jobs dj
+                          WHERE dj.job_type = 'BuildImageJob'
+                            AND dj.outputs ->> 'image_tag' = od.image_name
+                      )
+                      OR NOT EXISTS (
+                          SELECT 1
+                          FROM deployments d
+                          WHERE d.metadata ->> 'externalImageRef' = od.image_name
+                            AND {registry_pull}
+                      )
+                  )
+                "#,
+            registry_pull = sql_registry_pull(),
+        );
         let rows = self
             .db
             .as_ref()
             .query_all(Statement::from_string(
                 sea_orm::DatabaseBackend::Postgres,
-                r#"
-                SELECT DISTINCT d.image_name
-                FROM deployments d
-                JOIN deployment_containers dc ON dc.deployment_id = d.id
-                WHERE d.image_name IS NOT NULL
-                  AND dc.node_id IS NOT NULL
-                "#,
+                sql,
             ))
             .await?;
 
@@ -1294,6 +2079,15 @@ impl DockerCleanupService {
 
         // Remove old deployment images per project retention policy
         self.prune_old_deployment_images().await;
+
+        // Remove superseded sandbox/gateway images. Deployment images are
+        // the retention pass's job here, so only the infrastructure rule runs.
+        prune_local_images_without_database(
+            &self.docker_client,
+            LocalImagePrunePolicy::default(),
+            LocalPrunePasses::InfraOnly,
+        )
+        .await;
 
         // Cleanup old persisted static asset chunks
         if let Some(ref static_dir) = self.static_dir {
@@ -1541,12 +2335,16 @@ mod tests {
                 .iter()
                 .map(|name| ImageRemovalOutcome {
                     image_name: name.clone(),
-                    error: None,
+                    status: ImageRemovalStatus::Deleted,
                 })
                 .collect()
         }
 
-        async fn list_image_tags(&self) -> Result<Vec<String>, DockerImageListError> {
+        async fn list_images(&self) -> Result<Vec<LocalImage>, DockerInventoryError> {
+            Ok(Vec::new())
+        }
+
+        async fn list_containers(&self) -> Result<Vec<LocalContainer>, DockerInventoryError> {
             Ok(Vec::new())
         }
     }
@@ -1560,14 +2358,26 @@ mod tests {
         /// Image names the fake daemon refuses to remove (simulating "image is
         /// being used by container").
         refuse: Vec<String>,
-        /// Tags the fake daemon reports as present locally.
+        /// Tags the fake daemon reports as present locally (one image each).
         local_images: Vec<String>,
+        /// Full image inventory, used instead of `local_images` when set.
+        images: Vec<LocalImage>,
+        /// Containers the fake daemon reports.
+        containers: Vec<LocalContainer>,
     }
 
     impl RecordingDockerClient {
         fn with_local_images(tags: &[&str]) -> Self {
             Self {
                 local_images: tags.iter().map(|tag| tag.to_string()).collect(),
+                ..Default::default()
+            }
+        }
+
+        fn with_inventory(images: Vec<LocalImage>, containers: Vec<LocalContainer>) -> Self {
+            Self {
+                images,
+                containers,
                 ..Default::default()
             }
         }
@@ -1605,16 +2415,37 @@ mod tests {
                 .iter()
                 .map(|name| ImageRemovalOutcome {
                     image_name: name.clone(),
-                    error: self
-                        .refuse
-                        .contains(name)
-                        .then(|| format!("conflict: image {} is being used", name)),
+                    status: if self.refuse.contains(name) {
+                        ImageRemovalStatus::Retained {
+                            reason: format!("conflict: image {} is being used", name),
+                        }
+                    } else {
+                        ImageRemovalStatus::Deleted
+                    },
                 })
                 .collect()
         }
 
-        async fn list_image_tags(&self) -> Result<Vec<String>, DockerImageListError> {
-            Ok(self.local_images.clone())
+        async fn list_images(&self) -> Result<Vec<LocalImage>, DockerInventoryError> {
+            if !self.images.is_empty() {
+                return Ok(self.images.clone());
+            }
+            Ok(self
+                .local_images
+                .iter()
+                .enumerate()
+                .map(|(n, tag)| LocalImage {
+                    id: format!("sha256:{n:064x}"),
+                    repo_tags: vec![tag.clone()],
+                    repo_digests: Vec::new(),
+                    created: 0,
+                    size_bytes: 1024,
+                })
+                .collect())
+        }
+
+        async fn list_containers(&self) -> Result<Vec<LocalContainer>, DockerInventoryError> {
+            Ok(self.containers.clone())
         }
     }
 
@@ -1645,8 +2476,17 @@ mod tests {
             Vec::new()
         }
 
-        async fn list_image_tags(&self) -> Result<Vec<String>, DockerImageListError> {
-            Err(DockerImageListError::List {
+        async fn list_images(&self) -> Result<Vec<LocalImage>, DockerInventoryError> {
+            Err(DockerInventoryError::ListImages {
+                source: bollard::errors::Error::DockerResponseServerError {
+                    status_code: 500,
+                    message: "daemon unreachable".to_string(),
+                },
+            })
+        }
+
+        async fn list_containers(&self) -> Result<Vec<LocalContainer>, DockerInventoryError> {
+            Err(DockerInventoryError::ListContainers {
                 source: bollard::errors::Error::DockerResponseServerError {
                     status_code: 500,
                     message: "daemon unreachable".to_string(),
@@ -2003,10 +2843,15 @@ mod tests {
             .remove_images(&["temps-a:1".to_string(), "temps-b:1".to_string()])
             .await;
 
-        let removed = outcomes.iter().filter(|o| o.error.is_none()).count();
-        let failed = outcomes.len() - removed;
-        assert_eq!(removed, 1);
-        assert_eq!(failed, 1);
+        let summary = summarize_removals(
+            "test",
+            &outcomes,
+            &HashMap::from([("temps-b:1".to_string(), 7)]),
+        );
+        assert_eq!(summary.deleted, 1);
+        assert_eq!(summary.retained, 1);
+        assert_eq!(summary.failed, 0, "an in-use refusal is not a failure");
+        assert_eq!(summary.bytes_reclaimed, 7);
         assert_eq!(
             docker.removed_sorted(),
             vec!["temps-a:1".to_string(), "temps-b:1".to_string()]
@@ -2177,19 +3022,20 @@ mod tests {
             )
             .await;
 
-        assert!(
-            unused_outcome.error.is_none(),
-            "an unreferenced expired image must actually be removed, got: {:?}",
-            unused_outcome.error
+        assert_eq!(
+            unused_outcome.status,
+            ImageRemovalStatus::Deleted,
+            "an unreferenced expired image must actually be removed"
         );
         assert!(
             !unused_still_present,
             "the unused image must be gone from the daemon after removal"
         );
         assert!(
-            in_use_outcome.error.is_some(),
-            "an image still referenced by a container must be retained, not untagged \
-             underneath the service running it"
+            matches!(in_use_outcome.status, ImageRemovalStatus::Retained { .. }),
+            "an image still referenced by a container must be retained (a 409 \
+             conflict), not untagged underneath the service running it: {:?}",
+            in_use_outcome.status
         );
     }
 
@@ -2421,13 +3267,16 @@ mod tests {
         .await?;
         record_build(db.as_ref(), already_removed.id, "retention-app-8:latest").await?;
 
-        // Images Temps never built, all present locally and expired: an
-        // external pull, an external image recorded via metadata, and a
-        // name that merely looks like a builder tag. None has a build
-        // record, so none may be touched.
+        // Images Temps neither built nor pulled for an image deployment,
+        // all present locally and expired: a name recorded with no
+        // provenance at all, and a name that merely looks like a builder
+        // tag. Neither has a build record or a registry reference, so
+        // neither may be touched.
         insert_deployment("retention-app-10", "stopped", Some("nginx:latest"), old)
             .insert(db.as_ref())
             .await?;
+        // An expired registry image deployment: it can be pulled again from
+        // its registry (a rollback does so), so retention now removes it.
         deployments::ActiveModel {
             metadata: Set(Some(deployments::DeploymentMetadata {
                 external_image_ref: Some("registry.example.com/team/app:1".to_string()),
@@ -2475,12 +3324,13 @@ mod tests {
         assert_eq!(
             docker.removed_sorted(),
             vec![
+                "registry.example.com/team/app:1".to_string(),
                 "retention-app-1:latest".to_string(),
                 "retention-app-3:latest".to_string(),
             ],
-            "only expired, Temps-built, locally present images may be removed; \
-             reused, in-flight, active, uploaded, already-removed and non-built \
-             images must all survive"
+            "only expired, locally present images Temps built or pulled from a \
+             registry may be removed; reused, in-flight, active, uploaded, \
+             already-removed and provenance-less images must all survive"
         );
 
         // Pruning removes the Docker image, never the deployment record.
@@ -2599,8 +3449,12 @@ mod tests {
                 slug: Set(format!("livelock-app-{i}")),
                 state: Set("stopped".to_string()),
                 image_name: Set(Some(tag.clone())),
+                // A real upload: `image_uploaded_locally` is what makes it
+                // permanently protected. An `external_image_ref` alone no
+                // longer does, since a registry image can be pulled again.
                 metadata: Set(Some(deployments::DeploymentMetadata {
-                    external_image_ref: Some(format!("registry.internal/uploaded-{i}:1")),
+                    external_image_ref: Some(format!("livelock-app-{i}:latest")),
+                    image_uploaded_locally: true,
                     ..Default::default()
                 })),
                 created_at: Set(very_old),
@@ -2785,6 +3639,732 @@ mod tests {
              next run, not require a restart"
         );
 
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Database-free pruning (worker nodes, superseded infrastructure)
+    // ------------------------------------------------------------------
+
+    fn local_image(id: &str, created: i64, tags: &[&str], digests: &[&str]) -> LocalImage {
+        LocalImage {
+            id: id.to_string(),
+            repo_tags: tags.iter().map(|tag| tag.to_string()).collect(),
+            repo_digests: digests.iter().map(|digest| digest.to_string()).collect(),
+            created,
+            size_bytes: 100,
+        }
+    }
+
+    fn container(image: &str, image_id: &str, is_temps_deployment: bool) -> LocalContainer {
+        LocalContainer {
+            image: image.to_string(),
+            image_id: image_id.to_string(),
+            is_temps_deployment,
+        }
+    }
+
+    const APP_REPO: &str = "ghcr.io/example-org/app";
+
+    /// A registry-pulled build of the app: tagged and carrying a digest from
+    /// its own repository. `n` doubles as its build time.
+    fn app_image(n: i64) -> LocalImage {
+        local_image(
+            &format!("sha256:app{n}"),
+            n,
+            &[&format!("{APP_REPO}:sha-{n}")],
+            &[&format!("{APP_REPO}@sha256:digest{n}")],
+        )
+    }
+
+    fn app_tag(n: i64) -> String {
+        format!("{APP_REPO}:sha-{n}")
+    }
+
+    fn app_images(range: std::ops::RangeInclusive<i64>) -> Vec<LocalImage> {
+        range.map(app_image).collect()
+    }
+
+    /// The currently deployed container, which is what marks the repository
+    /// as one Temps deploys on this node.
+    fn serving(n: i64) -> LocalContainer {
+        container(&app_tag(n), &format!("sha256:app{n}"), true)
+    }
+
+    #[test]
+    fn image_repository_strips_tags_digests_and_docker_hub_prefixes() {
+        assert_eq!(
+            image_repository("ghcr.io/o/app:v1").as_deref(),
+            Some("ghcr.io/o/app")
+        );
+        assert_eq!(
+            image_repository("ghcr.io/o/app@sha256:abc").as_deref(),
+            Some("ghcr.io/o/app")
+        );
+        assert_eq!(
+            image_repository("registry:5000/team/app").as_deref(),
+            Some("registry:5000/team/app"),
+            "a registry port is not a tag"
+        );
+        assert_eq!(
+            image_repository("registry:5000/team/app:2").as_deref(),
+            Some("registry:5000/team/app")
+        );
+        assert_eq!(
+            image_repository("docker.io/library/nginx:1").as_deref(),
+            Some("nginx")
+        );
+        assert_eq!(
+            image_repository("docker.io/org/tool:1").as_deref(),
+            Some("org/tool")
+        );
+        assert_eq!(image_repository("nginx").as_deref(), Some("nginx"));
+        assert_eq!(image_repository("sha256:0123"), None);
+        assert_eq!(image_repository(""), None);
+    }
+
+    #[test]
+    fn docker_hub_short_names_also_match_their_qualified_forms() {
+        assert_eq!(
+            docker_hub_aliases("nginx:1"),
+            vec![
+                "nginx:1".to_string(),
+                "docker.io/library/nginx:1".to_string(),
+                "docker.io/nginx:1".to_string(),
+            ]
+        );
+        assert_eq!(
+            docker_hub_aliases("org/app:1"),
+            vec!["org/app:1".to_string(), "docker.io/org/app:1".to_string()]
+        );
+        for qualified in [
+            "ghcr.io/org/app:1",
+            "registry:5000/app:1",
+            "localhost/app:1",
+        ] {
+            assert_eq!(docker_hub_aliases(qualified), vec![qualified.to_string()]);
+        }
+    }
+
+    #[test]
+    fn infra_repositories_are_an_exact_allowlist() {
+        assert!(is_temps_managed_infra_repository(
+            "ghcr.io/gotempsh/temps-preview-gateway"
+        ));
+        assert!(is_temps_managed_infra_repository(
+            "ghcr.io/gotempsh/temps-sandbox-nodejs"
+        ));
+        assert!(is_temps_managed_infra_repository(
+            "ghcr.io/gotempsh/temps-sandbox-node"
+        ));
+        // The server image an operator may run (and roll back to) and the
+        // managed-database images are in the same namespace but not ours.
+        assert!(!is_temps_managed_infra_repository("ghcr.io/gotempsh/temps"));
+        assert!(!is_temps_managed_infra_repository(
+            "ghcr.io/gotempsh/mariadb-walg"
+        ));
+        assert!(!is_temps_managed_infra_repository(
+            "ghcr.io/gotempsh/temps-sandbox-"
+        ));
+        assert!(!is_temps_managed_infra_repository(
+            "ghcr.io/gotempsh/temps-preview-gateway-fork"
+        ));
+        assert!(!is_temps_managed_infra_repository(
+            "ghcr.io/someone/temps-sandbox-nodejs"
+        ));
+    }
+
+    /// Fix 2: a worker running image deployments keeps the newest N images
+    /// of each deployment repository and removes the rest, oldest first.
+    #[test]
+    fn node_pruning_keeps_the_newest_images_of_a_deployment_repository() {
+        let images = app_images(1..=8);
+        let policy = LocalImagePrunePolicy::default();
+
+        let removals = plan_node_deployment_image_removals(&images, &[serving(8)], &policy);
+
+        assert_eq!(removals, vec![app_tag(1), app_tag(2), app_tag(3)]);
+    }
+
+    /// No image a container uses, running or stopped, by ID or by the
+    /// reference it was created from, is ever selected.
+    #[test]
+    fn node_pruning_never_removes_an_image_a_container_uses() {
+        let images = app_images(1..=8);
+        let containers = vec![
+            serving(8),
+            // A stopped deployment container still pins its image.
+            container(&app_tag(1), "sha256:app1", true),
+            // A container that is not a Temps deployment, holding sha-2 by ID.
+            container("sha256:app2", "sha256:app2", false),
+        ];
+
+        let removals = plan_node_deployment_image_removals(
+            &images,
+            &containers,
+            &LocalImagePrunePolicy::default(),
+        );
+
+        assert_eq!(removals, vec![app_tag(3)]);
+    }
+
+    /// Images in a repository no Temps deployment container on this node was
+    /// created from are a user's (or a managed service's), however old.
+    #[test]
+    fn node_pruning_never_touches_images_outside_temps_deployment_repositories() {
+        let mut images = app_images(1..=3);
+        for n in 1..=8 {
+            images.push(local_image(
+                &format!("sha256:tool{n}"),
+                n,
+                &[&format!("ghcr.io/someone/tool:{n}")],
+                &[&format!("ghcr.io/someone/tool@sha256:t{n}")],
+            ));
+        }
+        let containers = vec![
+            serving(3),
+            container("ghcr.io/someone/tool:8", "sha256:tool8", false),
+        ];
+
+        let removals = plan_node_deployment_image_removals(
+            &images,
+            &containers,
+            &LocalImagePrunePolicy {
+                keep_newest_deployment_images: 1,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            removals,
+            vec![app_tag(1), app_tag(2)],
+            "only the Temps deployment repository may be pruned"
+        );
+    }
+
+    /// An image with no registry digest was transferred from the control
+    /// plane or built on this node: this copy may be the only one, so it is
+    /// never removed by the local rule.
+    #[test]
+    fn node_pruning_keeps_images_it_cannot_pull_again() {
+        let mut images = app_images(4..=8);
+        for n in 1..=3 {
+            images.push(local_image(
+                &format!("sha256:app{n}"),
+                n,
+                &[&app_tag(n)],
+                &[],
+            ));
+        }
+        // A digest from another repository does not make it re-pullable here.
+        images.push(local_image(
+            "sha256:app0",
+            0,
+            &[&app_tag(0)],
+            &["ghcr.io/someone-else/app@sha256:x"],
+        ));
+
+        let removals = plan_node_deployment_image_removals(
+            &images,
+            &[serving(8)],
+            &LocalImagePrunePolicy {
+                keep_newest_deployment_images: 2,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(removals, vec![app_tag(4), app_tag(5), app_tag(6)]);
+    }
+
+    #[test]
+    fn node_pruning_is_capped_per_run() {
+        let removals = plan_node_deployment_image_removals(
+            &app_images(1..=20),
+            &[serving(20)],
+            &LocalImagePrunePolicy {
+                max_removals_per_run: 2,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(removals, vec![app_tag(1), app_tag(2)], "oldest first");
+    }
+
+    fn gateway_image(n: i64) -> LocalImage {
+        // Pinned by digest: no tag, only a digest reference (`<none>` in
+        // `docker images`, and never matched by `dangling=true`).
+        local_image(
+            &format!("sha256:gw{n}"),
+            n,
+            &[],
+            &[&format!(
+                "{TEMPS_PREVIEW_GATEWAY_REPOSITORY}@sha256:gwdigest{n}"
+            )],
+        )
+    }
+
+    /// Fix 3: superseded gateway/sandbox versions are removed only when no
+    /// container (running or stopped) references them; the newest version of
+    /// each repository is kept.
+    #[test]
+    fn superseded_infra_images_are_removed_only_when_unreferenced() {
+        let images = vec![
+            gateway_image(1),
+            gateway_image(2),
+            gateway_image(3),
+            gateway_image(4),
+            local_image(
+                "sha256:node032",
+                1,
+                &["ghcr.io/gotempsh/temps-sandbox-nodejs:0.3.2"],
+                &["ghcr.io/gotempsh/temps-sandbox-nodejs@sha256:n032"],
+            ),
+            local_image(
+                "sha256:node034",
+                5,
+                &["ghcr.io/gotempsh/temps-sandbox-nodejs:0.3.4"],
+                &["ghcr.io/gotempsh/temps-sandbox-nodejs@sha256:n034"],
+            ),
+        ];
+        // A stopped sandbox still on the second gateway version.
+        let containers = vec![container(
+            &format!("{TEMPS_PREVIEW_GATEWAY_REPOSITORY}@sha256:gwdigest2"),
+            "sha256:gw2",
+            false,
+        )];
+
+        let removals = plan_superseded_infra_image_removals(
+            &images,
+            &containers,
+            &[],
+            &LocalImagePrunePolicy::default(),
+        );
+
+        assert_eq!(
+            removals,
+            vec![
+                "sha256:gw1".to_string(),
+                "sha256:node032".to_string(),
+                "sha256:gw3".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn pinned_infra_images_are_kept_even_when_unused() {
+        let images = vec![gateway_image(1), gateway_image(2)];
+        let pinned = format!("{TEMPS_PREVIEW_GATEWAY_REPOSITORY}@sha256:gwdigest1");
+
+        let removals = plan_superseded_infra_image_removals(
+            &images,
+            &[],
+            &[pinned.as_str()],
+            &LocalImagePrunePolicy::default(),
+        );
+
+        assert!(removals.is_empty(), "{removals:?}");
+    }
+
+    /// Only images whose every reference is in a Temps infrastructure
+    /// repository are considered.
+    #[test]
+    fn infra_pruning_never_touches_other_images() {
+        let images = vec![
+            gateway_image(9),
+            local_image("sha256:server1", 1, &["ghcr.io/gotempsh/temps:v1"], &[]),
+            local_image("sha256:server2", 2, &["ghcr.io/gotempsh/temps:v2"], &[]),
+            local_image(
+                "sha256:walg",
+                1,
+                &[],
+                &["ghcr.io/gotempsh/mariadb-walg@sha256:w"],
+            ),
+            local_image("sha256:user", 1, &["nginx:1"], &["nginx@sha256:u"]),
+            // An old gateway version a user also tagged into their own repo.
+            local_image(
+                "sha256:gwcopy",
+                1,
+                &["registry.internal/mirror/gateway:old"],
+                &[&format!("{TEMPS_PREVIEW_GATEWAY_REPOSITORY}@sha256:copy")],
+            ),
+            local_image("sha256:untagged", 1, &[], &[]),
+        ];
+
+        let removals = plan_superseded_infra_image_removals(
+            &images,
+            &[],
+            &[],
+            &LocalImagePrunePolicy::default(),
+        );
+
+        assert!(removals.is_empty(), "{removals:?}");
+    }
+
+    /// The worker's nightly run applies both local rules and removes exactly
+    /// what they select.
+    #[tokio::test]
+    async fn worker_nightly_cleanup_prunes_deployment_and_infra_images() {
+        let mut images = app_images(1..=6);
+        images.push(gateway_image(1));
+        images.push(gateway_image(2));
+        let docker = Arc::new(RecordingDockerClient::with_inventory(
+            images,
+            vec![serving(6)],
+        ));
+        let scheduler = DockerOnlyCleanupScheduler::new(docker.clone());
+
+        scheduler.perform_cleanup().await;
+
+        assert_eq!(
+            docker.removed_sorted(),
+            vec![app_tag(1), "sha256:gw1".to_string()]
+        );
+    }
+
+    /// The console prunes deployment images with the database policy; its
+    /// local pass must only touch infrastructure images.
+    #[tokio::test]
+    async fn console_local_pass_only_removes_infra_images() {
+        let mut images = app_images(1..=8);
+        images.push(gateway_image(1));
+        images.push(gateway_image(2));
+        let docker: Arc<RecordingDockerClient> = Arc::new(RecordingDockerClient::with_inventory(
+            images,
+            vec![serving(8)],
+        ));
+        let client: Arc<dyn DockerClient> = docker.clone();
+
+        prune_local_images_without_database(
+            &client,
+            LocalImagePrunePolicy::default(),
+            LocalPrunePasses::InfraOnly,
+        )
+        .await;
+
+        assert_eq!(docker.removed_sorted(), vec!["sha256:gw1".to_string()]);
+    }
+
+    /// Without a container listing the in-use check would be guessing, so
+    /// nothing may be removed.
+    #[tokio::test]
+    async fn local_pruning_fails_closed_when_the_daemon_cannot_be_listed() {
+        let docker = Arc::new(UnlistableDockerClient {
+            removed: Default::default(),
+        });
+        let client: Arc<dyn DockerClient> = docker.clone();
+
+        prune_local_images_without_database(
+            &client,
+            LocalImagePrunePolicy::default(),
+            LocalPrunePasses::WorkerNode,
+        )
+        .await;
+
+        assert!(docker
+            .removed
+            .lock()
+            .expect("unlistable mock mutex poisoned")
+            .is_empty());
+    }
+
+    #[test]
+    fn removal_outcomes_classify_docker_responses() {
+        let conflict = ImageRemovalOutcome::from_docker(
+            "a:1",
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 409,
+                message: "image is being used by stopped container abc".to_string(),
+            }),
+        );
+        assert!(matches!(
+            conflict.status,
+            ImageRemovalStatus::Retained { .. }
+        ));
+
+        let gone = ImageRemovalOutcome::from_docker(
+            "a:1",
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404,
+                message: "No such image".to_string(),
+            }),
+        );
+        assert_eq!(gone.status, ImageRemovalStatus::NotFound);
+
+        let failed = ImageRemovalOutcome::from_docker(
+            "a:1",
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 500,
+                message: "boom".to_string(),
+            }),
+        );
+        assert!(
+            matches!(&failed.status, ImageRemovalStatus::Failed { reason } if reason.contains("a:1"))
+        );
+
+        let untagged = ImageRemovalOutcome::from_docker(
+            "a:1",
+            Ok(vec![bollard::models::ImageDeleteResponseItem {
+                untagged: Some("a:1".to_string()),
+                deleted: None,
+            }]),
+        );
+        assert_eq!(untagged.status, ImageRemovalStatus::Untagged);
+    }
+
+    // ------------------------------------------------------------------
+    // Registry images under the database retention policy (fix 1)
+    // ------------------------------------------------------------------
+
+    /// `retention_fixture`, as a `docker_image` project: the shape of a
+    /// project deployed with `temps deploy:image`.
+    async fn registry_fixture(
+        db: &sea_orm::DatabaseConnection,
+        slug: &str,
+    ) -> Result<
+        (
+            temps_entities::projects::Model,
+            temps_entities::environments::Model,
+        ),
+        sea_orm::DbErr,
+    > {
+        use sea_orm::{ActiveModelTrait, ActiveValue::Set};
+        let (project, environment) = retention_fixture(db, slug).await?;
+        let mut update: temps_entities::projects::ActiveModel = project.into();
+        update.source_type = Set(temps_entities::source_type::SourceType::DockerImage);
+        let project = update.update(db).await?;
+        Ok((project, environment))
+    }
+
+    fn registry_deployment(
+        project_id: i32,
+        environment_id: i32,
+        slug: &str,
+        image: &str,
+        created_at: chrono::DateTime<chrono::Utc>,
+    ) -> temps_entities::deployments::ActiveModel {
+        use sea_orm::ActiveValue::Set;
+        use temps_entities::deployments;
+        deployments::ActiveModel {
+            project_id: Set(project_id),
+            environment_id: Set(environment_id),
+            slug: Set(slug.to_string()),
+            state: Set("stopped".to_string()),
+            image_name: Set(Some(image.to_string())),
+            metadata: Set(Some(deployments::DeploymentMetadata {
+                external_image_ref: Some(image.to_string()),
+                deployment_source_type: Some(temps_entities::source_type::SourceType::DockerImage),
+                ..Default::default()
+            })),
+            created_at: Set(created_at),
+            updated_at: Set(created_at),
+            ..Default::default()
+        }
+    }
+
+    /// Fix 1: registry-pulled images expire like built ones — the newest N
+    /// per project+environment and anything inside the retention window are
+    /// kept, older ones are removed. A rollback row that reused an image
+    /// (no image metadata of its own) does not pin it forever.
+    #[tokio::test]
+    async fn test_registry_images_expire_beyond_the_floor_and_window(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use chrono::{Duration, Utc};
+        use sea_orm::{ActiveModelTrait, ActiveValue::Set};
+
+        if !cleanup_integration_tests_available().await {
+            eprintln!("Docker/Postgres unavailable; skipping registry retention test");
+            return Ok(());
+        }
+
+        let test_db = temps_database::test_utils::TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, environment) = registry_fixture(db.as_ref(), "registry-app").await?;
+        let now = Utc::now();
+        let image = |n: u32| format!("registry.example.com/team/app:sha-{n}");
+
+        // Retention window is 1h (fixture override); floor is 1.
+        for (n, age) in [
+            (1, Duration::hours(96)),
+            (2, Duration::hours(72)),
+            (3, Duration::hours(48)),
+            (4, Duration::minutes(10)),
+            (5, Duration::minutes(1)),
+        ] {
+            registry_deployment(
+                project.id,
+                environment.id,
+                &format!("registry-app-{n}"),
+                &image(n),
+                now - age,
+            )
+            .insert(db.as_ref())
+            .await?;
+        }
+        // An old rollback onto sha-1: no metadata of its own.
+        temps_entities::deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("registry-app-6".to_string()),
+            state: Set("stopped".to_string()),
+            image_name: Set(Some(image(1))),
+            metadata: Set(Some(temps_entities::deployments::DeploymentMetadata {
+                is_rollback: true,
+                ..Default::default()
+            })),
+            context_vars: Set(Some(serde_json::json!({ "trigger": "rollback" }))),
+            created_at: Set(now - Duration::hours(90)),
+            updated_at: Set(now - Duration::hours(90)),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let local: Vec<String> = (1..=5).map(image).collect();
+        let local: Vec<&str> = local.iter().map(String::as_str).collect();
+        let docker = Arc::new(RecordingDockerClient::with_local_images(&local));
+        let service = DockerCleanupService::new(docker.clone(), db.clone(), mock_file_store())
+            .with_keep_recent_deployment_images(1)
+            .with_image_retention(&temps_core::ImageRetentionSettings {
+                enabled: true,
+                default_hours: 336,
+            });
+
+        service.prune_old_deployment_images().await;
+
+        assert_eq!(
+            docker.removed_sorted(),
+            vec![image(1), image(2), image(3)],
+            "sha-5 is the rollback floor and sha-4 is inside the retention window"
+        );
+        Ok(())
+    }
+
+    /// Fix 1's safety side: an upload (even one sharing a name with a
+    /// registry deployment), an image known only by external-image ID, the
+    /// image an environment serves, and one a live container on this host
+    /// runs are all kept. A registry image whose container was removed is
+    /// the positive control.
+    #[tokio::test]
+    async fn test_registry_retention_keeps_uploads_serving_and_live_images(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use chrono::{Duration, Utc};
+        use sea_orm::{ActiveModelTrait, ActiveValue::Set};
+        use temps_entities::{deployment_containers, deployments, environments};
+
+        if !cleanup_integration_tests_available().await {
+            eprintln!("Docker/Postgres unavailable; skipping registry protection test");
+            return Ok(());
+        }
+
+        let test_db = temps_database::test_utils::TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, environment) = registry_fixture(db.as_ref(), "guard-app").await?;
+        let old = Utc::now() - Duration::hours(72);
+        let (pid, eid) = (project.id, environment.id);
+
+        // An uploaded tarball.
+        deployments::ActiveModel {
+            metadata: Set(Some(deployments::DeploymentMetadata {
+                external_image_ref: Some("guard-app:upload-1".to_string()),
+                image_uploaded_locally: true,
+                uploaded_image_id: Some("sha256:upload".to_string()),
+                ..Default::default()
+            })),
+            context_vars: Set(Some(serde_json::json!({ "trigger": "image_upload" }))),
+            ..registry_deployment(pid, eid, "guard-app-1", "guard-app:upload-1", old)
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        // An upload whose tag a registry deployment later used too: the
+        // local image may be the uploaded content, which no registry has.
+        let shared = "registry.example.com/team/shared:1";
+        registry_deployment(pid, eid, "guard-app-2", shared, old)
+            .insert(db.as_ref())
+            .await?;
+        deployments::ActiveModel {
+            metadata: Set(Some(deployments::DeploymentMetadata {
+                external_image_ref: Some(shared.to_string()),
+                image_uploaded_locally: true,
+                ..Default::default()
+            })),
+            ..registry_deployment(pid, eid, "guard-app-3", shared, old)
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        // Known only by external-image ID: no registry reference to pull.
+        deployments::ActiveModel {
+            metadata: Set(Some(deployments::DeploymentMetadata {
+                external_image_id: Some(42),
+                ..Default::default()
+            })),
+            ..registry_deployment(pid, eid, "guard-app-4", "idonly:1", old)
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        // Served by the environment.
+        let live = "registry.example.com/team/live:1";
+        let serving = registry_deployment(pid, eid, "guard-app-5", live, old)
+            .insert(db.as_ref())
+            .await?;
+        let mut env_update: environments::ActiveModel = environment.clone().into();
+        env_update.current_deployment_id = Set(Some(serving.id));
+        env_update.update(db.as_ref()).await?;
+
+        // A container on this host still runs it.
+        let running = "registry.example.com/team/running:1";
+        let running_deployment = registry_deployment(pid, eid, "guard-app-6", running, old)
+            .insert(db.as_ref())
+            .await?;
+        // Its container was removed: the positive control.
+        let gone = "registry.example.com/team/gone:1";
+        let gone_deployment = registry_deployment(pid, eid, "guard-app-7", gone, old)
+            .insert(db.as_ref())
+            .await?;
+        for (deployment_id, image, deleted_at) in [
+            (running_deployment.id, running, None),
+            (gone_deployment.id, gone, Some(old)),
+        ] {
+            deployment_containers::ActiveModel {
+                deployment_id: Set(deployment_id),
+                container_id: Set(format!("container-{deployment_id}")),
+                container_name: Set(format!("guard-app-{deployment_id}")),
+                health_state: Set("healthy".to_string()),
+                image_name: Set(Some(image.to_string())),
+                status: Set(Some("running".to_string())),
+                deployed_at: Set(old),
+                deleted_at: Set(deleted_at),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await?;
+        }
+
+        let docker = Arc::new(RecordingDockerClient::with_local_images(&[
+            "guard-app:upload-1",
+            shared,
+            "idonly:1",
+            live,
+            running,
+            gone,
+        ]));
+        let service = DockerCleanupService::new(docker.clone(), db.clone(), mock_file_store())
+            .with_keep_recent_deployment_images(0)
+            .with_image_retention(&temps_core::ImageRetentionSettings {
+                enabled: true,
+                default_hours: 336,
+            });
+
+        service.prune_old_deployment_images().await;
+
+        assert_eq!(
+            docker.removed_sorted(),
+            vec![gone.to_string()],
+            "uploads, ID-only external images, the serving image and a live \
+             container's image must all survive"
+        );
         Ok(())
     }
 }
