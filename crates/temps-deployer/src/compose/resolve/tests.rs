@@ -1697,3 +1697,30 @@ async fn a_merged_model_is_narrowed_before_its_policy_check() {
         checked.rewrites
     );
 }
+
+/// Interpolation escapes a substituted value's dollar signs into the model
+/// (`a$b` is written `a$$b`), so a rewrite report quoting the model must be
+/// masked in that form too — otherwise the value is recoverable from the
+/// deployment log.
+#[tokio::test]
+async fn a_rewrite_report_masks_a_substituted_value_with_a_dollar_sign() {
+    let root = tempfile::tempdir().unwrap();
+    let environment = HashMap::from([("NAME".to_string(), "alpha$bravo".to_string())]);
+    let checked = disabled_executor(root.path().join("data"))
+        .with_security_policy(Default::default())
+        .check_configuration(&ComposeCheckInput {
+            content: "services:\n  web:\n    image: ghcr.io/example/web:1\n    container_name: ${NAME}\n",
+            allow_cli: false,
+            ..idiomatic_input(root.path(), &environment, None)
+        })
+        .await
+        .unwrap();
+    let [rewrite] = checked.rewrites.as_slice() else {
+        panic!("expected one rewrite, got {:?}", checked.rewrites);
+    };
+    let message = rewrite.message();
+    for leak in ["alpha", "bravo", "alpha$bravo", "alpha$$bravo"] {
+        assert!(!message.contains(leak), "{leak} leaked: {message}");
+    }
+    assert!(message.contains("<redacted>"), "{message}");
+}

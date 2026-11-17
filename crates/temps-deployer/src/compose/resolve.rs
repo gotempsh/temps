@@ -15,7 +15,7 @@ use temps_presets::compose_check::{
 
 use super::diagnostics::{
     classify_compose_config_failure_with_status, command_argv, redact_compose_text,
-    sanitize_config_stderr, SubstitutedValues,
+    redaction_forms, sanitize_config_stderr, SubstitutedValues,
 };
 use super::exec::isolated_docker_command;
 use super::files::render_env_file;
@@ -462,11 +462,7 @@ impl ComposeExecutor {
 
     /// [`Self::redact_variable_values`] for a list of values.
     fn redact_values(error: ComposeError, values: &[String]) -> ComposeError {
-        let values: Vec<String> = values
-            .iter()
-            .filter(|value| value.len() >= 3)
-            .cloned()
-            .collect();
+        let values: Vec<String> = values.iter().flat_map(redaction_forms).collect();
         if values.is_empty() {
             return error;
         }
