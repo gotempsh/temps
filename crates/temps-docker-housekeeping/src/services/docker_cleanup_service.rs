@@ -85,6 +85,22 @@ pub struct LocalImage {
     pub size_bytes: u64,
 }
 
+impl LocalImage {
+    /// The references a removal names this image by: its tags, or, for an
+    /// image pulled by digest and never tagged, its digest references.
+    ///
+    /// Digests are only used when there is no tag: removing an image's last
+    /// tag already drops its digest references from the same repository, so
+    /// listing both would only produce a second, redundant removal.
+    pub fn removable_references(&self) -> &[String] {
+        if self.repo_tags.is_empty() {
+            &self.repo_digests
+        } else {
+            &self.repo_tags
+        }
+    }
+}
+
 /// One container on the local daemon, running or stopped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalContainer {
@@ -817,7 +833,8 @@ impl<'a> ImagesInUse<'a> {
 }
 
 /// Which registry-pulled deployment images a worker node may remove, oldest
-/// first, as `repo:tag` references.
+/// first, as `repo:tag` references (or `repo@sha256:...` for an image that
+/// was pulled by digest and carries no tag).
 ///
 /// A worker has no database, so it cannot apply the console's retention
 /// policy. It applies a stricter local rule instead, and only to images it
@@ -860,7 +877,7 @@ pub fn plan_node_deployment_image_removals(
     let mut by_repository: std::collections::BTreeMap<String, Vec<(&LocalImage, &str)>> =
         std::collections::BTreeMap::new();
     for image in images {
-        for tag in &image.repo_tags {
+        for tag in image.removable_references() {
             if let Some(repository) = image_repository(tag) {
                 if deployment_repositories.contains(&repository) {
                     by_repository
@@ -1047,9 +1064,9 @@ async fn prune_local_images_without_database(
                 .iter()
                 .flat_map(|image| {
                     image
-                        .repo_tags
+                        .removable_references()
                         .iter()
-                        .map(move |tag| (tag.clone(), image.size_bytes))
+                        .map(move |reference| (reference.clone(), image.size_bytes))
                 })
                 .collect();
             let outcomes = docker_client.remove_images(&tags).await;
@@ -1220,6 +1237,62 @@ fn sql_registry_pull() -> String {
     format!(
         r#"(NULLIF(d.metadata ->> 'externalImageRef', '') IS NOT NULL
             AND NOT {SQL_HANDED_OVER_IMAGE})"#
+    )
+}
+
+/// The one spelling an image reference is compared by, so that every way of
+/// writing a Docker Hub name matches the others: `nginx:1`,
+/// `docker.io/nginx:1`, `index.docker.io/library/nginx:1` and
+/// `docker.io/library/nginx:1` all give `docker.io/library/nginx:1`, and
+/// `org/app:1` gives `docker.io/org/app:1`. Docker resolves all of them to the
+/// same local image, so a protection recorded under one spelling must cover a
+/// candidate recorded under another.
+///
+/// A reference that names a registry host (its first component has a `.` or
+/// `:`, or is `localhost`) and a bare image ID are returned unchanged.
+/// [`sql_canonical_image_reference`] is the same rule in SQL; keep them in
+/// step.
+pub fn canonical_image_reference(reference: &str) -> String {
+    if reference.is_empty() || reference.starts_with("sha256:") {
+        return reference.to_string();
+    }
+    let reference = match reference.strip_prefix("index.docker.io/") {
+        Some(rest) => format!("docker.io/{rest}"),
+        None => reference.to_string(),
+    };
+    if let Some(rest) = reference.strip_prefix("docker.io/") {
+        return if rest.contains('/') {
+            reference
+        } else {
+            format!("docker.io/library/{rest}")
+        };
+    }
+    match reference.split_once('/') {
+        None => format!("docker.io/library/{reference}"),
+        Some((first, _)) if first.contains('.') || first.contains(':') || first == "localhost" => {
+            reference
+        }
+        Some(_) => format!("docker.io/{reference}"),
+    }
+}
+
+/// SQL expression giving [`canonical_image_reference`] of `expr`, a column
+/// expression (never user input). NULL stays NULL.
+fn sql_canonical_image_reference(expr: &str) -> String {
+    let n = format!(r"regexp_replace({expr}, '^index\.docker\.io/', 'docker.io/')");
+    format!(
+        r"(CASE
+            WHEN {n} = '' OR {n} LIKE 'sha256:%' THEN {n}
+            WHEN {n} LIKE 'docker.io/%' THEN
+                CASE WHEN strpos(substr({n}, 11), '/') = 0
+                     THEN 'docker.io/library/' || substr({n}, 11)
+                     ELSE {n}
+                END
+            WHEN strpos({n}, '/') = 0 THEN 'docker.io/library/' || {n}
+            WHEN split_part({n}, '/', 1) ~ '[.:]'
+              OR split_part({n}, '/', 1) = 'localhost' THEN {n}
+            ELSE 'docker.io/' || {n}
+        END)"
     )
 }
 
@@ -1451,8 +1524,12 @@ impl DockerCleanupService {
     /// which images are candidates at all is decided by
     /// `expired_image_candidates` from the builder's own records, so a
     /// protection entry for any other name is simply never consulted.
+    ///
+    /// `candidates` is keyed by [`canonical_image_reference`], so protecting
+    /// `nginx:1` also protects a candidate recorded as
+    /// `docker.io/library/nginx:1`: both name the same local image.
     fn protect_image(candidates: &mut HashMap<String, bool>, image_name: &str) {
-        candidates.insert(image_name.to_string(), false);
+        candidates.insert(canonical_image_reference(image_name), false);
     }
 
     /// Calculate seconds until the next scheduled cleanup
@@ -1539,11 +1616,13 @@ impl DockerCleanupService {
         // Docker lists Docker Hub images by their short name (`nginx:1`),
         // while a deployment may have recorded the fully qualified reference
         // (`docker.io/library/nginx:1`); Docker resolves either form on
-        // removal, so both are matched.
+        // removal, so both are matched. An image a deployment pulled by
+        // digest (`repo@sha256:...`) has no tag, so its digest references
+        // stand in for one; otherwise it could never expire.
         let image_sizes: HashMap<String, u64> = local_images
             .iter()
             .flat_map(|image| {
-                image.repo_tags.iter().flat_map(move |tag| {
+                image.removable_references().iter().flat_map(move |tag| {
                     docker_hub_aliases(tag)
                         .into_iter()
                         .map(move |alias| (alias, image.size_bytes))
@@ -1563,7 +1642,7 @@ impl DockerCleanupService {
         // at `max_deployment_images_per_run` — see the doc comment on
         // `expired_image_candidates` for why this table's row count doesn't
         // shrink to "how many images exist".
-        let (mut candidates, oldest_reference_by_image) = match self
+        let (mut candidates, name_and_oldest_by_key) = match self
             .expired_image_candidates(default_image_retention_hours, &local_image_tags)
             .await
         {
@@ -1676,17 +1755,12 @@ impl DockerCleanupService {
             }
         }
 
+        // Keys a protection added that the query never returned have no
+        // recorded name and are not candidates.
         let mut expired: Vec<(String, chrono::DateTime<chrono::Utc>)> = candidates
             .into_iter()
-            .filter_map(|(name, eligible)| {
-                eligible.then(|| {
-                    let oldest = oldest_reference_by_image
-                        .get(&name)
-                        .copied()
-                        .unwrap_or_else(chrono::Utc::now);
-                    (name, oldest)
-                })
-            })
+            .filter(|(_, eligible)| *eligible)
+            .filter_map(|(key, _)| name_and_oldest_by_key.get(&key).cloned())
             .collect();
 
         // Preserve main's bounded nightly work from #645. Oldest candidates
@@ -1759,6 +1833,13 @@ impl DockerCleanupService {
     ///   with no registry reference, or any kind of upload, never makes its
     ///   image a candidate.
     ///
+    /// Every name is compared by [`canonical_image_reference`] (in SQL,
+    /// [`sql_canonical_image_reference`]): Docker resolves `nginx:1` and
+    /// `docker.io/library/nginx:1` to the same local image, so an upload
+    /// recorded under one spelling must protect a registry pull recorded under
+    /// the other. Each result row is one image: its canonical key and one
+    /// recorded name to remove it by.
+    ///
     /// Candidates are further restricted to `local_image_tags`, the tags that
     /// still exist on this daemon, so an image removed on an earlier night
     /// (whose deployment rows still name it) does not take up a slot in the
@@ -1805,7 +1886,7 @@ impl DockerCleanupService {
     ) -> Result<
         (
             HashMap<String, bool>,
-            HashMap<String, chrono::DateTime<chrono::Utc>>,
+            HashMap<String, (String, chrono::DateTime<chrono::Utc>)>,
         ),
         sea_orm::DbErr,
     > {
@@ -1834,39 +1915,50 @@ impl DockerCleanupService {
                     WHERE {registry_pull}
                 ),
                 local_images AS (
-                    SELECT jsonb_array_elements_text($4::jsonb) AS image_name
+                    SELECT DISTINCT {key_li} AS image_key
+                    FROM jsonb_array_elements_text($4::jsonb) AS li(image_name)
+                ),
+                built_keys AS (
+                    SELECT DISTINCT {key_b} AS image_key FROM built b
                 ),
                 candidate_images AS (
-                    SELECT DISTINCT
-                        s.image_name,
-                        NOT EXISTS (
-                            SELECT 1 FROM built b WHERE b.image_name = s.image_name
-                        ) AS registry_only
+                    SELECT
+                        {key_s} AS image_key,
+                        MIN(s.image_name) AS image_name
                     FROM (
                         SELECT image_name FROM built WHERE image_name NOT LIKE '%/%'
                         UNION
                         SELECT image_name FROM pulled
                     ) s
-                    JOIN local_images li ON li.image_name = s.image_name
+                    JOIN local_images li ON li.image_key = {key_s}
+                    GROUP BY 1
                 ),
                 refs AS (
-                    SELECT b.image_name, b.deployment_id
+                    SELECT ci.image_key, b.deployment_id
                     FROM built b
-                    JOIN candidate_images ci ON ci.image_name = b.image_name
+                    JOIN candidate_images ci ON ci.image_key = {key_b}
                     UNION
-                    SELECT ci.image_name, d.id AS deployment_id
+                    SELECT ci.image_key, d.id AS deployment_id
                     FROM candidate_images ci
-                    JOIN deployments d ON d.image_name = ci.image_name
+                    JOIN deployments d ON {key_d_name} = ci.image_key
                     UNION
-                    SELECT ci.image_name, d.id AS deployment_id
+                    SELECT ci.image_key, d.id AS deployment_id
                     FROM candidate_images ci
-                    JOIN deployments d
-                      ON d.metadata ->> 'externalImageRef' = ci.image_name
+                    JOIN deployments d ON {key_d_ref} = ci.image_key
+                ),
+                live_local_images AS (
+                    SELECT DISTINCT {key_dci} AS image_key
+                    FROM deployment_containers dci
+                    WHERE dci.node_id IS NULL
+                      AND dci.deleted_at IS NULL
                 ),
                 ref_rows AS (
                     SELECT
-                        r.image_name,
-                        ci.registry_only,
+                        r.image_key,
+                        ci.image_name,
+                        NOT EXISTS (
+                            SELECT 1 FROM built_keys bk WHERE bk.image_key = r.image_key
+                        ) AS registry_only,
                         d.created_at,
                         d.created_at < NOW() - (
                             COALESCE(p.image_retention_hours, $1) * INTERVAL '1 hour'
@@ -1893,15 +1985,16 @@ impl DockerCleanupService {
                               AND dcr.node_id IS NOT NULL
                         ) AS on_remote_node
                     FROM refs r
-                    JOIN candidate_images ci ON ci.image_name = r.image_name
+                    JOIN candidate_images ci ON ci.image_key = r.image_key
                     JOIN deployments d ON d.id = r.deployment_id
                     JOIN projects p ON p.id = d.project_id
                 )
                 SELECT
-                    image_name,
+                    image_key,
+                    MIN(image_name) AS image_name,
                     MIN(created_at) AS oldest_reference
                 FROM ref_rows
-                GROUP BY image_name
+                GROUP BY image_key
                 HAVING BOOL_AND(expired)
                    AND NOT BOOL_OR(in_flight)
                    AND NOT BOOL_OR(unrecoverable)
@@ -1909,16 +2002,20 @@ impl DockerCleanupService {
                    AND (BOOL_AND(registry_only) OR NOT BOOL_OR(on_remote_node))
                    AND NOT EXISTS (
                        SELECT 1
-                       FROM deployment_containers dci
-                       WHERE dci.image_name = ref_rows.image_name
-                         AND dci.node_id IS NULL
-                         AND dci.deleted_at IS NULL
+                       FROM live_local_images lli
+                       WHERE lli.image_key = ref_rows.image_key
                    )
                 ORDER BY MIN(created_at) ASC
                 LIMIT $2
                 "#,
             registry_pull = sql_registry_pull(),
             unrecoverable = sql_unrecoverable_deployment(),
+            key_li = sql_canonical_image_reference("li.image_name"),
+            key_b = sql_canonical_image_reference("b.image_name"),
+            key_s = sql_canonical_image_reference("s.image_name"),
+            key_d_name = sql_canonical_image_reference("d.image_name"),
+            key_d_ref = sql_canonical_image_reference("d.metadata ->> 'externalImageRef'"),
+            key_dci = sql_canonical_image_reference("dci.image_name"),
         );
         let rows = self
             .db
@@ -1936,20 +2033,21 @@ impl DockerCleanupService {
             .await?;
 
         let mut candidates = HashMap::new();
-        let mut oldest_reference_by_image = HashMap::new();
+        let mut name_and_oldest_by_key = HashMap::new();
         for row in rows {
+            let image_key: String = row.try_get("", "image_key")?;
             let image_name: String = row.try_get("", "image_name")?;
             let oldest_reference: chrono::DateTime<chrono::Utc> =
                 row.try_get("", "oldest_reference")?;
-            oldest_reference_by_image.insert(image_name.clone(), oldest_reference);
+            name_and_oldest_by_key.insert(image_key.clone(), (image_name, oldest_reference));
             // Every row that survives the query's HAVING clause is, by
             // definition, fully expired — `protect_image` (called for the
             // recent/unrebuildable/active/remote-node sets below) is what
             // flips an entry back to `false`.
-            candidates.insert(image_name, true);
+            candidates.insert(image_key, true);
         }
 
-        Ok((candidates, oldest_reference_by_image))
+        Ok((candidates, name_and_oldest_by_key))
     }
 
     /// Image names among the newest `keep_recent` deployments for each
@@ -2829,26 +2927,28 @@ mod tests {
     fn test_protection_beats_expiry_regardless_of_order() {
         let uploaded = "temps-demo-prod:upload-1750000000";
 
+        let key = canonical_image_reference(uploaded);
+
         // Protect first, then simulate an already-recorded expired entry.
         let mut protect_first = HashMap::new();
         DockerCleanupService::protect_image(&mut protect_first, uploaded);
         protect_first
-            .entry(uploaded.to_string())
+            .entry(key.clone())
             .and_modify(|eligible| *eligible &= true)
             .or_insert(true);
-        assert_eq!(protect_first.get(uploaded), Some(&false));
+        assert_eq!(protect_first.get(&key), Some(&false));
 
         // Simulate an already-recorded expired entry first, then protect.
         let mut record_first = HashMap::new();
-        record_first.insert(uploaded.to_string(), true);
+        record_first.insert(key.clone(), true);
         assert_eq!(
-            record_first.get(uploaded),
+            record_first.get(&key),
             Some(&true),
             "precondition: an old upload looks eligible on age alone"
         );
         DockerCleanupService::protect_image(&mut record_first, uploaded);
         assert_eq!(
-            record_first.get(uploaded),
+            record_first.get(&key),
             Some(&false),
             "protection must win over an already-recorded expiry"
         );
@@ -2859,10 +2959,64 @@ mod tests {
     /// once such tags became candidates. It must apply to any name now.
     #[test]
     fn test_protect_applies_to_builder_tags_without_temps_prefix() {
+        let key = canonical_image_reference("my-app-12:latest");
         let mut candidates = HashMap::new();
-        candidates.insert("my-app-12:latest".to_string(), true);
+        candidates.insert(key.clone(), true);
         DockerCleanupService::protect_image(&mut candidates, "my-app-12:latest");
-        assert_eq!(candidates.get("my-app-12:latest"), Some(&false));
+        assert_eq!(candidates.get(&key), Some(&false));
+    }
+
+    /// A protection recorded under one spelling of a Docker Hub name covers a
+    /// candidate recorded under another: Docker resolves both to one image.
+    #[test]
+    fn test_protection_matches_every_docker_hub_spelling() {
+        let mut candidates = HashMap::new();
+        candidates.insert(canonical_image_reference("docker.io/library/nginx:1"), true);
+        DockerCleanupService::protect_image(&mut candidates, "nginx:1");
+        assert_eq!(
+            candidates.get(&canonical_image_reference("index.docker.io/nginx:1")),
+            Some(&false)
+        );
+    }
+
+    #[test]
+    fn test_canonical_image_reference() {
+        for spelling in [
+            "nginx:1",
+            "docker.io/nginx:1",
+            "docker.io/library/nginx:1",
+            "index.docker.io/library/nginx:1",
+            "index.docker.io/nginx:1",
+        ] {
+            assert_eq!(
+                canonical_image_reference(spelling),
+                "docker.io/library/nginx:1",
+                "{spelling}"
+            );
+        }
+        assert_eq!(
+            canonical_image_reference("org/app:1"),
+            "docker.io/org/app:1"
+        );
+        assert_eq!(
+            canonical_image_reference("docker.io/org/app:1"),
+            "docker.io/org/app:1"
+        );
+        assert_eq!(
+            canonical_image_reference("nginx@sha256:abc"),
+            "docker.io/library/nginx@sha256:abc"
+        );
+        // Registry-qualified references and image IDs are left alone.
+        for unchanged in [
+            "ghcr.io/org/app:1",
+            "registry.example.com/team/app@sha256:abc",
+            "localhost:5000/app:1",
+            "localhost/app:1",
+            "sha256:abc",
+            "",
+        ] {
+            assert_eq!(canonical_image_reference(unchanged), unchanged);
+        }
     }
 
     /// The candidate query only considers images present on the local
@@ -3956,6 +4110,50 @@ mod tests {
         assert_eq!(removals, vec![app_tag(4), app_tag(5), app_tag(6)]);
     }
 
+    /// A deployment pinned by digest (`repo@sha256:...`) pulls an image that
+    /// has no tag at all. It must still age out, named by its digest
+    /// reference, while a digest-pinned image a container runs is kept.
+    #[test]
+    fn node_pruning_removes_untagged_images_pulled_by_digest() {
+        let digest_ref = |n: i64| format!("{APP_REPO}@sha256:digest{n}");
+        let images: Vec<LocalImage> = (1..=4)
+            .map(|n| local_image(&format!("sha256:app{n}"), n, &[], &[&digest_ref(n)]))
+            .collect();
+        let containers = vec![
+            // Serving the newest, created from its digest reference.
+            container(&digest_ref(4), "sha256:app4", true),
+            // A stopped deployment container still pins the oldest.
+            container(&digest_ref(1), "sha256:app1", true),
+        ];
+
+        let removals = plan_node_deployment_image_removals(
+            &images,
+            &containers,
+            &LocalImagePrunePolicy {
+                keep_newest_deployment_images: 1,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(removals, vec![digest_ref(2), digest_ref(3)]);
+    }
+
+    /// A tagged image is removed by its tag only: dropping the last tag also
+    /// drops its digest references, so naming both would be redundant.
+    #[test]
+    fn removable_references_prefer_tags_over_digests() {
+        let tagged = app_image(1);
+        assert_eq!(tagged.removable_references(), &[app_tag(1)]);
+        let untagged = local_image("sha256:x", 1, &[], &["ghcr.io/example-org/app@sha256:x"]);
+        assert_eq!(
+            untagged.removable_references(),
+            &["ghcr.io/example-org/app@sha256:x".to_string()]
+        );
+        assert!(local_image("sha256:y", 1, &[], &[])
+            .removable_references()
+            .is_empty());
+    }
+
     #[test]
     fn node_pruning_is_capped_per_run() {
         let removals = plan_node_deployment_image_removals(
@@ -4315,6 +4513,151 @@ mod tests {
             docker.removed_sorted(),
             vec![image(1), image(2), image(3)],
             "sha-5 is the rollback floor and sha-4 is inside the retention window"
+        );
+        Ok(())
+    }
+
+    /// A deployment pinned by digest pulls an image Docker lists with no tag,
+    /// only `repo@sha256:...`. It must still expire, by that reference.
+    #[tokio::test]
+    async fn test_registry_images_pulled_by_digest_expire() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use chrono::{Duration, Utc};
+        use sea_orm::ActiveModelTrait;
+
+        if !cleanup_integration_tests_available().await {
+            eprintln!("Docker/Postgres unavailable; skipping digest retention test");
+            return Ok(());
+        }
+
+        let test_db = temps_test_utils::TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, environment) = registry_fixture(db.as_ref(), "digest-app").await?;
+        let now = Utc::now();
+        let image = |n: u32| format!("registry.example.com/team/app@sha256:{n:064x}");
+
+        for (n, age) in [(1, Duration::hours(96)), (2, Duration::hours(72))] {
+            registry_deployment(
+                project.id,
+                environment.id,
+                &format!("digest-app-{n}"),
+                &image(n),
+                now - age,
+            )
+            .insert(db.as_ref())
+            .await?;
+        }
+
+        // Pulled by digest and never tagged: no `repo_tags` at all.
+        let inventory = (1..=2)
+            .map(|n| LocalImage {
+                id: format!("sha256:image{n}"),
+                repo_tags: Vec::new(),
+                repo_digests: vec![image(n)],
+                created: i64::from(n),
+                size_bytes: 1024,
+            })
+            .collect();
+        let docker = Arc::new(RecordingDockerClient::with_inventory(inventory, Vec::new()));
+        let service = DockerCleanupService::new(docker.clone(), db.clone(), mock_file_store())
+            .with_keep_recent_deployment_images(1)
+            .with_image_retention(&temps_config::ImageRetentionSettings {
+                enabled: true,
+                default_hours: 1,
+            });
+
+        service.prune_old_deployment_images().await;
+
+        assert_eq!(
+            docker.removed_sorted(),
+            vec![image(1)],
+            "the older digest-pinned image expires; the newest is the rollback floor"
+        );
+        Ok(())
+    }
+
+    /// An upload recorded as `example/shared:1` and an expired registry pull
+    /// recorded as `docker.io/example/shared:1` name the same local image, so
+    /// the upload protects it. An expired pull with no such twin, recorded in
+    /// the long form while Docker lists the short one, is still removed.
+    #[tokio::test]
+    async fn test_registry_retention_matches_docker_hub_spellings(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use chrono::{Duration, Utc};
+        use sea_orm::{ActiveModelTrait, ActiveValue::Set};
+        use temps_entities::deployments;
+
+        if !cleanup_integration_tests_available().await {
+            eprintln!("Docker/Postgres unavailable; skipping Docker Hub spelling test");
+            return Ok(());
+        }
+
+        let test_db = temps_test_utils::TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, environment) = registry_fixture(db.as_ref(), "spelling-app").await?;
+        let (pid, eid) = (project.id, environment.id);
+        let old = Utc::now() - Duration::hours(72);
+
+        deployments::ActiveModel {
+            metadata: Set(Some(deployments::DeploymentMetadata {
+                external_image_ref: Some("example/shared:1".to_string()),
+                image_uploaded_locally: true,
+                uploaded_image_id: Some("sha256:upload".to_string()),
+                ..Default::default()
+            })),
+            context_vars: Set(Some(serde_json::json!({ "trigger": "image_upload" }))),
+            ..registry_deployment(pid, eid, "spelling-app-1", "example/shared:1", old)
+        }
+        .insert(db.as_ref())
+        .await?;
+        registry_deployment(
+            pid,
+            eid,
+            "spelling-app-2",
+            "docker.io/example/shared:1",
+            old,
+        )
+        .insert(db.as_ref())
+        .await?;
+        registry_deployment(
+            pid,
+            eid,
+            "spelling-app-3",
+            "docker.io/library/old-tool:1",
+            old,
+        )
+        .insert(db.as_ref())
+        .await?;
+        // The newest deployment absorbs the rollback floor.
+        registry_deployment(
+            pid,
+            eid,
+            "spelling-app-4",
+            "registry.example.com/team/app:current",
+            Utc::now(),
+        )
+        .insert(db.as_ref())
+        .await?;
+
+        // Docker lists Docker Hub images by their short names.
+        let docker = Arc::new(RecordingDockerClient::with_local_images(&[
+            "example/shared:1",
+            "old-tool:1",
+            "registry.example.com/team/app:current",
+        ]));
+        let service = DockerCleanupService::new(docker.clone(), db.clone(), mock_file_store())
+            .with_keep_recent_deployment_images(1)
+            .with_image_retention(&temps_config::ImageRetentionSettings {
+                enabled: true,
+                default_hours: 1,
+            });
+
+        service.prune_old_deployment_images().await;
+
+        assert_eq!(
+            docker.removed_sorted(),
+            vec!["docker.io/library/old-tool:1".to_string()],
+            "the upload's image is kept whatever spelling the registry row used"
         );
         Ok(())
     }
