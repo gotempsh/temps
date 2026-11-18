@@ -3158,6 +3158,107 @@
         },
         "type": "object"
       },
+      "AiHarnessCredential": {
+        "description": "The credential that authenticated the harness. Never carries the secret,\nonly the identifiers the API-key list already shows.",
+        "properties": {
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "key_prefix": {
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/AiHarnessCredentialKind"
+          },
+          "last_used_at": {
+            "example": "2026-01-01T00:00:00Z",
+            "format": "date-time",
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "key_prefix",
+          "kind",
+          "last_used_at"
+        ],
+        "type": "object"
+      },
+      "AiHarnessCredentialKind": {
+        "description": "Which credential proved the harness connected.",
+        "enum": [
+          "dedicated_key",
+          "cli_login"
+        ],
+        "type": "string"
+      },
+      "AiHarnessState": {
+        "description": "Where the harness onboarding stands for the calling user.",
+        "enum": [
+          "missing",
+          "waiting",
+          "connected"
+        ],
+        "type": "string"
+      },
+      "AiHarnessStatusResponse": {
+        "description": "`GET /api-keys/ai-harness/status`: the caller's AI harness connection.",
+        "properties": {
+          "connected_via": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/AiHarnessCredential",
+                "description": "Set when `status` is `connected`."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "key_created_at": {
+            "example": "2026-01-01T00:00:00Z",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "key_id": {
+            "description": "The dedicated harness key, when one exists (active or not).",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "reason": {
+            "description": "Why the status is not `connected`, in words the console can show.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "setup_path": {
+            "description": "Console route that resolves `reason`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/AiHarnessState"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "type": "object"
+      },
       "AiModelOptionDto": {
         "properties": {
           "default_thinking_option_id": {
@@ -101734,6 +101835,42 @@
             "bearer_auth": []
           }
         ],
+        "tags": [
+          "API Keys"
+        ]
+      }
+    },
+    "/api-keys/ai-harness/status": {
+      "get": {
+        "description": "Backs the console's \"Let your AI operate Temps\" onboarding and its\napp-wide \"finish connecting\" banner. `connected` when the dedicated\n`Temps AI harness` key has authenticated a request, or when a key minted\nby a browser-approved `temps login` after it has: the CLI falls back to\nthat flow when it is not handed a usable key, so the harness works\nwithout ever sending the dedicated key.",
+        "operationId": "get_ai_harness_status",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AiHarnessStatusResponse"
+                }
+              }
+            },
+            "description": "AI harness connection status for the caller"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Whether the caller's external AI harness has connected.",
         "tags": [
           "API Keys"
         ]
