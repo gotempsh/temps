@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { afterEach, describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import {
@@ -95,9 +95,15 @@ describe('AdminGateCard', () => {
 
 describe('AdminGateCard hostname shortcut', () => {
   installBrowserWindow()
+  // `bun test` shares one DOM across files: put back the URL the setup
+  // registered, or later tests resolve relative URLs against the wrong page.
+  let originalUrl = ''
+  beforeEach(() => {
+    originalUrl = globalThis.location.href
+  })
   afterEach(() => {
     cleanup()
-    setUrl('about:blank')
+    setUrl(originalUrl)
   })
 
   /** happy-dom's control for the page URL the card reads its hostname from. */
