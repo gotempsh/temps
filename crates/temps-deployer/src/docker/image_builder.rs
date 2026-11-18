@@ -4,6 +4,7 @@
 //! The `ImageBuilder` impl of [`DockerRuntime`] and the build-context packing
 //! it relies on.
 
+use super::build_dns::BuildDnsWatch;
 use super::build_failure::build_stream_error_text;
 use super::build_limits::describe_build_memory_request;
 use super::guards::{combine_extraction_and_cleanup, DockerContainerCleanupGuard};
@@ -647,6 +648,7 @@ impl ImageBuilder for DockerRuntime {
 
         // Stream build output and write to log
         let mut step_timer = BuildStepTimer::new();
+        let mut dns_watch = BuildDnsWatch::default();
         let mut build_error = None;
         while let Some(build_info) = build_stream.next().await {
             match build_info {
@@ -654,9 +656,13 @@ impl ImageBuilder for DockerRuntime {
                     if let Some(stream) = info.stream {
                         let _ = log_file.write_all(stream.as_bytes()).await;
                         debug!("Build: {}", stream.trim());
+                        dns_watch.observe(&stream);
                     }
                     if let Some(bollard::models::BuildInfoAux::BuildKit(ref res)) = info.aux {
                         step_timer.observe_vertices(&res.vertexes);
+                        for log in &res.logs {
+                            dns_watch.observe(&String::from_utf8_lossy(&log.msg));
+                        }
                     }
                     if let Some(error_detail) = info.error_detail {
                         let error = error_detail
@@ -666,9 +672,13 @@ impl ImageBuilder for DockerRuntime {
                         let _ = log_file
                             .write_all(format!("ERROR: {}\n", error).as_bytes())
                             .await;
-                        let (err, memory_line) =
-                            self.classify_build_failure(error, &build_start, i64::from(memory_i32));
-                        if let Some(line) = memory_line {
+                        let (err, log_notes) = self.classify_build_failure(
+                            error,
+                            &build_start,
+                            i64::from(memory_i32),
+                            &dns_watch,
+                        );
+                        if let Some(line) = log_notes {
                             let _ = log_file.write_all(line.as_bytes()).await;
                         }
                         build_error = Some(err);
@@ -683,12 +693,13 @@ impl ImageBuilder for DockerRuntime {
                     let _ = log_file
                         .write_all(format!("ERROR: Build failed: {}\n", error_text).as_bytes())
                         .await;
-                    let (err, memory_line) = self.classify_build_failure(
+                    let (err, log_notes) = self.classify_build_failure(
                         error_text,
                         &build_start,
                         i64::from(memory_i32),
+                        &dns_watch,
                     );
-                    if let Some(line) = memory_line {
+                    if let Some(line) = log_notes {
                         let _ = log_file.write_all(line.as_bytes()).await;
                     }
                     build_error = Some(err);
@@ -875,6 +886,7 @@ impl ImageBuilder for DockerRuntime {
 
         // Stream build output and write to log and callback
         let mut step_timer = BuildStepTimer::new();
+        let mut dns_watch = BuildDnsWatch::default();
         let mut build_error = None;
         while let Some(build_info) = build_stream.next().await {
             match build_info {
@@ -883,6 +895,7 @@ impl ImageBuilder for DockerRuntime {
                         // Write to file
                         let _ = log_file.write_all(stream.as_bytes()).await;
                         debug!("Build: {}", stream.trim());
+                        dns_watch.observe(&stream);
 
                         // Call log callback if provided
                         if let Some(ref callback) = log_callback {
@@ -905,9 +918,13 @@ impl ImageBuilder for DockerRuntime {
                             callback(error_line.clone()).await;
                         }
 
-                        let (err, memory_line) =
-                            self.classify_build_failure(error, &build_start, i64::from(memory_i32));
-                        if let Some(line) = memory_line {
+                        let (err, log_notes) = self.classify_build_failure(
+                            error,
+                            &build_start,
+                            i64::from(memory_i32),
+                            &dns_watch,
+                        );
+                        if let Some(line) = log_notes {
                             let _ = log_file.write_all(line.as_bytes()).await;
                             if let Some(ref callback) = log_callback {
                                 callback(line).await;
@@ -918,7 +935,8 @@ impl ImageBuilder for DockerRuntime {
                     }
                     if let Some(bollard::models::BuildInfoAux::BuildKit(res)) = info.aux {
                         step_timer.observe_vertices(&res.vertexes);
-                        emit_buildkit_status(&res, &mut log_file, &log_callback).await;
+                        emit_buildkit_status(&res, &mut log_file, &log_callback, &mut dns_watch)
+                            .await;
                     }
                 }
                 Err(e) => {
@@ -934,12 +952,13 @@ impl ImageBuilder for DockerRuntime {
                         callback(error_line).await;
                     }
 
-                    let (err, memory_line) = self.classify_build_failure(
+                    let (err, log_notes) = self.classify_build_failure(
                         error_text,
                         &build_start,
                         i64::from(memory_i32),
+                        &dns_watch,
                     );
-                    if let Some(line) = memory_line {
+                    if let Some(line) = log_notes {
                         let _ = log_file.write_all(line.as_bytes()).await;
                         if let Some(ref callback) = log_callback {
                             callback(line).await;

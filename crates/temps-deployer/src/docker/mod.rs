@@ -16,6 +16,7 @@
 //! - `log_tail`: bounded container log capture
 //! - `guards`: drop guards that clean up probe execs and helper containers
 
+mod build_dns;
 mod build_failure;
 mod build_limits;
 mod deployer;
