@@ -954,7 +954,13 @@ jobs:
     name: Build Test Binaries
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
-    runs-on: ubuntu-latest
+    # Pinned, not ubuntu-latest: the debug `temps` built here is the binary
+    # the scenario suites run, some of them inside Docker-in-Docker and node
+    # images with an older glibc than the newest runner. A binary linked on a
+    # newer glibc fails to load there (`GLIBC_x.y not found`). Building on
+    # the oldest supported image keeps it loadable everywhere; the test
+    # binaries also built here run on newer runners unchanged.
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
@@ -992,8 +998,13 @@ jobs:
       - name: Key the build cache
         id: cache-key
         run: |
-          echo "rustc=$(rustc -Vv | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
-          echo "lock=${{ hashFiles('Cargo.lock') }}" >> "$GITHUB_OUTPUT"
+          # The image's release too: build scripts cached by a newer image
+          # are linked against its glibc and would not run on this one.
+          {
+            echo "rustc=$(rustc -Vv | sha256sum | cut -c1-16)"
+            echo "lock=${{ hashFiles('Cargo.lock') }}"
+            echo "os=$(. /etc/os-release && echo "${ID}${VERSION_ID}")"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Wait for the freed disk space
         run: timeout 600 sh -c 'until [ -f "$RUNNER_TEMP/disk-freed" ]; do sleep 2; done'; df -h /
@@ -1018,10 +1029,10 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-          key: test-target-v1-${{ runner.os }}-${{ steps.cache-key.outputs.rustc }}-${{ steps.cache-key.outputs.lock }}-${{ github.sha }}
+          key: test-target-v1-${{ runner.os }}-${{ steps.cache-key.outputs.os }}-${{ steps.cache-key.outputs.rustc }}-${{ steps.cache-key.outputs.lock }}-${{ github.sha }}
           restore-keys: |
-            test-target-v1-${{ runner.os }}-${{ steps.cache-key.outputs.rustc }}-${{ steps.cache-key.outputs.lock }}-
-            test-target-v1-${{ runner.os }}-${{ steps.cache-key.outputs.rustc }}-
+            test-target-v1-${{ runner.os }}-${{ steps.cache-key.outputs.os }}-${{ steps.cache-key.outputs.rustc }}-${{ steps.cache-key.outputs.lock }}-
+            test-target-v1-${{ runner.os }}-${{ steps.cache-key.outputs.os }}-${{ steps.cache-key.outputs.rustc }}-
 
       # Before the fallback restore below, so a failed restore does not start
       # another download onto a nearly full disk. The watcher keeps running.
@@ -1130,7 +1141,7 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-          key: test-target-v1-${{ runner.os }}-${{ steps.cache-key.outputs.rustc }}-${{ steps.cache-key.outputs.lock }}-${{ github.sha }}
+          key: test-target-v1-${{ runner.os }}-${{ steps.cache-key.outputs.os }}-${{ steps.cache-key.outputs.rustc }}-${{ steps.cache-key.outputs.lock }}-${{ github.sha }}
 
       - name: Upload default-feature archive
         uses: actions/upload-artifact@v7
