@@ -307,8 +307,11 @@ pub struct ServeCommand {
     /// `--console-address` listener only serves public ingest routes and the
     /// admin/UI surface (auth, projects, settings, dashboard) binds here.
     ///
-    /// Combine with `--admin-allowed-ips` / `--admin-allowed-hosts` to add a
+    /// Combine with the admin access gate (Settings → Security → Admin
+    /// access gate, or the TEMPS_ADMIN_ALLOWED_IPS /
+    /// TEMPS_ADMIN_ALLOWED_HOSTS environment variables) to add a
     /// defense-in-depth allowlist on top of the network-layer isolation.
+    /// See https://temps.sh/docs/admin-listener#admin-gate.
     #[arg(long, env = "TEMPS_CONSOLE_ADMIN_ADDRESS")]
     pub console_admin_address: Option<String>,
 
