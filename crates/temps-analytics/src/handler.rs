@@ -1346,8 +1346,44 @@ pub(super) fn handle_analytics_error(error: AnalyticsError) -> Problem {
             not_found().detail("Project not found").build()
         }
         AnalyticsError::AiRateLimited { reason } => too_many_requests().detail(reason).build(),
+        error @ AnalyticsError::TrafficBusy { .. } => {
+            tracing::warn!(error = %error, "API traffic query refused while busy");
+            too_many_requests()
+                .title("API Traffic Busy")
+                .detail(error.to_string())
+                .value("retry_after_seconds", API_TRAFFIC_RETRY_AFTER_SECONDS)
+                .build()
+        }
+        error @ AnalyticsError::TrafficTimeout { .. } => {
+            tracing::warn!(error = %error, "API traffic query timed out");
+            temps_core::error_builder::ErrorBuilder::new(axum::http::StatusCode::GATEWAY_TIMEOUT)
+                .title("API Traffic Query Timed Out")
+                .detail(error.to_string())
+                .build()
+        }
+        error @ AnalyticsError::TrafficInvalidQuery { .. } => bad_request()
+            .title("Invalid API Traffic Query")
+            .detail(error.to_string())
+            .build(),
+        AnalyticsError::TrafficStorage { operation, detail } => {
+            tracing::error!(
+                operation,
+                detail,
+                "API traffic query failed in the request-log backend"
+            );
+            internal_server_error()
+                .title("API Traffic Unavailable")
+                .detail(format!(
+                    "API traffic {operation} failed in the request-log backend; the server log has the cause"
+                ))
+                .build()
+        }
     }
 }
+
+/// Seconds a client should wait before retrying a busy API traffic query: the
+/// aggregations it waited behind are bounded by their own deadline.
+const API_TRAFFIC_RETRY_AFTER_SECONDS: u64 = 5;
 
 #[utoipa::path(
     tag = "Analytics",
@@ -2227,6 +2263,47 @@ mod api_traffic_window_tests {
         let start: UtcDateTime = chrono::Utc::now();
         let end = start + chrono::Duration::hours(24);
         assert!(validate_api_traffic_window(start, end).is_ok());
+    }
+
+    #[test]
+    fn api_traffic_failures_keep_their_status_and_hide_backend_detail() {
+        use axum::http::StatusCode;
+        let busy = handle_analytics_error(AnalyticsError::TrafficBusy {
+            operation: "aggregation",
+            reason: "server aggregation capacity exhausted",
+        });
+        assert_eq!(busy.status_code, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            busy.body.get("retry_after_seconds"),
+            Some(&serde_json::json!(API_TRAFFIC_RETRY_AFTER_SECONDS))
+        );
+
+        let timeout = handle_analytics_error(AnalyticsError::TrafficTimeout {
+            operation: "aggregation",
+            timeout_seconds: 15,
+        });
+        assert_eq!(timeout.status_code, StatusCode::GATEWAY_TIMEOUT);
+        assert!(serde_json::to_string(&timeout.body)
+            .expect("problem body serializes")
+            .contains("15-second"));
+
+        let invalid = handle_analytics_error(AnalyticsError::TrafficInvalidQuery {
+            operation: "aggregation",
+            detail: "group by fewer dimensions".to_string(),
+        });
+        assert_eq!(invalid.status_code, StatusCode::BAD_REQUEST);
+        assert!(serde_json::to_string(&invalid.body)
+            .expect("problem body serializes")
+            .contains("group by fewer dimensions"));
+
+        let storage = handle_analytics_error(AnalyticsError::TrafficStorage {
+            operation: "aggregation",
+            detail: "connection refused by request-log-store.internal:8123".to_string(),
+        });
+        assert_eq!(storage.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        let body = serde_json::to_string(&storage.body).expect("problem body serializes");
+        assert!(!body.contains("request-log-store.internal"), "{body}");
+        assert!(body.contains("API traffic aggregation failed"), "{body}");
     }
 
     #[test]
