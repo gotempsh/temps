@@ -1180,6 +1180,25 @@ mod tests {
             "an in-flight refresh must not overwrite the new token"
         );
 
+        // A check of the old token that finishes after the rotation must not
+        // mark the new token expired.
+        assert!(
+            !manager
+                .mark_checked_connection_expired(rotated_connection, true)
+                .await
+                .unwrap(),
+            "a stale check is not recorded"
+        );
+        assert!(!stored(rotated_connection.id).await.is_expired);
+        assert!(
+            manager
+                .mark_checked_connection_expired(&after, true)
+                .await
+                .unwrap(),
+            "a check of the current token is recorded"
+        );
+        assert!(stored(rotated_connection.id).await.is_expired);
+
         let other = stored(untouched_connection.id).await;
         assert_eq!(
             manager
