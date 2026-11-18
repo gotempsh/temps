@@ -356,7 +356,15 @@ pub trait RunOps: Send + Sync {
     /// Creates the certificate's record, validated by `challenge`
     /// (`http-01` or `dns-01`); issuing it is [`Self::finish_certificate`].
     async fn start_certificate(&self, host: &str, challenge: &str) -> Result<(), String>;
-    async fn finish_certificate(&self, host: &str, email: &str) -> Result<(), String>;
+    /// Issues it over `challenge`: for `dns-01` Temps publishes the
+    /// challenge record through the zone's DNS provider, waits until public
+    /// resolvers see it, then has it validated and removes it again.
+    async fn finish_certificate(
+        &self,
+        host: &str,
+        email: &str,
+        challenge: &str,
+    ) -> Result<(), String>;
     async fn delete_certificate(&self, host: &str) -> Result<(), String>;
     async fn resolve(&self, host: &str) -> Vec<IpAddr>;
     async fn reachability(&self, host: &str) -> AddressReachability;
@@ -3093,7 +3101,11 @@ impl Runner<'_> {
                     }),
                 )
                 .await;
-                match self.ops.finish_certificate(&address, &email).await {
+                match self
+                    .ops
+                    .finish_certificate(&address, &email, challenge)
+                    .await
+                {
                     Ok(()) => Outcome::Done(Some("Issued by Let's Encrypt.".into())),
                     Err(error) => Outcome::Failed(error),
                 }
@@ -4826,7 +4838,13 @@ mod tests {
             self.log(format!("challenge {challenge}"));
             self.result("start_certificate")
         }
-        async fn finish_certificate(&self, _host: &str, _email: &str) -> Result<(), String> {
+        async fn finish_certificate(
+            &self,
+            _host: &str,
+            _email: &str,
+            challenge: &str,
+        ) -> Result<(), String> {
+            self.log(format!("issue over {challenge}"));
             self.result("finish_certificate")
         }
         async fn delete_certificate(&self, host: &str) -> Result<(), String> {
@@ -6082,6 +6100,12 @@ mod tests {
             "{calls:?}"
         );
         assert!(calls.contains(&"challenge dns-01".to_string()), "{calls:?}");
+        // Issued over DNS-01 too, which publishes the challenge record:
+        // validating without it fails for every new hostname.
+        assert!(
+            calls.contains(&"issue over dns-01".to_string()),
+            "{calls:?}"
+        );
         assert!(
             calls.contains(&"set_address_audience private to 100.64.0.0/10".to_string()),
             "{calls:?}"

@@ -3973,7 +3973,22 @@ impl RunOps for LiveOps {
             .map_err(text)
     }
 
-    async fn finish_certificate(&self, host: &str, email: &str) -> Result<(), String> {
+    async fn finish_certificate(
+        &self,
+        host: &str,
+        email: &str,
+        challenge: &str,
+    ) -> Result<(), String> {
+        if challenge == "dns-01" {
+            // The zone's DNS provider publishes the challenge record, public
+            // resolvers are waited for, and the record is removed after.
+            return self
+                .deps
+                .domains
+                .issue_dns01_through_provider(host, email, &self.deps.dns_providers)
+                .await
+                .map_err(|e| format!("Let's Encrypt could not issue {host} over DNS-01: {e}"));
+        }
         self.deps
             .domains
             .request_challenge(host, email)
@@ -3987,8 +4002,7 @@ impl RunOps for LiveOps {
             .map_err(|e| {
                 format!(
                     "Let's Encrypt could not validate {host}: {e}. Over HTTP-01 its DNS must \
-                     point at this ingress with port 80 open to the internet; over DNS-01 the \
-                     zone's DNS provider in Temps must be able to write TXT records."
+                     point at this ingress with port 80 open to the internet."
                 )
             })
     }

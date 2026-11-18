@@ -218,6 +218,53 @@ pub enum DomainServiceError {
     /// no-op success — no ACME request should be sent.
     #[error("Certificate already active for {0}: skipping on-demand re-issuance")]
     CertificateAlreadyActive(String),
+
+    /// DNS-01 through a provider was asked for `domain`, but no active DNS
+    /// provider in Temps manages a verified zone for it with automatic DNS.
+    #[error(
+        "No DNS provider in Temps manages a verified zone for {domain} with automatic DNS on, \
+         so Temps cannot publish its DNS-01 challenge"
+    )]
+    Dns01NoProvider { domain: String },
+
+    /// The zone's DNS provider could not be reached or did not create every
+    /// DNS-01 challenge record for `domain`.
+    #[error(
+        "DNS provider {provider} could not publish the DNS-01 challenge for {domain}: {detail}"
+    )]
+    Dns01Provider {
+        domain: String,
+        provider: String,
+        detail: String,
+    },
+
+    /// The challenge record was published but public resolvers did not see
+    /// it in time; Let's Encrypt was not asked to validate, so the order is
+    /// not spent.
+    #[error(
+        "The DNS-01 challenge record {record} for {domain} was published, but public resolvers \
+         did not see it within {waited_secs}s. Let's Encrypt was not asked to validate it yet; \
+         try again in a few minutes"
+    )]
+    Dns01NotVisible {
+        domain: String,
+        record: String,
+        waited_secs: u64,
+    },
+
+    /// Saving or reading the record of which DNS-01 challenge records were
+    /// published for `domain` failed. When `records_may_have_changed`, the
+    /// provider may hold records Temps can no longer name exactly.
+    #[error(
+        "The record of DNS-01 challenge records published for {domain} could not be saved or \
+         read{}: {detail}",
+        if *records_may_have_changed { " after the provider may have changed them" } else { "" }
+    )]
+    Dns01Receipt {
+        domain: String,
+        records_may_have_changed: bool,
+        detail: String,
+    },
 }
 
 /// Fixed telemetry label for a certificate's verification method. The column is
@@ -2343,6 +2390,8 @@ fn parse_retry_after(detail: &str) -> Option<DateTime<Utc>> {
     }
     None
 }
+
+mod dns01;
 
 #[cfg(test)]
 mod tests {
