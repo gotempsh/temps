@@ -647,7 +647,18 @@ impl GitProviderManager {
         redirect_uri: Option<String>,
         token: Option<String>,
     ) -> Result<git_providers::Model, GitProviderManagerError> {
-        let provider = self.get_provider(provider_id).await?;
+        // The merge below reads the stored credentials and writes them back
+        // with the supplied fields replaced. Read them under a row lock in the
+        // transaction that writes, so two concurrent updates serialize: an
+        // update that omits the token can no longer write back a token another
+        // update has just replaced (leaving the provider and its connections
+        // on different tokens).
+        let txn = self.db.begin().await?;
+        let provider = git_providers::Entity::find_by_id(provider_id)
+            .lock_exclusive()
+            .one(&txn)
+            .await?
+            .ok_or_else(|| GitProviderManagerError::ProviderNotFound(provider_id.to_string()))?;
 
         // Decrypt current auth config and parse to enum so we can merge per-variant.
         let current_json = self.decrypt_sensitive_data(&provider.auth_config).await?;
@@ -722,7 +733,6 @@ impl GitProviderManager {
         let auth_config_json = serde_json::to_value(&updated_method)?;
         let encrypted_config = self.encrypt_sensitive_data(&auth_config_json).await?;
 
-        let txn = self.db.begin().await?;
         let mut active_model: git_providers::ActiveModel = provider.into();
         active_model.auth_config = Set(encrypted_config);
         active_model.auth_method = Set(self.get_auth_method_type(&updated_method));
@@ -1225,5 +1235,115 @@ mod tests {
             config,
             AuthMethod::PersonalAccessToken { token } if token == "new-token"
         ));
+    }
+
+    /// An update that omits the token must not write back a token another
+    /// update replaced while it ran: the merge reads the stored credentials
+    /// under a row lock, so it waits for the rotation and keeps the new token.
+    #[tokio::test]
+    async fn a_credential_update_without_a_token_waits_for_a_concurrent_rotation() {
+        use sea_orm::{QuerySelect, TransactionTrait};
+
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.connection_arc();
+        let manager = Arc::new(GitProviderManager::new(
+            db.clone(),
+            Arc::new(
+                temps_core::EncryptionService::new(
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                )
+                .unwrap(),
+            ),
+            Arc::new(MockJobQueue) as Arc<dyn JobQueue>,
+            create_test_config_service(db.clone()),
+            Arc::new(temps_core::NoopAuditLogger),
+        ));
+        let pat_config = |token: &str| {
+            serde_json::to_value(AuthMethod::PersonalAccessToken {
+                token: token.to_string(),
+            })
+            .unwrap()
+        };
+        let provider = git_providers::ActiveModel {
+            name: Set("concurrent".to_string()),
+            provider_type: Set("gitlab".to_string()),
+            base_url: Set(None),
+            api_url: Set(None),
+            auth_method: Set("pat".to_string()),
+            auth_config: Set(manager
+                .encrypt_sensitive_data(&pat_config("old-token"))
+                .await
+                .unwrap()),
+            webhook_secret: Set(None),
+            is_active: Set(true),
+            is_default: Set(false),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        // A rotation in progress holds the row.
+        let rotation = db.begin().await.unwrap();
+        let locked = git_providers::Entity::find_by_id(provider.id)
+            .lock_exclusive()
+            .one(&rotation)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let token_less = {
+            let manager = manager.clone();
+            let provider_id = provider.id;
+            tokio::spawn(async move {
+                manager
+                    .update_provider_credentials(
+                        provider_id,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !token_less.is_finished(),
+            "the token-less update must wait for the row"
+        );
+
+        let mut rotated: git_providers::ActiveModel = locked.into();
+        rotated.auth_config = Set(manager
+            .encrypt_sensitive_data(&pat_config("new-token"))
+            .await
+            .unwrap());
+        rotated.update(&rotation).await.unwrap();
+        rotation.commit().await.unwrap();
+
+        token_less
+            .await
+            .unwrap()
+            .expect("the token-less update succeeds after the rotation");
+        let stored = git_providers::Entity::find_by_id(provider.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        let config: AuthMethod = serde_json::from_value(
+            manager
+                .decrypt_sensitive_data(&stored.auth_config)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            matches!(config, AuthMethod::PersonalAccessToken { token } if token == "new-token"),
+            "the concurrent rotation's token survives"
+        );
     }
 }
