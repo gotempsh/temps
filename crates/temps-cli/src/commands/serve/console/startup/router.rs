@@ -157,6 +157,7 @@ pub(super) async fn build_router(
     let admin_gate_state = Arc::new(
         crate::commands::serve::admin_gate_handler::AdminGateAppState {
             service: admin_gate_service,
+            audit_service: service_context.require_service::<dyn temps_core::AuditLogger>(),
         },
     );
     // Re-apply the plugin middleware stack (auth, request metadata, audit)

@@ -36,11 +36,13 @@ pub enum UpgradeTier {
 /// identified by a `-nightly.` segment (`v1.2.0-nightly.20260727.abc1234`),
 /// minted automatically by CI — see `is_nightly_tag`.
 ///
-/// Channel selection is **CLI-only** — there is no env-var fallback. The
-/// default is `Stable` and the user must explicitly pass `--channel beta`
-/// or `--channel nightly` to opt into prereleases. This is by design: an
-/// env var on a long-lived shell or CI runner could silently switch a host
-/// onto beta/nightly without an audit trail, which we want to prevent.
+/// Channel selection is **CLI-only** — there is no env-var fallback. With
+/// no `--channel`, `temps upgrade` stays on the channel the running binary
+/// is already on (see [`pick_upgrade_channel`]): a `-beta.N` build tracks
+/// beta, a `-nightly.` build tracks nightly, a plain `vX.Y.Z` build tracks
+/// stable. Switching channel takes an explicit `--channel`. No env var is
+/// consulted, by design: an env var on a long-lived shell or CI runner could
+/// silently switch a host onto beta/nightly without an audit trail.
 /// Pinning a specific `--version` ignores the channel entirely.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 pub enum UpgradeChannel {
@@ -122,13 +124,94 @@ impl UpgradeChannel {
     }
 }
 
+/// Where the channel `temps upgrade` tracks came from, so the plan it prints
+/// can say why it is looking at that channel.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ChannelSource {
+    /// `--channel <X>` on the command line.
+    Flag,
+    /// The deprecated `--stable` alias.
+    LegacyStableFlag,
+    /// No flag: the channel the running binary's version tag is on.
+    InstalledVersion,
+}
+
+/// The channel `temps upgrade` will track and why.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ChannelChoice {
+    pub(crate) channel: UpgradeChannel,
+    pub(crate) source: ChannelSource,
+}
+
+impl ChannelChoice {
+    /// Human-readable channel line for the upgrade plan.
+    fn describe(self) -> String {
+        match self.source {
+            ChannelSource::Flag | ChannelSource::LegacyStableFlag => {
+                self.channel.as_str().to_string()
+            }
+            ChannelSource::InstalledVersion => format!(
+                "{} (same as the installed version; pass --channel to switch)",
+                self.channel.as_str()
+            ),
+        }
+    }
+}
+
+/// Pick the channel `temps upgrade` tracks. CLI-only by design, no env var:
+///   1. `--channel <X>` wins;
+///   2. the deprecated `--stable` alias selects stable;
+///   3. otherwise stay on the running binary's channel
+///      ([`UpgradeChannel::for_installed_version`]), the same inference the
+///      console's **Update now** and `temps doctor` use when no channel is
+///      configured. A beta install upgrading with no flag therefore gets the
+///      newest beta instead of an older stable release (or none at all).
+pub(crate) fn pick_upgrade_channel(
+    flag: Option<UpgradeChannel>,
+    legacy_stable: bool,
+    current_version: &str,
+) -> ChannelChoice {
+    if let Some(channel) = flag {
+        return ChannelChoice {
+            channel,
+            source: ChannelSource::Flag,
+        };
+    }
+    if legacy_stable {
+        return ChannelChoice {
+            channel: UpgradeChannel::Stable,
+            source: ChannelSource::LegacyStableFlag,
+        };
+    }
+    ChannelChoice {
+        channel: UpgradeChannel::for_installed_version(current_version),
+        source: ChannelSource::InstalledVersion,
+    }
+}
+
+/// The command that installs exactly what `temps upgrade --check` just
+/// reported. A pinned `--version` or an explicit channel must be repeated:
+/// without it the follow-up would infer the installed version's channel and
+/// could pick a different release than the one shown.
+pub(crate) fn install_command(version: Option<&str>, choice: ChannelChoice) -> String {
+    if let Some(version) = version {
+        return format!("temps upgrade --version {version}");
+    }
+    match choice.source {
+        ChannelSource::Flag | ChannelSource::LegacyStableFlag => {
+            format!("temps upgrade --channel {}", choice.channel.as_str())
+        }
+        ChannelSource::InstalledVersion => "temps upgrade".to_string(),
+    }
+}
+
 /// Self-upgrade temps to the latest version
 #[derive(Args)]
 pub struct UpgradeCommand {
-    /// Release channel to track. Default: `stable`. Pass `--channel beta`
-    /// to opt into prereleases, or `--channel nightly` to track automated
-    /// nightly builds cut from `main`. Pinning a `--version` ignores the
-    /// channel.
+    /// Release channel to track. Default: the channel of the running
+    /// binary (a `-beta.N` build tracks beta, a `-nightly.` build tracks
+    /// nightly, a plain `vX.Y.Z` build tracks stable). Pass `--channel` to
+    /// switch. Pinning a `--version` ignores the channel.
     #[arg(long, value_enum)]
     pub channel: Option<UpgradeChannel>,
 
@@ -160,8 +243,7 @@ pub struct UpgradeCommand {
 
     /// DEPRECATED: alias for `--channel stable`. Kept for backward compat
     /// with existing scripts; will be removed in a future release. New
-    /// callers should use `--channel stable` (or just omit the flag — it's
-    /// the default).
+    /// callers should use `--channel stable`.
     #[arg(long, hide = true)]
     pub stable: bool,
 
@@ -313,21 +395,10 @@ impl UpgradeCommand {
         rt.block_on(self.run())
     }
 
-    /// Resolve the effective channel. CLI-only by design — no env-var
-    /// fallback so a host can never auto-switch onto beta without an
-    /// explicit `--channel` invocation.
-    /// Precedence:
-    ///   1. `--channel <X>` flag wins
-    ///   2. legacy `--stable` alias selects Stable
-    ///   3. default: Stable
-    fn resolved_channel(&self) -> UpgradeChannel {
-        if let Some(c) = self.channel {
-            return c;
-        }
-        if self.stable {
-            return UpgradeChannel::Stable;
-        }
-        UpgradeChannel::Stable
+    /// Resolve the effective channel for the running `current_version`.
+    /// CLI-only by design; see [`pick_upgrade_channel`].
+    fn resolved_channel(&self, current_version: &str) -> ChannelChoice {
+        pick_upgrade_channel(self.channel, self.stable, current_version)
     }
 
     /// Effective tier. CLI-only, defaults to OSS.
@@ -367,7 +438,8 @@ impl UpgradeCommand {
 
         // Resolve channel before any network call so log output reflects
         // the actual subscription. Pinning a `--version` ignores channel.
-        let channel = self.resolved_channel();
+        let channel_choice = self.resolved_channel(&current_version);
+        let channel = channel_choice.channel;
 
         // Fetch release info
         let release = if let Some(ref version) = self.version {
@@ -441,7 +513,7 @@ impl UpgradeCommand {
             "    {} -> {}{}",
             current_version, latest_version, prerelease_label
         );
-        println!("    Channel:  {}", channel.as_str());
+        println!("    Channel:  {}", channel_choice.describe());
         println!("    Platform: {}", target);
         println!("    Binary:   {}", binary_path.display());
         println!("    Size:     {:.1} MB", size_mb);
@@ -450,7 +522,10 @@ impl UpgradeCommand {
         print_lock_capacity_warning(self.database_url.as_deref()).await;
 
         if self.check {
-            println!("Run `temps upgrade` to install this update.");
+            println!(
+                "Run `{}` to install this update.",
+                install_command(self.version.as_deref(), channel_choice)
+            );
             return Ok(());
         }
 
@@ -1260,22 +1335,44 @@ async fn fetch_latest_release_in_channel_from(
         page += 1;
     }
 
-    pick_installable_release_for_channel(releases, channel, target).ok_or_else(|| match channel {
-        UpgradeChannel::Stable => anyhow::anyhow!(
-            "No stable releases with a temps-{}.tar.gz asset found. Try `--channel beta` to include prereleases.",
+    // Decided before the picker consumes the list: an empty channel and a
+    // channel without this platform's archive need different advice.
+    let channel_has_releases = releases
+        .iter()
+        .any(|release| channel.includes(release) && version_sort_key(&release.tag_name).is_some());
+    pick_installable_release_for_channel(releases, channel, target)
+        .ok_or_else(|| no_installable_release_error(channel, channel_has_releases, target))
+}
+
+/// Explain why a channel offers nothing to install. The stable channel with
+/// no release at all is the common case while Temps ships only betas: say so
+/// plainly and name `--channel beta`, rather than an obscure lookup failure.
+fn no_installable_release_error(
+    channel: UpgradeChannel,
+    channel_has_releases: bool,
+    target: &str,
+) -> anyhow::Error {
+    match (channel, channel_has_releases) {
+        (UpgradeChannel::Stable, false) => anyhow::anyhow!(
+            "The stable channel has no releases yet: every Temps release so far is a \
+             prerelease. Run `temps upgrade --channel beta` to install the newest beta."
+        ),
+        (UpgradeChannel::Stable, true) => anyhow::anyhow!(
+            "No stable release ships a temps-{}.tar.gz archive for this platform. \
+             Run `temps upgrade --channel beta` to include prereleases.",
             target
         ),
-        UpgradeChannel::Beta => anyhow::anyhow!(
+        (UpgradeChannel::Beta, _) => anyhow::anyhow!(
             "No stable or beta releases with a temps-{}.tar.gz asset found.",
             target
         ),
-        UpgradeChannel::Nightly => anyhow::anyhow!(
+        (UpgradeChannel::Nightly, _) => anyhow::anyhow!(
             "No nightly releases with a temps-{}.tar.gz asset found. The nightly build only cuts a new tag when \
              `main` has commits since the last one — check the 'Nightly Release' \
              workflow run history, or try `--channel beta`.",
             target
         ),
-    })
+    }
 }
 
 fn release_page_requires_next(releases: &[GitHubRelease]) -> bool {
@@ -4601,11 +4698,180 @@ mod tests {
     }
 
     #[test]
-    fn resolved_channel_defaults_to_stable() {
-        // CLI-only design: with no flags set, the user always lands on
-        // stable. No env var or implicit state can change this. This is
-        // the contract operators rely on — running `temps upgrade` on a
-        // fresh shell never lands them on a beta build.
+    fn picker_beta_binary_without_flag_tracks_beta() {
+        // A reported install ran beta (the server installer's default) and
+        // plain `temps upgrade` looked at stable instead. With no flag the
+        // upgrader now stays on the running binary's channel.
+        let choice = pick_upgrade_channel(None, false, "v0.1.0-beta.12");
+        assert_eq!(choice.channel, UpgradeChannel::Beta);
+        assert_eq!(choice.source, ChannelSource::InstalledVersion);
+        assert!(choice.describe().contains("--channel"));
+    }
+
+    #[test]
+    fn picker_stable_binary_without_flag_tracks_stable() {
+        let choice = pick_upgrade_channel(None, false, "v1.2.0");
+        assert_eq!(choice.channel, UpgradeChannel::Stable);
+        assert_eq!(choice.source, ChannelSource::InstalledVersion);
+    }
+
+    #[test]
+    fn picker_nightly_binary_without_flag_tracks_nightly() {
+        let choice = pick_upgrade_channel(None, false, "v1.2.0-nightly.20260727.abc1234");
+        assert_eq!(choice.channel, UpgradeChannel::Nightly);
+        assert_eq!(choice.source, ChannelSource::InstalledVersion);
+    }
+
+    #[test]
+    fn picker_explicit_flag_overrides_installed_channel() {
+        // An explicit flag is the only way to switch channel, in both
+        // directions.
+        let choice = pick_upgrade_channel(Some(UpgradeChannel::Stable), false, "v1.2.0-beta.4");
+        assert_eq!(choice.channel, UpgradeChannel::Stable);
+        assert_eq!(choice.source, ChannelSource::Flag);
+        assert_eq!(choice.describe(), "stable");
+        let choice = pick_upgrade_channel(Some(UpgradeChannel::Beta), false, "v1.2.0");
+        assert_eq!(choice.channel, UpgradeChannel::Beta);
+    }
+
+    #[test]
+    fn picker_legacy_stable_flag_overrides_beta_binary() {
+        let choice = pick_upgrade_channel(None, true, "v1.2.0-beta.4");
+        assert_eq!(choice.channel, UpgradeChannel::Stable);
+        assert_eq!(choice.source, ChannelSource::LegacyStableFlag);
+    }
+
+    #[test]
+    fn check_follow_up_repeats_the_checked_selection() {
+        // `--channel stable --check` on a beta binary: the follow-up must
+        // keep stable, or plain `temps upgrade` would infer beta.
+        let explicit = pick_upgrade_channel(Some(UpgradeChannel::Stable), false, "v1.2.0-beta.4");
+        assert_eq!(
+            install_command(None, explicit),
+            "temps upgrade --channel stable"
+        );
+        let legacy = pick_upgrade_channel(None, true, "v1.2.0-beta.4");
+        assert_eq!(
+            install_command(None, legacy),
+            "temps upgrade --channel stable"
+        );
+        // Inferred channel: the plain command infers the same one again.
+        let inferred = pick_upgrade_channel(None, false, "v1.2.0-beta.4");
+        assert_eq!(install_command(None, inferred), "temps upgrade");
+        // A pinned version is what was checked, whatever the channel.
+        assert_eq!(
+            install_command(Some("v1.3.0"), explicit),
+            "temps upgrade --version v1.3.0"
+        );
+    }
+
+    #[test]
+    fn no_stable_releases_names_channel_beta() {
+        // Only prereleases published: the stable channel is empty and the
+        // error must say so and name the flag, not report a missing asset.
+        let releases = [
+            release("v1.0.0-beta.1", true, false),
+            release("v1.0.0-beta.2", true, false),
+        ];
+        let has_stable = releases
+            .iter()
+            .any(|r| UpgradeChannel::Stable.includes(r) && version_sort_key(&r.tag_name).is_some());
+        assert!(!has_stable);
+        let message =
+            no_installable_release_error(UpgradeChannel::Stable, has_stable, "linux-amd64")
+                .to_string();
+        assert!(
+            message.contains("stable channel has no releases yet"),
+            "{message}"
+        );
+        assert!(
+            message.contains("temps upgrade --channel beta"),
+            "{message}"
+        );
+        assert!(!message.contains("linux-amd64"), "{message}");
+
+        // Stable releases exist but none for this platform: different advice.
+        let message =
+            no_installable_release_error(UpgradeChannel::Stable, true, "linux-amd64").to_string();
+        assert!(message.contains("temps-linux-amd64.tar.gz"), "{message}");
+        assert!(message.contains("--channel beta"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn fetch_stable_with_only_betas_published_reports_empty_channel() {
+        use axum::{routing::get, Json, Router};
+
+        /// The fields of GitHub's release JSON that [`GitHubRelease`] reads,
+        /// typed so the fixture cannot drift from them silently.
+        #[derive(serde::Serialize)]
+        struct ReleaseFixture {
+            tag_name: &'static str,
+            prerelease: bool,
+            draft: bool,
+            assets: Vec<AssetFixture>,
+            html_url: &'static str,
+        }
+
+        #[derive(serde::Serialize)]
+        struct AssetFixture {
+            name: &'static str,
+            browser_download_url: &'static str,
+            size: u64,
+        }
+
+        async fn releases() -> Json<Vec<ReleaseFixture>> {
+            Json(vec![ReleaseFixture {
+                tag_name: "v0.1.0-beta.3",
+                prerelease: true,
+                draft: false,
+                assets: vec![AssetFixture {
+                    name: "temps-test-target.tar.gz",
+                    browser_download_url: "https://example.test/beta.tar.gz",
+                    size: 1,
+                }],
+                html_url: "https://example.test/beta",
+            }])
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("listener should have an address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/releases", get(releases)))
+                .await
+                .expect("test release server should run");
+        });
+
+        let error = fetch_latest_release_in_channel_from(
+            UpgradeChannel::Stable,
+            &format!("http://{address}/releases"),
+            "test-target",
+        )
+        .await
+        .expect_err("stable has no release");
+        let beta = fetch_latest_release_in_channel_from(
+            UpgradeChannel::Beta,
+            &format!("http://{address}/releases"),
+            "test-target",
+        )
+        .await
+        .expect("beta release should be found");
+
+        server.abort();
+        assert!(
+            error.to_string().contains("temps upgrade --channel beta"),
+            "{error}"
+        );
+        assert_eq!(beta.tag_name, "v0.1.0-beta.3");
+    }
+
+    #[test]
+    fn resolved_channel_follows_installed_version_without_flags() {
+        // CLI-only design: with no flags set no env var or settings row is
+        // consulted; the running binary's tag decides.
         let cmd = UpgradeCommand {
             channel: None,
             version: None,
@@ -4620,14 +4886,20 @@ mod tests {
             data_dir: None,
             database_url: None,
         };
-        assert_eq!(cmd.resolved_channel(), UpgradeChannel::Stable);
+        assert_eq!(
+            cmd.resolved_channel("v1.2.0-beta.4").channel,
+            UpgradeChannel::Beta
+        );
+        assert_eq!(
+            cmd.resolved_channel("v1.2.0").channel,
+            UpgradeChannel::Stable
+        );
     }
 
     #[test]
     fn resolved_channel_legacy_stable_flag_selects_stable() {
-        // The legacy `--stable` flag is now a no-op (Stable is already
-        // default), but we accept it for backward compat with existing
-        // CI scripts. Verify it doesn't somehow yield Beta.
+        // The legacy `--stable` flag is accepted for backward compat with
+        // existing CI scripts and still means stable, even on a beta binary.
         let cmd = UpgradeCommand {
             channel: None,
             version: None,
@@ -4642,7 +4914,10 @@ mod tests {
             data_dir: None,
             database_url: None,
         };
-        assert_eq!(cmd.resolved_channel(), UpgradeChannel::Stable);
+        assert_eq!(
+            cmd.resolved_channel("v1.2.0-beta.4").channel,
+            UpgradeChannel::Stable
+        );
     }
 
     #[test]
@@ -4664,7 +4939,7 @@ mod tests {
             data_dir: None,
             database_url: None,
         };
-        assert_eq!(cmd.resolved_channel(), UpgradeChannel::Beta);
+        assert_eq!(cmd.resolved_channel("v1.2.0").channel, UpgradeChannel::Beta);
     }
 
     #[test]
@@ -4684,7 +4959,7 @@ mod tests {
             data_dir: None,
             database_url: None,
         };
-        assert_eq!(cmd.resolved_channel(), UpgradeChannel::Beta);
+        assert_eq!(cmd.resolved_channel("v1.2.0").channel, UpgradeChannel::Beta);
     }
 
     // ── EE tier + license logic ──────────────────────────────────────────

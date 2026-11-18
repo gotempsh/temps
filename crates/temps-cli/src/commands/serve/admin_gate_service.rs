@@ -67,6 +67,56 @@ pub struct AdminGateSettings {
     pub trust_forwarded_for: bool,
 }
 
+impl AdminGateSettings {
+    /// The same rules in the form the live config reports them (bare IPs as
+    /// `/32` or `/128`, hosts lowercased), so an audit record compares like
+    /// with like. A stored document this build cannot parse is returned as
+    /// stored rather than dropped.
+    pub fn normalized(&self) -> AdminGateSettings {
+        match AdminGateConfig::from_parts(
+            &self.allowed_ips,
+            &self.allowed_hosts,
+            self.trust_forwarded_for,
+            AdminGateSource::Db,
+        ) {
+            Ok(cfg) => AdminGateSettings {
+                allowed_ips: cfg.allowed_nets.iter().map(|n| n.to_string()).collect(),
+                allowed_hosts: cfg.allowed_hosts.as_ref().clone(),
+                trust_forwarded_for: cfg.trust_forwarded_for,
+            },
+            Err(_) => self.clone(),
+        }
+    }
+}
+
+/// The stored rules a write replaced.
+#[derive(Debug, Clone)]
+pub enum PreviousAdminGate {
+    /// The rules as stored (empty lists when none had been saved).
+    Rules(AdminGateSettings),
+    /// The stored document did not parse (a hand-edited row, say). Kept as
+    /// its JSON text for the audit record; it never blocks saving valid
+    /// rules over it, since that save is how an operator repairs it.
+    Unreadable(String),
+}
+
+/// Upper bound on an unreadable previous document carried into an audit
+/// record, so a corrupt row cannot bloat the audit log.
+const MAX_UNREADABLE_PREVIOUS_CHARS: usize = 2_000;
+
+/// Result of a successful [`AdminGateService::update`].
+#[derive(Debug, Clone)]
+pub struct AdminGateUpdate {
+    /// The rules this write replaced, read from the row it locked: what the
+    /// database held at the moment of the change, not a snapshot taken
+    /// before it (which an overlapping save could already have replaced).
+    pub previous: PreviousAdminGate,
+    /// The config this write applied. Owned by this update rather than read
+    /// back from the shared handle, which a concurrent save may already have
+    /// replaced, so `previous` and `current` always describe the same change.
+    pub current: Arc<AdminGateConfig>,
+}
+
 #[derive(Debug, Error)]
 pub enum AdminGateServiceError {
     #[error("Admin gate config invalid: {0}")]
@@ -223,7 +273,7 @@ impl AdminGateService {
         new_settings: AdminGateSettings,
         caller_ips: AdminGateCallerIps,
         caller_host: Option<&str>,
-    ) -> Result<Arc<AdminGateConfig>, AdminGateServiceError> {
+    ) -> Result<AdminGateUpdate, AdminGateServiceError> {
         if self.env_overridden {
             return Err(AdminGateServiceError::EnvOverridden);
         }
@@ -249,8 +299,9 @@ impl AdminGateService {
             }
         }
 
-        persist_to_db(self.db.as_ref(), &new_settings).await?;
-        let prev = self.handle.store(candidate.clone());
+        let previous = persist_to_db(self.db.as_ref(), &new_settings).await?;
+        let applied = Arc::new(candidate.clone());
+        let prev = self.handle.store(candidate);
         info!(
             allowed_ips = ?new_settings.allowed_ips,
             allowed_hosts = ?new_settings.allowed_hosts,
@@ -258,7 +309,10 @@ impl AdminGateService {
             previous_source = ?prev.source,
             "Admin gate: configuration reloaded from DB"
         );
-        Ok(self.handle.current())
+        Ok(AdminGateUpdate {
+            previous,
+            current: applied,
+        })
     }
 
     /// Re-read the gate config from the DB and swap the live handle.
@@ -551,10 +605,13 @@ fn unknown_admin_gate_keys(value: &serde_json::Value) -> Vec<String> {
 /// lock a concurrent `ConfigService::update_settings` can compute its merge
 /// from a snapshot that predates this write and clobber the allowlist the
 /// operator just saved.
+///
+/// Returns the `admin_gate` document the write replaced, read under the same
+/// lock, so the caller can record exactly what this write changed.
 async fn persist_to_db(
     db: &DatabaseConnection,
     new_settings: &AdminGateSettings,
-) -> Result<(), AdminGateServiceError> {
+) -> Result<PreviousAdminGate, AdminGateServiceError> {
     let now = chrono::Utc::now();
     let new_value = serde_json::to_value(new_settings)?;
     let is_postgres = matches!(
@@ -571,6 +628,10 @@ async fn persist_to_db(
         row_query
     };
     let row = row_query.one(&txn).await?;
+    let previous = previous_admin_gate(
+        row.as_ref()
+            .and_then(|existing| existing.data.get("admin_gate")),
+    );
 
     match row {
         Some(existing) => {
@@ -603,7 +664,29 @@ async fn persist_to_db(
     }
 
     txn.commit().await?;
-    Ok(())
+    Ok(previous)
+}
+
+/// Classify the stored `admin_gate` document a write is about to replace.
+/// Never fails: a document this build cannot parse must not stop valid rules
+/// from being saved over it.
+fn previous_admin_gate(stored: Option<&serde_json::Value>) -> PreviousAdminGate {
+    let Some(value) = stored.filter(|value| !value.is_null()) else {
+        return PreviousAdminGate::Rules(AdminGateSettings::default());
+    };
+    match serde_json::from_value::<AdminGateSettings>(value.clone()) {
+        Ok(settings) => PreviousAdminGate::Rules(settings),
+        Err(e) => {
+            tracing::warn!(
+                target: "temps_cli::admin_gate",
+                error = %e,
+                "Admin gate: the stored `admin_gate` document is malformed; saving the new rules \
+                 over it and recording the old document as unreadable in the audit log"
+            );
+            let raw = value.to_string();
+            PreviousAdminGate::Unreadable(raw.chars().take(MAX_UNREADABLE_PREVIOUS_CHARS).collect())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1006,21 +1089,148 @@ mod tests {
             .unwrap();
 
         let caller = IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3));
-        svc.update(
-            AdminGateSettings {
-                allowed_ips: vec!["10.0.0.0/8".to_string()],
-                allowed_hosts: vec!["admin.example.com".to_string()],
-                trust_forwarded_for: false,
-            },
-            AdminGateCallerIps::direct(caller),
-            Some("admin.example.com"),
-        )
-        .await
-        .unwrap();
+        let update = svc
+            .update(
+                AdminGateSettings {
+                    allowed_ips: vec!["10.0.0.0/8".to_string()],
+                    allowed_hosts: vec!["admin.example.com".to_string()],
+                    trust_forwarded_for: false,
+                },
+                AdminGateCallerIps::direct(caller),
+                Some("admin.example.com"),
+            )
+            .await
+            .unwrap();
+        // The row had no rules saved, so this write replaced nothing.
+        let PreviousAdminGate::Rules(previous) = &update.previous else {
+            panic!("expected parsed previous rules, got {:?}", update.previous);
+        };
+        assert!(previous.allowed_ips.is_empty());
+        assert!(previous.allowed_hosts.is_empty());
 
         let cfg = handle.current();
         assert_eq!(cfg.source, AdminGateSource::Db);
         assert_eq!(cfg.allowed_nets.len(), 1);
         assert_eq!(cfg.allowed_hosts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn update_reports_the_rules_it_replaced_from_the_locked_row() {
+        // Boot saw no rules, but by the time this write locks the row another
+        // save has stored a host rule. The update must report the rules it
+        // actually replaced (read under the lock), not the boot snapshot.
+        let bootstrap_row = settings_row(serde_json::json!({}));
+        let concurrently_saved = settings_row(serde_json::json!({
+            "admin_gate": {
+                "allowed_ips": ["10.0.0.5"],
+                "allowed_hosts": ["Other.Example.com"],
+                "trust_forwarded_for": false
+            }
+        }));
+        let returned_row = settings_row(serde_json::json!({
+            "admin_gate": {
+                "allowed_ips": [],
+                "allowed_hosts": ["admin.example.com"],
+                "trust_forwarded_for": false
+            }
+        }));
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![bootstrap_row]])
+            .append_query_results(vec![vec![concurrently_saved]])
+            .append_query_results(vec![vec![returned_row]])
+            .into_connection();
+        let (svc, _handle) = AdminGateService::new(Arc::new(db), &[], &[], false)
+            .await
+            .unwrap();
+        assert!(svc.snapshot().is_noop());
+
+        let update = svc
+            .update(
+                AdminGateSettings {
+                    allowed_ips: vec![],
+                    allowed_hosts: vec!["admin.example.com".to_string()],
+                    trust_forwarded_for: false,
+                },
+                AdminGateCallerIps::direct(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))),
+                Some("admin.example.com"),
+            )
+            .await
+            .unwrap();
+
+        let PreviousAdminGate::Rules(previous) = &update.previous else {
+            panic!("expected parsed previous rules, got {:?}", update.previous);
+        };
+        assert_eq!(previous.allowed_hosts, vec!["Other.Example.com"]);
+        let normalized = previous.normalized();
+        assert_eq!(normalized.allowed_ips, vec!["10.0.0.5/32"]);
+        assert_eq!(normalized.allowed_hosts, vec!["other.example.com"]);
+        assert_eq!(
+            update.current.allowed_hosts.as_ref(),
+            &vec!["admin.example.com".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn update_saves_valid_rules_over_a_malformed_stored_document() {
+        // A hand-edited row stores `allowed_hosts` as a string. Saving valid
+        // rules from the console is how the operator repairs it, so the
+        // malformed old document must not fail the write; it is reported as
+        // unreadable for the audit record instead.
+        let bootstrap_row = settings_row(serde_json::json!({}));
+        let malformed_row = settings_row(serde_json::json!({
+            "admin_gate": { "allowed_hosts": "not-a-list" }
+        }));
+        let returned_row = settings_row(serde_json::json!({
+            "admin_gate": {
+                "allowed_ips": [],
+                "allowed_hosts": ["admin.example.com"],
+                "trust_forwarded_for": false
+            }
+        }));
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![bootstrap_row]])
+            .append_query_results(vec![vec![malformed_row]])
+            .append_query_results(vec![vec![returned_row]])
+            .into_connection();
+        let (svc, handle) = AdminGateService::new(Arc::new(db), &[], &[], false)
+            .await
+            .unwrap();
+
+        let update = svc
+            .update(
+                AdminGateSettings {
+                    allowed_ips: vec![],
+                    allowed_hosts: vec!["admin.example.com".to_string()],
+                    trust_forwarded_for: false,
+                },
+                AdminGateCallerIps::direct(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+                Some("admin.example.com"),
+            )
+            .await
+            .expect("valid rules must save over a malformed document");
+
+        match &update.previous {
+            PreviousAdminGate::Unreadable(raw) => assert!(raw.contains("not-a-list"), "{raw}"),
+            other => panic!("expected an unreadable previous document, got {other:?}"),
+        }
+        assert_eq!(
+            handle.current().allowed_hosts.as_ref(),
+            &vec!["admin.example.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn unreadable_previous_document_is_bounded() {
+        let huge = serde_json::json!({ "allowed_hosts": "x".repeat(10_000) });
+        match previous_admin_gate(Some(&huge)) {
+            PreviousAdminGate::Unreadable(raw) => {
+                assert_eq!(raw.chars().count(), MAX_UNREADABLE_PREVIOUS_CHARS)
+            }
+            other => panic!("expected unreadable, got {other:?}"),
+        }
+        assert!(matches!(
+            previous_admin_gate(None),
+            PreviousAdminGate::Rules(_)
+        ));
     }
 }
