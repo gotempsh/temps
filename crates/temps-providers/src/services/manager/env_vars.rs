@@ -1040,6 +1040,28 @@ impl ExternalServiceManager {
             || normalized.starts_with("private_")
     }
 
+    /// The sensitive parameters (passwords, keys, tokens, credential URLs) to
+    /// which `parameters` gives a non-empty value, sorted. Names only.
+    ///
+    /// The AI assistant may not supply these: a value it passes is one it
+    /// typed, so it went through the model provider and the chat. Temps
+    /// generates the ones a service needs when they are left out.
+    pub fn supplied_sensitive_parameters(
+        parameters: &HashMap<String, serde_json::Value>,
+    ) -> Vec<String> {
+        let mut names: Vec<String> = parameters
+            .iter()
+            .filter(|(name, value)| {
+                Self::is_sensitive_parameter(name)
+                    && !value.is_null()
+                    && value.as_str().is_none_or(|text| !text.trim().is_empty())
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
     pub(super) fn mask_sensitive_parameter_values(
         parameters: &mut HashMap<String, serde_json::Value>,
     ) -> Vec<String> {
@@ -1275,6 +1297,13 @@ mod tests {
     #[test]
     fn test_service_parameter_policy_does_not_mask_operational_settings() {
         assert!(ExternalServiceManager::is_sensitive_parameter("password"));
+        let supplied = ExternalServiceManager::supplied_sensitive_parameters(&HashMap::from([
+            ("password".to_string(), serde_json::json!("typed-in-chat")),
+            ("root_password".to_string(), serde_json::json!("")),
+            ("api_token".to_string(), serde_json::Value::Null),
+            ("database".to_string(), serde_json::json!("app")),
+        ]));
+        assert_eq!(supplied, vec!["password".to_string()]);
         assert!(ExternalServiceManager::is_sensitive_parameter("api_token"));
         assert!(ExternalServiceManager::is_sensitive_parameter(
             "DATABASE_URL"

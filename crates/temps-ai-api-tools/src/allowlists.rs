@@ -1053,6 +1053,12 @@ pub const AI_WRITE_ALLOWLIST: &[&str] = &[
     "update_s3_source",
     // Checks a candidate bucket before it is saved; the same secret_key rules.
     "test_s3_connection_preview",
+    // Which permissions a Cloudflare token has, before it is saved anywhere.
+    // It writes nothing, but it takes the token, and a `secret_ref:` handle is
+    // only resolved for a confirmed write: as a read-only POST the assistant
+    // could never pass one, and it used to tell users the operation did not
+    // exist. Same shape as `test_s3_connection_preview`.
+    "check_cloudflare_token",
     "create_backup_schedule",
     "update_backup_schedule",
     "enable_backup_schedule",
@@ -1165,12 +1171,15 @@ pub const AI_WRITE_ALLOWLIST: &[&str] = &[
     "create_alert",
     "update_alert",
     // ── Global notification control plane ──
-    // Provider payloads may contain credentials. `temps_write` encrypts
-    // executable parameters at rest and redacts both the approval card and
-    // result returned to the model. DELETE operations remain explicit even
-    // in Auto mode through `platform_request_is_destructive`.
-    "create_notification_provider",
-    "update_notification_provider",
+    // Every credential here is a `SecretString` (`webhook_url`, `password`,
+    // `api_token`, each webhook header value), so the model passes a
+    // `secret_ref:` handle from `request_secret` and never the value. The
+    // generic `create_notification_provider` / `update_notification_provider`
+    // take an untyped `config` the secret-slot layer cannot see into, so a
+    // credential there would be typed into the chat: they stay in the console
+    // (every provider type has a typed operation below). DELETE operations
+    // remain explicit even in Auto mode through
+    // `platform_request_is_destructive`.
     "delete_notification_provider",
     "create_slack_provider",
     "update_slack_provider",
@@ -1376,10 +1385,6 @@ pub const AI_READ_SAFE_POSTS: &[&str] = &[
     // Read-only POST: *Make it reachable* plans change nothing; a plan is
     // only kept for `apply`, which stays with the operator.
     "plan_environment_reachability",
-    // Read-only POST: which permissions a Cloudflare token has. Nothing is
-    // created or stored; the token is a `SecretString`, so the assistant
-    // passes it through a secret slot.
-    "check_cloudflare_token",
     // Read-only POST: one test lookup of a *.temps.local name from one
     // node's resolver (ADR-095), SettingsRead. It stores nothing; the body
     // is a POST only because it names the node, the name and the type.

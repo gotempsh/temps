@@ -8039,6 +8039,16 @@ export type CreateConnectorRequest = {
      */
     provider: string;
     /**
+     * Answers to the provider's credential fields (kind `secret`, such as an
+     * OAuth client secret), by field key. Same as giving them in `values`,
+     * but published as credentials, so the AI assistant passes a
+     * `secret_ref:` handle here and never sees the value. The assistant may
+     * not put a credential field in `values`. A key cannot be in both.
+     */
+    secrets?: {
+        [key: string]: SecretString;
+    };
+    /**
      * Answers to the provider's setup fields, by field key. DNS provider
      * fields take the provider's id; every other field takes a string.
      */
@@ -8086,7 +8096,7 @@ export type CreateDashboardRequest = {
 };
 
 export type CreateDeliveryProfileRequest = {
-    bunny_api_key?: string | null;
+    bunny_api_key?: SecretString | null;
     bunny_pull_zone_id?: number | null;
     name: string;
     provider_kind: DeliveryProviderKind;
@@ -38939,13 +38949,19 @@ export type WayInChoice = {
 
 /**
  * Configuration for a generic webhook notification provider
+ *
+ * Request-side config. Not `Serialize`: every header value is a
+ * `SecretString` (reads mask them all, because they are where a webhook's
+ * credential goes), so use [`WebhookConfig::into_stored_value`].
  */
 export type WebhookConfig = {
     /**
-     * Custom headers to include in the request (e.g., for authentication tokens)
+     * Custom headers to include in the request (e.g., for authentication
+     * tokens). Every value is treated as a credential: write-only, masked on
+     * read, and taken by the AI assistant through a secret slot.
      */
     headers?: {
-        [key: string]: string;
+        [key: string]: SecretString;
     };
     /**
      * HTTP method to use (POST, PUT, PATCH). Defaults to POST.

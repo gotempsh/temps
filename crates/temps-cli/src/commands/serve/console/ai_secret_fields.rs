@@ -192,7 +192,6 @@ const UNMARKED: &[&str] = &[
     "createHttpCheck:credential",
     "create_agent:api_key",
     "create_bulk_activation_job:plan_token",
-    "create_delivery_profile:bunny_api_key",
     "create_generic_provider:token_username",
     "create_plan:credentials.token",
     "create_user:password",
@@ -233,6 +232,118 @@ const NOT_CREDENTIALS: &[&str] = &[
     "update_settings:multi_node.join_token_hash",
 ];
 
+/// Whether `schema` is a map or value whose contents the spec does not
+/// describe: an object with no `properties` whose `additionalProperties` is not
+/// a flagged credential, or a schema with no type at all. A credential inside
+/// one is invisible to the secret-slot layer, which only knows the paths the
+/// spec flags, so the model would have to type it.
+fn is_free_form(spec: &Value, schema: &Value, depth: usize) -> bool {
+    if depth > MAX_SCHEMA_DEPTH || schema.get("$ref").is_some() {
+        return false;
+    }
+    if ["allOf", "oneOf", "anyOf"]
+        .iter()
+        .any(|key| schema.get(*key).is_some())
+    {
+        return ["allOf", "oneOf", "anyOf"].iter().any(|key| {
+            schema[*key].as_array().is_some_and(|parts| {
+                parts.iter().any(|p| {
+                    p.get("type") != Some(&Value::from("null")) && is_free_form(spec, p, depth + 1)
+                })
+            })
+        });
+    }
+    let is_object = match schema.get("type") {
+        Some(Value::String(t)) => t == "object",
+        Some(Value::Array(types)) => types.iter().any(|t| t == "object"),
+        None => {
+            // `{}` (any JSON value) is as opaque as an untyped object.
+            return schema.get("properties").is_none()
+                && schema.get("items").is_none()
+                && schema.get("enum").is_none()
+                && schema.get("const").is_none();
+        }
+        _ => false,
+    };
+    if !is_object || schema.get("properties").is_some() {
+        return false;
+    }
+    match schema.get("additionalProperties") {
+        Some(values) if values.is_object() => {
+            !is_flagged(spec, values, depth + 1) && !has_described_shape(spec, values, depth + 1)
+        }
+        _ => true,
+    }
+}
+
+/// A map whose values are themselves objects with named properties is walked
+/// like any other schema; only opaque values count as free-form.
+fn has_described_shape(spec: &Value, schema: &Value, depth: usize) -> bool {
+    if depth > MAX_SCHEMA_DEPTH {
+        return false;
+    }
+    if let Some((_, target)) = resolve(spec, schema) {
+        return has_described_shape(spec, target, depth + 1);
+    }
+    schema.get("properties").is_some()
+}
+
+/// `operation_id:field.path` of every free-form request field of the given
+/// operations.
+fn free_form_fields(spec: &Value, operations: &BTreeSet<String>) -> BTreeSet<String> {
+    let mut found = BTreeSet::new();
+    let Some(paths) = spec["paths"].as_object() else {
+        return found;
+    };
+    for item in paths.values().filter_map(Value::as_object) {
+        for operation in item.values() {
+            let Some(id) = operation["operationId"].as_str() else {
+                continue;
+            };
+            if !operations.contains(id) {
+                continue;
+            }
+            let Some(body) = operation.pointer("/requestBody/content/application~1json/schema")
+            else {
+                continue;
+            };
+            let mut fields = Vec::new();
+            walk(spec, body, "", 0, &mut Vec::new(), &mut fields);
+            for (path, schema) in fields {
+                if is_free_form(spec, schema, 0) {
+                    found.insert(format!("{id}:{path}"));
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Free-form request fields of operations the assistant can call, each
+/// reviewed: it holds no credential, or the handler refuses one the assistant
+/// sends. Adding an entry is the same security review as adding the operation.
+const REVIEWED_FREE_FORM: &[(&str, &str)] = &[
+    (
+        "create_ingress_connector:values",
+        "setup answers; the handler refuses a `secret` field from the assistant, which passes it in the flagged `secrets` map",
+    ),
+    (
+        "create_service:parameters",
+        "service settings; the handler refuses a sensitive parameter from the assistant and Temps generates the credentials",
+    ),
+    ("create_thread_artifact:payload", "artifact content the model writes itself"),
+    ("update_environment_settings:target_labels", "placement labels"),
+    ("deploy_from_image:metadata", "free-form deployment labels"),
+    ("register_external_image:metadata", "free-form image labels"),
+    ("send_workflow_event:payload", "application event payload the user's workflow consumes"),
+    ("start_workflow_run:input", "application workflow input"),
+    ("create_alert_rule:trigger_config", "thresholds and windows"),
+    ("update_alert_rule:trigger_config", "thresholds and windows"),
+    ("create_flag:default_value", "feature flag value"),
+    ("update_flag:default_value", "feature flag value"),
+    ("set_flag_environment:value", "feature flag value"),
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,6 +368,64 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n  ")
         );
+    }
+
+    fn assistant_operations() -> BTreeSet<String> {
+        super::super::ai_write_allowlist()
+            .into_iter()
+            .chain(super::super::ai_read_safe_posts())
+            .collect()
+    }
+
+    /// The name check above cannot see into a map: a free-form `config`,
+    /// `values` or `headers` object let the assistant type a credential into
+    /// an operation it could call (the generic notification provider config,
+    /// a tunnel's OAuth client secret, a webhook's Authorization header).
+    /// Every free-form field the assistant can reach must be reviewed.
+    #[test]
+    fn every_free_form_field_the_assistant_can_send_is_reviewed() {
+        let found = free_form_fields(&spec(), &assistant_operations());
+        let reviewed: BTreeSet<String> = REVIEWED_FREE_FORM
+            .iter()
+            .map(|(field, _)| field.to_string())
+            .collect();
+        let new: Vec<_> = found.difference(&reviewed).collect();
+        assert!(
+            new.is_empty(),
+            "the assistant can send these free-form request fields, and a credential inside one \
+             would pass through the chat:\n  {}\nType the credential as a `SecretString` field, \
+             refuse it in the handler for assistant calls, or keep the operation out of the \
+             assistant's lists. Then list the field in REVIEWED_FREE_FORM with the reason.",
+            new.iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join("\n  ")
+        );
+        let stale: Vec<_> = reviewed.difference(&found).collect();
+        assert!(
+            stale.is_empty(),
+            "no longer free-form or no longer reachable; delete from REVIEWED_FREE_FORM: {stale:?}"
+        );
+    }
+
+    #[test]
+    fn a_map_of_plain_strings_is_free_form_and_a_map_of_secrets_is_not() {
+        let mut document = doc(serde_json::json!({"type": "integer"}), Value::Null);
+        document["components"]["schemas"]["Body"]["properties"]["headers"] = serde_json::json!({
+            "type": "object", "additionalProperties": {"type": "string"}
+        });
+        document["components"]["schemas"]["Body"]["properties"]["sealed"] = serde_json::json!({
+            "type": "object",
+            "additionalProperties": {"$ref": "#/components/schemas/SecretString"}
+        });
+        document["components"]["schemas"]["Body"]["properties"]["config"] = serde_json::json!({});
+        let operations = BTreeSet::from(["create_thing".to_string()]);
+        let found = free_form_fields(&document, &operations);
+        assert!(found.contains("create_thing:headers"), "{found:?}");
+        assert!(found.contains("create_thing:config"), "{found:?}");
+        assert!(!found.contains("create_thing:sealed"), "{found:?}");
+        assert!(!found.contains("create_thing:name"), "{found:?}");
+        assert!(free_form_fields(&document, &BTreeSet::new()).is_empty());
     }
 
     #[test]

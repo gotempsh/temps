@@ -3612,6 +3612,7 @@ impl RunOps for LiveOps {
             name: name.to_string(),
             provider: crate::cloudflare::KIND.to_string(),
             values,
+            secrets: Default::default(),
             node_ids: node_ids.to_vec(),
             // Publish only what runs choose, so a tunnel on a whole zone
             // never puts other apps under it online by surprise.

@@ -16788,6 +16788,16 @@
             "description": "The provider's `kind`, from `GET /ingress/providers`.",
             "type": "string"
           },
+          "secrets": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/SecretString"
+            },
+            "description": "Answers to the provider's credential fields (kind `secret`, such as an\nOAuth client secret), by field key. Same as giving them in `values`,\nbut published as credentials, so the AI assistant passes a\n`secret_ref:` handle here and never sees the value. The assistant may\nnot put a credential field in `values`. A key cannot be in both.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
           "values": {
             "description": "Answers to the provider's setup fields, by field key. DNS provider\nfields take the provider's id; every other field takes a string.",
             "type": "object"
@@ -16919,9 +16929,14 @@
       "CreateDeliveryProfileRequest": {
         "properties": {
           "bunny_api_key": {
-            "type": [
-              "string",
-              "null"
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SecretString",
+                "description": "The Bunny account API key, for `bunny` profiles. Write-only: checked\nagainst the Pull Zone, then stored encrypted and never returned. A\ncredential, so the AI assistant passes it through a secret slot."
+              },
+              {
+                "type": "null"
+              }
             ]
           },
           "bunny_pull_zone_id": {
@@ -83678,13 +83693,13 @@
         "type": "object"
       },
       "WebhookConfig": {
-        "description": "Configuration for a generic webhook notification provider",
+        "description": "Configuration for a generic webhook notification provider\n\nRequest-side config. Not `Serialize`: every header value is a\n`SecretString` (reads mask them all, because they are where a webhook's\ncredential goes), so use [`WebhookConfig::into_stored_value`].",
         "properties": {
           "headers": {
             "additionalProperties": {
-              "type": "string"
+              "$ref": "#/components/schemas/SecretString"
             },
-            "description": "Custom headers to include in the request (e.g., for authentication tokens)",
+            "description": "Custom headers to include in the request (e.g., for authentication\ntokens). Every value is treated as a credential: write-only, masked on\nread, and taken by the AI assistant through a secret slot.",
             "example": {
               "Authorization": "Bearer your-token",
               "X-Custom-Header": "custom-value"

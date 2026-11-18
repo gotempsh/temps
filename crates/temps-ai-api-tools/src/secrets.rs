@@ -375,6 +375,49 @@ pub(crate) fn validate_without_resolver(
     Ok(())
 }
 
+/// Fail before a write is staged when a credential field holds anything but a
+/// well-formed handle, or a handle sits outside a credential field.
+///
+/// [`substitute`] makes the same checks, but only once the person has
+/// approved the request. Checking at proposal time means a value the model
+/// typed is never stored on a pending action nor shown on an approval card,
+/// and the model learns at once to call `request_secret`. The errors name the
+/// field, never the value.
+pub(crate) fn validate_handles(
+    operation_id: &str,
+    body: &Value,
+    paths: &[SecretPath],
+) -> Result<(), ApiToolError> {
+    let credential_slots = credential_pointers(body, paths);
+    if let Some(location) = first_misplaced_reference(body, "", &credential_slots) {
+        return Err(ApiToolError::SecretReferenceMisplaced {
+            operation_id: operation_id.to_string(),
+            location: format!("body field '{location}' (not a credential field)"),
+        });
+    }
+    for pointer in credential_slots {
+        match body.pointer(&pointer) {
+            Some(Value::String(text)) if is_secret_ref(text) => {}
+            Some(Value::String(text)) if text.contains(SECRET_REF_PREFIX) => {
+                return Err(ApiToolError::SecretReferenceMisplaced {
+                    operation_id: operation_id.to_string(),
+                    location: format!(
+                        "body field '{pointer}' (a handle must be the whole value, nothing around it)"
+                    ),
+                });
+            }
+            Some(Value::String(text)) if !text.is_empty() => {
+                return Err(ApiToolError::SecretLiteralRejected {
+                    operation_id: operation_id.to_string(),
+                    field: pointer,
+                });
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// Replace every handle at a credential path with the user's value.
 ///
 /// Returns the values that were substituted, so the caller can scrub them from

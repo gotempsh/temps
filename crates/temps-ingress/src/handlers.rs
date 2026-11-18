@@ -255,9 +255,13 @@ async fn create_ingress_connector(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<IngressAppState>>,
     Extension(metadata): Extension<RequestMetadata>,
+    ai_call: Option<Extension<temps_core::ai_tool_call::AiToolCall>>,
     Json(request): Json<CreateConnectorRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsWrite);
+    if ai_call.is_some() {
+        state.service.ensure_secret_answers_sealed(&request)?;
+    }
     let provider = request.provider.clone();
     let node_ids = request.node_ids.clone();
     let view = match state.service.create(request).await {

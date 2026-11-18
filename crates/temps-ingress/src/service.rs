@@ -15,6 +15,7 @@ use sea_orm::{
     PaginatorTrait, QueryFilter, QueryOrder, Set, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
+use temps_core::secret_string::SecretString;
 use temps_core::{DBDateTime, EncryptionService};
 use temps_dns::{
     DnsProviderService, DnsRecordContent, DnsRecordRequest, DnsRecordType, ManagedDnsRecordService,
@@ -68,6 +69,64 @@ pub fn live_connectors(models: Vec<ingress_connectors::Model>) -> Vec<ingress_co
         .filter(|m| !is_deleting(m) && !crate::registry::is_credential_kind(&m.provider))
         .collect()
 }
+/// `values` with the `secrets` answers added, after checking each names a
+/// credential field of the provider and is not also given in `values`.
+fn merge_secret_answers(
+    info: &ProviderInfo,
+    values: &BTreeMap<String, serde_json::Value>,
+    secrets: &BTreeMap<String, SecretString>,
+) -> Result<BTreeMap<String, serde_json::Value>, IngressError> {
+    let mut merged = values.clone();
+    for (key, secret) in secrets {
+        let Some(field) = info.fields.iter().find(|f| &f.key == key) else {
+            return Err(IngressError::Validation(format!(
+                "{} has no setting '{key}'.",
+                info.name
+            )));
+        };
+        if !matches!(field.kind, FieldKind::Secret) {
+            return Err(IngressError::Validation(format!(
+                "{} ({key}) of {} is not a credential; give it in `values`, not `secrets`.",
+                field.label, info.name
+            )));
+        }
+        if values.contains_key(key) {
+            return Err(IngressError::Validation(format!(
+                "{} ({key}) of {} is given in both `values` and `secrets`; give it once.",
+                field.label, info.name
+            )));
+        }
+        merged.insert(
+            key.clone(),
+            serde_json::Value::String(secret.expose().to_string()),
+        );
+    }
+    Ok(merged)
+}
+
+/// Fail when `values` answers a credential field of the provider. The error
+/// names the field, never its value.
+fn reject_plain_secret_answers(
+    info: &ProviderInfo,
+    values: &BTreeMap<String, serde_json::Value>,
+) -> Result<(), IngressError> {
+    let plain: Vec<String> = info
+        .fields
+        .iter()
+        .filter(|f| matches!(f.kind, FieldKind::Secret) && values.contains_key(&f.key))
+        .map(|f| format!("{} ({})", f.label, f.key))
+        .collect();
+    if plain.is_empty() {
+        return Ok(());
+    }
+    Err(IngressError::Validation(format!(
+        "{} takes {} as a credential: the assistant must pass it in `secrets` as a \
+         `secret_ref:` handle from `request_secret`, never in `values`.",
+        info.name,
+        plain.join(", ")
+    )))
+}
+
 const DEFAULT_PAGE_SIZE: u64 = 20;
 const MAX_PAGE_SIZE: u64 = 100;
 /// Most connectors one cluster may have. The console matches names against
@@ -86,6 +145,13 @@ pub struct CreateConnectorRequest {
     #[serde(default)]
     #[schema(value_type = Object)]
     pub values: BTreeMap<String, serde_json::Value>,
+    /// Answers to the provider's credential fields (kind `secret`, such as an
+    /// OAuth client secret), by field key. Same as giving them in `values`,
+    /// but published as credentials, so the AI assistant passes a
+    /// `secret_ref:` handle here and never sees the value. The assistant may
+    /// not put a credential field in `values`. A key cannot be in both.
+    #[serde(default)]
+    pub secrets: BTreeMap<String, SecretString>,
     /// Nodes that run a connector replica.
     pub node_ids: Vec<i32>,
     /// Publish every worker-served hostname under the domain (the default),
@@ -469,6 +535,21 @@ impl IngressConnectorService {
     /// The providers this control plane offers, for the console.
     pub fn providers(&self) -> Vec<ProviderInfo> {
         self.registry.infos()
+    }
+
+    /// Refuse a credential answer given in plain `values`.
+    ///
+    /// The console may send every answer in `values`. A request the AI
+    /// assistant issued may not: a credential there is a value the model typed,
+    /// so it has already passed through the model provider and the chat. Such a
+    /// request must put it in `secrets` as a `secret_ref:` handle, which the
+    /// tool layer resolves from the user's private form.
+    pub fn ensure_secret_answers_sealed(
+        &self,
+        request: &CreateConnectorRequest,
+    ) -> Result<(), IngressError> {
+        let info = self.registry.get(&request.provider)?.info();
+        reject_plain_secret_answers(&info, &request.values)
     }
 
     /// The credential providers this control plane offers (ADR 065 D2).
@@ -946,7 +1027,8 @@ impl IngressConnectorService {
         // Whether the workers allow it comes first: no point in answers a
         // worker will refuse.
         self.validate_nodes(&request.node_ids).await?;
-        let setup = self.resolve_setup(&info, &request.values).await?;
+        let values = merge_secret_answers(&info, &request.values, &request.secrets)?;
+        let setup = self.resolve_setup(&info, &values).await?;
         let host_suffix = host_suffix_for(&info, &setup, request.host_suffix.as_deref())?;
         factory.validate(&self.deps(), &setup).await?;
 
@@ -3278,5 +3360,95 @@ mod tests {
         assert_eq!(page_bounds(None, None), (1, 20));
         assert_eq!(page_bounds(Some(0), Some(0)), (1, 1));
         assert_eq!(page_bounds(Some(3), Some(500)), (3, 100));
+    }
+}
+
+#[cfg(test)]
+mod secret_answer_tests {
+    use super::*;
+    use crate::registry::{DnsHandling, SetupField};
+
+    fn info() -> ProviderInfo {
+        let field = |key: &str, kind: FieldKind| SetupField {
+            key: key.into(),
+            label: format!("Label of {key}"),
+            help: None,
+            kind,
+            required: true,
+            placeholder: None,
+        };
+        ProviderInfo {
+            kind: "fixture_tunnel".into(),
+            name: "Fixture tunnel".into(),
+            summary: String::new(),
+            requirements: Vec::new(),
+            needs_public_ip: false,
+            works_behind_cgnat: true,
+            dns: DnsHandling::ProviderHostname,
+            fields: vec![
+                field("client_id", FieldKind::Text),
+                field("client_secret", FieldKind::Secret),
+            ],
+            docs_url: None,
+        }
+    }
+
+    fn values(pairs: &[(&str, &str)]) -> BTreeMap<String, serde_json::Value> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), serde_json::json!(v)))
+            .collect()
+    }
+
+    #[test]
+    fn a_sealed_answer_reaches_the_setup_as_the_real_value() {
+        let secrets: BTreeMap<String, SecretString> = [(
+            "client_secret".to_string(),
+            SecretString::new("fixture-value"),
+        )]
+        .into();
+        let merged = merge_secret_answers(&info(), &values(&[("client_id", "id")]), &secrets)
+            .expect("a credential field may be sealed");
+        assert_eq!(merged["client_secret"], "fixture-value");
+        assert_eq!(merged["client_id"], "id");
+    }
+
+    #[test]
+    fn sealed_answers_must_name_a_credential_field_once() {
+        let sealed = |key: &str| -> BTreeMap<String, SecretString> {
+            [(key.to_string(), SecretString::new("fixture-value"))].into()
+        };
+        let not_a_credential = merge_secret_answers(&info(), &values(&[]), &sealed("client_id"))
+            .expect_err("a text field is not a credential");
+        assert!(not_a_credential.to_string().contains("client_id"));
+        let unknown =
+            merge_secret_answers(&info(), &values(&[]), &sealed("nope")).expect_err("unknown key");
+        assert!(unknown.to_string().contains("nope"));
+        let twice = merge_secret_answers(
+            &info(),
+            &values(&[("client_secret", "plain")]),
+            &sealed("client_secret"),
+        )
+        .expect_err("given twice");
+        assert!(twice.to_string().contains("both"));
+        for error in [not_a_credential, unknown, twice] {
+            assert!(!error.to_string().contains("fixture-value"), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_plain_credential_answer_is_refused_without_echoing_it() {
+        let error = reject_plain_secret_answers(
+            &info(),
+            &values(&[("client_id", "id"), ("client_secret", "typed-in-chat")]),
+        )
+        .expect_err("a credential in values is refused for the assistant");
+        let text = error.to_string();
+        assert!(
+            text.contains("client_secret") && text.contains("secrets"),
+            "{text}"
+        );
+        assert!(!text.contains("typed-in-chat"), "{text}");
+        assert!(reject_plain_secret_answers(&info(), &values(&[("client_id", "id")])).is_ok());
     }
 }

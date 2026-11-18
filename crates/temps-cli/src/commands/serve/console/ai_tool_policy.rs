@@ -559,6 +559,10 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "untyped config: a credential inside it is invisible to the secret-slot layer and would be typed into the chat; the assistant uses the typed create_*_provider / update_*_provider operations, whose credentials are SecretString",
+        &["create_notification_provider", "update_notification_provider"],
+    ),
+    (
         "payload carries a credential; it must be entered in the console until sealed secret input exists",
         &[
             "blob_enable",
