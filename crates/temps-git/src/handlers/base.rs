@@ -2871,7 +2871,7 @@ async fn record_git_provider_credentials(
         provider_name: provider.name.clone(),
         provider_type: provider.provider_type.clone(),
         auth_method: provider.auth_method.clone(),
-        base_url: provider.base_url.clone(),
+        base_url: super::audit::audited_base_url(provider.base_url.as_deref()),
         credentials_set,
         via_ai_assistant,
     };

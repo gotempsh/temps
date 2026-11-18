@@ -240,6 +240,13 @@ impl AuditOperation for GithubAppCreatedAudit {
     }
 }
 
+/// The provider's base URL as it may be audited: any username or password
+/// embedded in it (`https://user:secret@git.example.com`) is masked, because
+/// audit details are stored in plain text.
+pub(crate) fn audited_base_url(base_url: Option<&str>) -> Option<String> {
+    base_url.map(temps_core::url_validation::redact_url_password)
+}
+
 /// A git provider was created with a credential, or had one replaced.
 ///
 /// Records which provider, how it authenticates, which kinds of credential
@@ -284,6 +291,20 @@ impl AuditOperation for GitProviderCredentialAudit {
 #[cfg(test)]
 mod credential_audit_tests {
     use super::*;
+
+    #[test]
+    fn a_base_url_is_audited_without_embedded_credentials() {
+        let audited = audited_base_url(Some("https://someone:fixture-secret@git.example.com/api"))
+            .expect("a base URL stays recorded");
+        assert!(!audited.contains("fixture-secret"), "{audited}");
+        assert!(!audited.contains("someone"), "{audited}");
+        assert!(audited.contains("git.example.com"), "{audited}");
+        assert_eq!(
+            audited_base_url(Some("https://git.example.com")).as_deref(),
+            Some("https://git.example.com/")
+        );
+        assert_eq!(audited_base_url(None), None);
+    }
 
     #[test]
     fn provider_credential_audit_names_fields_not_values() {
