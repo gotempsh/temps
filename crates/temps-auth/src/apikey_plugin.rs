@@ -105,6 +105,10 @@ impl TempsPlugin for ApiKeyPlugin {
                 "/api-keys/permissions",
                 get(apikey_handler::get_api_key_permissions),
             )
+            .route(
+                "/api-keys/ai-harness/status",
+                get(apikey_handler::get_ai_harness_status),
+            )
             .with_state(apikey_state);
 
         Some(PluginRoutes::new(apikey_routes))

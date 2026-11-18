@@ -17,6 +17,7 @@ use temps_database::DbConnection;
 use temps_entities::api_keys::{ActiveModel as ApiKeyActiveModel, Entity as ApiKeyEntity};
 use temps_entities::users;
 use thiserror::Error;
+use tracing::warn;
 
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -476,22 +477,28 @@ impl ApiKeyService {
         Ok(ApiKeyResponse::from(updated_api_key))
     }
 
+    /// Delete one of `user_id`'s keys, returning the deleted key's
+    /// (secret-free) description so the caller can audit what was removed.
     pub async fn delete_api_key(
         &self,
         user_id: i32,
         api_key_id: i32,
-    ) -> Result<(), ApiKeyServiceError> {
+    ) -> Result<ApiKeyResponse, ApiKeyServiceError> {
         let api_key = ApiKeyEntity::find_by_id(api_key_id)
             .filter(temps_entities::api_keys::Column::UserId.eq(user_id))
             .one(self.db.as_ref())
             .await?
-            .ok_or_else(|| ApiKeyServiceError::NotFound("API key not found".to_string()))?;
+            .ok_or_else(|| {
+                ApiKeyServiceError::NotFound(format!(
+                    "API key {api_key_id} not found for user {user_id}"
+                ))
+            })?;
 
         ApiKeyEntity::delete_by_id(api_key.id)
             .exec(self.db.as_ref())
             .await?;
 
-        Ok(())
+        Ok(ApiKeyResponse::from(api_key))
     }
 
     pub async fn validate_api_key(
@@ -611,13 +618,7 @@ impl ApiKeyService {
         let owner_role = current_owner_role(self.db.as_ref(), user.id).await?;
         let (role, permissions) = cap_api_key_grant(role, permissions, &owner_role);
 
-        // Update last_used_at, throttled so repeated validations of the
-        // same key within LAST_USED_UPDATE_INTERVAL skip the DB write.
-        if self.last_used_throttle.should_update(api_key_model.id) {
-            let mut api_key_active: ApiKeyActiveModel = api_key_model.clone().into();
-            api_key_active.last_used_at = Set(Some(Utc::now()));
-            let _ = api_key_active.update(self.db.as_ref()).await; // Don't fail if this fails
-        }
+        self.record_last_used(&api_key_model).await;
 
         Ok(ValidatedApiKey {
             user,
@@ -627,6 +628,79 @@ impl ApiKeyService {
             id: api_key_model.id,
             scope,
         })
+    }
+
+    /// Record that `api_key` just authenticated a request.
+    ///
+    /// Writes are throttled per key id so repeated validations within
+    /// `LAST_USED_UPDATE_INTERVAL` skip the DB write, except a key's first
+    /// use (`last_used_at` still empty), which is always written: the AI
+    /// harness onboarding waits on exactly that timestamp, and a throttle
+    /// primed under the same id (by the previous secret of a rotated key)
+    /// must not hide it. A failed write never fails the request; it is
+    /// logged and the throttle entry dropped, so the next request retries.
+    async fn record_last_used(&self, api_key: &temps_entities::api_keys::Model) {
+        let first_use = api_key.last_used_at.is_none();
+        // Always consult the throttle so a first use also starts the window.
+        let throttle_allows = self.last_used_throttle.should_update(api_key.id);
+        if !(first_use || throttle_allows) {
+            return;
+        }
+        let mut api_key_active: ApiKeyActiveModel = api_key.clone().into();
+        api_key_active.last_used_at = Set(Some(Utc::now()));
+        if let Err(error) = api_key_active.update(self.db.as_ref()).await {
+            self.last_used_throttle.forget(api_key.id);
+            warn!(
+                api_key_id = api_key.id,
+                user_id = api_key.user_id,
+                key_prefix = %api_key.key_prefix,
+                first_use,
+                error = %error,
+                "Failed to record last_used_at for API key {}; the request stays authenticated and the next one retries the write",
+                api_key.id
+            );
+        }
+    }
+
+    /// The caller's AI harness connection status.
+    ///
+    /// Two indexed lookups on the caller's own keys: the dedicated
+    /// [`AI_HARNESS_KEY_NAME`](crate::ai_harness::AI_HARNESS_KEY_NAME) key
+    /// (names are unique per user), and, only while that key is unused, the
+    /// most recently used device-login key created after it. Unlike the
+    /// paginated key list it never misses the dedicated key behind newer ones.
+    pub async fn ai_harness_status(
+        &self,
+        user_id: i32,
+    ) -> Result<crate::ai_harness::AiHarnessStatusResponse, ApiKeyServiceError> {
+        use temps_entities::api_keys::Column;
+
+        let harness_key = ApiKeyEntity::find()
+            .filter(Column::UserId.eq(user_id))
+            .filter(Column::Name.eq(crate::ai_harness::AI_HARNESS_KEY_NAME))
+            .one(self.db.as_ref())
+            .await?;
+
+        let cli_login_key = match &harness_key {
+            Some(key) if key.is_active && key.last_used_at.is_none() => {
+                ApiKeyEntity::find()
+                    .filter(Column::UserId.eq(user_id))
+                    .filter(Column::IsActive.eq(true))
+                    .filter(Column::ProjectId.is_null())
+                    .filter(Column::Name.starts_with(crate::ai_harness::CLI_DEVICE_KEY_PREFIX))
+                    .filter(Column::CreatedAt.gte(key.created_at))
+                    .filter(Column::LastUsedAt.is_not_null())
+                    .order_by_desc(Column::LastUsedAt)
+                    .one(self.db.as_ref())
+                    .await?
+            }
+            _ => None,
+        };
+
+        Ok(crate::ai_harness::derive_ai_harness_status(
+            harness_key.as_ref(),
+            cli_login_key.as_ref(),
+        ))
     }
 
     pub async fn deactivate_api_key(
@@ -1795,6 +1869,304 @@ mod tests {
         assert_eq!(
             after_first_call, after_second_call,
             "second validate_api_key call within the throttle window must not rewrite last_used_at"
+        );
+    }
+
+    /// Rotation keeps the key id and resets `last_used_at`. When the old
+    /// secret was used moments before, the per-id throttle was already
+    /// primed, and before the first-use bypass the new secret's first request
+    /// was never recorded: the AI harness onboarding then waited forever.
+    #[tokio::test]
+    async fn first_use_of_a_rotated_secret_is_recorded_inside_the_throttle_window() {
+        let (db, service, user) = setup_test_env().await;
+        let created = service
+            .create_api_key(user.id, admin_key_request("Rotated harness key"))
+            .await
+            .unwrap();
+        service.validate_api_key(&created.api_key).await.unwrap();
+
+        let rotated = service.rotate_api_key(user.id, created.id).await.unwrap();
+        let reset = api_keys::Entity::find_by_id(created.id)
+            .one(db.db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reset.last_used_at, None, "rotation resets last_used_at");
+
+        service.validate_api_key(&rotated.api_key).await.unwrap();
+        let after = api_keys::Entity::find_by_id(created.id)
+            .one(db.db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            after.last_used_at.is_some(),
+            "the new secret's first use must be written even though the throttle window is open"
+        );
+    }
+
+    /// A failed bookkeeping write must not fail authentication, and must not
+    /// leave the throttle primed: the next request retries the write.
+    #[tokio::test]
+    async fn failed_last_used_write_is_retried_on_the_next_request() {
+        // No results queued: every statement, including the UPDATE, errors.
+        let service = ApiKeyService::new(Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+        ));
+        let now = Utc::now();
+        let key = api_keys::Model {
+            id: 41,
+            name: "write-fails".to_string(),
+            key_hash: "hash".to_string(),
+            key_prefix: "tk_abcde".to_string(),
+            user_id: 3,
+            role_type: "admin".to_string(),
+            permissions: None,
+            is_active: true,
+            expires_at: None,
+            last_used_at: Some(now),
+            created_at: now,
+            updated_at: now,
+            service_id: None,
+            project_id: None,
+            environment_id: None,
+        };
+
+        service.record_last_used(&key).await;
+
+        assert!(
+            service.last_used_throttle.should_update(key.id),
+            "a failed write must clear the throttle entry so the next request retries"
+        );
+    }
+
+    fn admin_key_request(name: &str) -> CreateApiKeyRequest {
+        CreateApiKeyRequest {
+            project_id: None,
+            environment_id: None,
+            name: name.to_string(),
+            role_type: "admin".to_string(),
+            permissions: None,
+            expires_at: None,
+        }
+    }
+
+    async fn set_created_at(
+        db: &Arc<DbConnection>,
+        key_id: i32,
+        created_at: chrono::DateTime<Utc>,
+    ) {
+        let key = api_keys::Entity::find_by_id(key_id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut active: api_keys::ActiveModel = key.into();
+        active.created_at = Set(created_at);
+        active.update(db.as_ref()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ai_harness_status_is_missing_without_a_dedicated_key() {
+        let (_db, service, user) = setup_test_env().await;
+        let status = service.ai_harness_status(user.id).await.unwrap();
+        assert_eq!(status.status, crate::ai_harness::AiHarnessState::Missing);
+        assert_eq!(status.key_id, None);
+    }
+
+    #[tokio::test]
+    async fn ai_harness_status_waits_then_connects_when_the_dedicated_key_is_used() {
+        let (_db, service, user) = setup_test_env().await;
+        let created = service
+            .create_api_key(
+                user.id,
+                admin_key_request(crate::ai_harness::AI_HARNESS_KEY_NAME),
+            )
+            .await
+            .unwrap();
+
+        let waiting = service.ai_harness_status(user.id).await.unwrap();
+        assert_eq!(waiting.status, crate::ai_harness::AiHarnessState::Waiting);
+        assert_eq!(waiting.key_id, Some(created.id));
+
+        service.validate_api_key(&created.api_key).await.unwrap();
+
+        let connected = service.ai_harness_status(user.id).await.unwrap();
+        assert_eq!(
+            connected.status,
+            crate::ai_harness::AiHarnessState::Connected
+        );
+        let via = connected.connected_via.unwrap();
+        assert_eq!(via.id, created.id);
+        assert_eq!(
+            via.kind,
+            crate::ai_harness::AiHarnessCredentialKind::DedicatedKey
+        );
+    }
+
+    /// The reported case: the copied connect command fell through to the
+    /// browser device login, which mints its own key. The harness works with
+    /// that key and never sends the dedicated one.
+    #[tokio::test]
+    async fn ai_harness_status_connects_through_a_later_device_login() {
+        let (db, service, user) = setup_test_env().await;
+        let harness = service
+            .create_api_key(
+                user.id,
+                admin_key_request(crate::ai_harness::AI_HARNESS_KEY_NAME),
+            )
+            .await
+            .unwrap();
+        set_created_at(&db.db, harness.id, Utc::now() - Duration::minutes(10)).await;
+        let cli = service
+            .create_api_key(user.id, admin_key_request("cli-device:laptop-1767225600"))
+            .await
+            .unwrap();
+
+        // Minted but not used yet: still waiting.
+        let before = service.ai_harness_status(user.id).await.unwrap();
+        assert_eq!(before.status, crate::ai_harness::AiHarnessState::Waiting);
+
+        service.validate_api_key(&cli.api_key).await.unwrap();
+
+        let status = service.ai_harness_status(user.id).await.unwrap();
+        assert_eq!(status.status, crate::ai_harness::AiHarnessState::Connected);
+        let via = status.connected_via.unwrap();
+        assert_eq!(via.id, cli.id);
+        assert_eq!(
+            via.kind,
+            crate::ai_harness::AiHarnessCredentialKind::CliLogin
+        );
+        assert_eq!(status.key_id, Some(harness.id));
+    }
+
+    #[tokio::test]
+    async fn ai_harness_status_ignores_earlier_and_other_users_device_logins() {
+        let (db, service, user) = setup_test_env().await;
+        // A device login from before onboarding started, in active use.
+        let earlier = service
+            .create_api_key(user.id, admin_key_request("cli-device:desktop-1700000000"))
+            .await
+            .unwrap();
+        set_created_at(&db.db, earlier.id, Utc::now() - Duration::days(2)).await;
+        service.validate_api_key(&earlier.api_key).await.unwrap();
+
+        service
+            .create_api_key(
+                user.id,
+                admin_key_request(crate::ai_harness::AI_HARNESS_KEY_NAME),
+            )
+            .await
+            .unwrap();
+
+        // Another user's fresh device login, also in use.
+        let other = users::ActiveModel {
+            email: Set(format!("other_{}@example.com", uuid::Uuid::new_v4())),
+            name: Set("Other User".to_string()),
+            email_verified: Set(true),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            mfa_enabled: Set(false),
+            ..Default::default()
+        }
+        .insert(db.db.as_ref())
+        .await
+        .unwrap();
+        let foreign = create_test_api_key(&db.db, other.id, "cli-device:other-1", "admin").await;
+        let mut foreign: api_keys::ActiveModel = foreign.into();
+        foreign.last_used_at = Set(Some(Utc::now()));
+        foreign.update(db.db.as_ref()).await.unwrap();
+
+        let status = service.ai_harness_status(user.id).await.unwrap();
+        assert_eq!(status.status, crate::ai_harness::AiHarnessState::Waiting);
+    }
+
+    /// The console used to look for the dedicated key in the first 100 keys
+    /// (newest first); every `temps login` mints a key, so it fell off that
+    /// page. The status lookup does not paginate.
+    #[tokio::test]
+    async fn ai_harness_status_finds_the_dedicated_key_behind_a_full_page_of_newer_keys() {
+        let (db, service, user) = setup_test_env().await;
+        let harness = create_test_api_key(
+            &db.db,
+            user.id,
+            crate::ai_harness::AI_HARNESS_KEY_NAME,
+            "admin",
+        )
+        .await;
+        set_created_at(&db.db, harness.id, Utc::now() - Duration::days(1)).await;
+        let mut used: api_keys::ActiveModel = harness.clone().into();
+        used.last_used_at = Set(Some(Utc::now()));
+        used.update(db.db.as_ref()).await.unwrap();
+        for index in 0..100 {
+            create_test_api_key(&db.db, user.id, &format!("newer key {index}"), "admin").await;
+        }
+
+        let first_page = service.list_api_keys(user.id, 1, 100).await.unwrap();
+        assert!(
+            first_page.api_keys.iter().all(|key| key.id != harness.id),
+            "precondition: the dedicated key is not on the first page of 100"
+        );
+
+        let status = service.ai_harness_status(user.id).await.unwrap();
+        assert_eq!(status.status, crate::ai_harness::AiHarnessState::Connected);
+        assert_eq!(status.key_id, Some(harness.id));
+    }
+
+    #[tokio::test]
+    async fn ai_harness_status_reports_a_deactivated_key_instead_of_offering_a_conflicting_create()
+    {
+        let (_db, service, user) = setup_test_env().await;
+        let created = service
+            .create_api_key(
+                user.id,
+                admin_key_request(crate::ai_harness::AI_HARNESS_KEY_NAME),
+            )
+            .await
+            .unwrap();
+        service
+            .deactivate_api_key(user.id, created.id)
+            .await
+            .unwrap();
+
+        let status = service.ai_harness_status(user.id).await.unwrap();
+        assert_eq!(status.status, crate::ai_harness::AiHarnessState::Missing);
+        assert_eq!(status.key_id, Some(created.id));
+        assert_eq!(
+            status.setup_path,
+            Some(format!("/settings/keys/{}", created.id))
+        );
+    }
+
+    #[tokio::test]
+    async fn ai_harness_status_surfaces_database_errors() {
+        let service = ApiKeyService::new(Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_errors([sea_orm::DbErr::Custom("api_keys lookup failed".into())])
+                .into_connection(),
+        ));
+        let error = service.ai_harness_status(5).await.unwrap_err();
+        assert!(matches!(error, ApiKeyServiceError::DatabaseError(_)));
+    }
+
+    #[tokio::test]
+    async fn delete_returns_the_deleted_key_and_names_the_missing_id() {
+        let (_db, service, user) = setup_test_env().await;
+        let created = service
+            .create_api_key(user.id, admin_key_request("Delete and describe"))
+            .await
+            .unwrap();
+        let deleted = service.delete_api_key(user.id, created.id).await.unwrap();
+        assert_eq!(deleted.id, created.id);
+        assert_eq!(deleted.name, "Delete and describe");
+
+        let error = service
+            .delete_api_key(user.id, created.id)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, ApiKeyServiceError::NotFound(message) if message.contains(&created.id.to_string())),
+            "{error}"
         );
     }
 

@@ -542,7 +542,12 @@ pub async fn cli_device_approve(
         .as_deref()
         .map(sanitize_device_label)
         .unwrap_or_else(|| "cli".to_string());
-    let key_name = format!("cli-device:{}-{}", device_label, now.timestamp());
+    let key_name = format!(
+        "{}{}-{}",
+        crate::ai_harness::CLI_DEVICE_KEY_PREFIX,
+        device_label,
+        now.timestamp()
+    );
     let expires_at = Some(now + Duration::days(CLI_KEY_TTL_DAYS));
 
     let created = state
