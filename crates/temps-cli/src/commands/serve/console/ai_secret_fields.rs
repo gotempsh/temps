@@ -121,6 +121,9 @@ struct Walk<'a> {
     limit: usize,
     seen: Vec<String>,
     out: Vec<(String, &'a Value)>,
+    /// `(path[], schema)` of every array element schema, kept apart from
+    /// `out` (the name check reads properties only).
+    elements: Vec<(String, &'a Value)>,
     /// Paths where the depth limit stopped the walk, so what lies below them
     /// was not inspected.
     truncated: Vec<String>,
@@ -133,6 +136,7 @@ impl<'a> Walk<'a> {
             limit,
             seen: Vec::new(),
             out: Vec::new(),
+            elements: Vec::new(),
             truncated: Vec::new(),
         }
     }
@@ -162,7 +166,17 @@ impl<'a> Walk<'a> {
             self.out.push((path.clone(), property));
             self.walk(property, &format!("{path}."), depth + 1);
         }
-        if let Some(items) = schema.get("items") {
+        // `items: false` (a closed tuple) is not a schema; tuple members
+        // (`prefixItems`, e.g. `[key, value]` pairs) are element schemas too.
+        let element = format!("{}[]", prefix.trim_end_matches('.'));
+        let tuple = schema["prefixItems"].as_array().into_iter().flatten();
+        for items in schema
+            .get("items")
+            .filter(|v| v.is_object())
+            .into_iter()
+            .chain(tuple)
+        {
+            self.elements.push((element.clone(), items));
             self.walk(items, &format!("{prefix}[]."), depth + 1);
         }
         // A map of described objects is not free-form itself, but the fields
@@ -349,7 +363,8 @@ fn free_form_fields(spec: &Value, operations: &BTreeSet<String>) -> BTreeSet<Str
             }
             let mut walk = Walk::new(spec, FREE_FORM_MAX_DEPTH);
             walk.walk(body, "", 0);
-            for (path, schema) in walk.out {
+            // An array's element can be the opaque map (`[{...}, {...}]`).
+            for (path, schema) in walk.out.into_iter().chain(walk.elements) {
                 if is_free_form(spec, schema, 0) {
                     found.insert(format!("{id}:{path}"));
                 }
@@ -698,6 +713,43 @@ mod tests {
         assert_eq!(
             free_form_fields(&spec, &operations),
             ["create_thing:settings.*.headers".to_string()]
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+        );
+    }
+
+    #[test]
+    fn an_array_of_opaque_maps_is_free_form_and_an_array_of_strings_is_not() {
+        let spec = serde_json::json!({
+            "paths": { "/things": { "post": {
+                "operationId": "create_thing",
+                "requestBody": { "content": { "application/json": { "schema": {
+                    "type": "object",
+                    "properties": {
+                        "rules": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": { "type": "string" }
+                            }
+                        },
+                        "tags": { "type": "array", "items": { "type": "string" } },
+                        "pairs": {
+                            "type": "array",
+                            "items": {
+                                "type": "array",
+                                "prefixItems": [{ "type": "string" }, { "type": "string" }],
+                                "items": false
+                            }
+                        }
+                    }
+                } } } }
+            } } }
+        });
+        let operations: BTreeSet<String> = ["create_thing".to_string()].into_iter().collect();
+        assert_eq!(
+            free_form_fields(&spec, &operations),
+            ["create_thing:rules[]".to_string()]
                 .into_iter()
                 .collect::<BTreeSet<_>>()
         );
