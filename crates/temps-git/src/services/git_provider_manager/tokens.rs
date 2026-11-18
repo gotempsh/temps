@@ -237,11 +237,16 @@ impl GitProviderManager {
                         connection_id
                     );
 
+                    // The verdict is about the token read with `connection`;
+                    // if the user replaced it meanwhile, it must not touch
+                    // the new one, so both writes are conditional on the
+                    // credential generation that was checked.
                     match provider_service.validate_token(&access_token).await {
                         Ok(true) => {
                             // Token is valid, mark as not expired if it was previously marked
                             if connection.is_expired {
-                                self.mark_connection_expired(connection_id, false).await?;
+                                self.mark_checked_connection_expired(&connection, false)
+                                    .await?;
                             }
                             Ok(access_token)
                         }
@@ -251,7 +256,8 @@ impl GitProviderManager {
                                 "PAT validation failed for connection {}, marking as expired",
                                 connection_id
                             );
-                            self.mark_connection_expired(connection_id, true).await?;
+                            self.mark_checked_connection_expired(&connection, true)
+                                .await?;
 
                             // Return specific error indicating the token is expired
                             Err(GitProviderManagerError::ConnectionTokenExpired { connection_id })
@@ -1007,6 +1013,39 @@ impl GitProviderManager {
         active_model.update(self.db.as_ref()).await?;
 
         Ok(())
+    }
+
+    /// Record the outcome of checking the token held by `checked`, unless the
+    /// connection's credentials were replaced since it was read (its
+    /// `credential_generation` moved on): a check that finishes after a
+    /// rotation must not mark the new token expired. Returns whether the flag
+    /// was written.
+    pub(crate) async fn mark_checked_connection_expired(
+        &self,
+        checked: &git_provider_connections::Model,
+        is_expired: bool,
+    ) -> Result<bool, GitProviderManagerError> {
+        let result = git_provider_connections::Entity::update_many()
+            .set(git_provider_connections::ActiveModel {
+                is_expired: Set(is_expired),
+                updated_at: Set(chrono::Utc::now()),
+                ..Default::default()
+            })
+            .filter(git_provider_connections::Column::Id.eq(checked.id))
+            .filter(
+                git_provider_connections::Column::CredentialGeneration
+                    .eq(checked.credential_generation),
+            )
+            .exec(self.db.as_ref())
+            .await?;
+        if result.rows_affected == 0 {
+            debug!(
+                connection_id = checked.id,
+                is_expired,
+                "Token check outcome not recorded: the connection's credentials changed meanwhile"
+            );
+        }
+        Ok(result.rows_affected > 0)
     }
 
     /// Check if a connection's token is expired and mark it inactive if so

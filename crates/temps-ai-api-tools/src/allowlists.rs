@@ -1041,18 +1041,36 @@ pub const AI_WRITE_ALLOWLIST: &[&str] = &[
     // (`update_connection_token`, `create_*_pat_provider`) stay out.
     "commit_repository_files",
     "open_repository_pull_request",
+    // Connect a Git host with a personal access token, or replace a
+    // provider's credentials. Every token, password, app secret and private
+    // key is a `SecretString`, so the model passes `secret_ref:` handles from
+    // `request_secret`. The handlers need `git_providers:create` /
+    // `git_providers:write` like the console, refuse private and metadata
+    // addresses as `base_url`, test the token, and audit which credential was
+    // set (never its value). `update_connection_token` stays out: it does not
+    // bind the connection to the caller.
+    "create_github_pat_provider",
+    "create_gitlab_pat_provider",
+    "create_gitea_pat_provider",
+    "create_bitbucket_provider",
+    "create_generic_provider",
+    "update_git_provider_credentials",
     // ── Getting started: backups ──
     // Schedules reference an S3 source by id. Registering or editing a
     // source takes the bucket secret key, so these three are proposable only
     // because `secret_key` is a `SecretString` flagged `x-temps-secret`: the
     // model passes a `secret_ref:` handle from `request_secret`, never the
-    // key, and the caller substitutes it server-side at confirm time. Git
-    // provider tokens (`create_*_pat_provider`, `create_generic_provider`)
-    // are not converted yet and stay out.
+    // key, and the caller substitutes it server-side at confirm time.
     "create_s3_source",
     "update_s3_source",
     // Checks a candidate bucket before it is saved; the same secret_key rules.
     "test_s3_connection_preview",
+    // Which permissions a Cloudflare token has, before it is saved anywhere.
+    // It writes nothing, but it takes the token, and a `secret_ref:` handle is
+    // only resolved for a confirmed write: as a read-only POST the assistant
+    // could never pass one, and it used to tell users the operation did not
+    // exist. Same shape as `test_s3_connection_preview`.
+    "check_cloudflare_token",
     "create_backup_schedule",
     "update_backup_schedule",
     "enable_backup_schedule",
@@ -1165,12 +1183,15 @@ pub const AI_WRITE_ALLOWLIST: &[&str] = &[
     "create_alert",
     "update_alert",
     // ── Global notification control plane ──
-    // Provider payloads may contain credentials. `temps_write` encrypts
-    // executable parameters at rest and redacts both the approval card and
-    // result returned to the model. DELETE operations remain explicit even
-    // in Auto mode through `platform_request_is_destructive`.
-    "create_notification_provider",
-    "update_notification_provider",
+    // Every credential here is a `SecretString` (`webhook_url`, `password`,
+    // `api_token`, each webhook header value), so the model passes a
+    // `secret_ref:` handle from `request_secret` and never the value. The
+    // generic `create_notification_provider` / `update_notification_provider`
+    // take an untyped `config` the secret-slot layer cannot see into, so a
+    // credential there would be typed into the chat: they stay in the console
+    // (every provider type has a typed operation below). DELETE operations
+    // remain explicit even in Auto mode through
+    // `platform_request_is_destructive`.
     "delete_notification_provider",
     "create_slack_provider",
     "update_slack_provider",
@@ -1220,6 +1241,23 @@ pub const AI_WRITE_ALLOWLIST: &[&str] = &[
     "kv_update",
     "blob_update",
     // Domains, DNS and email
+    // Register a DNS provider (Cloudflare, Bunny, Route53, DigitalOcean, GCP,
+    // Azure, Namecheap) or rotate its credentials. Every credential under
+    // `credentials` is a `SecretString`, so the model passes `secret_ref:`
+    // handles from `request_secret` and never sees the token; the handler
+    // tests the credentials before saving, needs `dns_providers:write` like
+    // the console and audits who did it (and that the assistant did) without
+    // the secret. Deleting a provider stays in the console.
+    "create_dns_provider",
+    "update_provider",
+    // Edge and CDN credentials, same rules: a Cloudflare Access token
+    // (checked, then sealed; `dns_providers:write`) and a Bunny delivery
+    // profile's API key (checked against its Pull Zone, then encrypted;
+    // `dns_providers:write` and `dns_automation:write`). Both are
+    // `SecretString`, neither is ever returned, both handlers audit.
+    "check_access_provider",
+    "create_access_provider",
+    "create_delivery_profile",
     "add_managed_domain",
     "update_managed_domain",
     "verify_managed_domain",
@@ -1229,6 +1267,12 @@ pub const AI_WRITE_ALLOWLIST: &[&str] = &[
     "import_managed_record",
     "remove_managed_record",
     "remove_managed_domain",
+    // Transactional email providers (SES, Scaleway, SMTP): every credential
+    // is a `SecretString` taken through a secret slot; the handlers need
+    // `email_providers:create` / `email_providers:write`, mask credentials in
+    // responses and audit the write.
+    "create_email_provider",
+    "update_email_provider",
     "create_email_domain",
     "import_email_domain",
     "setup_dns",
@@ -1246,6 +1290,11 @@ pub const AI_WRITE_ALLOWLIST: &[&str] = &[
     "update_preferences",
     "delete_preferences",
     "retry_delivery",
+    // Project webhooks. The optional signing `secret` is a `SecretString`
+    // taken through a secret slot; responses only say `has_secret`. The
+    // handlers need webhooks permissions plus project access, and audit.
+    "create_webhook",
+    "update_webhook",
     "delete_webhook",
     // Observability and analytics
     "create_dashboard",
@@ -1376,10 +1425,6 @@ pub const AI_READ_SAFE_POSTS: &[&str] = &[
     // Read-only POST: *Make it reachable* plans change nothing; a plan is
     // only kept for `apply`, which stays with the operator.
     "plan_environment_reachability",
-    // Read-only POST: which permissions a Cloudflare token has. Nothing is
-    // created or stored; the token is a `SecretString`, so the assistant
-    // passes it through a secret slot.
-    "check_cloudflare_token",
     // Read-only POST: one test lookup of a *.temps.local name from one
     // node's resolver (ADR-095), SettingsRead. It stores nothing; the body
     // is a POST only because it names the node, the name and the type.
@@ -1484,8 +1529,6 @@ mod tests {
         }
         for operation in [
             "update_connection_token",
-            "create_github_pat_provider",
-            "create_gitlab_pat_provider",
             "create_git_provider",
             "delete_connection",
         ] {
@@ -1499,7 +1542,8 @@ mod tests {
     /// The assistant must be able to take a user from nothing to a deployed
     /// project and scheduled backups. An operation whose payload carries a stored
     /// credential is proposable only once that field is a flagged `SecretString`
-    /// (the S3 source operations); the rest still go through the console forms.
+    /// (S3 sources, Git personal access tokens); the rest still go through the
+    /// console forms.
     #[test]
     fn getting_started_operations_are_proposable_but_unconverted_credential_forms_are_not() {
         let writes: std::collections::HashSet<String> = ai_write_allowlist().into_iter().collect();
@@ -1529,8 +1573,14 @@ mod tests {
             "update_git_provider_credentials",
         ] {
             assert!(
+                writes.contains(operation),
+                "`{operation}` takes its token through a secret slot and must be proposable"
+            );
+        }
+        for operation in ["create_git_provider", "create_gitlab_oauth_provider"] {
+            assert!(
                 !writes.contains(operation),
-                "`{operation}` carries a secret and must stay out of the assistant's write tool"
+                "`{operation}` carries an unflagged secret or a browser flow and must stay out"
             );
         }
         // Both return `S3SourceResponse`, which masks the access key id and the
@@ -1591,7 +1641,6 @@ mod tests {
             "update_project_deployment_config",
             "createHttpCheck",
             "updateHttpCheck",
-            "create_webhook",
             "create_api_key",
             "create_deployment_token",
             "createProjectSecret",
@@ -1624,6 +1673,58 @@ mod tests {
                 !reads.contains(operation),
                 "`{operation}` returns plaintext secrets and must stay out of the read tool"
             );
+        }
+    }
+
+    /// The operations that create a credential-bearing provider or replace its
+    /// key are proposable, and the token checks that take a credential are
+    /// writes: a `secret_ref:` handle is only resolved for a confirmed write, so
+    /// as a read-only POST one could never be passed. The untyped notification
+    /// operations, whose `config` hides its credentials, are not proposable.
+    #[test]
+    fn credential_providers_are_proposable_through_secret_slots() {
+        let writes: std::collections::HashSet<String> = ai_write_allowlist().into_iter().collect();
+        let safe: std::collections::HashSet<String> = ai_read_safe_posts().into_iter().collect();
+        for operation in [
+            "create_dns_provider",
+            "update_provider",
+            "test_provider_connection",
+            "check_cloudflare_token",
+            "check_access_provider",
+            "create_access_provider",
+            "create_delivery_profile",
+            "create_email_provider",
+            "update_email_provider",
+            "create_webhook",
+            "update_webhook",
+            "create_slack_provider",
+            "update_slack_provider",
+            "create_webhook_provider",
+            "update_webhook_provider",
+            "create_s3_source",
+            "update_s3_source",
+        ] {
+            assert!(
+                writes.contains(operation),
+                "`{operation}` must be proposable"
+            );
+            assert!(
+                !safe.contains(operation),
+                "`{operation}` takes a credential"
+            );
+        }
+        for operation in [
+            "create_notification_provider",
+            "update_notification_provider",
+            "delete_dns_provider",
+            "create_oidc_provider",
+            "create_provider_key",
+            "save_ai_provider_credential",
+            "set_ci_builder",
+            "blob_enable",
+            "NodeSshEnrollmentCreate",
+        ] {
+            assert!(!writes.contains(operation), "`{operation}` must stay out");
         }
     }
 

@@ -1045,13 +1045,21 @@ impl InternalApiCaller {
                 )
                 .and_then(|built| {
                     self.validate_plugin_route(op, &built)?;
-                    if reject_secret_input {
-                        if let Some(body) = &built.body {
+                    crate::secrets::reject_references_in_url(
+                        &op.operation_id,
+                        &built.path,
+                        &built.query,
+                    )?;
+                    if let Some(body) = &built.body {
+                        let paths = self.index.secret_fields(&op.operation_id);
+                        if reject_secret_input {
                             crate::secrets::validate_without_resolver(
                                 &op.operation_id,
                                 body,
-                                self.index.secret_fields(&op.operation_id),
+                                paths,
                             )?;
+                        } else {
+                            crate::secrets::validate_handles(&op.operation_id, body, paths)?;
                         }
                     }
                     Ok(())
@@ -3339,6 +3347,22 @@ mod tests {
             }}},"responses":{"200":{"description":"ok"}}}}}})).unwrap();
         let caller =
             InternalApiCaller::new_write_allowlisted(router, &api, vec!["create_source".into()]);
+        // A value the model typed is refused before anything is staged, and the
+        // refusal does not repeat it.
+        let WritePrepareOutcome::Invalid(refusal) =
+            caller.prepare_write_cli("create_source --secret_key typed-in-chat", &scope)
+        else {
+            panic!("a literal credential must never reach the approval card");
+        };
+        assert!(refusal.contains("request_secret"), "{refusal}");
+        assert!(!refusal.contains("typed-in-chat"), "{refusal}");
+        assert!(matches!(
+            caller.prepare_write_cli(
+                "create_source --secret_key x-secret_ref:v1:fixture-slot",
+                &scope
+            ),
+            WritePrepareOutcome::Invalid(_)
+        ));
         let command = "create_source --secret_key secret_ref:v1:fixture-slot";
         let WritePrepareOutcome::Prepared(prepared) = caller.prepare_write_cli(command, &scope)
         else {

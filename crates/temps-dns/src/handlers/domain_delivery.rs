@@ -25,7 +25,10 @@ pub struct CreateDeliveryProfileRequest {
     pub name: String,
     pub provider_kind: DeliveryProviderKind,
     pub bunny_pull_zone_id: Option<i64>,
-    pub bunny_api_key: Option<String>,
+    /// The Bunny account API key, for `bunny` profiles. Write-only: checked
+    /// against the Pull Zone, then stored encrypted and never returned. A
+    /// credential, so the AI assistant passes it through a secret slot.
+    pub bunny_api_key: Option<temps_core::secret_string::SecretString>,
 }
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct UpdateProjectDeliverySettingsRequest {
@@ -497,7 +500,8 @@ pub async fn create_delivery_profile(
             req.name,
             req.provider_kind,
             req.bunny_pull_zone_id,
-            req.bunny_api_key,
+            req.bunny_api_key
+                .map(temps_core::secret_string::SecretString::into_exposed),
         )
         .await?;
     audit(

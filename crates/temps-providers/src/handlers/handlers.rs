@@ -875,6 +875,33 @@ async fn get_service(
     }
 }
 
+/// Refuse a credential the AI assistant put in a service's `parameters`.
+///
+/// `parameters` is a free-form map, so the secret-slot layer cannot tell a
+/// password in it from any other value, and one the assistant passes is one
+/// the model typed. Temps generates every credential a managed service needs
+/// when it is left out, so the assistant leaves them out. The error names the
+/// parameters, never their values.
+fn refuse_assistant_supplied_secrets(
+    parameters: &HashMap<String, serde_json::Value>,
+) -> Result<(), Problem> {
+    let supplied =
+        crate::services::ExternalServiceManager::supplied_sensitive_parameters(parameters);
+    if supplied.is_empty() {
+        return Ok(());
+    }
+    Err(temps_core::error_builder::bad_request()
+        .title("Credentials Are Generated")
+        .detail(format!(
+            "Leave out {}: Temps generates a service's credentials, and a value the assistant \
+             passes would go through the chat. The user can change them in the console \
+             afterwards.",
+            supplied.join(", ")
+        ))
+        .value("parameters", supplied)
+        .build())
+}
+
 /// Create new external service
 #[utoipa::path(
     post,
@@ -893,9 +920,13 @@ async fn create_service(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<AppState>>,
     Extension(metadata): Extension<RequestMetadata>,
+    ai_call: Option<Extension<temps_core::ai_tool_call::AiToolCall>>,
     Json(request): Json<CreateExternalServiceRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesCreate);
+    if ai_call.is_some() {
+        refuse_assistant_supplied_secrets(&request.parameters)?;
+    }
 
     if let Some(project_id) = request.project_id {
         project_permission_guard!(
@@ -4083,6 +4114,24 @@ mod tests {
     use sea_orm::MockDatabase;
     use std::sync::Mutex;
     use temps_entities::{external_services, project_services};
+
+    /// A password the assistant passes in `parameters` is one the model typed;
+    /// it is refused by name, without the value, and Temps generates it.
+    #[test]
+    fn assistant_supplied_service_credentials_are_refused_by_name() {
+        let parameters = HashMap::from([
+            ("password".to_string(), serde_json::json!("typed-in-chat")),
+            ("database".to_string(), serde_json::json!("app")),
+        ]);
+        let problem = refuse_assistant_supplied_secrets(&parameters)
+            .expect_err("a supplied password is refused");
+        assert_eq!(problem.status_code, axum::http::StatusCode::BAD_REQUEST);
+        let body = serde_json::to_string(&problem.body).expect("problem body serializes");
+        assert!(body.contains("password"), "{body}");
+        assert!(!body.contains("typed-in-chat"), "{body}");
+        let without = HashMap::from([("database".to_string(), serde_json::json!("app"))]);
+        assert!(refuse_assistant_supplied_secrets(&without).is_ok());
+    }
 
     /// These handlers reach an engine call whose bad-input or unsupported
     /// error `external_service_problem` answers with a 400.

@@ -13,7 +13,7 @@ use super::git_provider::{
 use reqwest::Url;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
-    QueryOrder, QuerySelect, Set,
+    QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 use serde_json::json;
 use std::collections::HashMap;

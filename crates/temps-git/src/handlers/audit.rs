@@ -239,3 +239,111 @@ impl AuditOperation for GithubAppCreatedAudit {
         temps_core::serialize_audit_operation(self)
     }
 }
+
+/// The provider's base URL as it may be audited. Audit details are stored in
+/// plain text, so nothing that can carry a credential is kept: an embedded
+/// username or password (`https://user:secret@git.example.com`) is masked and
+/// the query string and fragment (`?access_token=...`) are dropped. A value
+/// that does not parse as a URL is not recorded at all.
+pub(crate) fn audited_base_url(base_url: Option<&str>) -> Option<String> {
+    let mut url = reqwest::Url::parse(base_url?).ok()?;
+    url.set_query(None);
+    url.set_fragment(None);
+    Some(temps_core::url_validation::redact_url_password(
+        url.as_str(),
+    ))
+}
+
+/// A git provider was created with a credential, or had one replaced.
+///
+/// Records which provider, how it authenticates, which kinds of credential
+/// were set and whether the AI assistant issued the request. Never a value:
+/// `credentials_set` holds field names only.
+#[derive(Debug, Clone, Serialize)]
+pub struct GitProviderCredentialAudit {
+    #[serde(skip)]
+    pub action: &'static str,
+    pub context: AuditContext,
+    pub provider_id: i32,
+    pub provider_name: String,
+    pub provider_type: String,
+    pub auth_method: String,
+    pub base_url: Option<String>,
+    pub credentials_set: Vec<&'static str>,
+    pub via_ai_assistant: bool,
+}
+
+impl AuditOperation for GitProviderCredentialAudit {
+    fn operation_type(&self) -> String {
+        self.action.to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
+    }
+}
+
+#[cfg(test)]
+mod credential_audit_tests {
+    use super::*;
+
+    #[test]
+    fn a_base_url_is_audited_without_embedded_credentials() {
+        let audited = audited_base_url(Some("https://someone:fixture-secret@git.example.com/api"))
+            .expect("a base URL stays recorded");
+        assert!(!audited.contains("fixture-secret"), "{audited}");
+        assert!(!audited.contains("someone"), "{audited}");
+        assert!(audited.contains("git.example.com"), "{audited}");
+        assert_eq!(
+            audited_base_url(Some("https://git.example.com")).as_deref(),
+            Some("https://git.example.com/")
+        );
+        let with_query = audited_base_url(Some(
+            "https://git.example.com/api?access_token=fixture-secret#private_token=fixture-secret",
+        ))
+        .expect("a base URL stays recorded");
+        assert!(!with_query.contains("fixture-secret"), "{with_query}");
+        assert_eq!(with_query, "https://git.example.com/api");
+        assert_eq!(audited_base_url(Some("not a url fixture-secret")), None);
+        assert_eq!(audited_base_url(None), None);
+    }
+
+    #[test]
+    fn provider_credential_audit_names_fields_not_values() {
+        let audit = GitProviderCredentialAudit {
+            action: "GIT_PROVIDER_CREDENTIALS_UPDATED",
+            context: AuditContext {
+                user_id: 4,
+                ip_address: Some("192.0.2.10".into()),
+                user_agent: "Mozilla/5.0 (via Temps AI assistant)".into(),
+            },
+            provider_id: 9,
+            provider_name: "Team Git".into(),
+            provider_type: "gitlab".into(),
+            auth_method: "pat".into(),
+            base_url: Some("https://git.example.com".into()),
+            credentials_set: vec!["token"],
+            via_ai_assistant: true,
+        };
+        assert_eq!(audit.operation_type(), "GIT_PROVIDER_CREDENTIALS_UPDATED");
+        let json: serde_json::Value =
+            serde_json::from_str(&AuditOperation::serialize(&audit).expect("serializes"))
+                .expect("json");
+        assert_eq!(json["provider_id"], 9);
+        assert_eq!(json["credentials_set"][0], "token");
+        assert_eq!(json["via_ai_assistant"], true);
+        assert!(json.get("action").is_none());
+    }
+}
