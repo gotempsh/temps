@@ -1053,8 +1053,10 @@ impl ExternalServiceManager {
             .iter()
             .filter(|(name, value)| {
                 Self::is_sensitive_parameter(name)
-                    && !value.is_null()
-                    && value.as_str().is_none_or(|text| !text.trim().is_empty())
+                    // Same rule as the defaults: only `null` and `""` count
+                    // as omitted, so a whitespace password the assistant
+                    // supplies is refused rather than kept.
+                    && !temps_providers_core::externalsvc::is_empty_parameter_value(Some(value))
             })
             .map(|(name, _)| name.clone())
             .collect();
@@ -1301,9 +1303,13 @@ mod tests {
             ("password".to_string(), serde_json::json!("typed-in-chat")),
             ("root_password".to_string(), serde_json::json!("")),
             ("api_token".to_string(), serde_json::Value::Null),
+            ("admin_password".to_string(), serde_json::json!("   ")),
             ("database".to_string(), serde_json::json!("app")),
         ]));
-        assert_eq!(supplied, vec!["password".to_string()]);
+        assert_eq!(
+            supplied,
+            vec!["admin_password".to_string(), "password".to_string()]
+        );
         assert!(ExternalServiceManager::is_sensitive_parameter("api_token"));
         assert!(ExternalServiceManager::is_sensitive_parameter(
             "DATABASE_URL"
