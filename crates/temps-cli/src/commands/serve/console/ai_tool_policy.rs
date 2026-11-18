@@ -566,12 +566,9 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
         "payload carries a credential; it must be entered in the console until sealed secret input exists",
         &[
             "blob_enable",
-            "check_access_provider",
             "createHttpCheck",
-            "create_access_provider",
             "create_agent",
             "create_bitbucket_provider",
-            "create_delivery_profile",
             "create_email_provider",
             "create_generic_provider",
             "create_git_provider",

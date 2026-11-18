@@ -1238,6 +1238,14 @@ pub const AI_WRITE_ALLOWLIST: &[&str] = &[
     // the secret. Deleting a provider stays in the console.
     "create_dns_provider",
     "update_provider",
+    // Edge and CDN credentials, same rules: a Cloudflare Access token
+    // (checked, then sealed; `dns_providers:write`) and a Bunny delivery
+    // profile's API key (checked against its Pull Zone, then encrypted;
+    // `dns_providers:write` and `dns_automation:write`). Both are
+    // `SecretString`, neither is ever returned, both handlers audit.
+    "check_access_provider",
+    "create_access_provider",
+    "create_delivery_profile",
     "add_managed_domain",
     "update_managed_domain",
     "verify_managed_domain",
