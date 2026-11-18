@@ -21,11 +21,23 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 
 SCRIPTS = Path(__file__).resolve().parent
 PRUNE = SCRIPTS / "prune-cargo-build-cache.py"
+REPO = SCRIPTS.parent.parent
+
+# The pruner reads the target-directory layout of the toolchain the real
+# musl build uses, which is the repository's pinned one. The fixture
+# workspace lives in a temp directory outside the repository, where
+# rust-toolchain.toml does not apply, so without this the test would run on
+# whatever cargo the CI runner image ships: Cargo 1.100 moved build outputs
+# from target/<profile>/deps to target/<profile>/build/<package>/, and an
+# image update alone failed this test. Bumping the pin to such a toolchain
+# fails it as well, which is the signal that the pruner needs the new layout.
+PINNED_TOOLCHAIN = tomllib.loads((REPO / "rust-toolchain.toml").read_text())["toolchain"]["channel"]
 
 WORKSPACE = {
     "Cargo.toml": """\
@@ -86,6 +98,9 @@ def cargo_build(workspace: Path, target: Path) -> list[dict]:
             "CARGO_TARGET_DIR": str(target),
             "CARGO_INCREMENTAL": "1",
             "RUSTC_WRAPPER": "",
+            # rustup installs the pinned toolchain on first use if the
+            # runner lacks it.
+            "RUSTUP_TOOLCHAIN": PINNED_TOOLCHAIN,
         },
         check=True,
         capture_output=True,
