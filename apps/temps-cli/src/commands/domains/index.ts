@@ -346,8 +346,12 @@ async function dns01Route(domain: string): Promise<Dns01Route> {
   }
   const candidates: ProviderZones[] = []
   for (const provider of providers.filter((p) => p.is_active)) {
-    const { data: zones } = await listManagedDomains({ client, path: { id: provider.id } })
-    candidates.push({ provider, zones: zones ?? [] })
+    const { data: zones, error: listingError } = await listManagedDomains({ client, path: { id: provider.id } })
+    candidates.push(
+      listingError || !zones
+        ? { provider, zones: [], listingError: getErrorMessage(listingError) }
+        : { provider, zones },
+    )
   }
   return chooseDns01Route(domain, candidates)
 }

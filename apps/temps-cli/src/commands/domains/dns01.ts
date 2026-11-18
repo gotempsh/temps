@@ -13,6 +13,8 @@ import type { DnsProviderResponse, ManagedDomainResponse } from '../../api/types
 export interface ProviderZones {
   provider: Pick<DnsProviderResponse, 'id' | 'name' | 'is_active'>
   zones: Array<Pick<ManagedDomainResponse, 'domain' | 'verified' | 'auto_manage'>>
+  /** Why this provider's zones could not be listed; its `zones` are then unknown, not empty. */
+  listingError?: string
 }
 
 export type Dns01Route =
@@ -32,6 +34,16 @@ function normalize(name: string): string {
  */
 export function chooseDns01Route(domain: string, candidates: ProviderZones[]): Dns01Route {
   const host = normalize(domain.startsWith('*.') ? domain.slice(2) : domain)
+  // A provider whose zones could not be listed may manage this domain too:
+  // choosing among the rest could pick the wrong provider, or miss that two
+  // claim the zone. Fall back to manual instructions rather than guess.
+  const unlisted = candidates.find((c) => c.provider.is_active && c.listingError !== undefined)
+  if (unlisted) {
+    return {
+      mode: 'manual',
+      reason: `Could not list the zones of DNS provider ${unlisted.provider.name} (${unlisted.listingError}), so Temps cannot tell which provider manages ${host}.`,
+    }
+  }
   const covering: Array<{ providerId: number; providerName: string; zone: string }> = []
   for (const { provider, zones } of candidates) {
     if (!provider.is_active) continue

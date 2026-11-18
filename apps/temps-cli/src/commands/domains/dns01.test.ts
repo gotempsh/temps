@@ -55,6 +55,24 @@ describe('chooseDns01Route', () => {
     expect(chooseDns01Route('app.example.com', [provider(1, [{ domain: 'example.com' }], false)]).mode).toBe('manual')
   })
 
+  test('a provider whose zones could not be listed is never assumed to manage none', () => {
+    const route = chooseDns01Route('app.example.com', [
+      provider(1, [{ domain: 'example.com' }]),
+      { ...provider(2, []), listingError: 'connection reset' },
+    ])
+    expect(route.mode).toBe('manual')
+    expect(route.mode === 'manual' && route.reason).toContain('provider-2')
+    expect(route.mode === 'manual' && route.reason).toContain('connection reset')
+  })
+
+  test('an inactive provider whose listing failed does not block the choice', () => {
+    const route = chooseDns01Route('app.example.com', [
+      provider(1, [{ domain: 'example.com' }]),
+      { ...provider(2, [], false), listingError: 'connection reset' },
+    ])
+    expect(route).toMatchObject({ mode: 'provider', providerId: 1 })
+  })
+
   test('two providers for the same zone are ambiguous, never guessed', () => {
     const route = chooseDns01Route('app.example.com', [
       provider(1, [{ domain: 'example.com' }]),
