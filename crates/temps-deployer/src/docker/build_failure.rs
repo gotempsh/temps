@@ -4,6 +4,7 @@
 //! Classifying failed image builds: whether a step ran out of memory, and
 //! whether that can be attributed to this build.
 
+use super::build_dns::BuildDnsWatch;
 use super::DockerRuntime;
 use crate::{BuildMemoryDiagnosis, BuilderError, OomAttribution};
 
@@ -381,31 +382,41 @@ impl DockerRuntime {
         Some(start.others_at_start? + started_since as usize)
     }
 
-    /// Map a failed build step to its error. When the failure looks like an
-    /// out-of-memory kill, the second value is an extra `ERROR:` line for the
-    /// build log so the deployment log says so where the user reads it.
+    /// Map a failed build step to its error. The second value is extra lines
+    /// for the build log, so the deployment log says what went wrong where the
+    /// user reads it: an `ERROR:` line when the failure looks like an
+    /// out-of-memory kill, and one when the build's output (watched by `dns`)
+    /// shows the build container could not resolve host names.
     pub(super) fn classify_build_failure(
         &self,
         error_text: String,
         start: &BuildStartSample,
         requested_cap_bytes: i64,
+        dns: &BuildDnsWatch,
     ) -> (BuilderError, Option<String>) {
-        match self.diagnose_out_of_memory(&error_text, start, requested_cap_bytes) {
-            MemoryVerdict::OutOfMemory(diagnosis) => {
-                let line = format!("ERROR: {}\n", diagnosis);
-                (
-                    BuilderError::BuildOutOfMemory {
-                        message: error_text,
-                        diagnosis,
-                    },
-                    Some(line),
-                )
-            }
-            MemoryVerdict::Unattributed(note) => {
-                (BuilderError::BuildFailed(error_text), Some(note))
-            }
-            MemoryVerdict::NotMemory => (BuilderError::BuildFailed(error_text), None),
-        }
+        let dns_line = dns.failure_hint(&error_text);
+        let (error, memory_line) =
+            match self.diagnose_out_of_memory(&error_text, start, requested_cap_bytes) {
+                MemoryVerdict::OutOfMemory(diagnosis) => {
+                    let line = format!("ERROR: {}\n", diagnosis);
+                    (
+                        BuilderError::BuildOutOfMemory {
+                            message: error_text,
+                            diagnosis,
+                        },
+                        Some(line),
+                    )
+                }
+                MemoryVerdict::Unattributed(note) => {
+                    (BuilderError::BuildFailed(error_text), Some(note))
+                }
+                MemoryVerdict::NotMemory => (BuilderError::BuildFailed(error_text), None),
+            };
+        let notes = match (memory_line, dns_line) {
+            (Some(memory), Some(dns)) => Some(memory + &dns),
+            (memory, dns) => memory.or(dns),
+        };
+        (error, notes)
     }
 }
 
@@ -792,6 +803,37 @@ mod tests {
     // rather than panicking or producing a confusing bollard connection error.
     // None of these tests require a live daemon: they are pure in-process
     // checks of the enum's behaviour under the control-plane profile.
+
+    #[test]
+    fn classify_build_failure_adds_the_dns_line_when_the_output_showed_one() {
+        let rt = runtime_for_diagnosis(true);
+        // No host memory signals: an unrelated OOM kill on the test host
+        // must not turn this into a memory diagnosis.
+        let start = BuildStartSample {
+            oom_kills: None,
+            uptime_us: None,
+            others_at_start: None,
+            builds_started: 0,
+        };
+        let failed_step =
+            "process \"/bin/sh -c npm ci\" did not complete successfully: exit code: 1".to_string();
+
+        let quiet = BuildDnsWatch::default();
+        let (error, notes) = rt.classify_build_failure(failed_step.clone(), &start, CAP, &quiet);
+        assert!(matches!(error, BuilderError::BuildFailed(_)));
+        assert!(
+            notes.as_deref().is_none_or(|n| !n.contains("DNS")),
+            "no DNS line without a resolver failure: {notes:?}"
+        );
+
+        let mut dns = BuildDnsWatch::default();
+        dns.observe_stream("npm error code EAI_AGAIN\n");
+        let (error, notes) = rt.classify_build_failure(failed_step.clone(), &start, CAP, &dns);
+        // The error itself is unchanged; the explanation goes to the log.
+        assert_eq!(error.to_string(), format!("Build failed: {failed_step}"));
+        let notes = notes.expect("a DNS line");
+        assert!(notes.contains("ERROR: DNS resolution failed inside the build container"));
+    }
 
     #[test]
     fn build_stream_error_text_drops_the_stream_wrapper() {

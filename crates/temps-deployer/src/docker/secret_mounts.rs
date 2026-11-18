@@ -3,6 +3,7 @@
 
 //! Builds that serve BuildKit secret mounts, for `RUN --mount=type=secret`.
 
+use super::build_dns::BuildDnsWatch;
 use super::image_builder::{docker_build_args, image_labels};
 use super::DockerRuntime;
 use crate::build_timings::BuildStepTimer;
@@ -154,7 +155,13 @@ pub(super) async fn emit_buildkit_status(
     status: &BuildKitStatus,
     log_file: &mut tokio::fs::File,
     log_callback: &Option<crate::LogCallback>,
+    dns_watch: &mut BuildDnsWatch,
 ) {
+    // Scan before the first await: a drain deadline can cancel log delivery,
+    // and a resolver failure already received must still reach the hint.
+    for log in &status.logs {
+        dns_watch.observe(&log.vertex, log.stream, &String::from_utf8_lossy(&log.msg));
+    }
     for vertex in &status.vertexes {
         if vertex.name.is_empty() {
             continue;
@@ -183,9 +190,10 @@ pub(super) async fn emit_buildkit_status(
     }
     for log in &status.logs {
         let _ = log_file.write_all(&log.msg[..]).await;
-        debug!("BuildKit: {}", String::from_utf8_lossy(&log.msg));
+        let text = String::from_utf8_lossy(&log.msg[..]);
+        debug!("BuildKit: {}", text);
         if let Some(callback) = log_callback {
-            callback(String::from_utf8_lossy(&log.msg[..]).to_string()).await;
+            callback(text.into_owned()).await;
         }
     }
 }
@@ -200,13 +208,14 @@ enum BuildStatusEvent {
 async fn record_build_status_event(
     event: BuildStatusEvent,
     step_timer: &mut BuildStepTimer,
+    dns_watch: &mut BuildDnsWatch,
     log_file: &mut tokio::fs::File,
     log_callback: &Option<crate::LogCallback>,
 ) {
     match event {
         BuildStatusEvent::Status(status) => {
             step_timer.observe_vertices(&status.vertexes);
-            emit_buildkit_status(&status, log_file, log_callback).await;
+            emit_buildkit_status(&status, log_file, log_callback, dns_watch).await;
         }
         BuildStatusEvent::Unavailable(reason) => {
             warn!("Live build output is unavailable: {}", reason);
@@ -500,10 +509,11 @@ impl DockerRuntime {
         tokio::pin!(solve);
 
         let mut step_timer = BuildStepTimer::new();
+        let mut dns_watch = BuildDnsWatch::default();
         let outcome = loop {
             tokio::select! {
                 Some(event) = status_receiver.recv() => {
-                    record_build_status_event(event, &mut step_timer, &mut log_file, &log_callback)
+                    record_build_status_event(event, &mut step_timer, &mut dns_watch, &mut log_file, &log_callback)
                         .await;
                 }
                 outcome = &mut solve => break outcome,
@@ -512,8 +522,14 @@ impl DockerRuntime {
         // The solve can end just before its last events are delivered.
         let drain = async {
             while let Some(event) = status_receiver.recv().await {
-                record_build_status_event(event, &mut step_timer, &mut log_file, &log_callback)
-                    .await;
+                record_build_status_event(
+                    event,
+                    &mut step_timer,
+                    &mut dns_watch,
+                    &mut log_file,
+                    &log_callback,
+                )
+                .await;
             }
         };
         let _ = tokio::time::timeout(STATUS_DRAIN_TIMEOUT, drain).await;
@@ -539,9 +555,13 @@ impl DockerRuntime {
             if let Some(ref callback) = log_callback {
                 callback(error_line).await;
             }
-            let (error, memory_line) =
-                self.classify_build_failure(error_text, &build_start, i64::from(memory_i32));
-            if let Some(line) = memory_line {
+            let (error, log_notes) = self.classify_build_failure(
+                error_text,
+                &build_start,
+                i64::from(memory_i32),
+                &dns_watch,
+            );
+            if let Some(line) = log_notes {
                 let _ = log_file.write_all(line.as_bytes()).await;
                 if let Some(ref callback) = log_callback {
                     callback(line).await;
