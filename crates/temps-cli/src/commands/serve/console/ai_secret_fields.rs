@@ -370,11 +370,180 @@ mod tests {
         );
     }
 
+    fn assistant_write_operations() -> BTreeSet<String> {
+        super::super::ai_write_allowlist().into_iter().collect()
+    }
+
     fn assistant_operations() -> BTreeSet<String> {
         super::super::ai_write_allowlist()
             .into_iter()
             .chain(super::super::ai_read_safe_posts())
             .collect()
+    }
+
+    /// Every credential operation the assistant may propose, with the fields
+    /// the user types into the private form (the pointers the
+    /// `add-a-provider-credential` playbook names). Each must be a secret path
+    /// in the published spec, so a literal there is refused and only a
+    /// `secret_ref:` handle is accepted; the other fields must not be, or the
+    /// model could not fill them in.
+    const CREDENTIAL_OPERATIONS: &[(&str, &[&str], &[&str])] = &[
+        (
+            "create_dns_provider",
+            &[
+                "/credentials/api_token",
+                "/credentials/api_key",
+                "/credentials/secret_access_key",
+                "/credentials/session_token",
+                "/credentials/private_key",
+                "/credentials/client_secret",
+            ],
+            &["/name", "/credentials/type", "/credentials/account_id"],
+        ),
+        (
+            "update_provider",
+            &["/credentials/api_token", "/credentials/secret_access_key"],
+            &["/name", "/credentials/access_key_id"],
+        ),
+        ("check_cloudflare_token", &["/token"], &["/zone"]),
+        ("check_access_provider", &["/token"], &["/account_id"]),
+        (
+            "create_access_provider",
+            &["/token"],
+            &["/account_id", "/name"],
+        ),
+        (
+            "create_delivery_profile",
+            &["/bunny_api_key"],
+            &["/name", "/bunny_pull_zone_id"],
+        ),
+        (
+            "create_email_provider",
+            &[
+                "/ses_credentials/secret_access_key",
+                "/scaleway_credentials/api_key",
+                "/smtp_credentials/password",
+            ],
+            &["/name", "/ses_credentials/access_key_id"],
+        ),
+        (
+            "update_email_provider",
+            &[
+                "/ses_credentials/secret_access_key",
+                "/scaleway_credentials/api_key",
+                "/smtp_credentials/password",
+            ],
+            &["/name"],
+        ),
+        (
+            "create_slack_provider",
+            &["/config/webhook_url"],
+            &["/name"],
+        ),
+        (
+            "update_slack_provider",
+            &["/config/webhook_url"],
+            &["/name"],
+        ),
+        (
+            "create_notification_email_provider",
+            &["/config/password"],
+            &["/name"],
+        ),
+        (
+            "update_notification_email_provider",
+            &["/config/password"],
+            &["/name"],
+        ),
+        (
+            "create_cloudflare_provider",
+            &["/config/api_token"],
+            &["/name"],
+        ),
+        (
+            "update_cloudflare_provider",
+            &["/config/api_token"],
+            &["/name"],
+        ),
+        (
+            "create_webhook_provider",
+            &[
+                "/config/headers/Authorization",
+                "/config/headers/X-Signature",
+            ],
+            &["/name", "/config/url"],
+        ),
+        (
+            "update_webhook_provider",
+            &["/config/headers/Authorization"],
+            &["/name", "/config/url"],
+        ),
+        ("create_webhook", &["/secret"], &["/url"]),
+        ("update_webhook", &["/secret"], &["/url"]),
+        ("create_github_pat_provider", &["/token"], &["/name"]),
+        ("create_gitlab_pat_provider", &["/token"], &["/name"]),
+        ("create_gitea_pat_provider", &["/token"], &["/name"]),
+        ("create_generic_provider", &["/token"], &["/name"]),
+        (
+            "create_bitbucket_provider",
+            &["/auth/token", "/auth/password"],
+            &["/name"],
+        ),
+        ("update_git_provider_credentials", &["/token"], &[]),
+        // S3 seals its access key id too (DNS and email treat it as an
+        // identifier); either way the secret half is sealed.
+        (
+            "create_s3_source",
+            &["/secret_key", "/access_key_id"],
+            &["/name", "/bucket_name"],
+        ),
+        (
+            "create_ingress_connector",
+            &["/secrets/client_secret"],
+            &["/values/client_secret", "/provider"],
+        ),
+    ];
+
+    fn operation<'a>(spec: &'a Value, operation_id: &str) -> Option<&'a Value> {
+        spec.get("paths")?
+            .as_object()?
+            .values()
+            .filter_map(Value::as_object)
+            .flat_map(|methods| methods.values())
+            .find(|op| op.get("operationId").and_then(Value::as_str) == Some(operation_id))
+    }
+
+    #[test]
+    fn every_provider_credential_the_assistant_can_send_is_a_secret_path() {
+        let spec = spec();
+        let components = spec.get("components").cloned().unwrap_or(Value::Null);
+        let writes = assistant_write_operations();
+        for (operation_id, credentials, plain) in CREDENTIAL_OPERATIONS {
+            assert!(
+                writes.contains(*operation_id),
+                "`{operation_id}` must be in the assistant's write list: a secret handle only \
+                 resolves for a confirmed write"
+            );
+            let op = operation(&spec, operation_id)
+                .unwrap_or_else(|| panic!("`{operation_id}` is not in the published spec"));
+            let body = op
+                .get("requestBody")
+                .unwrap_or_else(|| panic!("`{operation_id}` has no request body"));
+            let paths = temps_ai_api_tools::secret_paths_for_request_body(body, &components);
+            for pointer in *credentials {
+                assert!(
+                    temps_ai_api_tools::pointer_is_credential(pointer, &paths),
+                    "`{operation_id}` {pointer} must be a secret path, or a literal key could be \
+                     typed into the chat"
+                );
+            }
+            for pointer in *plain {
+                assert!(
+                    !temps_ai_api_tools::pointer_is_credential(pointer, &paths),
+                    "`{operation_id}` {pointer} is not a credential; a handle there is refused"
+                );
+            }
+        }
     }
 
     /// The name check above cannot see into a map: a free-form `config`,
