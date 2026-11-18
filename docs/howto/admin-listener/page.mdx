@@ -39,8 +39,8 @@ There are two ways to configure it, and exactly one is in effect:
 
 | Source | How | When it applies |
 | --- | --- | --- |
-| Console setting (recommended) | **Settings → Security → Admin access gate**, or `PATCH /api/admin/gate-settings` (needs the `SettingsWrite` permission). Stored in the database, takes effect immediately on every process without a restart, and every change is recorded in the audit log as `ADMIN_GATE_UPDATED` with the old and new rules. | When none of the variables below is set. |
-| Environment variables | `TEMPS_ADMIN_ALLOWED_HOSTS`, `TEMPS_ADMIN_ALLOWED_IPS`, `TEMPS_ADMIN_TRUST_FORWARDED_FOR` on the `temps serve` (and, in split topology, `temps proxy`) process. Read once at startup. | When **any** of them is set. They replace the console setting entirely, and the console page shows the gate read-only. |
+| Console setting (recommended) | **Settings → Security → Admin access gate**, or `PATCH /api/admin/gate-settings` (needs the `SettingsWrite` permission). Stored in the database, no restart needed: the process that saves the rules applies them at once, and every other Temps process (a separate `temps proxy` in split topology) picks them up on the database change notification, or within 60 seconds at the latest. Every change is recorded in the audit log as `ADMIN_GATE_UPDATED` with the old and new rules. | When the environment variables below do not take over. |
+| Environment variables | `TEMPS_ADMIN_ALLOWED_HOSTS`, `TEMPS_ADMIN_ALLOWED_IPS`, `TEMPS_ADMIN_TRUST_FORWARDED_FOR` on the `temps serve` (and, in split topology, `temps proxy`) process. Read once at startup. | When `TEMPS_ADMIN_ALLOWED_HOSTS` or `TEMPS_ADMIN_ALLOWED_IPS` has at least one entry, or `TEMPS_ADMIN_TRUST_FORWARDED_FOR` is true. They then replace the console setting entirely, and the console page shows the gate read-only. An empty list or `TEMPS_ADMIN_TRUST_FORWARDED_FOR=false` on its own changes nothing: the console setting stays in effect and editable. |
 
 There are no `temps serve` flags for the gate. Older `--help` text mentioned
 `--admin-allowed-ips` / `--admin-allowed-hosts`; those flags never existed.
@@ -61,11 +61,15 @@ console.example.com
 
 The console refuses to save rules that would lock out the admin saving them,
 so open the console through that hostname first. Then check from another
-machine:
+machine. `--resolve` sends the request to the server while TLS and the `Host`
+header both use the console's name (setting only `-H 'Host: ...'` would fail
+the certificate check); `-k` accepts the certificate's name mismatch for the
+bare-IP request:
 
 ```bash
-curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: console.example.com' https://<server-ip>/   # 200
-curl -s -o /dev/null -w '%{http_code}\n' http://<server-ip>/                                   # 404
+curl -s -o /dev/null -w '%{http_code}\n' \
+  --resolve console.example.com:443:<server-ip> https://console.example.com/   # 200
+curl -sk -o /dev/null -w '%{http_code}\n' https://<server-ip>/                 # 404
 ```
 
 A `Host` allowlist hides the console from anything that does not know its name;
@@ -80,14 +84,20 @@ relying on an IP allowlist.
 ### If you lock yourself out
 
 The console refuses a save that would deny the admin saving it, but your
-address can still change later. The rules live in the database, so clear them
-there; every Temps process picks the change up within a minute, without a
-restart:
+address can still change later. The rules live in the database, so replace them
+there with empty ones; every Temps process picks the change up within a minute,
+without a restart:
 
 ```bash
 psql "$TEMPS_DATABASE_URL" -c \
-  "UPDATE settings SET data = (data::jsonb - 'admin_gate')::json WHERE id = 1;"
+  "UPDATE settings SET data = jsonb_set(data::jsonb, '{admin_gate}',
+     '{\"allowed_ips\": [], \"allowed_hosts\": [], \"trust_forwarded_for\": false}')::json
+   WHERE id = 1;"
 ```
+
+Write the empty rules rather than deleting the `admin_gate` key: a running
+server deliberately keeps its current rules when the key disappears, so that a
+lost or restored settings row can never open the console by itself.
 
 The console is then open again on any host and address until you save new
 rules. If the gate comes from the `TEMPS_ADMIN_*` variables instead, change
@@ -211,7 +221,7 @@ that case.
 | `TEMPS_CONSOLE_ADDRESS`            | `host:port`      | random     | Public listener (and admin listener when admin is not split out)                              |
 | `TEMPS_CONSOLE_ADMIN_ADDRESS`      | `host:port`      | unset      | Bind admin/management routes to this address. Enables two-listener mode.                      |
 | `TEMPS_CONSOLE_INGRESS_ADDRESS`    | `host:port`      | automatic  | Listener that serves only the public callback routes and health probes, used for callbacks while the console is restricted. `temps serve` picks a loopback port itself; set it only in split topology, to the same value on `temps serve --role=console` and `temps proxy`. It is always an address of its own, also in two-listener mode: `TEMPS_CONSOLE_ADDRESS` has no admin routes then but still serves the authenticated MCP endpoint, so it must not be reused. Startup fails if it equals another console listener. |
-| `TEMPS_ADMIN_ALLOWED_IPS`          | CSV of IP/CIDR   | empty      | Allowlist source addresses for the admin surface. Empty = no IP gate. Setting any `TEMPS_ADMIN_*` variable overrides the console's [admin access gate](#admin-gate) setting. |
+| `TEMPS_ADMIN_ALLOWED_IPS`          | CSV of IP/CIDR   | empty      | Allowlist source addresses for the admin surface. Empty = no IP gate. A non-empty `TEMPS_ADMIN_ALLOWED_IPS` or `TEMPS_ADMIN_ALLOWED_HOSTS`, or `TEMPS_ADMIN_TRUST_FORWARDED_FOR=true`, overrides the console's [admin access gate](#admin-gate) setting; empty values leave it in effect. |
 | `TEMPS_ADMIN_ALLOWED_HOSTS`        | CSV of hostnames | empty      | Allowlist `Host` header values on the admin surface. Empty = no Host gate. Port is stripped. |
 | `TEMPS_ADMIN_TRUST_FORWARDED_FOR`  | bool             | `false`    | Honor `X-Forwarded-For` for the IP gate, but only from loopback peers (anti-spoof).            |
 

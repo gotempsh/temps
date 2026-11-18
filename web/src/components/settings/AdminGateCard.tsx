@@ -176,7 +176,9 @@ export function AdminGateCard() {
                   type="button"
                   size="sm"
                   variant="outline"
-                  disabled={updateMutation.isPending}
+                  // The shortcut saves the stored rules plus this hostname;
+                  // with unsaved edits below it would silently discard them.
+                  disabled={updateMutation.isPending || dirty}
                   onClick={() => restrictToHost(suggestedHost)}
                 >
                   {updateMutation.isPending && (
@@ -184,6 +186,11 @@ export function AdminGateCard() {
                   )}
                   Only answer on {suggestedHost}
                 </Button>
+              )}
+              {suggestedHost && dirty && (
+                <p className="text-xs text-muted-foreground">
+                  Save the edits below first; this shortcut would replace them.
+                </p>
               )}
             </AlertDescription>
           </Alert>

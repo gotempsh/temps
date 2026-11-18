@@ -193,7 +193,6 @@ async fn patch_admin_gate(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsWrite);
 
-    let previous = state.service.snapshot();
     let caller_host = headers
         .get(header::HOST)
         .and_then(|v| v.to_str().ok())
@@ -206,10 +205,14 @@ async fn patch_admin_gate(
         trust_forwarded_for: request.trust_forwarded_for,
     };
 
-    let cfg = state
+    let update = state
         .service
         .update(new_settings, caller_ips, caller_host.as_deref())
         .await?;
+    // The rules this write replaced, read under the row lock it took, so
+    // overlapping saves each audit the change they actually made.
+    let previous = update.previous.normalized();
+    let cfg = update.current;
 
     let audit = AdminGateUpdatedAudit {
         context: AuditContext {
@@ -217,12 +220,8 @@ async fn patch_admin_gate(
             ip_address: Some(metadata.ip_address.clone()),
             user_agent: metadata.user_agent.clone(),
         },
-        old_allowed_ips: previous
-            .allowed_nets
-            .iter()
-            .map(|n| n.to_string())
-            .collect(),
-        old_allowed_hosts: previous.allowed_hosts.as_ref().clone(),
+        old_allowed_ips: previous.allowed_ips,
+        old_allowed_hosts: previous.allowed_hosts,
         old_trust_forwarded_for: previous.trust_forwarded_for,
         new_allowed_ips: cfg.allowed_nets.iter().map(|n| n.to_string()).collect(),
         new_allowed_hosts: cfg.allowed_hosts.as_ref().clone(),
