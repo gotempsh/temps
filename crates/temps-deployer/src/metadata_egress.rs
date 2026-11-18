@@ -156,17 +156,35 @@ struct Installed {
     changed: bool,
 }
 
+/// What installs remember between passes, whichever caller ran them.
+struct GuardState {
+    /// DNS exceptions in the ruleset that is live.
+    committed: Vec<IpAddr>,
+    /// Whether the systemd-resolved upstream file has been the resolver file
+    /// containers get, at any point while this process runs (see
+    /// [`container_nameservers`]).
+    systemd_selected: bool,
+}
+
 /// One nft transaction at a time, whichever caller asks. The lock also holds
 /// the DNS exceptions last committed, so every caller compares against the
 /// ruleset that is actually live.
 async fn install() -> Result<Installed, MetadataEgressError> {
-    static COMMITTED: tokio::sync::Mutex<Vec<IpAddr>> = tokio::sync::Mutex::const_new(Vec::new());
-    let mut committed = COMMITTED.lock().await;
-    let current = host_dns_exceptions(Path::new(RESOLV_CONF), Path::new(SYSTEMD_RESOLV_CONF)).await;
-    let dns_exceptions = retain_previous_exceptions(current, &committed);
+    static STATE: tokio::sync::Mutex<GuardState> = tokio::sync::Mutex::const_new(GuardState {
+        committed: Vec::new(),
+        systemd_selected: false,
+    });
+    let mut state = STATE.lock().await;
+    let current = host_dns_exceptions(
+        Path::new(RESOLV_CONF),
+        Path::new(SYSTEMD_RESOLV_CONF),
+        &mut state.systemd_selected,
+    )
+    .await;
+    let dns_exceptions = retain_previous_exceptions(current, &state.committed);
     apply_nft(&render_ruleset(&dns_exceptions)).await?;
-    let changed = *committed != dns_exceptions;
-    committed.clone_from(&dns_exceptions);
+    let changed = state.committed != dns_exceptions;
+    state.committed.clone_from(&dns_exceptions);
     Ok(Installed {
         dns_exceptions,
         changed,
@@ -283,23 +301,43 @@ async fn read_resolv_conf(path: &Path) -> Option<String> {
 /// The nameservers Docker and BuildKit hand to containers: those in `primary`,
 /// unless its only nameserver is the systemd-resolved stub, in which case
 /// those of `systemd` (the same choice Docker makes).
-async fn container_nameservers(primary: &Path, systemd: &Path) -> Vec<IpAddr> {
-    let nameservers = read_resolv_conf(primary)
-        .await
-        .map(|text| parse_nameservers(&text))
-        .unwrap_or_default();
-    if nameservers != [SYSTEMD_RESOLVED_STUB] {
-        return nameservers;
+///
+/// dockerd makes that choice once and keeps it for its lifetime, so after
+/// `primary` stops naming only the stub it may still copy `systemd` into new
+/// containers. Once the stub case has been seen (`systemd_selected`), both
+/// files' resolvers are therefore returned, `primary` first. A daemon that
+/// made the systemd choice before this process first looked cannot be
+/// detected: dockerd does not expose it.
+async fn container_nameservers(
+    primary: &Path,
+    systemd: &Path,
+    systemd_selected: &mut bool,
+) -> Vec<IpAddr> {
+    let read = |path| async move {
+        read_resolv_conf(path)
+            .await
+            .map(|text| parse_nameservers(&text))
+            .unwrap_or_default()
+    };
+    let mut nameservers = read(primary).await;
+    if nameservers == [SYSTEMD_RESOLVED_STUB] {
+        *systemd_selected = true;
+        return read(systemd).await;
     }
-    read_resolv_conf(systemd)
-        .await
-        .map(|text| parse_nameservers(&text))
-        .unwrap_or_default()
+    if *systemd_selected {
+        nameservers.extend(read(systemd).await);
+    }
+    nameservers
 }
 
 /// The resolvers Docker hands to containers that sit inside a blocked range.
-async fn host_dns_exceptions(primary: &Path, systemd: &Path) -> Vec<IpAddr> {
-    let exceptions = dns_exceptions(container_nameservers(primary, systemd).await);
+async fn host_dns_exceptions(
+    primary: &Path,
+    systemd: &Path,
+    systemd_selected: &mut bool,
+) -> Vec<IpAddr> {
+    let exceptions =
+        dns_exceptions(container_nameservers(primary, systemd, systemd_selected).await);
     debug!(dns_exceptions = ?exceptions, "Host resolvers inside cloud-metadata ranges");
     exceptions
 }
@@ -617,26 +655,57 @@ nameserverx 10.0.0.1
 
         // Only the stub: Docker hands containers the upstream file.
         std::fs::write(&primary, "nameserver 127.0.0.53\noptions edns0\n").expect("write");
+        let mut selected = false;
         assert_eq!(
-            host_dns_exceptions(&primary, &systemd).await,
+            host_dns_exceptions(&primary, &systemd, &mut selected).await,
             vec![ip("169.254.169.254")]
         );
+        assert!(selected);
 
         // A real resolver in the primary file: the systemd file is inactive,
         // so its link-local resolver gets no exception.
         std::fs::write(&primary, "nameserver 10.0.0.53\n").expect("write");
-        assert!(host_dns_exceptions(&primary, &systemd).await.is_empty());
+        let mut selected = false;
+        assert!(host_dns_exceptions(&primary, &systemd, &mut selected)
+            .await
+            .is_empty());
+        assert!(!selected);
 
         // The stub next to another resolver is not the systemd-resolved case.
         std::fs::write(&primary, "nameserver 127.0.0.53\nnameserver 10.0.0.53\n").expect("write");
-        assert!(host_dns_exceptions(&primary, &systemd).await.is_empty());
+        assert!(host_dns_exceptions(&primary, &systemd, &mut selected)
+            .await
+            .is_empty());
 
         // A link-local resolver in the primary file itself.
         std::fs::write(&primary, "nameserver 169.254.169.253\n").expect("write");
         assert_eq!(
-            host_dns_exceptions(&primary, &systemd).await,
+            host_dns_exceptions(&primary, &systemd, &mut selected).await,
             vec![ip("169.254.169.253")]
         );
+    }
+
+    #[tokio::test]
+    async fn the_systemd_choice_sticks_like_dockerds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primary = dir.path().join("resolv.conf");
+        let systemd = dir.path().join("systemd-resolv.conf");
+        std::fs::write(&primary, "nameserver 127.0.0.53\n").expect("write");
+        std::fs::write(&systemd, "nameserver 169.254.169.254\n").expect("write");
+        let mut selected = false;
+        host_dns_exceptions(&primary, &systemd, &mut selected).await;
+        assert!(selected);
+
+        // The primary file stops naming only the stub and the upstream
+        // resolver changes: dockerd may still copy the systemd file, so its
+        // current resolver is covered, after the primary's.
+        std::fs::write(&primary, "nameserver 169.254.169.250\n").expect("write");
+        std::fs::write(&systemd, "nameserver 169.254.169.253\n").expect("write");
+        assert_eq!(
+            host_dns_exceptions(&primary, &systemd, &mut selected).await,
+            vec![ip("169.254.169.250"), ip("169.254.169.253")]
+        );
+        assert!(selected);
     }
 
     #[test]
