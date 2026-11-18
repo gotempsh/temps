@@ -412,7 +412,17 @@ pub(crate) fn validate_handles(
                     field: pointer,
                 });
             }
-            _ => {}
+            // An empty string or null leaves the field unset.
+            Some(Value::String(_)) | Some(Value::Null) | None => {}
+            // A credential is a string. An object, array, number or bool
+            // there is a value the model typed (`{"token": "..."}`), so it
+            // must not be staged either.
+            Some(_) => {
+                return Err(ApiToolError::SecretLiteralRejected {
+                    operation_id: operation_id.to_string(),
+                    field: pointer,
+                });
+            }
         }
     }
     Ok(())
@@ -449,7 +459,15 @@ pub(crate) async fn substitute(
                     field: pointer,
                 });
             }
-            _ => continue,
+            Some(Value::String(_)) | Some(Value::Null) | None => continue,
+            // Not a string, so not a handle: a structured value the model
+            // typed into a credential field is refused, never sent.
+            Some(_) => {
+                return Err(ApiToolError::SecretLiteralRejected {
+                    operation_id: operation_id.to_string(),
+                    field: pointer,
+                });
+            }
         };
         if !is_secret_ref(&handle) {
             return Err(ApiToolError::SecretReferenceMisplaced {
@@ -530,6 +548,42 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::collections::HashMap;
+
+    #[test]
+    fn a_structured_value_in_a_credential_field_is_refused_at_proposal() {
+        let paths = collect_secret_paths(
+            &json!({"type":"object","properties":{"credentials":{"type":"object","properties":{
+                "api_token":{"type":"string","x-temps-secret":true}
+            }}}}),
+            &json!({}),
+        );
+        for value in [
+            json!({"token": "fixture-private-value"}),
+            json!(["fixture-private-value"]),
+            json!(42),
+            json!(true),
+        ] {
+            let body = json!({"credentials": {"api_token": value}});
+            let error = validate_handles("create_dns_provider", &body, &paths)
+                .expect_err("only a handle, an empty string or null may sit in a credential field");
+            assert!(
+                matches!(&error, ApiToolError::SecretLiteralRejected { field, .. }
+                    if field == "/credentials/api_token"),
+                "{error:?}"
+            );
+            assert!(!error.to_string().contains("fixture-private-value"));
+        }
+        for unset in [json!(""), json!(null)] {
+            validate_handles(
+                "create_dns_provider",
+                &json!({"credentials": {"api_token": unset}}),
+                &paths,
+            )
+            .expect("an unset credential is not a literal");
+        }
+        validate_handles("create_dns_provider", &json!({"credentials": {}}), &paths)
+            .expect("an absent credential is not a literal");
+    }
 
     #[test]
     fn unavailable_secret_input_checks_nested_slots_without_echoing_values() {

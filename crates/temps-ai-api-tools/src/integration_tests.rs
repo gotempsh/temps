@@ -809,6 +809,28 @@ mod tests {
             "{literal:?}"
         );
         assert!(!literal.to_string().contains("typed-in-chat"));
+        let structured = caller
+            .call(
+                "create_dns_provider",
+                json!({"name": "edge", "provider_type": "cloudflare",
+                       "credentials": {"type": "cloudflare",
+                                       "api_token": {"value": "typed-in-chat"}}}),
+                &scope,
+            )
+            .await
+            .expect_err("a structured value in a credential field is refused");
+        // The body's shape check refuses it first; either refusal names the
+        // field and never the value.
+        assert!(
+            matches!(
+                &structured,
+                crate::ApiToolError::SecretLiteralRejected { .. }
+                    | crate::ApiToolError::BadObjectShape { .. }
+            ),
+            "{structured:?}"
+        );
+        assert!(!structured.to_string().contains("typed-in-chat"));
+        assert!(!format!("{structured:?}").contains("typed-in-chat"));
         let misplaced = caller
             .call(
                 "create_dns_provider",
