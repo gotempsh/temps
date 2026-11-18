@@ -515,6 +515,18 @@ fn is_private_ip(ip: &str) -> bool {
     }
 }
 
+/// The control plane's public address for whoever must not guess it from
+/// DNS (*Make it reachable*): the address the public-IP lookup found,
+/// cached like every other read of it.
+#[async_trait::async_trait]
+impl temps_core::server_public_address::ServerPublicAddress for PlatformInfoService {
+    async fn detected_public_ip(&self) -> Option<IpAddr> {
+        self.get_public_ip_with_fallback()
+            .await
+            .and_then(|ip| ip.trim().parse::<IpAddr>().ok())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

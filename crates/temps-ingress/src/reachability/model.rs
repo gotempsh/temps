@@ -655,6 +655,19 @@ pub struct DnsRecordState {
     /// The run whose marker it carries.
     #[serde(default)]
     pub run_id: Option<i32>,
+    /// Whether the provider proxies it, when read: what undo puts back
+    /// with the content. `None` in records read before this was kept.
+    /// Journal state for undo, not part of the API schema.
+    #[serde(default)]
+    #[schema(ignore)]
+    pub proxied: Option<bool>,
+    /// The run whose DNS-only or proxied write this is, when its marker
+    /// covers it except for the proxy flag, toggled at the provider since:
+    /// that run can take it back to undo it. Read live by undo, not part
+    /// of the API schema.
+    #[serde(default)]
+    #[schema(ignore)]
+    pub proxy_toggled_run_id: Option<i32>,
 }
 
 impl DnsRecordState {

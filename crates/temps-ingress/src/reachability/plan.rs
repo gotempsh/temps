@@ -93,6 +93,8 @@ pub const FIELD_ACCESS_EMAIL_DOMAINS: &str = "access_email_domains";
 pub const ACCESS_SETUP_PATH: &str = "/dns-providers#cloudflare-access";
 /// Where the control plane's public address is set.
 pub const EDGE_TARGET_SETTINGS_PATH: &str = "/settings#edge-target";
+/// Where DNS providers and their zones are managed.
+pub const DNS_PROVIDERS_PATH: &str = "/dns-providers";
 
 /// A saved Cloudflare Access token, and the apps in its account that
 /// protect the planned address (ADR 065 D9).
@@ -153,6 +155,16 @@ pub struct ZoneFact {
     pub domain: String,
     pub verified: bool,
     pub auto_manage: bool,
+    /// Records Temps writes in the zone are proxied by the provider
+    /// (Cloudflare's orange cloud) unless a write says otherwise (ADR 031).
+    pub proxied_by_default: bool,
+}
+
+impl ZoneFact {
+    /// Whether the zone's provider can proxy a record (Cloudflare).
+    pub fn can_proxy(&self) -> bool {
+        self.provider_type == "cloudflare"
+    }
 }
 
 /// A worker in `private` mode (ADR 064 D5), as it reports itself.
@@ -246,6 +258,10 @@ pub struct PlanFacts {
     /// plane is no direct ingress: the hosts it is reached at and what they
     /// resolve to, none of it public. Empty when it has no such host.
     pub control_plane_hosts: Option<Vec<ControlPlaneHost>>,
+    /// Why the address the server knows for itself cannot be an origin
+    /// (a known proxy's edge, or a non-public edge target), when that is
+    /// why the control plane is no direct ingress.
+    pub control_plane_refusal: Option<String>,
     /// Active workers that let Temps run a tunnel on them.
     pub tunnel_workers: Vec<NamedId>,
     /// Active workers whose owner keeps Temps from exposing them.
@@ -930,6 +946,92 @@ pub fn http01_direct(facts: &PlanFacts) -> Option<&DirectIngress> {
         .find(|d| d.takes_port_80 && d.check_failed.is_none() && !d.ips.is_empty())
 }
 
+/// The direct ingress a certificate through DNS-01 can be issued for: it
+/// has an address and passed its last check. Port 80 does not matter, so a
+/// server behind a CDN's proxy or a firewall qualifies.
+pub fn dns01_direct(facts: &PlanFacts) -> Option<&DirectIngress> {
+    facts
+        .directs
+        .iter()
+        .find(|d| d.check_failed.is_none() && !d.ips.is_empty())
+        .filter(|d| {
+            d.ips
+                .iter()
+                .all(|ip| temps_core::known_proxies::known_proxy(*ip).is_none())
+        })
+}
+
+/// The direct ingress a direct option uses, by the challenge it issues the
+/// certificate with: DNS-01 when the zone is managed, HTTP-01 otherwise.
+pub fn direct_for(facts: &PlanFacts, kind: PlanOptionKind) -> Option<&DirectIngress> {
+    match kind {
+        PlanOptionKind::DirectManagedDns => dns01_direct(facts),
+        _ => http01_direct(facts),
+    }
+}
+
+/// How the record a direct option writes is served, for its step label.
+fn proxy_state(zone: &ZoneFact) -> String {
+    match (zone.can_proxy(), zone.proxied_by_default) {
+        (true, true) => format!("(proxied by {}, as the zone's default)", zone.provider_name),
+        (true, false) => format!(
+            "(DNS only: {}'s proxy off, as the zone's default)",
+            zone.provider_name
+        ),
+        (false, _) => "(DNS only)".to_string(),
+    }
+}
+
+/// A DNS-only record in a zone whose provider could proxy it publishes the
+/// server's address and lets visitors bypass the proxy. Behind an origin
+/// lock (a firewall that admits only the proxy) they are refused outright.
+/// Said whenever it applies, more firmly when the console itself is
+/// reached through that proxy, which is how such setups look.
+fn dns_only_warning(
+    facts: &PlanFacts,
+    shown: &str,
+    ip: std::net::IpAddr,
+    zone: &ZoneFact,
+) -> Option<String> {
+    if !zone.can_proxy() || zone.proxied_by_default {
+        return None;
+    }
+    let console_behind_proxy = facts.control_plane_hosts.iter().flatten().any(|h| {
+        h.ips
+            .iter()
+            .any(|ip| temps_core::known_proxies::known_proxy(*ip).is_some())
+    });
+    let lead = if console_behind_proxy {
+        format!(
+            "This console is reached through {}'s proxy, but ",
+            zone.provider_name
+        )
+    } else {
+        String::new()
+    };
+    let record = format!(
+        "{lead}{shown}'s record will be DNS only: visitors connect straight to {ip}, \
+         bypassing {provider}, and a firewall that admits only {provider} (an origin lock) \
+         refuses them.",
+        provider = zone.provider_name
+    );
+    Some(format!(
+        "{} To keep it behind Cloudflare, turn on \"Proxy through Cloudflare\" for {} on \
+         {}'s page under DNS providers, then plan again.",
+        capitalize(&record),
+        zone.domain,
+        zone.provider_name
+    ))
+}
+
+fn capitalize(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
 /// Why no tunnel can carry the environment: it is deployed and its workers
 /// serve none of it, so it runs on the control plane.
 fn tunnel_unserved(facts: &PlanFacts) -> Option<PlanBlocked> {
@@ -949,14 +1051,20 @@ fn tunnel_unserved(facts: &PlanFacts) -> Option<PlanBlocked> {
 /// console reached over a tailnet or a LAN reads as the cause.
 fn control_plane_unaddressed(facts: &PlanFacts) -> Option<PlanBlocked> {
     let hosts = facts.control_plane_hosts.as_ref()?;
-    let found = if hosts.is_empty() {
-        "it has no edge target, and no external URL to look up".to_string()
+    let found = if let Some(refusal) = &facts.control_plane_refusal {
+        refusal.clone()
+    } else if hosts.is_empty() {
+        "it has no edge target, and the server could not detect its own public address".to_string()
     } else {
-        hosts
-            .iter()
-            .map(describe_control_plane_host)
-            .collect::<Vec<_>>()
-            .join("; ")
+        format!(
+            "it has no edge target address, the server could not detect its own public \
+             address, and {}",
+            hosts
+                .iter()
+                .map(describe_control_plane_host)
+                .collect::<Vec<_>>()
+                .join("; ")
+        )
     };
     Some(PlanBlocked {
         reason: format!(
@@ -984,7 +1092,13 @@ fn describe_control_plane_host(host: &ControlPlaneHost) -> String {
     let ips = host
         .ips
         .iter()
-        .map(|ip| format!("{ip}, {}", describe_scope(address_scope(*ip))))
+        .map(|ip| match temps_core::known_proxies::known_proxy(*ip) {
+            Some(proxy) => format!(
+                "{ip}, {proxy}'s edge (the hostname is behind {proxy}'s proxy, so its address \
+                 is not this server's)"
+            ),
+            None => format!("{ip}, {}", describe_scope(address_scope(*ip))),
+        })
         .collect::<Vec<_>>()
         .join(" and ");
     format!("{} resolves to {ips}", host.host)
@@ -1295,9 +1409,16 @@ pub fn plan(facts: &PlanFacts) -> ReachabilityPlan {
         });
     }
 
-    // Direct ingresses that can take an HTTP-01 certificate.
+    // A zone Temps manages takes the certificate over DNS-01, which needs
+    // nothing reachable on port 80 and works behind a CDN's proxy. Only DNS
+    // set by hand needs a direct ingress that answers HTTP-01.
+    let managed_zone = address
+        .as_deref()
+        .and_then(|host| zone_for(host, &facts.zones))
+        .filter(|z| z.verified);
     let direct = http01_direct(facts);
-    if direct.is_none() {
+    let managed_direct = managed_zone.and_then(|_| dns01_direct(facts));
+    if direct.is_none() && managed_direct.is_none() {
         if let Some(d) = facts.directs.iter().find(|d| !d.ips.is_empty()) {
             blocked_reasons.push(PlanBlocked {
                 reason: if let Some(why) = &d.check_failed {
@@ -1305,25 +1426,22 @@ pub fn plan(facts: &PlanFacts) -> ReachabilityPlan {
                 } else {
                     format!(
                         "{} does not answer on port 80, which a certificate through HTTP-01 \
-                         needs. Add the domain under Domains with DNS-01 instead.",
+                         needs. Let a DNS provider in Temps manage the domain's zone and the \
+                         certificate comes over DNS-01 instead.",
                         d.name
                     )
                 },
                 action: Some(
-                    ReachAction::new(ActionKind::OpenIngress, "Add a domain")
-                        .with_href("/domains/add"),
+                    ReachAction::new(ActionKind::OpenIngress, "Add a DNS provider")
+                        .with_href(DNS_PROVIDERS_PATH),
                 ),
             });
         }
     }
-    let managed_zone = address
-        .as_deref()
-        .and_then(|host| zone_for(host, &facts.zones))
-        .filter(|z| z.verified);
 
     // 2. A direct ingress with DNS Temps manages. A record already there is
     //    changed only when Temps manages it, and the plan says so.
-    let existing = match (direct, address.as_deref()) {
+    let existing = match (managed_direct, address.as_deref()) {
         (Some(direct), Some(host)) => planned_record(facts, host, record_type_of(direct.ips[0])),
         _ => PlannedRecord::Absent,
     };
@@ -1356,9 +1474,12 @@ pub fn plan(facts: &PlanFacts) -> ReachabilityPlan {
             action: None,
         });
     }
-    if let (Some(direct), Some(zone), None) = (direct, managed_zone, &dns_blocked) {
+    if let (Some(direct), Some(zone), None) = (managed_direct, managed_zone, &dns_blocked) {
         let ip = direct.ips[0];
         let mut warnings = Vec::new();
+        if let Some(warning) = dns_only_warning(facts, &shown, ip, zone) {
+            warnings.push(warning);
+        }
         if let PlannedRecord::Present { record } = &existing {
             if record.content != ip.to_string() {
                 warnings.push(format!(
@@ -1372,17 +1493,24 @@ pub fn plan(facts: &PlanFacts) -> ReachabilityPlan {
             kind: PlanOptionKind::DirectManagedDns,
             title: format!("Straight to {}", direct.name),
             description: format!(
-                "Temps points {shown} at {} ({ip}) through {} and issues its certificate.",
+                "Temps points {shown} at {} ({ip}) through {} and issues its certificate over \
+                 DNS-01, which needs no open port 80.",
                 direct.name, zone.provider_name
             ),
             actions: 1,
             way_in: format!("direct:{}", direct.name),
             steps: vec![
                 step(StepKind::AttachDomain, attach_label.clone()),
-                step(StepKind::SetDnsRecord, dns_label(ip, zone)),
+                step(
+                    StepKind::SetDnsRecord,
+                    format!("{} {}", dns_label(ip, zone), proxy_state(zone)),
+                ),
                 step(
                     StepKind::IssueCertificate,
-                    format!("Issue a certificate for {shown}"),
+                    format!(
+                        "Issue a certificate for {shown} over DNS-01 through {}",
+                        zone.provider_name
+                    ),
                 ),
                 step(StepKind::CheckReachability, format!("Check {shown}")),
             ],
@@ -3270,6 +3398,7 @@ mod tests {
             domain: domain.into(),
             verified: true,
             auto_manage: true,
+            proxied_by_default: false,
         }
     }
 
@@ -4138,8 +4267,9 @@ mod tests {
         assert!(
             blocked.reason.starts_with(
                 "production runs on the control plane, which has no public address to point \
-                 DNS at: console.example.ts.net resolves to 100.101.102.103, a carrier-grade \
-                 NAT address, such as Tailscale's."
+                 DNS at: it has no edge target address, the server could not detect its own \
+                 public address, and console.example.ts.net resolves to 100.101.102.103, a \
+                 carrier-grade NAT address, such as Tailscale's."
             ),
             "{}",
             blocked.reason
@@ -4181,9 +4311,174 @@ mod tests {
         };
         let reason = plan(&facts).blocked.expect("blocked").reason;
         assert!(
-            reason.contains("it has no edge target, and no external URL to look up."),
+            reason.contains(
+                "it has no edge target, and the server could not detect its own public address."
+            ),
             "{reason}"
         );
+    }
+
+    /// A reported install: the console sits behind Cloudflare's proxy, so
+    /// its hostname resolves to Cloudflare's edge. That is said for what it
+    /// is, never taken as the server's address.
+    #[test]
+    fn a_console_behind_cloudflare_is_described_as_cloudflares_edge() {
+        let facts = PlanFacts {
+            served_by_workers: false,
+            control_plane_hosts: Some(vec![control_plane_host(
+                "console.example.com",
+                &["104.16.0.1"],
+            )]),
+            ..base()
+        };
+        let reason = plan(&facts).blocked.expect("blocked").reason;
+        assert!(reason.contains("104.16.0.1, Cloudflare's edge"), "{reason}");
+        assert!(!reason.contains("104.16.0.1, a public address"), "{reason}");
+    }
+
+    /// The server's own origin refused (a Cloudflare edge target) is the
+    /// reason given, in place of the hostnames' resolution.
+    #[test]
+    fn a_refused_origin_is_the_reason_the_control_plane_is_unaddressed() {
+        let facts = PlanFacts {
+            served_by_workers: false,
+            control_plane_hosts: Some(vec![control_plane_host(
+                "console.example.com",
+                &["104.16.0.1"],
+            )]),
+            control_plane_refusal: Some(
+                "the edge target is 104.16.0.1, which belongs to Cloudflare's edge".into(),
+            ),
+            ..base()
+        };
+        let blocked = plan(&facts).blocked.expect("blocked");
+        assert!(
+            blocked.reason.contains(
+                "DNS at: the edge target is 104.16.0.1, which belongs to Cloudflare's edge"
+            ),
+            "{}",
+            blocked.reason
+        );
+        assert_eq!(
+            blocked.action.and_then(|a| a.href).as_deref(),
+            Some(EDGE_TARGET_SETTINGS_PATH)
+        );
+    }
+
+    /// A managed zone issues over DNS-01, so a direct ingress that does not
+    /// answer on port 80 (a firewall, a proxy in front) is still offered,
+    /// and its steps say so.
+    #[test]
+    fn a_managed_zone_offers_the_direct_way_in_over_dns01_without_port_80() {
+        let facts = PlanFacts {
+            directs: vec![direct(false)],
+            zones: vec![zone("example.com", "cloudflare")],
+            requested: Some("myapp.example.com".into()),
+            dns_records: vec![(
+                "myapp.example.com".into(),
+                "A".into(),
+                PlannedRecord::Absent,
+            )],
+            ..base()
+        };
+        let planned = plan(&facts);
+        let option = planned
+            .options
+            .iter()
+            .find(|o| o.kind == PlanOptionKind::DirectManagedDns)
+            .expect("direct option over DNS-01");
+        let certificate = option
+            .steps
+            .iter()
+            .find(|s| s.kind == StepKind::IssueCertificate)
+            .expect("certificate step");
+        assert!(
+            certificate.label.contains("over DNS-01 through cf"),
+            "{}",
+            certificate.label
+        );
+        assert_eq!(
+            direct_for(&facts, PlanOptionKind::DirectManagedDns).map(|d| d.name.as_str()),
+            Some("edge-1")
+        );
+        assert!(direct_for(&facts, PlanOptionKind::DirectManualDns).is_none());
+    }
+
+    /// ADR 031: a DNS-only record in a Cloudflare zone bypasses Cloudflare
+    /// and an origin lock behind it. The step says how the record is
+    /// served, and the plan warns while the zone does not proxy.
+    #[test]
+    fn a_dns_only_record_in_a_cloudflare_zone_is_warned_about() {
+        let dns_only = PlanFacts {
+            directs: vec![direct(true)],
+            zones: vec![zone("example.com", "cloudflare")],
+            requested: Some("myapp.example.com".into()),
+            dns_records: vec![(
+                "myapp.example.com".into(),
+                "A".into(),
+                PlannedRecord::Absent,
+            )],
+            ..base()
+        };
+        let option = |facts: &PlanFacts| {
+            plan(facts)
+                .options
+                .into_iter()
+                .find(|o| o.kind == PlanOptionKind::DirectManagedDns)
+                .expect("direct option")
+        };
+        let warned = option(&dns_only);
+        let record = warned
+            .steps
+            .iter()
+            .find(|s| s.kind == StepKind::SetDnsRecord)
+            .expect("record step");
+        assert!(record.label.contains("DNS only"), "{}", record.label);
+        assert!(
+            warned
+                .warnings
+                .iter()
+                .any(|w| w.contains("origin lock") && w.contains("Proxy through Cloudflare")),
+            "{:?}",
+            warned.warnings
+        );
+
+        let mut proxied_zone = zone("example.com", "cloudflare");
+        proxied_zone.proxied_by_default = true;
+        let proxied = option(&PlanFacts {
+            zones: vec![proxied_zone],
+            ..dns_only.clone()
+        });
+        let record = proxied
+            .steps
+            .iter()
+            .find(|s| s.kind == StepKind::SetDnsRecord)
+            .expect("record step");
+        assert!(record.label.contains("proxied by cf"), "{}", record.label);
+        assert!(
+            !proxied.warnings.iter().any(|w| w.contains("origin lock")),
+            "{:?}",
+            proxied.warnings
+        );
+
+        // A provider that cannot proxy has nothing to warn about.
+        let plain = option(&PlanFacts {
+            zones: vec![zone("example.com", "route53")],
+            ..dns_only
+        });
+        assert!(!plain.warnings.iter().any(|w| w.contains("origin lock")));
+    }
+
+    /// A known proxy's edge is never a direct ingress's address.
+    #[test]
+    fn a_direct_ingress_at_a_cloudflare_address_is_not_offered_over_dns01() {
+        let mut at_cloudflare = direct(true);
+        at_cloudflare.ips = vec!["104.16.0.1".parse().expect("ip")];
+        let facts = PlanFacts {
+            directs: vec![at_cloudflare],
+            ..base()
+        };
+        assert!(dns01_direct(&facts).is_none());
     }
 
     /// The fact also reaches the choice the user is offered first.
@@ -4452,6 +4747,8 @@ mod tests {
                 modified_on: Some(modified.into()),
                 managed,
                 run_id: None,
+                proxied: Some(false),
+                proxy_toggled_run_id: None,
             },
         }
     }
@@ -4504,7 +4801,14 @@ mod tests {
             "{}",
             dns.label
         );
-        assert!(option.warnings[0].contains("Undo puts 198.51.100.1 back"));
+        assert!(
+            option
+                .warnings
+                .iter()
+                .any(|w| w.contains("Undo puts 198.51.100.1 back")),
+            "{:?}",
+            option.warnings
+        );
 
         // A record Temps does not manage is never offered for change.
         let plan = plan_of(&direct_facts(seen("198.51.100.1", "t", false)));

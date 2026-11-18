@@ -122,6 +122,9 @@ impl TempsPlugin for IngressPlugin {
             domains: context.require_service::<temps_domains::DomainService>(),
             config: context.require_service::<ConfigService>(),
             access: context.require_service::<AccessProviderService>(),
+            // Registered by the infrastructure plugin.
+            public_address: context
+                .require_service::<dyn temps_core::server_public_address::ServerPublicAddress>(),
         }));
         // Runs a restart left behind are reconciled now and every minute.
         reachability.clone().start_reconciler();

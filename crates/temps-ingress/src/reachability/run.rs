@@ -327,14 +327,25 @@ pub trait RunOps: Send + Sync {
         record_type: &str,
     ) -> Result<Option<DnsRecordState>, String>;
     /// Creates the record, or changes the one Temps already manages, to
-    /// `content`, with `run_id` in its ownership marker. Returns its label.
+    /// `content`, with `run_id` in its ownership marker. `proxied` sets the
+    /// provider's proxy; `None` takes the zone's default. Returns its label.
     async fn write_dns_record(
         &self,
         host: &str,
         record_type: &str,
         content: &str,
         run_id: Option<i32>,
+        proxied: Option<bool>,
     ) -> Result<String, WriteError>;
+    /// Takes back a record `run_id` wrote whose only change since is its
+    /// proxy flag, toggled at the provider: its marker covers it again, so
+    /// undo can remove or restore it. The record is not touched.
+    async fn reclaim_dns_record(
+        &self,
+        host: &str,
+        record_type: &str,
+        run_id: i32,
+    ) -> Result<(), String>;
     async fn remove_dns_record(
         &self,
         host: &str,
@@ -1720,6 +1731,9 @@ impl Runner<'_> {
     /// writing, write nothing when it is not what the plan saw, journal a
     /// change with the value it replaces.
     async fn set_dns_record(&mut self, host: &str, ip: IpAddr) -> Outcome {
+        if let Some(why) = temps_core::known_proxies::origin_refusal(ip) {
+            return Outcome::Failed(format!("Temps wrote no record for {host}: {why}"));
+        }
         let run_id = self.input.run_id;
         let kind = record_type(ip).to_string();
         let content = ip.to_string();
@@ -1844,7 +1858,7 @@ impl Runner<'_> {
             Ok(Begin::Have(_)) => done,
             Ok(Begin::Go) => match self
                 .ops
-                .write_dns_record(host, &kind, &content, Some(run_id))
+                .write_dns_record(host, &kind, &content, Some(run_id), self.record_proxied())
                 .await
             {
                 Ok(label) => {
@@ -1888,6 +1902,14 @@ impl Runner<'_> {
                 }
             },
         }
+    }
+
+    /// The proxy flag the run's record is written with: the zone's own
+    /// default for a direct way in through a zone Temps manages (ADR 031),
+    /// whose certificate comes over DNS-01 and so works behind the proxy;
+    /// DNS only otherwise (a private listener no proxy can reach).
+    fn record_proxied(&self) -> Option<bool> {
+        (self.input.option != PlanOptionKind::DirectManagedDns).then_some(false)
     }
 
     /// The address's id, from what attached it: the journal, else its row.
@@ -2957,6 +2979,11 @@ impl Runner<'_> {
                 let Some((_, ip)) = input.direct.clone() else {
                     return Outcome::Failed("No address to point the record at.".into());
                 };
+                if let Some(why) = temps_core::known_proxies::origin_refusal(ip) {
+                    return Outcome::Failed(format!(
+                        "Temps will not ask for a record pointing {address} at {ip}: {why}"
+                    ));
+                }
                 let wanted = format!(
                     "Add an A record for {address} pointing at {ip} where your domain's DNS is \
                      hosted"
@@ -3954,6 +3981,26 @@ pub async fn undo(
                     if record.managed
                         && record.run_id == Some(run_id)
                         && content.as_ref().is_none_or(|c| *c == record.content) => {}
+                // Only its proxy flag changed since this run wrote it (the
+                // proxy switched at the provider): still this run's record,
+                // taken back so it is removed or restored like the rest.
+                Ok(Some(record))
+                    if record.proxy_toggled_run_id == Some(run_id)
+                        && content.as_ref().is_none_or(|c| *c == record.content) =>
+                {
+                    if let Err(error) = ops.reclaim_dns_record(hostname, record_type, run_id).await
+                    {
+                        return stop(
+                            results,
+                            Stop::Failed(format!(
+                                "The {record_type} record for {hostname} is the one this run \
+                                 wrote with its proxy switched since, but Temps could not take \
+                                 it back, so it touched nothing from there on: {error} Undo \
+                                 again to retry."
+                            )),
+                        );
+                    }
+                }
                 // Gone already: nothing to remove.
                 Ok(None) => {
                     entry.state = JournalState::Absent;
@@ -3982,6 +4029,25 @@ pub async fn undo(
                 ..
             } if !checked => match ops.read_dns_record(hostname, record_type).await {
                 Ok(Some(record)) if holds_this_run(&record, after, run_id) => {}
+                // Only its proxy flag changed since this run wrote it (the
+                // proxy switched at the provider): still this run's record,
+                // taken back so it is removed or restored like the rest.
+                Ok(Some(record))
+                    if record.proxy_toggled_run_id == Some(run_id) && record.content == *after =>
+                {
+                    if let Err(error) = ops.reclaim_dns_record(hostname, record_type, run_id).await
+                    {
+                        return stop(
+                            results,
+                            Stop::Failed(format!(
+                                "The {record_type} record for {hostname} is the one this run \
+                                 wrote with its proxy switched since, but Temps could not take \
+                                 it back, so it touched nothing from there on: {error} Undo \
+                                 again to retry."
+                            )),
+                        );
+                    }
+                }
                 // An earlier undo put it back already.
                 Ok(Some(record)) if record.content == before.content => {
                     entry.state = JournalState::Absent;
@@ -4256,7 +4322,16 @@ pub async fn undo(
                 before,
                 ..
             } => ops
-                .write_dns_record(hostname, record_type, &before.content, before.run_id)
+                .write_dns_record(
+                    hostname,
+                    record_type,
+                    &before.content,
+                    before.run_id,
+                    // Put back exactly what was there, its proxy flag
+                    // included; one read before this was kept was DNS
+                    // only, as every run wrote then.
+                    Some(before.proxied.unwrap_or(false)),
+                )
                 .await
                 .map(|_| ())
                 .map_err(|e| e.message),
@@ -4378,6 +4453,8 @@ mod tests {
             modified_on: Some(modified.into()),
             managed: true,
             run_id,
+            proxied: Some(false),
+            proxy_toggled_run_id: None,
         }
     }
     use std::sync::Mutex;
@@ -4661,8 +4738,10 @@ mod tests {
             _record_type: &str,
             content: &str,
             run_id: Option<i32>,
+            proxied: Option<bool>,
         ) -> Result<String, WriteError> {
             self.log(format!("write_dns_record {content} {run_id:?}"));
+            self.log(format!("dns_record_proxied {proxied:?}"));
             if self.fail.contains(&"write_dns_record") {
                 return Err(WriteError::unknown("the request timed out"));
             }
@@ -4671,6 +4750,24 @@ mod tests {
             }
             *self.dns.lock().expect("lock") = Some(record(content, run_id, "written"));
             Ok("myapp".into())
+        }
+        async fn reclaim_dns_record(
+            &self,
+            host: &str,
+            record_type: &str,
+            run_id: i32,
+        ) -> Result<(), String> {
+            self.log(format!("reclaim_dns_record {host} {record_type} {run_id}"));
+            if self.fail.contains(&"reclaim_dns_record") {
+                return Err("Cloudflare timed out".into());
+            }
+            let mut dns = self.dns.lock().expect("lock");
+            if let Some(record) = dns.as_mut() {
+                record.managed = true;
+                record.run_id = Some(run_id);
+                record.proxy_toggled_run_id = None;
+            }
+            Ok(())
         }
         async fn remove_dns_record(
             &self,
@@ -8079,5 +8176,171 @@ mod tests {
             .calls()
             .iter()
             .any(|c| c.starts_with("delete_service")));
+    }
+
+    /// A reported install: the console's hostname resolved to Cloudflare,
+    /// and a run pointed the app's record at that edge. A run never writes
+    /// a known proxy's address as an origin, whatever its plan held.
+    #[tokio::test]
+    async fn a_run_never_points_a_record_at_a_cloudflare_address() {
+        let ops = Fake {
+            reachable: true,
+            ..Default::default()
+        };
+        let input = RunInput {
+            direct: Some(("control-plane".into(), "104.16.0.1".parse().expect("ip"))),
+            ..direct_input(9, PlannedRecord::Absent)
+        };
+        let after = execute(&input, &ops, &Saved::default(), timing()).await;
+        assert_eq!(after.state, RunState::Failed);
+        let error = after.error.expect("error");
+        assert!(error.contains("Cloudflare"), "{error}");
+        assert!(!ops
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("write_dns_record")));
+
+        let manual = RunInput {
+            option: PlanOptionKind::DirectManualDns,
+            steps: steps(&[StepKind::ShowDnsRecord]),
+            ..input
+        };
+        let after = execute(&manual, &Fake::default(), &Saved::default(), timing()).await;
+        assert_eq!(after.state, RunState::Failed);
+        assert!(after.error.expect("error").contains("Cloudflare"));
+    }
+
+    /// ADR 031: the direct way in through a managed zone takes the zone's
+    /// proxy default; a private listener's record is always DNS only.
+    #[tokio::test]
+    async fn the_record_takes_the_zones_proxy_default_only_for_a_direct_way_in() {
+        let ops = Fake {
+            reachable: true,
+            ..Default::default()
+        };
+        execute(
+            &direct_input(9, PlannedRecord::Absent),
+            &ops,
+            &Saved::default(),
+            timing(),
+        )
+        .await;
+        assert!(ops.calls().contains(&"dns_record_proxied None".to_string()));
+
+        let ops = Fake {
+            reachable: true,
+            ..Default::default()
+        };
+        let private = RunInput {
+            option: PlanOptionKind::PrivateWorker,
+            ..direct_input(9, PlannedRecord::Absent)
+        };
+        execute(&private, &ops, &Saved::default(), timing()).await;
+        assert!(ops
+            .calls()
+            .contains(&"dns_record_proxied Some(false)".to_string()));
+    }
+
+    /// A reported install: the run's record was proxied by hand at
+    /// Cloudflare afterwards, which left its marker stale, and undo refused
+    /// to remove it. A change of the proxy flag alone keeps it this run's.
+    #[tokio::test]
+    async fn undo_removes_a_record_whose_proxy_was_switched_since() {
+        let ops = Fake::default();
+        *ops.dns.lock().expect("lock") = Some(DnsRecordState {
+            managed: false,
+            run_id: None,
+            proxied: Some(true),
+            proxy_toggled_run_id: Some(9),
+            ..record("203.0.113.5", None, "later")
+        });
+        let mut journal = vec![created_record("203.0.113.5")];
+        let outcome = undo(&mut journal, &ops, 9, &Journaled::default()).await;
+        assert!(outcome.stopped.is_none(), "{:?}", outcome.stopped);
+        let calls = ops.calls();
+        let reclaimed = calls
+            .iter()
+            .position(|c| c == "reclaim_dns_record myapp.example.com A 9")
+            .expect("reclaimed");
+        let removed = calls
+            .iter()
+            .position(|c| c == "remove_dns_record myapp.example.com myapp A")
+            .expect("removed");
+        assert!(reclaimed < removed, "{calls:?}");
+        assert_eq!(journal[0].state, JournalState::Absent);
+
+        // Another run's toggled record, or other content: never taken back.
+        for state in [
+            DnsRecordState {
+                managed: false,
+                proxy_toggled_run_id: Some(3),
+                ..record("203.0.113.5", None, "later")
+            },
+            DnsRecordState {
+                managed: false,
+                proxy_toggled_run_id: Some(9),
+                ..record("192.0.2.44", None, "later")
+            },
+        ] {
+            let ops = Fake::default();
+            *ops.dns.lock().expect("lock") = Some(state);
+            let mut journal = vec![created_record("203.0.113.5")];
+            let outcome = undo(&mut journal, &ops, 9, &Journaled::default()).await;
+            assert!(matches!(outcome.stopped, Some(Stop::Conflict(_))));
+            assert!(
+                !ops.calls()
+                    .iter()
+                    .any(|c| c.starts_with("reclaim_dns_record")
+                        || c.starts_with("remove_dns_record"))
+            );
+        }
+    }
+
+    /// Taking the record back failing stops undo before it removes
+    /// anything older, like any read that fails.
+    #[tokio::test]
+    async fn undo_stops_when_a_proxy_switched_record_cannot_be_taken_back() {
+        let ops = Fake {
+            fail: vec!["reclaim_dns_record"],
+            ..Default::default()
+        };
+        *ops.dns.lock().expect("lock") = Some(DnsRecordState {
+            managed: false,
+            proxy_toggled_run_id: Some(9),
+            ..record("203.0.113.5", None, "later")
+        });
+        let mut journal = vec![created_record("203.0.113.5")];
+        let outcome = undo(&mut journal, &ops, 9, &Journaled::default()).await;
+        let Some(Stop::Failed(why)) = &outcome.stopped else {
+            panic!("expected a failure, got {:?}", outcome.stopped);
+        };
+        assert!(why.contains("could not take it back"), "{why}");
+        assert!(!ops
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("remove_dns_record")));
+    }
+
+    /// Undo of a changed record puts back its proxy flag with its content.
+    #[tokio::test]
+    async fn undo_restores_the_proxy_flag_the_record_had() {
+        let ops = Fake {
+            reachable: true,
+            ..Default::default()
+        };
+        let before = DnsRecordState {
+            proxied: Some(true),
+            ..was()
+        };
+        *ops.dns.lock().expect("lock") = Some(before.clone());
+        let input = direct_input(9, PlannedRecord::Present { record: before });
+        let done_run = execute(&input, &ops, &Saved::default(), timing()).await;
+        assert_eq!(done_run.state, RunState::Succeeded);
+        let mut journal = done_run.journal.clone();
+        let outcome = undo(&mut journal, &ops, 9, &Journaled::default()).await;
+        assert!(outcome.stopped.is_none(), "{:?}", outcome.stopped);
+        assert!(ops
+            .calls()
+            .contains(&"dns_record_proxied Some(true)".to_string()));
     }
 }

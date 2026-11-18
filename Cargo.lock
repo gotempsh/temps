@@ -14441,6 +14441,7 @@ name = "temps-infra"
 version = "0.1.0-beta.62"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "bollard",
  "chrono",
