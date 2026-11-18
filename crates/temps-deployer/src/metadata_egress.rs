@@ -13,10 +13,12 @@
 //! Cloud and Google Cloud answer DNS on 169.254.169.254, AWS on
 //! 169.254.169.253). Docker hands containers the host's resolvers, so
 //! rejecting the whole range cut every container off from DNS. Each install
-//! therefore reads the host's resolver list and accepts DNS (UDP and TCP port
-//! 53) to exactly those resolvers that fall in a blocked range, ahead of the
-//! rejects. Every other port on those addresses, and every other address in
-//! the blocked ranges, stays rejected.
+//! therefore reads the resolvers Docker hands to containers and accepts DNS
+//! (UDP and TCP port 53) to exactly those that fall in a blocked range, ahead
+//! of the rejects. A resolver the host stops using keeps its exception while
+//! this process runs, because containers started earlier still query it.
+//! Every other port on those addresses, and every other address in the
+//! blocked ranges, stays rejected.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
@@ -40,14 +42,18 @@ const AWS_METADATA_V6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0
 /// Google Cloud's IPv6 metadata endpoint.
 const GCP_METADATA_V6: Ipv6Addr = Ipv6Addr::new(0xfd20, 0x00ce, 0, 0, 0, 0, 0, 0x0254);
 
-/// Where the host's resolvers are listed. Docker reads the second one instead
-/// of the first when the first only names systemd-resolved's loopback stub, so
-/// both are consulted.
-const RESOLV_CONF_PATHS: [&str; 2] = ["/etc/resolv.conf", "/run/systemd/resolve/resolv.conf"];
+/// The host's resolver list.
+const RESOLV_CONF: &str = "/etc/resolv.conf";
+/// systemd-resolved's upstream resolver list. Docker and BuildKit hand
+/// containers this file instead of [`RESOLV_CONF`] when that one names only
+/// the resolved stub, which containers cannot reach.
+const SYSTEMD_RESOLV_CONF: &str = "/run/systemd/resolve/resolv.conf";
+/// systemd-resolved's loopback stub listener.
+const SYSTEMD_RESOLVED_STUB: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 53));
 /// resolv.conf is a few hundred bytes; never read more than this of it.
-const RESOLV_CONF_MAX_BYTES: u64 = 64 * 1024;
-/// glibc uses at most three nameservers; leave room for the union of both
-/// files without letting a malformed file inflate the ruleset.
+const RESOLV_CONF_MAX_BYTES: usize = 64 * 1024;
+/// glibc uses at most three nameservers; leave room for resolvers retained
+/// across a change without letting a malformed file inflate the ruleset.
 const MAX_DNS_EXCEPTIONS: usize = 8;
 
 #[derive(Debug, Error)]
@@ -85,13 +91,13 @@ pub async fn apply_metadata_egress_block(
         return Ok(());
     }
 
-    let dns_exceptions = install().await?;
+    let installed = install().await?;
 
     info!(
         network = network_name,
         table = TABLE,
         priority = FORWARD_PRIORITY,
-        dns_exceptions = ?dns_exceptions,
+        dns_exceptions = ?installed.dns_exceptions,
         "Cloud-metadata egress protection reconciled"
     );
     Ok(())
@@ -104,33 +110,34 @@ pub async fn apply_metadata_egress_block(
 /// would run its containers without it. Each pass replaces the table in one
 /// transaction, which also undoes any edit to it, and re-reads the host's
 /// resolvers, so a resolver change from DHCP is picked up on the next pass.
-/// Only the first success, a change of DNS exceptions, failures and the
-/// recovery after a failure are logged, not every pass.
+/// Only the first success, a change of DNS exceptions (by any caller), failures
+/// and the recovery after a failure are logged, not every pass.
 pub async fn maintain_metadata_egress_block(interval: Duration, shutdown: Arc<Notify>) {
     if !cfg!(target_os = "linux") {
         return;
     }
 
-    let mut installed: Option<Vec<IpAddr>> = None;
+    let mut recovering = true;
     loop {
         match install().await {
-            Ok(dns_exceptions) if installed.as_ref() != Some(&dns_exceptions) => {
-                info!(
-                    table = TABLE,
-                    priority = FORWARD_PRIORITY,
-                    dns_exceptions = ?dns_exceptions,
-                    "Cloud-metadata egress protection installed"
-                );
-                installed = Some(dns_exceptions);
+            Ok(installed) => {
+                if recovering || installed.changed {
+                    info!(
+                        table = TABLE,
+                        priority = FORWARD_PRIORITY,
+                        dns_exceptions = ?installed.dns_exceptions,
+                        "Cloud-metadata egress protection installed"
+                    );
+                }
+                recovering = false;
             }
-            Ok(_) => {}
             Err(error) => {
                 warn!(
                     %error,
                     retry_in_secs = interval.as_secs(),
                     "Cloud-metadata egress protection is not installed; containers on this node can reach the cloud metadata service until it is"
                 );
-                installed = None;
+                recovering = true;
             }
         }
         tokio::select! {
@@ -140,14 +147,51 @@ pub async fn maintain_metadata_egress_block(interval: Duration, shutdown: Arc<No
     }
 }
 
-/// One nft transaction at a time, whichever caller asks. Returns the host
-/// resolvers that DNS was let through to.
-async fn install() -> Result<Vec<IpAddr>, MetadataEgressError> {
-    static APPLY_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-    let _guard = APPLY_LOCK.lock().await;
-    let dns_exceptions = host_dns_exceptions().await;
+/// What one install committed.
+#[derive(Debug)]
+struct Installed {
+    /// Resolvers DNS is let through to.
+    dns_exceptions: Vec<IpAddr>,
+    /// Whether they differ from the last ruleset any caller committed.
+    changed: bool,
+}
+
+/// One nft transaction at a time, whichever caller asks. The lock also holds
+/// the DNS exceptions last committed, so every caller compares against the
+/// ruleset that is actually live.
+async fn install() -> Result<Installed, MetadataEgressError> {
+    static COMMITTED: tokio::sync::Mutex<Vec<IpAddr>> = tokio::sync::Mutex::const_new(Vec::new());
+    let mut committed = COMMITTED.lock().await;
+    let current = host_dns_exceptions(Path::new(RESOLV_CONF), Path::new(SYSTEMD_RESOLV_CONF)).await;
+    let dns_exceptions = retain_previous_exceptions(current, &committed);
     apply_nft(&render_ruleset(&dns_exceptions)).await?;
-    Ok(dns_exceptions)
+    let changed = *committed != dns_exceptions;
+    committed.clone_from(&dns_exceptions);
+    Ok(Installed {
+        dns_exceptions,
+        changed,
+    })
+}
+
+/// `current` followed by every previously committed exception it no longer
+/// names, at most [`MAX_DNS_EXCEPTIONS`]. Docker writes a container's
+/// resolv.conf when the container (or build step) starts and never updates a
+/// running one, so after the host's resolver changes, workloads started
+/// earlier still query the old one. Keeping its exception while this process
+/// runs keeps their DNS working; it is still port 53 only, to an address the
+/// host itself used as its resolver.
+fn retain_previous_exceptions(current: Vec<IpAddr>, previous: &[IpAddr]) -> Vec<IpAddr> {
+    let mut exceptions = current;
+    exceptions.truncate(MAX_DNS_EXCEPTIONS);
+    for ip in previous {
+        if exceptions.len() == MAX_DNS_EXCEPTIONS {
+            break;
+        }
+        if !exceptions.contains(ip) {
+            exceptions.push(*ip);
+        }
+    }
+    exceptions
 }
 
 /// Whether the guard rejects traffic to `ip`.
@@ -158,8 +202,20 @@ fn is_blocked(ip: IpAddr) -> bool {
     }
 }
 
+/// One `nameserver` address. A zone (`%eth0`) is only valid on an IPv6
+/// address; an IPv4-mapped IPv6 address is the IPv4 address it carries, which
+/// is what its packets are sent to.
+fn parse_nameserver(address: &str) -> Option<IpAddr> {
+    let ip = match address.split_once('%') {
+        Some((ip, zone)) if !zone.is_empty() => IpAddr::V6(ip.parse::<Ipv6Addr>().ok()?),
+        Some(_) => return None,
+        None => address.parse().ok()?,
+    };
+    Some(ip.to_canonical())
+}
+
 /// Nameservers listed in resolv.conf text. Comments, other directives and
-/// unparseable entries are skipped; an IPv6 zone (`%eth0`) is dropped.
+/// unparseable entries are skipped.
 fn parse_nameservers(resolv_conf: &str) -> Vec<IpAddr> {
     resolv_conf
         .lines()
@@ -168,11 +224,22 @@ fn parse_nameservers(resolv_conf: &str) -> Vec<IpAddr> {
             if fields.next()? != "nameserver" {
                 return None;
             }
-            let address = fields.next()?;
-            let address = address.split_once('%').map_or(address, |(ip, _)| ip);
-            address.parse().ok()
+            parse_nameserver(fields.next()?)
         })
         .collect()
+}
+
+/// resolv.conf text from at most [`RESOLV_CONF_MAX_BYTES`] of a file read with
+/// one byte more: when the limit cut the file, the last, possibly cut line is
+/// dropped so a truncated address is never read as a different one. Bytes
+/// that are not UTF-8 (a comment in another encoding) only spoil their line.
+fn resolv_conf_text(mut bytes: Vec<u8>) -> String {
+    if bytes.len() > RESOLV_CONF_MAX_BYTES {
+        bytes.truncate(RESOLV_CONF_MAX_BYTES);
+        let complete = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+        bytes.truncate(complete);
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 /// The host resolvers, among `nameservers`, that the guard would otherwise
@@ -194,6 +261,9 @@ fn dns_exceptions(nameservers: impl IntoIterator<Item = IpAddr>) -> Vec<IpAddr> 
 /// normal (no systemd-resolved) and yields `None`, as does an unreadable one:
 /// without it the guard simply makes no DNS exception, the pre-existing policy.
 async fn read_resolv_conf(path: &Path) -> Option<String> {
+    let limit = u64::try_from(RESOLV_CONF_MAX_BYTES)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
     let file = match tokio::fs::File::open(path).await {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
@@ -202,28 +272,34 @@ async fn read_resolv_conf(path: &Path) -> Option<String> {
             return None;
         }
     };
-    let mut text = String::new();
-    if let Err(error) = file
-        .take(RESOLV_CONF_MAX_BYTES)
-        .read_to_string(&mut text)
-        .await
-    {
+    let mut bytes = Vec::new();
+    if let Err(error) = file.take(limit).read_to_end(&mut bytes).await {
         warn!(path = %path.display(), %error, "Could not read the host resolver list; no DNS exception is made for resolvers it names");
         return None;
     }
-    Some(text)
+    Some(resolv_conf_text(bytes))
 }
 
-/// The host's resolvers that sit inside a blocked range, from every
-/// resolv.conf Docker may hand to containers.
-async fn host_dns_exceptions() -> Vec<IpAddr> {
-    let mut nameservers = Vec::new();
-    for path in RESOLV_CONF_PATHS {
-        if let Some(text) = read_resolv_conf(Path::new(path)).await {
-            nameservers.extend(parse_nameservers(&text));
-        }
+/// The nameservers Docker and BuildKit hand to containers: those in `primary`,
+/// unless its only nameserver is the systemd-resolved stub, in which case
+/// those of `systemd` (the same choice Docker makes).
+async fn container_nameservers(primary: &Path, systemd: &Path) -> Vec<IpAddr> {
+    let nameservers = read_resolv_conf(primary)
+        .await
+        .map(|text| parse_nameservers(&text))
+        .unwrap_or_default();
+    if nameservers != [SYSTEMD_RESOLVED_STUB] {
+        return nameservers;
     }
-    let exceptions = dns_exceptions(nameservers);
+    read_resolv_conf(systemd)
+        .await
+        .map(|text| parse_nameservers(&text))
+        .unwrap_or_default()
+}
+
+/// The resolvers Docker hands to containers that sit inside a blocked range.
+async fn host_dns_exceptions(primary: &Path, systemd: &Path) -> Vec<IpAddr> {
+    let exceptions = dns_exceptions(container_nameservers(primary, systemd).await);
     debug!(dns_exceptions = ?exceptions, "Host resolvers inside cloud-metadata ranges");
     exceptions
 }
@@ -492,5 +568,99 @@ nameserverx 10.0.0.1
         std::fs::write(&path, "nameserver 169.254.169.254\n").expect("write resolv.conf");
         let text = read_resolv_conf(&path).await.expect("readable");
         assert_eq!(parse_nameservers(&text), vec![ip("169.254.169.254")]);
+    }
+
+    #[test]
+    fn a_zone_is_only_accepted_on_ipv6_and_mapped_addresses_are_ipv4() {
+        assert_eq!(parse_nameserver("169.254.169.254%eth0"), None);
+        assert_eq!(parse_nameserver("fe80::1%"), None);
+        assert_eq!(parse_nameserver("fe80::1%eth0"), Some(ip("fe80::1")));
+        assert_eq!(
+            parse_nameserver("::ffff:169.254.169.254"),
+            Some(ip("169.254.169.254"))
+        );
+        // The mapped and bare forms are one exception and one `ip daddr` rule.
+        let exceptions = dns_exceptions(parse_nameservers(
+            "nameserver ::ffff:169.254.169.254\nnameserver 169.254.169.254\n",
+        ));
+        assert_eq!(exceptions, vec![ip("169.254.169.254")]);
+        assert!(render_ruleset(&exceptions).contains("ip daddr 169.254.169.254 udp dport 53"));
+    }
+
+    #[test]
+    fn a_line_cut_by_the_read_limit_is_dropped() {
+        // The limit falls inside the address: `169.254.169.25|4`.
+        let mut bytes = vec![b'#'; RESOLV_CONF_MAX_BYTES - 26];
+        bytes.push(b'\n');
+        bytes.extend_from_slice(b"nameserver 169.254.169.254\n");
+        assert!(bytes.len() > RESOLV_CONF_MAX_BYTES);
+        assert!(parse_nameservers(&resolv_conf_text(bytes)).is_empty());
+
+        // Within the limit, a final line without a newline is complete.
+        let text = resolv_conf_text(b"nameserver 169.254.169.254".to_vec());
+        assert_eq!(parse_nameservers(&text), vec![ip("169.254.169.254")]);
+    }
+
+    #[test]
+    fn a_comment_that_is_not_utf8_does_not_hide_a_nameserver() {
+        let text =
+            resolv_conf_text(b"# caf\xe9 r\xe9solveur\nnameserver 169.254.169.254\n".to_vec());
+        assert_eq!(parse_nameservers(&text), vec![ip("169.254.169.254")]);
+    }
+
+    #[tokio::test]
+    async fn the_systemd_file_is_used_only_behind_the_resolved_stub() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primary = dir.path().join("resolv.conf");
+        let systemd = dir.path().join("systemd-resolv.conf");
+        std::fs::write(&systemd, "nameserver 169.254.169.254\n").expect("write systemd file");
+
+        // Only the stub: Docker hands containers the upstream file.
+        std::fs::write(&primary, "nameserver 127.0.0.53\noptions edns0\n").expect("write");
+        assert_eq!(
+            host_dns_exceptions(&primary, &systemd).await,
+            vec![ip("169.254.169.254")]
+        );
+
+        // A real resolver in the primary file: the systemd file is inactive,
+        // so its link-local resolver gets no exception.
+        std::fs::write(&primary, "nameserver 10.0.0.53\n").expect("write");
+        assert!(host_dns_exceptions(&primary, &systemd).await.is_empty());
+
+        // The stub next to another resolver is not the systemd-resolved case.
+        std::fs::write(&primary, "nameserver 127.0.0.53\nnameserver 10.0.0.53\n").expect("write");
+        assert!(host_dns_exceptions(&primary, &systemd).await.is_empty());
+
+        // A link-local resolver in the primary file itself.
+        std::fs::write(&primary, "nameserver 169.254.169.253\n").expect("write");
+        assert_eq!(
+            host_dns_exceptions(&primary, &systemd).await,
+            vec![ip("169.254.169.253")]
+        );
+    }
+
+    #[test]
+    fn resolvers_from_before_a_change_keep_their_exception() {
+        let old = ip("169.254.169.254");
+        let new = ip("169.254.169.253");
+        assert_eq!(
+            retain_previous_exceptions(vec![new], &[old]),
+            vec![new, old]
+        );
+        assert_eq!(
+            retain_previous_exceptions(vec![old], &[old, new]),
+            vec![old, new]
+        );
+        assert_eq!(
+            retain_previous_exceptions(vec![], &[]),
+            Vec::<IpAddr>::new()
+        );
+
+        // Current resolvers always fit; older ones fill what is left.
+        let current: Vec<IpAddr> = (1..=MAX_DNS_EXCEPTIONS as u8)
+            .map(|n| IpAddr::V4(Ipv4Addr::new(169, 254, 1, n)))
+            .collect();
+        let retained = retain_previous_exceptions(current.clone(), &[old]);
+        assert_eq!(retained, current);
     }
 }
