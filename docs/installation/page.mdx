@@ -99,6 +99,53 @@ and is not a claim that all packages are present in the runtime image.
 Everything else a self-hosted install supports, from worker and builder nodes
 to backups, is listed in [What Temps supports](/docs/capabilities).
 
+### Docker, and access to its socket
+
+Temps builds and runs applications as Docker containers, so the server needs a
+running Docker Engine **and the user that runs Temps must be able to open the
+Docker socket** (`/var/run/docker.sock` on Linux). Without that access the
+console does not start: the proxy keeps serving your applications, but the
+console answers `503` and the log shows `Docker dependency check FAILED`.
+
+Check it as that user before you start Temps (here the user is `temps`):
+
+```bash
+sudo -u temps docker info >/dev/null && echo ok
+```
+
+`permission denied while trying to connect to the Docker daemon socket` means
+the user is not allowed to use the socket. Grant it one of two ways:
+
+- **Add the user to the `docker` group** (the socket's group on most
+  distributions), then restart Temps:
+
+  ```bash
+  sudo usermod -aG docker temps
+  ```
+
+- **For a systemd service, grant the group to the service only** with a
+  drop-in, without changing the user's groups everywhere:
+
+  ```bash
+  sudo systemctl edit temps
+  ```
+
+  ```ini
+  [Service]
+  SupplementaryGroups=docker
+  ```
+
+  ```bash
+  sudo systemctl restart temps
+  ```
+
+Membership of the `docker` group is equivalent to root on the host, which is
+why Temps runs as a dedicated user. Colima, OrbStack, Rancher Desktop and
+rootless Docker use a different socket; see
+[Docker is not reachable](/docs/troubleshooting#startup). A control plane that
+runs no workloads itself (`temps serve --profile control-plane`) does not need
+Docker at all.
+
 ### Required Ports
 
 | Port     | Service                  | Required                |
@@ -478,6 +525,15 @@ sudo systemctl start temps
 # Check status
 sudo systemctl status temps
 ```
+
+The `temps` user must be able to open the Docker socket, either through
+membership of the `docker` group or by adding `SupplementaryGroups=docker` to
+the `[Service]` section above (see
+[Docker, and access to its socket](#docker-and-access-to-its-socket)).
+
+By default the console answers on every hostname and on the server's bare IP
+address. To serve it only on its own hostname, set the
+[admin access gate](/docs/admin-listener#admin-gate) after the first login.
 
 Never pass `--database-url` on `ExecStart`: the flag still works, but it puts
 the password in `ps` output and in `systemctl cat temps`, and Temps logs a
