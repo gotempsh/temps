@@ -698,7 +698,7 @@ impl GitProviderManager {
             AuthMethod::PersonalAccessToken {
                 token: existing_token,
             } => AuthMethod::PersonalAccessToken {
-                token: token.unwrap_or(existing_token),
+                token: token.clone().unwrap_or(existing_token),
             },
             AuthMethod::BasicAuth { .. } | AuthMethod::SSHKey { .. } => {
                 return Err(GitProviderManagerError::InvalidConfiguration(
@@ -707,13 +707,54 @@ impl GitProviderManager {
             }
         };
 
+        // A PAT provider's connections each hold their own encrypted copy of
+        // the token, and that copy is what repository sync and clones use
+        // (`get_connection_token`). Rotating only the provider's config left
+        // every connection on the old token, which fails as soon as the user
+        // revokes it, so the new token is written to both, atomically.
+        let rotated_connection_token = match (&updated_method, token) {
+            (AuthMethod::PersonalAccessToken { .. }, Some(new_token)) => {
+                Some(self.encrypt_string(&new_token).await?)
+            }
+            _ => None,
+        };
+
         let auth_config_json = serde_json::to_value(&updated_method)?;
         let encrypted_config = self.encrypt_sensitive_data(&auth_config_json).await?;
 
+        let txn = self.db.begin().await?;
         let mut active_model: git_providers::ActiveModel = provider.into();
         active_model.auth_config = Set(encrypted_config);
         active_model.auth_method = Set(self.get_auth_method_type(&updated_method));
-        let updated = active_model.update(self.db.as_ref()).await?;
+        let updated = active_model.update(&txn).await?;
+        if let Some(encrypted_token) = rotated_connection_token {
+            let rotated = git_provider_connections::Entity::update_many()
+                .set(git_provider_connections::ActiveModel {
+                    access_token: Set(Some(encrypted_token)),
+                    token_expires_at: Set(None),
+                    is_expired: Set(false),
+                    updated_at: Set(chrono::Utc::now()),
+                    ..Default::default()
+                })
+                // A refresh in flight must not overwrite the token the user
+                // just entered (same rule as a per-connection token update).
+                .col_expr(
+                    git_provider_connections::Column::CredentialGeneration,
+                    sea_orm::sea_query::Expr::col(
+                        git_provider_connections::Column::CredentialGeneration,
+                    )
+                    .add(1),
+                )
+                .filter(git_provider_connections::Column::ProviderId.eq(provider_id))
+                .exec(&txn)
+                .await?;
+            info!(
+                provider_id,
+                connections = rotated.rows_affected,
+                "Rotated the personal access token on the provider and its connections"
+            );
+        }
+        txn.commit().await?;
 
         // Clear cache so new credentials take effect on next provider_service request.
         self.providers_cache.write().await.clear();
@@ -1021,5 +1062,149 @@ mod tests {
                 .is_empty(),
             "the hidden connection should have been cascaded away"
         );
+    }
+
+    /// Rotating a PAT provider's token must reach its connections: their own
+    /// encrypted copy is what sync and clones use, so updating only the
+    /// provider left every connection on the revoked token.
+    #[tokio::test]
+    async fn rotating_a_pat_provider_token_updates_its_connections_only() {
+        use chrono::Utc;
+
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.connection_arc();
+        let manager = GitProviderManager::new(
+            db.clone(),
+            Arc::new(
+                temps_core::EncryptionService::new(
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                )
+                .unwrap(),
+            ),
+            Arc::new(MockJobQueue) as Arc<dyn JobQueue>,
+            create_test_config_service(db.clone()),
+            Arc::new(temps_core::NoopAuditLogger),
+        );
+
+        let pat_config = |token: &str| {
+            serde_json::to_value(AuthMethod::PersonalAccessToken {
+                token: token.to_string(),
+            })
+            .unwrap()
+        };
+        let mut providers = Vec::new();
+        for name in ["rotated", "untouched"] {
+            let provider = git_providers::ActiveModel {
+                name: Set(name.to_string()),
+                provider_type: Set("gitlab".to_string()),
+                base_url: Set(None),
+                api_url: Set(None),
+                auth_method: Set("pat".to_string()),
+                auth_config: Set(manager
+                    .encrypt_sensitive_data(&pat_config("old-token"))
+                    .await
+                    .unwrap()),
+                webhook_secret: Set(None),
+                is_active: Set(true),
+                is_default: Set(false),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await
+            .unwrap();
+            let now = Utc::now();
+            let connection = git_provider_connections::ActiveModel {
+                provider_id: Set(provider.id),
+                user_id: Set(None),
+                account_name: Set(format!("{name}-account")),
+                account_type: Set("User".to_string()),
+                access_token: Set(Some(manager.encrypt_string("old-token").await.unwrap())),
+                refresh_token: Set(None),
+                token_expires_at: Set(None),
+                refresh_token_expires_at: Set(None),
+                installation_id: Set(None),
+                metadata: Set(None),
+                is_active: Set(true),
+                is_expired: Set(true),
+                syncing: Set(false),
+                last_synced_at: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await
+            .unwrap();
+            providers.push((provider, connection));
+        }
+        let (rotated, rotated_connection) = &providers[0];
+        let (_, untouched_connection) = &providers[1];
+
+        manager
+            .update_provider_credentials(
+                rotated.id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("new-token".to_string()),
+            )
+            .await
+            .expect("a PAT provider's token rotates");
+
+        let stored = |id: i32| {
+            let db = db.clone();
+            async move {
+                git_provider_connections::Entity::find_by_id(id)
+                    .one(db.as_ref())
+                    .await
+                    .unwrap()
+                    .expect("connection still exists")
+            }
+        };
+        let after = stored(rotated_connection.id).await;
+        assert_eq!(
+            manager
+                .decrypt_string(after.access_token.as_deref().unwrap())
+                .await
+                .unwrap(),
+            "new-token"
+        );
+        assert!(!after.is_expired, "a new token clears the expired flag");
+        assert_eq!(
+            after.credential_generation,
+            rotated_connection.credential_generation + 1,
+            "an in-flight refresh must not overwrite the new token"
+        );
+
+        let other = stored(untouched_connection.id).await;
+        assert_eq!(
+            manager
+                .decrypt_string(other.access_token.as_deref().unwrap())
+                .await
+                .unwrap(),
+            "old-token",
+            "another provider's connection keeps its token"
+        );
+
+        let provider = git_providers::Entity::find_by_id(rotated.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        let config: AuthMethod = serde_json::from_value(
+            manager
+                .decrypt_sensitive_data(&provider.auth_config)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            config,
+            AuthMethod::PersonalAccessToken { token } if token == "new-token"
+        ));
     }
 }
