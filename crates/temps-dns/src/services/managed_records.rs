@@ -285,6 +285,10 @@ enum RegistryState {
 struct ProxyToggled {
     marker: OwnershipMarker,
     marker_record: DnsRecord,
+    /// The record as it was verified: its content unchanged since the run
+    /// wrote it, only its proxy flag flipped. A reclaim signs exactly this
+    /// fingerprint, never a later read of the record.
+    fingerprint: String,
 }
 
 /// Per-key async locks that self-clean when the last holder releases.
@@ -1356,12 +1360,18 @@ impl ManagedDnsRecordService {
         Ok(Some(ProxyToggled {
             marker,
             marker_record: *marker_record,
+            fingerprint: current,
         }))
     }
 
     /// See [`Self::reclaim_proxy_toggled_record`]. The caller holds the
     /// record's locks.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the zone, record key, install identity, signing key, scope and run each \
+                  identify a different part of the marker being re-signed, matching the \
+                  other guarded_* helpers"
+    )]
     pub(crate) async fn guarded_reclaim_proxy_toggle(
         provider: &dyn DnsProvider,
         zone: &str,
@@ -1376,6 +1386,7 @@ impl ManagedDnsRecordService {
         let Some(ProxyToggled {
             marker,
             marker_record,
+            fingerprint,
         }) = Self::proxy_toggled_marker(provider, zone, name, record_type, instance, signing_key)
             .await?
         else {
@@ -1404,16 +1415,22 @@ impl ManagedDnsRecordService {
                 ),
             ));
         }
+        // Sign only the record that was verified above. A record edited
+        // since (another address, another proxy flag, a second record) is
+        // someone else's change: refuse rather than sign it as this run's.
         let records = provider.get_records(zone, name, record_type).await?;
-        let [record] = records.as_slice() else {
+        let unchanged = match records.as_slice() {
+            [record] => record_fingerprint(&record.content, record.proxied)? == fingerprint,
+            _ => false,
+        };
+        if !unchanged {
             return Err(Self::record_conflict(
                 zone,
                 name,
                 record_type,
-                "the record changed while temps was taking it back",
+                "the record changed while temps was taking it back, so temps will not take it back",
             ));
-        };
-        let fingerprint = record_fingerprint(&record.content, record.proxied)?;
+        }
         let stamp_scope = scope.stamped_over(Some(&marker));
         let reclaimed = OwnershipMarker::new_signed(
             signing_key,
@@ -2046,6 +2063,10 @@ mod tests {
         /// Simulates a concurrent writer: inserted into the zone right after
         /// the first TXT (marker) write, i.e. after every ownership check.
         race_record: Mutex<Option<(String, DnsRecordContent)>>,
+        /// Simulates an operator's edit between two reads: once this many
+        /// zone listings have been answered, the `app` record of the
+        /// content's type takes the new content.
+        edit_after_reads: Mutex<Option<(usize, DnsRecordContent)>>,
     }
 
     impl MockProvider {
@@ -2062,6 +2083,7 @@ mod tests {
                 apply_failed_target_updates: false,
                 provider_type: DnsProviderType::Cloudflare,
                 race_record: Mutex::new(None),
+                edit_after_reads: Mutex::new(None),
             }
         }
 
@@ -2155,7 +2177,24 @@ mod tests {
             if *self.listings_fail.lock().unwrap() {
                 return Err(DnsError::ApiError("simulated listing failure".to_string()));
             }
-            Ok(self.records.lock().unwrap().values().cloned().collect())
+            let listed = self.records.lock().unwrap().values().cloned().collect();
+            let mut pending = self.edit_after_reads.lock().unwrap();
+            if let Some((reads, content)) = pending.as_mut() {
+                *reads = reads.saturating_sub(1);
+                if *reads == 0 {
+                    let record_type = content.record_type().to_string();
+                    if let Some(record) = self
+                        .records
+                        .lock()
+                        .unwrap()
+                        .get_mut(&("app".to_string(), record_type))
+                    {
+                        record.content = content.clone();
+                    }
+                    *pending = None;
+                }
+            }
+            Ok(listed)
         }
 
         async fn get_record(
@@ -4458,6 +4497,28 @@ mod tests {
             provider.record_value("app", DnsRecordType::A).as_deref(),
             Some("192.0.2.99")
         );
+    }
+
+    #[tokio::test]
+    async fn an_edit_after_the_proxy_toggle_is_verified_is_never_signed() {
+        let provider = record_proxied_after_run_wrote_it().await;
+        // The operator points the record elsewhere right after temps has
+        // verified that only its proxy flag changed.
+        *provider.edit_after_reads.lock().unwrap() = Some((1, a_content("192.0.2.99")));
+
+        let error = reclaim(&provider, 7).await.unwrap_err();
+
+        assert!(error.to_string().contains("changed while temps"), "{error}");
+        assert_eq!(
+            provider.record_value("app", DnsRecordType::A).as_deref(),
+            Some("192.0.2.99")
+        );
+        // The edit is not signed as run 7's: the record stays unmanaged, so
+        // undo cannot delete or overwrite it.
+        assert!(matches!(
+            ownership_of_app(&provider).await,
+            RecordOwnership::Unmanaged(_)
+        ));
     }
 
     #[tokio::test]
