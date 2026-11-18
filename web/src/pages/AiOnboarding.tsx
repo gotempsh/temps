@@ -3,7 +3,7 @@
 
 import { useEffect, useState, type ReactNode } from 'react'
 import { Link } from 'react-router'
-import { useMutation, useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   ArrowLeft,
   ArrowRight,
@@ -23,22 +23,28 @@ import {
 } from 'lucide-react'
 import {
   createApiKeyMutation,
-  listApiKeysOptions,
+  deleteApiKeyMutation,
+  getAiHarnessStatusOptions,
+  getAiHarnessStatusQueryKey,
+  listApiKeysQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { CopyButton } from '@/components/ui/copy-button'
 import { HighlightedCode } from '@/components/ui/code-block'
 import { ScrollRegion } from '@/components/ui/scroll-region'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
+import { useManualHarnessCompletion } from '@/hooks/useManualHarnessCompletion'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import {
+  AI_HARNESS_KEY_NAME,
   buildAiHarnessCommands,
   buildAiHarnessKeyRequest,
-  findAiHarnessKey,
-  getAiHarnessStatus,
+  describeHarnessConnection,
+  harnessStatusOf,
 } from '@/lib/ai-onboarding'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import { sensitiveActionErrorMessage } from '@/lib/sensitiveActionProblem'
@@ -72,18 +78,29 @@ export function AiOnboarding() {
   const origin = typeof window === 'undefined' ? '' : window.location.origin
   const commands = buildAiHarnessCommands(origin)
 
+  const queryClient = useQueryClient()
+  const [confirmRemoveOpen, setConfirmRemoveOpen] = useState(false)
+  const { markCompleted: markHarnessCompleted } = useManualHarnessCompletion()
+
   const {
-    data: apiKeysData,
-    isLoading: apiKeysLoading,
-    refetch: refetchApiKeys,
+    data: harness,
+    isLoading: harnessLoading,
+    refetch: refetchHarness,
   } = useQuery({
-    ...listApiKeysOptions({ query: { page: 1, page_size: 100 } }),
+    ...getAiHarnessStatusOptions(),
     retry: false,
+    // Faster than the app-wide banner: this page is where the user waits.
     refetchInterval: (query) =>
-      getAiHarnessStatus(query.state.data?.api_keys) === 'waiting'
-        ? 5_000
-        : false,
+      harnessStatusOf(query.state.data) === 'waiting' ? 5_000 : false,
   })
+
+  const invalidateHarnessQueries = () =>
+    Promise.all([
+      queryClient.invalidateQueries({
+        queryKey: getAiHarnessStatusQueryKey(),
+      }),
+      queryClient.invalidateQueries({ queryKey: listApiKeysQueryKey() }),
+    ])
   const { handleSensitiveActionError, verificationDialog } =
     useSensitiveActionVerification()
 
@@ -94,7 +111,7 @@ export function AiOnboarding() {
     },
     onSuccess: async (response) => {
       setCreatedKeySecret(response.api_key)
-      await refetchApiKeys()
+      await refetchHarness()
       toast.success('AI harness key created')
     },
     onError: (error, variables) => {
@@ -114,6 +131,39 @@ export function AiOnboarding() {
     },
   })
 
+  // The way out when the harness connected with a credential the server
+  // cannot attribute to it (an older key, a renamed one): remove the unused
+  // admin key, which is audit-logged, and mark the setup step done.
+  const removePendingKey = useMutation({
+    ...deleteApiKeyMutation(),
+    meta: {
+      errorTitle: 'Failed to remove the pending AI harness key',
+    },
+    onSuccess: async () => {
+      setCreatedKeySecret(null)
+      setConfirmRemoveOpen(false)
+      try {
+        markHarnessCompleted()
+      } catch (error) {
+        toast.error(
+          error instanceof Error
+            ? error.message
+            : 'Could not mark the harness step as done'
+        )
+      }
+      await invalidateHarnessQueries()
+      toast.success('Pending harness key removed')
+    },
+    onError: (error) => {
+      toast.error(
+        sensitiveActionErrorMessage(
+          error,
+          'Failed to remove the pending AI harness key'
+        )
+      )
+    },
+  })
+
   usePageTitle('Connect AI harness')
 
   useEffect(() => {
@@ -123,10 +173,17 @@ export function AiOnboarding() {
     ])
   }, [setBreadcrumbs])
 
-  const harnessKey = findAiHarnessKey(apiKeysData?.api_keys)
-  const harnessStatus = getAiHarnessStatus(apiKeysData?.api_keys)
+  const harnessKeyId = harness?.key_id ?? null
+  const harnessStatus = harnessStatusOf(harness) ?? 'missing'
   const effectiveHarnessStatus =
-    createdKeySecret && harnessStatus === 'missing' ? 'waiting' : harnessStatus
+    createdKeySecret && harnessStatus === 'missing' && harnessKeyId === null
+      ? 'waiting'
+      : harnessStatus
+  // A dedicated key exists but cannot connect (deactivated, or expired
+  // unused). Creating another would conflict on its name, so link to it.
+  const harnessKeyUnusable =
+    effectiveHarnessStatus === 'missing' && harnessKeyId !== null
+  const connectedVia = describeHarnessConnection(harness?.connected_via)
 
   const handleCreateHarnessKey = () => {
     createHarnessKey.mutate({ body: buildAiHarnessKeyRequest() })
@@ -180,13 +237,27 @@ export function AiOnboarding() {
                 </p>
               </div>
             </div>
-            {apiKeysLoading ? (
+            {harnessLoading ? (
               <Skeleton className="h-10 w-44" />
             ) : effectiveHarnessStatus === 'connected' ? (
-              <div className="inline-flex items-center gap-2 rounded-lg border border-emerald-500/30 bg-emerald-500/5 px-4 py-2.5 text-sm font-medium text-emerald-700 dark:text-emerald-400">
-                <Check className="size-4" />
-                Harness connected
+              <div className="flex flex-col items-start gap-1.5 lg:items-end">
+                <div className="inline-flex items-center gap-2 rounded-lg border border-emerald-500/30 bg-emerald-500/5 px-4 py-2.5 text-sm font-medium text-emerald-700 dark:text-emerald-400">
+                  <Check className="size-4" />
+                  Harness connected
+                </div>
+                {connectedVia && (
+                  <p className="text-xs text-muted-foreground">
+                    {connectedVia}
+                  </p>
+                )}
               </div>
+            ) : harnessKeyUnusable && harness?.setup_path ? (
+              <Button asChild size="lg" variant="outline">
+                <Link to={harness.setup_path}>
+                  Manage harness key
+                  <ArrowRight className="ml-1.5 size-4" />
+                </Link>
+              </Button>
             ) : effectiveHarnessStatus === 'waiting' ? (
               <div className="inline-flex items-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/5 px-4 py-2.5 text-sm font-medium text-amber-700 dark:text-amber-300">
                 <Circle className="size-3 fill-current" />
@@ -218,10 +289,39 @@ export function AiOnboarding() {
           <Terminal className="size-4 text-amber-700 dark:text-amber-300" />
           <AlertTitle>API key created — finish the connection</AlertTitle>
           <AlertDescription>
-            Install the skill, authenticate the CLI, and run either read-only
-            verification command below. This page checks for the key&apos;s
-            first authenticated request automatically.
+            <p>
+              Install the skill, run the connect command and paste the key at
+              its prompt, then run either read-only verification command below.
+              This page detects the first authenticated request automatically,
+              including a CLI login you approve in the browser.
+            </p>
+            {harnessKeyId !== null && (
+              <div className="mt-3 flex flex-col gap-2 sm:flex-row sm:items-center">
+                <span className="text-sm">
+                  Connected with a different credential?
+                </span>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setConfirmRemoveOpen(true)}
+                  disabled={removePendingKey.isPending}
+                >
+                  {removePendingKey.isPending ? (
+                    <Loader2 className="mr-1.5 size-3.5 animate-spin" />
+                  ) : null}
+                  Remove pending key
+                </Button>
+              </div>
+            )}
           </AlertDescription>
+        </Alert>
+      )}
+
+      {harnessKeyUnusable && harness?.reason && (
+        <Alert className="border-amber-500/30 bg-amber-500/5">
+          <ShieldAlert className="size-4 text-amber-700 dark:text-amber-300" />
+          <AlertTitle>The harness key cannot connect</AlertTitle>
+          <AlertDescription>{harness.reason}</AlertDescription>
         </Alert>
       )}
 
@@ -231,9 +331,17 @@ export function AiOnboarding() {
           icon={KeyRound}
           title="Create a dedicated admin key"
           description="The harness needs platform access to create and verify services, databases, deployments, domains, and other resources."
-          ready={!!harnessKey || !!createdKeySecret}
-          loading={apiKeysLoading}
-          status={harnessKey || createdKeySecret ? 'Key ready' : 'Required'}
+          ready={
+            (harnessKeyId !== null && !harnessKeyUnusable) || !!createdKeySecret
+          }
+          loading={harnessLoading}
+          status={
+            harnessKeyUnusable
+              ? 'Needs attention'
+              : harnessKeyId !== null || createdKeySecret
+                ? 'Key ready'
+                : 'Required'
+          }
         >
           <div className="space-y-3">
             <Alert className="border-amber-500/25 bg-amber-500/5">
@@ -247,9 +355,9 @@ export function AiOnboarding() {
             </Alert>
             {createdKeySecret ? (
               <OneTimeKeySecret value={createdKeySecret} />
-            ) : harnessKey ? (
+            ) : harnessKeyId !== null ? (
               <Button asChild variant="outline">
-                <Link to={`/settings/keys/${harnessKey.id}`}>
+                <Link to={`/settings/keys/${harnessKeyId}`}>
                   Manage harness key
                   <ArrowRight className="ml-1.5 size-3.5" />
                 </Link>
@@ -277,7 +385,7 @@ export function AiOnboarding() {
           number="02"
           icon={Wand2}
           title="Add Temps to your harness"
-          description="Run the skill installer inside the repository where you use your AI agent, then authenticate the pinned CLI with the key from step one."
+          description="Run the skill installer inside the repository where you use your AI agent, then run the connect command and paste the key from step one when it asks."
           ready={effectiveHarnessStatus === 'connected'}
           status={
             effectiveHarnessStatus === 'connected'
@@ -296,8 +404,8 @@ export function AiOnboarding() {
               multiline
             />
             <p className="text-xs leading-relaxed text-muted-foreground">
-              The key is entered through a hidden terminal prompt and removed
-              from the shell environment after login.
+              Works in bash and zsh. The key is read without echo and cleared
+              from the shell after login.
             </p>
           </div>
         </OnboardingStep>
@@ -423,6 +531,20 @@ export function AiOnboarding() {
         </Button>
       </div>
       {verificationDialog}
+      <ConfirmDeleteDialog
+        open={confirmRemoveOpen}
+        onOpenChange={setConfirmRemoveOpen}
+        resourceType="API key"
+        resourceName={AI_HARNESS_KEY_NAME}
+        verb="Remove"
+        consequences="The unused admin key stops working and this setup step is marked done. A harness already connected with another credential keeps working. The removal is recorded in the audit log."
+        isPending={removePendingKey.isPending}
+        onConfirm={() => {
+          if (harnessKeyId !== null) {
+            removePendingKey.mutate({ path: { id: harnessKeyId } })
+          }
+        }}
+      />
     </div>
   )
 }
