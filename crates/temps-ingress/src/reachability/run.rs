@@ -660,6 +660,12 @@ pub struct RunInput {
     /// `dns-01` for a private address no CA can reach; `http-01` otherwise.
     #[serde(default)]
     pub certificate_challenge: Option<String>,
+    /// For the direct way in through a managed zone: whether its record is
+    /// proxied, the zone's default resolved when the run was planned (ADR
+    /// 031). `None` (a run stored before this existed) leaves it to the
+    /// zone's default at write time.
+    #[serde(default)]
+    pub dns_proxied: Option<bool>,
     /// For a private address: who it is for once the run is done, and who
     /// it was for before.
     #[serde(default)]
@@ -773,6 +779,13 @@ fn describe_record(current: Option<&DnsRecordState>) -> String {
 }
 
 /// The record holds what this run wrote: `content`, with its marker.
+/// Whether a record's proxy flag differs from the one a write would set.
+/// Unknown on either side (a provider without a proxy, or a write that
+/// takes the zone's default) is no difference.
+fn proxy_differs(current: Option<bool>, wanted: Option<bool>) -> bool {
+    matches!((current, wanted), (Some(current), Some(wanted)) if current != wanted)
+}
+
 fn holds_this_run(record: &DnsRecordState, content: &str, run_id: i32) -> bool {
     record.managed && record.content == content && record.run_id == Some(run_id)
 }
@@ -1836,9 +1849,19 @@ impl Runner<'_> {
                 }
             }
         };
-        if before.as_ref().is_some_and(|b| b.content == content) {
-            return Outcome::Skipped(format!("{host} already points at {ip}."));
-        }
+        let proxied = self.record_proxied();
+        // Already right only when the proxy flag is too: a DNS-only record at
+        // the right address in a zone that proxies by default is changed
+        // (and journaled, so undo puts the flag back).
+        let proxy_only = match before.as_ref() {
+            Some(b) if b.content == content => {
+                if !proxy_differs(b.proxied, proxied) {
+                    return Outcome::Skipped(format!("{host} already points at {ip}."));
+                }
+                true
+            }
+            _ => false,
+        };
         let intent = match &before {
             None => Intent::DnsRecord {
                 hostname: host.to_string(),
@@ -1858,7 +1881,7 @@ impl Runner<'_> {
             Ok(Begin::Have(_)) => done,
             Ok(Begin::Go) => match self
                 .ops
-                .write_dns_record(host, &kind, &content, Some(run_id), self.record_proxied())
+                .write_dns_record(host, &kind, &content, Some(run_id), proxied)
                 .await
             {
                 Ok(label) => {
@@ -1870,8 +1893,18 @@ impl Runner<'_> {
                             after,
                             ..
                         } => {
-                            let detail =
-                                format!("{host} changed from {} to {ip}.", before.describe());
+                            let detail = if proxy_only {
+                                format!(
+                                    "{host} still points at {ip}, now {}.",
+                                    if proxied == Some(true) {
+                                        "proxied"
+                                    } else {
+                                        "DNS only"
+                                    }
+                                )
+                            } else {
+                                format!("{host} changed from {} to {ip}.", before.describe())
+                            };
                             (
                                 RunResource::DnsChange {
                                     hostname,
@@ -1909,7 +1942,11 @@ impl Runner<'_> {
     /// whose certificate comes over DNS-01 and so works behind the proxy;
     /// DNS only otherwise (a private listener no proxy can reach).
     fn record_proxied(&self) -> Option<bool> {
-        (self.input.option != PlanOptionKind::DirectManagedDns).then_some(false)
+        if self.input.option == PlanOptionKind::DirectManagedDns {
+            self.input.dns_proxied
+        } else {
+            Some(false)
+        }
     }
 
     /// The address's id, from what attached it: the journal, else its row.
@@ -4748,7 +4785,10 @@ mod tests {
             if self.fail.contains(&"write_refused") {
                 return Err(WriteError::refused("set_dns_record broke"));
             }
-            *self.dns.lock().expect("lock") = Some(record(content, run_id, "written"));
+            *self.dns.lock().expect("lock") = Some(DnsRecordState {
+                proxied: Some(proxied.unwrap_or(false)),
+                ..record(content, run_id, "written")
+            });
             Ok("myapp".into())
         }
         async fn reclaim_dns_record(
@@ -5543,6 +5583,7 @@ mod tests {
             acme_email: None,
             dns_before: PlannedRecord::Absent,
             certificate_challenge: None,
+            dns_proxied: None,
             audience: None,
             access: None,
             serve: None,
@@ -8239,6 +8280,72 @@ mod tests {
         assert!(ops
             .calls()
             .contains(&"dns_record_proxied Some(false)".to_string()));
+    }
+
+    /// A DNS-only record already at the right address, in a zone that
+    /// proxies by default: the run turns the proxy on rather than skip it,
+    /// journals the change, and undo puts the record back DNS only.
+    #[tokio::test]
+    async fn a_proxy_only_difference_is_written_and_undone() {
+        let ops = Fake {
+            reachable: true,
+            ..Default::default()
+        };
+        let at_ingress = record("203.0.113.5", None, "before");
+        *ops.dns.lock().expect("lock") = Some(at_ingress.clone());
+        let input = RunInput {
+            dns_proxied: Some(true),
+            ..direct_input(
+                9,
+                PlannedRecord::Present {
+                    record: at_ingress.clone(),
+                },
+            )
+        };
+        let done_run = execute(&input, &ops, &Saved::default(), timing()).await;
+        assert_eq!(done_run.state, RunState::Succeeded);
+        assert!(ops
+            .calls()
+            .contains(&"dns_record_proxied Some(true)".to_string()));
+        let change = done_run
+            .journal
+            .iter()
+            .find(|e| matches!(e.intent, Intent::DnsChange { .. }))
+            .expect("the proxy-only change is journaled");
+        let Intent::DnsChange { before, .. } = &change.intent else {
+            unreachable!()
+        };
+        assert_eq!(before.proxied, Some(false));
+
+        let mut journal = done_run.journal.clone();
+        let outcome = undo(&mut journal, &ops, 9, &Journaled::default()).await;
+        assert!(outcome.stopped.is_none(), "{:?}", outcome.stopped);
+        let calls = ops.calls();
+        let restore = calls
+            .iter()
+            .rposition(|c| c == "write_dns_record 203.0.113.5 None")
+            .expect("undo rewrites the record");
+        assert_eq!(calls[restore + 1], "dns_record_proxied Some(false)");
+
+        // Same address and the same flag: nothing to do.
+        let ops = Fake {
+            reachable: true,
+            ..Default::default()
+        };
+        let proxied = DnsRecordState {
+            proxied: Some(true),
+            ..at_ingress
+        };
+        *ops.dns.lock().expect("lock") = Some(proxied.clone());
+        let input = RunInput {
+            dns_proxied: Some(true),
+            ..direct_input(9, PlannedRecord::Present { record: proxied })
+        };
+        execute(&input, &ops, &Saved::default(), timing()).await;
+        assert!(!ops
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("write_dns_record")));
     }
 
     /// A reported install: the run's record was proxied by hand at

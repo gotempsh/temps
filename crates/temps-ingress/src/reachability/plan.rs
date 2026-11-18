@@ -357,11 +357,20 @@ pub fn records_to_read(facts: &PlanFacts, address: &str) -> Vec<(String, String)
         if let Some((_, ip)) = private_worker(facts) {
             out.push((address.to_string(), record_type_of(ip).to_string()));
         }
-    } else if let Some(direct) = http01_direct(facts) {
-        out.push((
-            address.to_string(),
-            record_type_of(direct.ips[0]).to_string(),
-        ));
+    } else {
+        // Both direct options write a record: the managed one through the
+        // DNS-01 ingress (port 80 not needed), the manual one through the
+        // HTTP-01 ingress. Each may be a different ingress or address type,
+        // so read the record either would write.
+        for direct in [dns01_direct(facts), http01_direct(facts)]
+            .into_iter()
+            .flatten()
+        {
+            out.push((
+                address.to_string(),
+                record_type_of(direct.ips[0]).to_string(),
+            ));
+        }
     }
     out.sort();
     out.dedup();
@@ -4402,6 +4411,44 @@ mod tests {
             Some("edge-1")
         );
         assert!(direct_for(&facts, PlanOptionKind::DirectManualDns).is_none());
+    }
+
+    /// The record the DNS-01 option would write is read even when no
+    /// direct ingress takes port 80, so an existing record there keeps its
+    /// state (and an unmanaged one its refusal) in the plan and fingerprint.
+    #[test]
+    fn the_record_a_dns01_direct_option_writes_is_read_without_port_80() {
+        let facts_with = |record: PlannedRecord| PlanFacts {
+            directs: vec![direct(false)],
+            dns_records: vec![("myapp.example.com".into(), "A".into(), record)],
+            ..direct_facts(PlannedRecord::Absent)
+        };
+        // The key the service reads is the one the DNS-01 option writes.
+        assert_eq!(
+            records_to_read(&facts_with(PlannedRecord::Absent), "myapp.example.com"),
+            vec![("myapp.example.com".to_string(), "A".to_string())]
+        );
+
+        // A record Temps does not manage there is never offered for change.
+        let unmanaged = plan_of(&facts_with(seen("198.51.100.1", "t", false)));
+        assert!(!kinds(&unmanaged).contains(&PlanOptionKind::DirectManagedDns));
+        let blocked = format!("{:?}", unmanaged.blocked);
+        assert!(blocked.contains("that Temps did not create"), "{blocked}");
+
+        // A managed one keeps its state in the plan and the fingerprint.
+        let managed = facts_with(seen("198.51.100.1", "t", true));
+        let planned = plan(&managed);
+        let dns = planned.options[0]
+            .steps
+            .iter()
+            .find(|s| s.kind == StepKind::SetDnsRecord)
+            .expect("dns step");
+        assert!(dns.label.contains("from 198.51.100.1"), "{}", dns.label);
+        let host = Some("myapp.example.com");
+        assert_ne!(
+            fingerprint(&managed, host),
+            fingerprint(&facts_with(PlannedRecord::Absent), host)
+        );
     }
 
     /// ADR 031: a DNS-only record in a Cloudflare zone bypasses Cloudflare

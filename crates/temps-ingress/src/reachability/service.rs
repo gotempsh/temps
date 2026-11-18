@@ -2054,6 +2054,7 @@ impl ReachabilityService {
             direct: None,
             dns_before: PlannedRecord::Absent,
             certificate_challenge: None,
+            dns_proxied: None,
             audience: None,
             access: None,
             serve: None,
@@ -2301,6 +2302,10 @@ impl ReachabilityService {
                     // The zone's DNS provider writes the challenge: no port
                     // 80, and a proxied record is fine.
                     input.certificate_challenge = Some("dns-01".to_string());
+                    // The record is served as the plan said: the zone's
+                    // proxy default where its provider can proxy (ADR 031).
+                    input.dns_proxied = zone_for(&address, &facts.zones)
+                        .map(|zone| zone.can_proxy() && zone.proxied_by_default);
                 }
             }
             PlanOptionKind::TunnelEnvironmentHosts => {
