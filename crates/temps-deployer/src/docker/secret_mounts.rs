@@ -157,6 +157,11 @@ pub(super) async fn emit_buildkit_status(
     log_callback: &Option<crate::LogCallback>,
     dns_watch: &mut BuildDnsWatch,
 ) {
+    // Scan before the first await: a drain deadline can cancel log delivery,
+    // and a resolver failure already received must still reach the hint.
+    for log in &status.logs {
+        dns_watch.observe(&log.vertex, log.stream, &String::from_utf8_lossy(&log.msg));
+    }
     for vertex in &status.vertexes {
         if vertex.name.is_empty() {
             continue;
@@ -187,7 +192,6 @@ pub(super) async fn emit_buildkit_status(
         let _ = log_file.write_all(&log.msg[..]).await;
         let text = String::from_utf8_lossy(&log.msg[..]);
         debug!("BuildKit: {}", text);
-        dns_watch.observe(&text);
         if let Some(callback) = log_callback {
             callback(text.into_owned()).await;
         }

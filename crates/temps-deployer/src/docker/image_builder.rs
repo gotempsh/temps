@@ -656,12 +656,16 @@ impl ImageBuilder for DockerRuntime {
                     if let Some(stream) = info.stream {
                         let _ = log_file.write_all(stream.as_bytes()).await;
                         debug!("Build: {}", stream.trim());
-                        dns_watch.observe(&stream);
+                        dns_watch.observe_stream(&stream);
                     }
                     if let Some(bollard::models::BuildInfoAux::BuildKit(ref res)) = info.aux {
                         step_timer.observe_vertices(&res.vertexes);
                         for log in &res.logs {
-                            dns_watch.observe(&String::from_utf8_lossy(&log.msg));
+                            dns_watch.observe(
+                                &log.vertex,
+                                log.stream,
+                                &String::from_utf8_lossy(&log.msg),
+                            );
                         }
                     }
                     if let Some(error_detail) = info.error_detail {
@@ -895,7 +899,7 @@ impl ImageBuilder for DockerRuntime {
                         // Write to file
                         let _ = log_file.write_all(stream.as_bytes()).await;
                         debug!("Build: {}", stream.trim());
-                        dns_watch.observe(&stream);
+                        dns_watch.observe_stream(&stream);
 
                         // Call log callback if provided
                         if let Some(ref callback) = log_callback {
