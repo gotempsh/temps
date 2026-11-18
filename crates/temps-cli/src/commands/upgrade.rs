@@ -4801,18 +4801,36 @@ mod tests {
     async fn fetch_stable_with_only_betas_published_reports_empty_channel() {
         use axum::{routing::get, Json, Router};
 
-        async fn releases() -> Json<serde_json::Value> {
-            Json(serde_json::json!([{
-                "tag_name": "v0.1.0-beta.3",
-                "prerelease": true,
-                "draft": false,
-                "assets": [{
-                    "name": "temps-test-target.tar.gz",
-                    "browser_download_url": "https://example.test/beta.tar.gz",
-                    "size": 1
+        /// The fields of GitHub's release JSON that [`GitHubRelease`] reads,
+        /// typed so the fixture cannot drift from them silently.
+        #[derive(serde::Serialize)]
+        struct ReleaseFixture {
+            tag_name: &'static str,
+            prerelease: bool,
+            draft: bool,
+            assets: Vec<AssetFixture>,
+            html_url: &'static str,
+        }
+
+        #[derive(serde::Serialize)]
+        struct AssetFixture {
+            name: &'static str,
+            browser_download_url: &'static str,
+            size: u64,
+        }
+
+        async fn releases() -> Json<Vec<ReleaseFixture>> {
+            Json(vec![ReleaseFixture {
+                tag_name: "v0.1.0-beta.3",
+                prerelease: true,
+                draft: false,
+                assets: vec![AssetFixture {
+                    name: "temps-test-target.tar.gz",
+                    browser_download_url: "https://example.test/beta.tar.gz",
+                    size: 1,
                 }],
-                "html_url": "https://example.test/beta"
-            }]))
+                html_url: "https://example.test/beta",
+            }])
         }
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
