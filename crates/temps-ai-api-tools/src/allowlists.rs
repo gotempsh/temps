@@ -1255,6 +1255,12 @@ pub const AI_WRITE_ALLOWLIST: &[&str] = &[
     "import_managed_record",
     "remove_managed_record",
     "remove_managed_domain",
+    // Transactional email providers (SES, Scaleway, SMTP): every credential
+    // is a `SecretString` taken through a secret slot; the handlers need
+    // `email_providers:create` / `email_providers:write`, mask credentials in
+    // responses and audit the write.
+    "create_email_provider",
+    "update_email_provider",
     "create_email_domain",
     "import_email_domain",
     "setup_dns",
