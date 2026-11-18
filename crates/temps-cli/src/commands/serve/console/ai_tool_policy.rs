@@ -578,7 +578,6 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "create_mcp",
             "create_plan",
             "create_provider_key",
-            "create_webhook",
             "discover_workloads",
             "execute_import",
             "import_external_service",
@@ -599,7 +598,6 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "update_provider_key",
             "update_service",
             "update_settings",
-            "update_webhook",
         ],
     ),
     (

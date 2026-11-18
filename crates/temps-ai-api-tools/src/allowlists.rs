@@ -1278,6 +1278,11 @@ pub const AI_WRITE_ALLOWLIST: &[&str] = &[
     "update_preferences",
     "delete_preferences",
     "retry_delivery",
+    // Project webhooks. The optional signing `secret` is a `SecretString`
+    // taken through a secret slot; responses only say `has_secret`. The
+    // handlers need webhooks permissions plus project access, and audit.
+    "create_webhook",
+    "update_webhook",
     "delete_webhook",
     // Observability and analytics
     "create_dashboard",
@@ -1619,7 +1624,6 @@ mod tests {
             "update_project_deployment_config",
             "createHttpCheck",
             "updateHttpCheck",
-            "create_webhook",
             "create_api_key",
             "create_deployment_token",
             "createProjectSecret",
