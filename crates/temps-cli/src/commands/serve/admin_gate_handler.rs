@@ -32,6 +32,7 @@ use utoipa::ToSchema;
 use super::admin_gate::{trusted_forwarded_client_ip, AdminGateSource, InvalidForwardedFor};
 use super::admin_gate_service::{
     AdminGateCallerIps, AdminGateService, AdminGateServiceError, AdminGateSettings,
+    PreviousAdminGate,
 };
 
 /// State carried by these handlers. Held behind an `Arc` so axum can clone
@@ -50,6 +51,10 @@ pub struct AdminGateUpdatedAudit {
     pub old_allowed_ips: Vec<String>,
     pub old_allowed_hosts: Vec<String>,
     pub old_trust_forwarded_for: bool,
+    /// The stored document this save replaced, as JSON text, when it could
+    /// not be parsed (the `old_*` fields are then empty).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_unreadable_document: Option<String>,
     pub new_allowed_ips: Vec<String>,
     pub new_allowed_hosts: Vec<String>,
     pub new_trust_forwarded_for: bool,
@@ -211,7 +216,10 @@ async fn patch_admin_gate(
         .await?;
     // The rules this write replaced, read under the row lock it took, so
     // overlapping saves each audit the change they actually made.
-    let previous = update.previous.normalized();
+    let (previous, old_unreadable_document) = match update.previous {
+        PreviousAdminGate::Rules(rules) => (rules.normalized(), None),
+        PreviousAdminGate::Unreadable(raw) => (AdminGateSettings::default(), Some(raw)),
+    };
     let cfg = update.current;
 
     let audit = AdminGateUpdatedAudit {
@@ -223,6 +231,7 @@ async fn patch_admin_gate(
         old_allowed_ips: previous.allowed_ips,
         old_allowed_hosts: previous.allowed_hosts,
         old_trust_forwarded_for: previous.trust_forwarded_for,
+        old_unreadable_document,
         new_allowed_ips: cfg.allowed_nets.iter().map(|n| n.to_string()).collect(),
         new_allowed_hosts: cfg.allowed_hosts.as_ref().clone(),
         new_trust_forwarded_for: cfg.trust_forwarded_for,
