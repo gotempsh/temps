@@ -82,8 +82,12 @@ impl DomainService {
 enum Requested {
     /// A still-valid authorization: issued without a challenge.
     Issued,
-    /// The `(name, value)` TXT records to publish.
-    Publish(Vec<(String, String)>),
+    /// The `(name, value)` TXT records to publish for the order at
+    /// `order_url`, the one this call created.
+    Publish {
+        order_url: String,
+        records: Vec<(String, String)>,
+    },
 }
 
 /// One DNS-01 issuance's steps, so their order and the cleanup are tested
@@ -91,28 +95,35 @@ enum Requested {
 #[async_trait]
 trait Dns01Steps: Send + Sync {
     async fn request(&self) -> Result<Requested, DomainServiceError>;
-    async fn publish(&self, records: &[(String, String)]) -> Result<(), DomainServiceError>;
+    /// Every later step acts on `order_url` only: an order created for the
+    /// domain meanwhile (a retry from the console or the API) is someone
+    /// else's, and is never published to, validated or cleaned up here.
+    async fn publish(
+        &self,
+        order_url: &str,
+        records: &[(String, String)],
+    ) -> Result<(), DomainServiceError>;
     async fn wait_visible(&self, records: &[(String, String)]) -> Result<(), DomainServiceError>;
-    async fn complete(&self) -> Result<(), DomainServiceError>;
-    /// Remove what this order published; failures are logged, never raised:
-    /// the outcome of issuing is what the caller needs.
-    async fn clean_up(&self);
+    async fn complete(&self, order_url: &str) -> Result<(), DomainServiceError>;
+    /// Remove what `order_url` published; failures are logged, never
+    /// raised: the outcome of issuing is what the caller needs.
+    async fn clean_up(&self, order_url: &str);
 }
 
 async fn issue(steps: &dyn Dns01Steps) -> Result<(), DomainServiceError> {
-    let records = match steps.request().await? {
+    let (order_url, records) = match steps.request().await? {
         Requested::Issued => return Ok(()),
-        Requested::Publish(records) => records,
+        Requested::Publish { order_url, records } => (order_url, records),
     };
     // `publish` records what it is about to create before creating it, so a
     // failure part way still leaves something to remove.
     let validated = async {
-        steps.publish(&records).await?;
+        steps.publish(&order_url, &records).await?;
         steps.wait_visible(&records).await?;
-        steps.complete().await
+        steps.complete(&order_url).await
     }
     .await;
-    steps.clean_up().await;
+    steps.clean_up(&order_url).await;
     validated
 }
 
@@ -138,6 +149,31 @@ impl LiveSteps<'_> {
             .find_acme_order_by_domain(domain.id)
             .await?)
     }
+
+    /// The domain's order, while it is still the one at `order_url`.
+    async fn this_order(
+        &self,
+        order_url: &str,
+    ) -> Result<Option<crate::tls::models::AcmeOrder>, DomainServiceError> {
+        Ok(still_this_order(self.order().await?, order_url))
+    }
+
+    fn replaced(&self, order_url: &str, before: &str) -> DomainServiceError {
+        DomainServiceError::Challenge(format!(
+            "The ACME order {order_url} for {} was replaced by a newer one before {before}, so \
+             Temps left the newer order alone. Try again once it has finished.",
+            self.domain
+        ))
+    }
+}
+
+/// `order` when it is still the one at `order_url`: a replacement is a
+/// different order with its own challenge and cleanup receipt.
+fn still_this_order(
+    order: Option<crate::tls::models::AcmeOrder>,
+    order_url: &str,
+) -> Option<crate::tls::models::AcmeOrder> {
+    order.filter(|order| order.order_url == order_url)
 }
 
 #[async_trait]
@@ -161,22 +197,38 @@ impl Dns01Steps for LiveSteps<'_> {
                 self.domain
             )));
         }
-        Ok(Requested::Publish(
-            challenge
+        // The order this request stored: the one carrying its challenge.
+        let order_url = self
+            .order()
+            .await?
+            .filter(|order| order.token.as_deref() == Some(challenge.token.as_str()))
+            .map(|order| order.order_url)
+            .ok_or_else(|| {
+                DomainServiceError::Challenge(format!(
+                    "The ACME order for {} was replaced while Temps was creating it, so Temps \
+                     published nothing. Try again once the other request has finished.",
+                    self.domain
+                ))
+            })?;
+        Ok(Requested::Publish {
+            order_url,
+            records: challenge
                 .txt_records
                 .into_iter()
                 .map(|r| (r.name, r.value))
                 .collect(),
-        ))
+        })
     }
 
-    async fn publish(&self, records: &[(String, String)]) -> Result<(), DomainServiceError> {
-        let order = self.order().await?.ok_or_else(|| {
-            DomainServiceError::Challenge(format!(
-                "The ACME order for {} disappeared before its DNS-01 record was published",
-                self.domain
-            ))
-        })?;
+    async fn publish(
+        &self,
+        order_url: &str,
+        records: &[(String, String)],
+    ) -> Result<(), DomainServiceError> {
+        let order = self
+            .this_order(order_url)
+            .await?
+            .ok_or_else(|| self.replaced(order_url, "its DNS-01 record was published"))?;
         let published = publish_dns01_challenge(
             self.domain,
             self.provider,
@@ -225,17 +277,30 @@ impl Dns01Steps for LiveSteps<'_> {
         Ok(())
     }
 
-    async fn complete(&self) -> Result<(), DomainServiceError> {
+    async fn complete(&self, order_url: &str) -> Result<(), DomainServiceError> {
+        if self.this_order(order_url).await?.is_none() {
+            return Err(self.replaced(order_url, "Let's Encrypt was asked to validate it"));
+        }
         self.service
             .complete_challenge_with(DomainLookup::Name(self.domain), self.email, true)
             .await
             .map(|_| ())
     }
 
-    async fn clean_up(&self) {
-        let order = match self.order().await {
+    async fn clean_up(&self, order_url: &str) {
+        let order = match self.this_order(order_url).await {
             Ok(Some(order)) => order,
-            Ok(None) => return,
+            // Replaced: the newer order took over this one's cleanup receipt
+            // (`request_challenge` moves it), so finalizing that order removes
+            // these records. Touching them here would break its challenge.
+            Ok(None) => {
+                info!(
+                    "The ACME order {} for {} was replaced; its DNS-01 records are left to the \
+                     newer order's cleanup",
+                    order_url, self.domain
+                );
+                return;
+            }
             Err(e) => {
                 warn!(
                     "Could not read the ACME order for {} to remove its DNS-01 records: {}",
@@ -295,9 +360,13 @@ mod tests {
     #[derive(Default)]
     struct Fake {
         calls: Mutex<Vec<&'static str>>,
+        /// The order each step acted on.
+        orders: Mutex<Vec<String>>,
         issued_without_challenge: bool,
         fail: Option<&'static str>,
     }
+
+    const ORDER: &str = "https://acme.example/order/1";
 
     impl Fake {
         fn step(&self, name: &'static str) -> Result<(), DomainServiceError> {
@@ -311,6 +380,10 @@ mod tests {
         fn calls(&self) -> Vec<&'static str> {
             self.calls.lock().unwrap().clone()
         }
+
+        fn on(&self, order_url: &str) {
+            self.orders.lock().unwrap().push(order_url.to_string());
+        }
     }
 
     #[async_trait]
@@ -320,22 +393,29 @@ mod tests {
             Ok(if self.issued_without_challenge {
                 Requested::Issued
             } else {
-                Requested::Publish(vec![(
-                    "_acme-challenge.app.example.com".into(),
-                    "token".into(),
-                )])
+                Requested::Publish {
+                    order_url: ORDER.into(),
+                    records: vec![("_acme-challenge.app.example.com".into(), "token".into())],
+                }
             })
         }
-        async fn publish(&self, _: &[(String, String)]) -> Result<(), DomainServiceError> {
+        async fn publish(
+            &self,
+            order_url: &str,
+            _: &[(String, String)],
+        ) -> Result<(), DomainServiceError> {
+            self.on(order_url);
             self.step("publish")
         }
         async fn wait_visible(&self, _: &[(String, String)]) -> Result<(), DomainServiceError> {
             self.step("wait_visible")
         }
-        async fn complete(&self) -> Result<(), DomainServiceError> {
+        async fn complete(&self, order_url: &str) -> Result<(), DomainServiceError> {
+            self.on(order_url);
             self.step("complete")
         }
-        async fn clean_up(&self) {
+        async fn clean_up(&self, order_url: &str) {
+            self.on(order_url);
             self.calls.lock().unwrap().push("clean_up");
         }
     }
@@ -348,6 +428,39 @@ mod tests {
             steps.calls(),
             ["request", "publish", "wait_visible", "complete", "clean_up"]
         );
+        // Every step acts on the order this call created, never on whichever
+        // order the domain has by then.
+        assert_eq!(*steps.orders.lock().unwrap(), [ORDER, ORDER, ORDER]);
+    }
+
+    fn order(order_url: &str) -> crate::tls::models::AcmeOrder {
+        crate::tls::models::AcmeOrder {
+            id: 1,
+            order_url: order_url.into(),
+            domain_id: 7,
+            email: "ops@example.com".into(),
+            status: "pending".into(),
+            identifiers: serde_json::json!([]),
+            authorizations: None,
+            finalize_url: None,
+            certificate_url: None,
+            error: None,
+            error_type: None,
+            token: Some("token".into()),
+            key_authorization: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            expires_at: None,
+        }
+    }
+
+    /// A newer order for the domain (a retry while this call waited for
+    /// DNS) is someone else's: its records and receipt are never touched.
+    #[test]
+    fn a_replacement_order_is_never_taken_for_this_one() {
+        assert!(still_this_order(Some(order(ORDER)), ORDER).is_some());
+        assert!(still_this_order(Some(order("https://acme.example/order/2")), ORDER).is_none());
+        assert!(still_this_order(None, ORDER).is_none());
     }
 
     #[tokio::test]
