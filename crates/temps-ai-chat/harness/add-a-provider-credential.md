@@ -48,10 +48,13 @@ for the other flags; do not call an operation that is not listed there.
 - **Cloudflare token for a tunnel or *Make it reachable***: before saving it
   anywhere, `check_cloudflare_token` with `/token` (and `--zone` when known)
   says which permissions it has and which are missing. It stores nothing.
-- **Cloudflare Access**: `check_access_provider` with `/token` and
-  `--account_id`, then `create_access_provider` with the same. There is no
-  rotate operation: create a new one, and the user deletes the old one in the
-  console.
+- **Cloudflare Access**: `create_access_provider` with `/token` and
+  `--account_id`; it checks the token before saving and refuses one that
+  fails. A handle works for one operation only, so do not ask for the token
+  once for `check_access_provider` and again to create: use
+  `check_access_provider` only to diagnose a token the user does not want
+  saved. There is no rotate operation: create a new one, and the user deletes
+  the old one in the console.
 - **Bunny CDN delivery profile**: `create_delivery_profile` with
   `--provider_kind bunny`, `--bunny_pull_zone_id` and `/bunny_api_key`; the key
   is checked against the Pull Zone. There is no rotate operation.
