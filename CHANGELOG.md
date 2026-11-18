@@ -5,6 +5,214 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.0-beta.63] - 2026-11-18
+
+### Added
+
+- **install:** Point to the "What Temps supports" page after installing
+- **web:** Link "What Temps supports" from the sidebar help area
+- **telemetry:** Track first-run onboarding milestones
+- **storage:** Offer backup setup when creating services
+- **updates:** Highlight security releases in the console
+- **proxy:** Resolve client IPs through configured trusted proxy ranges
+- **web:** Retire AI harness surfaces and promote AI chat and gateway to beta
+- **web:** Reuse feature setup flows in first-run onboarding ([#1936](https://github.com/gotempsh/temps/issues/1936))
+- **auth:** Confine API keys to deployment resource scopes
+- **proxy:** Add preferred-node routing and active health checks ([#1890](https://github.com/gotempsh/temps/issues/1890))
+- **compose:** Rewrite published ports to loopback and container_name to aliases
+- **dns:** Let the AI assistant create DNS providers and rotate their credentials
+- **ai-api-tools:** Let the AI assistant connect Cloudflare Access and Bunny CDN by secret form
+- **email:** Let the AI assistant add and rotate email provider credentials by secret form
+- **webhooks:** Let the AI assistant create and update project webhooks with a sealed signing secret
+- **git:** Let the AI assistant connect Git hosts by token and rotate it, with an audit trail
+
+### Build
+
+- **deps:** Bump the web-minor-patch group in /web with 14 updates
+- **deps:** Bump actions/setup-node from 6.5.0 to 7.1.0
+- **deps:** Bump github/codeql-action/upload-sarif
+- **deps:** Bump astral-sh/setup-uv
+- **deps:** Bump taiki-e/install-action
+- **deps:** Bump lopdf from 0.46.0 to 0.47.0
+- **deps:** Bump matchit from 0.8.4 to 0.9.2
+- **deps:** Bump jsonschema from 0.60.2 to 0.61.2
+- **deps:** Bump rtnetlink from 0.23.0 to 0.24.0
+- **deps:** Bump netlink-packet-route to 0.34 alongside rtnetlink 0.24
+- **deps:** Bump maxminddb from 0.32.0 to 0.33.0
+- **deps:** Bump the cargo-minor-patch group with 25 updates
+- **deps:** Bump ed25519-dalek from 2.2.0 to 3.0.0
+- **deps:** Move tokenless to 0.8.0 for ed25519-dalek 3
+
+### CI
+
+- **deps:** Mirror the chrono advisory exceptions in the cargo-audit step
+- Build scenario e2e binary on ubuntu-24.04
+
+### Documentation
+
+- Explain that registry images are pruned and re-pulled on rollback
+- **blob:** Align upload examples with supported SDK options
+- **blob:** Correct the random suffix default
+- **agents:** Only add third-party libraries when they can't be built in-repo
+- **agents:** Point the dependency rule at the price table's new path
+- **compose:** Analyse the Compose security policy and propose easier deploys
+- **compose:** Keep proposed rewrites from widening access or detaching data
+- Add a "What Temps supports" page for self-hosted installs
+- Qualify mixed-architecture builds and label static hosting Experimental
+- **cli:** Synchronize scoped API key command references
+- **serve:** Check Docker socket access with the service's groups
+- **ai-chat:** Teach the assistant how to add or rotate a provider credential
+- **ai-chat:** Create Cloudflare Access providers with one secret form, not two
+- **cli:** Regenerate command references for `domains add --manual-dns`
+
+### Fixed
+
+- **deployments:** Re-pull a pruned registry image before a local rollback
+- **deployments:** Prune pulled and superseded infra images on all nodes
+- **agents:** Remove the replaced preview gateway image after an update
+- **release:** Publish prepared SDK versions in the main lifecycle
+- **ci:** Report PR dependency audits through job status
+- **sdks:** Verify Rust uploads and remove unsupported blob options
+- **release:** Automate CLI publication and refresh skill invocations
+- **sdks:** Refresh the Python SDK lockfile and fail builds on a stale one
+- **release:** Publish SDK crates without rebuilding them next to registry credentials
+- **release:** Align plugin SDK versions with the released lockfile
+- **cli:** Follow Bun file conventions and align skill CI guidance
+- **ai-gateway:** Refresh model price table from provider pricing pages
+- **web:** Show the AI gateway's recorded request costs, not list-price estimates
+- **ai-gateway:** Stop undercounting cached, long and unpriced requests
+- **ai-gateway:** Price batch totals at base rates and tell free requests from unpriced
+- **ai-chat:** Count a chat request to a free model as priced
+- **web:** Send the usage page's cost filter in microcents
+- **ai-gateway:** Price a request only from its own provider's catalogue entries
+- **dns:** Stop sending placeholder content filter on Cloudflare record lookups
+- **dns:** Filter Cloudflare record lookups by type server side without content
+- **deployments:** Identify rejected compose checks in telemetry
+- **deployments:** Authenticate compose check metadata at error boundaries
+- **deployments:** Classify executor and terminal container failures
+- **deployments:** Keep compose build database errors in the build stage
+- **deployments:** Distinguish executor failures from application diagnostics
+- **deployments:** Attribute persistence timeouts to platform failures
+- **deployments:** Redact identifiers from failure reports
+- **deployments:** Preserve secret redaction across log boundaries
+- **deployments:** Preserve complete identifier masks in reports
+- **deployments:** Mask overlapping identifiers together
+- **web:** Lead onboarding with a ready sample deployment
+- **telemetry:** Accept first-run milestones at ingest
+- **storage:** Keep backup deferral available after refetch
+- **storage:** Preserve backup choices after refresh errors
+- **storage:** Respect backup setup choices for new services
+- **storage:** Keep creation within function size limit
+- **updates:** Require release-specific security coverage
+- **git:** Resolve deployment refs consistently across checkout paths
+- **deployments:** Preserve workflow failures and startup error context
+- **backup:** Report outcomes across backup execution paths
+- **backup:** Preserve registered engine telemetry labels
+- **proxy:** Normalize mapped ranges and validate trust settings
+- **web:** Make trusted proxy settings searchable
+- **proxy:** Avoid repeated chain parsing and isolate trust tests
+- **deployments:** Attribute compose rejections only to checks that govern them
+- **deployments:** Expose startup exit diagnostics and retained logs
+- **web:** Reveal crash diagnostics when a live deployment fails
+- **web:** Scope failure evidence expansion to the deployment it was made on
+- **deployments:** Stop promising container logs below startup guidance
+- **web:** Say why All workflows failed to load and offer a retry
+- **web:** Move linked vaults from the service overview to Integrations
+- **web:** Put the Open vaults action on its own line
+- **web:** File chats under the right date heading across daylight-saving changes
+- **web:** Give the vault list the full width and center sandbox settings
+- **web:** Stop a crafted returnTo from linking to another site
+- **web:** Keep the chat search after opening a chat and going back
+- **web:** Keep unsaved sandbox settings when switching tabs
+- **web:** Send "Configure telemetry" to the service's traces setup
+- **web:** Open the traces setup when a link asks for it
+- **web:** Always scroll to the traces setup, without motion if reduced
+- **migrate:** Finish an update when only a post-migration index build has to wait
+- **deployments:** Keep the earlier inspection error when a later inspection stalls
+- **auth:** Bound scoped-key routes and permit deployment clients
+- **auth:** Allow scoped static bundle staging
+- **auth:** Correct API key scope handling, creation and responsive layout
+- **web:** Show the created API key's stored scope in the creation result
+- **sandbox-providers:** Pin microsandbox runtime to 0.7.15 with the SDK
+- **proxy:** Address routing review edge cases for #1890
+- **proxy:** Preserve routing policy across private routes and saves ([#1890](https://github.com/gotempsh/temps/issues/1890))
+- **routes:** Publish health probes atomically with routes ([#1890](https://github.com/gotempsh/temps/issues/1890))
+- **web:** Show overflow limits only for preferred routing ([#1890](https://github.com/gotempsh/temps/issues/1890))
+- **web:** Preserve numeric routing edits during saves ([#1890](https://github.com/gotempsh/temps/issues/1890))
+- **proxy:** Retain private replica state and validate probe paths ([#1890](https://github.com/gotempsh/temps/issues/1890))
+- **notifications:** Select readable bodies for text providers
+- **notifications:** Preserve repeated counts in text alternatives
+- **telemetry-api:** Rate-limit and size-cap the public event ingest
+- **telemetry-api:** Close gaps in the ingest limits found in review
+- **telemetry-api:** Key ingest rate limits on the proxy-written address
+- **deps:** Patch security vulnerabilities reported by Dependabot
+- **compose:** Narrow a merged Compose model before its policy check
+- **compose:** Mask a substituted value's escaped form in Compose diagnostics
+- **deployments:** Check a present rollback image against its recorded identity
+- **ai-agents:** Never remove a replaced gateway image that cannot be pulled again
+- **docker-housekeeping:** Expire digest-pinned images and match every Docker Hub spelling
+- **deps:** Patch libz-sys and unblock the dependency scan; regenerate crate map
+- **docker-housekeeping:** Keep local infrastructure builds the nightly sweep cannot pull again
+- **ai-agents:** Keep a replaced gateway image that still carries a dev tag
+- **docker-housekeeping:** Decide deployment image retention per local image
+- **docker-housekeeping:** Keep unremovable images out of the retention run window
+- **docker-housekeeping:** Never let protected images stall retention or a moved tag lose a new image
+- **docker-housekeeping:** Parenthesise the image ID expression in retention SQL
+- **deployer:** Let containers reach a host DNS resolver in link-local space
+- **deployer:** Say when a build failed because its container had no DNS
+- **deployer:** Read container resolvers the way Docker does for DNS exceptions
+- **deployer:** Only blame DNS for a failed build on resolver-outage evidence
+- **deployer:** Keep DNS exceptions for the resolver file dockerd keeps copying
+- **upgrade:** Follow the installed version's channel when --channel is omitted
+- **admin-gate:** Audit gate changes and show when the console is open to any host
+- **serve:** Say "Docker socket not reachable" and how to grant socket access
+- **admin-gate:** Audit the rules each save replaced, keep unsaved edits, correct recovery docs
+- **upgrade:** Repeat the checked channel in the `temps upgrade --check` hint
+- **admin-gate:** Let valid rules replace a malformed stored gate, and audit this save's own rules
+- **ai-api-tools:** Keep every provider credential out of the assistant's chat
+- **analytics:** Stop API traffic views failing with a 500 when several load at once
+- **git:** Rotate a personal access token on the provider's connections too
+- **git:** Mask credentials embedded in a provider URL in its audit entry
+- **git:** Keep a token check that finishes after a rotation from expiring the new token
+- **ai-api-tools:** Refuse a structured value in a credential field, not only a typed string
+- **providers:** Refuse a whitespace-only service credential from the AI assistant
+- **git:** Drop the query string and fragment of a provider URL from its audit entry
+- **git:** Serialize concurrent provider credential updates so none restores a replaced token
+- **reachability:** Never point an origin record at a CDN edge, issue over DNS-01 and undo proxy-switched records
+- **cli:** Issue DNS-01 certificates through the zone's DNS provider in `domains add`
+- **deps:** Bump lettre to 0.11.24 for RUSTSEC-2026-0560 to 0565
+- **dns:** Reclaim only the proxy-toggled record that was verified
+- **cli:** Fall back to manual DNS-01 when a provider's zones cannot be listed
+- **reachability:** Read the DNS-01 option's record and apply proxy-only changes
+- **infra:** Expire the cached public and private IPs independently
+- **reachability:** Publish the DNS-01 challenge through the zone's provider
+- **domains:** Keep DNS-01 issuance to the order it created
+
+### Refactor
+
+- **ai-gateway:** Move pricing and usage service tests into sibling modules
+- **updates:** Keep release metadata tests beside the module
+- **docker-housekeeping:** Move database-free image pruning into its own module
+- Move the deploy-image and preview-gateway unit tests into sibling files
+- **docker-housekeeping:** Name the by-name removal status apart from the guarded one
+
+### Testing
+
+- **core:** Read cargo-audit's ignored advisories from the AUDIT_IGNORE list
+- **ai-gateway:** Fail real-database usage tests on setup errors, not skip them
+- **dns:** Cover a successful Cloudflare get_records lookup across pages
+- **web:** Match the SMTP Port field exactly in the Mailpit e2e test
+- **web:** Keep scroll stubs from leaking into other suites
+- **web:** Test the no-matcher scroll case without reading the real window
+- **sandbox-providers:** Raise recursion limit for microsandbox netpol e2e
+- **docker-housekeeping:** Isolate the unremovable-image window test from the rollback floor
+- **install:** Make agent-service contract test independent of host coreutils layout
+- **upgrade:** Type the mocked GitHub releases response
+- **web:** Restore the DOM URL after the admin gate shortcut tests
+- **console:** Catch free-form maps behind a schema reference in the AI credential guard
+- **console:** Inspect map values and fail closed on depth in the AI credential guard
+- **console:** Check array element schemas in the AI credential guard
+
 ## [0.1.0-beta.62] - 2026-11-15
 
 ### Added
