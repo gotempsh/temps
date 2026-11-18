@@ -638,6 +638,215 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Credentials nested in a tagged union (the DNS provider shape)
+    // -----------------------------------------------------------------------
+
+    /// `POST /dns-providers` with `credentials` as an internally tagged
+    /// `oneOf`, each member carrying its own `SecretString`, exactly as utoipa
+    /// publishes `DnsProviderCredentials`.
+    fn dns_openapi() -> utoipa::openapi::OpenApi {
+        serde_json::from_value(json!({
+            "openapi": "3.1.0",
+            "info": {"title": "t", "version": "1"},
+            "paths": {
+                "/dns-providers": {"post": {
+                    "operationId": "create_dns_provider",
+                    "requestBody": {"required": true, "content": {"application/json": {
+                        "schema": {"$ref": "#/components/schemas/CreateDnsProviderRequest"}
+                    }}},
+                    "responses": {"201": {"description": "created"}}
+                }}
+            },
+            "components": {"schemas": {
+                "SecretString": {"type": "string", "format": "password", "x-temps-secret": true},
+                "CreateDnsProviderRequest": {
+                    "type": "object",
+                    "required": ["name", "provider_type", "credentials"],
+                    "properties": {
+                        "name": {"type": "string"},
+                        "provider_type": {"type": "string"},
+                        "credentials": {"$ref": "#/components/schemas/DnsProviderCredentials"}
+                    }
+                },
+                "DnsProviderCredentials": {"oneOf": [
+                    {"type": "object", "required": ["type", "api_key"], "properties": {
+                        "type": {"type": "string", "enum": ["bunny"]},
+                        "api_key": {"$ref": "#/components/schemas/SecretString"}
+                    }},
+                    {"type": "object", "required": ["type", "api_token"], "properties": {
+                        "type": {"type": "string", "enum": ["cloudflare"]},
+                        "api_token": {"$ref": "#/components/schemas/SecretString"},
+                        "account_id": {"type": ["string", "null"]}
+                    }},
+                    {"type": "object", "required": ["type", "access_key_id", "secret_access_key"], "properties": {
+                        "type": {"type": "string", "enum": ["route53"]},
+                        "access_key_id": {"type": "string"},
+                        "secret_access_key": {"$ref": "#/components/schemas/SecretString"},
+                        "session_token": {"oneOf": [
+                            {"$ref": "#/components/schemas/SecretString"}, {"type": "null"}
+                        ]}
+                    }}
+                ]}
+            }}
+        }))
+        .expect("test spec parses")
+    }
+
+    #[derive(Debug)]
+    struct DnsToken;
+
+    #[async_trait::async_trait]
+    impl crate::SecretResolver for DnsToken {
+        async fn resolve(
+            &self,
+            handle: &str,
+            usage: &crate::SecretUse<'_>,
+        ) -> Result<temps_core::secret_string::SecretString, crate::SecretResolveError> {
+            if handle == SECRET_HANDLE
+                && usage.operation_id == "create_dns_provider"
+                && usage.field == "/credentials/api_token"
+            {
+                Ok(temps_core::secret_string::SecretString::new(SECRET_VALUE))
+            } else {
+                Err(crate::SecretResolveError::NotPermitted {
+                    handle: handle.to_string(),
+                    operation_id: usage.operation_id.to_string(),
+                    field: usage.field.clone(),
+                    reason: "issued for another field".to_string(),
+                })
+            }
+        }
+    }
+
+    fn dns_caller(seen: Seen) -> InternalApiCaller {
+        let router = Router::new().route(
+            "/dns-providers",
+            axum::routing::post(move |Json(body): Json<Value>| {
+                let seen = seen.clone();
+                async move {
+                    *seen.lock().expect("lock") = Some(body.clone());
+                    // Echo the token, as a careless provider error might.
+                    let token = body["credentials"]["api_token"].clone();
+                    (StatusCode::CREATED, Json(json!({"id": 1, "echo": token})))
+                }
+            }),
+        );
+        InternalApiCaller::new_write_allowlisted(
+            router,
+            &dns_openapi(),
+            vec!["create_dns_provider".to_string()],
+        )
+    }
+
+    #[test]
+    fn every_credential_of_every_dns_provider_type_is_a_secret_path() {
+        let caller = dns_caller(Seen::default());
+        let mut fields = caller.credential_fields("create_dns_provider");
+        fields.sort();
+        assert_eq!(
+            fields,
+            vec![
+                "/credentials/api_key",
+                "/credentials/api_token",
+                "/credentials/secret_access_key",
+                "/credentials/session_token",
+            ]
+        );
+        for field in &fields {
+            assert!(caller.is_credential_field("create_dns_provider", field));
+        }
+        for not_secret in [
+            "/credentials/account_id",
+            "/credentials/type",
+            "/name",
+            "/credentials",
+        ] {
+            assert!(
+                !caller.is_credential_field("create_dns_provider", not_secret),
+                "{not_secret}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_nested_dns_token_handle_resolves_and_never_comes_back() {
+        let seen = Seen::default();
+        let caller = dns_caller(seen.clone());
+        let response = caller
+            .call(
+                "create_dns_provider",
+                json!({"name": "edge", "provider_type": "cloudflare",
+                       "credentials": {"type": "cloudflare", "api_token": SECRET_HANDLE}}),
+                &secrets_scope(Some(std::sync::Arc::new(DnsToken))),
+            )
+            .await
+            .expect("a resolvable handle succeeds");
+        assert_eq!(
+            seen.lock().expect("lock").as_ref().expect("handler ran")["credentials"]["api_token"],
+            SECRET_VALUE
+        );
+        assert_eq!(response.body["echo"], "***");
+        assert!(!response.body.to_string().contains(SECRET_VALUE));
+    }
+
+    #[tokio::test]
+    async fn a_literal_or_misplaced_dns_token_is_refused_before_anything_is_sent() {
+        let seen = Seen::default();
+        let caller = dns_caller(seen.clone());
+        let scope = secrets_scope(Some(std::sync::Arc::new(DnsToken)));
+        let literal = caller
+            .call(
+                "create_dns_provider",
+                json!({"name": "edge", "provider_type": "cloudflare",
+                       "credentials": {"type": "cloudflare", "api_token": "typed-in-chat"}}),
+                &scope,
+            )
+            .await
+            .expect_err("a literal token is refused");
+        assert!(
+            matches!(&literal, crate::ApiToolError::SecretLiteralRejected { field, .. }
+                if field == "/credentials/api_token"),
+            "{literal:?}"
+        );
+        assert!(!literal.to_string().contains("typed-in-chat"));
+        let misplaced = caller
+            .call(
+                "create_dns_provider",
+                json!({"name": "edge", "provider_type": "cloudflare",
+                       "credentials": {"type": "cloudflare", "api_token": "",
+                                       "account_id": SECRET_HANDLE}}),
+                &scope,
+            )
+            .await
+            .expect_err("a handle outside a credential field is refused");
+        assert!(
+            matches!(
+                misplaced,
+                crate::ApiToolError::SecretReferenceMisplaced { .. }
+            ),
+            "{misplaced:?}"
+        );
+        // A handle issued for another field is refused by the resolver.
+        let wrong_field = caller
+            .call(
+                "create_dns_provider",
+                json!({"name": "edge", "provider_type": "bunny",
+                       "credentials": {"type": "bunny", "api_key": SECRET_HANDLE}}),
+                &scope,
+            )
+            .await
+            .expect_err("a handle is bound to its field");
+        assert!(
+            matches!(wrong_field, crate::ApiToolError::SecretUnresolved { .. }),
+            "{wrong_field:?}"
+        );
+        assert!(
+            seen.lock().expect("lock").is_none(),
+            "the handler must not run"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // List parameters over a real serde body and a derived OpenAPI schema
     // -----------------------------------------------------------------------
 

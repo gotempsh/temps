@@ -1229,6 +1229,15 @@ pub const AI_WRITE_ALLOWLIST: &[&str] = &[
     "kv_update",
     "blob_update",
     // Domains, DNS and email
+    // Register a DNS provider (Cloudflare, Bunny, Route53, DigitalOcean, GCP,
+    // Azure, Namecheap) or rotate its credentials. Every credential under
+    // `credentials` is a `SecretString`, so the model passes `secret_ref:`
+    // handles from `request_secret` and never sees the token; the handler
+    // tests the credentials before saving, needs `dns_providers:write` like
+    // the console and audits who did it (and that the assistant did) without
+    // the secret. Deleting a provider stays in the console.
+    "create_dns_provider",
+    "update_provider",
     "add_managed_domain",
     "update_managed_domain",
     "verify_managed_domain",
