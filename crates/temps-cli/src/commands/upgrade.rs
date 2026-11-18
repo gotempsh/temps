@@ -189,6 +189,22 @@ pub(crate) fn pick_upgrade_channel(
     }
 }
 
+/// The command that installs exactly what `temps upgrade --check` just
+/// reported. A pinned `--version` or an explicit channel must be repeated:
+/// without it the follow-up would infer the installed version's channel and
+/// could pick a different release than the one shown.
+pub(crate) fn install_command(version: Option<&str>, choice: ChannelChoice) -> String {
+    if let Some(version) = version {
+        return format!("temps upgrade --version {version}");
+    }
+    match choice.source {
+        ChannelSource::Flag | ChannelSource::LegacyStableFlag => {
+            format!("temps upgrade --channel {}", choice.channel.as_str())
+        }
+        ChannelSource::InstalledVersion => "temps upgrade".to_string(),
+    }
+}
+
 /// Self-upgrade temps to the latest version
 #[derive(Args)]
 pub struct UpgradeCommand {
@@ -506,7 +522,10 @@ impl UpgradeCommand {
         print_lock_capacity_warning(self.database_url.as_deref()).await;
 
         if self.check {
-            println!("Run `temps upgrade` to install this update.");
+            println!(
+                "Run `{}` to install this update.",
+                install_command(self.version.as_deref(), channel_choice)
+            );
             return Ok(());
         }
 
@@ -4720,6 +4739,30 @@ mod tests {
         let choice = pick_upgrade_channel(None, true, "v1.2.0-beta.4");
         assert_eq!(choice.channel, UpgradeChannel::Stable);
         assert_eq!(choice.source, ChannelSource::LegacyStableFlag);
+    }
+
+    #[test]
+    fn check_follow_up_repeats_the_checked_selection() {
+        // `--channel stable --check` on a beta binary: the follow-up must
+        // keep stable, or plain `temps upgrade` would infer beta.
+        let explicit = pick_upgrade_channel(Some(UpgradeChannel::Stable), false, "v1.2.0-beta.4");
+        assert_eq!(
+            install_command(None, explicit),
+            "temps upgrade --channel stable"
+        );
+        let legacy = pick_upgrade_channel(None, true, "v1.2.0-beta.4");
+        assert_eq!(
+            install_command(None, legacy),
+            "temps upgrade --channel stable"
+        );
+        // Inferred channel: the plain command infers the same one again.
+        let inferred = pick_upgrade_channel(None, false, "v1.2.0-beta.4");
+        assert_eq!(install_command(None, inferred), "temps upgrade");
+        // A pinned version is what was checked, whatever the channel.
+        assert_eq!(
+            install_command(Some("v1.3.0"), explicit),
+            "temps upgrade --version v1.3.0"
+        );
     }
 
     #[test]

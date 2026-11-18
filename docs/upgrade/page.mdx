@@ -98,8 +98,9 @@ are running: a `-beta.N` version tracks **beta**, a `-nightly.` version tracks
 **nightly**, and a plain `vX.Y.Z` version tracks **stable**. The upgrade plan
 prints the channel and says when it was inferred. Pass `--channel` to switch;
 nothing else (no environment variable, no setting) changes the channel this
-command uses. The console's **Update now** and `temps doctor` pick the channel
-the same way unless a channel is set under **Settings → Version**.
+command uses. `temps doctor` always infers the channel the same way. The
+console's **Update now** does too, unless a channel is set under
+**Settings → Version**, which only the console reads.
 
 If the stable channel has no release yet, `temps upgrade --channel stable` says
 so and suggests `--channel beta`. It never downgrades: when the newest release
