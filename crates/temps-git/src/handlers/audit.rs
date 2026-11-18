@@ -240,11 +240,18 @@ impl AuditOperation for GithubAppCreatedAudit {
     }
 }
 
-/// The provider's base URL as it may be audited: any username or password
-/// embedded in it (`https://user:secret@git.example.com`) is masked, because
-/// audit details are stored in plain text.
+/// The provider's base URL as it may be audited. Audit details are stored in
+/// plain text, so nothing that can carry a credential is kept: an embedded
+/// username or password (`https://user:secret@git.example.com`) is masked and
+/// the query string and fragment (`?access_token=...`) are dropped. A value
+/// that does not parse as a URL is not recorded at all.
 pub(crate) fn audited_base_url(base_url: Option<&str>) -> Option<String> {
-    base_url.map(temps_core::url_validation::redact_url_password)
+    let mut url = reqwest::Url::parse(base_url?).ok()?;
+    url.set_query(None);
+    url.set_fragment(None);
+    Some(temps_core::url_validation::redact_url_password(
+        url.as_str(),
+    ))
 }
 
 /// A git provider was created with a credential, or had one replaced.
@@ -303,6 +310,13 @@ mod credential_audit_tests {
             audited_base_url(Some("https://git.example.com")).as_deref(),
             Some("https://git.example.com/")
         );
+        let with_query = audited_base_url(Some(
+            "https://git.example.com/api?access_token=fixture-secret#private_token=fixture-secret",
+        ))
+        .expect("a base URL stays recorded");
+        assert!(!with_query.contains("fixture-secret"), "{with_query}");
+        assert_eq!(with_query, "https://git.example.com/api");
+        assert_eq!(audited_base_url(Some("not a url fixture-secret")), None);
         assert_eq!(audited_base_url(None), None);
     }
 
