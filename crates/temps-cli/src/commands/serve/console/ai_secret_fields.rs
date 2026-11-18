@@ -108,39 +108,68 @@ fn is_string_like(spec: &Value, schema: &Value, depth: usize) -> bool {
     })
 }
 
-/// Collect `(path, schema)` for every property reachable from `schema`.
-fn walk<'a>(
+/// How deep the free-form check follows a request body. Deeper than the name
+/// check because reference hops and `oneOf` arms count as levels; cycles are
+/// cut by name, and a body deeper than this fails the check instead of being
+/// accepted half-inspected.
+const FREE_FORM_MAX_DEPTH: usize = 16;
+
+/// Collects `(path, schema)` for every property reachable from a schema,
+/// including the properties of map values (`field.*.name`).
+struct Walk<'a> {
     spec: &'a Value,
-    schema: &'a Value,
-    prefix: &str,
-    depth: usize,
-    seen: &mut Vec<String>,
-    out: &mut Vec<(String, &'a Value)>,
-) {
-    if depth > MAX_SCHEMA_DEPTH {
-        return;
+    limit: usize,
+    seen: Vec<String>,
+    out: Vec<(String, &'a Value)>,
+    /// Paths where the depth limit stopped the walk, so what lies below them
+    /// was not inspected.
+    truncated: Vec<String>,
+}
+
+impl<'a> Walk<'a> {
+    fn new(spec: &'a Value, limit: usize) -> Self {
+        Self {
+            spec,
+            limit,
+            seen: Vec::new(),
+            out: Vec::new(),
+            truncated: Vec::new(),
+        }
     }
-    if let Some((name, target)) = resolve(spec, schema) {
-        if seen.iter().any(|s| s == name) {
+
+    fn walk(&mut self, schema: &'a Value, prefix: &str, depth: usize) {
+        if depth > self.limit {
+            self.truncated
+                .push(prefix.trim_end_matches('.').to_string());
             return;
         }
-        seen.push(name.to_string());
-        walk(spec, target, prefix, depth + 1, seen, out);
-        seen.pop();
-        return;
-    }
-    for key in ["allOf", "oneOf", "anyOf"] {
-        for part in schema[key].as_array().into_iter().flatten() {
-            walk(spec, part, prefix, depth + 1, seen, out);
+        if let Some((name, target)) = resolve(self.spec, schema) {
+            if self.seen.iter().any(|s| s == name) {
+                return;
+            }
+            self.seen.push(name.to_string());
+            self.walk(target, prefix, depth + 1);
+            self.seen.pop();
+            return;
         }
-    }
-    for (name, property) in schema["properties"].as_object().into_iter().flatten() {
-        let path = format!("{prefix}{name}");
-        out.push((path.clone(), property));
-        walk(spec, property, &format!("{path}."), depth + 1, seen, out);
-    }
-    if let Some(items) = schema.get("items") {
-        walk(spec, items, &format!("{prefix}[]."), depth + 1, seen, out);
+        for key in ["allOf", "oneOf", "anyOf"] {
+            for part in schema[key].as_array().into_iter().flatten() {
+                self.walk(part, prefix, depth + 1);
+            }
+        }
+        for (name, property) in schema["properties"].as_object().into_iter().flatten() {
+            let path = format!("{prefix}{name}");
+            self.out.push((path.clone(), property));
+            self.walk(property, &format!("{path}."), depth + 1);
+        }
+        if let Some(items) = schema.get("items") {
+            self.walk(items, &format!("{prefix}[]."), depth + 1);
+        }
+        // A map of described objects is not free-form itself, but the fields
+        // of its values still are fields the caller sends.
+        if let Some(values) = schema.get("additionalProperties").filter(|v| v.is_object()) {
+            self.walk(values, &format!("{prefix}*."), depth + 1);
+        }
     }
 }
 
@@ -163,9 +192,9 @@ fn unmarked_secret_fields(spec: &Value) -> BTreeSet<String> {
             else {
                 continue;
             };
-            let mut fields = Vec::new();
-            walk(spec, body, "", 0, &mut Vec::new(), &mut fields);
-            for (path, schema) in fields {
+            let mut walk = Walk::new(spec, MAX_SCHEMA_DEPTH);
+            walk.walk(body, "", 0);
+            for (path, schema) in walk.out {
                 let leaf = path.rsplit('.').next().unwrap_or(&path);
                 if looks_like_a_credential(leaf)
                     && !NOT_CREDENTIALS.contains(&format!("{id}:{path}").as_str())
@@ -238,8 +267,9 @@ const NOT_CREDENTIALS: &[&str] = &[
 /// one is invisible to the secret-slot layer, which only knows the paths the
 /// spec flags, so the model would have to type it.
 fn is_free_form(spec: &Value, schema: &Value, depth: usize) -> bool {
-    if depth > MAX_SCHEMA_DEPTH {
-        return false;
+    // A schema too deep to resolve cannot be shown to hold no credential.
+    if depth > FREE_FORM_MAX_DEPTH {
+        return true;
     }
     // A named schema can be a bare map too; moving an inline map into
     // `components` must not hide it from this check.
@@ -317,12 +347,15 @@ fn free_form_fields(spec: &Value, operations: &BTreeSet<String>) -> BTreeSet<Str
             if is_free_form(spec, body, 0) {
                 found.insert(format!("{id}:(body)"));
             }
-            let mut fields = Vec::new();
-            walk(spec, body, "", 0, &mut Vec::new(), &mut fields);
-            for (path, schema) in fields {
+            let mut walk = Walk::new(spec, FREE_FORM_MAX_DEPTH);
+            walk.walk(body, "", 0);
+            for (path, schema) in walk.out {
                 if is_free_form(spec, schema, 0) {
                     found.insert(format!("{id}:{path}"));
                 }
+            }
+            for path in walk.truncated {
+                found.insert(format!("{id}:{path} (too deep to inspect)"));
             }
         }
     }
@@ -635,6 +668,68 @@ mod tests {
                 .into_iter()
                 .map(String::from)
                 .collect::<BTreeSet<_>>()
+        );
+    }
+
+    #[test]
+    fn an_opaque_map_inside_a_map_of_objects_is_free_form() {
+        let spec = serde_json::json!({
+            "paths": { "/things": { "post": {
+                "operationId": "create_thing",
+                "requestBody": { "content": { "application/json": { "schema": {
+                    "type": "object",
+                    "properties": { "settings": {
+                        "type": "object",
+                        "additionalProperties": {
+                            "type": "object",
+                            "properties": {
+                                "url": { "type": "string" },
+                                "headers": {
+                                    "type": "object",
+                                    "additionalProperties": { "type": "string" }
+                                }
+                            }
+                        }
+                    } }
+                } } } }
+            } } }
+        });
+        let operations: BTreeSet<String> = ["create_thing".to_string()].into_iter().collect();
+        assert_eq!(
+            free_form_fields(&spec, &operations),
+            ["create_thing:settings.*.headers".to_string()]
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+        );
+    }
+
+    #[test]
+    fn a_body_too_deep_to_inspect_fails_the_check() {
+        let mut schemas = serde_json::Map::new();
+        let hops = FREE_FORM_MAX_DEPTH + 2;
+        for hop in 0..hops {
+            schemas.insert(
+                format!("Hop{hop}"),
+                serde_json::json!({ "$ref": format!("#/components/schemas/Hop{}", hop + 1) }),
+            );
+        }
+        schemas.insert(
+            format!("Hop{hops}"),
+            serde_json::json!({ "type": "object", "additionalProperties": { "type": "string" } }),
+        );
+        let spec = serde_json::json!({
+            "paths": { "/things": { "post": {
+                "operationId": "create_thing",
+                "requestBody": { "content": { "application/json": {
+                    "schema": { "$ref": "#/components/schemas/Hop0" }
+                } } }
+            } } },
+            "components": { "schemas": schemas }
+        });
+        let operations: BTreeSet<String> = ["create_thing".to_string()].into_iter().collect();
+        assert!(
+            !free_form_fields(&spec, &operations).is_empty(),
+            "a reference chain past the limit must be reported, not accepted"
         );
     }
 
