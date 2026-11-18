@@ -238,8 +238,14 @@ const NOT_CREDENTIALS: &[&str] = &[
 /// one is invisible to the secret-slot layer, which only knows the paths the
 /// spec flags, so the model would have to type it.
 fn is_free_form(spec: &Value, schema: &Value, depth: usize) -> bool {
-    if depth > MAX_SCHEMA_DEPTH || schema.get("$ref").is_some() {
+    if depth > MAX_SCHEMA_DEPTH {
         return false;
+    }
+    // A named schema can be a bare map too; moving an inline map into
+    // `components` must not hide it from this check.
+    if schema.get("$ref").is_some() {
+        return resolve(spec, schema)
+            .is_some_and(|(_, target)| is_free_form(spec, target, depth + 1));
     }
     if ["allOf", "oneOf", "anyOf"]
         .iter()
@@ -307,6 +313,10 @@ fn free_form_fields(spec: &Value, operations: &BTreeSet<String>) -> BTreeSet<Str
             else {
                 continue;
             };
+            // The body itself can be the map (`walk` only reports properties).
+            if is_free_form(spec, body, 0) {
+                found.insert(format!("{id}:(body)"));
+            }
             let mut fields = Vec::new();
             walk(spec, body, "", 0, &mut Vec::new(), &mut fields);
             for (path, schema) in fields {
@@ -574,6 +584,57 @@ mod tests {
         assert!(
             stale.is_empty(),
             "no longer free-form or no longer reachable; delete from REVIEWED_FREE_FORM: {stale:?}"
+        );
+    }
+
+    #[test]
+    fn a_map_behind_a_reference_is_still_free_form() {
+        let spec = serde_json::json!({
+            "paths": {
+                "/things": { "post": {
+                    "operationId": "create_thing",
+                    "requestBody": { "content": { "application/json": {
+                        "schema": { "$ref": "#/components/schemas/CreateThing" }
+                    } } }
+                } },
+                "/labels": { "post": {
+                    "operationId": "set_labels",
+                    "requestBody": { "content": { "application/json": {
+                        "schema": { "$ref": "#/components/schemas/Labels" }
+                    } } }
+                } }
+            },
+            "components": { "schemas": {
+                "CreateThing": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string" },
+                        "settings": { "$ref": "#/components/schemas/Labels" },
+                        "sealed": { "$ref": "#/components/schemas/SealedMap" }
+                    }
+                },
+                "Labels": {
+                    "type": "object",
+                    "additionalProperties": { "type": "string" }
+                },
+                "SealedMap": {
+                    "type": "object",
+                    "additionalProperties": { "$ref": "#/components/schemas/SecretString" }
+                },
+                "SecretString": { "type": "string", "x-temps-secret": true }
+            } }
+        });
+        let operations: BTreeSet<String> = ["create_thing", "set_labels"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let found = free_form_fields(&spec, &operations);
+        assert_eq!(
+            found,
+            ["create_thing:settings", "set_labels:(body)"]
+                .into_iter()
+                .map(String::from)
+                .collect::<BTreeSet<_>>()
         );
     }
 
