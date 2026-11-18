@@ -139,6 +139,19 @@ the user is not allowed to use the socket. Grant it one of two ways:
   sudo systemctl restart temps
   ```
 
+  `sudo -u temps docker info` keeps failing after this change, because sudo
+  uses the account's own groups and the drop-in only applies to the service.
+  To test with the service's groups, run the check the way systemd runs the
+  service:
+
+  ```bash
+  sudo systemd-run --uid=temps -p SupplementaryGroups=docker --pipe --wait --quiet \
+    docker info >/dev/null && echo ok
+  ```
+
+  Or restart the service and check that its log no longer shows
+  `Docker dependency check FAILED`.
+
 Membership of the `docker` group is equivalent to root on the host, which is
 why Temps runs as a dedicated user. Colima, OrbStack, Rancher Desktop and
 rootless Docker use a different socket; see

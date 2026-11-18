@@ -205,7 +205,7 @@ fn summarize_typed(error: &ConsoleStartupError) -> ConsoleStartupFailure {
             }
             remediation.extend([
                 "To run this server without local workloads, start it with `temps serve --profile control-plane` and add worker nodes with `temps join`.".to_string(),
-                "Check with `temps doctor` as the user that runs Temps (`sudo -u <user> temps doctor`), then restart `temps serve`.".to_string(),
+                "Restart `temps serve` and check its log. `sudo -u <user> temps doctor` tests the account's own groups; it does not see a group added only by a systemd SupplementaryGroups= drop-in.".to_string(),
             ]);
             ConsoleStartupFailure::new(ConsoleStartupCheck::Docker, summary, reason, remediation)
         }
@@ -371,10 +371,14 @@ mod tests {
             failure
                 .remediation
                 .iter()
-                .filter(|step| step.contains("SupplementaryGroups"))
+                .filter(|step| step.contains("usermod -aG docker"))
                 .count(),
             1
         );
+        // The verification step warns that sudo does not see a group the
+        // systemd drop-in grants only to the service.
+        let last = failure.remediation.last().expect("remediation steps");
+        assert!(last.contains("account's own groups"), "{last}");
     }
 
     #[test]

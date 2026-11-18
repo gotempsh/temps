@@ -83,7 +83,7 @@ The console checks Docker at startup and gives up if the daemon does not answer 
   [Service]
   SupplementaryGroups=docker
   ```
-  Then `sudo systemctl restart temps`. See [Docker, and access to its socket](/docs/installation#docker-and-access-to-its-socket).
+  Then `sudo systemctl restart temps`. With the drop-in, `sudo -u <user> docker info` and `sudo -u <user> temps doctor` still fail: sudo uses the account's own groups, not the service's. Test with the service's groups using `sudo systemd-run --uid=<user> -p SupplementaryGroups=docker --pipe --wait --quiet docker info`, or restart and check the log. See [Docker, and access to its socket](/docs/installation#docker-and-access-to-its-socket).
 - **Colima, OrbStack, Rancher Desktop or rootless Docker.** These runtimes do not listen on `/var/run/docker.sock`. When `DOCKER_HOST` is not set, Temps reads the active Docker context (`$DOCKER_CONTEXT`, or `currentContext` in `~/.docker/config.json`) and uses it if it is a `unix://` socket that exists. You will see `Using Docker context '<name>' (<host>) because DOCKER_HOST is not set` in the log. `ssh://` and `tcp://` contexts are not adopted automatically. For those, or if the context is not picked up, set `DOCKER_HOST` explicitly, for example:
 
   ```bash
@@ -93,7 +93,7 @@ The console checks Docker at startup and gives up if the daemon does not answer 
   `DOCKER_HOST` always takes precedence over contexts. `docker context inspect` shows the socket path of a context.
 - **A control plane without local workloads.** `temps serve --profile control-plane` does not need a Docker daemon. Applications then run on worker nodes joined with `temps join`.
 
-**The console returns `503`.** With the default `--role all`, a failed Docker check stops the console but not the proxy, which then answers console requests with `503`. The page names the failed check (for example `Docker socket not reachable at ...`) and the steps to fix it only for clients the server trusts with the console: loopback, or an address in the admin IP allowlist. From anywhere else you get a generic "the console failed to start" page. To see the cause, open it from the server itself against the proxy's HTTP port (`TEMPS_ADDRESS`, for example `curl -s -H 'Accept: application/json' http://127.0.0.1:80/`), or read the log.
+**The console returns `503`.** With the default `--role all`, a failed Docker check stops the console but not the proxy, which then answers console requests with `503`. The page names the failed check (for example `Docker socket not reachable at ...`) and the steps to fix it only for clients the server trusts with the console: loopback, or an address in the admin IP allowlist. From anywhere else you get a generic "the console failed to start" page. To see the cause, open it from the server itself against the proxy's HTTP port (`TEMPS_ADDRESS`), for example `curl -s -H 'Accept: application/json' http://127.0.0.1:80/`. If the [admin access gate](/docs/admin-listener#admin-gate) has **Allowed hosts** set, also send one of them, or the gate answers `404` first: `curl -s -H 'Accept: application/json' -H 'Host: console.example.com' http://127.0.0.1:80/`. Or read the log.
 
 With the default `--role all`, a failed Docker check stops the console but not the proxy. The log shows `❌ Console API failed to start: ...` followed by `Proxied traffic to deployed applications is NOT affected.` The process keeps running, so check the log rather than whether the process is up.
 
