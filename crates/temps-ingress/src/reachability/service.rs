@@ -54,9 +54,10 @@ use tracing::{info, warn};
 use super::access::{self as access_api, AccessApp, AccessPolicyAnswer, ACCESS_TUNNEL_ONLY};
 use super::access_service::AccessProviderService;
 use super::compute::{
-    address_reachability, is_local_only, needs_lookup, overall_state, summary, AddressFacts,
-    AddressInput, ControlPlaneHost, DirectIngress, InsideCheck, PrivateBinding, PrivateFacts,
-    Resolution, ServeEntryState, ServiceHostsState, TailnetFacts, TunnelState, PRIVATE_COMMAND,
+    address_reachability, control_plane_origin, is_local_only, needs_lookup, overall_state,
+    summary, AddressFacts, AddressInput, ControlPlaneHost, ControlPlaneOrigin, DirectIngress,
+    InsideCheck, PrivateBinding, PrivateFacts, Resolution, ServeEntryState, ServiceHostsState,
+    TailnetFacts, TunnelState, PRIVATE_COMMAND,
 };
 use super::edge_rules::{
     self, EdgeRuleCreated, EdgeRuleError, EdgeRulePurpose, EdgeRuleSeen, HttpPolicy,
@@ -72,8 +73,8 @@ use super::plan::{
     access_choice, access_policy_answer, AccessChoice, AccessProviderFact, FIELD_ACCESS_PROVIDER,
 };
 use super::plan::{
-    address_for_audience, choice, chosen_http_policy, environment_hosts_tunnel, fingerprint,
-    gate_allow_answer, guess_zone, http01_direct, place_http_policy_steps, plan, planned_record,
+    address_for_audience, choice, chosen_http_policy, direct_for, environment_hosts_tunnel,
+    fingerprint, gate_allow_answer, guess_zone, place_http_policy_steps, plan, planned_record,
     private_worker, record_type_of, records_to_read, service_of, service_tag, service_worker,
     tunnel_domain_for, tunnel_route, unique_tunnel_name, zone_for, NamedId, PlanFacts,
     PrivateWorkerFact, ServeEntryFact, ServiceSeen, TailnetWorkerFact, TailscaleCredentialFact,
@@ -195,6 +196,10 @@ pub struct ReachabilityDeps {
     pub config: Arc<ConfigService>,
     /// Saved Cloudflare Access tokens and their apps (ADR 065 D9).
     pub access: Arc<AccessProviderService>,
+    /// The control plane's own public address, as the server detects it:
+    /// what a direct way in points DNS at when the edge target is no
+    /// address. Never the console hostname's resolution.
+    pub public_address: Arc<dyn temps_core::server_public_address::ServerPublicAddress>,
 }
 
 pub struct ReachabilityService {
@@ -724,6 +729,32 @@ impl ReachabilityService {
         })
     }
 
+    /// The control plane's origin address from what the server knows: the
+    /// edge target when it is an address, else the address it detected for
+    /// itself. Never the console hostname's resolution, which behind a CDN
+    /// is the CDN's edge.
+    pub(super) async fn control_plane_origin(
+        &self,
+        settings: &temps_config::AppSettings,
+    ) -> ControlPlaneOrigin {
+        let edge_is_address = settings
+            .edge_target
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|t| {
+                t.trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .parse::<IpAddr>()
+                    .is_ok()
+            });
+        let detected = if edge_is_address {
+            None
+        } else {
+            self.deps.public_address.detected_public_ip().await
+        };
+        control_plane_origin(settings.edge_target.as_deref(), detected)
+    }
+
     /// The control plane's proxy and every worker's direct ingress, with the
     /// public addresses DNS would point at.
     pub(super) async fn directs(&self, settings: &temps_config::AppSettings) -> Vec<DirectIngress> {
@@ -734,19 +765,11 @@ impl ReachabilityService {
             .rsplit_once(':')
             .and_then(|(_, port)| port.parse::<u16>().ok())
             == Some(80);
-        let mut ips = Vec::new();
-        for host in control_plane_hosts(settings).await {
-            for ip in host.ips {
-                if address_scope(ip) == AddressScope::Public && !ips.contains(&ip) {
-                    ips.push(ip);
-                }
-            }
-        }
-        if !ips.is_empty() {
+        if let ControlPlaneOrigin::Address { ip, .. } = self.control_plane_origin(settings).await {
             directs.push(DirectIngress {
                 name: CONTROL_PLANE.to_string(),
                 node_id: None,
-                ips,
+                ips: vec![ip],
                 takes_port_80,
                 check_failed: None,
             });
@@ -792,7 +815,10 @@ impl ReachabilityService {
                 row.listen_address.as_deref(),
                 &interfaces,
             )
-            .filter(|ip| address_scope(*ip) == AddressScope::Public) else {
+            .filter(|ip| address_scope(*ip) == AddressScope::Public)
+            // A worker's reported address inside a CDN's edge is the
+            // CDN's, not the worker's: DNS never points at it.
+            .filter(|ip| temps_core::known_proxies::known_proxy(*ip).is_none()) else {
                 continue;
             };
             let check_failed = row.last_check.as_ref().and_then(|check| {
@@ -1388,6 +1414,7 @@ impl ReachabilityService {
                 domain: z.domain.trim_end_matches('.').to_ascii_lowercase(),
                 verified: z.verified,
                 auto_manage: z.auto_manage,
+                proxied_by_default: z.proxied_by_default,
             }));
         }
         let cloudflare_accounts = providers
@@ -1545,15 +1572,21 @@ impl ReachabilityService {
         // Only a public or signed-in plan for an environment the control
         // plane serves alone is stopped by the control plane having no
         // public address, so only then is it said what its hosts resolve to.
-        let control_plane = if matches!(audience, Audience::Public | Audience::SignedIn)
-            && gathered.deployed
-            && !served_by_workers
-            && !directs.iter().any(|d| d.node_id.is_none())
-        {
-            Some(control_plane_hosts(&self.settings().await?).await)
-        } else {
-            None
-        };
+        let (control_plane, control_plane_refusal) =
+            if matches!(audience, Audience::Public | Audience::SignedIn)
+                && gathered.deployed
+                && !served_by_workers
+                && !directs.iter().any(|d| d.node_id.is_none())
+            {
+                let settings = self.settings().await?;
+                let refusal = match self.control_plane_origin(&settings).await {
+                    ControlPlaneOrigin::Refused(why) => Some(why),
+                    ControlPlaneOrigin::Address { .. } | ControlPlaneOrigin::Unknown => None,
+                };
+                (Some(control_plane_hosts(&settings).await), refusal)
+            } else {
+                (None, None)
+            };
         let facts = PlanFacts {
             intents: HashMap::new(),
             choices: tunnel_facts.choices,
@@ -1575,6 +1608,7 @@ impl ReachabilityService {
             cloudflare_accounts,
             directs,
             control_plane_hosts: control_plane,
+            control_plane_refusal,
             tunnel_workers,
             workers_refusing,
             dns_records: Vec::new(),
@@ -2020,6 +2054,7 @@ impl ReachabilityService {
             direct: None,
             dns_before: PlannedRecord::Absent,
             certificate_challenge: None,
+            dns_proxied: None,
             audience: None,
             access: None,
             serve: None,
@@ -2252,11 +2287,26 @@ impl ReachabilityService {
                 ));
             }
             PlanOptionKind::DirectManagedDns | PlanOptionKind::DirectManualDns => {
-                let direct = http01_direct(&facts).ok_or_else(|| {
-                    ReachabilityError::Conflict("No direct ingress takes port 80 any more.".into())
+                let direct = direct_for(&facts, option.kind).ok_or_else(|| {
+                    ReachabilityError::Conflict(
+                        if option.kind == PlanOptionKind::DirectManagedDns {
+                            "No direct ingress has a public address any more.".into()
+                        } else {
+                            "No direct ingress takes port 80 any more.".into()
+                        },
+                    )
                 })?;
                 input.direct = Some((direct.name.clone(), direct.ips[0]));
                 input.dns_before = planned_record(&facts, &address, record_type_of(direct.ips[0]));
+                if option.kind == PlanOptionKind::DirectManagedDns {
+                    // The zone's DNS provider writes the challenge: no port
+                    // 80, and a proxied record is fine.
+                    input.certificate_challenge = Some("dns-01".to_string());
+                    // The record is served as the plan said: the zone's
+                    // proxy default where its provider can proxy (ADR 031).
+                    input.dns_proxied = zone_for(&address, &facts.zones)
+                        .map(|zone| zone.can_proxy() && zone.proxied_by_default);
+                }
             }
             PlanOptionKind::TunnelEnvironmentHosts => {
                 let tunnel = environment_hosts_tunnel(&facts, &address).ok_or_else(|| {
@@ -3808,6 +3858,8 @@ impl RunOps for LiveOps {
             modified_on: s.modified_on,
             managed: s.managed,
             run_id: s.run_id,
+            proxied: Some(s.proxied),
+            proxy_toggled_run_id: s.proxy_toggled_run_id,
         }))
     }
 
@@ -3817,6 +3869,7 @@ impl RunOps for LiveOps {
         record_type: &str,
         content: &str,
         run_id: Option<i32>,
+        proxied: Option<bool>,
     ) -> Result<String, WriteError> {
         let label = self.label_of(host).await.map_err(WriteError::refused)?;
         let value = match record_type {
@@ -3835,9 +3888,10 @@ impl RunOps for LiveOps {
                     name: label.clone(),
                     content: value,
                     ttl: Some(300),
-                    proxied: false,
+                    proxied: proxied.unwrap_or(false),
                 },
-                Some(false),
+                // `None` takes the zone's "proxied by default" (ADR 031).
+                proxied,
                 OwnershipScope {
                     run_id,
                     ..self.dns_scope()
@@ -3862,6 +3916,26 @@ impl RunOps for LiveOps {
                 }
             })?;
         Ok(label)
+    }
+
+    async fn reclaim_dns_record(
+        &self,
+        host: &str,
+        record_type: &str,
+        run_id: i32,
+    ) -> Result<(), String> {
+        let label = self.label_of(host).await?;
+        self.deps
+            .records
+            .reclaim_proxy_toggled_record(
+                host,
+                &label,
+                dns_record_type(record_type),
+                self.dns_scope(),
+                run_id,
+            )
+            .await
+            .map_err(text)
     }
 
     async fn remove_dns_record(
@@ -3900,7 +3974,22 @@ impl RunOps for LiveOps {
             .map_err(text)
     }
 
-    async fn finish_certificate(&self, host: &str, email: &str) -> Result<(), String> {
+    async fn finish_certificate(
+        &self,
+        host: &str,
+        email: &str,
+        challenge: &str,
+    ) -> Result<(), String> {
+        if challenge == "dns-01" {
+            // The zone's DNS provider publishes the challenge record, public
+            // resolvers are waited for, and the record is removed after.
+            return self
+                .deps
+                .domains
+                .issue_dns01_through_provider(host, email, &self.deps.dns_providers)
+                .await
+                .map_err(|e| format!("Let's Encrypt could not issue {host} over DNS-01: {e}"));
+        }
         self.deps
             .domains
             .request_challenge(host, email)
@@ -3914,8 +4003,7 @@ impl RunOps for LiveOps {
             .map_err(|e| {
                 format!(
                     "Let's Encrypt could not validate {host}: {e}. Over HTTP-01 its DNS must \
-                     point at this ingress with port 80 open to the internet; over DNS-01 the \
-                     zone's DNS provider in Temps must be able to write TXT records."
+                     point at this ingress with port 80 open to the internet."
                 )
             })
     }

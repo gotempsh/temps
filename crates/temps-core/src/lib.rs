@@ -36,6 +36,7 @@ pub mod gate_access;
 /// Internal access grants on the route-sync wire (ADR 101).
 pub mod internal_access;
 pub mod jobs;
+pub mod known_proxies;
 pub mod log_storage_config;
 /// Log recurring conditions on state transitions instead of on every tick.
 pub mod log_transitions;
@@ -86,6 +87,7 @@ pub mod secrets_manager;
 pub mod self_update;
 pub mod sensitive_action;
 pub mod serve_profile;
+pub mod server_public_address;
 pub mod source_drop;
 pub mod static_files;
 pub mod tailnet;
