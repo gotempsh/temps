@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { useEffect, useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
 import {
   CheckCircle2,
   Circle,
@@ -11,14 +10,11 @@ import {
   XCircle,
 } from 'lucide-react'
 import type { CreationStep, SandboxCreation } from '@/api/client'
-import { getSandboxCreationOptions } from '@/api/client/@tanstack/react-query.gen'
 import { Progress } from '@/components/ui/progress'
 import { Skeleton } from '@/components/ui/skeleton'
 import { cn } from '@/lib/utils'
 import {
-  CREATION_POLL_MS,
   creationDurationMs,
-  creationRunning,
   downloadLabel,
   downloadPercent,
   failedStep,
@@ -38,22 +34,6 @@ function useTick(enabled: boolean): number {
     return () => clearInterval(id)
   }, [enabled])
   return now
-}
-
-/**
- * Polls the steps of the create sent with `creationId` while it runs. A 404
- * before the server has started tracking it is retried, not shown as an
- * error: the create request and the first poll race.
- */
-export function useSandboxCreation(creationId: string | null) {
-  return useQuery({
-    ...getSandboxCreationOptions({ path: { creation_id: creationId ?? '' } }),
-    enabled: creationId !== null,
-    retry: (failureCount) => failureCount < 10,
-    retryDelay: CREATION_POLL_MS,
-    refetchInterval: (query) =>
-      creationRunning(query.state.data) ? CREATION_POLL_MS : false,
-  })
 }
 
 interface SandboxCreationStepsProps {

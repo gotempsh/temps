@@ -20,8 +20,10 @@
 //!   "Prepare sandboxes", never silently.
 //! - `prepared_image`: the exact reference last prepared on the host, so a
 //!   changed default is noticed and the old image can be removed.
-//! - `stale_image`: a previously prepared image whose removal is pending
-//!   because a container still used it.
+//! - `stale_images`: previously prepared images whose removal is pending
+//!   because a container still used them. A list, because several upgrades
+//!   can pass while one long-lived sandbox keeps an old image in use; capped
+//!   so a host that never frees them cannot grow the row without bound.
 //! - `last_error` / `last_error_at`: why the last preparation failed.
 //!
 //! A table rather than a column on `nodes`, because the control plane is a
@@ -44,7 +46,8 @@ impl MigrationTrait for Migration {
                 node_id INTEGER NULL REFERENCES nodes(id) ON DELETE CASCADE,
                 keep_prepared BOOLEAN NOT NULL DEFAULT FALSE,
                 prepared_image TEXT NULL,
-                stale_image TEXT NULL,
+                stale_images TEXT[] NOT NULL DEFAULT '{}' \
+                    CHECK (cardinality(stale_images) <= 16),
                 last_error TEXT NULL,
                 last_error_at TIMESTAMPTZ NULL,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT now(),

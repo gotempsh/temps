@@ -33,8 +33,8 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use futures::{stream, StreamExt};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseBackend, DatabaseConnection, DbErr, EntityTrait,
-    IntoActiveModel, QueryFilter, Set, Statement,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection, DbErr,
+    EntityTrait, IntoActiveModel, QueryFilter, Set, Statement, TransactionTrait,
 };
 use serde::Serialize;
 use utoipa::ToSchema;
@@ -113,8 +113,8 @@ pub struct HostImagePreparation {
     pub status_error: Option<String>,
     /// The image Temps last prepared on this host.
     pub prepared_image: Option<String>,
-    /// A previously prepared image still to remove (a container used it).
-    pub stale_image: Option<String>,
+    /// Previously prepared images still to remove (a container used them).
+    pub stale_images: Vec<String>,
     /// Why the last preparation failed.
     pub last_error: Option<String>,
     #[schema(value_type = Option<String>, format = DateTime)]
@@ -189,21 +189,76 @@ pub(crate) fn plan_host(
 }
 
 /// Images to remove once `ready` is the host's prepared image: the one
-/// prepared before it and one still pending removal, never `ready` itself.
+/// prepared before it and every one still pending removal, never `ready`
+/// itself.
 pub(crate) fn images_to_retire(
     row: &sandbox_image_preparations::Model,
     ready: &str,
 ) -> Vec<String> {
     let mut retire = Vec::new();
-    for image in [row.prepared_image.as_deref(), row.stale_image.as_deref()]
+    for image in row
+        .prepared_image
+        .as_deref()
         .into_iter()
-        .flatten()
+        .chain(row.stale_images.iter().map(String::as_str))
     {
         if image != ready && !retire.iter().any(|r: &String| r == image) {
             retire.push(image.to_string());
         }
     }
     retire
+}
+
+/// Upsert a host's row with `keep_prepared = keep`.
+async fn upsert_keep<C: ConnectionTrait>(
+    conn: &C,
+    host: &str,
+    api_id: i32,
+    keep: bool,
+) -> Result<sandbox_image_preparations::Model, ImagePreparationError> {
+    let statement = Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "INSERT INTO sandbox_image_preparations (node_id, keep_prepared) VALUES ($1, $2) \
+         ON CONFLICT ((COALESCE(node_id, 0))) \
+         DO UPDATE SET keep_prepared = EXCLUDED.keep_prepared, updated_at = now() \
+         RETURNING *",
+        [row_node_id(api_id).into(), keep.into()],
+    );
+    sandbox_image_preparations::Entity::find()
+        .from_raw_sql(statement)
+        .one(conn)
+        .await
+        .and_then(|row| {
+            row.ok_or_else(|| {
+                DbErr::RecordNotFound(format!(
+                    "sandbox_image_preparations row for node {api_id} after upsert"
+                ))
+            })
+        })
+        .map_err(|source| ImagePreparationError::Database {
+            operation: "saving",
+            host: host.to_string(),
+            source,
+        })
+}
+
+/// Most images kept awaiting removal per host (the column's CHECK).
+pub(crate) const MAX_STALE_IMAGES: usize = 16;
+
+/// The images still awaiting removal, newest first, within
+/// [`MAX_STALE_IMAGES`]. Past the cap the oldest are forgotten (logged):
+/// they stay on the host as ordinary cached images.
+pub(crate) fn pending_removal(host: &str, mut still_used: Vec<String>) -> Vec<String> {
+    if still_used.len() > MAX_STALE_IMAGES {
+        for forgotten in still_used.drain(MAX_STALE_IMAGES..) {
+            tracing::warn!(
+                host = %host,
+                image = %forgotten,
+                "too many previous sandbox images still in use; no longer tracking this one for removal"
+            );
+        }
+    }
+    still_used
 }
 
 /// The API's node id for a host: `0` for the control plane.
@@ -323,12 +378,43 @@ impl ImagePreparationService {
                 eligible
             }
         };
-        let mut prepared = Vec::with_capacity(targets.len());
-        for host in targets {
-            let row = self.set_keep(&host.name, host.id, true).await?;
-            self.start_host(&host.name, row).await;
-            prepared.push(host.id);
+        // Every host's policy in one transaction, so the caller audits
+        // exactly what was saved: all of it, or (on an error) nothing.
+        let txn = self
+            .db
+            .begin()
+            .await
+            .map_err(|source| ImagePreparationError::Database {
+                operation: "starting to save",
+                host: "the hosts to prepare".to_string(),
+                source,
+            })?;
+        let mut rows = Vec::with_capacity(targets.len());
+        for host in &targets {
+            let row = upsert_keep(&txn, &host.name, host.id, true).await?;
+            rows.push((host.name.clone(), row));
         }
+        txn.commit()
+            .await
+            .map_err(|source| ImagePreparationError::Database {
+                operation: "saving",
+                host: "the hosts to prepare".to_string(),
+                source,
+            })?;
+        let prepared = targets.iter().map(|h| h.id).collect();
+
+        // Asking a host to pull can take up to HOST_CALL_DEADLINE when it is
+        // unresponsive: done in the background, a few hosts at a time, so
+        // the request returns at once. Progress is read from `status`.
+        let service = Arc::clone(self);
+        tokio::spawn(async move {
+            stream::iter(rows)
+                .for_each_concurrent(STATUS_CONCURRENCY, |(host, row)| {
+                    let service = Arc::clone(&service);
+                    async move { service.start_host(&host, row).await }
+                })
+                .await;
+        });
         Ok(prepared)
     }
 
@@ -345,40 +431,7 @@ impl ImagePreparationService {
                 host: node.to_string(),
             }
         })?;
-        self.set_keep(&host.name, host.id, keep).await
-    }
-
-    /// Upsert a host's row with `keep_prepared = keep`.
-    async fn set_keep(
-        &self,
-        host: &str,
-        api_id: i32,
-        keep: bool,
-    ) -> Result<sandbox_image_preparations::Model, ImagePreparationError> {
-        let statement = Statement::from_sql_and_values(
-            DatabaseBackend::Postgres,
-            "INSERT INTO sandbox_image_preparations (node_id, keep_prepared) VALUES ($1, $2) \
-             ON CONFLICT ((COALESCE(node_id, 0))) \
-             DO UPDATE SET keep_prepared = EXCLUDED.keep_prepared, updated_at = now() \
-             RETURNING *",
-            [row_node_id(api_id).into(), keep.into()],
-        );
-        sandbox_image_preparations::Entity::find()
-            .from_raw_sql(statement)
-            .one(self.db.as_ref())
-            .await
-            .and_then(|row| {
-                row.ok_or_else(|| {
-                    DbErr::RecordNotFound(format!(
-                        "sandbox_image_preparations row for node {api_id} after upsert"
-                    ))
-                })
-            })
-            .map_err(|source| ImagePreparationError::Database {
-                operation: "saving",
-                host: host.to_string(),
-                source,
-            })
+        upsert_keep(self.db.as_ref(), &host.name, host.id, keep).await
     }
 
     /// Ask the host to pull its default image and follow the pull.
@@ -536,10 +589,24 @@ impl ImagePreparationService {
 
     /// `image` is ready on the host: record it, then retire the images
     /// prepared before it. An image a container still uses stays, recorded
-    /// as `stale_image` for a later attempt.
+    /// in `stale_images` for a later attempt.
+    ///
+    /// A host whose operator turned `keep_prepared` off while the pull ran
+    /// gets the result recorded and nothing removed: retiring images is
+    /// part of keeping a host prepared, and that is no longer asked for.
     async fn record_ready(&self, host: &str, row: &sandbox_image_preparations::Model, image: &str) {
-        let mut still_used = None;
-        for old in images_to_retire(row, image) {
+        let retire = if row.keep_prepared {
+            images_to_retire(row, image)
+        } else {
+            tracing::info!(host = %host, image = %image, "sandbox image ready on a host no longer kept prepared; previous images left in place");
+            Vec::new()
+        };
+        let mut still_used = if row.keep_prepared {
+            Vec::new()
+        } else {
+            row.stale_images.clone()
+        };
+        for old in retire {
             match self
                 .provider
                 .remove_prepared_image_on(row.node_id, &old)
@@ -547,20 +614,20 @@ impl ImagePreparationService {
             {
                 Ok(ImageRemoval::InUse) => {
                     tracing::info!(host = %host, image = %old, "previous sandbox image still in use; removal retried later");
-                    still_used.get_or_insert(old);
+                    still_used.push(old);
                 }
                 Ok(
                     ImageRemoval::Removed | ImageRemoval::NotPresent | ImageRemoval::Unsupported,
                 ) => {}
                 Err(error) => {
                     tracing::warn!(host = %host, image = %old, %error, "could not remove a previous sandbox image; retried later");
-                    still_used.get_or_insert(old);
+                    still_used.push(old);
                 }
             }
         }
         let mut active = row.clone().into_active_model();
         active.prepared_image = Set(Some(image.to_string()));
-        active.stale_image = Set(still_used);
+        active.stale_images = Set(pending_removal(host, still_used));
         active.last_error = Set(None);
         active.last_error_at = Set(None);
         if let Err(error) = active.update(self.db.as_ref()).await {
@@ -626,10 +693,8 @@ impl ImagePreparationService {
             };
             match plan_host(&row, &status, Utc::now()) {
                 HostAction::Nothing => {
-                    if let Some(stale) = row.stale_image.clone() {
-                        if row.prepared_image.as_deref() != Some(stale.as_str()) {
-                            self.retry_removal(&host.name, &row, &stale).await;
-                        }
+                    if !row.stale_images.is_empty() {
+                        self.retry_removal(&host.name, &row).await;
                     }
                 }
                 HostAction::Prepare => {
@@ -643,25 +708,36 @@ impl ImagePreparationService {
         Ok(())
     }
 
-    async fn retry_removal(
-        &self,
-        host: &str,
-        row: &sandbox_image_preparations::Model,
-        image: &str,
-    ) {
-        match self
-            .provider
-            .remove_prepared_image_on(row.node_id, image)
-            .await
-        {
-            Ok(ImageRemoval::InUse) | Err(_) => {}
-            Ok(ImageRemoval::Removed | ImageRemoval::NotPresent | ImageRemoval::Unsupported) => {
-                let mut active = row.clone().into_active_model();
-                active.stale_image = Set(None);
-                if let Err(error) = active.update(self.db.as_ref()).await {
-                    tracing::warn!(host = %host, %error, "could not clear a removed sandbox image");
-                }
+    /// Try again to remove every image awaiting removal; keep the ones a
+    /// container still uses.
+    async fn retry_removal(&self, host: &str, row: &sandbox_image_preparations::Model) {
+        let mut still_used = Vec::new();
+        for image in &row.stale_images {
+            if row.prepared_image.as_deref() == Some(image.as_str()) {
+                continue;
             }
+            match self
+                .provider
+                .remove_prepared_image_on(row.node_id, image)
+                .await
+            {
+                Ok(ImageRemoval::InUse) => still_used.push(image.clone()),
+                Err(error) => {
+                    tracing::debug!(host = %host, image = %image, %error, "could not remove a previous sandbox image; retried later");
+                    still_used.push(image.clone());
+                }
+                Ok(
+                    ImageRemoval::Removed | ImageRemoval::NotPresent | ImageRemoval::Unsupported,
+                ) => tracing::info!(host = %host, image = %image, "previous sandbox image removed"),
+            }
+        }
+        if still_used == row.stale_images {
+            return;
+        }
+        let mut active = row.clone().into_active_model();
+        active.stale_images = Set(still_used);
+        if let Err(error) = active.update(self.db.as_ref()).await {
+            tracing::warn!(host = %host, %error, "could not record removed sandbox images");
         }
     }
 
@@ -722,7 +798,10 @@ async fn describe_host(
         status,
         status_error,
         prepared_image: row.as_ref().and_then(|r| r.prepared_image.clone()),
-        stale_image: row.as_ref().and_then(|r| r.stale_image.clone()),
+        stale_images: row
+            .as_ref()
+            .map(|r| r.stale_images.clone())
+            .unwrap_or_default(),
         last_error: row.as_ref().and_then(|r| r.last_error.clone()),
         last_error_at: row.as_ref().and_then(|r| r.last_error_at),
     }
@@ -738,7 +817,7 @@ mod tests {
             node_id: None,
             keep_prepared: keep,
             prepared_image: prepared.map(str::to_string),
-            stale_image: None,
+            stale_images: Vec::new(),
             last_error: None,
             last_error_at: None,
             created_at: Utc::now(),
@@ -840,12 +919,36 @@ mod tests {
     #[test]
     fn retiring_never_removes_the_ready_image_and_dedupes() {
         let mut r = row(true, Some("img:1"));
-        r.stale_image = Some("img:0".into());
+        r.stale_images = vec!["img:0".into()];
         assert_eq!(images_to_retire(&r, "img:2"), vec!["img:1", "img:0"]);
         assert!(images_to_retire(&r, "img:1") == vec!["img:0".to_string()]);
-        r.stale_image = Some("img:1".into());
+        r.stale_images = vec!["img:1".into()];
         assert_eq!(images_to_retire(&r, "img:2"), vec!["img:1"]);
         assert!(images_to_retire(&row(true, None), "img:2").is_empty());
+    }
+
+    #[test]
+    fn every_image_still_in_use_stays_tracked_across_upgrades() {
+        // Two upgrades while sandboxes keep both older images in use: all of
+        // them stay candidates for removal, none is forgotten.
+        let mut r = row(true, Some("img:2"));
+        r.stale_images = vec!["img:1".into(), "img:0".into()];
+        let retire = images_to_retire(&r, "img:3");
+        assert_eq!(retire, vec!["img:2", "img:1", "img:0"]);
+        assert_eq!(
+            pending_removal("control plane", retire),
+            vec!["img:2", "img:1", "img:0"]
+        );
+    }
+
+    #[test]
+    fn images_awaiting_removal_are_bounded() {
+        let many: Vec<String> = (0..MAX_STALE_IMAGES + 5)
+            .map(|i| format!("img:{i}"))
+            .collect();
+        let kept = pending_removal("control plane", many.clone());
+        assert_eq!(kept.len(), MAX_STALE_IMAGES);
+        assert_eq!(kept[..], many[..MAX_STALE_IMAGES], "the newest are kept");
     }
 
     #[test]
@@ -854,5 +957,209 @@ mod tests {
         assert_eq!(api_node_id(Some(4)), 4);
         assert_eq!(row_node_id(0), None);
         assert_eq!(row_node_id(4), Some(4));
+    }
+
+    /// A host that accepts a prepare request and never answers it, counting
+    /// how often it was asked and recording every image it was told to
+    /// remove.
+    #[derive(Default)]
+    struct UnresponsiveHost {
+        asked: std::sync::atomic::AtomicUsize,
+        removed: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SandboxProvider for UnresponsiveHost {
+        async fn prepare_image(
+            &self,
+            _image: Option<&str>,
+            _backend: Option<temps_sandbox_providers::SandboxBackend>,
+        ) -> Result<ImagePrepareStatus, temps_agent_core::error::AgentError> {
+            self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::pending().await
+        }
+        async fn create(
+            &self,
+            _c: temps_sandbox_providers::SandboxCreateConfig,
+        ) -> Result<temps_sandbox_providers::SandboxHandle, temps_agent_core::error::AgentError>
+        {
+            unreachable!("not exercised")
+        }
+        async fn exec(
+            &self,
+            _h: &temps_sandbox_providers::SandboxHandle,
+            _c: Vec<String>,
+            _e: std::collections::HashMap<String, String>,
+            _o: Option<temps_agent_core::OnEventCallback>,
+        ) -> Result<temps_sandbox_providers::SandboxExecResult, temps_agent_core::error::AgentError>
+        {
+            unreachable!("not exercised")
+        }
+        async fn is_alive(
+            &self,
+            _h: &temps_sandbox_providers::SandboxHandle,
+        ) -> Result<bool, temps_agent_core::error::AgentError> {
+            Ok(false)
+        }
+        async fn write_file(
+            &self,
+            _h: &temps_sandbox_providers::SandboxHandle,
+            _p: &str,
+            _c: &[u8],
+            _m: u32,
+        ) -> Result<(), temps_agent_core::error::AgentError> {
+            Ok(())
+        }
+        async fn read_file(
+            &self,
+            _h: &temps_sandbox_providers::SandboxHandle,
+            _p: &str,
+        ) -> Result<Vec<u8>, temps_agent_core::error::AgentError> {
+            Ok(Vec::new())
+        }
+        async fn write_directory(
+            &self,
+            _h: &temps_sandbox_providers::SandboxHandle,
+            _l: &std::path::Path,
+            _t: &str,
+        ) -> Result<(), temps_agent_core::error::AgentError> {
+            Ok(())
+        }
+        async fn kill_processes(
+            &self,
+            _h: &temps_sandbox_providers::SandboxHandle,
+            _p: &str,
+            _s: temps_sandbox_providers::KillSignal,
+        ) -> Result<(), temps_agent_core::error::AgentError> {
+            Ok(())
+        }
+        async fn destroy(
+            &self,
+            _h: &temps_sandbox_providers::SandboxHandle,
+            _p: bool,
+        ) -> Result<(), temps_agent_core::error::AgentError> {
+            Ok(())
+        }
+        async fn recover(
+            &self,
+            _run_id: i32,
+        ) -> Result<
+            Option<temps_sandbox_providers::SandboxHandle>,
+            temps_agent_core::error::AgentError,
+        > {
+            Ok(None)
+        }
+        fn name(&self) -> &str {
+            "unresponsive"
+        }
+        async fn is_available(&self) -> bool {
+            true
+        }
+        async fn image_status(
+            &self,
+        ) -> Result<(bool, String), temps_agent_core::error::AgentError> {
+            Ok((false, String::new()))
+        }
+        async fn rebuild_image(&self) -> Result<String, temps_agent_core::error::AgentError> {
+            Ok(String::new())
+        }
+        async fn remove_prepared_image(
+            &self,
+            image: &str,
+        ) -> Result<ImageRemoval, temps_agent_core::error::AgentError> {
+            self.removed.lock().unwrap().push(image.to_string());
+            Ok(ImageRemoval::Removed)
+        }
+    }
+
+    /// The service over a mock database that answers `results` in order.
+    fn service_with(
+        results: Vec<Vec<sandbox_image_preparations::Model>>,
+        host: Arc<UnresponsiveHost>,
+    ) -> Arc<ImagePreparationService> {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(results)
+                .into_connection(),
+        );
+        let sandbox_service = Arc::new(
+            crate::services::sandbox_service::tests::preview_test_service_with_db(db.clone()),
+        );
+        Arc::new(ImagePreparationService::new(db, host, sandbox_service))
+    }
+
+    #[tokio::test]
+    async fn a_ready_image_retires_the_previous_one_on_a_host_kept_prepared() {
+        let host = Arc::new(UnresponsiveHost::default());
+        let mut before = row(true, Some("img:1"));
+        before.stale_images = vec!["img:0".into()];
+        let service = service_with(vec![vec![row(true, Some("img:2"))]], host.clone());
+
+        service
+            .record_ready("control plane", &before, "img:2")
+            .await;
+
+        assert_eq!(*host.removed.lock().unwrap(), vec!["img:1", "img:0"]);
+    }
+
+    #[tokio::test]
+    async fn a_ready_image_removes_nothing_once_keep_prepared_is_off() {
+        // The operator turned keep_prepared off while the pull ran: the
+        // result is recorded, the older images and the removal list stay.
+        let host = Arc::new(UnresponsiveHost::default());
+        let mut before = row(false, Some("img:1"));
+        before.stale_images = vec!["img:0".into()];
+        let service = service_with(vec![vec![row(false, Some("img:2"))]], host.clone());
+
+        service
+            .record_ready("control plane", &before, "img:2")
+            .await;
+
+        assert!(
+            host.removed.lock().unwrap().is_empty(),
+            "removed {:?}",
+            host.removed.lock().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_saves_the_policy_and_returns_without_waiting_for_hosts() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+        let saved = row(true, None);
+        // Placement (settings, workers, live counts), then the upsert inside
+        // the transaction. A slow host is never waited for.
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<temps_entities::settings::Model>::new()])
+                .append_query_results([Vec::<temps_entities::nodes::Model>::new()])
+                .append_query_results([Vec::<temps_entities::sandboxes::Model>::new()])
+                .append_query_results([vec![saved]])
+                .into_connection(),
+        );
+        let sandbox_service = Arc::new(
+            crate::services::sandbox_service::tests::preview_test_service_with_db(db.clone()),
+        );
+        let host = Arc::new(UnresponsiveHost::default());
+        let service = Arc::new(ImagePreparationService::new(
+            db,
+            host.clone(),
+            sandbox_service,
+        ));
+
+        let prepared = tokio::time::timeout(Duration::from_secs(1), service.prepare(None))
+            .await
+            .expect("prepare returns without waiting for the host")
+            .expect("prepare");
+        assert_eq!(prepared, vec![0], "the control plane");
+
+        // The host is asked in the background.
+        for _ in 0..100 {
+            if host.asked.load(std::sync::atomic::Ordering::SeqCst) == 1 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("the host was never asked to pull");
     }
 }

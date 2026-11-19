@@ -38373,12 +38373,12 @@
               "null"
             ]
           },
-          "stale_image": {
-            "description": "A previously prepared image still to remove (a container used it).",
-            "type": [
-              "string",
-              "null"
-            ]
+          "stale_images": {
+            "description": "Previously prepared images still to remove (a container used them).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
           },
           "status": {
             "oneOf": [
@@ -38404,7 +38404,8 @@
           "node_name",
           "is_control_plane",
           "eligible",
-          "keep_prepared"
+          "keep_prepared",
+          "stale_images"
         ],
         "type": "object"
       },
@@ -54184,6 +54185,23 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "PrepareSandboxImagesResponse": {
+        "description": "The hosts a \"prepare\" was accepted for.",
+        "properties": {
+          "node_ids": {
+            "description": "The hosts now kept prepared and asked to pull (node id, `0` for the\ncontrol plane). Their progress is read from\n`GET /v1/sandboxes/image-preparation`.",
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "node_ids"
+        ],
         "type": "object"
       },
       "PresetConfigSchema": {
@@ -180483,22 +180501,29 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/PrepareSandboxImagesBody"
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/PrepareSandboxImagesBody"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
               }
             }
           },
-          "required": true
+          "description": "Optional; an empty body prepares every eligible host"
         },
         "responses": {
           "202": {
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/SandboxImagePreparationResponse"
+                  "$ref": "#/components/schemas/PrepareSandboxImagesResponse"
                 }
               }
             },
-            "description": "Preparation started; current status of every host"
+            "description": "Preparation started on these hosts"
           },
           "401": {
             "description": "Unauthorized"
@@ -180521,7 +180546,7 @@
             "bearer_auth": []
           }
         ],
-        "summary": "Pull the default sandbox image on every eligible host (or one), so the\nfirst sandbox there starts without a multi-gigabyte download, and keep\nthose hosts prepared across upgrades. Returns at once; the pulls run in\nthe background and their progress is read from the GET. Admin only.",
+        "summary": "Pull the default sandbox image on every eligible host (or one), so the\nfirst sandbox there starts without a multi-gigabyte download, and keep\nthose hosts prepared across upgrades. Saves the policy of every host at\nonce and returns; the hosts are asked to pull in the background and\ntheir progress is read from the GET. Admin only.",
         "tags": [
           "Sandboxes"
         ],

@@ -13,12 +13,14 @@
 //!
 //! Memory: one entry per distinct image reference asked for, each a few
 //! hundred bytes plus a map of the image's layers while it pulls; finished
-//! entries beyond [`MAX_FINISHED_ENTRIES`] are dropped oldest first. A
+//! entries beyond [`MAX_FINISHED_ENTRIES`] are dropped oldest first, both
+//! when a pull starts and when one finishes. A
 //! running pull is never dropped, and the number of running pulls is bounded
 //! by the number of distinct images callers ask for at once.
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use bollard::models::CreateImageInfo;
 use chrono::Utc;
@@ -42,8 +44,10 @@ pub(crate) enum PullOutcome {
 /// Every pull this host is running or ran recently, by image reference.
 #[derive(Default)]
 pub(crate) struct ImagePulls {
-    entries: std::sync::Mutex<HashMap<String, watch::Receiver<ImagePrepareStatus>>>,
+    entries: Arc<Mutex<Entries>>,
 }
+
+type Entries = HashMap<String, watch::Receiver<ImagePrepareStatus>>;
 
 /// Handed to a pull job to publish its progress.
 pub(crate) struct PullReporter {
@@ -148,7 +152,7 @@ impl ImagePulls {
             ..ImagePrepareStatus::new(image, ImagePrepareState::Pulling)
         };
         let (tx, rx) = watch::channel(initial);
-        prune_finished(&mut entries);
+        prune_finished(&mut entries, 1);
         entries.insert(image.to_string(), rx.clone());
         drop(entries);
 
@@ -157,6 +161,7 @@ impl ImagePulls {
             layers: HashMap::new(),
         });
         let image = image.to_string();
+        let registry = Arc::clone(&self.entries);
         tokio::spawn(async move {
             // A second task, so a panicking job still ends the pull with a
             // terminal state instead of leaving waiters stuck on "pulling".
@@ -192,6 +197,9 @@ impl ImagePulls {
                     }
                 }
             });
+            // Many pulls can finish without another one starting; trim here
+            // too so the finished ones stay bounded.
+            prune_finished(&mut lock_entries(&registry), 0);
         });
         (rx, true)
     }
@@ -202,18 +210,19 @@ impl ImagePulls {
         self.lock().get(image).map(|rx| rx.borrow().clone())
     }
 
-    fn lock(
-        &self,
-    ) -> std::sync::MutexGuard<'_, HashMap<String, watch::Receiver<ImagePrepareStatus>>> {
-        self.entries
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    fn lock(&self) -> MutexGuard<'_, Entries> {
+        lock_entries(&self.entries)
     }
 }
 
+fn lock_entries(entries: &Mutex<Entries>) -> MutexGuard<'_, Entries> {
+    entries.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// Drop the oldest finished entries so at most [`MAX_FINISHED_ENTRIES`]
-/// remain (plus the one about to be inserted). Running pulls stay.
-fn prune_finished(entries: &mut HashMap<String, watch::Receiver<ImagePrepareStatus>>) {
+/// remain, leaving `room` for entries about to be inserted. Running pulls
+/// stay.
+fn prune_finished(entries: &mut Entries, room: usize) {
     let mut finished: Vec<(String, Option<chrono::DateTime<Utc>>)> = entries
         .iter()
         .filter_map(|(image, rx)| {
@@ -224,11 +233,12 @@ fn prune_finished(entries: &mut HashMap<String, watch::Receiver<ImagePrepareStat
                 .then(|| (image.clone(), status.finished_at))
         })
         .collect();
-    if finished.len() < MAX_FINISHED_ENTRIES {
+    let limit = MAX_FINISHED_ENTRIES.saturating_sub(room);
+    if finished.len() <= limit {
         return;
     }
     finished.sort_by_key(|(_, finished_at)| *finished_at);
-    let excess = finished.len() + 1 - MAX_FINISHED_ENTRIES;
+    let excess = finished.len() - limit;
     for (image, _) in finished.into_iter().take(excess) {
         entries.remove(&image);
     }
@@ -438,6 +448,35 @@ mod tests {
         assert!(entries.contains_key("img:running"));
         drop(entries);
         drop(running);
+    }
+
+    #[tokio::test]
+    async fn pulls_finishing_together_stay_bounded_without_a_new_start() {
+        let pulls = ImagePulls::default();
+        let (release, released) = watch::channel(false);
+        let mut receivers = Vec::new();
+        for i in 0..(MAX_FINISHED_ENTRIES * 3) {
+            let mut released = released.clone();
+            let (rx, started) = pulls.start(&format!("img:{i}"), |_| async move {
+                let _ = released.wait_for(|go| *go).await;
+                Ok(PullOutcome::Pulled)
+            });
+            assert!(started);
+            receivers.push(rx);
+        }
+        release.send(true).unwrap();
+        for rx in receivers {
+            wait_for_pull(rx, |_| {}).await;
+        }
+        // The last waiter can wake before the task that published its
+        // result has trimmed the map.
+        for _ in 0..200 {
+            if pulls.lock().len() <= MAX_FINISHED_ENTRIES {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("{} finished entries kept", pulls.lock().len());
     }
 
     #[test]

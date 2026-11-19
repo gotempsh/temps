@@ -14435,16 +14435,17 @@ export const getSandboxImagePreparation = <ThrowOnError extends boolean = false>
 /**
  * Pull the default sandbox image on every eligible host (or one), so the
  * first sandbox there starts without a multi-gigabyte download, and keep
- * those hosts prepared across upgrades. Returns at once; the pulls run in
- * the background and their progress is read from the GET. Admin only.
+ * those hosts prepared across upgrades. Saves the policy of every host at
+ * once and returns; the hosts are asked to pull in the background and
+ * their progress is read from the GET. Admin only.
  */
-export const prepareSandboxImages = <ThrowOnError extends boolean = false>(options: Options<PrepareSandboxImagesData, ThrowOnError>): RequestResult<PrepareSandboxImagesResponses, PrepareSandboxImagesErrors, ThrowOnError> => (options.client ?? client).post<PrepareSandboxImagesResponses, PrepareSandboxImagesErrors, ThrowOnError>({
+export const prepareSandboxImages = <ThrowOnError extends boolean = false>(options?: Options<PrepareSandboxImagesData, ThrowOnError>): RequestResult<PrepareSandboxImagesResponses, PrepareSandboxImagesErrors, ThrowOnError> => (options?.client ?? client).post<PrepareSandboxImagesResponses, PrepareSandboxImagesErrors, ThrowOnError>({
     security: [{ scheme: 'bearer', type: 'http' }],
     url: '/v1/sandboxes/image-preparation',
     ...options,
     headers: {
         'Content-Type': 'application/json',
-        ...options.headers
+        ...options?.headers
     }
 });
 

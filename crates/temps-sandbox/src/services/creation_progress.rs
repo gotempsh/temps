@@ -338,6 +338,23 @@ fn generated_creation_id() -> String {
     format!("crt_{}", hex::encode(bytes))
 }
 
+/// See [`CreationProgress::abandon_guard`].
+pub struct AbandonGuard {
+    progress: CreationProgress,
+}
+
+/// What an abandoned create reports as its error.
+pub const ABANDONED_CREATE: &str =
+    "the create stopped before it finished: the operation that started it was cancelled";
+
+impl Drop for AbandonGuard {
+    fn drop(&mut self) {
+        if self.progress.is_running() {
+            self.progress.fail(ABANDONED_CREATE);
+        }
+    }
+}
+
 /// Records one create's steps. Cheap to clone; every method is a short,
 /// non-blocking update.
 #[derive(Clone)]
@@ -514,6 +531,22 @@ impl CreationProgress {
     /// The create failed: the running step (else the first pending one)
     /// failed with `error`; the steps after it were not reached and stay
     /// pending.
+    /// A guard that fails this create, if it is still running, when the
+    /// guard is dropped: the future driving it was dropped before it
+    /// finished (a caller that wraps the create in a timeout). Without it
+    /// the record would stay running, and running records are never pruned.
+    pub fn abandon_guard(&self) -> AbandonGuard {
+        AbandonGuard {
+            progress: self.clone(),
+        }
+    }
+
+    fn is_running(&self) -> bool {
+        self.tracker
+            .get(self.key.0, &self.key.1)
+            .is_some_and(|creation| creation.status == CreationStatus::Running)
+    }
+
     pub fn fail(&self, error: &str) {
         let now = Utc::now();
         self.tracker.update(&self.key, |creation| {
@@ -761,5 +794,38 @@ mod tests {
         assert_eq!(pull.bytes_done, Some(1_113_929_288));
         assert_eq!(human_bytes(512), "512 B");
         assert_eq!(human_bytes(2_500_000), "2.50 MB");
+    }
+
+    #[test]
+    fn a_create_dropped_mid_way_is_failed_not_left_running() {
+        let tracker = Arc::new(CreationTracker::default());
+        let progress = tracker.begin(1, Some("create-drop-1")).expect("begin");
+        {
+            let _guard = progress.abandon_guard();
+            progress.start(CreationStepKind::PullImage);
+            // The future is dropped here, as a caller's timeout would.
+        }
+        let creation = tracker.get(1, "create-drop-1").expect("tracked");
+        assert_eq!(creation.status, CreationStatus::Failed);
+        assert_eq!(creation.error.as_deref(), Some(ABANDONED_CREATE));
+        let pull = creation
+            .steps
+            .iter()
+            .find(|s| s.kind == CreationStepKind::PullImage)
+            .expect("pull step");
+        assert_eq!(pull.status, CreationStepStatus::Failed);
+        assert!(
+            creation.finished_at.is_some(),
+            "finished, so it is pruned later"
+        );
+
+        // A create that finished normally is left as it ended.
+        let done = tracker.begin(1, Some("create-drop-2")).expect("begin");
+        {
+            let _guard = done.abandon_guard();
+            done.succeed("ok");
+        }
+        let creation = tracker.get(1, "create-drop-2").expect("tracked");
+        assert_eq!(creation.status, CreationStatus::Succeeded);
     }
 }

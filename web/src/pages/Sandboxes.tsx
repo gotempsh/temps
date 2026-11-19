@@ -64,6 +64,7 @@ import {
   resumeSandboxMutation,
   stopSandboxMutation,
 } from '@/api/client/@tanstack/react-query.gen'
+import { refreshSandboxImageStatus } from '@/components/sandboxes/sandbox-creation'
 import type {
   ApplicationResponse,
   ApplicationWorkspaceResponse,
@@ -256,6 +257,9 @@ export default function Sandboxes() {
 
   const refreshAll = () => {
     void refetch()
+    // The sandbox image card on this page: Refresh updates its host status
+    // too, not only at the card's own poll.
+    void refreshSandboxImageStatus(queryClient)
     if (loadWorkspaces) {
       void applicationsQuery.refetch()
       void globalWorkspaceQuery.refetch()

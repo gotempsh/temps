@@ -24,8 +24,9 @@ pub struct Model {
     pub keep_prepared: bool,
     /// The exact image reference last prepared on this host.
     pub prepared_image: Option<String>,
-    /// A previously prepared image still to remove (a container used it).
-    pub stale_image: Option<String>,
+    /// Previously prepared images still to remove (a container used them).
+    /// At most 16.
+    pub stale_images: Vec<String>,
     /// Why the last preparation failed.
     pub last_error: Option<String>,
     pub last_error_at: Option<DBDateTime>,

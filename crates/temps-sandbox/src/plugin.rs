@@ -446,9 +446,10 @@ impl TempsPlugin for SandboxPlugin {
         let sensitive_action_authorizer =
             context.require_service::<dyn temps_core::SensitiveActionAuthorizer>();
 
-        // Registered next to `SandboxService`, so present whenever it is.
-        let image_preparation =
-            context.get_service::<crate::services::image_preparation::ImagePreparationService>()?;
+        // Registered next to `SandboxService`, so present whenever it is:
+        // its absence is a wiring bug, reported at startup.
+        let image_preparation = context
+            .require_service::<crate::services::image_preparation::ImagePreparationService>();
 
         let app_state = Arc::new(SandboxAppState {
             sandbox_service,

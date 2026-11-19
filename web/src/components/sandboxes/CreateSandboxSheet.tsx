@@ -57,7 +57,8 @@ import {
   type CreateSandboxFormValues,
 } from './sandbox-create'
 import { SandboxBackendLogo } from './SandboxBackendLogo'
-import { SandboxCreationSteps, useSandboxCreation } from './SandboxCreationSteps'
+import { SandboxCreationSteps } from './SandboxCreationSteps'
+import { useSandboxCreation } from './useSandboxCreation'
 import { newCreationId } from './sandbox-creation'
 
 const LIFECYCLES = [
@@ -75,10 +76,14 @@ const LIFECYCLES = [
   },
 ] as const
 
-const BACKEND_DESCRIPTIONS: Record<string, { title: string; description: string }> = {
+const BACKEND_DESCRIPTIONS: Record<
+  string,
+  { title: string; description: string }
+> = {
   docker: {
     title: 'Docker',
-    description: 'A namespaced container. Starts fastest and runs on every node.',
+    description:
+      'A namespaced container. Starts fastest and runs on every node.',
   },
   firecracker: {
     title: 'Firecracker',
@@ -135,7 +140,7 @@ export function CreateSandboxSheet({
   // The id the current attempt's steps are tracked under. Set on submit,
   // kept after a failure so the failed step stays on screen.
   const [creationId, setCreationId] = useState<string | null>(null)
-  const creation = useSandboxCreation(creationId)
+  const creation = useSandboxCreation(creationId, !create.isPending)
 
   // Start from a clean form, and without the previous attempt's error, each
   // time the sheet is opened (it stays mounted while closed).
@@ -163,7 +168,11 @@ export function CreateSandboxSheet({
     setCreationId(id)
     create.mutate({ body: { ...toCreateSandboxBody(values), creation_id: id } })
   }
-  const showSteps = creationId !== null && (create.isPending || create.isError)
+  // A refused create the server never tracked has no steps: its error
+  // alone says what happened.
+  const showSteps =
+    creationId !== null &&
+    (create.isPending || (create.isError && creation.data !== undefined))
 
   return (
     <Sheet
@@ -383,7 +392,8 @@ export function CreateSandboxSheet({
                         // A backend the new node cannot run goes back to the
                         // default rather than failing the create.
                         const still = backendChoices(allNodes, value).find(
-                          (choice) => choice.backend === form.getValues('backend')
+                          (choice) =>
+                            choice.backend === form.getValues('backend')
                         )
                         if (still && !still.available) {
                           form.setValue('backend', DEFAULT_BACKEND)
@@ -453,7 +463,9 @@ export function CreateSandboxSheet({
                             title={text?.title ?? choice.backend}
                             description={text?.description ?? ''}
                             reason={choice.available ? null : choice.reason}
-                            logo={<SandboxBackendLogo backend={choice.backend} />}
+                            logo={
+                              <SandboxBackendLogo backend={choice.backend} />
+                            }
                           />
                         )
                       })}

@@ -110,6 +110,8 @@ impl SandboxService {
                     user_id,
                 },
             })?;
+        // Fails the record if this future is dropped before it finishes.
+        let _abandoned = progress.abandon_guard();
         let result = self.create_sandbox_steps(user_id, req, &progress).await;
         match &result {
             Ok(_) => progress.succeed(UNREPORTED_STEP_DETAIL),

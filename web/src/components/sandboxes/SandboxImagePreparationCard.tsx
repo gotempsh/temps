@@ -74,8 +74,10 @@ export function SandboxImagePreparationCard({
     ...prepareSandboxImagesMutation(),
     meta: { errorTitle: 'Failed to prepare sandbox hosts' },
     onSuccess: (data) => {
-      queryClient.setQueryData(queryKey, data)
-      toast.success('Pulling the sandbox image in the background')
+      const hosts = data.node_ids.length
+      toast.success(
+        `Pulling the sandbox image on ${hosts} ${hosts === 1 ? 'host' : 'hosts'} in the background`
+      )
     },
     onSettled: () => queryClient.invalidateQueries({ queryKey }),
   })
@@ -172,18 +174,21 @@ function PreparationBody({
       </div>
     )
   }
-  if (error) {
-    return (
-      <Alert variant="destructive">
-        <AlertTriangle className="size-4" />
-        <AlertDescription className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-          <span className="[overflow-wrap:anywhere]">{error}</span>
-          <Button variant="outline" size="sm" onClick={onRetry}>
-            Try again
-          </Button>
-        </AlertDescription>
-      </Alert>
-    )
+  const refreshFailed = error ? (
+    <Alert variant="destructive">
+      <AlertTriangle className="size-4" />
+      <AlertDescription className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+        <span className="[overflow-wrap:anywhere]">{error}</span>
+        <Button variant="outline" size="sm" onClick={onRetry}>
+          Try again
+        </Button>
+      </AlertDescription>
+    </Alert>
+  ) : null
+  // A failed refresh keeps the last hosts read on screen, under the error:
+  // a pull in progress should not vanish because one poll failed.
+  if (refreshFailed && hosts.length === 0) {
+    return refreshFailed
   }
   if (hosts.length === 0) {
     return (
@@ -194,6 +199,7 @@ function PreparationBody({
   }
   return (
     <>
+      {refreshFailed}
       {pendingCount > 0 && (
         <p className="text-sm text-muted-foreground">
           {canManage
@@ -294,11 +300,13 @@ function HostRow({
           {problem}
         </p>
       )}
-      {host.stale_image && (
+      {host.stale_images.length > 0 && (
         <p className="text-xs text-muted-foreground [overflow-wrap:anywhere]">
-          The previous image{' '}
-          <span className="font-mono">{host.stale_image}</span> is still used by
-          a sandbox; it is removed once nothing uses it.
+          {host.stale_images.length === 1
+            ? 'A previous image is'
+            : `${host.stale_images.length} previous images are`}{' '}
+          still used by a sandbox and removed once nothing uses them:{' '}
+          <span className="font-mono">{host.stale_images.join(', ')}</span>
         </p>
       )}
     </li>

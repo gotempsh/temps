@@ -17900,9 +17900,9 @@ export type HostImagePreparation = {
      */
     prepared_image?: string | null;
     /**
-     * A previously prepared image still to remove (a container used it).
+     * Previously prepared images still to remove (a container used them).
      */
-    stale_image?: string | null;
+    stale_images: Array<string>;
     status?: ImagePrepareStatus | null;
     /**
      * Why the status could not be read.
@@ -25338,6 +25338,18 @@ export type PrepareSandboxImagesBody = {
      * Omitted or `null`: every host eligible for sandbox placement.
      */
     node_id?: number | null;
+};
+
+/**
+ * The hosts a "prepare" was accepted for.
+ */
+export type PrepareSandboxImagesResponse = {
+    /**
+     * The hosts now kept prepared and asked to pull (node id, `0` for the
+     * control plane). Their progress is read from
+     * `GET /v1/sandboxes/image-preparation`.
+     */
+    node_ids: Array<number>;
 };
 
 /**
@@ -97361,7 +97373,10 @@ export type GetSandboxImagePreparationResponses = {
 export type GetSandboxImagePreparationResponse = GetSandboxImagePreparationResponses[keyof GetSandboxImagePreparationResponses];
 
 export type PrepareSandboxImagesData = {
-    body: PrepareSandboxImagesBody;
+    /**
+     * Optional; an empty body prepares every eligible host
+     */
+    body?: PrepareSandboxImagesBody | null;
     path?: never;
     query?: never;
     url: '/v1/sandboxes/image-preparation';
@@ -97392,12 +97407,12 @@ export type PrepareSandboxImagesErrors = {
 
 export type PrepareSandboxImagesResponses = {
     /**
-     * Preparation started; current status of every host
+     * Preparation started on these hosts
      */
-    202: SandboxImagePreparationResponse;
+    202: PrepareSandboxImagesResponse;
 };
 
-export type PrepareSandboxImagesResponse = PrepareSandboxImagesResponses[keyof PrepareSandboxImagesResponses];
+export type PrepareSandboxImagesResponse2 = PrepareSandboxImagesResponses[keyof PrepareSandboxImagesResponses];
 
 export type UpdateHostImagePreparationData = {
     body: UpdateHostImagePreparationBody;

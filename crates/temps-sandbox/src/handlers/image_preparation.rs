@@ -68,6 +68,15 @@ pub struct PrepareSandboxImagesBody {
     pub node_id: Option<i32>,
 }
 
+/// The hosts a "prepare" was accepted for.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PrepareSandboxImagesResponse {
+    /// The hosts now kept prepared and asked to pull (node id, `0` for the
+    /// control plane). Their progress is read from
+    /// `GET /v1/sandboxes/image-preparation`.
+    pub node_ids: Vec<i32>,
+}
+
 /// Turn keeping one host prepared on or off.
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
@@ -164,15 +173,16 @@ pub async fn get_sandbox_image_preparation(
 
 /// Pull the default sandbox image on every eligible host (or one), so the
 /// first sandbox there starts without a multi-gigabyte download, and keep
-/// those hosts prepared across upgrades. Returns at once; the pulls run in
-/// the background and their progress is read from the GET. Admin only.
+/// those hosts prepared across upgrades. Saves the policy of every host at
+/// once and returns; the hosts are asked to pull in the background and
+/// their progress is read from the GET. Admin only.
 #[utoipa::path(
     tag = "Sandboxes",
     post,
     path = "/v1/sandboxes/image-preparation",
-    request_body = PrepareSandboxImagesBody,
+    request_body(content = Option<PrepareSandboxImagesBody>, description = "Optional; an empty body prepares every eligible host"),
     responses(
-        (status = 202, description = "Preparation started; current status of every host", body = SandboxImagePreparationResponse),
+        (status = 202, description = "Preparation started on these hosts", body = PrepareSandboxImagesResponse),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Administrator role required"),
         (status = 404, description = "No such host"),
@@ -201,12 +211,14 @@ pub async fn prepare_sandbox_images(
                 user_agent: metadata.user_agent.clone(),
             },
             requested_node_id: requested,
-            prepared_node_ids: prepared,
+            prepared_node_ids: prepared.clone(),
         },
     )
     .await;
-    let status = state.image_preparation.status().await?;
-    Ok((StatusCode::ACCEPTED, Json(status)))
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(PrepareSandboxImagesResponse { node_ids: prepared }),
+    ))
 }
 
 /// Turn keeping one host's sandbox image prepared on or off. Admin only.
@@ -363,6 +375,21 @@ mod tests {
             .body(axum::body::Body::from(body.to_string()))
             .expect("request");
         app.oneshot(request).await.expect("response").status()
+    }
+
+    #[test]
+    fn the_prepare_body_is_documented_as_optional() {
+        use utoipa::OpenApi;
+        let api = crate::handlers::SandboxApiDoc::openapi();
+        let post = api.paths.paths["/v1/sandboxes/image-preparation"]
+            .post
+            .as_ref()
+            .expect("POST is documented");
+        let Some(utoipa::openapi::RefOr::T(body)) = post.request_body.as_ref() else {
+            panic!("the request body is documented inline");
+        };
+        // OpenAPI's default for `required` is false: absent means optional.
+        assert_ne!(body.required, Some(utoipa::openapi::Required::True));
     }
 
     #[tokio::test]

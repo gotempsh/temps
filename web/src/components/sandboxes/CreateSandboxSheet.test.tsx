@@ -130,6 +130,12 @@ test('a refused create keeps the sheet open and shows the reason', async () => {
 
   await view.findByText(/Node worker-9 is offline/)
   expect(view.queryByText('detail page')).toBeNull()
+  // The server never tracked this create: no step list left loading.
+  await waitFor(() =>
+    expect(
+      view.queryByRole('list', { name: 'Sandbox creation steps' })
+    ).toBeNull()
+  )
   api.restore()
 })
 

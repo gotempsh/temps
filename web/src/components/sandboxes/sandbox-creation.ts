@@ -7,6 +7,20 @@ import type {
   ImagePrepareStatus,
   SandboxCreation,
 } from '@/api/client'
+import type { QueryClient } from '@tanstack/react-query'
+import { getSandboxImagePreparationQueryKey } from '@/api/client/@tanstack/react-query.gen'
+
+/**
+ * Mark the sandbox image status stale so the card showing it reads it again
+ * now, as part of a page's Refresh, instead of at its next poll.
+ */
+export function refreshSandboxImageStatus(
+  queryClient: QueryClient
+): Promise<void> {
+  return queryClient.invalidateQueries({
+    queryKey: getSandboxImagePreparationQueryKey(),
+  })
+}
 
 /** How often a running create is polled for its steps. */
 export const CREATION_POLL_MS = 1_000
@@ -94,6 +108,19 @@ export function creationRunning(
   creation: SandboxCreation | undefined
 ): boolean {
   return creation === undefined || creation.status === 'running'
+}
+
+/**
+ * Whether to poll a create's steps again: while it runs, and, before the
+ * first answer, only as long as the create request itself is in flight.
+ */
+export function keepPolling(
+  creation: SandboxCreation | undefined,
+  lastPollFailed: boolean,
+  requestSettled: boolean
+): boolean {
+  if (creation) return creation.status === 'running'
+  return !(lastPollFailed && requestSettled)
 }
 
 /** One line for a host's image state. */

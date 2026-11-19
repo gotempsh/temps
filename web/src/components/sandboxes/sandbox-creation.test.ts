@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { describe, expect, test } from 'bun:test'
+import { QueryClient } from '@tanstack/react-query'
+import { getSandboxImagePreparationQueryKey } from '@/api/client/@tanstack/react-query.gen'
 import type {
   CreationStep,
   HostImagePreparation,
@@ -17,6 +19,8 @@ import {
   formatDuration,
   hostsToPrepare,
   imageStateLabel,
+  keepPolling,
+  refreshSandboxImageStatus,
   newCreationId,
   stepDurationMs,
 } from './sandbox-creation'
@@ -47,7 +51,7 @@ function host(overrides: Partial<HostImagePreparation>): HostImagePreparation {
     status: { image: 'img:1', state: 'not_pulled', already_present: false },
     status_error: null,
     prepared_image: null,
-    stale_image: null,
+    stale_images: [],
     last_error: null,
     last_error_at: null,
     ...overrides,
@@ -118,6 +122,17 @@ describe('creation state', () => {
     expect(creationRunning({ ...base, status: 'failed' })).toBe(false)
   })
 
+  test('stops polling a create the server never tracked once its request ended', () => {
+    // Before any answer: keep trying while the request is in flight.
+    expect(keepPolling(undefined, false, false)).toBe(true)
+    expect(keepPolling(undefined, true, false)).toBe(true)
+    // The request ended and the progress is still unknown: stop.
+    expect(keepPolling(undefined, true, true)).toBe(false)
+    // A tracked create is followed until it finishes.
+    expect(keepPolling(base, true, true)).toBe(true)
+    expect(keepPolling({ ...base, status: 'failed' }, false, false)).toBe(false)
+  })
+
   test('the failed step is the one marked failed', () => {
     expect(failedStep(base)).toBeNull()
     const failed = {
@@ -177,5 +192,16 @@ describe('host preparation', () => {
     expect(hostsToPrepare(hosts).map((h) => h.node_id)).toEqual([0, 4])
     expect(anyHostPulling(hosts)).toBe(true)
     expect(anyHostPulling([hosts[0]])).toBe(false)
+  })
+})
+
+describe('refreshSandboxImageStatus', () => {
+  test('marks the image status the card shows as stale', async () => {
+    const client = new QueryClient()
+    const queryKey = getSandboxImagePreparationQueryKey()
+    client.setQueryData(queryKey, { hosts: [], all_ready: true })
+    expect(client.getQueryState(queryKey)?.isInvalidated).toBe(false)
+    await refreshSandboxImageStatus(client)
+    expect(client.getQueryState(queryKey)?.isInvalidated).toBe(true)
   })
 })

@@ -563,6 +563,29 @@ const SANDBOX_IMAGE_PULL_TIMEOUTS: temps_docker_util::PullTimeouts =
         total: std::time::Duration::from_secs(3 * 60 * 60),
     };
 
+/// Ceiling on the local build a preset falls back to when its pull fails.
+/// The build compiles a helper from source, so it gets room on a small
+/// host, but a stuck daemon must not keep the pull "running" (and every
+/// create waiting on it) forever.
+const SANDBOX_IMAGE_FALLBACK_BUILD_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(2 * 60 * 60);
+
+/// Run `build` for at most `limit`, failing with a reason that names the
+/// image and the limit when it runs out.
+async fn build_within(
+    image: &str,
+    limit: std::time::Duration,
+    build: impl std::future::Future<Output = Result<(), String>>,
+) -> Result<(), String> {
+    tokio::time::timeout(limit, build)
+        .await
+        .unwrap_or_else(|_| {
+            Err(format!(
+                "the local build of image {image} did not finish within {limit:?}"
+            ))
+        })
+}
+
 impl DockerSandboxProvider {
     /// Build the sandbox image if it doesn't exist.
     /// For preset runtimes, generates a Dockerfile dynamically.
@@ -704,10 +727,14 @@ async fn pull_or_build(
         "Pull of the sandbox image failed, falling back to a local build"
     );
     reporter.detail("building locally");
-    build_preset_image(&docker, runtime, &image, None)
-        .await
-        .map(|()| image_pulls::PullOutcome::Pulled)
-        .map_err(|build| format!("{build} (after the pull failed: {cause})"))
+    build_within(
+        &image,
+        SANDBOX_IMAGE_FALLBACK_BUILD_TIMEOUT,
+        build_preset_image(&docker, runtime, &image, None),
+    )
+    .await
+    .map(|()| image_pulls::PullOutcome::Pulled)
+    .map_err(|build| format!("{build} (after the pull failed: {cause})"))
 }
 
 /// Build a runtime preset's image from its generated Dockerfile, tagged
@@ -773,6 +800,36 @@ async fn build_preset_image(
     tracing::info!("Sandbox image {} built successfully", image_name);
     send(format!("Image {} built successfully.", image_name)).await;
     Ok(())
+}
+
+#[cfg(test)]
+mod build_deadline_tests {
+    use super::build_within;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn a_build_that_never_ends_fails_with_the_image_and_the_limit() {
+        let result = build_within(
+            "registry.example/sandbox:1",
+            Duration::from_millis(20),
+            std::future::pending(),
+        )
+        .await;
+        let reason = result.expect_err("a stuck build must fail");
+        assert!(reason.contains("registry.example/sandbox:1"), "{reason}");
+        assert!(reason.contains("did not finish within 20ms"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn a_build_that_ends_in_time_keeps_its_result() {
+        let ok = build_within("img", Duration::from_secs(60), async { Ok(()) }).await;
+        assert_eq!(ok, Ok(()));
+        let failed = build_within("img", Duration::from_secs(60), async {
+            Err("Image build error: boom".to_string())
+        })
+        .await;
+        assert_eq!(failed, Err("Image build error: boom".to_string()));
+    }
 }
 
 #[cfg(test)]

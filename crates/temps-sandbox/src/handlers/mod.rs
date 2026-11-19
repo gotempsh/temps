@@ -179,6 +179,7 @@ pub struct SandboxAppState {
         placement::EvictionFailedSandbox,
         crate::services::placement::PlacementNode,
         image_preparation::PrepareSandboxImagesBody,
+        image_preparation::PrepareSandboxImagesResponse,
         image_preparation::UpdateHostImagePreparationBody,
         crate::services::image_preparation::SandboxImagePreparationResponse,
         crate::services::image_preparation::HostImagePreparation,

@@ -26,7 +26,7 @@ function host(
     status: { image: IMAGE, state: 'not_pulled', already_present: false },
     status_error: null,
     prepared_image: null,
-    stale_image: null,
+    stale_images: [],
     last_error: null,
     last_error_at: null,
     ...overrides,
@@ -35,12 +35,20 @@ function host(
 
 function render(
   data: SandboxImagePreparationResponse | undefined,
-  canManage = true
+  canManage = true,
+  refreshError?: Error
 ) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false, staleTime: Infinity } },
   })
-  if (data) client.setQueryData(getSandboxImagePreparationQueryKey(), data)
+  const queryKey = getSandboxImagePreparationQueryKey()
+  if (data) client.setQueryData(queryKey, data)
+  if (refreshError) {
+    client
+      .getQueryCache()
+      .build(client, { queryKey })
+      .setState({ status: 'error', error: refreshError })
+  }
   return renderToStaticMarkup(
     <QueryClientProvider client={client}>
       <SandboxImagePreparationCard canManage={canManage} />
@@ -112,6 +120,31 @@ describe('SandboxImagePreparationCard', () => {
     expect(html).toContain('Prepare sandboxes')
   })
 
+  test('a failed refresh keeps the last hosts read, under the error', () => {
+    const html = render(
+      {
+        hosts: [
+          host({
+            node_name: 'worker-a',
+            status: {
+              image: IMAGE,
+              state: 'pulling',
+              already_present: false,
+              bytes_done: 50,
+              bytes_total: 100,
+            },
+          }),
+        ],
+        all_ready: false,
+      },
+      true,
+      new Error('network down')
+    )
+    expect(html).toContain('Try again')
+    expect(html).toContain('worker-a')
+    expect(html).toContain(IMAGE)
+  })
+
   test('every host ready: no call to action', () => {
     const html = render({
       hosts: [
@@ -135,17 +168,23 @@ describe('SandboxImagePreparationCard', () => {
     expect(html).not.toContain('Prepare sandboxes')
   })
 
-  test('says when an old image is kept because a sandbox still uses it', () => {
+  test('lists every old image kept because a sandbox still uses it', () => {
     const html = render({
       hosts: [
         host({
           status: { image: IMAGE, state: 'ready', already_present: false },
-          stale_image: 'ghcr.io/example/sandbox:old',
+          stale_images: [
+            'ghcr.io/example/sandbox:old',
+            'ghcr.io/example/sandbox:older',
+          ],
         }),
       ],
       all_ready: true,
     })
-    expect(html).toContain('ghcr.io/example/sandbox:old')
-    expect(html).toContain('removed once nothing uses it')
+    expect(html).toContain('2 previous images are')
+    expect(html).toContain(
+      'ghcr.io/example/sandbox:old, ghcr.io/example/sandbox:older'
+    )
+    expect(html).toContain('removed once nothing uses them')
   })
 })
